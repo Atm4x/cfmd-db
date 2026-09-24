@@ -1,0 +1,563 @@
+=== versions ===
+rustc 1.98.1 (48a229cea 2026-09-01)
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+rustfmt 1.9.0-stable (48a229ceae 2026-09-01)
+clippy 0.1.98 (48a229ceae 2026-09-01)
+=== cargo fmt --all -- --check ===
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:5:
+     AggregateSpec, MaterializedRelPlanState, OrderDirection, PreparedMaterializedRelPlanTransition,
+     RelExpr, RelQueryError, RelType, RelationDelta, RelationValue, StorageCertifiedRelationDelta,
+ };
+-use kernel_types::{RevisionId, SemanticId};
+ pub use kernel_types::StableRowHandle as PhysicalRowId;
++use kernel_types::{RevisionId, SemanticId};
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct LayoutId(pub u128);
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:485:
+         store: &mut PhysicalStore,
+         plan: &mut MaterializedRelPlanState,
+     ) -> Result<RelationDelta, PhysicalExecutionError> {
+-        let PreparedStoragePlanTransition { storage, plan: prepared_plan, .. } = self;
++        let PreparedStoragePlanTransition {
++            storage,
++            plan: prepared_plan,
++            ..
++        } = self;
+         let (storage_candidate, _) = storage.into_candidate_if_current(store)?;
+         let (plan_candidate, output_delta) = prepared_plan.into_candidate_if_current(plan)?;
+         *store = storage_candidate;
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:577:
+         if self.revision.is_some() {
+             return Err(PhysicalExecutionError::RevisionBoundMutationRequiresPreparedTransition);
+         }
+-        let prepared = self.prepare_relation_delta_certified(
+-            relation, layout, delta, context, registry,
+-        )?;
++        let prepared =
++            self.prepare_relation_delta_certified(relation, layout, delta, context, registry)?;
+         let (candidate, certified) = prepared.into_candidate_if_current(self)?;
+         *self = candidate;
+         Ok(certified)
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:597:
+             return Err(PhysicalExecutionError::RevisionBoundMutationRequiresPreparedTransition);
+         }
+         let mut candidate = self.clone();
+-        let certified_delta = candidate.apply_relation_delta_certified_in_place(
+-            relation, layout, delta, context, registry,
+-        )?;
++        let certified_delta = candidate
++            .apply_relation_delta_certified_in_place(relation, layout, delta, context, registry)?;
+         Ok(PreparedPhysicalStoreTransition {
+             source_epoch: self.transition_epoch,
+             source_revision: None,
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:611:
+ 
+     /// Binds an initialized physical snapshot to the logical revision it represents.
+     /// Semantic mutation of a bound store is allowed only through the joint path.
+-    pub fn bind_revision(
+-        &mut self,
+-        revision: RevisionId,
+-    ) -> Result<(), PhysicalExecutionError> {
++    pub fn bind_revision(&mut self, revision: RevisionId) -> Result<(), PhysicalExecutionError> {
+         match self.revision {
+             Some(current) if current == revision => return Ok(()),
+             Some(_) => return Err(PhysicalExecutionError::RevisionBindingMismatch),
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:651:
+             return Err(PhysicalExecutionError::RevisionBindingMismatch);
+         }
+         let mut candidate = self.clone();
+-        let certified_delta = candidate.apply_relation_delta_certified_in_place(
+-            relation, layout, delta, context, registry,
+-        )?;
++        let certified_delta = candidate
++            .apply_relation_delta_certified_in_place(relation, layout, delta, context, registry)?;
+         candidate.revision = Some(target_revision);
+         Ok(PreparedPhysicalStoreTransition {
+             source_epoch: self.transition_epoch,
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:5846:
+         model
+             .relations
+             .insert(relation, vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
+-        let mut maintained = MaterializedRelPlanState::build(
+-            &RelExpr::Scan(relation),
+-            &model,
+-            &context,
+-            &registry,
+-        )
+-        .unwrap();
++        let mut maintained =
++            MaterializedRelPlanState::build(&RelExpr::Scan(relation), &model, &context, &registry)
++                .unwrap();
+         let mut store = PhysicalStore::default();
+         store
+             .install(
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:5921:
+             )
+             .unwrap();
+         let handles = store.logical_row_handles(relation, binding).unwrap();
+-        maintained.attach_storage_handles(relation, &handles).unwrap();
++        maintained
++            .attach_storage_handles(relation, &handles)
++            .unwrap();
+         let delta = RelationDelta {
+             inserted: vec![vec![Value::I64(3)]],
+             removed: vec![vec![Value::I64(1)]],
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:5942:
+         )
+         .unwrap();
+ 
+-        maintained.attach_storage_handles(relation, &handles).unwrap();
++        maintained
++            .attach_storage_handles(relation, &handles)
++            .unwrap();
+         let store_before_commit = store.clone();
+         let plan_before_commit = maintained.clone();
+         assert_eq!(
+Diff in /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-query/src/lib.rs:2009:
+     }
+ 
+     #[must_use]
+-    fn can_commit_prepared(
+-        &self,
+-        prepared: &PreparedMaterializedRelPlanTransition,
+-    ) -> bool {
++    fn can_commit_prepared(&self, prepared: &PreparedMaterializedRelPlanTransition) -> bool {
+         self == prepared.source_state.as_ref()
+             && self.transition_epoch == prepared.source_epoch
+             && prepared
+=== cargo check --workspace --all-targets ===
+    Checking kernel-types v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-types)
+    Checking kernel-proof v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-proof)
+    Checking kernel-aggregate v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-aggregate)
+    Checking kernel-change v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-change)
+    Checking kernel-lifecycle v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-lifecycle)
+    Checking kernel-schema v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-schema)
+    Checking kernel-identity v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-identity)
+    Checking kernel-retention v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-retention)
+    Checking kernel-fixpoint v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-fixpoint)
+    Checking kernel-model v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-model)
+    Checking kernel-semantics v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-semantics)
+    Checking kernel-lens v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-lens)
+    Checking kernel-query v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-query)
+    Checking kernel-validation v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-validation)
+    Checking kernel-revision v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-revision)
+    Checking kernel-plan v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan)
+    Checking kernel-transport v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-transport)
+    Checking storage-memory v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/storage-memory)
+    Checking kernel-integration v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-integration)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.69s
+=== cargo test --workspace ===
+   Compiling kernel-types v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-types)
+   Compiling kernel-proof v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-proof)
+   Compiling kernel-change v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-change)
+   Compiling kernel-aggregate v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-aggregate)
+   Compiling kernel-schema v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-schema)
+   Compiling kernel-lifecycle v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-lifecycle)
+   Compiling kernel-identity v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-identity)
+   Compiling kernel-model v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-model)
+   Compiling kernel-semantics v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-semantics)
+   Compiling kernel-retention v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-retention)
+   Compiling kernel-lens v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-lens)
+   Compiling kernel-fixpoint v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-fixpoint)
+   Compiling kernel-query v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-query)
+   Compiling kernel-validation v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-validation)
+   Compiling kernel-revision v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-revision)
+   Compiling kernel-plan v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan)
+   Compiling kernel-transport v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-transport)
+   Compiling storage-memory v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/storage-memory)
+   Compiling kernel-integration v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-integration)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.46s
+     Running unittests src/lib.rs (target/debug/deps/kernel_aggregate-d2264bed3c913642)
+
+running 8 tests
+test tests::exact_count_decrement_is_checked_and_demotes_after_big_boundary ... ok
+test tests::catastrophic_cancellation_is_exact_and_order_independent ... ok
+test tests::exact_count_is_mergeable_and_checks_result_range ... ok
+test tests::exact_count_promotes_losslessly_when_small_representation_overflows ... ok
+test tests::exact_f64_sum_removal_is_an_exact_inverse ... ok
+test tests::merge_is_reproducible_across_partitions ... ok
+test tests::non_finite_inputs_are_explicitly_rejected ... ok
+test tests::subnormal_values_sum_exactly ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/kernel_change-0b1a36697ce69fe9)
+
+running 3 tests
+test tests::invalid_splice_is_not_silently_clamped ... ok
+test tests::sequence_splice_has_exact_checked_semantics ... ok
+test tests::set_change_round_trips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/kernel_fixpoint-f6e8ac924546d41c)
+
+running 4 tests
+test tests::checker_rejects_closed_but_nonleast_superset_without_witness ... ok
+test tests::checker_rejects_nonclosed_candidate ... ok
+test tests::solver_emits_checkable_least_fixpoint_certificate ... ok
+test tests::generic_solver_boundary_exposes_only_checked_certificate_after_verification ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/kernel_identity-5c10ec9586fdcb8b)
+
+running 3 tests
+test tests::bijective_transports_form_a_groupoid_under_composition ... ok
+test tests::merge_is_not_identity_transport ... ok
+test tests::split_is_not_identity_transport ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/kernel_integration-9e68b38f56972a8c)
+
+running 1 test
+test tests::vertical_slice_preserves_semantics_across_layers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/kernel_lens-eb4475f3fd2cf50b)
+
+running 2 tests
+test tests::product_field_lens_preserves_complement_and_laws ... ok
+test tests::composed_lens_is_lawful ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/kernel_lifecycle-06f3d3e17656cc6a)
+
+running 5 tests
+test tests::contradictory_fact_edits_are_typed_conflicts ... ok
+test tests::merge_composes_intents_before_gc ... ok
+test tests::non_conflicting_intent_merge_is_commutative ... ok
+test tests::normalization_is_idempotent ... ok
+test tests::exhaustive_small_graphs_normalize_idempotently ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/kernel_model-87536bc784d890dd)
+
+running 5 tests
+test tests::historical_identity_may_outlive_entity ... ok
+test tests::structural_values_are_identity_free_until_reference_is_explicit ... ok
+test tests::set_and_map_equality_are_explicit_semantic_inputs ... ok
+test tests::normalization_removes_dead_entities_from_carriers_and_owned_fields ... ok
+test tests::surviving_entity_cannot_keep_dangling_live_reference ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/kernel_plan-e8b0f3c3981e9186)
+
+running 53 tests
+test tests::baseline_choices_are_explicit_and_contain_no_opaque_operator_variant ... ok
+test tests::baseline_lowering_is_exact_round_trip_for_every_operator_shape ... ok
+test tests::adaptive_indexed_join_falls_back_for_non_i64_columnar_keys ... ok
+test tests::atomic_relation_delta_updates_relation_and_persisted_index_together ... ok
+test tests::columnar_join_selects_indexed_i64_path_and_preserves_bag_multiplicity ... ok
+test tests::dense_slot_delete_repairs_only_the_swapped_row_position ... ok
+test tests::compositional_typed_batch_chain_handles_nested_filters_projects_and_bag_promotion ... ok
+test tests::competing_prepared_transitions_from_same_revision_cannot_both_commit ... ok
+test tests::generation_exhaustion_is_rejected_before_any_relation_mutation ... ok
+test tests::generational_slots_reuse_metadata_without_reviving_stale_handles ... ok
+test tests::invalid_relation_delta_is_rejected_before_relation_or_index_mutation ... ok
+test tests::failed_plan_prepare_does_not_publish_prepared_storage_candidate ... ok
+test tests::indexed_i64_join_project_fuses_without_materializing_full_join_rows ... ok
+test tests::lowering_checker_rejects_a_plan_that_changes_logical_meaning ... ok
+test tests::joint_prepare_rejects_same_source_and_target_revision_without_mutation ... ok
+test tests::lowering_crosses_the_generic_checked_certificate_boundary ... ok
+test tests::lowering_preserves_native_relation_layout_without_forced_conversion_node ... ok
+test tests::maintained_i64_index_matches_fresh_rebuild_across_bag_delta_sequence ... ok
+test tests::mixed_typed_columnar_rejects_shape_and_schema_mismatch ... ok
+test tests::mixed_typed_columnar_covers_all_scalar_carriers_and_matches_logical_reference ... ok
+test tests::mixed_typed_predicate_kernels_cover_every_scalar_carrier ... ok
+test tests::native_columnar_filter_project_matches_logical_reference_without_full_row_materialization ... ok
+test tests::native_distinct_matches_logical_reference ... ok
+test tests::native_group_count_matches_logical_reference_including_empty_global_group ... ok
+test tests::native_group_exact_f64_sum_matches_logical_reference ... ok
+test tests::native_nested_loop_join_matches_logical_reference ... ok
+test tests::native_row_store_filter_project_matches_logical_reference ... ok
+test tests::native_runtime_refuses_layout_family_mismatch ... ok
+test tests::native_top_k_with_ties_matches_logical_reference ... ok
+test tests::persisted_i64_index_is_reused_and_maintained_by_relation_delta ... ok
+test tests::prepared_plan_preserves_catalog_layout_after_typecheck ... ok
+test tests::prepared_plan_reference_execution_rejects_semantic_context_drift ... ok
+test tests::prepared_plan_requires_logical_typecheck_before_lowering ... ok
+test tests::reinstalling_physical_relation_invalidates_persisted_i64_index ... ok
+test tests::prepared_storage_transition_rejects_different_same_epoch_same_revision_store ... ok
+test tests::revision_bound_states_reject_legacy_semantic_mutation_entrypoints ... ok
+test tests::revision_mismatch_during_joint_prepare_leaves_both_live_states_unchanged ... ok
+test tests::sequential_joint_transitions_carry_revision_and_stable_handles_forward ... ok
+test tests::stable_row_handles_survive_position_shifts_without_payload_aliasing ... ok
+test tests::storage_certified_delta_updates_recursive_scan_without_semantic_relookup ... ok
+test tests::storage_epoch_change_makes_joint_transition_stale_before_plan_swap ... ok
+test tests::typed_batch_chain_preserves_logical_order_after_physical_swap_remove ... ok
+test tests::typed_batch_dag_keeps_join_filter_project_unmaterialized_until_output ... ok
+test tests::typed_i64_columnar_matches_generic_columnar_and_logical_reference ... ok
+test tests::typed_i64_columnar_rejects_non_i64_schema ... ok
+test tests::typed_stateful_distinct_and_group_preserve_text_ci_semantics ... ok
+test tests::typed_stateful_distinct_consumes_batch_selection_without_full_input_rows ... ok
+test tests::typed_stateful_group_count_consumes_filtered_projected_batch_selection ... ok
+test tests::typed_stateful_group_exact_f64_sum_reads_only_group_key_and_aggregate_column ... ok
+test tests::high_churn_slot_metadata_is_bounded_by_peak_live_rows ... ok
+test tests::typed_stateful_top_k_with_ties_sorts_positions_before_materializing_rows ... ok
+test tests::joint_prepare_is_invisible_until_commit_and_then_publishes_both_states ... FAILED
+test tests::stale_joint_transition_is_rejected_before_either_participant_is_swapped ... FAILED
+
+failures:
+
+---- tests::joint_prepare_is_invisible_until_commit_and_then_publishes_both_states stdout ----
+
+thread 'tests::joint_prepare_is_invisible_until_commit_and_then_publishes_both_states' (8898) panicked at crates/kernel-plan/src/lib.rs:5832:9:
+assertion `left == right` failed
+  left: [[I64(3)], [I64(2)], [I64(4)]]
+ right: [[I64(2)], [I64(3)], [I64(4)]]
+stack backtrace:
+   0:     0x5615dc0c4f41 - std[6c98fd8553dbae28]::backtrace_rs::backtrace::libunwind::trace
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1:     0x5615dc0c4f41 - std[6c98fd8553dbae28]::backtrace_rs::backtrace::trace_unsynchronized::<std[6c98fd8553dbae28]::sys::backtrace::_print_fmt::{closure#1}>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2:     0x5615dc0c4f41 - std[6c98fd8553dbae28]::sys::backtrace::_print_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:74:9
+   3:     0x5615dc0c4f41 - <<std[6c98fd8553dbae28]::sys::backtrace::BacktraceLock>::print::DisplayBacktrace as core[c0acaeba6ab4c2e0]::fmt::Display>::fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:44:26
+   4:     0x5615dc0d9cda - <core[c0acaeba6ab4c2e0]::fmt::rt::Argument>::fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/fmt/rt.rs:152:76
+   5:     0x5615dc0d9cda - core[c0acaeba6ab4c2e0]::fmt::write
+   6:     0x5615dc0c93fc - std[6c98fd8553dbae28]::io::default_write_fmt::<alloc[12e961f32105355]::vec::Vec<u8>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/io/mod.rs:626:11
+   7:     0x5615dc0c93fc - <alloc[12e961f32105355]::vec::Vec<u8> as std[6c98fd8553dbae28]::io::Write>::write_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/io/mod.rs:1730:13
+   8:     0x5615dc0a3666 - <std[6c98fd8553dbae28]::sys::backtrace::BacktraceLock>::print
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:47:9
+   9:     0x5615dc0a3666 - std[6c98fd8553dbae28]::panicking::default_hook::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:292:27
+  10:     0x5615dc0bd169 - std[6c98fd8553dbae28]::panicking::default_hook
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:316:9
+  11:     0x5615dbee65d0 - <alloc[12e961f32105355]::boxed::Box<dyn for<'a, 'b> core[c0acaeba6ab4c2e0]::ops::function::Fn<(&'a std[6c98fd8553dbae28]::panic::PanicHookInfo<'b>,), Output = ()> + core[c0acaeba6ab4c2e0]::marker::Send + core[c0acaeba6ab4c2e0]::marker::Sync> as core[c0acaeba6ab4c2e0]::ops::function::Fn<(&std[6c98fd8553dbae28]::panic::PanicHookInfo,)>>::call
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2333:9
+  12:     0x5615dbee65d0 - test[69f9176bb4e5faed]::test_main_inner::<test[69f9176bb4e5faed]::test_main_static::{closure#0}>::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:155:21
+  13:     0x5615dc0bd322 - <alloc[12e961f32105355]::boxed::Box<dyn for<'a, 'b> core[c0acaeba6ab4c2e0]::ops::function::Fn<(&'a std[6c98fd8553dbae28]::panic::PanicHookInfo<'b>,), Output = ()> + core[c0acaeba6ab4c2e0]::marker::Send + core[c0acaeba6ab4c2e0]::marker::Sync> as core[c0acaeba6ab4c2e0]::ops::function::Fn<(&std[6c98fd8553dbae28]::panic::PanicHookInfo,)>>::call
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2333:9
+  14:     0x5615dc0bd322 - std[6c98fd8553dbae28]::panicking::panic_with_hook
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:823:13
+  15:     0x5615dc0a3712 - std[6c98fd8553dbae28]::panicking::panic_handler::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:688:13
+  16:     0x5615dc0988d9 - std[6c98fd8553dbae28]::sys::backtrace::__rust_end_short_backtrace::<std[6c98fd8553dbae28]::panicking::panic_handler::{closure#0}, !>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:182:18
+  17:     0x5615dc0a430d - __rustc[100742bb89c490cb]::rust_begin_unwind
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:679:5
+  18:     0x5615dc0da46c - core[c0acaeba6ab4c2e0]::panicking::panic_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panicking.rs:80:14
+  19:     0x5615dc0da323 - core[c0acaeba6ab4c2e0]::panicking::assert_failed_inner
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panicking.rs:439:17
+  20:     0x5615dbe9ba8a - core[c0acaeba6ab4c2e0]::panicking::assert_failed::<&[alloc[12e961f32105355]::vec::Vec<kernel_model[3f7a228163a17a5]::Value>], &[alloc[12e961f32105355]::vec::Vec<kernel_model[3f7a228163a17a5]::Value>]>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panicking.rs:394:5
+  21:     0x5615dbe37e05 - kernel_plan[8631e75308df1d82]::tests::joint_prepare_is_invisible_until_commit_and_then_publishes_both_states
+                               at /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:5832:9
+  22:     0x5615dbda4587 - kernel_plan[8631e75308df1d82]::tests::joint_prepare_is_invisible_until_commit_and_then_publishes_both_states::{closure#0}
+                               at /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:5751:80
+  23:     0x5615dbdb1736 - <kernel_plan[8631e75308df1d82]::tests::joint_prepare_is_invisible_until_commit_and_then_publishes_both_states::{closure#0} as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250:5
+  24:     0x5615dbed990b - <fn() -> core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String> as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250:5
+  25:     0x5615dbed990b - test[69f9176bb4e5faed]::__rust_begin_short_backtrace::<core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>, fn() -> core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:724:18
+  26:     0x5615dbee6f55 - test[69f9176bb4e5faed]::run_test_in_process::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:747:74
+  27:     0x5615dbee6f55 - <core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<test[69f9176bb4e5faed]::run_test_in_process::{closure#0}> as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275:9
+  28:     0x5615dbee6f55 - std[6c98fd8553dbae28]::panicking::catch_unwind::do_call::<core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<test[69f9176bb4e5faed]::run_test_in_process::{closure#0}>, core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576:43
+  29:     0x5615dbee6f55 - std[6c98fd8553dbae28]::panicking::catch_unwind::<core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>, core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<test[69f9176bb4e5faed]::run_test_in_process::{closure#0}>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544:19
+  30:     0x5615dbee6f55 - std[6c98fd8553dbae28]::panic::catch_unwind::<core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<test[69f9176bb4e5faed]::run_test_in_process::{closure#0}>, core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359:14
+  31:     0x5615dbee6f55 - test[69f9176bb4e5faed]::run_test_in_process
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:747:27
+  32:     0x5615dbee6f55 - test[69f9176bb4e5faed]::run_test::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:668:43
+  33:     0x5615dbee0904 - test[69f9176bb4e5faed]::run_test::{closure#1}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:698:41
+  34:     0x5615dbee0904 - std[6c98fd8553dbae28]::sys::backtrace::__rust_begin_short_backtrace::<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166:18
+  35:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked::<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70:13
+  36:     0x5615dbeea0a2 - <core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}> as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275:9
+  37:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::panicking::catch_unwind::do_call::<core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>, ()>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576:43
+  38:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::panicking::catch_unwind::<(), core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544:19
+  39:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::panic::catch_unwind::<core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>, ()>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359:14
+  40:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked::<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:68:26
+  41:     0x5615dbeea0a2 - <std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1} as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250:5
+  42:     0x5615dc0c47cf - <alloc[12e961f32105355]::boxed::Box<dyn core[c0acaeba6ab4c2e0]::ops::function::FnOnce<(), Output = ()> + core[c0acaeba6ab4c2e0]::marker::Send> as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2319:9
+  43:     0x5615dc0c47cf - <std[6c98fd8553dbae28]::sys::thread::unix::Thread>::new::thread_start
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/thread/unix.rs:123:17
+  44:     0x7f31a036eb7b - <unknown>
+  45:     0x7f31a03ec7f8 - <unknown>
+  46:                0x0 - <unknown>
+
+---- tests::stale_joint_transition_is_rejected_before_either_participant_is_swapped stdout ----
+
+thread 'tests::stale_joint_transition_is_rejected_before_either_participant_is_swapped' (8925) panicked at crates/kernel-plan/src/lib.rs:5948:9:
+assertion `left == right` failed
+  left: Err(Query(StalePreparedTransition))
+ right: Err(StalePreparedTransition)
+stack backtrace:
+   0:     0x5615dc0c4f41 - std[6c98fd8553dbae28]::backtrace_rs::backtrace::libunwind::trace
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1:     0x5615dc0c4f41 - std[6c98fd8553dbae28]::backtrace_rs::backtrace::trace_unsynchronized::<std[6c98fd8553dbae28]::sys::backtrace::_print_fmt::{closure#1}>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2:     0x5615dc0c4f41 - std[6c98fd8553dbae28]::sys::backtrace::_print_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:74:9
+   3:     0x5615dc0c4f41 - <<std[6c98fd8553dbae28]::sys::backtrace::BacktraceLock>::print::DisplayBacktrace as core[c0acaeba6ab4c2e0]::fmt::Display>::fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:44:26
+   4:     0x5615dc0d9cda - <core[c0acaeba6ab4c2e0]::fmt::rt::Argument>::fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/fmt/rt.rs:152:76
+   5:     0x5615dc0d9cda - core[c0acaeba6ab4c2e0]::fmt::write
+   6:     0x5615dc0c93fc - std[6c98fd8553dbae28]::io::default_write_fmt::<alloc[12e961f32105355]::vec::Vec<u8>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/io/mod.rs:626:11
+   7:     0x5615dc0c93fc - <alloc[12e961f32105355]::vec::Vec<u8> as std[6c98fd8553dbae28]::io::Write>::write_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/io/mod.rs:1730:13
+   8:     0x5615dc0a3666 - <std[6c98fd8553dbae28]::sys::backtrace::BacktraceLock>::print
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:47:9
+   9:     0x5615dc0a3666 - std[6c98fd8553dbae28]::panicking::default_hook::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:292:27
+  10:     0x5615dc0bd169 - std[6c98fd8553dbae28]::panicking::default_hook
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:316:9
+  11:     0x5615dbee65d0 - <alloc[12e961f32105355]::boxed::Box<dyn for<'a, 'b> core[c0acaeba6ab4c2e0]::ops::function::Fn<(&'a std[6c98fd8553dbae28]::panic::PanicHookInfo<'b>,), Output = ()> + core[c0acaeba6ab4c2e0]::marker::Send + core[c0acaeba6ab4c2e0]::marker::Sync> as core[c0acaeba6ab4c2e0]::ops::function::Fn<(&std[6c98fd8553dbae28]::panic::PanicHookInfo,)>>::call
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2333:9
+  12:     0x5615dbee65d0 - test[69f9176bb4e5faed]::test_main_inner::<test[69f9176bb4e5faed]::test_main_static::{closure#0}>::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:155:21
+  13:     0x5615dc0bd322 - <alloc[12e961f32105355]::boxed::Box<dyn for<'a, 'b> core[c0acaeba6ab4c2e0]::ops::function::Fn<(&'a std[6c98fd8553dbae28]::panic::PanicHookInfo<'b>,), Output = ()> + core[c0acaeba6ab4c2e0]::marker::Send + core[c0acaeba6ab4c2e0]::marker::Sync> as core[c0acaeba6ab4c2e0]::ops::function::Fn<(&std[6c98fd8553dbae28]::panic::PanicHookInfo,)>>::call
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2333:9
+  14:     0x5615dc0bd322 - std[6c98fd8553dbae28]::panicking::panic_with_hook
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:823:13
+  15:     0x5615dc0a3712 - std[6c98fd8553dbae28]::panicking::panic_handler::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:688:13
+  16:     0x5615dc0988d9 - std[6c98fd8553dbae28]::sys::backtrace::__rust_end_short_backtrace::<std[6c98fd8553dbae28]::panicking::panic_handler::{closure#0}, !>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:182:18
+  17:     0x5615dc0a430d - __rustc[100742bb89c490cb]::rust_begin_unwind
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:679:5
+  18:     0x5615dc0da46c - core[c0acaeba6ab4c2e0]::panicking::panic_fmt
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panicking.rs:80:14
+  19:     0x5615dc0da323 - core[c0acaeba6ab4c2e0]::panicking::assert_failed_inner
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panicking.rs:439:17
+  20:     0x5615dbe9b2f2 - core[c0acaeba6ab4c2e0]::panicking::assert_failed::<core[c0acaeba6ab4c2e0]::result::Result<kernel_query[26879d1a68b0a6fe]::RelationDelta, kernel_plan[8631e75308df1d82]::PhysicalExecutionError>, core[c0acaeba6ab4c2e0]::result::Result<kernel_query[26879d1a68b0a6fe]::RelationDelta, kernel_plan[8631e75308df1d82]::PhysicalExecutionError>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panicking.rs:394:5
+  21:     0x5615dbe413a0 - kernel_plan[8631e75308df1d82]::tests::stale_joint_transition_is_rejected_before_either_participant_is_swapped
+                               at /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:5948:9
+  22:     0x5615dbda4647 - kernel_plan[8631e75308df1d82]::tests::stale_joint_transition_is_rejected_before_either_participant_is_swapped::{closure#0}
+                               at /mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan/src/lib.rs:5902:81
+  23:     0x5615dbdb1836 - <kernel_plan[8631e75308df1d82]::tests::stale_joint_transition_is_rejected_before_either_participant_is_swapped::{closure#0} as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250:5
+  24:     0x5615dbed990b - <fn() -> core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String> as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250:5
+  25:     0x5615dbed990b - test[69f9176bb4e5faed]::__rust_begin_short_backtrace::<core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>, fn() -> core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:724:18
+  26:     0x5615dbee6f55 - test[69f9176bb4e5faed]::run_test_in_process::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:747:74
+  27:     0x5615dbee6f55 - <core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<test[69f9176bb4e5faed]::run_test_in_process::{closure#0}> as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275:9
+  28:     0x5615dbee6f55 - std[6c98fd8553dbae28]::panicking::catch_unwind::do_call::<core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<test[69f9176bb4e5faed]::run_test_in_process::{closure#0}>, core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576:43
+  29:     0x5615dbee6f55 - std[6c98fd8553dbae28]::panicking::catch_unwind::<core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>, core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<test[69f9176bb4e5faed]::run_test_in_process::{closure#0}>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544:19
+  30:     0x5615dbee6f55 - std[6c98fd8553dbae28]::panic::catch_unwind::<core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<test[69f9176bb4e5faed]::run_test_in_process::{closure#0}>, core[c0acaeba6ab4c2e0]::result::Result<(), alloc[12e961f32105355]::string::String>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359:14
+  31:     0x5615dbee6f55 - test[69f9176bb4e5faed]::run_test_in_process
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:747:27
+  32:     0x5615dbee6f55 - test[69f9176bb4e5faed]::run_test::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:668:43
+  33:     0x5615dbee0904 - test[69f9176bb4e5faed]::run_test::{closure#1}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/test/src/lib.rs:698:41
+  34:     0x5615dbee0904 - std[6c98fd8553dbae28]::sys::backtrace::__rust_begin_short_backtrace::<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166:18
+  35:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked::<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70:13
+  36:     0x5615dbeea0a2 - <core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}> as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275:9
+  37:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::panicking::catch_unwind::do_call::<core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>, ()>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576:43
+  38:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::panicking::catch_unwind::<(), core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544:19
+  39:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::panic::catch_unwind::<core[c0acaeba6ab4c2e0]::panic::unwind_safe::AssertUnwindSafe<std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>, ()>
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359:14
+  40:     0x5615dbeea0a2 - std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked::<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:68:26
+  41:     0x5615dbeea0a2 - <std[6c98fd8553dbae28]::thread::lifecycle::spawn_unchecked<test[69f9176bb4e5faed]::run_test::{closure#1}, ()>::{closure#1} as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250:5
+  42:     0x5615dc0c47cf - <alloc[12e961f32105355]::boxed::Box<dyn core[c0acaeba6ab4c2e0]::ops::function::FnOnce<(), Output = ()> + core[c0acaeba6ab4c2e0]::marker::Send> as core[c0acaeba6ab4c2e0]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2319:9
+  43:     0x5615dc0c47cf - <std[6c98fd8553dbae28]::sys::thread::unix::Thread>::new::thread_start
+                               at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/thread/unix.rs:123:17
+  44:     0x7f31a036eb7b - <unknown>
+  45:     0x7f31a03ec7f8 - <unknown>
+  46:                0x0 - <unknown>
+
+
+failures:
+    tests::joint_prepare_is_invisible_until_commit_and_then_publishes_both_states
+    tests::stale_joint_transition_is_rejected_before_either_participant_is_swapped
+
+test result: FAILED. 51 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p kernel-plan --lib`
+=== cargo clippy --workspace --all-targets -- -D warnings ===
+    Checking kernel-types v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-types)
+    Checking kernel-proof v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-proof)
+    Checking kernel-aggregate v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-aggregate)
+    Checking kernel-change v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-change)
+    Checking kernel-lifecycle v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-lifecycle)
+    Checking kernel-schema v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-schema)
+    Checking kernel-identity v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-identity)
+    Checking kernel-retention v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-retention)
+    Checking kernel-fixpoint v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-fixpoint)
+    Checking kernel-model v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-model)
+    Checking kernel-semantics v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-semantics)
+    Checking kernel-lens v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-lens)
+    Checking kernel-query v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-query)
+    Checking kernel-validation v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-validation)
+    Checking kernel-revision v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-revision)
+    Checking kernel-plan v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-plan)
+    Checking kernel-transport v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/kernel-transport)
+    Checking storage-memory v0.1.0 (/mnt/data/cfmd_pass28_work/cfmd_workspace_pass28/crates/storage-memory)
+error: this function has too many arguments (8/7)
+   --> crates/kernel-plan/src/lib.rs:637:5
+    |
+637 | /     fn prepare_relation_delta_certified_for_revision(
+638 | |         &self,
+639 | |         source_revision: RevisionId,
+640 | |         target_revision: RevisionId,
+...   |
+645 | |         registry: &kernel_semantics::SemanticRegistry,
+646 | |     ) -> Result<PreparedPhysicalStoreTransition, PhysicalExecutionError> {
+    | |________________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+    = note: `-D clippy::too-many-arguments` implied by `-D clippy::all`
+    = help: to override `-D clippy::all` add `#[allow(clippy::too_many_arguments)]`
+
+error: this function has too many arguments (9/7)
+   --> crates/kernel-plan/src/lib.rs:772:1
+    |
+772 | / pub fn prepare_storage_plan_transition(
+773 | |     store: &PhysicalStore,
+774 | |     plan: &MaterializedRelPlanState,
+775 | |     source_revision: RevisionId,
+...   |
+781 | |     registry: &kernel_semantics::SemanticRegistry,
+782 | | ) -> Result<PreparedStoragePlanTransition, PhysicalExecutionError> {
+    | |__________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+
+error: could not compile `kernel-plan` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...

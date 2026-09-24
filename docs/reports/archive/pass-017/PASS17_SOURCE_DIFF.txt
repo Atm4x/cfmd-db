@@ -1,0 +1,220 @@
+diff -ru --exclude target --exclude 'PASS17*' --exclude 'IMPLEMENTATION_REPORT*' --exclude CFMD_IDEAL_DB_SPEC.md /mnt/data/cfmd_workspace_pass17/cfmd_workspace_pass16/crates/kernel-plan/src/lib.rs /mnt/data/cfmd_workspace_pass17/work/crates/kernel-plan/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass17/cfmd_workspace_pass16/crates/kernel-plan/src/lib.rs	2026-09-19 13:21:05.000000000 +0000
++++ /mnt/data/cfmd_workspace_pass17/work/crates/kernel-plan/src/lib.rs	2026-09-19 13:44:57.107540343 +0000
+@@ -199,9 +199,76 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct PhysicalRowId(pub usize);
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct InstalledRelation {
++    data: NativeRelation,
++    row_ids: Vec<PhysicalRowId>,
++    positions: Vec<Option<usize>>,
++    positions_are_identity: bool,
++}
++
++impl InstalledRelation {
++    fn new(data: NativeRelation) -> Self {
++        let row_count = native_row_count(&data);
++        let mut row_ids = Vec::with_capacity(row_count);
++        let mut positions = Vec::with_capacity(row_count);
++        for index in 0..row_count {
++            row_ids.push(PhysicalRowId(index));
++            positions.push(Some(index));
++        }
++        Self {
++            data,
++            row_ids,
++            positions,
++            positions_are_identity: true,
++        }
++    }
++
++    fn row_id_at(&self, index: usize) -> Result<PhysicalRowId, PhysicalExecutionError> {
++        self.row_ids
++            .get(index)
++            .copied()
++            .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
++    }
++
++    fn position(&self, id: PhysicalRowId) -> Option<usize> {
++        if self.positions_are_identity {
++            return (id.0 < self.row_ids.len()).then_some(id.0);
++        }
++        self.positions.get(id.0).copied().flatten()
++    }
++
++    fn remove_row(&mut self, index: usize) -> Result<PhysicalRowId, PhysicalExecutionError> {
++        let id = self.row_id_at(index)?;
++        remove_native_row(&mut self.data, index)?;
++        self.row_ids.remove(index);
++        self.positions_are_identity = false;
++        self.positions[id.0] = None;
++        for (position, row_id) in self.row_ids.iter().copied().enumerate().skip(index) {
++            self.positions[row_id.0] = Some(position);
++        }
++        Ok(id)
++    }
++
++    fn push_row(
++        &mut self,
++        row: &kernel_query::Row,
++    ) -> Result<PhysicalRowId, PhysicalExecutionError> {
++        push_native_row(&mut self.data, row)?;
++        let id = PhysicalRowId(self.positions.len());
++        let position = self.row_ids.len();
++        self.row_ids.push(id);
++        self.positions.push(Some(position));
++        Ok(id)
++    }
++}
++
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+ pub struct PhysicalStore {
+-    relations: BTreeMap<(SemanticId, LayoutId), NativeRelation>,
++    relations: BTreeMap<(SemanticId, LayoutId), InstalledRelation>,
+     i64_indexes: BTreeMap<I64IndexBinding, MaterializedI64IndexState>,
+ }
+ 
+@@ -225,7 +292,8 @@
+         if !family_matches {
+             return Err(PhysicalExecutionError::LayoutFamilyMismatch);
+         }
+-        self.relations.insert((relation, binding.id), data);
++        self.relations
++            .insert((relation, binding.id), InstalledRelation::new(data));
+         self.i64_indexes
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+         Ok(())
+@@ -237,26 +305,12 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+-        let data = self.get(index.relation, index.layout)?;
+-        let state = MaterializedI64IndexState::build(index, data, context, registry)?;
++        let relation = self.installed(index.relation, index.layout)?;
++        let state = MaterializedI64IndexState::build(index, relation, context, registry)?;
+         self.i64_indexes.insert(index, state);
+         Ok(())
+     }
+ 
+-    pub fn maintain_i64_index_delta(
+-        &mut self,
+-        index: I64IndexBinding,
+-        delta: &RelationDelta,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<(), PhysicalExecutionError> {
+-        let state = self
+-            .i64_indexes
+-            .get_mut(&index)
+-            .ok_or(PhysicalExecutionError::MissingPhysicalIndex)?;
+-        state.apply_delta(delta, context, registry)
+-    }
+-
+     /// Atomically applies a semantic relation delta to the installed physical relation and to
+     /// every persisted I64 index bound to that exact relation/layout. All updates are prepared on
+     /// clones first; an inconsistent delta leaves both relation and indexes unchanged.
+@@ -275,13 +329,14 @@
+                 layout: layout.id,
+             },
+         )?;
+-        apply_native_relation_delta(&mut next_relation, relation, delta, context, registry)?;
++        let physical_delta =
++            apply_installed_relation_delta(&mut next_relation, relation, delta, context, registry)?;
+ 
+         let mut next_indexes = Vec::new();
+         for (binding, state) in &self.i64_indexes {
+             if binding.relation == relation && binding.layout.id == layout.id {
+                 let mut next_state = state.clone();
+-                next_state.apply_delta(delta, context, registry)?;
++                next_state.apply_physical_delta(&physical_delta)?;
+                 next_indexes.push((*binding, next_state));
+             }
+         }
+@@ -297,11 +352,11 @@
+         self.i64_indexes.get(&index)
+     }
+ 
+-    fn get(
++    fn installed(
+         &self,
+         relation: SemanticId,
+         binding: LayoutBinding,
+-    ) -> Result<&NativeRelation, PhysicalExecutionError> {
++    ) -> Result<&InstalledRelation, PhysicalExecutionError> {
+         self.relations.get(&(relation, binding.id)).ok_or(
+             PhysicalExecutionError::MissingPhysicalRelation {
+                 relation,
+@@ -309,19 +364,33 @@
+             },
+         )
+     }
++
++    fn get(
++        &self,
++        relation: SemanticId,
++        binding: LayoutBinding,
++    ) -> Result<&NativeRelation, PhysicalExecutionError> {
++        Ok(&self.installed(relation, binding)?.data)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct PhysicalRelationDelta {
++    removed: Vec<(PhysicalRowId, kernel_query::Row)>,
++    inserted: Vec<(PhysicalRowId, kernel_query::Row)>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct MaterializedI64IndexState {
+     binding: I64IndexBinding,
+     result_type: RelType,
+-    buckets: BTreeMap<i64, Vec<kernel_query::Row>>,
++    buckets: BTreeMap<i64, Vec<PhysicalRowId>>,
+ }
+ 
+ impl MaterializedI64IndexState {
+-    pub fn build(
++    fn build(
+         binding: I64IndexBinding,
+-        data: &NativeRelation,
++        relation: &InstalledRelation,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, PhysicalExecutionError> {
+@@ -344,14 +413,15 @@
+         ) {
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+         }
+-        validate_indexable_i64_relation(context, binding.relation, data)?;
+-        let keys = native_i64_column(data, binding.key_column)
++        validate_indexable_i64_relation(context, binding.relation, &relation.data)?;
++        let keys = native_i64_column(&relation.data, binding.key_column)
+             .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
+-        let mut buckets: BTreeMap<i64, Vec<kernel_query::Row>> = BTreeMap::new();
++        let mut buckets: BTreeMap<i64, Vec<PhysicalRowId>> = BTreeMap::new();
+         for (row_index, key) in keys.iter().copied().enumerate() {
+-            let mut row = Vec::with_capacity(native_column_count(data));
+-            append_native_row_values(&mut row, data, row_index)?;
+-            buckets.entry(key).or_default().push(row);
++            buckets
++                .entry(key)
++                .or_default()
++                .push(relation.row_id_at(row_index)?);
+         }
+         Ok(Self {
+             binding,
+@@ -365,28 +435,15 @@
+         self.buckets.values().map(Vec::len).sum()
+     }
+ 
+-    fn probe(&self, key: i64) -> Option<&[kernel_query::Row]> {
++    fn probe(&self, key: i64) -> Option<&[PhysicalRowId]> {
+         self.buckets.get(&key).map(Vec::as_slice)
+     }
+ 
+-    pub fn apply_delta(

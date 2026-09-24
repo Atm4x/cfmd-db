@@ -1,0 +1,1436 @@
+diff -ruN /mnt/data/cfmd_workspace_pass44/crates/kernel-plan/src/lib.rs /mnt/data/cfmd_workspace_pass45/crates/kernel-plan/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass44/crates/kernel-plan/src/lib.rs	2026-09-20 11:56:17.830730135 +0000
++++ /mnt/data/cfmd_workspace_pass45/crates/kernel-plan/src/lib.rs	2026-09-20 12:19:51.828025371 +0000
+@@ -3416,6 +3416,43 @@
+ 
+ impl SemanticAccessCostModel {
+     #[must_use]
++    pub const fn join_scan_work(left_rows: usize, right_rows: usize) -> usize {
++        left_rows.saturating_mul(right_rows)
++    }
++
++    #[must_use]
++    pub const fn persisted_join_work(
++        left_rows: usize,
++        right_rows: usize,
++        right_distinct_keys: usize,
++    ) -> usize {
++        if left_rows == 0 || right_rows == 0 || right_distinct_keys == 0 {
++            return 0;
++        }
++        let average_bucket = right_rows.div_ceil(right_distinct_keys);
++        left_rows.saturating_mul(1_usize.saturating_add(average_bucket))
++    }
++
++    #[must_use]
++    pub const fn ephemeral_join_work(
++        left_rows: usize,
++        right_rows: usize,
++        right_distinct_keys: usize,
++        key_parts: usize,
++    ) -> usize {
++        if left_rows == 0 || right_rows == 0 || right_distinct_keys == 0 {
++            return 0;
++        }
++        let key_parts = if key_parts == 0 { 1 } else { key_parts };
++        let build_work = right_rows.saturating_mul(key_parts);
++        build_work.saturating_add(Self::persisted_join_work(
++            left_rows,
++            right_rows,
++            right_distinct_keys,
++        ))
++    }
++
++    #[must_use]
+     pub const fn choose_filter(row_count: usize, matching_rows: usize) -> SemanticAccessPath {
+         let scan_work = row_count;
+         let index_work = 1_usize.saturating_add(matching_rows);
+@@ -3435,9 +3472,8 @@
+         if left_rows == 0 || right_rows == 0 || right_distinct_keys == 0 {
+             return SemanticAccessPath::PersistedIndex;
+         }
+-        let nested_work = left_rows.saturating_mul(right_rows);
+-        let average_bucket = right_rows.div_ceil(right_distinct_keys);
+-        let indexed_work = left_rows.saturating_mul(1_usize.saturating_add(average_bucket));
++        let nested_work = Self::join_scan_work(left_rows, right_rows);
++        let indexed_work = Self::persisted_join_work(left_rows, right_rows, right_distinct_keys);
+         if indexed_work < nested_work {
+             SemanticAccessPath::PersistedIndex
+         } else {
+@@ -3455,12 +3491,9 @@
+         if left_rows == 0 || right_rows == 0 || right_distinct_keys == 0 {
+             return SemanticAccessPath::PersistedIndex;
+         }
+-        let nested_work = left_rows.saturating_mul(right_rows);
+-        let key_parts = if key_parts == 0 { 1 } else { key_parts };
+-        let build_work = right_rows.saturating_mul(key_parts);
+-        let average_bucket = right_rows.div_ceil(right_distinct_keys);
+-        let indexed_work = build_work
+-            .saturating_add(left_rows.saturating_mul(1_usize.saturating_add(average_bucket)));
++        let nested_work = Self::join_scan_work(left_rows, right_rows);
++        let indexed_work =
++            Self::ephemeral_join_work(left_rows, right_rows, right_distinct_keys, key_parts);
+         if indexed_work < nested_work {
+             SemanticAccessPath::PersistedIndex
+         } else {
+@@ -4048,6 +4081,81 @@
+     projected: bool,
+ }
+ 
++enum JoinBatchIndex<'a> {
++    Persisted(&'a MaterializedI64IndexState),
++    Ephemeral(BTreeMap<i64, Vec<usize>>),
++    FullScan,
++}
++
++fn select_join_batch_index<'a>(
++    program: &IndexedJoinBatchProgram<'a>,
++    store: &'a PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Option<JoinBatchIndex<'a>>, PhysicalExecutionError> {
++    let left_keys = program
++        .left_columns
++        .get(program.left_key_column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    let right_keys = program
++        .right_columns
++        .get(program.right_key_column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    let decision = right_scan_join_access_decision(
++        RightJoinAccessRequest {
++            left_rows: left_keys.len(),
++            right_relation: program.right_relation,
++            right_layout: program.right_layout,
++            right_column: program.right_key_column,
++            equivalence: program.equivalence,
++            allow_ephemeral: true,
++        },
++        store,
++        context,
++        registry,
++    )?;
++    match decision.family {
++        JoinAccessFamily::PersistedI64 => {
++            let index = store
++                .i64_index(I64IndexBinding {
++                    relation: program.right_relation,
++                    layout: program.right_layout,
++                    key_column: program.right_key_column,
++                    equivalence: program.equivalence,
++                })
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
++            Ok(Some(JoinBatchIndex::Persisted(index)))
++        }
++        JoinAccessFamily::EphemeralI64 => {
++            let mut index = BTreeMap::<i64, Vec<usize>>::new();
++            for position in program.right.scan_positions() {
++                index
++                    .entry(right_keys[position])
++                    .or_default()
++                    .push(position);
++            }
++            stats.ephemeral_index_builds = stats.ephemeral_index_builds.saturating_add(1);
++            stats.scanned_rows = stats.scanned_rows.saturating_add(right_keys.len());
++            stats.values_read = stats.values_read.saturating_add(right_keys.len());
++            if SemanticAccessCostModel::choose_ephemeral_join(
++                left_keys.len(),
++                right_keys.len(),
++                index.len(),
++                1,
++            ) == SemanticAccessPath::FullScan
++            {
++                return Ok(Some(JoinBatchIndex::FullScan));
++            }
++            Ok(Some(JoinBatchIndex::Ephemeral(index)))
++        }
++        JoinAccessFamily::FullScan
++        | JoinAccessFamily::PersistedSemantic
++        | JoinAccessFamily::EphemeralSemantic => Ok(None),
++    }
++}
++
+ fn try_execute_indexed_join_batch_chain(
+     plan: &Plan,
+     store: &PhysicalStore,
+@@ -4069,83 +4177,60 @@
+         .get(program.right_key_column)
+         .ok_or(RelQueryError::ColumnOutOfBounds)?;
+     let mut stats = ExecutionStats::default();
+-    let persisted = store.i64_index(I64IndexBinding {
+-        relation: program.right_relation,
+-        layout: program.right_layout,
+-        key_column: program.right_key_column,
+-        equivalence: program.equivalence,
+-    });
+-    let mut ephemeral = BTreeMap::<i64, Vec<usize>>::new();
+-    if let Some(index) = persisted {
+-        if SemanticAccessCostModel::choose_join(
+-            left_keys.len(),
+-            right_keys.len(),
+-            index.distinct_key_count(),
+-        ) == SemanticAccessPath::FullScan
+-        {
+-            return Ok(None);
+-        }
+-        stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+-    } else {
+-        if SemanticAccessCostModel::choose_ephemeral_join(
+-            left_keys.len(),
+-            right_keys.len(),
+-            right_keys.len(),
+-            1,
+-        ) == SemanticAccessPath::FullScan
+-        {
+-            return Ok(None);
+-        }
+-        for position in program.right.scan_positions() {
+-            ephemeral
+-                .entry(right_keys[position])
+-                .or_default()
+-                .push(position);
+-        }
+-        if SemanticAccessCostModel::choose_ephemeral_join(
+-            left_keys.len(),
+-            right_keys.len(),
+-            ephemeral.len(),
+-            1,
+-        ) == SemanticAccessPath::FullScan
+-        {
+-            return Ok(None);
+-        }
+-        stats.scanned_rows = stats.scanned_rows.saturating_add(right_keys.len());
+-        stats.values_read = stats.values_read.saturating_add(right_keys.len());
+-        stats.ephemeral_index_builds = stats.ephemeral_index_builds.saturating_add(1);
+-    }
++    let Some(index) = select_join_batch_index(&program, store, context, registry, &mut stats)?
++    else {
++        return Ok(None);
++    };
+ 
+     let mut out = Vec::new();
+     for left_position in program.left.scan_positions() {
+         stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+         stats.values_read = stats.values_read.saturating_add(1);
+         let key = left_keys[left_position];
+-        if let Some(index) = persisted {
+-            if let Some(right_row_ids) = index.probe(key) {
+-                for right_row_id in right_row_ids {
+-                    let right_position = program
+-                        .right
+-                        .position(*right_row_id)
+-                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-                    execute_join_batch_candidate(
+-                        &program,
+-                        left_position,
+-                        right_position,
+-                        &mut out,
+-                        &mut stats,
+-                    )?;
++        match &index {
++            JoinBatchIndex::Persisted(index) => {
++                if let Some(right_row_ids) = index.probe(key) {
++                    for right_row_id in right_row_ids {
++                        let right_position = program
++                            .right
++                            .position(*right_row_id)
++                            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                        execute_join_batch_candidate(
++                            &program,
++                            left_position,
++                            right_position,
++                            &mut out,
++                            &mut stats,
++                        )?;
++                    }
+                 }
+             }
+-        } else if let Some(right_positions) = ephemeral.get(&key) {
+-            for &right_position in right_positions {
+-                execute_join_batch_candidate(
+-                    &program,
+-                    left_position,
+-                    right_position,
+-                    &mut out,
+-                    &mut stats,
+-                )?;
++            JoinBatchIndex::Ephemeral(ephemeral) => {
++                if let Some(right_positions) = ephemeral.get(&key) {
++                    for &right_position in right_positions {
++                        execute_join_batch_candidate(
++                            &program,
++                            left_position,
++                            right_position,
++                            &mut out,
++                            &mut stats,
++                        )?;
++                    }
++                }
++            }
++            JoinBatchIndex::FullScan => {
++                for right_position in program.right.scan_positions() {
++                    stats.values_read = stats.values_read.saturating_add(1);
++                    if right_keys[right_position] == key {
++                        execute_join_batch_candidate(
++                            &program,
++                            left_position,
++                            right_position,
++                            &mut out,
++                            &mut stats,
++                        )?;
++                    }
++                }
+             }
+         }
+     }
+@@ -6481,61 +6566,27 @@
+         .collect()
+ }
+ 
+-fn multiway_persisted_index_estimate(
++fn multiway_right_access_estimate(
+     store: &PhysicalStore,
+     leaf: &MultiwayJoinLeaf,
+     predicate: MultiwayJoinPredicate,
+     left_rows: usize,
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+-) -> Result<Option<(u128, usize)>, PhysicalExecutionError> {
+-    if let Some(index) = store.i64_index(I64IndexBinding {
+-        relation: leaf.relation,
+-        layout: leaf.layout,
+-        key_column: predicate.right.column,
+-        equivalence: predicate.equivalence,
+-    }) {
+-        let distinct = index.distinct_key_count();
+-        if SemanticAccessCostModel::choose_join(left_rows, leaf.rows, distinct)
+-            == SemanticAccessPath::PersistedIndex
+-        {
+-            let average_bucket = if distinct == 0 {
+-                0
+-            } else {
+-                leaf.rows.div_ceil(distinct)
+-            };
+-            return Ok(Some((
+-                (left_rows as u128).saturating_mul(1_u128 + average_bucket as u128),
+-                left_rows.saturating_mul(average_bucket),
+-            )));
+-        }
+-    }
+-
+-    let binding = SemanticIndexBinding::single(
+-        leaf.relation,
+-        leaf.layout,
+-        predicate.right.column,
+-        predicate.equivalence,
+-    );
+-    if let Some(index) = store.semantic_index(&binding)
+-        && index.compatible_with(context, registry)?
+-    {
+-        let distinct = index.distinct_key_count();
+-        if SemanticAccessCostModel::choose_join(left_rows, leaf.rows, distinct)
+-            == SemanticAccessPath::PersistedIndex
+-        {
+-            let average_bucket = if distinct == 0 {
+-                0
+-            } else {
+-                leaf.rows.div_ceil(distinct)
+-            };
+-            return Ok(Some((
+-                (left_rows as u128).saturating_mul(1_u128 + average_bucket as u128),
+-                left_rows.saturating_mul(average_bucket),
+-            )));
+-        }
+-    }
+-    Ok(None)
++) -> Result<JoinAccessDecision, PhysicalExecutionError> {
++    right_scan_join_access_decision(
++        RightJoinAccessRequest {
++            left_rows,
++            right_relation: leaf.relation,
++            right_layout: leaf.layout,
++            right_column: predicate.right.column,
++            equivalence: predicate.equivalence,
++            allow_ephemeral: false,
++        },
++        store,
++        context,
++        registry,
++    )
+ }
+ 
+ fn multiway_join_merge_estimate(
+@@ -6552,16 +6603,16 @@
+     }
+     let right_leaf = &planner.leaves[interval.end];
+     for (index, predicate) in crossing.iter().copied().enumerate() {
+-        if let Some((work, output_rows)) = multiway_persisted_index_estimate(
++        let decision = multiway_right_access_estimate(
+             planner.store,
+             right_leaf,
+             predicate,
+             left_rows,
+             planner.context,
+             planner.registry,
+-        )? && work < best.0
+-        {
+-            best = (work, output_rows, index);
++        )?;
++        if decision.family != JoinAccessFamily::FullScan && (decision.work as u128) < best.0 {
++            best = (decision.work as u128, decision.estimated_output_rows, index);
+         }
+     }
+     Ok(best)
+@@ -6744,51 +6795,57 @@
+                 registry,
+             );
+         }
+-        if let Some(rows) = try_execute_indexed_i64_join(
+-            left,
+-            right,
+-            left_column,
+-            right_column,
+-            equivalence,
+-            store,
+-            context,
+-            registry,
+-            stats,
+-            false,
+-        )? {
+-            return Ok(rows);
+-        }
+-        if let Some(rows) = try_execute_persisted_semantic_join(
+-            left,
+-            right,
+-            left_column,
+-            right_column,
+-            equivalence,
+-            store,
+-            context,
+-            registry,
+-            stats,
+-        )? {
+-            return Ok(rows);
+-        }
+-        if let Some(rows) = try_execute_indexed_i64_join(
+-            left,
+-            right,
+-            left_column,
+-            right_column,
+-            equivalence,
+-            store,
+-            context,
+-            registry,
+-            stats,
+-            true,
+-        )? {
+-            return Ok(rows);
+-        }
+-        if let Some(rows) =
+-            try_execute_ephemeral_semantic_join(left, right, key, store, context, registry, stats)?
++        if let Some(decision) =
++            direct_join_access_decision(left, right, key, store, context, registry)?
+         {
+-            return Ok(rows);
++            if decision.persisted_rejected {
++                stats.persisted_index_cost_rejections =
++                    stats.persisted_index_cost_rejections.saturating_add(1);
++            }
++            let rows = match decision.family {
++                JoinAccessFamily::FullScan => None,
++                JoinAccessFamily::PersistedI64 => try_execute_indexed_i64_join(
++                    left,
++                    right,
++                    left_column,
++                    right_column,
++                    equivalence,
++                    store,
++                    context,
++                    registry,
++                    stats,
++                    false,
++                )?,
++                JoinAccessFamily::PersistedSemantic => try_execute_persisted_semantic_join(
++                    left,
++                    right,
++                    left_column,
++                    right_column,
++                    equivalence,
++                    store,
++                    context,
++                    registry,
++                    stats,
++                )?,
++                JoinAccessFamily::EphemeralI64 => try_execute_indexed_i64_join(
++                    left,
++                    right,
++                    left_column,
++                    right_column,
++                    equivalence,
++                    store,
++                    context,
++                    registry,
++                    stats,
++                    true,
++                )?,
++                JoinAccessFamily::EphemeralSemantic => try_execute_ephemeral_semantic_join(
++                    left, right, key, store, context, registry, stats,
++                )?,
++            };
++            if let Some(rows) = rows {
++                return Ok(rows);
++            }
+         }
+     }
+     let left_rows = left.execute_native_rows(store, context, registry, stats)?;
+@@ -6811,6 +6868,196 @@
+     equivalence: SemanticId,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum JoinAccessFamily {
++    FullScan,
++    PersistedI64,
++    PersistedSemantic,
++    EphemeralI64,
++    EphemeralSemantic,
++}
++
++impl JoinAccessFamily {
++    const fn tie_priority(self) -> u8 {
++        match self {
++            Self::FullScan => 0,
++            Self::PersistedI64 => 1,
++            Self::PersistedSemantic => 2,
++            Self::EphemeralI64 => 3,
++            Self::EphemeralSemantic => 4,
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct JoinAccessDecision {
++    family: JoinAccessFamily,
++    work: usize,
++    estimated_output_rows: usize,
++    persisted_rejected: bool,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct RightJoinAccessRequest {
++    left_rows: usize,
++    right_relation: SemanticId,
++    right_layout: LayoutBinding,
++    right_column: usize,
++    equivalence: SemanticId,
++    allow_ephemeral: bool,
++}
++
++fn consider_join_access_candidate(best: &mut JoinAccessDecision, candidate: JoinAccessDecision) {
++    if candidate.work < best.work
++        || (candidate.work == best.work
++            && candidate.family.tie_priority() < best.family.tie_priority())
++    {
++        *best = candidate;
++    }
++}
++
++fn right_scan_join_access_decision(
++    request: RightJoinAccessRequest,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<JoinAccessDecision, PhysicalExecutionError> {
++    let RightJoinAccessRequest {
++        left_rows,
++        right_relation,
++        right_layout,
++        right_column,
++        equivalence,
++        allow_ephemeral,
++    } = request;
++    let right = store.installed(right_relation, right_layout)?;
++    let right_rows = native_row_count(&right.data);
++    let mut best = JoinAccessDecision {
++        family: JoinAccessFamily::FullScan,
++        work: SemanticAccessCostModel::join_scan_work(left_rows, right_rows),
++        estimated_output_rows: left_rows.saturating_mul(right_rows),
++        persisted_rejected: false,
++    };
++    if left_rows == 0 || right_rows == 0 {
++        return Ok(best);
++    }
++
++    let resolved = registry.resolve_primitive_equivalence(context, equivalence)?;
++    let is_i64 = resolved.as_ref().is_some_and(|resolved| {
++        matches!(
++            resolved.bind_right(&Value::I64(0)),
++            Ok(kernel_semantics::BoundPrimitivePredicate::I64(_))
++        )
++    });
++
++    let mut saw_persisted = false;
++    if is_i64
++        && let Some(index) = store.i64_index(I64IndexBinding {
++            relation: right_relation,
++            layout: right_layout,
++            key_column: right_column,
++            equivalence,
++        })
++    {
++        saw_persisted = true;
++        let distinct = index.distinct_key_count();
++        let average_bucket = right_rows.div_ceil(distinct.max(1));
++        consider_join_access_candidate(
++            &mut best,
++            JoinAccessDecision {
++                family: JoinAccessFamily::PersistedI64,
++                work: SemanticAccessCostModel::persisted_join_work(left_rows, right_rows, distinct),
++                estimated_output_rows: left_rows.saturating_mul(average_bucket),
++                persisted_rejected: false,
++            },
++        );
++    }
++
++    let binding =
++        SemanticIndexBinding::single(right_relation, right_layout, right_column, equivalence);
++    let semantic_supported = primitive_binding_supported(&binding, context, registry)?;
++    if let Some(index) = store.semantic_index(&binding)
++        && index.compatible_with(context, registry)?
++    {
++        saw_persisted = true;
++        let distinct = index.distinct_key_count();
++        let average_bucket = right_rows.div_ceil(distinct.max(1));
++        consider_join_access_candidate(
++            &mut best,
++            JoinAccessDecision {
++                family: JoinAccessFamily::PersistedSemantic,
++                work: SemanticAccessCostModel::persisted_join_work(left_rows, right_rows, distinct),
++                estimated_output_rows: left_rows.saturating_mul(average_bucket),
++                persisted_rejected: false,
++            },
++        );
++    }
++
++    if allow_ephemeral && is_i64 {
++        consider_join_access_candidate(
++            &mut best,
++            JoinAccessDecision {
++                family: JoinAccessFamily::EphemeralI64,
++                work: SemanticAccessCostModel::ephemeral_join_work(
++                    left_rows, right_rows, right_rows, 1,
++                ),
++                estimated_output_rows: left_rows,
++                persisted_rejected: false,
++            },
++        );
++    }
++    if allow_ephemeral && semantic_supported {
++        consider_join_access_candidate(
++            &mut best,
++            JoinAccessDecision {
++                family: JoinAccessFamily::EphemeralSemantic,
++                work: SemanticAccessCostModel::ephemeral_join_work(
++                    left_rows, right_rows, right_rows, 1,
++                ),
++                estimated_output_rows: left_rows,
++                persisted_rejected: false,
++            },
++        );
++    }
++    best.persisted_rejected = saw_persisted
++        && !matches!(
++            best.family,
++            JoinAccessFamily::PersistedI64 | JoinAccessFamily::PersistedSemantic
++        );
++    Ok(best)
++}
++
++fn direct_join_access_decision(
++    left: &Plan,
++    right: &Plan,
++    key: JoinKeySpec,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<JoinAccessDecision>, PhysicalExecutionError> {
++    let Some((left_relation, left_layout)) = direct_scan_relation(left) else {
++        return Ok(None);
++    };
++    let Some((right_relation, right_layout)) = direct_scan_relation(right) else {
++        return Ok(None);
++    };
++    let left_rows = native_row_count(&store.installed(left_relation, left_layout)?.data);
++    right_scan_join_access_decision(
++        RightJoinAccessRequest {
++            left_rows,
++            right_relation,
++            right_layout,
++            right_column: key.right_column,
++            equivalence: key.equivalence,
++            allow_ephemeral: true,
++        },
++        store,
++        context,
++        registry,
++    )
++    .map(Some)
++}
++
+ struct RightScanJoinInputs<'a> {
+     left_rows: &'a [kernel_query::Row],
+     right: &'a InstalledRelation,
+@@ -6940,6 +7187,122 @@
+     Ok(Some(out))
+ }
+ 
++fn join_rows_with_ephemeral_i64(
++    inputs: &RightScanJoinInputs<'_>,
++    resolved: Option<&kernel_semantics::ResolvedPrimitiveEquivalence>,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let Some(resolved) = resolved else {
++        return Ok(None);
++    };
++    if !matches!(
++        resolved.bind_right(&Value::I64(0)),
++        Ok(kernel_semantics::BoundPrimitivePredicate::I64(_))
++    ) {
++        return Ok(None);
++    }
++    let Some(right_keys) = native_i64_column(&inputs.right.data, inputs.key.right_column) else {
++        return Ok(None);
++    };
++    let mut index = BTreeMap::<i64, Vec<usize>>::new();
++    for position in inputs.right.scan_positions() {
++        index
++            .entry(right_keys[position])
++            .or_default()
++            .push(position);
++    }
++    stats.ephemeral_index_builds = stats.ephemeral_index_builds.saturating_add(1);
++    if SemanticAccessCostModel::choose_ephemeral_join(
++        inputs.left_rows.len(),
++        right_keys.len(),
++        index.len(),
++        1,
++    ) == SemanticAccessPath::FullScan
++    {
++        return Ok(None);
++    }
++    let mut out = Vec::new();
++    for left_row in inputs.left_rows {
++        let Some(Value::I64(key)) = left_row.get(inputs.key.left_column) else {
++            return Err(RelQueryError::ColumnOutOfBounds.into());
++        };
++        stats.scanned_rows = stats.scanned_rows.saturating_add(1);
++        stats.values_read = stats.values_read.saturating_add(1);
++        if let Some(right_positions) = index.get(key) {
++            for &position in right_positions {
++                let right_row = materialize_native_row(&inputs.right.data, position)?;
++                let mut row = left_row.clone();
++                row.extend(right_row);
++                stats.values_read = stats.values_read.saturating_add(row.len());
++                out.push(row);
++            }
++        }
++    }
++    Ok(Some(out))
++}
++
++fn join_rows_with_ephemeral_semantic(
++    inputs: &RightScanJoinInputs<'_>,
++    resolved: Option<&kernel_semantics::ResolvedPrimitiveEquivalence>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let Some(resolved) = resolved else {
++        return Ok(None);
++    };
++    let binding = SemanticIndexBinding::single(
++        inputs.right_relation,
++        inputs.right_layout,
++        inputs.key.right_column,
++        inputs.key.equivalence,
++    );
++    if !primitive_binding_supported(&binding, context, registry)? {
++        return Ok(None);
++    }
++    let index = MaterializedSemanticIndexState::build(binding, inputs.right, context, registry)?;
++    stats.ephemeral_index_builds = stats.ephemeral_index_builds.saturating_add(1);
++    if SemanticAccessCostModel::choose_ephemeral_join(
++        inputs.left_rows.len(),
++        native_row_count(&inputs.right.data),
++        index.distinct_key_count(),
++        1,
++    ) == SemanticAccessPath::FullScan
++    {
++        return Ok(None);
++    }
++    let mut out = Vec::new();
++    for left_row in inputs.left_rows {
++        let left_key = left_row
++            .get(inputs.key.left_column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        stats.scanned_rows = stats.scanned_rows.saturating_add(1);
++        stats.values_read = stats.values_read.saturating_add(1);
++        if let Some(right_ids) = index.probe_value(left_key)? {
++            for right_id in right_ids {
++                let position = inputs
++                    .right
++                    .position(*right_id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let right_row = materialize_native_row(&inputs.right.data, position)?;
++                let right_key = right_row
++                    .get(inputs.key.right_column)
++                    .ok_or(RelQueryError::ColumnOutOfBounds)?;
++                if !resolved.equivalent(left_key, right_key)? {
++                    return Err(RelQueryError::InconsistentIncrementalDelta.into());
++                }
++                let mut row = left_row.clone();
++                row.extend(right_row);
++                stats.values_read = stats
++                    .values_read
++                    .saturating_add(row.len().saturating_add(1));
++                out.push(row);
++            }
++        }
++    }
++    Ok(Some(out))
++}
++
+ fn try_execute_indexed_right_scan_join_from_rows(
+     left_rows: &[kernel_query::Row],
+     right: &Plan,
+@@ -6961,23 +7324,38 @@
+         right_layout,
+         key,
+     };
+-
+-    if let Some(rows) = try_join_rows_with_persisted_i64(&inputs, resolved.as_ref(), store, stats)?
+-    {
+-        return Ok(Some(rows));
++    let decision = right_scan_join_access_decision(
++        RightJoinAccessRequest {
++            left_rows: left_rows.len(),
++            right_relation,
++            right_layout,
++            right_column: key.right_column,
++            equivalence: key.equivalence,
++            allow_ephemeral: true,
++        },
++        store,
++        context,
++        registry,
++    )?;
++    if decision.persisted_rejected {
++        stats.persisted_index_cost_rejections =
++            stats.persisted_index_cost_rejections.saturating_add(1);
+     }
+-    let binding = SemanticIndexBinding::single(
+-        right_relation,
+-        right_layout,
+-        key.right_column,
+-        key.equivalence,
+-    );
+-    if let Some(index) = store.semantic_index(&binding)
+-        && index.compatible_with(context, registry)?
+-    {
+-        return try_join_rows_with_persisted_semantic(&inputs, resolved.as_ref(), store, stats);
++    match decision.family {
++        JoinAccessFamily::FullScan => Ok(None),
++        JoinAccessFamily::PersistedI64 => {
++            try_join_rows_with_persisted_i64(&inputs, resolved.as_ref(), store, stats)
++        }
++        JoinAccessFamily::PersistedSemantic => {
++            try_join_rows_with_persisted_semantic(&inputs, resolved.as_ref(), store, stats)
++        }
++        JoinAccessFamily::EphemeralI64 => {
++            join_rows_with_ephemeral_i64(&inputs, resolved.as_ref(), stats)
++        }
++        JoinAccessFamily::EphemeralSemantic => {
++            join_rows_with_ephemeral_semantic(&inputs, resolved.as_ref(), context, registry, stats)
++        }
+     }
+-    Ok(None)
+ }
+ 
+ fn direct_columnar_scan(plan: &Plan) -> bool {
+@@ -7014,42 +7392,50 @@
+         equivalence,
+         algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
+     } = input
+-        && let Some(rows) = try_execute_persisted_semantic_join(
+-            left,
+-            right,
+-            *left_column,
+-            *right_column,
+-            *equivalence,
+-            store,
+-            context,
+-            registry,
+-            stats,
+-        )?
+-    {
+-        return project_rows(rows, columns, stats);
+-    }
+-    if let Plan::JoinEq {
+-        left,
+-        right,
+-        left_column,
+-        right_column,
+-        equivalence,
+-        algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
+-    } = input
+-        && let Some(rows) = try_execute_indexed_i64_join_project(
+-            left,
+-            right,
+-            *left_column,
+-            *right_column,
+-            *equivalence,
+-            columns,
+-            store,
+-            context,
+-            registry,
+-            stats,
+-        )?
+     {
+-        return Ok(rows);
++        let key = JoinKeySpec {
++            left_column: *left_column,
++            right_column: *right_column,
++            equivalence: *equivalence,
++        };
++        if let Some(decision) =
++            direct_join_access_decision(left, right, key, store, context, registry)?
++        {
++            match decision.family {
++                JoinAccessFamily::PersistedSemantic => {
++                    if let Some(rows) = try_execute_persisted_semantic_join(
++                        left,
++                        right,
++                        *left_column,
++                        *right_column,
++                        *equivalence,
++                        store,
++                        context,
++                        registry,
++                        stats,
++                    )? {
++                        return project_rows(rows, columns, stats);
++                    }
++                }
++                JoinAccessFamily::PersistedI64 | JoinAccessFamily::EphemeralI64 => {
++                    if let Some(rows) = try_execute_indexed_i64_join_project(
++                        left,
++                        right,
++                        *left_column,
++                        *right_column,
++                        *equivalence,
++                        columns,
++                        store,
++                        context,
++                        registry,
++                        stats,
++                    )? {
++                        return Ok(rows);
++                    }
++                }
++                JoinAccessFamily::FullScan | JoinAccessFamily::EphemeralSemantic => {}
++            }
++        }
+     }
+     if let Some(rows) =
+         try_execute_persisted_semantic_filter_plan(input, store, context, registry, stats)?
+@@ -12692,6 +13078,110 @@
+         assert_eq!(stats.persisted_index_cost_rejections, 1);
+     }
+ 
++    #[test]
++    fn join_project_reuses_persisted_semantic_index_before_building_ephemeral_i64() {
++        let relation = sid(348);
++        let equivalence = sid(349);
++        let (context, registry) = two_i64_column_context(relation, equivalence, 44);
++        let logical = RelExpr::Project {
++            input: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(relation)),
++                right: Box::new(RelExpr::Scan(relation)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            columns: vec![1, 3],
++        };
++        let layout = LayoutBinding {
++            id: LayoutId(999),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, layout);
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let keys = (0_i64..128).collect::<Vec<_>>();
++        let payload = (1_000_i64..1_128).collect::<Vec<_>>();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![
++                    NativeColumn::I64(keys.clone()),
++                    NativeColumn::I64(payload.clone()),
++                ])
++                .unwrap(),
++            )
++            .unwrap();
++        store
++            .install_semantic_index(
++                SemanticIndexBinding::single(relation, layout, 0, equivalence),
++                &context,
++                &registry,
++            )
++            .unwrap();
++
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            keys.into_iter()
++                .zip(payload)
++                .map(|(key, value)| vec![Value::I64(key), Value::I64(value)])
++                .collect(),
++        );
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(stats.persisted_index_hits, 1);
++        assert_eq!(stats.ephemeral_index_builds, 0);
++        assert_eq!(stats.fused_join_project_hits, 0);
++    }
++
++    #[test]
++    fn duplicate_heavy_join_project_does_not_rebuild_rejected_transient_index() {
++        let relation = sid(350);
++        let equivalence = sid(351);
++        let (context, registry) = two_i64_column_context(relation, equivalence, 45);
++        let logical = RelExpr::Project {
++            input: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(relation)),
++                right: Box::new(RelExpr::Scan(relation)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            columns: vec![1, 3],
++        };
++        let layout = LayoutBinding {
++            id: LayoutId(1_000),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, layout);
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let keys = vec![1_i64; 50];
++        let payload = (0_i64..50).collect::<Vec<_>>();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![
++                    NativeColumn::I64(keys.clone()),
++                    NativeColumn::I64(payload.clone()),
++                ])
++                .unwrap(),
++            )
++            .unwrap();
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(native.rows().len(), 2_500);
++        assert_eq!(stats.ephemeral_index_builds, 1);
++        assert_eq!(stats.fused_join_project_hits, 1);
++    }
++
+     fn three_relation_i64_context() -> (
+         SemanticContext,
+         SemanticRegistry,
+@@ -12922,6 +13412,377 @@
+         );
+     }
+ 
++    #[test]
++    fn join_access_decision_unifies_persisted_and_ephemeral_i64_families() {
++        let (context, registry, relation) = planning_context();
++        let layout = LayoutBinding {
++            id: LayoutId(1_044),
++            family: LayoutFamily::Columnar,
++        };
++        let equivalence = sid(101);
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64((0_i64..100).collect())])
++                    .unwrap(),
++            )
++            .unwrap();
++        let i64_binding = I64IndexBinding {
++            relation,
++            layout,
++            key_column: 0,
++            equivalence,
++        };
++        let semantic_binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        store
++            .install_i64_index(i64_binding, &context, &registry)
++            .unwrap();
++        store
++            .install_semantic_index(semantic_binding.clone(), &context, &registry)
++            .unwrap();
++
++        let both = right_scan_join_access_decision(
++            RightJoinAccessRequest {
++                left_rows: 100,
++                right_relation: relation,
++                right_layout: layout,
++                right_column: 0,
++                equivalence,
++                allow_ephemeral: true,
++            },
++            &store,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(both.family, JoinAccessFamily::PersistedI64);
++        assert!(!both.persisted_rejected);
++
++        store.i64_indexes.remove(&i64_binding);
++        let semantic_only = right_scan_join_access_decision(
++            RightJoinAccessRequest {
++                left_rows: 100,
++                right_relation: relation,
++                right_layout: layout,
++                right_column: 0,
++                equivalence,
++                allow_ephemeral: true,
++            },
++            &store,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(semantic_only.family, JoinAccessFamily::PersistedSemantic);
++
++        store.semantic_indexes.remove(&semantic_binding);
++        let transient = right_scan_join_access_decision(
++            RightJoinAccessRequest {
++                left_rows: 100,
++                right_relation: relation,
++                right_layout: layout,
++                right_column: 0,
++                equivalence,
++                allow_ephemeral: true,
++            },
++            &store,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(transient.family, JoinAccessFamily::EphemeralI64);
++    }
++
++    #[test]
++    fn multiway_and_direct_join_planning_share_the_same_right_access_decision() {
++        let (context, registry, relation) = planning_context();
++        let layout = LayoutBinding {
++            id: LayoutId(1_045),
++            family: LayoutFamily::Columnar,
++        };
++        let equivalence = sid(101);
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64((0_i64..128).collect())])
++                    .unwrap(),
++            )
++            .unwrap();
++        store
++            .install_i64_index(
++                I64IndexBinding {
++                    relation,
++                    layout,
++                    key_column: 0,
++                    equivalence,
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++        let direct = right_scan_join_access_decision(
++            RightJoinAccessRequest {
++                left_rows: 64,
++                right_relation: relation,
++                right_layout: layout,
++                right_column: 0,
++                equivalence,
++                allow_ephemeral: true,
++            },
++            &store,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        let leaf = MultiwayJoinLeaf {
++            plan: Plan::Scan {
++                relation,
++                layout,
++                algorithm: ScanAlgorithm::FullScan,
++            },
++            relation,
++            layout,
++            width: 1,
++            rows: 128,
++        };
++        let multiway = multiway_right_access_estimate(
++            &store,
++            &leaf,
++            MultiwayJoinPredicate {
++                left: MultiwayJoinColumnRef { leaf: 0, column: 0 },
++                right: MultiwayJoinColumnRef { leaf: 1, column: 0 },
++                equivalence,
++            },
++            64,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(multiway, direct);
++    }
++
++    #[test]
++    fn multiway_costing_does_not_credit_unbuilt_transient_distinctness() {
++        let (context, registry, relation) = planning_context();
++        let layout = LayoutBinding {
++            id: LayoutId(1_052),
++            family: LayoutFamily::Columnar,
++        };
++        let equivalence = sid(101);
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64((0_i64..128).collect())])
++                    .unwrap(),
++            )
++            .unwrap();
++        let direct = right_scan_join_access_decision(
++            RightJoinAccessRequest {
++                left_rows: 64,
++                right_relation: relation,
++                right_layout: layout,
++                right_column: 0,
++                equivalence,
++                allow_ephemeral: true,
++            },
++            &store,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(direct.family, JoinAccessFamily::EphemeralI64);
++
++        let leaf = MultiwayJoinLeaf {
++            plan: Plan::Scan {
++                relation,
++                layout,
++                algorithm: ScanAlgorithm::FullScan,
++            },
++            relation,
++            layout,
++            width: 1,
++            rows: 128,
++        };
++        let multiway = multiway_right_access_estimate(
++            &store,
++            &leaf,
++            MultiwayJoinPredicate {
++                left: MultiwayJoinColumnRef { leaf: 0, column: 0 },
++                right: MultiwayJoinColumnRef { leaf: 1, column: 0 },
++                equivalence,
++            },
++            64,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(multiway.family, JoinAccessFamily::FullScan);
++    }
++
++    #[test]
++    fn join_access_decision_can_choose_transient_generic_semantic_family() {
++        let (context, registry, relation, equivalence, layout, mut store) =
++            text_semantic_index_fixture();
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        store.semantic_indexes.remove(&binding);
++        let decision = right_scan_join_access_decision(
++            RightJoinAccessRequest {
++                left_rows: 100,
++                right_relation: relation,
++                right_layout: layout,
++                right_column: 0,
++                equivalence,
++                allow_ephemeral: true,
++            },
++            &store,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(decision.family, JoinAccessFamily::EphemeralSemantic);
++        assert!(!decision.persisted_rejected);
++    }
++
++    #[test]
++    fn multiway_join_executes_transient_access_after_intermediate_join() {
++        let (context, registry, relations, equivalence) = three_relation_i64_context();
++        let [a, b, c] = relations;
++        let bindings = [
++            LayoutBinding {
++                id: LayoutId(1_046),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1_047),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1_048),
++                family: LayoutFamily::Columnar,
++            },
++        ];
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, layout) in relations.into_iter().zip(bindings) {
++            catalog.bind_relation(relation, layout);
++        }
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(a)),
++            right: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(b)),
++                right: Box::new(RelExpr::Scan(c)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let values = [
++            (1_i64..=8).collect::<Vec<_>>(),
++            (1_i64..=512).collect::<Vec<_>>(),
++            (1_i64..=512).collect::<Vec<_>>(),
++        ];
++        let mut store = PhysicalStore::default();
++        let mut model = kernel_model::FiniteModel::default();
++        for ((relation, layout), relation_values) in relations.into_iter().zip(bindings).zip(values)
++        {
++            store
++                .install(
++                    relation,
++                    layout,
++                    NativeRelation::typed_columnar(vec![NativeColumn::I64(
++                        relation_values.clone(),
++                    )])
++                    .unwrap(),
++                )
++                .unwrap();
++            model.relations.insert(
++                relation,
++                relation_values
++                    .into_iter()
++                    .map(|value| vec![Value::I64(value)])
++                    .collect(),
++            );
++        }
++
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(stats.multiway_join_reorders, 1);
++        assert_eq!(stats.ephemeral_index_builds, 2);
++        assert_eq!(stats.persisted_index_hits, 0);
++    }
++
++    #[test]
++    fn intermediate_transient_join_rechecks_actual_distinctness_before_committing_to_index() {
++        let (context, registry, relations, equivalence) = three_relation_i64_context();
++        let [a, b, c] = relations;
++        let bindings = [
++            LayoutBinding {
++                id: LayoutId(1_049),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1_050),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1_051),
++                family: LayoutFamily::Columnar,
++            },
++        ];
++        let mut store = PhysicalStore::default();
++        for (relation, layout, values) in [
++            (a, bindings[0], vec![1_i64]),
++            (b, bindings[1], vec![1_i64; 50]),
++            (c, bindings[2], vec![1_i64; 50]),
++        ] {
++            store
++                .install(
++                    relation,
++                    layout,
++                    NativeRelation::typed_columnar(vec![NativeColumn::I64(values)]).unwrap(),
++                )
++                .unwrap();
++        }
++        let scan = |relation, layout| Plan::Scan {
++            relation,
++            layout,
++            algorithm: ScanAlgorithm::FullScan,
++        };
++        let plan = Plan::JoinEq {
++            left: Box::new(Plan::JoinEq {
++                left: Box::new(scan(a, bindings[0])),
++                right: Box::new(scan(b, bindings[1])),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++                algorithm: JoinAlgorithm::NestedLoop,
++            }),
++            right: Box::new(scan(c, bindings[2])),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++            algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
++        };
++        let mut stats = ExecutionStats::default();
++        let rows = plan
++            .execute_native_rows(&store, &context, &registry, &mut stats)
++            .unwrap();
++        assert_eq!(rows.len(), 2_500);
++        assert_eq!(stats.ephemeral_index_builds, 1);
++        assert_eq!(stats.persisted_index_hits, 0);
++    }
++
+     fn multiway_filter_store_and_model(
+         context: &SemanticContext,
+         registry: &SemanticRegistry,

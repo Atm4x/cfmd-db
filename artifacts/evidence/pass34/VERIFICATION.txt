@@ -1,0 +1,25 @@
+Pass34 final verification — Rust 1.98.1
+
+PASS cargo fmt --all -- --check
+PASS cargo check --workspace --all-targets
+PASS cargo test --workspace --all-targets
+PASS cargo clippy --workspace --all-targets -- -D warnings
+PASS cargo test --workspace --all-targets --release
+PASS cargo build --workspace --release
+PASS RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+PASS RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release
+
+Notes:
+- First combined release command hit the external 120-second command limit during compilation; rerun separately completed PASS.
+- First overflow-check invocation hit the same external compile timeout; warmed rerun completed PASS.
+- No test failure occurred in either timed-out invocation.
+
+Metrics:
+273 declared tests
+70 kernel-plan tests
+65 kernel-query tests
+20 kernel-durability tests
+20 crates
+34,177 Rust LOC
+0 external Cargo sources
+0 unsafe occurrences under crates/

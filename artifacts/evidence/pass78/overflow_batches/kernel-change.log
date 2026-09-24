@@ -1,0 +1,11 @@
+   Compiling kernel-change v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-change)
+    Finished `release` profile [optimized] target(s) in 0.37s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_change-c6bfbf2e2afa1fff)
+
+running 3 tests
+test tests::invalid_splice_is_not_silently_clamped ... ok
+test tests::sequence_splice_has_exact_checked_semantics ... ok
+test tests::set_change_round_trips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

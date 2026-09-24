@@ -1,0 +1,1143 @@
+--- /mnt/data/cfmd_pass42_audit/cfmd_workspace_pass42/crates/kernel-plan/src/lib.rs	2026-09-20 10:36:28.000000000 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 11:17:14.153540921 +0000
+@@ -653,6 +653,7 @@
+     relations: BTreeMap<(SemanticId, LayoutId), InstalledRelation>,
+     i64_indexes: BTreeMap<I64IndexBinding, MaterializedI64IndexState>,
+     semantic_indexes: BTreeMap<SemanticIndexBinding, MaterializedSemanticIndexState>,
++    advisor_managed_semantic_indexes: BTreeSet<SemanticIndexBinding>,
+     transition_epoch: u64,
+     revision: Option<RevisionId>,
+ }
+@@ -1806,6 +1807,51 @@
+         *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
+         Ok(())
+     }
++
++    pub fn advise_semantic_indexes(
++        &self,
++        workload: &[SemanticIndexWorkloadSample],
++        policy: SemanticIndexAdvisorPolicy,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<SemanticIndexAdvisorReport, PhysicalExecutionError> {
++        let mut state = self
++            .root
++            .write()
++            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
++        let RuntimeRevisionCellState::Serving(live) = &*state else {
++            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
++        };
++        let mut physical = live.physical.clone();
++        let source_epoch = physical.transition_epoch();
++        let report = physical.advise_semantic_indexes(
++            workload,
++            policy,
++            live.revision.semantic_context(),
++            registry,
++        )?;
++        if physical.transition_epoch() == source_epoch {
++            return Ok(report);
++        }
++        let next_version = live
++            .root_identity
++            .version
++            .0
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
++        let candidate = RuntimeRevisionBundle {
++            root_identity: RuntimeRootIdentity {
++                root_id: live.root_identity.root_id,
++                version: RuntimeRootVersion(next_version),
++            },
++            revision: live.revision.clone(),
++            physical,
++            relation_layouts: live.relation_layouts.clone(),
++            materialization_specs: live.materialization_specs.clone(),
++            materializations: live.materializations.clone(),
++        };
++        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
++        Ok(report)
++    }
+ }
+ 
+ impl DurableRuntime {
+@@ -2075,6 +2121,15 @@
+     ) -> Result<(), PhysicalExecutionError> {
+         self.cell.install_semantic_index(index, registry)
+     }
++
++    pub fn advise_semantic_indexes(
++        &self,
++        workload: &[SemanticIndexWorkloadSample],
++        policy: SemanticIndexAdvisorPolicy,
++    ) -> Result<SemanticIndexAdvisorReport, PhysicalExecutionError> {
++        self.cell
++            .advise_semantic_indexes(workload, policy, &self.registry)
++    }
+ }
+ 
+ impl DurableRuntimeSupervisor {
+@@ -2574,6 +2629,8 @@
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+         self.semantic_indexes
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
++        self.advisor_managed_semantic_indexes
++            .retain(|index| index.relation != relation || index.layout.id != binding.id);
+         self.transition_epoch = next_epoch;
+         Ok(())
+     }
+@@ -2608,11 +2665,103 @@
+             .transition_epoch
+             .checked_add(1)
+             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
++        self.advisor_managed_semantic_indexes.remove(&index);
+         self.semantic_indexes.insert(index, state);
+         self.transition_epoch = next_epoch;
+         Ok(())
+     }
+ 
++    pub fn advise_semantic_indexes(
++        &mut self,
++        workload: &[SemanticIndexWorkloadSample],
++        policy: SemanticIndexAdvisorPolicy,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<SemanticIndexAdvisorReport, PhysicalExecutionError> {
++        let (selected, managed_key_cells, mut report) =
++            semantic_index_advisor_selection(self, workload, policy, context, registry)?;
++        let prepared_states =
++            self.prepare_advised_semantic_indexes(&selected, context, registry)?;
++        let evicted = self
++            .advisor_managed_semantic_indexes
++            .iter()
++            .filter(|binding| !selected.contains(*binding))
++            .cloned()
++            .collect::<Vec<_>>();
++        let changed = !evicted.is_empty() || !prepared_states.is_empty();
++        let next_epoch = if changed {
++            Some(
++                self.transition_epoch
++                    .checked_add(1)
++                    .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?,
++            )
++        } else {
++            None
++        };
++
++        for binding in &evicted {
++            self.semantic_indexes.remove(binding);
++            self.advisor_managed_semantic_indexes.remove(binding);
++            report.evicted.push(binding.clone());
++        }
++        for (binding, state) in prepared_states {
++            let existed = self.semantic_indexes.contains_key(&binding);
++            self.semantic_indexes.insert(binding.clone(), state);
++            self.advisor_managed_semantic_indexes
++                .insert(binding.clone());
++            if existed {
++                report.rebuilt.push(binding);
++            } else {
++                report.created.push(binding);
++            }
++        }
++        for binding in selected {
++            if report.created.contains(&binding) || report.rebuilt.contains(&binding) {
++                continue;
++            }
++            if self.advisor_managed_semantic_indexes.contains(&binding) {
++                report.retained.push(binding);
++            } else {
++                report.reused_existing.push(binding);
++            }
++        }
++        if let Some(next_epoch) = next_epoch {
++            self.transition_epoch = next_epoch;
++        }
++        report.managed_key_cells = managed_key_cells;
++        Ok(report)
++    }
++
++    fn prepare_advised_semantic_indexes(
++        &self,
++        selected: &BTreeSet<SemanticIndexBinding>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Vec<(SemanticIndexBinding, MaterializedSemanticIndexState)>, PhysicalExecutionError>
++    {
++        let mut prepared = Vec::new();
++        for binding in selected {
++            let compatible = match self.semantic_indexes.get(binding) {
++                Some(state) => state.compatible_with(context, registry)?,
++                None => false,
++            };
++            if compatible {
++                continue;
++            }
++            let relation = self.installed(binding.relation, binding.layout)?;
++            prepared.push((
++                binding.clone(),
++                MaterializedSemanticIndexState::build(
++                    binding.clone(),
++                    relation,
++                    context,
++                    registry,
++                )?,
++            ));
++        }
++        Ok(prepared)
++    }
++
+     /// Atomically applies a semantic relation delta to the installed physical relation and to
+     /// every persisted I64 index bound to that exact relation/layout. The complete mutation is
+     /// planned and validated before any state is changed, so user-visible validation failures do
+@@ -3350,6 +3499,37 @@
+     PromoteToBag(Box<Self>),
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SemanticIndexWorkloadSample {
++    pub plan: Plan,
++    pub expected_executions: usize,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SemanticIndexAdvisorPolicy {
++    pub max_managed_key_cells: usize,
++}
++
++impl Default for SemanticIndexAdvisorPolicy {
++    fn default() -> Self {
++        Self {
++            max_managed_key_cells: usize::MAX,
++        }
++    }
++}
++
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct SemanticIndexAdvisorReport {
++    pub created: Vec<SemanticIndexBinding>,
++    pub rebuilt: Vec<SemanticIndexBinding>,
++    pub retained: Vec<SemanticIndexBinding>,
++    pub evicted: Vec<SemanticIndexBinding>,
++    pub reused_existing: Vec<SemanticIndexBinding>,
++    pub rejected_unprofitable: Vec<SemanticIndexBinding>,
++    pub rejected_budget: Vec<SemanticIndexBinding>,
++    pub managed_key_cells: usize,
++}
++
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+ pub struct PlanShape {
+     pub nodes: usize,
+@@ -7495,6 +7675,411 @@
+     }
+ }
+ 
++#[derive(Debug, Clone)]
++struct SemanticIndexAdviceObservation {
++    binding: SemanticIndexBinding,
++    savings_per_execution: u128,
++    key_cells: usize,
++}
++
++#[derive(Debug, Clone)]
++struct SemanticIndexAdviceScore {
++    binding: SemanticIndexBinding,
++    gross_savings: u128,
++    key_cells: usize,
++}
++
++#[derive(Debug, Clone)]
++struct SemanticIndexAdviceChoice {
++    binding: SemanticIndexBinding,
++    net_savings: u128,
++    key_cells: usize,
++    compatible_existing: bool,
++    advisor_managed: bool,
++}
++
++fn semantic_index_advice_scores(
++    store: &PhysicalStore,
++    workload: &[SemanticIndexWorkloadSample],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<BTreeMap<SemanticIndexBinding, SemanticIndexAdviceScore>, PhysicalExecutionError> {
++    let mut scores = BTreeMap::<SemanticIndexBinding, SemanticIndexAdviceScore>::new();
++    for sample in workload {
++        if sample.expected_executions == 0 {
++            continue;
++        }
++        for observation in
++            semantic_index_advice_observations(&sample.plan, store, context, registry)?
++        {
++            let entry = scores
++                .entry(observation.binding.clone())
++                .or_insert_with(|| SemanticIndexAdviceScore {
++                    binding: observation.binding.clone(),
++                    gross_savings: 0,
++                    key_cells: observation.key_cells,
++                });
++            entry.gross_savings = entry.gross_savings.saturating_add(
++                observation
++                    .savings_per_execution
++                    .saturating_mul(sample.expected_executions as u128),
++            );
++            entry.key_cells = entry.key_cells.max(observation.key_cells);
++        }
++    }
++    Ok(scores)
++}
++
++fn semantic_index_advice_choices(
++    store: &PhysicalStore,
++    scores: BTreeMap<SemanticIndexBinding, SemanticIndexAdviceScore>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    report: &mut SemanticIndexAdvisorReport,
++) -> Result<Vec<SemanticIndexAdviceChoice>, PhysicalExecutionError> {
++    let mut choices = Vec::new();
++    for score in scores.into_values() {
++        let compatible_existing = match store.semantic_indexes.get(&score.binding) {
++            Some(state) => state.compatible_with(context, registry)?,
++            None => false,
++        };
++        let build_work = if compatible_existing {
++            0
++        } else {
++            score.key_cells as u128
++        };
++        if score.gross_savings <= build_work {
++            report.rejected_unprofitable.push(score.binding);
++            continue;
++        }
++        let advisor_managed = store
++            .advisor_managed_semantic_indexes
++            .contains(&score.binding);
++        choices.push(SemanticIndexAdviceChoice {
++            binding: score.binding,
++            net_savings: score.gross_savings - build_work,
++            key_cells: score.key_cells,
++            compatible_existing,
++            advisor_managed,
++        });
++    }
++    Ok(choices)
++}
++
++const fn semantic_index_managed_cost(choice: &SemanticIndexAdviceChoice) -> usize {
++    if choice.compatible_existing && !choice.advisor_managed {
++        0
++    } else {
++        choice.key_cells
++    }
++}
++
++fn compare_semantic_index_advice_choice(
++    left: &SemanticIndexAdviceChoice,
++    right: &SemanticIndexAdviceChoice,
++) -> std::cmp::Ordering {
++    let left_cost = semantic_index_managed_cost(left);
++    let right_cost = semantic_index_managed_cost(right);
++    match (left_cost, right_cost) {
++        (0, 0) => right
++            .net_savings
++            .cmp(&left.net_savings)
++            .then_with(|| left.binding.cmp(&right.binding)),
++        (0, _) => std::cmp::Ordering::Less,
++        (_, 0) => std::cmp::Ordering::Greater,
++        _ => {
++            let left_density = left.net_savings.saturating_mul(right_cost as u128);
++            let right_density = right.net_savings.saturating_mul(left_cost as u128);
++            right_density
++                .cmp(&left_density)
++                .then_with(|| right.net_savings.cmp(&left.net_savings))
++                .then_with(|| left.binding.cmp(&right.binding))
++        }
++    }
++}
++
++fn semantic_index_advisor_selection(
++    store: &PhysicalStore,
++    workload: &[SemanticIndexWorkloadSample],
++    policy: SemanticIndexAdvisorPolicy,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<
++    (
++        BTreeSet<SemanticIndexBinding>,
++        usize,
++        SemanticIndexAdvisorReport,
++    ),
++    PhysicalExecutionError,
++> {
++    let scores = semantic_index_advice_scores(store, workload, context, registry)?;
++    let mut report = SemanticIndexAdvisorReport::default();
++    let mut choices = semantic_index_advice_choices(store, scores, context, registry, &mut report)?;
++    choices.sort_by(compare_semantic_index_advice_choice);
++
++    let mut selected = BTreeSet::new();
++    let mut managed_key_cells = 0_usize;
++    for choice in choices {
++        let managed_cost = semantic_index_managed_cost(&choice);
++        if managed_key_cells.saturating_add(managed_cost) > policy.max_managed_key_cells {
++            report.rejected_budget.push(choice.binding);
++            continue;
++        }
++        managed_key_cells = managed_key_cells.saturating_add(managed_cost);
++        selected.insert(choice.binding);
++    }
++    Ok((selected, managed_key_cells, report))
++}
++
++fn semantic_index_state_for_advice<'a>(
++    store: &'a PhysicalStore,
++    binding: &SemanticIndexBinding,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<std::borrow::Cow<'a, MaterializedSemanticIndexState>, PhysicalExecutionError> {
++    if let Some(existing) = store.semantic_indexes.get(binding)
++        && existing.compatible_with(context, registry)?
++    {
++        return Ok(std::borrow::Cow::Borrowed(existing));
++    }
++    let relation = store.installed(binding.relation, binding.layout)?;
++    Ok(std::borrow::Cow::Owned(
++        MaterializedSemanticIndexState::build(binding.clone(), relation, context, registry)?,
++    ))
++}
++
++fn primitive_binding_supported(
++    binding: &SemanticIndexBinding,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<bool, PhysicalExecutionError> {
++    for part in &binding.key_parts {
++        if registry
++            .resolve_primitive_equivalence(context, part.equivalence)?
++            .is_none()
++        {
++            return Ok(false);
++        }
++    }
++    Ok(true)
++}
++
++fn semantic_index_filter_advice_observation(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<SemanticIndexAdviceObservation>, PhysicalExecutionError> {
++    let Some((relation, layout, predicates)) = collect_direct_filter_chain(plan) else {
++        return Ok(None);
++    };
++    if predicates.is_empty() {
++        return Ok(None);
++    }
++    let mut key_parts = predicates
++        .iter()
++        .map(|predicate| SemanticIndexKeyPart {
++            column: predicate.column,
++            equivalence: predicate.equivalence,
++        })
++        .collect::<Vec<_>>();
++    key_parts.sort_unstable();
++    key_parts.dedup();
++    let binding = SemanticIndexBinding {
++        relation,
++        layout,
++        key_parts,
++    };
++    if !primitive_binding_supported(&binding, context, registry)? {
++        return Ok(None);
++    }
++    let installed = store.installed(relation, layout)?;
++    let row_count = native_row_count(&installed.data);
++    let key_cells = row_count.saturating_mul(binding.key_parts.len());
++    let state = semantic_index_state_for_advice(store, &binding, context, registry)?;
++    let values = binding
++        .key_parts
++        .iter()
++        .map(|part| {
++            predicates
++                .iter()
++                .find(|predicate| {
++                    predicate.column == part.column && predicate.equivalence == part.equivalence
++                })
++                .map(|predicate| predicate.value)
++                .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)
++        })
++        .collect::<Result<Vec<_>, _>>()?;
++    let matching_rows = state
++        .probe_values(&values)?
++        .map_or(0, <[PhysicalRowId]>::len);
++    let scan_work = row_count as u128;
++    let index_work = 1_u128.saturating_add(matching_rows as u128);
++    Ok(Some(SemanticIndexAdviceObservation {
++        binding,
++        savings_per_execution: scan_work.saturating_sub(index_work),
++        key_cells,
++    }))
++}
++
++fn semantic_index_join_advice_observation(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<SemanticIndexAdviceObservation>, PhysicalExecutionError> {
++    let (left, right, mut key_parts) = if let Some(join) = collect_direct_multi_key_join(plan) {
++        let Some((left_relation, left_layout)) = direct_scan_relation(join.left) else {
++            return Ok(None);
++        };
++        let Some((right_relation, right_layout)) = direct_scan_relation(join.right) else {
++            return Ok(None);
++        };
++        let left_installed = store.installed(left_relation, left_layout)?;
++        let right_installed = store.installed(right_relation, right_layout)?;
++        let Some(keys) = normalize_join_column_predicates(
++            &join,
++            native_column_count(&left_installed.data),
++            native_column_count(&right_installed.data),
++        ) else {
++            return Ok(None);
++        };
++        let parts = keys
++            .into_iter()
++            .map(|key| SemanticIndexKeyPart {
++                column: key.right_column,
++                equivalence: key.equivalence,
++            })
++            .collect::<Vec<_>>();
++        (
++            (left_relation, left_layout),
++            (right_relation, right_layout),
++            parts,
++        )
++    } else {
++        let Plan::JoinEq {
++            left,
++            right,
++            right_column,
++            equivalence,
++            algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
++            ..
++        } = plan
++        else {
++            return Ok(None);
++        };
++        let Some(left) = direct_scan_relation(left) else {
++            return Ok(None);
++        };
++        let Some(right) = direct_scan_relation(right) else {
++            return Ok(None);
++        };
++        (
++            left,
++            right,
++            vec![SemanticIndexKeyPart {
++                column: *right_column,
++                equivalence: *equivalence,
++            }],
++        )
++    };
++    key_parts.sort_unstable();
++    let binding = SemanticIndexBinding {
++        relation: right.0,
++        layout: right.1,
++        key_parts,
++    };
++    if !primitive_binding_supported(&binding, context, registry)? {
++        return Ok(None);
++    }
++    let left_installed = store.installed(left.0, left.1)?;
++    let right_installed = store.installed(right.0, right.1)?;
++    let left_rows = native_row_count(&left_installed.data);
++    let right_rows = native_row_count(&right_installed.data);
++    let key_cells = right_rows.saturating_mul(binding.key_parts.len());
++    let state = semantic_index_state_for_advice(store, &binding, context, registry)?;
++    let distinct = state.distinct_key_count();
++    if left_rows == 0 || right_rows == 0 || distinct == 0 {
++        return Ok(Some(SemanticIndexAdviceObservation {
++            binding,
++            savings_per_execution: 0,
++            key_cells,
++        }));
++    }
++    let nested_work = (left_rows as u128).saturating_mul(right_rows as u128);
++    let average_bucket = right_rows.div_ceil(distinct) as u128;
++    let indexed_work = (left_rows as u128).saturating_mul(1_u128 + average_bucket);
++    Ok(Some(SemanticIndexAdviceObservation {
++        binding,
++        savings_per_execution: nested_work.saturating_sub(indexed_work),
++        key_cells,
++    }))
++}
++
++fn semantic_index_advice_observations(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Vec<SemanticIndexAdviceObservation>, PhysicalExecutionError> {
++    let mut observations = Vec::new();
++    collect_semantic_index_advice_observations(plan, store, context, registry, &mut observations)?;
++    Ok(observations)
++}
++
++fn collect_semantic_index_advice_observations(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    observations: &mut Vec<SemanticIndexAdviceObservation>,
++) -> Result<(), PhysicalExecutionError> {
++    if let Some(observation) =
++        semantic_index_filter_advice_observation(plan, store, context, registry)?
++    {
++        observations.push(observation);
++        return Ok(());
++    }
++    if let Some(observation) =
++        semantic_index_join_advice_observation(plan, store, context, registry)?
++    {
++        observations.push(observation);
++        return Ok(());
++    }
++    match plan {
++        Plan::FilterEqConst { input, .. }
++        | Plan::FilterEqColumns { input, .. }
++        | Plan::Project { input, .. }
++        | Plan::Distinct { input, .. }
++        | Plan::Group { input, .. }
++        | Plan::TopKWithTies { input, .. }
++        | Plan::PromoteToBag(input) => collect_semantic_index_advice_observations(
++            input,
++            store,
++            context,
++            registry,
++            observations,
++        ),
++        Plan::JoinEq { left, right, .. } => {
++            collect_semantic_index_advice_observations(
++                left,
++                store,
++                context,
++                registry,
++                observations,
++            )?;
++            collect_semantic_index_advice_observations(
++                right,
++                store,
++                context,
++                registry,
++                observations,
++            )
++        }
++        Plan::Scan { .. } => Ok(()),
++    }
++}
++
+ fn validate_indexable_i64_relation(
+     context: &kernel_schema::SemanticContext,
+     relation: SemanticId,
+@@ -9714,6 +10299,44 @@
+     }
+ 
+     #[test]
++    fn semantic_index_advisor_publishes_one_runtime_root_and_noop_does_not_republish() {
++        let values = (0_i64..64).collect::<Vec<_>>();
++        let (context, registry, relation, binding, runtime) = scan_runtime_bundle(72, 965, &values);
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let query = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            value: Value::I64(37),
++            equivalence: sid(101),
++        };
++        let prepared = prepare_with_catalog(query, &context, &registry, &catalog).unwrap();
++        let workload = [SemanticIndexWorkloadSample {
++            plan: prepared.physical().clone(),
++            expected_executions: 2,
++        }];
++        let index = SemanticIndexBinding::single(relation, binding, 0, sid(101));
++        let cell = RuntimeRevisionCell::new(runtime);
++        let old_reader = cell.snapshot().unwrap();
++
++        let first = cell
++            .advise_semantic_indexes(&workload, SemanticIndexAdvisorPolicy::default(), &registry)
++            .unwrap();
++        let new_reader = cell.snapshot().unwrap();
++        assert_eq!(first.created, vec![index.clone()]);
++        assert_eq!(old_reader.root_version().raw(), 0);
++        assert_eq!(new_reader.root_version().raw(), 1);
++        assert!(old_reader.physical_store().semantic_index(&index).is_none());
++        assert!(new_reader.physical_store().semantic_index(&index).is_some());
++
++        let second = cell
++            .advise_semantic_indexes(&workload, SemanticIndexAdvisorPolicy::default(), &registry)
++            .unwrap();
++        assert_eq!(second.retained, vec![index]);
++        assert_eq!(cell.snapshot().unwrap().root_version().raw(), 1);
++    }
++
++    #[test]
+     fn competing_prepared_transitions_from_same_revision_cannot_both_publish() {
+         let (context, registry, relation, _, runtime) = scan_runtime_bundle(100, 967, &[1, 2]);
+         let delta_a = scan_delta(relation, &[3], &[1], &context, &registry);
+@@ -10990,6 +11613,361 @@
+         assert_eq!(stats.scanned_rows, 1);
+     }
+ 
++    fn advisor_text_fixture(
++        relation: SemanticId,
++        equivalence: SemanticId,
++        revision: u64,
++        layout_id: u64,
++        values: Vec<String>,
++    ) -> (
++        SemanticContext,
++        SemanticRegistry,
++        LayoutBinding,
++        PhysicalStore,
++        PreparedPlan,
++    ) {
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(revision));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(revision));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let layout = LayoutBinding {
++            id: LayoutId(layout_id.into()),
++            family: LayoutFamily::Columnar,
++        };
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::Text(values)]).unwrap(),
++            )
++            .unwrap();
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, layout);
++        let query = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            value: Value::Text("needle".into()),
++            equivalence,
++        };
++        let prepared = prepare_with_catalog(query, &context, &registry, &catalog).unwrap();
++        (context, registry, layout, store, prepared)
++    }
++
++    #[test]
++    fn semantic_index_advisor_amortizes_build_and_reuses_one_shared_index() {
++        let relation = sid(353);
++        let equivalence = sid(354);
++        let values = (0..64)
++            .map(|index| {
++                if index == 37 {
++                    "Needle".to_owned()
++                } else {
++                    format!("row-{index}")
++                }
++            })
++            .collect::<Vec<_>>();
++        let (context, registry, layout, mut store, prepared) =
++            advisor_text_fixture(relation, equivalence, 39, 942, values);
++        let workload = [
++            SemanticIndexWorkloadSample {
++                plan: prepared.physical().clone(),
++                expected_executions: 1,
++            },
++            SemanticIndexWorkloadSample {
++                plan: prepared.physical().clone(),
++                expected_executions: 1,
++            },
++        ];
++
++        let report = store
++            .advise_semantic_indexes(
++                &workload,
++                SemanticIndexAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        let index = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        assert_eq!(report.created, vec![index.clone()]);
++        assert!(report.rejected_unprofitable.is_empty());
++        assert_eq!(report.managed_key_cells, 64);
++        assert_eq!(store.semantic_indexes.len(), 1);
++        assert!(store.advisor_managed_semantic_indexes.contains(&index));
++
++        let (value, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(value.rows(), &[vec![Value::Text("Needle".into())]]);
++        assert_eq!(stats.persisted_index_hits, 1);
++    }
++
++    #[test]
++    fn semantic_index_advisor_discovers_access_path_below_project_boundary() {
++        let relation = sid(366);
++        let equivalence = sid(367);
++        let values = (0..64)
++            .map(|index| {
++                if index == 23 {
++                    "Needle".to_owned()
++                } else {
++                    format!("row-{index}")
++                }
++            })
++            .collect::<Vec<_>>();
++        let (context, registry, layout, mut store, filter) =
++            advisor_text_fixture(relation, equivalence, 44, 949, values);
++        let plan = Plan::Project {
++            input: Box::new(filter.physical().clone()),
++            columns: vec![0],
++        };
++        let report = store
++            .advise_semantic_indexes(
++                &[SemanticIndexWorkloadSample {
++                    plan,
++                    expected_executions: 2,
++                }],
++                SemanticIndexAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(
++            report.created,
++            vec![SemanticIndexBinding::single(
++                relation,
++                layout,
++                0,
++                equivalence
++            )]
++        );
++    }
++
++    #[test]
++    fn semantic_index_advisor_rejects_one_shot_build_that_does_not_amortize() {
++        let relation = sid(355);
++        let equivalence = sid(356);
++        let values = (0..64)
++            .map(|index| {
++                if index == 17 {
++                    "Needle".to_owned()
++                } else {
++                    format!("row-{index}")
++                }
++            })
++            .collect::<Vec<_>>();
++        let (context, registry, layout, mut store, prepared) =
++            advisor_text_fixture(relation, equivalence, 40, 943, values);
++        let index = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        let report = store
++            .advise_semantic_indexes(
++                &[SemanticIndexWorkloadSample {
++                    plan: prepared.physical().clone(),
++                    expected_executions: 1,
++                }],
++                SemanticIndexAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(report.rejected_unprofitable, vec![index.clone()]);
++        assert!(report.created.is_empty());
++        assert!(store.semantic_index(&index).is_none());
++    }
++
++    fn advisor_budget_fixture() -> (
++        SemanticContext,
++        SemanticRegistry,
++        PhysicalStore,
++        Plan,
++        Plan,
++        SemanticIndexBinding,
++        SemanticIndexBinding,
++    ) {
++        let relation_a = sid(357);
++        let relation_b = sid(358);
++        let equivalence = sid(359);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(41));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(41));
++        for relation in [relation_a, relation_b] {
++            schema
++                .define_relation(RelationDef {
++                    id: relation,
++                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
++                    semantics: RelationSemantics::Bag {
++                        column_equivalences: vec![equivalence],
++                    },
++                })
++                .unwrap();
++        }
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let layout_a = LayoutBinding {
++            id: LayoutId(944),
++            family: LayoutFamily::Columnar,
++        };
++        let layout_b = LayoutBinding {
++            id: LayoutId(945),
++            family: LayoutFamily::Columnar,
++        };
++        let values = (0..64)
++            .map(|index| {
++                if index == 7 {
++                    "Needle".to_owned()
++                } else {
++                    format!("row-{index}")
++                }
++            })
++            .collect::<Vec<_>>();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation_a,
++                layout_a,
++                NativeRelation::typed_columnar(vec![NativeColumn::Text(values.clone())]).unwrap(),
++            )
++            .unwrap();
++        store
++            .install(
++                relation_b,
++                layout_b,
++                NativeRelation::typed_columnar(vec![NativeColumn::Text(values)]).unwrap(),
++            )
++            .unwrap();
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation_a, layout_a);
++        catalog.bind_relation(relation_b, layout_b);
++        let filter = |relation| RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            value: Value::Text("needle".into()),
++            equivalence,
++        };
++        let plan_a = prepare_with_catalog(filter(relation_a), &context, &registry, &catalog)
++            .unwrap()
++            .physical()
++            .clone();
++        let plan_b = prepare_with_catalog(filter(relation_b), &context, &registry, &catalog)
++            .unwrap()
++            .physical()
++            .clone();
++        let index_a = SemanticIndexBinding::single(relation_a, layout_a, 0, equivalence);
++        let index_b = SemanticIndexBinding::single(relation_b, layout_b, 0, equivalence);
++        (context, registry, store, plan_a, plan_b, index_a, index_b)
++    }
++
++    #[test]
++    fn semantic_index_advisor_budget_evicts_only_its_own_lower_value_index() {
++        let (context, registry, mut store, plan_a, plan_b, index_a, index_b) =
++            advisor_budget_fixture();
++        let policy = SemanticIndexAdvisorPolicy {
++            max_managed_key_cells: 64,
++        };
++
++        let first = store
++            .advise_semantic_indexes(
++                &[SemanticIndexWorkloadSample {
++                    plan: plan_a,
++                    expected_executions: 3,
++                }],
++                policy,
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(first.created, vec![index_a.clone()]);
++
++        store
++            .install_semantic_index(index_b.clone(), &context, &registry)
++            .unwrap();
++        let second = store
++            .advise_semantic_indexes(
++                &[SemanticIndexWorkloadSample {
++                    plan: plan_b,
++                    expected_executions: 3,
++                }],
++                SemanticIndexAdvisorPolicy {
++                    max_managed_key_cells: 0,
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(second.evicted, vec![index_a.clone()]);
++        assert_eq!(second.reused_existing, vec![index_b.clone()]);
++        assert!(store.semantic_index(&index_a).is_none());
++        assert!(store.semantic_index(&index_b).is_some());
++        assert!(!store.advisor_managed_semantic_indexes.contains(&index_b));
++    }
++
++    #[test]
++    fn semantic_index_advisor_rebuilds_stale_gamma_bound_index_before_reuse() {
++        let relation = sid(360);
++        let equivalence = sid(361);
++        let values = (0..64)
++            .map(|index| match index {
++                10 => "Needle".to_owned(),
++                11 => "needle".to_owned(),
++                _ => format!("row-{index}"),
++            })
++            .collect::<Vec<_>>();
++        let (context, mut registry, _layout, mut store, prepared) =
++            advisor_text_fixture(relation, equivalence, 42, 946, values);
++        let workload = [SemanticIndexWorkloadSample {
++            plan: prepared.physical().clone(),
++            expected_executions: 3,
++        }];
++        let first = store
++            .advise_semantic_indexes(
++                &workload,
++                SemanticIndexAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(first.created.len(), 1);
++
++        let mut changed_context = context.clone();
++        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        changed_context
++            .environment
++            .pin_module(equivalence, exact_digest);
++        let rebuilt = store
++            .advise_semantic_indexes(
++                &workload,
++                SemanticIndexAdvisorPolicy::default(),
++                &changed_context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(rebuilt.rebuilt.len(), 1);
++        let index = &rebuilt.rebuilt[0];
++        assert!(
++            store
++                .semantic_index(index)
++                .unwrap()
++                .compatible_with(&changed_context, &registry)
++                .unwrap()
++        );
++    }
++
+     fn text_i64_semantic_fixture(
+         relations: &[SemanticId],
+         text_equivalence: SemanticId,
+@@ -11042,6 +12020,94 @@
+     }
+ 
+     #[test]
++    fn semantic_index_advisor_builds_profitable_composite_join_index() {
++        let left_relation = sid(362);
++        let right_relation = sid(363);
++        let text_equivalence = sid(364);
++        let i64_equivalence = sid(365);
++        let (context, registry) = text_i64_semantic_fixture(
++            &[left_relation, right_relation],
++            text_equivalence,
++            i64_equivalence,
++            43,
++        );
++        let left_layout = LayoutBinding {
++            id: LayoutId(947),
++            family: LayoutFamily::Columnar,
++        };
++        let right_layout = LayoutBinding {
++            id: LayoutId(948),
++            family: LayoutFamily::Columnar,
++        };
++        let left_values = [("K-7", 7), ("K-37", 37), ("missing", 999)];
++        let right_values = (0..128)
++            .map(|index| (format!("K-{index}"), i64::from(index)))
++            .collect::<Vec<_>>();
++        let mut store = PhysicalStore::default();
++        store
++            .install(left_relation, left_layout, text_i64_native(&left_values))
++            .unwrap();
++        store
++            .install(
++                right_relation,
++                right_layout,
++                NativeRelation::typed_columnar(vec![
++                    NativeColumn::Text(right_values.iter().map(|(text, _)| text.clone()).collect()),
++                    NativeColumn::I64(right_values.iter().map(|(_, number)| *number).collect()),
++                ])
++                .unwrap(),
++            )
++            .unwrap();
++        let query = RelExpr::FilterEqColumns {
++            input: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(left_relation)),
++                right: Box::new(RelExpr::Scan(right_relation)),
++                left_column: 0,
++                right_column: 0,
++                equivalence: text_equivalence,
++            }),
++            left_column: 1,
++            right_column: 3,
++            equivalence: i64_equivalence,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(left_relation, left_layout);
++        catalog.bind_relation(right_relation, right_layout);
++        let prepared = prepare_with_catalog(query.clone(), &context, &registry, &catalog).unwrap();
++
++        let report = store
++            .advise_semantic_indexes(
++                &[SemanticIndexWorkloadSample {
++                    plan: prepared.physical().clone(),
++                    expected_executions: 1,
++                }],
++                SemanticIndexAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(report.created.len(), 1);
++        assert_eq!(report.created[0].relation, right_relation);
++        assert_eq!(report.created[0].key_parts.len(), 2);
++
++        let (value, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(stats.persisted_index_hits, 1);
++        let mut model = kernel_model::FiniteModel::default();
++        model
++            .relations
++            .insert(left_relation, text_i64_rows(&left_values));
++        model.relations.insert(
++            right_relation,
++            right_values
++                .iter()
++                .map(|(text, number)| vec![Value::Text(text.clone()), Value::I64(*number)])
++                .collect(),
++        );
++        let reference = query.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(value, reference);
++    }
++
++    #[test]
+     fn composite_mixed_type_semantic_index_drives_filter_chain_and_maintains_delta() {
+         let relation = sid(346);
+         let text_equivalence = sid(347);

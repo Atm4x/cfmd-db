@@ -1,0 +1,12 @@
+Pass43 static audit
+
+Production source modified after freeze check:
+2026-09-20 11:17:14.153540921 +0000 crates/kernel-plan/src/lib.rs
+
+declared Rust tests: 326
+kernel-plan tests: 98
+Rust LOC under crates/: 43838
+unsafe occurrences under crates/: 0
+external registry/git source markers: 0
+
+Advisor assertion-side-effect audit:

@@ -1,0 +1,14 @@
+[package]
+name = "kernel-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-identity = { path = "../kernel-identity" }
+kernel-types = { path = "../kernel-types" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-lifecycle = { path = "../kernel-lifecycle" }
+
+[lints]
+workspace = true

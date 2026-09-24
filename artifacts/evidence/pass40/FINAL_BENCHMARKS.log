@@ -1,0 +1,32 @@
+== semantic_index_join_bench ==
+-- run 1
+workload=TextAsciiCaseInsensitive,left_rows=1,delta_rows=1,rounds=7
+rows=1000,indexed_median_ns=1318,legacy_scan_median_ns=558,scan_over_indexed_x1000=423
+rows=10000,indexed_median_ns=1348,legacy_scan_median_ns=5279,scan_over_indexed_x1000=3916
+rows=50000,indexed_median_ns=1290,legacy_scan_median_ns=23788,scan_over_indexed_x1000=18440
+-- run 2
+workload=TextAsciiCaseInsensitive,left_rows=1,delta_rows=1,rounds=7
+rows=1000,indexed_median_ns=1468,legacy_scan_median_ns=561,scan_over_indexed_x1000=382
+rows=10000,indexed_median_ns=1302,legacy_scan_median_ns=5111,scan_over_indexed_x1000=3925
+rows=50000,indexed_median_ns=1368,legacy_scan_median_ns=23625,scan_over_indexed_x1000=17269
+-- run 3
+workload=TextAsciiCaseInsensitive,left_rows=1,delta_rows=1,rounds=7
+rows=1000,indexed_median_ns=1288,legacy_scan_median_ns=550,scan_over_indexed_x1000=427
+rows=10000,indexed_median_ns=1357,legacy_scan_median_ns=5071,scan_over_indexed_x1000=3736
+rows=50000,indexed_median_ns=1428,legacy_scan_median_ns=24218,scan_over_indexed_x1000=16959
+== maintained_group_bench ==
+-- run 1
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=380
+baseline_median_ns=159
+ratio_milli=2389
+-- run 2
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=631
+baseline_median_ns=163
+ratio_milli=3871
+-- run 3
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=353
+baseline_median_ns=151
+ratio_milli=2337

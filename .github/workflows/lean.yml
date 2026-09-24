@@ -1,0 +1,51 @@
+name: Lean formal boundary
+
+on:
+  push:
+    paths:
+      - 'formal/**'
+      - 'lean-toolchain'
+      - 'docs/spec/CFMD_CORE_SPEC.md'
+      - 'crates/kernel-durability/**'
+      - 'crates/kernel-schema/**'
+      - 'crates/kernel-query/**'
+      - 'crates/kernel-plan/**'
+      - 'crates/kernel-change/**'
+      - 'crates/kernel-violation/**'
+      - 'crates/kernel-retention/**'
+      - '.github/workflows/lean.yml'
+  pull_request:
+    paths:
+      - 'formal/**'
+      - 'lean-toolchain'
+      - 'docs/spec/CFMD_CORE_SPEC.md'
+      - 'crates/kernel-durability/**'
+      - 'crates/kernel-schema/**'
+      - 'crates/kernel-query/**'
+      - 'crates/kernel-plan/**'
+      - 'crates/kernel-change/**'
+      - 'crates/kernel-violation/**'
+      - 'crates/kernel-retention/**'
+      - '.github/workflows/lean.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Install pinned Lean
+        run: |
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.34.0
+          "$HOME/.elan/bin/elan" override set leanprover/lean4:v4.34.0
+          "$HOME/.elan/bin/lean" --version
+      - name: Lean + source-refinement gates
+        run: ./scripts/ci-formal.sh

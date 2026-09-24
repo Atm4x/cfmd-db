@@ -1,0 +1,15 @@
+[package]
+name = "kernel-lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-identity = { path = "../kernel-identity" }
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+kernel-grounded-closure = { path = "../kernel-grounded-closure" }

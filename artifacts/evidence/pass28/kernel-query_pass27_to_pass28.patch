@@ -1,0 +1,276 @@
+--- a/crates/kernel-query/src/lib.rs
++++ b/crates/kernel-query/src/lib.rs
+@@ -1556,6 +1556,39 @@
+     semantic_context: kernel_schema::SemanticContext,
+     result_type: RelType,
+     node: MaintainedRelPlanNode,
++    transition_epoch: u64,
++    revision: Option<kernel_types::RevisionId>,
++}
++
++/// Correctness-first prepared maintained-plan transition.
++///
++/// The full source snapshot is retained intentionally so commit freshness is an
++/// exact state check rather than an epoch-only heuristic. A later implementation
++/// may replace this clone with a collision-resistant state/version identity.
++#[derive(Debug, PartialEq, Eq)]
++pub struct PreparedMaterializedRelPlanTransition {
++    source_epoch: u64,
++    source_revision: Option<kernel_types::RevisionId>,
++    source_state: Box<MaterializedRelPlanState>,
++    candidate: Box<MaterializedRelPlanState>,
++    output_delta: RelationDelta,
++}
++
++impl PreparedMaterializedRelPlanTransition {
++    #[must_use]
++    pub fn output_delta(&self) -> &RelationDelta {
++        &self.output_delta
++    }
++
++    pub fn into_candidate_if_current(
++        self,
++        current: &MaterializedRelPlanState,
++    ) -> Result<(MaterializedRelPlanState, RelationDelta), RelQueryError> {
++        if !current.can_commit_prepared(&self) {
++            return Err(RelQueryError::StalePreparedTransition);
++        }
++        Ok((*self.candidate, self.output_delta))
++    }
+ }
+ 
+ impl MaterializedRelPlanState {
+@@ -1573,6 +1606,8 @@
+             semantic_context: context.clone(),
+             result_type,
+             node,
++            transition_epoch: 0,
++            revision: None,
+         })
+     }
+ 
+@@ -1806,6 +1841,21 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<RelationDelta, RelQueryError> {
++        if self.revision.is_some() {
++            return Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition);
++        }
++        let mut candidate = self.clone();
++        let output = candidate.apply_relation_deltas_in_place(deltas, context, registry)?;
++        *self = candidate;
++        Ok(output)
++    }
++
++    fn apply_relation_deltas_in_place(
++        &mut self,
++        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelationDelta, RelQueryError> {
+         if context != &self.semantic_context {
+             return Err(RelQueryError::SemanticRevisionMismatch);
+         }
+@@ -1815,7 +1865,13 @@
+             }
+         }
+         self.validate_leaf_deltas(deltas, context, registry)?;
+-        self.apply_relation_deltas_inner(deltas, context, registry)
++        let next_epoch = self
++            .transition_epoch
++            .checked_add(1)
++            .ok_or(RelQueryError::TransitionEpochExhausted)?;
++        let output = self.apply_relation_deltas_inner(deltas, context, registry)?;
++        self.transition_epoch = next_epoch;
++        Ok(output)
+     }
+ 
+     /// Attaches authoritative storage row identities to every `Scan` of one
+@@ -1827,6 +1883,22 @@
+         relation: kernel_types::SemanticId,
+         ids: &[kernel_types::StableRowHandle],
+     ) -> Result<(), RelQueryError> {
++        let next_epoch = self
++            .transition_epoch
++            .checked_add(1)
++            .ok_or(RelQueryError::TransitionEpochExhausted)?;
++        let mut candidate = self.clone();
++        candidate.attach_storage_handles_inner(relation, ids)?;
++        candidate.transition_epoch = next_epoch;
++        *self = candidate;
++        Ok(())
++    }
++
++    fn attach_storage_handles_inner(
++        &mut self,
++        relation: kernel_types::SemanticId,
++        ids: &[kernel_types::StableRowHandle],
++    ) -> Result<(), RelQueryError> {
+         match &mut self.node {
+             MaintainedRelPlanNode::Scan {
+                 relation: current,
+@@ -1849,24 +1921,131 @@
+             | MaintainedRelPlanNode::PromoteToBag { input }
+             | MaintainedRelPlanNode::Group { input, .. }
+             | MaintainedRelPlanNode::TopK { input, .. } => {
+-                input.attach_storage_handles(relation, ids)
++                input.attach_storage_handles_inner(relation, ids)
+             }
+             MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.attach_storage_handles(relation, ids)?;
+-                right.attach_storage_handles(relation, ids)
++                left.attach_storage_handles_inner(relation, ids)?;
++                right.attach_storage_handles_inner(relation, ids)
+             }
+         }
+     }
+ 
++    /// Binds this maintained snapshot to the logical revision it represents.
++    /// A bound state can advance only through a revision-aware prepared transition.
++    pub fn bind_revision(
++        &mut self,
++        revision: kernel_types::RevisionId,
++    ) -> Result<(), RelQueryError> {
++        match self.revision {
++            Some(current) if current == revision => return Ok(()),
++            Some(_) => return Err(RelQueryError::RevisionBindingMismatch),
++            None => {}
++        }
++        let next_epoch = self
++            .transition_epoch
++            .checked_add(1)
++            .ok_or(RelQueryError::TransitionEpochExhausted)?;
++        self.revision = Some(revision);
++        self.transition_epoch = next_epoch;
++        Ok(())
++    }
++
++    #[must_use]
++    pub const fn revision(&self) -> Option<kernel_types::RevisionId> {
++        self.revision
++    }
++
++    #[must_use]
++    pub const fn transition_epoch(&self) -> u64 {
++        self.transition_epoch
++    }
++
++    fn prepare_storage_certified_deltas(
++        &self,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<PreparedMaterializedRelPlanTransition, RelQueryError> {
++        if self.revision.is_some() {
++            return Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition);
++        }
++        let mut candidate = self.clone();
++        let output_delta =
++            candidate.apply_storage_certified_deltas_in_place(deltas, context, registry)?;
++        Ok(PreparedMaterializedRelPlanTransition {
++            source_epoch: self.transition_epoch,
++            source_revision: None,
++            source_state: Box::new(self.clone()),
++            candidate: Box::new(candidate),
++            output_delta,
++        })
++    }
++
++    pub fn prepare_storage_certified_deltas_for_revision(
++        &self,
++        source_revision: kernel_types::RevisionId,
++        target_revision: kernel_types::RevisionId,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<PreparedMaterializedRelPlanTransition, RelQueryError> {
++        if source_revision == target_revision {
++            return Err(RelQueryError::InvalidRevisionTransition);
++        }
++        if self.revision != Some(source_revision) {
++            return Err(RelQueryError::RevisionBindingMismatch);
++        }
++        let mut candidate = self.clone();
++        let output_delta =
++            candidate.apply_storage_certified_deltas_in_place(deltas, context, registry)?;
++        candidate.revision = Some(target_revision);
++        Ok(PreparedMaterializedRelPlanTransition {
++            source_epoch: self.transition_epoch,
++            source_revision: Some(source_revision),
++            source_state: Box::new(self.clone()),
++            candidate: Box::new(candidate),
++            output_delta,
++        })
++    }
++
++    #[must_use]
++    fn can_commit_prepared(
++        &self,
++        prepared: &PreparedMaterializedRelPlanTransition,
++    ) -> bool {
++        self == prepared.source_state.as_ref()
++            && self.transition_epoch == prepared.source_epoch
++            && prepared
++                .source_revision
++                .is_none_or(|revision| self.revision == Some(revision))
++            && self.semantic_context == prepared.candidate.semantic_context
++            && self.query == prepared.candidate.query
++    }
++
+     /// Applies storage-certified base-table deltas without repeating semantic
+-    /// membership search inside `Scan` nodes. Row identity is resolved once by
+-    /// the authoritative storage layer and propagated here as stable handles.
++    /// membership search inside `Scan` nodes. Revision-bound states must use the
++    /// joint prepared-transition path instead of this legacy convenience entrypoint.
+     pub fn apply_storage_certified_deltas(
+         &mut self,
+         deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<RelationDelta, RelQueryError> {
++        if self.revision.is_some() {
++            return Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition);
++        }
++        let prepared = self.prepare_storage_certified_deltas(deltas, context, registry)?;
++        let (candidate, output_delta) = prepared.into_candidate_if_current(self)?;
++        *self = candidate;
++        Ok(output_delta)
++    }
++
++    fn apply_storage_certified_deltas_in_place(
++        &mut self,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelationDelta, RelQueryError> {
+         if context != &self.semantic_context {
+             return Err(RelQueryError::SemanticRevisionMismatch);
+         }
+@@ -1876,8 +2055,14 @@
+             }
+         }
+         self.validate_certified_leaf_deltas(deltas, context, registry)?;
++        let next_epoch = self
++            .transition_epoch
++            .checked_add(1)
++            .ok_or(RelQueryError::TransitionEpochExhausted)?;
+         self.apply_certified_leaf_deltas(deltas)?;
+-        self.propagate_certified_deltas_inner(deltas, context, registry)
++        let output = self.propagate_certified_deltas_inner(deltas, context, registry)?;
++        self.transition_epoch = next_epoch;
++        Ok(output)
+     }
+ 
+     fn validate_certified_leaf_deltas(
+@@ -4355,6 +4540,11 @@
+     OrderingNotCongruentWithEquality,
+     InconsistentIncrementalDelta,
+     SemanticRevisionMismatch,
++    RevisionBindingMismatch,
++    InvalidRevisionTransition,
++    RevisionBoundMutationRequiresPreparedTransition,
++    StalePreparedTransition,
++    TransitionEpochExhausted,
+     Semantic(kernel_semantics::SemanticError),
+     Aggregate(kernel_aggregate::AggregateError),
+ }

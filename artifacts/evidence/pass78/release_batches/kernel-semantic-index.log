@@ -1,0 +1,14 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_semantic_index-321b3308708491fa)
+
+running 7 tests
+test tests::binding_rejects_revision_digest_and_encoding_mismatch ... ok
+test tests::compatibility_reports_exact_rebuild_reason ... ok
+test tests::duplicate_bucket_membership_and_reverse_map_are_exact ... ok
+test tests::binding_rejects_same_nominal_revision_with_changed_structural_definition ... ok
+test tests::bucket_preserves_identity_insertion_order_and_same_key_reinsert_is_stable ... ok
+test tests::rebinding_identity_removes_dead_bucket ... ok
+test tests::retained_size_estimate_accounts_for_bucket_and_reverse_payloads ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,18 @@
+[package]
+name = "kernel-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-aggregate = { path = "../kernel-aggregate" }
+kernel-change = { path = "../kernel-change" }
+kernel-fixpoint = { path = "../kernel-fixpoint" }
+kernel-model = { path = "../kernel-model" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-semantic-index = { path = "../kernel-semantic-index" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=2550
+baseline_median_ns=111
+ratio_milli=22972
+full_replay_median_like_ns=359576
+maintained_vs_full_replay_milli=7
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=2487
+baseline_median_ns=111
+ratio_milli=22405
+full_replay_median_like_ns=314201
+maintained_vs_full_replay_milli=7
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=2426
+baseline_median_ns=119
+ratio_milli=20386
+full_replay_median_like_ns=327806
+maintained_vs_full_replay_milli=7
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=2500
+baseline_median_ns=120
+ratio_milli=20833
+full_replay_median_like_ns=350165
+maintained_vs_full_replay_milli=7
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=2371
+baseline_median_ns=120
+ratio_milli=19758
+full_replay_median_like_ns=325566
+maintained_vs_full_replay_milli=7

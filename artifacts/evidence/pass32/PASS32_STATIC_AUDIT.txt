@@ -1,0 +1,75 @@
+PASS32 STATIC AUDIT
+UTC 2026-09-19T22:35:53Z
+
+[workspace metrics]
+declared_tests=260
+kernel_plan_tests=65
+kernel_durability_tests=13
+workspace_crates=20
+rust_loc=31959
+external_cargo_sources=0
+unsafe_occurrences=0
+
+[authority audit: durability must not serialize physical/runtime authority]
+
+[WAL creation/locking]
+257:            .create_new(true)
+261:        file.lock()?;
+281:        file.lock()?;
+290:            file.sync_all()?;
+333:        if let Err(error) = self.file.sync_data() {
+1459:            file.sync_all().unwrap();
+
+[durability dependencies]
+[package]
+name = "kernel-durability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-model = { path = "../kernel-model" }
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true
+
+[mainline durable ordering]
+    }
+
+    /// Commits one runtime revision through the durable logical WAL boundary.
+    ///
+    /// The exact ordering is:
+    ///
+    /// 1. build the detached runtime candidate;
+    /// 2. durably append PREPARE;
+    /// 3. acquire the exclusive freshness seal;
+    /// 4. durably append COMMIT;
+    /// 5. publish the already-sealed runtime root infallibly.
+    ///
+    /// A stale transition discovered at step 3 leaves only an uncommitted
+    /// durable PREPARE, which recovery ignores. If the COMMIT durability call
+    /// returns an error, the runtime root is not published and the caller must
+    /// treat the durable outcome as uncertain until WAL recovery.
+    pub fn commit_revision_durable<D: RevisionDurability>(
+        &self,
+        request: &RevisionTransitionRequest<'_>,
+        durability: &mut D,
+    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+        let prepared = self.prepare_revision(request)?;
+        let durable_descriptor = prepared.descriptor().durable_descriptor();
+        let durable_prepare = durability
+            .durably_prepare(&durable_descriptor)
+            .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let sealed = prepared.seal(self)?;
+        let durable = durability
+            .durably_commit(durable_prepare)
+            .map_err(DurableRuntimeCommitError::CommitDurabilityUncertain)?;
+        let output_deltas = sealed.publish();
+        Ok(DurableRuntimeCommitReceipt {
+            durable,
+            output_deltas,
+        })
+    }
+
+    /// Reconstructible index publication is also a whole-root swap. Existing

@@ -1,0 +1,464 @@
+--- /mnt/data/cfmd_pass75_work/crates/kernel-plan/src/lib.rs	2026-09-21 12:54:39.392785861 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-21 13:22:50.156527951 +0000
+@@ -1262,6 +1262,26 @@
+     pub total_estimated_bytes_after: usize,
+ }
+ 
++impl PhysicalRecoveryReport {
++    /// Advisor-owned recipes that were compatible but not admitted by the
++    /// selected recovery resource policy. These remain reconstructible hints,
++    /// not logical authority, and may be retried after the runtime starts
++    /// serving without reopening the durable generation.
++    #[must_use]
++    pub fn deferred_advisor_artifacts(&self) -> Vec<DurablePhysicalArtifactSpec> {
++        let mut deferred = self
++            .skipped_key_evaluation_budget
++            .iter()
++            .chain(self.skipped_estimated_byte_budget.iter())
++            .filter(|spec| durable_physical_artifact_is_advisor_managed(spec))
++            .cloned()
++            .collect::<Vec<_>>();
++        deferred.sort();
++        deferred.dedup();
++        deferred
++    }
++}
++
+ impl From<kernel_revision::RevisionError> for RuntimeRecoveryError {
+     fn from(value: kernel_revision::RevisionError) -> Self {
+         Self::Revision(value)
+@@ -2508,6 +2528,67 @@
+         *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
+         Ok(report)
+     }
++
++    fn resume_deferred_physical_recovery(
++        &self,
++        specs: &[DurablePhysicalArtifactSpec],
++        policy: PhysicalRecoveryPolicy,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<PhysicalRecoveryReport, PhysicalExecutionError> {
++        let mut state = self
++            .root
++            .write()
++            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
++        let RuntimeRevisionCellState::Serving(live) = &*state else {
++            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
++        };
++        let deferred = specs
++            .iter()
++            .filter(|spec| durable_physical_artifact_is_advisor_managed(spec))
++            .cloned()
++            .collect::<Vec<_>>();
++        if deferred.is_empty() {
++            return Ok(PhysicalRecoveryReport {
++                total_estimated_bytes_after: live
++                    .physical
++                    .artifact_memory_report()
++                    .total_estimated_retained_bytes,
++                ..PhysicalRecoveryReport::default()
++            });
++        }
++
++        let mut physical = live.physical.clone();
++        let report = physical.restore_durable_physical_artifacts(
++            &deferred,
++            &live.relation_layouts,
++            policy,
++            live.revision.semantic_context(),
++            registry,
++        );
++        if report.rebuilt.is_empty() {
++            return Ok(report);
++        }
++
++        let next_version = live
++            .root_identity
++            .version
++            .0
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
++        let candidate = RuntimeRevisionBundle {
++            root_identity: RuntimeRootIdentity {
++                root_id: live.root_identity.root_id,
++                version: RuntimeRootVersion(next_version),
++            },
++            revision: live.revision.clone(),
++            physical,
++            relation_layouts: live.relation_layouts.clone(),
++            materialization_specs: live.materialization_specs.clone(),
++            materializations: live.materializations.clone(),
++        };
++        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
++        Ok(report)
++    }
+ }
+ 
+ impl DurableRuntime {
+@@ -2647,6 +2728,19 @@
+         self.cell.snapshot()
+     }
+ 
++    /// Retries advisor-owned physical recipes that a prior bounded reopen left
++    /// deferred. Logical Revision and durable authority remain unchanged; any
++    /// accepted artifacts are published as a new immutable runtime root.
++    pub fn resume_deferred_physical_recovery(
++        &self,
++        prior_report: &PhysicalRecoveryReport,
++        policy: PhysicalRecoveryPolicy,
++    ) -> Result<PhysicalRecoveryReport, PhysicalExecutionError> {
++        let deferred = prior_report.deferred_advisor_artifacts();
++        self.cell
++            .resume_deferred_physical_recovery(&deferred, policy, &self.registry)
++    }
++
+     pub fn commit_revision(
+         &self,
+         transaction_id: ClientTransactionId,
+@@ -3029,6 +3123,21 @@
+         self.reopen_locked(&mut slot)
+     }
+ 
++    pub fn resume_deferred_physical_recovery(
++        &self,
++        prior_report: &PhysicalRecoveryReport,
++        policy: PhysicalRecoveryPolicy,
++    ) -> Result<PhysicalRecoveryReport, RuntimeRecoveryError> {
++        let slot = self
++            .runtime
++            .lock()
++            .map_err(|_| RuntimeRecoveryError::Durability(DurabilityError::Poisoned))?;
++        slot.as_ref()
++            .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
++            .resume_deferred_physical_recovery(prior_report, policy)
++            .map_err(RuntimeRecoveryError::from)
++    }
++
+     pub fn snapshot(&self) -> Result<RuntimeRevisionSnapshot, RuntimeRecoveryError> {
+         let mut slot = self
+             .runtime
+@@ -4066,12 +4175,8 @@
+             .filter(|spec| !matches!(spec, DurablePhysicalArtifactSpec::RelationLayout { .. }))
+             .cloned()
+             .collect::<Vec<_>>();
+-        optional_specs.sort_by(|left, right| {
+-            durable_physical_artifact_is_advisor_managed(left)
+-                .cmp(&durable_physical_artifact_is_advisor_managed(right))
+-                .then_with(|| left.cmp(right))
+-        });
+-
++        optional_specs.sort();
++        let mut scheduled_specs = Vec::with_capacity(optional_specs.len());
+         for spec in optional_specs {
+             // Recipes describe reconstructible optimization state, never logical
+             // authority. Manual pins get deterministic priority over advisor-owned
+@@ -4083,6 +4188,21 @@
+                 report.dropped_incompatible.push(spec);
+                 continue;
+             };
++            scheduled_specs.push((spec, key_evaluations));
++        }
++        scheduled_specs.sort_by(|(left, left_work), (right, right_work)| {
++            let left_advisor = durable_physical_artifact_is_advisor_managed(left);
++            let right_advisor = durable_physical_artifact_is_advisor_managed(right);
++            left_advisor.cmp(&right_advisor).then_with(|| {
++                if left_advisor {
++                    left_work.cmp(right_work).then_with(|| left.cmp(right))
++                } else {
++                    left.cmp(right)
++                }
++            })
++        });
++
++        for (spec, key_evaluations) in scheduled_specs {
+             let advisor_managed = durable_physical_artifact_is_advisor_managed(&spec);
+             let next_total_key_evaluations = report
+                 .attempted_rebuild_key_evaluations
+@@ -19418,6 +19538,91 @@
+         )
+     }
+ 
++    fn advisor_i64_recovery_bundle(
++        revision_id: u64,
++        left_values: &[i64],
++        right_values: &[i64],
++    ) -> (
++        SemanticRegistry,
++        I64IndexBinding,
++        I64IndexBinding,
++        RuntimeRevisionBundle,
++    ) {
++        let (context, registry, left, right, equivalence) = two_relation_context();
++        let left_layout = LayoutBinding {
++            id: LayoutId(9_182),
++            family: LayoutFamily::Columnar,
++        };
++        let right_layout = LayoutBinding {
++            id: LayoutId(9_183),
++            family: LayoutFamily::Columnar,
++        };
++        let mut model = kernel_model::FiniteModel::default();
++        for (relation, values) in [(left, left_values), (right, right_values)] {
++            model.relations.insert(
++                relation,
++                values
++                    .iter()
++                    .copied()
++                    .map(|value| vec![Value::I64(value)])
++                    .collect(),
++            );
++        }
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(revision_id),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let mut store = PhysicalStore::default();
++        for (relation, layout, values) in [
++            (left, left_layout, left_values),
++            (right, right_layout, right_values),
++        ] {
++            store
++                .install(
++                    relation,
++                    layout,
++                    NativeRelation::typed_columnar(vec![NativeColumn::I64(values.to_vec())])
++                        .unwrap(),
++                )
++                .unwrap();
++        }
++        let left_index = I64IndexBinding {
++            relation: left,
++            layout: left_layout,
++            key_column: 0,
++            equivalence,
++        };
++        let right_index = I64IndexBinding {
++            relation: right,
++            layout: right_layout,
++            key_column: 0,
++            equivalence,
++        };
++        for binding in [left_index, right_index] {
++            store
++                .install_i64_index(binding, &context, &registry)
++                .unwrap();
++            store
++                .advisor_managed_artifacts_mut()
++                .insert(ManagedPhysicalArtifact::I64Index(binding));
++        }
++        let root = RuntimeRevisionBundle::build(
++            revision,
++            store,
++            BTreeMap::from([(left, left_layout), (right, right_layout)]),
++            &[],
++            &registry,
++        )
++        .unwrap();
++        (registry, left_index, right_index, root)
++    }
++
+     #[test]
+     fn multi_relation_revision_publishes_one_coherent_join_snapshot() {
+         let (context, registry, left, right, left_binding, right_binding, query, runtime) =
+@@ -27470,6 +27675,195 @@
+         );
+         drop(supervisor);
+         std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
++        let dir = durable_test_dir("deferred-physical-recovery-resume");
++        let (context, registry, relation, layout, mut root) =
++            scan_runtime_bundle(5_178, 9_178, &[1, 2, 3, 4]);
++        let semantic = SemanticIndexBinding::single(relation, layout, 0, sid(101));
++        root.physical
++            .install_semantic_index(semantic.clone(), &context, &registry)
++            .unwrap();
++        root.physical
++            .advisor_managed_artifacts_mut()
++            .insert(ManagedPhysicalArtifact::SemanticIndex(semantic.clone()));
++        drop(DurableRuntime::create(root, &dir, &registry).unwrap());
++
++        let (runtime, initial) = DurableRuntime::open_with_recovery_policy(
++            &dir,
++            PhysicalRecoveryPolicy {
++                max_advisor_rebuild_key_evaluations: 0,
++                ..PhysicalRecoveryPolicy::default()
++            },
++        )
++        .unwrap();
++        assert_eq!(initial.deferred_advisor_artifacts().len(), 1);
++        let before = runtime.snapshot().unwrap();
++        let source_version = before.root_version();
++        assert_eq!(before.revision_id(), RevisionId::new(5_178));
++        assert!(before.physical_store().semantic_index(&semantic).is_none());
++        drop(before);
++
++        let resumed = runtime
++            .resume_deferred_physical_recovery(&initial, PhysicalRecoveryPolicy::default())
++            .unwrap();
++        assert_eq!(resumed.rebuilt.len(), 1);
++        assert!(resumed.deferred_advisor_artifacts().is_empty());
++        let after = runtime.snapshot().unwrap();
++        assert_eq!(after.revision_id(), RevisionId::new(5_178));
++        assert_eq!(after.root_version().0, source_version.0 + 1);
++        assert!(after.physical_store().semantic_index(&semantic).is_some());
++        assert!(
++            after
++                .physical_store()
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticIndex(semantic.clone()))
++        );
++        drop(after);
++
++        runtime.checkpoint().unwrap();
++        drop(runtime);
++        let (reopened, second) = DurableRuntime::open_with_recovery_policy(
++            &dir,
++            PhysicalRecoveryPolicy {
++                max_advisor_rebuild_key_evaluations: 0,
++                ..PhysicalRecoveryPolicy::default()
++            },
++        )
++        .unwrap();
++        assert_eq!(second.deferred_advisor_artifacts().len(), 1);
++        assert!(
++            reopened
++                .snapshot()
++                .unwrap()
++                .physical_store()
++                .semantic_index(&semantic)
++                .is_none()
++        );
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn bounded_recovery_schedules_cheaper_advisor_rebuild_before_semantic_id_order() {
++        let dir = durable_test_dir("bounded-physical-recovery-work-order");
++        let expensive_values = (1_i64..=10).collect::<Vec<_>>();
++        let cheap_values = vec![1_i64, 2];
++        let (registry, expensive, cheap, root) =
++            advisor_i64_recovery_bundle(5_181, &expensive_values, &cheap_values);
++        assert!(expensive.relation < cheap.relation);
++        drop(DurableRuntime::create(root, &dir, &registry).unwrap());
++
++        let (reopened, report) = DurableRuntime::open_with_recovery_policy(
++            &dir,
++            PhysicalRecoveryPolicy {
++                max_advisor_rebuild_key_evaluations: 2,
++                ..PhysicalRecoveryPolicy::default()
++            },
++        )
++        .unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert!(snapshot.physical_store().i64_index(cheap).is_some());
++        assert!(snapshot.physical_store().i64_index(expensive).is_none());
++        assert_eq!(report.advisor_rebuild_key_evaluations, 2);
++        assert!(matches!(
++            report.rebuilt.as_slice(),
++            [DurablePhysicalArtifactSpec::I64Index { relation, .. }] if *relation == cheap.relation
++        ));
++        assert!(matches!(
++            report.skipped_key_evaluation_budget.as_slice(),
++            [DurablePhysicalArtifactSpec::I64Index { relation, .. }] if *relation == expensive.relation
++        ));
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn deferred_recovery_never_replays_manual_or_incompatible_recipes() {
++        let dir = durable_test_dir("deferred-physical-recovery-safety");
++        let (context, registry, relation, layout, mut root) =
++            scan_runtime_bundle(5_179, 9_179, &[1, 2, 3]);
++        let manual = SemanticIndexBinding::single(relation, layout, 0, sid(101));
++        root.physical
++            .install_semantic_index(manual.clone(), &context, &registry)
++            .unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
++        let before = runtime.snapshot().unwrap().root_version();
++        let fabricated = PhysicalRecoveryReport {
++            skipped_key_evaluation_budget: vec![DurablePhysicalArtifactSpec::SemanticIndex {
++                relation,
++                key_parts: vec![DurableSemanticKeyPart {
++                    column: 0,
++                    equivalence: sid(101),
++                }],
++                advisor_managed: false,
++            }],
++            skipped_estimated_byte_budget: vec![DurablePhysicalArtifactSpec::SemanticIndex {
++                relation: sid(0xdead),
++                key_parts: vec![DurableSemanticKeyPart {
++                    column: 0,
++                    equivalence: sid(101),
++                }],
++                advisor_managed: true,
++            }],
++            ..PhysicalRecoveryReport::default()
++        };
++
++        assert_eq!(fabricated.deferred_advisor_artifacts().len(), 1);
++        let report = runtime
++            .resume_deferred_physical_recovery(&fabricated, PhysicalRecoveryPolicy::default())
++            .unwrap();
++        assert!(report.rebuilt.is_empty());
++        assert_eq!(report.dropped_incompatible.len(), 1);
++        let after = runtime.snapshot().unwrap();
++        assert_eq!(after.root_version(), before);
++        assert!(after.physical_store().semantic_index(&manual).is_some());
++        drop(after);
++        drop(runtime);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn supervisor_can_resume_deferred_recovery_without_reopen() {
++        let dir = durable_test_dir("deferred-supervisor-recovery-resume");
++        let (context, registry, relation, layout, mut root) =
++            scan_runtime_bundle(5_180, 9_180, &[1, 2, 3, 4]);
++        let semantic = SemanticIndexBinding::single(relation, layout, 0, sid(101));
++        root.physical
++            .install_semantic_index(semantic.clone(), &context, &registry)
++            .unwrap();
++        root.physical
++            .advisor_managed_artifacts_mut()
++            .insert(ManagedPhysicalArtifact::SemanticIndex(semantic.clone()));
++        let supervisor = DurableRuntimeSupervisor::create_with_recovery_policy(
++            root,
++            &dir,
++            PhysicalRecoveryPolicy {
++                max_advisor_rebuild_key_evaluations: 0,
++                ..PhysicalRecoveryPolicy::default()
++            },
++            &registry,
++        )
++        .unwrap();
++        let initial = supervisor.recover_with_report().unwrap();
++        assert_eq!(initial.deferred_advisor_artifacts().len(), 1);
++        let resumed = supervisor
++            .resume_deferred_physical_recovery(&initial, PhysicalRecoveryPolicy::default())
++            .unwrap();
++        assert_eq!(resumed.rebuilt.len(), 1);
++        assert!(
++            supervisor
++                .snapshot()
++                .unwrap()
++                .physical_store()
++                .semantic_index(&semantic)
++                .is_some()
++        );
++        drop(supervisor);
++        std::fs::remove_dir_all(dir).unwrap();
+     }
+ 
+     #[test]

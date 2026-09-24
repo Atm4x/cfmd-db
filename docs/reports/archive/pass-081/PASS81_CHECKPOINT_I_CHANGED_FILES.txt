@@ -1,0 +1,7 @@
+crates/kernel-durability/src/lib.rs
+crates/kernel-durability/src/metadata.rs
+crates/kernel-durability/src/store.rs
+crates/kernel-plan/src/lib.rs
+PASS81_INTEGRATION_LEDGER.md
+PASS81_CHECKPOINT_I_DURABLE_REWRITE_INTENT.md
+PASS81_CHECKPOINT_I_CHANGED_FILES.txt

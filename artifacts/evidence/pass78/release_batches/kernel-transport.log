@@ -1,0 +1,28 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_transport-58aed9425fb29845)
+
+running 21 tests
+test tests::adding_query_visible_module_is_conservative_but_removing_it_is_not ... ok
+test tests::changed_law_is_not_misclassified_as_implementation_upgrade ... ok
+test tests::environment_transport_compares_query_visible_modules_even_when_schema_does_not_use_them ... ok
+test tests::bijective_identity_transport_rewrites_lifecycle_carriers_and_nested_references_coherently ... ok
+test tests::field_transport_cannot_silently_reinterpret_semantic_environment ... ok
+test tests::historical_ids_must_be_covered_by_identity_retention_domain ... ok
+test tests::genuine_semantic_law_migration_has_no_generic_relational_impact_invariance ... ok
+test tests::impact_commutes_with_bijective_identity_transport ... ok
+test tests::law_migration_revalidates_target_instead_of_silently_collapsing_set_rows ... ok
+test tests::implementation_upgrade_with_same_contract_is_identity_transport ... ok
+test tests::relational_impact_commutes_with_bijective_identity_transport ... ok
+test tests::rename_and_revision_bump_transport_without_data_migration ... ok
+test tests::relational_impact_is_preserved_by_identity_like_semantic_context_transports ... ok
+test tests::retention_domain_mapping_does_not_resurrect_non_live_ids ... ok
+test tests::semantic_environment_transport_is_generic_across_ordering_modules ... ok
+test tests::semantic_environment_transport_is_generic_across_tokenizer_modules ... ok
+test tests::semantic_type_change_is_not_definitional_transport ... ok
+test tests::typed_relation_transport_checks_full_set_bag_semantics ... ok
+test tests::typed_field_transport_reuses_exact_query_ir_and_rebuilds_trusted_revision ... ok
+test tests::typed_transport_rejects_transform_whose_output_type_disagrees_with_target ... ok
+test tests::typed_relation_transport_reuses_relational_query_ir ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

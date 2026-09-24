@@ -1,0 +1,875 @@
+--- /mnt/data/cfmd_workspace_pass45/crates/kernel-plan/src/lib.rs	2026-09-20 12:19:51.828025371 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 12:53:51.030739042 +0000
+@@ -653,6 +653,7 @@
+     relations: BTreeMap<(SemanticId, LayoutId), InstalledRelation>,
+     i64_indexes: BTreeMap<I64IndexBinding, MaterializedI64IndexState>,
+     semantic_indexes: BTreeMap<SemanticIndexBinding, MaterializedSemanticIndexState>,
++    semantic_statistics: BTreeMap<SemanticIndexBinding, MaterializedSemanticStatisticsState>,
+     advisor_managed_semantic_indexes: BTreeSet<SemanticIndexBinding>,
+     transition_epoch: u64,
+     revision: Option<RevisionId>,
+@@ -1773,6 +1774,45 @@
+         Ok(())
+     }
+ 
++    pub fn install_semantic_statistics(
++        &self,
++        binding: SemanticIndexBinding,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<SemanticKeyStatistics, PhysicalExecutionError> {
++        let mut state = self
++            .root
++            .write()
++            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
++        let RuntimeRevisionCellState::Serving(live) = &*state else {
++            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
++        };
++        let next_version = live
++            .root_identity
++            .version
++            .0
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
++        let mut physical = live.physical.clone();
++        let snapshot = physical.install_semantic_statistics(
++            binding,
++            live.revision.semantic_context(),
++            registry,
++        )?;
++        let candidate = RuntimeRevisionBundle {
++            root_identity: RuntimeRootIdentity {
++                root_id: live.root_identity.root_id,
++                version: RuntimeRootVersion(next_version),
++            },
++            revision: live.revision.clone(),
++            physical,
++            relation_layouts: live.relation_layouts.clone(),
++            materialization_specs: live.materialization_specs.clone(),
++            materializations: live.materializations.clone(),
++        };
++        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
++        Ok(snapshot)
++    }
++
+     pub fn install_semantic_index(
+         &self,
+         index: SemanticIndexBinding,
+@@ -2629,6 +2669,8 @@
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+         self.semantic_indexes
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
++        self.semantic_statistics
++            .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+         self.advisor_managed_semantic_indexes
+             .retain(|index| index.relation != relation || index.layout.id != binding.id);
+         self.transition_epoch = next_epoch;
+@@ -2652,6 +2694,48 @@
+         Ok(())
+     }
+ 
++    pub fn install_semantic_statistics(
++        &mut self,
++        binding: SemanticIndexBinding,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<SemanticKeyStatistics, PhysicalExecutionError> {
++        let relation = self.installed(binding.relation, binding.layout)?;
++        let state = MaterializedSemanticStatisticsState::build(
++            binding.clone(),
++            relation,
++            context,
++            registry,
++        )?;
++        let snapshot = state.snapshot();
++        let next_epoch = self
++            .transition_epoch
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
++        self.semantic_statistics.insert(binding, state);
++        self.transition_epoch = next_epoch;
++        Ok(snapshot)
++    }
++
++    pub fn semantic_statistics(
++        &self,
++        binding: &SemanticIndexBinding,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Option<SemanticKeyStatistics>, PhysicalExecutionError> {
++        let Some(state) = self.semantic_statistics.get(binding) else {
++            return Ok(None);
++        };
++        if !state.compatible_with(context, registry)? {
++            return Ok(None);
++        }
++        let relation = self.installed(binding.relation, binding.layout)?;
++        if state.row_count != native_row_count(&relation.data) {
++            return Ok(None);
++        }
++        Ok(Some(state.snapshot()))
++    }
++
+     pub fn install_semantic_index(
+         &mut self,
+         index: SemanticIndexBinding,
+@@ -2883,6 +2967,14 @@
+                 return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+             }
+         }
++        for (binding, state) in &self.semantic_statistics {
++            if binding.relation == relation
++                && binding.layout.id == layout.id
++                && !state.compatible_with(context, registry)?
++            {
++                return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
++            }
++        }
+         let candidate_index = self
+             .i64_indexes
+             .iter()
+@@ -2906,6 +2998,11 @@
+                 state.validate_physical_delta(&physical_delta)?;
+             }
+         }
++        for (binding, state) in &self.semantic_statistics {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.validate_physical_delta(&physical_delta)?;
++            }
++        }
+         let next_epoch = self
+             .transition_epoch
+             .checked_add(1)
+@@ -2928,6 +3025,11 @@
+                 state.apply_physical_delta(&physical_delta)?;
+             }
+         }
++        for (binding, state) in &mut self.semantic_statistics {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.apply_physical_delta(&physical_delta)?;
++            }
++        }
+         self.transition_epoch = next_epoch;
+         let resolved_delta = RelationDelta {
+             inserted: physical_delta
+@@ -3136,6 +3238,43 @@
+     }
+ }
+ 
++fn resolve_semantic_index_binding(
++    binding: &SemanticIndexBinding,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<
++    (
++        Vec<kernel_semantics::ResolvedPrimitiveEquivalence>,
++        Vec<kernel_semantic_index::SemanticModuleBinding>,
++    ),
++    PhysicalExecutionError,
++> {
++    if binding.key_parts.is_empty() {
++        return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++    }
++    let definition = context
++        .schema
++        .relation(binding.relation)
++        .ok_or(RelQueryError::UnknownRelation(binding.relation))?;
++    let mut resolved = Vec::with_capacity(binding.key_parts.len());
++    let mut dependencies = Vec::with_capacity(binding.key_parts.len());
++    for part in &binding.key_parts {
++        if part.column >= definition.columns.len() {
++            return Err(RelQueryError::ColumnOutOfBounds.into());
++        }
++        let Some(module) = registry.resolve_primitive_equivalence(context, part.equivalence)?
++        else {
++            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++        };
++        dependencies.push(kernel_semantic_index::SemanticModuleBinding {
++            semantic_id: part.equivalence,
++            module_digest: module.module_digest(),
++        });
++        resolved.push(module);
++    }
++    Ok((resolved, dependencies))
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct MaterializedSemanticIndexState {
+     binding: SemanticIndexBinding,
+@@ -3153,29 +3292,7 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, PhysicalExecutionError> {
+-        if binding.key_parts.is_empty() {
+-            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+-        }
+-        let definition = context
+-            .schema
+-            .relation(binding.relation)
+-            .ok_or(RelQueryError::UnknownRelation(binding.relation))?;
+-        let mut resolved = Vec::with_capacity(binding.key_parts.len());
+-        let mut dependencies = Vec::with_capacity(binding.key_parts.len());
+-        for part in &binding.key_parts {
+-            if part.column >= definition.columns.len() {
+-                return Err(RelQueryError::ColumnOutOfBounds.into());
+-            }
+-            let Some(module) = registry.resolve_primitive_equivalence(context, part.equivalence)?
+-            else {
+-                return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+-            };
+-            dependencies.push(kernel_semantic_index::SemanticModuleBinding {
+-                semantic_id: part.equivalence,
+-                module_digest: module.module_digest(),
+-            });
+-            resolved.push(module);
+-        }
++        let (resolved, dependencies) = resolve_semantic_index_binding(&binding, context, registry)?;
+         let mut index = kernel_semantic_index::SemanticBucketIndex::new(
+             kernel_semantic_index::SemanticIndexBinding::new(context, dependencies),
+         );
+@@ -3288,6 +3405,136 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SemanticKeyStatistics {
++    pub row_count: usize,
++    pub distinct_key_count: usize,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct MaterializedSemanticStatisticsState {
++    binding: SemanticIndexBinding,
++    resolved: Vec<kernel_semantics::ResolvedPrimitiveEquivalence>,
++    counts: BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, usize>,
++    row_count: usize,
++}
++
++impl MaterializedSemanticStatisticsState {
++    fn build(
++        binding: SemanticIndexBinding,
++        relation: &InstalledRelation,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, PhysicalExecutionError> {
++        let (resolved, _) = resolve_semantic_index_binding(&binding, context, registry)?;
++        let mut counts = BTreeMap::new();
++        for row_index in relation.scan_positions() {
++            let row = materialize_native_row(&relation.data, row_index)?;
++            let key = semantic_index_row_key(&binding, &resolved, &row)?;
++            let count = counts.entry(key).or_insert(0_usize);
++            *count = count
++                .checked_add(1)
++                .ok_or(PhysicalExecutionError::StatisticsCountOverflow)?;
++        }
++        Ok(Self {
++            binding,
++            resolved,
++            counts,
++            row_count: native_row_count(&relation.data),
++        })
++    }
++
++    fn compatible_with(
++        &self,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<bool, PhysicalExecutionError> {
++        if self.binding.key_parts.len() != self.resolved.len() {
++            return Ok(false);
++        }
++        for (part, expected) in self.binding.key_parts.iter().zip(&self.resolved) {
++            let Some(actual) = registry.resolve_primitive_equivalence(context, part.equivalence)?
++            else {
++                return Ok(false);
++            };
++            if &actual != expected {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
++    fn row_key(
++        &self,
++        row: &kernel_query::Row,
++    ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
++        semantic_index_row_key(&self.binding, &self.resolved, row)
++    }
++
++    fn validate_physical_delta(
++        &self,
++        delta: &PhysicalRelationDelta,
++    ) -> Result<(), PhysicalExecutionError> {
++        let mut removals = BTreeMap::<Vec<kernel_semantics::CanonicalEqKey>, usize>::new();
++        for (_, row) in &delta.removed {
++            let key = self.row_key(row)?;
++            let count = removals.entry(key.clone()).or_insert(0_usize);
++            *count = count
++                .checked_add(1)
++                .ok_or(PhysicalExecutionError::StatisticsCountOverflow)?;
++            if *count > self.counts.get(&key).copied().unwrap_or(0) {
++                return Err(RelQueryError::InconsistentIncrementalDelta.into());
++            }
++        }
++        for (_, row) in &delta.inserted {
++            let _ = self.row_key(row)?;
++        }
++        Ok(())
++    }
++
++    fn apply_physical_delta(
++        &mut self,
++        delta: &PhysicalRelationDelta,
++    ) -> Result<(), PhysicalExecutionError> {
++        for (_, row) in &delta.removed {
++            let key = self.row_key(row)?;
++            let count = self
++                .counts
++                .get_mut(&key)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            *count = count
++                .checked_sub(1)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            if *count == 0 {
++                self.counts.remove(&key);
++            }
++            self.row_count = self
++                .row_count
++                .checked_sub(1)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        }
++        for (_, row) in &delta.inserted {
++            let key = self.row_key(row)?;
++            let count = self.counts.entry(key).or_insert(0_usize);
++            *count = count
++                .checked_add(1)
++                .ok_or(PhysicalExecutionError::StatisticsCountOverflow)?;
++            self.row_count = self
++                .row_count
++                .checked_add(1)
++                .ok_or(PhysicalExecutionError::StatisticsCountOverflow)?;
++        }
++        Ok(())
++    }
++
++    fn snapshot(&self) -> SemanticKeyStatistics {
++        SemanticKeyStatistics {
++            row_count: self.row_count,
++            distinct_key_count: self.counts.len(),
++        }
++    }
++}
++
+ fn semantic_index_row_key(
+     binding: &SemanticIndexBinding,
+     resolved: &[kernel_semantics::ResolvedPrimitiveEquivalence],
+@@ -3346,6 +3593,7 @@
+     SemanticContextTransitionRequiresRebuild,
+     RevisionBoundMutationRequiresPreparedTransition,
+     TransitionEpochExhausted,
++    StatisticsCountOverflow,
+     RuntimeRootIdentityExhausted,
+     RuntimeRootVersionExhausted,
+     RuntimePublicationPoisoned,
+@@ -6574,6 +6822,15 @@
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<JoinAccessDecision, PhysicalExecutionError> {
++    let binding = SemanticIndexBinding::single(
++        leaf.relation,
++        leaf.layout,
++        predicate.right.column,
++        predicate.equivalence,
++    );
++    let allow_ephemeral = store
++        .semantic_statistics(&binding, context, registry)?
++        .is_some();
+     right_scan_join_access_decision(
+         RightJoinAccessRequest {
+             left_rows,
+@@ -6581,7 +6838,7 @@
+             right_layout: leaf.layout,
+             right_column: predicate.right.column,
+             equivalence: predicate.equivalence,
+-            allow_ephemeral: false,
++            allow_ephemeral,
+         },
+         store,
+         context,
+@@ -6916,6 +7173,48 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy)]
++struct TransientJoinEstimate {
++    left_rows: usize,
++    right_rows: usize,
++    distinct_keys: usize,
++    key_parts: usize,
++    is_i64: bool,
++    semantic_supported: bool,
++}
++
++fn consider_ephemeral_join_candidates(
++    best: &mut JoinAccessDecision,
++    estimate: TransientJoinEstimate,
++) {
++    let TransientJoinEstimate {
++        left_rows,
++        right_rows,
++        distinct_keys,
++        key_parts,
++        is_i64,
++        semantic_supported,
++    } = estimate;
++    let average_bucket = right_rows.div_ceil(distinct_keys.max(1));
++    let candidate = |family| JoinAccessDecision {
++        family,
++        work: SemanticAccessCostModel::ephemeral_join_work(
++            left_rows,
++            right_rows,
++            distinct_keys,
++            key_parts,
++        ),
++        estimated_output_rows: left_rows.saturating_mul(average_bucket),
++        persisted_rejected: false,
++    };
++    if is_i64 {
++        consider_join_access_candidate(best, candidate(JoinAccessFamily::EphemeralI64));
++    }
++    if semantic_supported {
++        consider_join_access_candidate(best, candidate(JoinAccessFamily::EphemeralSemantic));
++    }
++}
++
+ fn right_scan_join_access_decision(
+     request: RightJoinAccessRequest,
+     store: &PhysicalStore,
+@@ -6976,6 +7275,10 @@
+     let binding =
+         SemanticIndexBinding::single(right_relation, right_layout, right_column, equivalence);
+     let semantic_supported = primitive_binding_supported(&binding, context, registry)?;
++    let retained_statistics = store.semantic_statistics(&binding, context, registry)?;
++    let transient_distinct = retained_statistics.map_or(right_rows, |statistics| {
++        statistics.distinct_key_count.max(1)
++    });
+     if let Some(index) = store.semantic_index(&binding)
+         && index.compatible_with(context, registry)?
+     {
+@@ -6993,29 +7296,16 @@
+         );
+     }
+ 
+-    if allow_ephemeral && is_i64 {
+-        consider_join_access_candidate(
+-            &mut best,
+-            JoinAccessDecision {
+-                family: JoinAccessFamily::EphemeralI64,
+-                work: SemanticAccessCostModel::ephemeral_join_work(
+-                    left_rows, right_rows, right_rows, 1,
+-                ),
+-                estimated_output_rows: left_rows,
+-                persisted_rejected: false,
+-            },
+-        );
+-    }
+-    if allow_ephemeral && semantic_supported {
+-        consider_join_access_candidate(
++    if allow_ephemeral {
++        consider_ephemeral_join_candidates(
+             &mut best,
+-            JoinAccessDecision {
+-                family: JoinAccessFamily::EphemeralSemantic,
+-                work: SemanticAccessCostModel::ephemeral_join_work(
+-                    left_rows, right_rows, right_rows, 1,
+-                ),
+-                estimated_output_rows: left_rows,
+-                persisted_rejected: false,
++            TransientJoinEstimate {
++                left_rows,
++                right_rows,
++                distinct_keys: transient_distinct,
++                key_parts: binding.key_parts.len(),
++                is_i64,
++                semantic_supported,
+             },
+         );
+     }
+@@ -11649,6 +11939,49 @@
+     }
+ 
+     #[test]
++    fn semantic_statistics_publish_as_reconstructible_runtime_state() {
++        let values = (0_i64..64).collect::<Vec<_>>();
++        let (context, registry, relation, layout, runtime) = scan_runtime_bundle(73, 966, &values);
++        let binding = SemanticIndexBinding::single(relation, layout, 0, sid(101));
++        let delta = scan_delta(relation, &[100], &[0], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let prepared = prepare_runtime_revision(&runtime, 74, &mutations, &registry).unwrap();
++        let cell = RuntimeRevisionCell::new(runtime);
++        let old_reader = cell.snapshot().unwrap();
++
++        let statistics = cell
++            .install_semantic_statistics(binding.clone(), &registry)
++            .unwrap();
++        let new_reader = cell.snapshot().unwrap();
++        assert_eq!(statistics.row_count, 64);
++        assert_eq!(statistics.distinct_key_count, 64);
++        assert_eq!(old_reader.root_version().raw(), 0);
++        assert_eq!(new_reader.root_version().raw(), 1);
++        assert_eq!(old_reader.revision_id(), new_reader.revision_id());
++        assert_eq!(
++            old_reader
++                .physical_store()
++                .semantic_statistics(&binding, &context, &registry)
++                .unwrap(),
++            None
++        );
++        assert_eq!(
++            new_reader
++                .physical_store()
++                .semantic_statistics(&binding, &context, &registry)
++                .unwrap(),
++            Some(statistics)
++        );
++        assert!(matches!(
++            prepared.seal(&cell),
++            Err(PhysicalExecutionError::StalePreparedTransition)
++        ));
++    }
++
++    #[test]
+     fn semantic_index_advisor_publishes_one_runtime_root_and_noop_does_not_republish() {
+         let values = (0_i64..64).collect::<Vec<_>>();
+         let (context, registry, relation, binding, runtime) = scan_runtime_bundle(72, 965, &values);
+@@ -12926,6 +13259,42 @@
+     }
+ 
+     #[test]
++    fn semantic_statistics_are_invalidated_by_gamma_change() {
++        let (context, mut registry, relation, equivalence, layout, mut store) =
++            text_semantic_index_fixture();
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        store.semantic_indexes.remove(&binding);
++        let statistics = store
++            .install_semantic_statistics(binding.clone(), &context, &registry)
++            .unwrap();
++        assert_eq!(statistics.distinct_key_count, 2);
++
++        let mut changed_context = context.clone();
++        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        changed_context
++            .environment
++            .pin_module(equivalence, exact_digest);
++        assert_eq!(
++            store
++                .semantic_statistics(&binding, &changed_context, &registry)
++                .unwrap(),
++            None
++        );
++        let result_type = RelExpr::Scan(relation)
++            .typecheck(&changed_context, &registry)
++            .unwrap();
++        let delta = RelationDelta {
++            inserted: vec![vec![Value::Text("C".into())]],
++            removed: Vec::new(),
++            result_type,
++        };
++        assert!(matches!(
++            store.apply_relation_delta(relation, layout, &delta, &changed_context, &registry),
++            Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild)
++        ));
++    }
++
++    #[test]
+     fn cost_model_rejects_unprofitable_tiny_text_semantic_index() {
+         let (context, registry, relation, equivalence, binding, store) =
+             text_semantic_index_fixture();
+@@ -13626,6 +13995,284 @@
+     }
+ 
+     #[test]
++    fn semantic_statistics_are_maintained_with_relation_delta() {
++        let (context, registry, relation) = planning_context();
++        let layout = LayoutBinding {
++            id: LayoutId(1_053),
++            family: LayoutFamily::Columnar,
++        };
++        let equivalence = sid(101);
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 1, 2])]).unwrap(),
++            )
++            .unwrap();
++        let initial = store
++            .install_semantic_statistics(binding.clone(), &context, &registry)
++            .unwrap();
++        assert_eq!(
++            initial,
++            SemanticKeyStatistics {
++                row_count: 3,
++                distinct_key_count: 2,
++            }
++        );
++
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        store
++            .apply_relation_delta(relation, layout, &delta, &context, &registry)
++            .unwrap();
++        assert_eq!(
++            store
++                .semantic_statistics(&binding, &context, &registry)
++                .unwrap(),
++            Some(SemanticKeyStatistics {
++                row_count: 3,
++                distinct_key_count: 3,
++            })
++        );
++        let second = scan_delta(relation, &[2], &[1], &context, &registry);
++        store
++            .apply_relation_delta(relation, layout, &second, &context, &registry)
++            .unwrap();
++        assert_eq!(
++            store
++                .semantic_statistics(&binding, &context, &registry)
++                .unwrap(),
++            Some(SemanticKeyStatistics {
++                row_count: 3,
++                distinct_key_count: 2,
++            })
++        );
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![9, 10])]).unwrap(),
++            )
++            .unwrap();
++        assert_eq!(
++            store
++                .semantic_statistics(&binding, &context, &registry)
++                .unwrap(),
++            None
++        );
++    }
++
++    #[test]
++    fn inconsistent_statistics_are_ignored_as_non_authoritative_physical_state() {
++        let (context, registry, relation) = planning_context();
++        let layout = LayoutBinding {
++            id: LayoutId(1_058),
++            family: LayoutFamily::Columnar,
++        };
++        let equivalence = sid(101);
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 2, 3])]).unwrap(),
++            )
++            .unwrap();
++        store
++            .install_semantic_statistics(binding.clone(), &context, &registry)
++            .unwrap();
++        store
++            .semantic_statistics
++            .get_mut(&binding)
++            .unwrap()
++            .row_count = 99;
++        assert_eq!(
++            store
++                .semantic_statistics(&binding, &context, &registry)
++                .unwrap(),
++            None
++        );
++        let decision = right_scan_join_access_decision(
++            RightJoinAccessRequest {
++                left_rows: 3,
++                right_relation: relation,
++                right_layout: layout,
++                right_column: 0,
++                equivalence,
++                allow_ephemeral: true,
++            },
++            &store,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(decision.family, JoinAccessFamily::FullScan);
++    }
++
++    #[test]
++    fn retained_statistics_avoid_duplicate_heavy_transient_build() {
++        let (context, registry, [left_relation, right_relation, _], equivalence) =
++            three_relation_i64_context();
++        let left_layout = LayoutBinding {
++            id: LayoutId(1_055),
++            family: LayoutFamily::Columnar,
++        };
++        let right_layout = LayoutBinding {
++            id: LayoutId(1_056),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(left_relation, left_layout);
++        catalog.bind_relation(right_relation, right_layout);
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(left_relation)),
++            right: Box::new(RelExpr::Scan(right_relation)),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared = prepare_with_catalog(logical, &context, &registry, &catalog).unwrap();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                left_relation,
++                left_layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64((1_i64..=64).collect())])
++                    .unwrap(),
++            )
++            .unwrap();
++        store
++            .install(
++                right_relation,
++                right_layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1; 128])]).unwrap(),
++            )
++            .unwrap();
++        let binding = SemanticIndexBinding::single(right_relation, right_layout, 0, equivalence);
++        store
++            .install_semantic_statistics(binding, &context, &registry)
++            .unwrap();
++
++        let decision = right_scan_join_access_decision(
++            RightJoinAccessRequest {
++                left_rows: 64,
++                right_relation,
++                right_layout,
++                right_column: 0,
++                equivalence,
++                allow_ephemeral: true,
++            },
++            &store,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(decision.family, JoinAccessFamily::FullScan);
++        let (value, execution) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(value.rows().len(), 128);
++        assert_eq!(execution.ephemeral_index_builds, 0);
++    }
++
++    #[test]
++    fn retained_statistics_enable_safe_multiway_transient_costing() {
++        let (context, registry, relation) = planning_context();
++        let layout = LayoutBinding {
++            id: LayoutId(1_054),
++            family: LayoutFamily::Columnar,
++        };
++        let equivalence = sid(101);
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64((0_i64..128).collect())])
++                    .unwrap(),
++            )
++            .unwrap();
++        store
++            .install_semantic_statistics(binding, &context, &registry)
++            .unwrap();
++        let leaf = MultiwayJoinLeaf {
++            plan: Plan::Scan {
++                relation,
++                layout,
++                algorithm: ScanAlgorithm::FullScan,
++            },
++            relation,
++            layout,
++            width: 1,
++            rows: 128,
++        };
++        let decision = multiway_right_access_estimate(
++            &store,
++            &leaf,
++            MultiwayJoinPredicate {
++                left: MultiwayJoinColumnRef { leaf: 0, column: 0 },
++                right: MultiwayJoinColumnRef { leaf: 1, column: 0 },
++                equivalence,
++            },
++            64,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        assert_eq!(decision.family, JoinAccessFamily::EphemeralI64);
++        assert_eq!(decision.estimated_output_rows, 64);
++    }
++
++    #[test]
++    fn composite_semantic_statistics_use_the_same_canonical_key_contract_as_indexes() {
++        let relation = sid(370);
++        let text_equivalence = sid(371);
++        let i64_equivalence = sid(372);
++        let (context, registry) =
++            text_i64_semantic_fixture(&[relation], text_equivalence, i64_equivalence, 46);
++        let layout = LayoutBinding {
++            id: LayoutId(1_057),
++            family: LayoutFamily::Columnar,
++        };
++        let binding = SemanticIndexBinding {
++            relation,
++            layout,
++            key_parts: vec![
++                SemanticIndexKeyPart {
++                    column: 0,
++                    equivalence: text_equivalence,
++                },
++                SemanticIndexKeyPart {
++                    column: 1,
++                    equivalence: i64_equivalence,
++                },
++            ],
++        };
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                text_i64_native(&[("A", 1), ("a", 1), ("A", 2), ("B", 1)]),
++            )
++            .unwrap();
++        let statistics = store
++            .install_semantic_statistics(binding.clone(), &context, &registry)
++            .unwrap();
++        assert_eq!(statistics.row_count, 4);
++        assert_eq!(statistics.distinct_key_count, 3);
++
++        store
++            .install_semantic_index(binding.clone(), &context, &registry)
++            .unwrap();
++        assert_eq!(
++            store.semantic_index(&binding).unwrap().distinct_key_count(),
++            statistics.distinct_key_count
++        );
++    }
++
++    #[test]
+     fn join_access_decision_can_choose_transient_generic_semantic_family() {
+         let (context, registry, relation, equivalence, layout, mut store) =
+             text_semantic_index_fixture();

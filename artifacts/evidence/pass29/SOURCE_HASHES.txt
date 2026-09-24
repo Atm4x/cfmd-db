@@ -1,0 +1,2 @@
+ebb0fb6dae1d55bb8d208b873bc24177515ff7c4665f30c250963baeaeb810b1  crates/kernel-plan/src/lib.rs
+5d25da3d2e67f3097b42a7798d782b44f32aca85dbf30ac9a3495f4d59250f6c  crates/kernel-query/src/lib.rs

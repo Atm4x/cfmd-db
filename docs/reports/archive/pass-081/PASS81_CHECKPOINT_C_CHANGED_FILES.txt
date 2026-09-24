@@ -1,0 +1,7 @@
+crates/kernel-change/Cargo.toml
+crates/kernel-change/src/lib.rs
+crates/kernel-query/src/lib.rs
+crates/kernel-transport/src/lib.rs
+PASS81_INTEGRATION_LEDGER.md
+PASS81_CHECKPOINT_C_WRITE_FOUNDATION.md
+PASS81_CHECKPOINT_C_CHANGED_FILES.txt

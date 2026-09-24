@@ -1,0 +1,31 @@
+CFMD Pass31 final verification summary
+Status: VERIFIED
+Toolchain: Rust 1.98.1
+
+Final successful gate:
+PASS cargo fmt --all -- --check
+PASS cargo check --workspace --all-targets
+PASS cargo test --workspace --all-targets
+PASS cargo clippy --workspace --all-targets -- -D warnings
+PASS cargo test --workspace --all-targets --release
+PASS cargo build --workspace --release
+PASS RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+PASS RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release
+
+Static audit:
+PASS no StorageCertifiedRelationDelta / old certified APIs under crates/
+PASS PreparedMaterializedRelPlanTransition is not public
+PASS PreparedRuntimeRevisionTransition retains source root identity rather than full source bundle
+PASS RuntimeRevisionCell publishes one Arc<RuntimeRevisionBundle> root
+PASS StorageResolvedRelationDelta documented/implemented as non-authoritative evidence
+
+Metrics:
+243 declared workspace tests
+61 kernel-plan tests
+19 workspace crates
+30053 Rust LOC
+0 external Cargo source entries
+0 unsafe occurrences under crates/
+
+Note: two earlier combined release invocations hit the execution time limit during compilation.
+Their replacement commands were rerun separately and then again in PASS31_FINAL_RELEASE_GATE.log; all completed successfully.

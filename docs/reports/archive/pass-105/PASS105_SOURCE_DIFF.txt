@@ -1,0 +1,2446 @@
+--- /mnt/data/cfmd_pass104_work/crates/kernel-query/src/lib.rs	2026-09-23 11:48:30.666720311 +0000
++++ crates/kernel-query/src/lib.rs	2026-09-23 12:36:52.126392871 +0000
+@@ -1,12 +1,18 @@
+ use std::collections::{BTreeMap, BTreeSet};
+ mod delta_abi;
++mod execgraph;
+ mod linear_island;
++mod sealed_group_v3;
+ mod topk_i64;
+ pub use delta_abi::{
+     AdaptiveDelta, BinaryDeltaKernel, CompactDelta, CompiledDeltaEdgeIdentity, DeltaSink,
+     DeltaView, InlineDelta, PlannedDeltaEffect, RelationDeltaView, UnaryDeltaKernel,
+     ValidatedTransitionFrame, Weighted,
+ };
++pub use execgraph::{
++    ExecutionInputSlot, NodeId, NodeInbox, PreparedRelGraph, UnifiedTransitionProgram,
++    UnifiedTransitionScratch,
++};
+ pub use linear_island::{
+     BarrierKernelClass, CompiledDeltaProgram, LinearIslandNormalForm, LinearIslandPredicate,
+ };
+@@ -938,6 +944,21 @@
+     by_position: Vec<CanonicalRowKey>,
+ }
+ 
++/// R&D V3 scan-level commit patch.  Both semantic deltas and
++/// storage-resolved deltas feed the same immutable maintained-plan planner;
++/// only the leaf publication mechanism differs.
++#[derive(Debug)]
++enum MaintainedScanCommitPatch {
++    Semantic(RelationMutationPlan),
++    StorageResolved(StorageResolvedScanPatch),
++}
++
++#[derive(Debug)]
++struct StorageResolvedScanPatch {
++    removed_handles: Vec<kernel_types::StableRowHandle>,
++    inserted: Vec<(kernel_types::StableRowHandle, Row)>,
++}
++
+ #[derive(Debug)]
+ struct PlannedI64JoinSide {
+     buckets: BTreeMap<i64, Vec<Row>>,
+@@ -3122,13 +3143,12 @@
+ 
+ #[derive(Debug)]
+ enum MaintainedGroupCommitPatch {
+-    I64(I64CountGroupPatch),
+-    Replace(Box<MaterializedGroupDeltaState>),
++    Sealed(sealed_group_v3::SealedGroupPatch),
+ }
+ 
+ #[derive(Debug)]
+ enum MaintainedRelPlanPatch {
+-    Scan(Option<RelationMutationPlan>),
++    Scan(Option<MaintainedScanCommitPatch>),
+     Unary(Box<MaintainedRelPlanPatch>),
+     SetUnary {
+         input: Box<MaintainedRelPlanPatch>,
+@@ -3368,7 +3388,7 @@
+ pub struct MaterializedRelPlanState {
+     query: RelExpr,
+     semantic_context: kernel_schema::SemanticContext,
+-    differential: RelDifferentialProgram,
++    differential: Arc<RelDifferentialProgram>,
+     result_type: RelType,
+     node: Arc<MaintainedRelPlanNode>,
+     transition_epoch: u64,
+@@ -3377,32 +3397,6 @@
+ 
+ type MaintainedDelta = AdaptiveDelta<Row, 4>;
+ 
+-/// Correctness-first prepared maintained-plan transition.
+-///
+-/// The full source snapshot is retained intentionally so commit freshness is an
+-/// exact state check rather than an epoch-only heuristic. A later implementation
+-/// may replace this clone with a collision-resistant state/version identity.
+-#[derive(Debug, PartialEq, Eq)]
+-struct PreparedMaterializedRelPlanTransition {
+-    source_epoch: u64,
+-    source_revision: Option<kernel_types::RevisionId>,
+-    source_state: Box<MaterializedRelPlanState>,
+-    candidate: Box<MaterializedRelPlanState>,
+-    output_delta: RelationDelta,
+-}
+-
+-impl PreparedMaterializedRelPlanTransition {
+-    fn into_candidate_if_current(
+-        self,
+-        current: &MaterializedRelPlanState,
+-    ) -> Result<(MaterializedRelPlanState, RelationDelta), RelQueryError> {
+-        if !current.can_commit_prepared(&self) {
+-            return Err(RelQueryError::StalePreparedTransition);
+-        }
+-        Ok((*self.candidate, self.output_delta))
+-    }
+-}
+-
+ impl MaterializedRelPlanState {
+     pub fn build(
+         query: &RelExpr,
+@@ -3411,14 +3405,25 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, RelQueryError> {
+         query.prepare(context, registry)?;
+-        let differential = RelDifferentialProgram::compile(query, context, registry)?;
+-        let result_type = query.typecheck(context, registry)?;
+-        let node = Self::build_node(query, old, &result_type, context, registry)?;
++        let differential = Arc::new(RelDifferentialProgram::compile(query, context, registry)?);
++        let state = Self::build_subtree(query, old, context, registry, Arc::clone(&differential))?;
+         let mut bound_requirements = BTreeSet::new();
+-        collect_maintained_state_requirements(&node, &mut bound_requirements);
++        collect_maintained_state_requirements(state.node.as_ref(), &mut bound_requirements);
+         if bound_requirements != differential.state_requirements() {
+             return Err(RelQueryError::InconsistentIncrementalDelta);
+         }
++        Ok(state)
++    }
++
++    fn build_subtree(
++        query: &RelExpr,
++        old: &kernel_model::FiniteModel,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++        differential: Arc<RelDifferentialProgram>,
++    ) -> Result<Self, RelQueryError> {
++        let result_type = query.typecheck(context, registry)?;
++        let node = Self::build_node(query, old, &result_type, context, registry, &differential)?;
+         Ok(Self {
+             query: query.clone(),
+             semantic_context: context.clone(),
+@@ -3436,16 +3441,18 @@
+     /// rejects any drift between the compiled differential requirements and the concrete
+     /// maintained-state capabilities owned by the tree.
+     #[must_use]
+-    pub const fn differential(&self) -> &RelDifferentialProgram {
+-        &self.differential
++    pub fn differential(&self) -> &RelDifferentialProgram {
++        self.differential.as_ref()
+     }
+ 
++    #[allow(clippy::too_many_lines)]
+     fn build_node(
+         query: &RelExpr,
+         old: &kernel_model::FiniteModel,
+         result_type: &RelType,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
++        differential: &Arc<RelDifferentialProgram>,
+     ) -> Result<MaintainedRelPlanNode, RelQueryError> {
+         Ok(match query {
+             RelExpr::Scan(relation) => {
+@@ -3469,7 +3476,13 @@
+                 value,
+                 equivalence,
+             } => MaintainedRelPlanNode::Filter {
+-                input: Box::new(Self::build(input, old, context, registry)?),
++                input: Box::new(Self::build_subtree(
++                    input,
++                    old,
++                    context,
++                    registry,
++                    Arc::clone(differential),
++                )?),
+                 column: *column,
+                 value: value.clone(),
+                 equivalence: *equivalence,
+@@ -3480,14 +3493,26 @@
+                 right_column,
+                 equivalence,
+             } => MaintainedRelPlanNode::FilterColumns {
+-                input: Box::new(Self::build(input, old, context, registry)?),
++                input: Box::new(Self::build_subtree(
++                    input,
++                    old,
++                    context,
++                    registry,
++                    Arc::clone(differential),
++                )?),
+                 left_column: *left_column,
+                 right_column: *right_column,
+                 equivalence: *equivalence,
+             },
+-            RelExpr::Project { input, columns } => {
+-                Self::build_project_node(input, columns, old, result_type, context, registry)?
+-            }
++            RelExpr::Project { input, columns } => Self::build_project_node(
++                input,
++                columns,
++                old,
++                result_type,
++                context,
++                registry,
++                differential,
++            )?,
+             RelExpr::Difference { left, right } => Self::build_blocker_node(
+                 left,
+                 right,
+@@ -3496,6 +3521,7 @@
+                 result_type,
+                 context,
+                 registry,
++                differential,
+             )?,
+             RelExpr::AntiJoin {
+                 left,
+@@ -3515,25 +3541,33 @@
+                 result_type,
+                 context,
+                 registry,
++                differential,
+             )?,
+             RelExpr::Distinct { input, .. } => {
+-                Self::build_distinct_node(input, old, result_type, context, registry)?
++                Self::build_distinct_node(input, old, result_type, context, registry, differential)?
+             }
+             RelExpr::PromoteToBag(input) => MaintainedRelPlanNode::PromoteToBag {
+-                input: Box::new(Self::build(input, old, context, registry)?),
++                input: Box::new(Self::build_subtree(
++                    input,
++                    old,
++                    context,
++                    registry,
++                    Arc::clone(differential),
++                )?),
+             },
+             RelExpr::JoinEq { left, right, .. } => {
+-                Self::build_join_node(query, left, right, old, context, registry)?
++                Self::build_join_node(query, left, right, old, context, registry, differential)?
+             }
+             RelExpr::Group { input, .. } => {
+-                Self::build_group_node(query, input, old, context, registry)?
++                Self::build_group_node(query, input, old, context, registry, differential)?
+             }
+             RelExpr::TopKWithTies { input, .. } => {
+-                Self::build_top_k_node(query, input, old, context, registry)?
++                Self::build_top_k_node(query, input, old, context, registry, differential)?
+             }
+         })
+     }
+ 
++    #[allow(clippy::too_many_arguments)]
+     fn build_blocker_node(
+         left: &RelExpr,
+         right: &RelExpr,
+@@ -3542,9 +3576,12 @@
+         result_type: &RelType,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
++        differential: &Arc<RelDifferentialProgram>,
+     ) -> Result<MaintainedRelPlanNode, RelQueryError> {
+-        let left_state = Self::build(left, old, context, registry)?;
+-        let right_state = Self::build(right, old, context, registry)?;
++        let left_state =
++            Self::build_subtree(left, old, context, registry, Arc::clone(differential))?;
++        let right_state =
++            Self::build_subtree(right, old, context, registry, Arc::clone(differential))?;
+         let state = MaterializedBlockerDeltaState::build(
+             &left_state.output_value(context, registry)?,
+             &right_state.output_value(context, registry)?,
+@@ -3571,8 +3608,10 @@
+         result_type: &RelType,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
++        differential: &Arc<RelDifferentialProgram>,
+     ) -> Result<MaintainedRelPlanNode, RelQueryError> {
+-        let input_state = Self::build(input, old, context, registry)?;
++        let input_state =
++            Self::build_subtree(input, old, context, registry, Arc::clone(differential))?;
+         if matches!(
+             input_state.result_type.semantics,
+             kernel_schema::RelationSemantics::Set { .. }
+@@ -3602,8 +3641,10 @@
+         result_type: &RelType,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
++        differential: &Arc<RelDifferentialProgram>,
+     ) -> Result<MaintainedRelPlanNode, RelQueryError> {
+-        let input_state = Self::build(input, old, context, registry)?;
++        let input_state =
++            Self::build_subtree(input, old, context, registry, Arc::clone(differential))?;
+         let input_value = input_state.output_value(context, registry)?;
+         let supports = MaterializedSetSupportState::build(
+             input_value.rows(),
+@@ -3624,9 +3665,12 @@
+         old: &kernel_model::FiniteModel,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
++        differential: &Arc<RelDifferentialProgram>,
+     ) -> Result<MaintainedRelPlanNode, RelQueryError> {
+-        let left_state = Self::build(left, old, context, registry)?;
+-        let right_state = Self::build(right, old, context, registry)?;
++        let left_state =
++            Self::build_subtree(left, old, context, registry, Arc::clone(differential))?;
++        let right_state =
++            Self::build_subtree(right, old, context, registry, Arc::clone(differential))?;
+         let left_value = left_state.output_value(context, registry)?;
+         let right_value = right_state.output_value(context, registry)?;
+         let state = MaterializedJoinDeltaState::build_from_input_values(
+@@ -3650,8 +3694,10 @@
+         old: &kernel_model::FiniteModel,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
++        differential: &Arc<RelDifferentialProgram>,
+     ) -> Result<MaintainedRelPlanNode, RelQueryError> {
+-        let input_state = Self::build(input, old, context, registry)?;
++        let input_state =
++            Self::build_subtree(input, old, context, registry, Arc::clone(differential))?;
+         let input_value = input_state.output_value(context, registry)?;
+         let state = MaterializedGroupDeltaState::build_from_input_value(
+             query,
+@@ -3672,8 +3718,10 @@
+         old: &kernel_model::FiniteModel,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
++        differential: &Arc<RelDifferentialProgram>,
+     ) -> Result<MaintainedRelPlanNode, RelQueryError> {
+-        let input_state = Self::build(input, old, context, registry)?;
++        let input_state =
++            Self::build_subtree(input, old, context, registry, Arc::clone(differential))?;
+         let input_value = input_state.output_value(context, registry)?;
+         let state = MaterializedTopKDeltaState::build_from_input_value(
+             query,
+@@ -3817,8 +3865,13 @@
+         if context != &self.semantic_context {
+             return Err(RelQueryError::SemanticRevisionMismatch);
+         }
++        let transition_program = self
++            .differential
++            .physical_program()
++            .execution_graph()
++            .transition_program();
+         for relation in deltas.keys() {
+-            if !self.contains_scan_relation(*relation) {
++            if !transition_program.contains_source(*relation) {
+                 return Err(RelQueryError::UnknownRelation(*relation));
+             }
+         }
+@@ -3940,27 +3993,6 @@
+         self.transition_epoch
+     }
+ 
+-    fn prepare_storage_resolved_deltas(
+-        &self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<PreparedMaterializedRelPlanTransition, RelQueryError> {
+-        if self.revision.is_some() {
+-            return Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition);
+-        }
+-        let mut candidate = self.clone();
+-        let output_delta =
+-            candidate.apply_storage_resolved_deltas_in_place(deltas, context, registry)?;
+-        Ok(PreparedMaterializedRelPlanTransition {
+-            source_epoch: self.transition_epoch,
+-            source_revision: None,
+-            source_state: Box::new(self.clone()),
+-            candidate: Box::new(candidate),
+-            output_delta,
+-        })
+-    }
+-
+     /// Builds a detached candidate for a revision-bound maintained plan from
+     /// storage-resolved row identities. This does not mutate or publish the
+     /// source state; authoritative publication remains owned by `kernel-plan`.
+@@ -3985,17 +4017,6 @@
+         Ok((candidate, output_delta))
+     }
+ 
+-    #[must_use]
+-    fn can_commit_prepared(&self, prepared: &PreparedMaterializedRelPlanTransition) -> bool {
+-        self == prepared.source_state.as_ref()
+-            && self.transition_epoch == prepared.source_epoch
+-            && prepared
+-                .source_revision
+-                .is_none_or(|revision| self.revision == Some(revision))
+-            && self.semantic_context == prepared.candidate.semantic_context
+-            && self.query == prepared.candidate.query
+-    }
+-
+     /// Applies storage-resolved base-table deltas without repeating semantic
+     /// membership search inside `Scan` nodes. Revision-bound states must use the
+     /// joint prepared-transition path instead of this legacy convenience entrypoint.
+@@ -4008,10 +4029,199 @@
+         if self.revision.is_some() {
+             return Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition);
+         }
+-        let prepared = self.prepare_storage_resolved_deltas(deltas, context, registry)?;
+-        let (candidate, output_delta) = prepared.into_candidate_if_current(self)?;
+-        *self = candidate;
+-        Ok(output_delta)
++        if context != &self.semantic_context {
++            return Err(RelQueryError::SemanticRevisionMismatch);
++        }
++        let transition_program = self
++            .differential
++            .physical_program()
++            .execution_graph()
++            .transition_program();
++        for (relation, resolved) in deltas {
++            if *relation != resolved.relation || !transition_program.contains_source(*relation) {
++                return Err(RelQueryError::UnknownRelation(*relation));
++            }
++        }
++        let mut validated_frames = self.validate_resolved_leaf_frames(deltas, context, registry)?;
++        let next_epoch = self
++            .transition_epoch
++            .checked_add(1)
++            .ok_or(RelQueryError::TransitionEpochExhausted)?;
++        let mut plan = RelationDeltaPlanContext {
++            validated_frames: &mut validated_frames,
++            next_edge_ordinal: 0,
++            context,
++            registry,
++        };
++        let planned = self.plan_relation_deltas_inner(&mut plan)?;
++        if !validated_frames.is_empty() {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        let output = materialize_delta_view(&planned.effect, self.result_type.clone())?;
++        self.commit_relation_plan(planned.patch);
++        self.transition_epoch = next_epoch;
++        Ok(output)
++    }
++
++    /// Builds the exact same compiled-edge frame map as the semantic-delta
++    /// planner, but seals Scan publication to already-resolved stable handles.
++    /// All operator state above Scan therefore goes through one immutable
++    /// plan/commit semantics regardless of the source delta representation.
++    fn validate_resolved_leaf_frames(
++        &self,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<ValidatedLeafTransitionFrames, RelQueryError> {
++        let mut frames = BTreeMap::new();
++        let mut next_edge_ordinal = 0_u32;
++        self.validate_resolved_leaf_frames_inner(
++            deltas,
++            context,
++            registry,
++            &mut next_edge_ordinal,
++            &mut frames,
++        )?;
++        Ok(frames)
++    }
++
++    #[allow(clippy::too_many_lines)]
++    fn validate_resolved_leaf_frames_inner(
++        &self,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++        next_edge_ordinal: &mut u32,
++        frames: &mut ValidatedLeafTransitionFrames,
++    ) -> Result<(), RelQueryError> {
++        match self.node.as_ref() {
++            MaintainedRelPlanNode::Scan {
++                relation,
++                value,
++                handles,
++                ..
++            } => {
++                let edge = CompiledDeltaEdgeIdentity::new(*next_edge_ordinal, *relation);
++                *next_edge_ordinal = next_edge_ordinal
++                    .checked_add(1)
++                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
++                let Some(resolved) = deltas.get(relation) else {
++                    return Ok(());
++                };
++                if resolved.delta.result_type != self.result_type
++                    || resolved.removed_handles.len() != resolved.delta.removed.len()
++                    || resolved.inserted_handles.len() != resolved.delta.inserted.len()
++                {
++                    return Err(RelQueryError::TypeMismatch);
++                }
++                MaterializedSetSupportState::validate_rows(
++                    &resolved.delta.removed,
++                    &self.result_type,
++                    context,
++                    registry,
++                )?;
++                MaterializedSetSupportState::validate_rows(
++                    &resolved.delta.inserted,
++                    &self.result_type,
++                    context,
++                    registry,
++                )?;
++                let handles = handles
++                    .as_ref()
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let mut seen = BTreeSet::new();
++                for (id, row) in resolved
++                    .removed_handles
++                    .iter()
++                    .copied()
++                    .zip(&resolved.delta.removed)
++                {
++                    if !seen.insert(id) || handles.row_for_handle(value, id)? != row {
++                        return Err(RelQueryError::InconsistentIncrementalDelta);
++                    }
++                }
++                for id in &resolved.inserted_handles {
++                    if handles.positions.contains_key(id) || !seen.insert(*id) {
++                        return Err(RelQueryError::InconsistentIncrementalDelta);
++                    }
++                }
++                let patch = StorageResolvedScanPatch {
++                    removed_handles: resolved.removed_handles.clone(),
++                    inserted: resolved
++                        .inserted_handles
++                        .iter()
++                        .copied()
++                        .zip(resolved.delta.inserted.iter().cloned())
++                        .collect(),
++                };
++                if frames
++                    .insert(
++                        edge,
++                        ValidatedTransitionFrame::new(
++                            edge,
++                            MaintainedScanCommitPatch::StorageResolved(patch),
++                            resolved.delta.clone(),
++                        ),
++                    )
++                    .is_some()
++                {
++                    return Err(RelQueryError::InconsistentIncrementalDelta);
++                }
++                Ok(())
++            }
++            MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::FilterColumns { input, .. }
++            | MaintainedRelPlanNode::ProjectBag { input, .. }
++            | MaintainedRelPlanNode::ProjectSet { input, .. }
++            | MaintainedRelPlanNode::Distinct { input, .. }
++            | MaintainedRelPlanNode::PromoteToBag { input }
++            | MaintainedRelPlanNode::Group { input, .. }
++            | MaintainedRelPlanNode::TopK { input, .. } => input
++                .validate_resolved_leaf_frames_inner(
++                    deltas,
++                    context,
++                    registry,
++                    next_edge_ordinal,
++                    frames,
++                ),
++            MaintainedRelPlanNode::Blocker { left, right, .. }
++            | MaintainedRelPlanNode::Join { left, right, .. } => {
++                left.validate_resolved_leaf_frames_inner(
++                    deltas,
++                    context,
++                    registry,
++                    next_edge_ordinal,
++                    frames,
++                )?;
++                right.validate_resolved_leaf_frames_inner(
++                    deltas,
++                    context,
++                    registry,
++                    next_edge_ordinal,
++                    frames,
++                )
++            }
++        }
++    }
++
++    fn commit_storage_resolved_scan_patch(
++        value: &mut RelationValue,
++        handles: &mut Option<MaintainedLeafHandles>,
++        patch: StorageResolvedScanPatch,
++    ) {
++        let handles = handles
++            .as_mut()
++            .expect("sealed storage-resolved Scan patch requires bound handles");
++        for id in patch.removed_handles {
++            handles
++                .remove(value, id)
++                .expect("validated storage-resolved Scan removal must commit");
++        }
++        for (id, row) in patch.inserted {
++            handles
++                .insert(value, id, row)
++                .expect("validated storage-resolved Scan insertion must commit");
++        }
+     }
+ 
+     fn apply_storage_resolved_deltas_in_place(
+@@ -4274,13 +4484,7 @@
+         deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<
+-        BTreeMap<
+-            CompiledDeltaEdgeIdentity,
+-            ValidatedTransitionFrame<RelationMutationPlan, RelationDelta>,
+-        >,
+-        RelQueryError,
+-    > {
++    ) -> Result<ValidatedLeafTransitionFrames, RelQueryError> {
+         let mut frames = BTreeMap::new();
+         let mut next_edge_ordinal = 0_u32;
+         self.validate_leaf_deltas_inner(
+@@ -4299,10 +4503,7 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+         next_edge_ordinal: &mut u32,
+-        frames: &mut BTreeMap<
+-            CompiledDeltaEdgeIdentity,
+-            ValidatedTransitionFrame<RelationMutationPlan, RelationDelta>,
+-        >,
++        frames: &mut ValidatedLeafTransitionFrames,
+     ) -> Result<(), RelQueryError> {
+         match self.node.as_ref() {
+             MaintainedRelPlanNode::Scan {
+@@ -4344,7 +4545,11 @@
+                 if frames
+                     .insert(
+                         edge,
+-                        ValidatedTransitionFrame::new(edge, plan, delta.clone()),
++                        ValidatedTransitionFrame::new(
++                            edge,
++                            MaintainedScanCommitPatch::Semantic(plan),
++                            delta.clone(),
++                        ),
+                     )
+                     .is_some()
+                 {
+@@ -4561,18 +4766,12 @@
+     ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
+         let child = input.plan_relation_deltas_inner(plan)?;
+         let planned = state.plan_delta_view(&child.effect, plan.context, plan.registry)?;
+-        let patch = match planned.patch {
+-            GroupDeltaPatch::I64Count(patch) => MaintainedGroupCommitPatch::I64(patch),
+-            GroupDeltaPatch::Generic(patch) => {
+-                let mut candidate = state.clone();
+-                candidate.commit_group_patch(
+-                    GroupDeltaPatch::Generic(patch),
+-                    plan.context,
+-                    plan.registry,
+-                )?;
+-                MaintainedGroupCommitPatch::Replace(Box::new(candidate))
+-            }
+-        };
++        let patch = MaintainedGroupCommitPatch::Sealed(sealed_group_v3::seal_group_patch(
++            state,
++            planned.patch,
++            plan.context,
++            plan.registry,
++        )?);
+         Ok(PlannedMaintainedRelPlanTransition {
+             patch: MaintainedRelPlanPatch::Group {
+                 input: Box::new(child.patch),
+@@ -4603,13 +4802,24 @@
+             (
+                 MaintainedRelPlanNode::Scan {
+                     value,
++                    handles,
+                     canonical_lookup,
+                     ..
+                 },
+                 MaintainedRelPlanPatch::Scan(Some(plan)),
+-            ) => {
+-                MaterializedJoinDeltaState::commit_relation_mutation(value, canonical_lookup, plan);
+-            }
++            ) => match plan {
++                MaintainedScanCommitPatch::Semantic(plan) => {
++                    MaterializedJoinDeltaState::commit_relation_mutation(
++                        value,
++                        canonical_lookup,
++                        plan,
++                    );
++                }
++                MaintainedScanCommitPatch::StorageResolved(plan) => {
++                    Self::commit_storage_resolved_scan_patch(value, handles, plan);
++                    *canonical_lookup = None;
++                }
++            },
+             (MaintainedRelPlanNode::Scan { .. }, MaintainedRelPlanPatch::Scan(None)) => {}
+             (
+                 MaintainedRelPlanNode::Filter { input, .. }
+@@ -4663,10 +4873,9 @@
+                 },
+             ) => {
+                 match patch {
+-                    MaintainedGroupCommitPatch::I64(patch) => state
+-                        .commit_i64_count_patch(patch)
+-                        .expect("planned I64 Group patch must commit"),
+-                    MaintainedGroupCommitPatch::Replace(candidate) => *state = *candidate,
++                    MaintainedGroupCommitPatch::Sealed(patch) => {
++                        sealed_group_v3::commit_sealed_group_patch(state, patch);
++                    }
+                 }
+                 input.commit_relation_plan(*child);
+             }
+@@ -4687,7 +4896,7 @@
+ 
+ type ValidatedLeafTransitionFrames = BTreeMap<
+     CompiledDeltaEdgeIdentity,
+-    ValidatedTransitionFrame<RelationMutationPlan, RelationDelta>,
++    ValidatedTransitionFrame<MaintainedScanCommitPatch, RelationDelta>,
+ >;
+ 
+ struct RelationDeltaPlanContext<'a> {
+@@ -5439,6 +5648,9 @@
+         &self,
+         input_delta: &D,
+     ) -> Result<PlannedDeltaEffect<I64CountGroupPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
++        if let Some(planned) = self.plan_small_i64_count_delta(input_delta)? {
++            return Ok(planned);
++        }
+         let group_column = self.group_columns[0];
+         let mut signed = BTreeMap::<i64, i128>::new();
+         let mut error = None;
+@@ -5523,6 +5735,150 @@
+         })
+     }
+ 
++    /// Common tiny-delta lowering for I64 Count groups.  This is deliberately
++    /// only a representation optimization: unsupported shapes fall through to
++    /// the general signed-map planner below, while the patch/effect contract is
++    /// identical.
++    #[allow(clippy::too_many_lines)]
++    fn plan_small_i64_count_delta<D: DeltaView<Row>>(
++        &self,
++        input_delta: &D,
++    ) -> Result<Option<PlannedDeltaEffect<I64CountGroupPatch, AdaptiveDelta<Row, 4>>>, RelQueryError>
++    {
++        if input_delta.support_len() > 2 {
++            return Ok(None);
++        }
++        let group_column = self.group_columns[0];
++        let mut first = None::<(i64, i64)>;
++        let mut second = None::<(i64, i64)>;
++        let mut unsupported = false;
++        let mut error = None;
++        input_delta.visit(|weight, row| {
++            if weight == 0 || unsupported || error.is_some() {
++                return;
++            }
++            if weight != -1 && weight != 1 {
++                unsupported = true;
++                return;
++            }
++            let Some(Value::I64(key)) = row.get(group_column) else {
++                error = Some(RelQueryError::TypeMismatch);
++                return;
++            };
++            if first.is_none() {
++                first = Some((weight, *key));
++            } else if second.is_none() {
++                second = Some((weight, *key));
++            } else {
++                unsupported = true;
++            }
++        });
++        if let Some(error) = error {
++            return Err(error);
++        }
++        if unsupported {
++            return Ok(None);
++        }
++
++        let mut entries = [(0_i64, 0_i64); 2];
++        let mut len = 0_usize;
++        if let Some(entry) = first {
++            entries[len] = entry;
++            len += 1;
++        }
++        if let Some(entry) = second {
++            if len == 1 && entries[0].1 == entry.1 {
++                let combined = entries[0].0 + entry.0;
++                if combined == 0 {
++                    len = 0;
++                } else {
++                    // Same-key ±2 is uncommon and belongs to the general path.
++                    return Ok(None);
++                }
++            } else {
++                entries[len] = entry;
++                len += 1;
++            }
++        }
++
++        let retain_dense = self.dense_i64_count.as_ref().is_some_and(|dense| {
++            entries[..len]
++                .iter()
++                .all(|(_, key)| dense.index(*key).is_some())
++        });
++        let lookup = self
++            .i64_lookup
++            .as_ref()
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        let mut changes = Vec::with_capacity(len);
++        let mut effect = AdaptiveDelta::<Row, 4>::default();
++        let mut dense_move = None;
++
++        let mut source_is_one = false;
++        let mut target_is_zero = false;
++        let mut removed_key = None;
++        let mut inserted_key = None;
++
++        for &(weight, key) in &entries[..len] {
++            let current = if retain_dense {
++                self.dense_i64_count
++                    .as_ref()
++                    .and_then(|dense| dense.count(key))
++                    .cloned()
++                    .unwrap_or_default()
++            } else {
++                lookup
++                    .get(&key)
++                    .map(|index| self.groups[*index].count.clone())
++                    .unwrap_or_default()
++            };
++            let before = (!current.is_zero())
++                .then(|| current.finish_i64())
++                .transpose()?;
++            if weight == -1 {
++                source_is_one = current.is_one();
++                removed_key = Some(key);
++            } else {
++                target_is_zero = current.is_zero();
++                inserted_key = Some(key);
++            }
++            let mut next = current;
++            if weight == -1 {
++                next.remove_one()?;
++            } else {
++                next.add_one();
++            }
++            let after = (!next.is_zero()).then(|| next.finish_i64()).transpose()?;
++            if before != after {
++                if let Some(value) = before {
++                    effect.push_weighted(-1, vec![Value::I64(key), Value::I64(value)]);
++                }
++                if let Some(value) = after {
++                    effect.push_weighted(1, vec![Value::I64(key), Value::I64(value)]);
++                }
++            }
++            changes.push((key, next));
++        }
++
++        if retain_dense
++            && len == 2
++            && source_is_one
++            && target_is_zero
++            && removed_key != inserted_key
++            && let (Some(removed), Some(inserted)) = (removed_key, inserted_key)
++        {
++            dense_move = Some((removed, inserted));
++        }
++        Ok(Some(PlannedDeltaEffect {
++            patch: I64CountGroupPatch {
++                changes,
++                retain_dense,
++                dense_move,
++            },
++            effect,
++        }))
++    }
++
+     fn plan_dense_singleton_move(
+         &self,
+         signed: &BTreeMap<i64, i128>,
+@@ -6580,9 +6936,8 @@
+                     registry,
+                 )?;
+                 let before = rows.output_rows(self.direction, self.k);
+-                let mut candidate = rows.as_ref().clone();
+-                candidate.commit_plan(patch.clone());
+-                let after = candidate.output_rows(self.direction, self.k);
++                let after =
++                    Self::semantic_output_rows_after_patch(rows, &patch, self.direction, self.k);
+                 let effect = adaptive_delta_between_rows(
+                     &before,
+                     &after,
+@@ -6598,6 +6953,117 @@
+         }
+     }
+ 
++    /// Computes the selected WITH-TIES output after one already-validated
++    /// semantic ordered mutation without cloning the complete ordered store.
++    ///
++    /// The mutation patch changes only the canonical-order buckets named by
++    /// removed/inserted identities.  A merge of the immutable base bucket
++    /// stream with those changed buckets is therefore sufficient to recover
++    /// the exact post-state prefix.  Work is proportional to the visible
++    /// prefix plus the delta, rather than to the complete relation.
++    fn semantic_output_rows_after_patch(
++        rows: &IndexedOrderedRows,
++        patch: &IndexedOrderedMutationPlan,
++        direction: OrderDirection,
++        k: usize,
++    ) -> Vec<Row> {
++        if k == 0 {
++            return Vec::new();
++        }
++
++        let removed = patch.remove_ids.iter().copied().collect::<BTreeSet<_>>();
++        let mut inserted = BTreeMap::<&kernel_semantics::CanonicalOrderKey, Vec<&Row>>::new();
++        for (_, key, row) in &patch.inserted {
++            inserted.entry(key).or_default().push(row);
++        }
++
++        let mut output = Vec::new();
++        let emit_base = |ids: &[IndexedRowId], output: &mut Vec<Row>| {
++            for id in ids {
++                if !removed.contains(id) {
++                    output.push(rows.rows[id].clone());
++                }
++            }
++        };
++        let emit_inserted = |values: &[&Row], output: &mut Vec<Row>| {
++            output.extend(values.iter().map(|row| (*row).clone()));
++        };
++
++        match direction {
++            OrderDirection::Ascending => {
++                let mut base = rows.index.buckets().peekable();
++                let mut delta = inserted.iter().peekable();
++                while output.len() < k {
++                    let base_key = base.peek().map(|(key, _)| *key);
++                    let delta_key = delta.peek().map(|(key, _)| **key);
++                    match (base_key, delta_key) {
++                        (Some(base_key), Some(delta_key)) => match base_key.cmp(delta_key) {
++                            std::cmp::Ordering::Less => {
++                                let (_, ids) = base.next().expect("peeked base bucket");
++                                emit_base(ids, &mut output);
++                            }
++                            std::cmp::Ordering::Equal => {
++                                let (_, ids) = base.next().expect("peeked base bucket");
++                                let (_, values) = delta.next().expect("peeked delta bucket");
++                                emit_base(ids, &mut output);
++                                emit_inserted(values, &mut output);
++                            }
++                            std::cmp::Ordering::Greater => {
++                                let (_, values) = delta.next().expect("peeked delta bucket");
++                                emit_inserted(values, &mut output);
++                            }
++                        },
++                        (Some(_), None) => {
++                            let (_, ids) = base.next().expect("peeked base bucket");
++                            emit_base(ids, &mut output);
++                        }
++                        (None, Some(_)) => {
++                            let (_, values) = delta.next().expect("peeked delta bucket");
++                            emit_inserted(values, &mut output);
++                        }
++                        (None, None) => break,
++                    }
++                }
++            }
++            OrderDirection::Descending => {
++                let mut base = rows.index.buckets().rev().peekable();
++                let mut delta = inserted.iter().rev().peekable();
++                while output.len() < k {
++                    let base_key = base.peek().map(|(key, _)| *key);
++                    let delta_key = delta.peek().map(|(key, _)| **key);
++                    match (base_key, delta_key) {
++                        (Some(base_key), Some(delta_key)) => match base_key.cmp(delta_key) {
++                            std::cmp::Ordering::Greater => {
++                                let (_, ids) = base.next().expect("peeked base bucket");
++                                emit_base(ids, &mut output);
++                            }
++                            std::cmp::Ordering::Equal => {
++                                let (_, ids) = base.next().expect("peeked base bucket");
++                                let (_, values) = delta.next().expect("peeked delta bucket");
++                                emit_base(ids, &mut output);
++                                emit_inserted(values, &mut output);
++                            }
++                            std::cmp::Ordering::Less => {
++                                let (_, values) = delta.next().expect("peeked delta bucket");
++                                emit_inserted(values, &mut output);
++                            }
++                        },
++                        (Some(_), None) => {
++                            let (_, ids) = base.next().expect("peeked base bucket");
++                            emit_base(ids, &mut output);
++                        }
++                        (None, Some(_)) => {
++                            let (_, values) = delta.next().expect("peeked delta bucket");
++                            emit_inserted(values, &mut output);
++                        }
++                        (None, None) => break,
++                    }
++                }
++            }
++        }
++        output
++    }
++
+     fn commit_topk_patch(&mut self, patch: TopKDeltaPatch) {
+         match (patch, &mut self.storage) {
+             (TopKDeltaPatch::I64Scalar(patch), MaintainedTopKStorage::I64Scalar(state)) => {
+@@ -6722,7 +7188,7 @@
+             changes.push((key, (!bucket.is_empty()).then_some(bucket)));
+         }
+         let before = self.i64_output_rows(buckets);
+-        let after = self.i64_output_rows_with_changes(buckets, &changes);
++        let after = self.i64_output_rows_after_changes(buckets, &changes);
+         let effect =
+             adaptive_delta_between_rows(&before, &after, &self.result_type, context, registry)?;
+         Ok(PlannedDeltaEffect {
+@@ -6731,6 +7197,103 @@
+         })
+     }
+ 
++    /// Computes the post-mutation WITH-TIES prefix by merging the immutable
++    /// ordered buckets with the sorted changed-bucket overlay.  No complete
++    /// `BTreeMap<i64, Vec<Row>>` candidate is constructed.
++    fn i64_output_rows_after_changes(
++        &self,
++        buckets: &BTreeMap<i64, Vec<Row>>,
++        changes: &[(i64, Option<Vec<Row>>)],
++    ) -> Vec<Row> {
++        if self.k == 0 {
++            return Vec::new();
++        }
++        let mut output = Vec::new();
++        match self.direction {
++            OrderDirection::Ascending => {
++                let mut base = buckets.iter().peekable();
++                let mut delta = changes.iter().peekable();
++                while output.len() < self.k {
++                    let base_key = base.peek().map(|(key, _)| **key);
++                    let delta_key = delta.peek().map(|change| change.0);
++                    match (base_key, delta_key) {
++                        (Some(base_key), Some(delta_key)) => match base_key.cmp(&delta_key) {
++                            std::cmp::Ordering::Less => {
++                                let (_, rows) = base.next().expect("peeked base bucket");
++                                output.extend(rows.iter().cloned());
++                            }
++                            std::cmp::Ordering::Equal => {
++                                let _ = base.next().expect("peeked base bucket");
++                                let (_, replacement) = delta.next().expect("peeked delta bucket");
++                                if let Some(rows) = replacement {
++                                    output.extend(rows.iter().cloned());
++                                }
++                            }
++                            std::cmp::Ordering::Greater => {
++                                let (_, replacement) = delta.next().expect("peeked delta bucket");
++                                if let Some(rows) = replacement {
++                                    output.extend(rows.iter().cloned());
++                                }
++                            }
++                        },
++                        (Some(_), None) => {
++                            let (_, rows) = base.next().expect("peeked base bucket");
++                            output.extend(rows.iter().cloned());
++                        }
++                        (None, Some(_)) => {
++                            let (_, replacement) = delta.next().expect("peeked delta bucket");
++                            if let Some(rows) = replacement {
++                                output.extend(rows.iter().cloned());
++                            }
++                        }
++                        (None, None) => break,
++                    }
++                }
++            }
++            OrderDirection::Descending => {
++                let mut base = buckets.iter().rev().peekable();
++                let mut delta = changes.iter().rev().peekable();
++                while output.len() < self.k {
++                    let base_key = base.peek().map(|(key, _)| **key);
++                    let delta_key = delta.peek().map(|change| change.0);
++                    match (base_key, delta_key) {
++                        (Some(base_key), Some(delta_key)) => match base_key.cmp(&delta_key) {
++                            std::cmp::Ordering::Greater => {
++                                let (_, rows) = base.next().expect("peeked base bucket");
++                                output.extend(rows.iter().cloned());
++                            }
++                            std::cmp::Ordering::Equal => {
++                                let _ = base.next().expect("peeked base bucket");
++                                let (_, replacement) = delta.next().expect("peeked delta bucket");
++                                if let Some(rows) = replacement {
++                                    output.extend(rows.iter().cloned());
++                                }
++                            }
++                            std::cmp::Ordering::Less => {
++                                let (_, replacement) = delta.next().expect("peeked delta bucket");
++                                if let Some(rows) = replacement {
++                                    output.extend(rows.iter().cloned());
++                                }
++                            }
++                        },
++                        (Some(_), None) => {
++                            let (_, rows) = base.next().expect("peeked base bucket");
++                            output.extend(rows.iter().cloned());
++                        }
++                        (None, Some(_)) => {
++                            let (_, replacement) = delta.next().expect("peeked delta bucket");
++                            if let Some(rows) = replacement {
++                                output.extend(rows.iter().cloned());
++                            }
++                        }
++                        (None, None) => break,
++                    }
++                }
++            }
++        }
++        output
++    }
++
+     fn i64_scalar_output_rows(state: &topk_i64::I64TopKState) -> Vec<Row> {
+         state
+             .selected_counts()
+@@ -6794,100 +7357,6 @@
+         }
+     }
+ 
+-    fn i64_output_rows_with_changes(
+-        &self,
+-        buckets: &BTreeMap<i64, Vec<Row>>,
+-        changes: &[(i64, Option<Vec<Row>>)],
+-    ) -> Vec<Row> {
+-        if self.k == 0 {
+-            return Vec::new();
+-        }
+-        let mut out = Vec::new();
+-        match self.direction {
+-            OrderDirection::Ascending => {
+-                let mut base = buckets.iter().peekable();
+-                let mut overlay = changes.iter().peekable();
+-                while out.len() < self.k {
+-                    match (base.peek(), overlay.peek()) {
+-                        (Some((base_key, base_bucket)), Some((changed_key, changed_bucket))) => {
+-                            match (**base_key).cmp(changed_key) {
+-                                std::cmp::Ordering::Less => {
+-                                    out.extend(base_bucket.iter().cloned());
+-                                    base.next();
+-                                }
+-                                std::cmp::Ordering::Greater => {
+-                                    if let Some(bucket) = changed_bucket {
+-                                        out.extend(bucket.iter().cloned());
+-                                    }
+-                                    overlay.next();
+-                                }
+-                                std::cmp::Ordering::Equal => {
+-                                    if let Some(bucket) = changed_bucket {
+-                                        out.extend(bucket.iter().cloned());
+-                                    }
+-                                    base.next();
+-                                    overlay.next();
+-                                }
+-                            }
+-                        }
+-                        (Some((_, bucket)), None) => {
+-                            out.extend(bucket.iter().cloned());
+-                            base.next();
+-                        }
+-                        (None, Some((_, bucket))) => {
+-                            if let Some(bucket) = bucket {
+-                                out.extend(bucket.iter().cloned());
+-                            }
+-                            overlay.next();
+-                        }
+-                        (None, None) => break,
+-                    }
+-                }
+-            }
+-            OrderDirection::Descending => {
+-                let mut base = buckets.iter().rev().peekable();
+-                let mut overlay = changes.iter().rev().peekable();
+-                while out.len() < self.k {
+-                    match (base.peek(), overlay.peek()) {
+-                        (Some((base_key, base_bucket)), Some((changed_key, changed_bucket))) => {
+-                            match (**base_key).cmp(changed_key) {
+-                                std::cmp::Ordering::Greater => {
+-                                    out.extend(base_bucket.iter().cloned());
+-                                    base.next();
+-                                }
+-                                std::cmp::Ordering::Less => {
+-                                    if let Some(bucket) = changed_bucket {
+-                                        out.extend(bucket.iter().cloned());
+-                                    }
+-                                    overlay.next();
+-                                }
+-                                std::cmp::Ordering::Equal => {
+-                                    if let Some(bucket) = changed_bucket {
+-                                        out.extend(bucket.iter().cloned());
+-                                    }
+-                                    base.next();
+-                                    overlay.next();
+-                                }
+-                            }
+-                        }
+-                        (Some((_, bucket)), None) => {
+-                            out.extend(bucket.iter().cloned());
+-                            base.next();
+-                        }
+-                        (None, Some((_, bucket))) => {
+-                            if let Some(bucket) = bucket {
+-                                out.extend(bucket.iter().cloned());
+-                            }
+-                            overlay.next();
+-                        }
+-                        (None, None) => break,
+-                    }
+-                }
+-            }
+-        }
+-        out
+-    }
+-
+     fn i64_output_rows(&self, buckets: &BTreeMap<i64, Vec<Row>>) -> Vec<Row> {
+         if self.k == 0 {
+             return Vec::new();
+--- /mnt/data/cfmd_pass104_work/crates/kernel-query/src/linear_island.rs	2026-09-23 01:55:20.000000000 +0000
++++ crates/kernel-query/src/linear_island.rs	2026-09-23 12:23:01.791931230 +0000
+@@ -4,7 +4,9 @@
+ //! change relational semantics and deliberately excludes zero-crossing/stateful
+ //! barriers such as `Set` projection, `Distinct`, `Group`, `TopK` and `Join`.
+ 
+-use crate::{AdaptiveDelta, DeltaSink, DeltaView, RelExpr, RelQueryError, Row, Value};
++use crate::{
++    AdaptiveDelta, DeltaSink, DeltaView, PreparedRelGraph, RelExpr, RelQueryError, Row, Value,
++};
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum LinearIslandPredicate {
+@@ -137,10 +139,11 @@
+ ///
+ /// `linear_islands` lists every maximal DTC-Linear chain. Stateful/non-linear
+ /// barriers remain in the existing maintained plan and are ported separately.
+-#[derive(Debug, Clone, PartialEq, Eq, Default)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct CompiledDeltaProgram {
+     linear_islands: Vec<LinearIslandNormalForm>,
+     barriers: Vec<BarrierKernelClass>,
++    execution_graph: PreparedRelGraph,
+ }
+ 
+ /// Physical state-kernel classes required by non-linear maintained nodes.
+@@ -171,6 +174,7 @@
+         Ok(Self {
+             linear_islands,
+             barriers,
++            execution_graph: PreparedRelGraph::compile(query),
+         })
+     }
+ 
+@@ -183,6 +187,11 @@
+     pub fn barriers(&self) -> &[BarrierKernelClass] {
+         &self.barriers
+     }
++
++    #[must_use]
++    pub const fn execution_graph(&self) -> &PreparedRelGraph {
++        &self.execution_graph
++    }
+ }
+ 
+ fn collect_barriers(
+--- /dev/null	2026-09-23 10:43:08.546241767 +0000
++++ crates/kernel-query/src/sealed_group_v3.rs	2026-09-23 12:19:46.004555200 +0000
+@@ -0,0 +1,480 @@
++//! R&D V3: pre-publication sealing for Group state patches.
++//!
++//! This module deliberately lives beside the production implementation in the
++//! disposable Pass103 R&D workspace.  It proves that all semantic/index/shape
++//! failure discovery can happen before publication, leaving a structural
++//! commit that does not return a recoverable error.
++
++use super::{
++    BTreeMap, BTreeSet, GenericGroupPatch, GroupDeltaPatch, I64CountGroupPatch,
++    MaintainedGroupBucket, MaterializedGroupDeltaState, RelQueryError, Row, Value,
++};
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(super) enum SealedLookupKey {
++    I64(i64),
++    Semantic(Vec<kernel_semantics::CanonicalEqKey>),
++    None,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(super) struct SealedRemoval {
++    index: usize,
++    removed_lookup: SealedLookupKey,
++    moved_lookup: Option<SealedLookupKey>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(super) struct SealedMove {
++    index: usize,
++    old_lookup: SealedLookupKey,
++    new_lookup: SealedLookupKey,
++    bucket: MaintainedGroupBucket,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(super) enum SealedDenseAction {
++    Untouched,
++    Drop,
++    Assign(Vec<(usize, kernel_aggregate::ExactCount)>),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(super) struct SealedGroupPatch {
++    moves: Vec<SealedMove>,
++    replacements: Vec<(usize, MaintainedGroupBucket)>,
++    removals: Vec<SealedRemoval>,
++    insertions: Vec<(MaintainedGroupBucket, SealedLookupKey)>,
++    dense: SealedDenseAction,
++}
++
++fn lookup_key_for(
++    state: &MaterializedGroupDeltaState,
++    key: &Row,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<SealedLookupKey, RelQueryError> {
++    if state.i64_lookup.is_some() {
++        let [Value::I64(value)] = key.as_slice() else {
++            return Err(RelQueryError::TypeMismatch);
++        };
++        return Ok(SealedLookupKey::I64(*value));
++    }
++    if state.semantic_lookup.is_some() {
++        let canonical = state
++            .canonical_group_key(key, registry)?
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        return Ok(SealedLookupKey::Semantic(canonical));
++    }
++    Ok(SealedLookupKey::None)
++}
++
++fn seal_removals(
++    state: &MaterializedGroupDeltaState,
++    mut indices: Vec<usize>,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Vec<SealedRemoval>, RelQueryError> {
++    // Descending indices make swap-remove relocation deterministic.  The small
++    // virtual source map tracks which original bucket occupies a slot after
++    // earlier removals without cloning the whole group vector.
++    indices.sort_unstable_by(|left, right| right.cmp(left));
++    if indices.windows(2).any(|pair| pair[0] == pair[1]) {
++        return Err(RelQueryError::InconsistentIncrementalDelta);
++    }
++    let mut current_len = state.groups.len();
++    let mut virtual_sources = BTreeMap::<usize, usize>::new();
++    let mut sealed = Vec::with_capacity(indices.len());
++    for index in indices {
++        if index >= current_len {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        let source = virtual_sources.get(&index).copied().unwrap_or(index);
++        let removed_lookup = lookup_key_for(state, &state.groups[source].key, registry)?;
++        let tail = current_len - 1;
++        let tail_source = virtual_sources.get(&tail).copied().unwrap_or(tail);
++        let moved_lookup = if index == tail {
++            None
++        } else {
++            let key = lookup_key_for(state, &state.groups[tail_source].key, registry)?;
++            virtual_sources.insert(index, tail_source);
++            Some(key)
++        };
++        virtual_sources.remove(&tail);
++        sealed.push(SealedRemoval {
++            index,
++            removed_lookup,
++            moved_lookup,
++        });
++        current_len -= 1;
++    }
++    Ok(sealed)
++}
++
++#[allow(clippy::too_many_lines)]
++fn seal_i64_group_patch(
++    state: &MaterializedGroupDeltaState,
++    patch: I64CountGroupPatch,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<SealedGroupPatch, RelQueryError> {
++    if !state.fast_i64_count || state.i64_lookup.is_none() {
++        return Err(RelQueryError::InconsistentIncrementalDelta);
++    }
++    if !patch.retain_dense && patch.dense_move.is_some() {
++        return Err(RelQueryError::InconsistentIncrementalDelta);
++    }
++
++    let dense = if patch.retain_dense {
++        let dense = state
++            .dense_i64_count
++            .as_ref()
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        let mut assignments = Vec::with_capacity(patch.changes.len());
++        for (key, count) in &patch.changes {
++            let index = dense
++                .index(*key)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            let dense_present = !dense.counts[index].is_zero();
++            let lookup_present = state
++                .i64_lookup
++                .as_ref()
++                .is_some_and(|lookup| lookup.contains_key(key));
++            if dense_present != lookup_present {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
++            }
++            assignments.push((index, count.clone()));
++        }
++        SealedDenseAction::Assign(assignments)
++    } else {
++        SealedDenseAction::Drop
++    };
++
++    let lookup = state
++        .i64_lookup
++        .as_ref()
++        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++    if let Some((removed, inserted)) = patch.dense_move {
++        let index = lookup
++            .get(&removed)
++            .copied()
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        if lookup.contains_key(&inserted) {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        let inserted_count = patch
++            .changes
++            .iter()
++            .find(|(key, _)| *key == inserted)
++            .map(|(_, count)| count.clone())
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        let [Value::I64(actual_key)] = state.groups[index].key.as_slice() else {
++            return Err(RelQueryError::TypeMismatch);
++        };
++        if *actual_key != removed || !state.groups[index].count.is_one() {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        let mut bucket = state.groups[index].clone();
++        bucket.key = vec![Value::I64(inserted)];
++        bucket.count = inserted_count;
++        return Ok(SealedGroupPatch {
++            moves: vec![SealedMove {
++                index,
++                old_lookup: SealedLookupKey::I64(removed),
++                new_lookup: SealedLookupKey::I64(inserted),
++                bucket,
++            }],
++            replacements: Vec::new(),
++            removals: Vec::new(),
++            insertions: Vec::new(),
++            dense,
++        });
++    }
++    let mut replacements = Vec::new();
++    let mut removal_indices = Vec::new();
++    let mut insertions = Vec::new();
++    let mut touched_indices = BTreeSet::new();
++
++    for (key, count) in patch.changes {
++        match (lookup.get(&key).copied(), count.is_zero()) {
++            (Some(index), false) => {
++                if !touched_indices.insert(index) {
++                    return Err(RelQueryError::InconsistentIncrementalDelta);
++                }
++                let [Value::I64(actual_key)] = state.groups[index].key.as_slice() else {
++                    return Err(RelQueryError::TypeMismatch);
++                };
++                if *actual_key != key {
++                    return Err(RelQueryError::InconsistentIncrementalDelta);
++                }
++                let mut bucket = state.groups[index].clone();
++                bucket.count = count;
++                replacements.push((index, bucket));
++            }
++            (Some(index), true) => {
++                if !touched_indices.insert(index) {
++                    return Err(RelQueryError::InconsistentIncrementalDelta);
++                }
++                removal_indices.push(index);
++            }
++            (None, false) => {
++                let mut bucket = MaterializedGroupDeltaState::empty_bucket(vec![Value::I64(key)]);
++                bucket.count = count;
++                insertions.push((bucket, SealedLookupKey::I64(key)));
++            }
++            (None, true) => {}
++        }
++    }
++
++    let removals = seal_removals(state, removal_indices, registry)?;
++    Ok(SealedGroupPatch {
++        moves: Vec::new(),
++        replacements,
++        removals,
++        insertions,
++        dense,
++    })
++}
++
++fn seal_generic_group_patch(
++    state: &MaterializedGroupDeltaState,
++    patch: GenericGroupPatch,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<SealedGroupPatch, RelQueryError> {
++    let mut replacements = Vec::new();
++    let mut removal_indices = Vec::new();
++    let mut insertions = Vec::new();
++    let mut touched_indices = BTreeSet::new();
++
++    for (key, next_bucket) in patch.planned {
++        let current = state.find_group(&key, context, registry)?;
++        match (current, next_bucket) {
++            (Some(index), Some(bucket)) => {
++                if !touched_indices.insert(index) {
++                    return Err(RelQueryError::InconsistentIncrementalDelta);
++                }
++                replacements.push((index, bucket));
++            }
++            (Some(index), None) => {
++                if !touched_indices.insert(index) {
++                    return Err(RelQueryError::InconsistentIncrementalDelta);
++                }
++                removal_indices.push(index);
++            }
++            (None, Some(bucket)) => {
++                let lookup = lookup_key_for(state, &bucket.key, registry)?;
++                insertions.push((bucket, lookup));
++            }
++            (None, None) => {}
++        }
++    }
++
++    let removals = seal_removals(state, removal_indices, registry)?;
++    let final_len = state.groups.len() - removals.len() + insertions.len();
++    if state.group_columns.is_empty() && final_len == 0 {
++        let bucket = MaterializedGroupDeltaState::empty_bucket(Vec::new());
++        let lookup = lookup_key_for(state, &bucket.key, registry)?;
++        insertions.push((bucket, lookup));
++    }
++
++    Ok(SealedGroupPatch {
++        moves: Vec::new(),
++        replacements,
++        removals,
++        insertions,
++        dense: SealedDenseAction::Untouched,
++    })
++}
++
++pub(super) fn seal_group_patch(
++    state: &MaterializedGroupDeltaState,
++    patch: GroupDeltaPatch,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<SealedGroupPatch, RelQueryError> {
++    match patch {
++        GroupDeltaPatch::I64Count(patch) => seal_i64_group_patch(state, patch, registry),
++        GroupDeltaPatch::Generic(patch) => {
++            seal_generic_group_patch(state, patch, context, registry)
++        }
++    }
++}
++
++fn remove_lookup_total(state: &mut MaterializedGroupDeltaState, key: &SealedLookupKey) {
++    match key {
++        SealedLookupKey::I64(key) => {
++            let lookup = state
++                .i64_lookup
++                .as_mut()
++                .expect("sealed I64 lookup backend");
++            let removed = lookup.remove(key);
++            debug_assert!(removed.is_some());
++        }
++        SealedLookupKey::Semantic(key) => {
++            let lookup = state
++                .semantic_lookup
++                .as_mut()
++                .expect("sealed semantic lookup backend");
++            let removed = lookup.remove(key);
++            debug_assert!(removed.is_some());
++        }
++        SealedLookupKey::None => {}
++    }
++}
++
++fn insert_lookup_total(
++    state: &mut MaterializedGroupDeltaState,
++    key: &SealedLookupKey,
++    index: usize,
++) {
++    match key {
++        SealedLookupKey::I64(key) => {
++            state
++                .i64_lookup
++                .as_mut()
++                .expect("sealed I64 lookup backend")
++                .insert(*key, index);
++        }
++        SealedLookupKey::Semantic(key) => {
++            state
++                .semantic_lookup
++                .as_mut()
++                .expect("sealed semantic lookup backend")
++                .insert(key.clone(), index);
++        }
++        SealedLookupKey::None => {}
++    }
++}
++
++/// Total over the exact state generation against which the patch was sealed.
++/// Every recoverable semantic/index/shape failure belongs to `seal_group_patch`.
++pub(super) fn commit_sealed_group_patch(
++    state: &mut MaterializedGroupDeltaState,
++    patch: SealedGroupPatch,
++) {
++    for movement in patch.moves {
++        remove_lookup_total(state, &movement.old_lookup);
++        state.groups[movement.index] = movement.bucket;
++        insert_lookup_total(state, &movement.new_lookup, movement.index);
++    }
++    for (index, bucket) in patch.replacements {
++        state.groups[index] = bucket;
++    }
++
++    match patch.dense {
++        SealedDenseAction::Untouched => {}
++        SealedDenseAction::Drop => state.dense_i64_count = None,
++        SealedDenseAction::Assign(assignments) => {
++            let dense = state
++                .dense_i64_count
++                .as_mut()
++                .expect("sealed dense backend");
++            for (index, count) in assignments {
++                dense.counts[index] = count;
++            }
++        }
++    }
++
++    for removal in patch.removals {
++        debug_assert!(removal.index < state.groups.len());
++        remove_lookup_total(state, &removal.removed_lookup);
++        let last = state.groups.len() - 1;
++        state.groups.swap_remove(removal.index);
++        if removal.index == last {
++            debug_assert!(removal.moved_lookup.is_none());
++        } else {
++            insert_lookup_total(
++                state,
++                removal
++                    .moved_lookup
++                    .as_ref()
++                    .expect("sealed moved lookup key"),
++                removal.index,
++            );
++        }
++    }
++
++    for (bucket, lookup_key) in patch.insertions {
++        let index = state.groups.len();
++        insert_lookup_total(state, &lookup_key, index);
++        state.groups.push(bucket);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{AggregateSpec, CompactDelta, RelExpr};
++    use kernel_model::FiniteModel;
++    use kernel_schema::{
++        RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext, SemanticEnvironment,
++        TypeExpr,
++    };
++    use kernel_semantics::{EquivalenceModule, SemanticRegistry};
++    use kernel_types::{SchemaRevisionId, SemanticEnvId, SemanticId};
++
++    #[test]
++    fn sealed_i64_outlier_roundtrip_matches_legacy_commit() {
++        let relation = SemanticId::new(390_001);
++        let eq = SemanticId::new(390_002);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(390_001));
++        environment.pin_module(eq, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(390_001));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![eq],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let query = RelExpr::Group {
++            input: Box::new(RelExpr::Scan(relation)),
++            group_columns: vec![0],
++            group_equivalences: vec![eq],
++            aggregate: AggregateSpec::Count {
++                result_equivalence: eq,
++            },
++        };
++        let mut model = FiniteModel::default();
++        model
++            .relations
++            .insert(relation, (0..8).map(|i| vec![Value::I64(i)]).collect());
++        let original = MaterializedGroupDeltaState::build(&query, &model, &context, &registry)
++            .unwrap()
++            .unwrap();
++
++        let forward = CompactDelta::replace(vec![Value::I64(0)], vec![Value::I64(10_000)]);
++        let planned = original
++            .plan_delta_view(&forward, &context, &registry)
++            .unwrap();
++        let mut legacy = original.clone();
++        legacy
++            .commit_group_patch(planned.patch.clone(), &context, &registry)
++            .unwrap();
++        let sealed = seal_group_patch(&original, planned.patch, &context, &registry).unwrap();
++        let mut total = original.clone();
++        commit_sealed_group_patch(&mut total, sealed);
++        assert_eq!(total, legacy, "sealed forward state differs from legacy");
++
++        let backward = CompactDelta::replace(vec![Value::I64(10_000)], vec![Value::I64(0)]);
++        let planned = total
++            .plan_delta_view(&backward, &context, &registry)
++            .unwrap();
++        let mut legacy_back = total.clone();
++        legacy_back
++            .commit_group_patch(planned.patch.clone(), &context, &registry)
++            .unwrap();
++        let sealed = seal_group_patch(&total, planned.patch, &context, &registry).unwrap();
++        commit_sealed_group_patch(&mut total, sealed);
++        assert_eq!(
++            total, legacy_back,
++            "sealed backward state differs from legacy"
++        );
++    }
++}
+--- /dev/null	2026-09-23 10:43:08.546241767 +0000
++++ crates/kernel-query/src/execgraph.rs	2026-09-23 12:37:30.120276931 +0000
+@@ -0,0 +1,705 @@
++use crate::{RelExpr, RelQueryError};
++use std::collections::BTreeMap;
++
++pub type NodeId = usize;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ExecutionInputSlot {
++    Unary,
++    Left,
++    Right,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct EdgeTarget {
++    node: NodeId,
++    slot: ExecutionInputSlot,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum PreparedNodeInputs {
++    Source(kernel_types::SemanticId),
++    Unary(NodeId),
++    Binary { left: NodeId, right: NodeId },
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct PreparedGraphNode {
++    inputs: PreparedNodeInputs,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct SourceProgram {
++    occurrences: usize,
++    feeds: Box<[EdgeTarget]>,
++    is_root: bool,
++}
++
++/// One physical transition scheduler for every relational graph shape.
++///
++/// Unlike the retired V3 experiment, this program has no source-specific route
++/// kind and no cost model. Chains remain cheap because runtime scheduling keeps
++/// one ready node in the continuation register; real branching spills into the
++/// same hierarchical ready set and paged inbox representation.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct UnifiedTransitionProgram {
++    sources: BTreeMap<kernel_types::SemanticId, SourceProgram>,
++    out_edges: Box<[Box<[EdgeTarget]>]>,
++    root: NodeId,
++    node_count: usize,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PreparedRelGraph {
++    nodes: Box<[PreparedGraphNode]>,
++    users: Box<[Box<[NodeId]>]>,
++    source_index: BTreeMap<kernel_types::SemanticId, Box<[NodeId]>>,
++    program: UnifiedTransitionProgram,
++}
++
++impl PreparedRelGraph {
++    #[must_use]
++    pub fn compile(query: &RelExpr) -> Self {
++        let mut nodes = Vec::new();
++        let root = compile_postorder(query, &mut nodes);
++        let mut users = vec![Vec::new(); nodes.len()];
++        let mut source_index = BTreeMap::<kernel_types::SemanticId, Vec<NodeId>>::new();
++        for (node_id, node) in nodes.iter().enumerate() {
++            match node.inputs {
++                PreparedNodeInputs::Source(relation) => {
++                    source_index.entry(relation).or_default().push(node_id);
++                }
++                PreparedNodeInputs::Unary(input) => users[input].push(node_id),
++                PreparedNodeInputs::Binary { left, right } => {
++                    users[left].push(node_id);
++                    users[right].push(node_id);
++                }
++            }
++        }
++        let source_index = source_index
++            .into_iter()
++            .map(|(relation, ids)| (relation, ids.into_boxed_slice()))
++            .collect::<BTreeMap<_, _>>();
++        let users = users
++            .into_iter()
++            .map(Vec::into_boxed_slice)
++            .collect::<Vec<_>>()
++            .into_boxed_slice();
++        let nodes = nodes.into_boxed_slice();
++        let program = UnifiedTransitionProgram::compile(&nodes, &users, &source_index, root);
++        Self {
++            nodes,
++            users,
++            source_index,
++            program,
++        }
++    }
++
++    #[must_use]
++    pub const fn root(&self) -> NodeId {
++        self.program.root
++    }
++
++    #[must_use]
++    pub fn node_count(&self) -> usize {
++        self.nodes.len()
++    }
++
++    #[must_use]
++    pub fn source_count(&self) -> usize {
++        self.source_index.len()
++    }
++
++    #[must_use]
++    pub const fn transition_program(&self) -> &UnifiedTransitionProgram {
++        &self.program
++    }
++
++    #[must_use]
++    pub fn user_count(&self, node: NodeId) -> Option<usize> {
++        self.users.get(node).map(|users| users.len())
++    }
++}
++
++impl UnifiedTransitionProgram {
++    fn compile(
++        nodes: &[PreparedGraphNode],
++        users: &[Box<[NodeId]>],
++        source_index: &BTreeMap<kernel_types::SemanticId, Box<[NodeId]>>,
++        root: NodeId,
++    ) -> Self {
++        let mut out_edges = vec![Vec::<EdgeTarget>::new(); nodes.len()];
++        for (child, node_users) in users.iter().enumerate() {
++            for &user in node_users {
++                let slot = input_slot(nodes, child, user)
++                    .expect("prepared relational graph edge must target its declared input");
++                out_edges[child].push(EdgeTarget { node: user, slot });
++            }
++        }
++
++        let mut sources = BTreeMap::new();
++        for (&relation, occurrences) in source_index {
++            let mut feeds = Vec::new();
++            let mut is_root = false;
++            for &source in occurrences {
++                is_root |= source == root;
++                feeds.extend(out_edges[source].iter().copied());
++            }
++            sources.insert(
++                relation,
++                SourceProgram {
++                    occurrences: occurrences.len(),
++                    feeds: feeds.into_boxed_slice(),
++                    is_root,
++                },
++            );
++        }
++
++        Self {
++            sources,
++            out_edges: out_edges
++                .into_iter()
++                .map(Vec::into_boxed_slice)
++                .collect::<Vec<_>>()
++                .into_boxed_slice(),
++            root,
++            node_count: nodes.len(),
++        }
++    }
++
++    #[must_use]
++    pub const fn root(&self) -> NodeId {
++        self.root
++    }
++
++    #[must_use]
++    pub const fn node_count(&self) -> usize {
++        self.node_count
++    }
++
++    #[must_use]
++    pub fn contains_source(&self, relation: kernel_types::SemanticId) -> bool {
++        self.sources.contains_key(&relation)
++    }
++
++    #[must_use]
++    pub fn source_occurrences(&self, relation: kernel_types::SemanticId) -> Option<usize> {
++        self.sources.get(&relation).map(|source| source.occurrences)
++    }
++
++    #[must_use]
++    pub fn source_is_root(&self, relation: kernel_types::SemanticId) -> bool {
++        self.sources
++            .get(&relation)
++            .is_some_and(|source| source.is_root)
++    }
++
++    #[must_use]
++    pub fn source_feed_count(&self, relation: kernel_types::SemanticId) -> Option<usize> {
++        self.sources.get(&relation).map(|source| source.feeds.len())
++    }
++
++    #[must_use]
++    pub fn out_edge_count(&self, node: NodeId) -> Option<usize> {
++        self.out_edges.get(node).map(|edges| edges.len())
++    }
++}
++
++fn input_slot(
++    nodes: &[PreparedGraphNode],
++    child: NodeId,
++    user: NodeId,
++) -> Option<ExecutionInputSlot> {
++    match nodes.get(user)?.inputs {
++        PreparedNodeInputs::Unary(input) if input == child => Some(ExecutionInputSlot::Unary),
++        PreparedNodeInputs::Binary { left, .. } if left == child => Some(ExecutionInputSlot::Left),
++        PreparedNodeInputs::Binary { right, .. } if right == child => {
++            Some(ExecutionInputSlot::Right)
++        }
++        PreparedNodeInputs::Source(_)
++        | PreparedNodeInputs::Unary(_)
++        | PreparedNodeInputs::Binary { .. } => None,
++    }
++}
++
++fn compile_postorder(query: &RelExpr, nodes: &mut Vec<PreparedGraphNode>) -> NodeId {
++    let inputs = match query {
++        RelExpr::Scan(relation) => PreparedNodeInputs::Source(*relation),
++        RelExpr::FilterEqConst { input, .. }
++        | RelExpr::FilterEqColumns { input, .. }
++        | RelExpr::Project { input, .. }
++        | RelExpr::Distinct { input, .. }
++        | RelExpr::Group { input, .. }
++        | RelExpr::TopKWithTies { input, .. }
++        | RelExpr::PromoteToBag(input) => {
++            PreparedNodeInputs::Unary(compile_postorder(input, nodes))
++        }
++        RelExpr::JoinEq { left, right, .. }
++        | RelExpr::Difference { left, right }
++        | RelExpr::AntiJoin { left, right, .. } => PreparedNodeInputs::Binary {
++            left: compile_postorder(left, nodes),
++            right: compile_postorder(right, nodes),
++        },
++    };
++    let id = nodes.len();
++    nodes.push(PreparedGraphNode { inputs });
++    id
++}
++
++#[derive(Debug)]
++pub struct NodeInbox<D> {
++    unary: Option<D>,
++    left: Option<D>,
++    right: Option<D>,
++}
++
++impl<D> Default for NodeInbox<D> {
++    fn default() -> Self {
++        Self {
++            unary: None,
++            left: None,
++            right: None,
++        }
++    }
++}
++
++impl<D> NodeInbox<D> {
++    pub fn take_unary(&mut self) -> Option<D> {
++        self.unary.take()
++    }
++
++    pub fn take_left(&mut self) -> Option<D> {
++        self.left.take()
++    }
++
++    pub fn take_right(&mut self) -> Option<D> {
++        self.right.take()
++    }
++}
++
++const INBOX_PAGE: usize = 64;
++
++#[derive(Debug, Default)]
++struct PagedInboxArena<D> {
++    pages: Vec<Option<Box<[NodeInbox<D>; INBOX_PAGE]>>>,
++}
++
++impl<D> PagedInboxArena<D> {
++    fn ensure_nodes(&mut self, nodes: usize) {
++        let pages = nodes.div_ceil(INBOX_PAGE);
++        if self.pages.len() < pages {
++            self.pages.resize_with(pages, || None);
++        }
++    }
++
++    fn get_mut(&mut self, node: NodeId) -> &mut NodeInbox<D> {
++        let page = node / INBOX_PAGE;
++        let slot = node % INBOX_PAGE;
++        let entries = self.pages[page]
++            .get_or_insert_with(|| Box::new(std::array::from_fn(|_| NodeInbox::default())));
++        &mut entries[slot]
++    }
++
++    fn take(&mut self, node: NodeId) -> NodeInbox<D> {
++        let page = node / INBOX_PAGE;
++        let slot = node % INBOX_PAGE;
++        self.pages
++            .get_mut(page)
++            .and_then(Option::as_mut)
++            .map(|entries| std::mem::take(&mut entries[slot]))
++            .unwrap_or_default()
++    }
++
++    fn clear(&mut self, node: NodeId) {
++        let page = node / INBOX_PAGE;
++        let slot = node % INBOX_PAGE;
++        if let Some(Some(entries)) = self.pages.get_mut(page) {
++            entries[slot] = NodeInbox::default();
++        }
++    }
++}
++
++#[derive(Debug)]
++struct ReadyNode<D> {
++    node: NodeId,
++    inbox: NodeInbox<D>,
++}
++
++/// Reusable V4 scheduling scratch. No source-specific route is selected.
++/// A direct chain stays entirely in `continuation`; branching spills into the
++/// hierarchical ready-set and lazily allocated inbox pages.
++#[derive(Debug, Default)]
++pub struct UnifiedTransitionScratch<D> {
++    inboxes: PagedInboxArena<D>,
++    dirty: Vec<NodeId>,
++    continuation: Option<ReadyNode<D>>,
++    active: HierarchicalActivationQueue,
++}
++
++impl<D> UnifiedTransitionScratch<D> {
++    pub fn ensure_nodes(&mut self, nodes: usize) {
++        self.inboxes.ensure_nodes(nodes);
++        if self.active.capacity() != nodes {
++            self.active = HierarchicalActivationQueue::new(nodes);
++        }
++    }
++
++    pub fn deliver(
++        &mut self,
++        node: NodeId,
++        slot: ExecutionInputSlot,
++        delta: D,
++    ) -> Result<(), RelQueryError> {
++        if let Some(continuation) = self.continuation.as_mut()
++            && continuation.node == node
++        {
++            return put_side(&mut continuation.inbox, slot, delta);
++        }
++        if self.active.contains(node) {
++            return put_side(self.inboxes.get_mut(node), slot, delta);
++        }
++
++        let mut inbox = NodeInbox::default();
++        put_side(&mut inbox, slot, delta)?;
++        let ready = ReadyNode { node, inbox };
++        match self.continuation.take() {
++            None => {
++                if self
++                    .active
++                    .peek_min()
++                    .is_none_or(|queued| ready.node < queued)
++                {
++                    self.continuation = Some(ready);
++                } else {
++                    self.spill(ready)?;
++                }
++            }
++            Some(current) if ready.node < current.node => {
++                self.spill(current)?;
++                self.continuation = Some(ready);
++            }
++            Some(current) => {
++                self.continuation = Some(current);
++                self.spill(ready)?;
++            }
++        }
++        Ok(())
++    }
++
++    fn spill(&mut self, ready: ReadyNode<D>) -> Result<(), RelQueryError> {
++        if self.active.contains(ready.node) {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        let inbox = self.inboxes.get_mut(ready.node);
++        if inbox.unary.is_some() || inbox.left.is_some() || inbox.right.is_some() {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        *inbox = ready.inbox;
++        self.dirty.push(ready.node);
++        self.active.insert(ready.node);
++        Ok(())
++    }
++
++    pub fn pop_next(&mut self) -> Option<(NodeId, NodeInbox<D>)> {
++        if let Some(ready) = self.continuation.take() {
++            return Some((ready.node, ready.inbox));
++        }
++        let node = self.active.pop_min()?;
++        Some((node, self.inboxes.take(node)))
++    }
++
++    pub fn finish_success(&mut self) {
++        debug_assert!(self.continuation.is_none());
++        debug_assert!(self.active.is_empty());
++        self.dirty.clear();
++    }
++
++    pub fn reset(&mut self) {
++        self.continuation = None;
++        self.active.clear_all();
++        for node in self.dirty.drain(..) {
++            self.inboxes.clear(node);
++        }
++    }
++}
++
++fn put_side<D>(
++    inbox: &mut NodeInbox<D>,
++    slot: ExecutionInputSlot,
++    delta: D,
++) -> Result<(), RelQueryError> {
++    let target = match slot {
++        ExecutionInputSlot::Unary => &mut inbox.unary,
++        ExecutionInputSlot::Left => &mut inbox.left,
++        ExecutionInputSlot::Right => &mut inbox.right,
++    };
++    if target.is_some() {
++        return Err(RelQueryError::InconsistentIncrementalDelta);
++    }
++    *target = Some(delta);
++    Ok(())
++}
++
++#[derive(Debug, Default)]
++struct HierarchicalActivationQueue {
++    capacity: usize,
++    levels: Vec<Vec<u64>>,
++}
++
++impl HierarchicalActivationQueue {
++    fn new(capacity: usize) -> Self {
++        let mut levels = Vec::new();
++        let mut words = capacity.div_ceil(64).max(1);
++        levels.push(vec![0; words]);
++        while words > 1 {
++            words = words.div_ceil(64);
++            levels.push(vec![0; words]);
++        }
++        Self { capacity, levels }
++    }
++
++    const fn capacity(&self) -> usize {
++        self.capacity
++    }
++
++    fn insert(&mut self, node: NodeId) {
++        debug_assert!(node < self.capacity);
++        let word = node / 64;
++        let bit = node % 64;
++        let mask = 1_u64 << bit;
++        if self.levels[0][word] & mask != 0 {
++            return;
++        }
++        let was_zero = self.levels[0][word] == 0;
++        self.levels[0][word] |= mask;
++        if was_zero {
++            self.propagate_set(1, word);
++        }
++    }
++
++    fn propagate_set(&mut self, level: usize, child_word: usize) {
++        if level >= self.levels.len() {
++            return;
++        }
++        let word = child_word / 64;
++        let bit = child_word % 64;
++        let mask = 1_u64 << bit;
++        let was_zero = self.levels[level][word] == 0;
++        self.levels[level][word] |= mask;
++        if was_zero {
++            self.propagate_set(level + 1, word);
++        }
++    }
++
++    fn contains(&self, node: NodeId) -> bool {
++        if node >= self.capacity || self.levels.is_empty() {
++            return false;
++        }
++        self.levels[0][node / 64] & (1_u64 << (node % 64)) != 0
++    }
++
++    fn peek_min(&self) -> Option<NodeId> {
++        if self.levels.is_empty() || self.levels.last()?.first().copied().unwrap_or(0) == 0 {
++            return None;
++        }
++        let mut word_index = 0usize;
++        for level in (1..self.levels.len()).rev() {
++            let word = self.levels[level][word_index];
++            word_index = word_index * 64 + word.trailing_zeros() as usize;
++        }
++        let word = self.levels[0][word_index];
++        let node = word_index * 64 + word.trailing_zeros() as usize;
++        (node < self.capacity).then_some(node)
++    }
++
++    fn pop_min(&mut self) -> Option<NodeId> {
++        let node = self.peek_min()?;
++        self.clear_node(node);
++        Some(node)
++    }
++
++    fn clear_node(&mut self, node: NodeId) {
++        if node >= self.capacity || self.levels.is_empty() {
++            return;
++        }
++        let word = node / 64;
++        let bit = node % 64;
++        let mask = 1_u64 << bit;
++        if self.levels[0][word] & mask == 0 {
++            return;
++        }
++        self.levels[0][word] &= !mask;
++        if self.levels[0][word] == 0 {
++            self.propagate_clear(1, word);
++        }
++    }
++
++    fn propagate_clear(&mut self, level: usize, child_word: usize) {
++        if level >= self.levels.len() {
++            return;
++        }
++        let word = child_word / 64;
++        let bit = child_word % 64;
++        self.levels[level][word] &= !(1_u64 << bit);
++        if self.levels[level][word] == 0 {
++            self.propagate_clear(level + 1, word);
++        }
++    }
++
++    fn is_empty(&self) -> bool {
++        self.levels
++            .last()
++            .and_then(|level| level.first())
++            .copied()
++            .unwrap_or(0)
++            == 0
++    }
++
++    fn clear_all(&mut self) {
++        while self.pop_min().is_some() {}
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{AggregateSpec, OrderDirection, Value};
++
++    fn scan(id: u128) -> RelExpr {
++        RelExpr::Scan(kernel_types::SemanticId::new(id))
++    }
++
++    #[test]
++    fn compiles_every_rel_expr_shape_into_one_unified_program() {
++        let eq = kernel_types::SemanticId::new(100);
++        let ord = kernel_types::SemanticId::new(101);
++        let aggregate_eq = kernel_types::SemanticId::new(102);
++        let left = RelExpr::Project {
++            input: Box::new(RelExpr::FilterEqConst {
++                input: Box::new(scan(1)),
++                column: 0,
++                value: Value::I64(7),
++                equivalence: eq,
++            }),
++            columns: vec![0],
++        };
++        let right = RelExpr::Distinct {
++            input: Box::new(RelExpr::FilterEqColumns {
++                input: Box::new(scan(2)),
++                left_column: 0,
++                right_column: 0,
++                equivalence: eq,
++            }),
++            column_equivalences: vec![eq],
++        };
++        let joined = RelExpr::JoinEq {
++            left: Box::new(left),
++            right: Box::new(right),
++            left_column: 0,
++            right_column: 0,
++            equivalence: eq,
++        };
++        let blocked = RelExpr::AntiJoin {
++            left: Box::new(joined),
++            right: Box::new(RelExpr::Difference {
++                left: Box::new(scan(3)),
++                right: Box::new(scan(4)),
++            }),
++            left_column: 0,
++            right_column: 0,
++            equivalence: eq,
++        };
++        let grouped = RelExpr::Group {
++            input: Box::new(RelExpr::PromoteToBag(Box::new(blocked))),
++            group_columns: vec![0],
++            group_equivalences: vec![eq],
++            aggregate: AggregateSpec::Count {
++                result_equivalence: aggregate_eq,
++            },
++        };
++        let query = RelExpr::TopKWithTies {
++            input: Box::new(grouped),
++            column: 1,
++            ordering: ord,
++            direction: OrderDirection::Descending,
++            k: 3,
++        };
++        let graph = PreparedRelGraph::compile(&query);
++        assert_eq!(graph.node_count(), 14);
++        assert_eq!(graph.root(), 13);
++        assert_eq!(graph.source_count(), 4);
++        assert_eq!(graph.transition_program().node_count(), 14);
++        for id in 1..=4 {
++            assert!(
++                graph
++                    .transition_program()
++                    .contains_source(kernel_types::SemanticId::new(id))
++            );
++        }
++    }
++
++    #[test]
++    fn repeated_source_is_compiled_without_route_choice() {
++        let relation = kernel_types::SemanticId::new(1);
++        let query = RelExpr::Difference {
++            left: Box::new(RelExpr::Difference {
++                left: Box::new(RelExpr::Scan(relation)),
++                right: Box::new(RelExpr::Scan(relation)),
++            }),
++            right: Box::new(scan(2)),
++        };
++        let graph = PreparedRelGraph::compile(&query);
++        let program = graph.transition_program();
++        assert_eq!(program.source_occurrences(relation), Some(2));
++        assert_eq!(program.source_feed_count(relation), Some(2));
++        assert!(program.contains_source(kernel_types::SemanticId::new(2)));
++    }
++
++    #[test]
++    fn hierarchical_queue_orders_and_deduplicates_without_route_choice() {
++        let mut queue = HierarchicalActivationQueue::new(10_000);
++        for node in [9999, 2, 4097, 2, 64, 63, 4096, 1] {
++            queue.insert(node);
++        }
++        let mut actual = Vec::new();
++        while let Some(node) = queue.pop_min() {
++            actual.push(node);
++        }
++        assert_eq!(actual, vec![1, 2, 63, 64, 4096, 4097, 9999]);
++    }
++
++    #[test]
++    fn continuation_handles_chain_and_spills_branching_into_same_scheduler() {
++        let mut scratch = UnifiedTransitionScratch::<i32>::default();
++        scratch.ensure_nodes(256);
++        scratch.deliver(100, ExecutionInputSlot::Unary, 1).unwrap();
++        scratch.deliver(50, ExecutionInputSlot::Left, 2).unwrap();
++        scratch.deliver(150, ExecutionInputSlot::Right, 3).unwrap();
++        let (node, mut inbox) = scratch.pop_next().unwrap();
++        assert_eq!(node, 50);
++        assert_eq!(inbox.take_left(), Some(2));
++        let (node, mut inbox) = scratch.pop_next().unwrap();
++        assert_eq!(node, 100);
++        assert_eq!(inbox.take_unary(), Some(1));
++        let (node, mut inbox) = scratch.pop_next().unwrap();
++        assert_eq!(node, 150);
++        assert_eq!(inbox.take_right(), Some(3));
++        assert!(scratch.pop_next().is_none());
++        scratch.finish_success();
++    }
++
++    #[test]
++    fn failed_schedule_reset_discards_paged_mailboxes_and_ready_nodes() {
++        let mut scratch = UnifiedTransitionScratch::<i32>::default();
++        scratch.ensure_nodes(4097);
++        scratch.deliver(4096, ExecutionInputSlot::Right, 9).unwrap();
++        scratch.deliver(1, ExecutionInputSlot::Unary, 7).unwrap();
++        scratch.reset();
++        assert!(scratch.pop_next().is_none());
++        scratch.deliver(4096, ExecutionInputSlot::Left, 11).unwrap();
++        let (node, mut inbox) = scratch.pop_next().unwrap();
++        assert_eq!(node, 4096);
++        assert_eq!(inbox.take_left(), Some(11));
++        assert_eq!(inbox.take_right(), None);
++    }
++}

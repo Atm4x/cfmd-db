@@ -1,0 +1,22 @@
+Pass38 final verification environment
+Rust: rustc 1.98.1 (48a229cea 2026-09-01)
+Cargo: cargo 1.98.1 (797e8a9bc 2026-08-05)
+
+cargo fmt --all -- --check                                  PASS
+cargo check --workspace --all-targets                       PASS
+cargo test --workspace --all-targets                        PASS
+cargo clippy --workspace --all-targets -- -D warnings       PASS
+cargo test --workspace --all-targets --release              PASS
+cargo build --workspace --release                           PASS
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps  PASS
+RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release PASS
+
+Metrics:
+297 declared tests
+81 kernel-plan tests
+65 kernel-query tests
+32 kernel-durability tests
+20 crates
+38,065 Rust LOC
+0 external Cargo sources
+0 unsafe

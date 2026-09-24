@@ -1,0 +1,163 @@
+--- a/crates/kernel-query/src/lib.rs
++++ b/crates/kernel-query/src/lib.rs
+@@ -9309,4 +9309,45 @@
+             old = next;
+         }
+     }
++
++    #[test]
++    fn hostile_forged_resolved_handle_payload_mismatch_must_be_rejected() {
++        let (context, registry, text_eq, relation, _) = setup();
++        let i64_eq = SemanticId::new(101);
++        let mut model = FiniteModel::default();
++        let alpha = vec![Value::Text("Alpha".into()), Value::I64(1)];
++        let beta = vec![Value::Text("Beta".into()), Value::I64(2)];
++        model.relations.insert(relation, vec![alpha.clone(), beta.clone()]);
++
++        let query = RelExpr::Distinct {
++            input: Box::new(RelExpr::Scan(relation)),
++            column_equivalences: vec![text_eq, i64_eq],
++        };
++        let mut state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
++        state.attach_storage_handles(
++            relation,
++            &[
++                kernel_types::StableRowHandle { slot: 0, generation: 0 },
++                kernel_types::StableRowHandle { slot: 1, generation: 0 },
++            ],
++        ).unwrap();
++
++        // Forgery: payload says "remove Beta", but handle selects Alpha.
++        let delta = RelationDelta {
++            inserted: Vec::new(),
++            removed: vec![beta.clone()],
++            result_type: RelExpr::Scan(relation).typecheck(&context, &registry).unwrap(),
++        };
++        let forged = StorageResolvedRelationDelta::from_parts(
++            relation,
++            delta,
++            vec![kernel_types::StableRowHandle { slot: 0, generation: 0 }],
++            Vec::new(),
++        );
++        let map = BTreeMap::from([(relation, forged)]);
++
++        let result = state.apply_storage_resolved_deltas(&map, &context, &registry);
++        assert!(result.is_err(), "forged handle/payload association was accepted: {result:?}");
++    }
++
+ }
+--- a/crates/kernel-plan/src/lib.rs
++++ b/crates/kernel-plan/src/lib.rs
+@@ -8618,4 +8618,112 @@
+         assert_eq!(relation.position(first), None);
+         assert_eq!(relation.position(current), Some(0));
+     }
++
++    #[test]
++    fn hostile_bootstrap_semantic_bag_reordering_breaks_storage_handle_alignment() {
++        let (context, registry, relation) = planning_context();
++        let binding = LayoutBinding {
++            id: LayoutId(4242),
++            family: LayoutFamily::Columnar,
++        };
++
++        // Logical authority and physical storage are semantically equal bags,
++        // but intentionally use different row order.
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            vec![vec![Value::I64(1)], vec![Value::I64(2)]],
++        );
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(500),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![2, 1])]).unwrap(),
++            )
++            .unwrap();
++
++        let runtime = RuntimeRevisionBundle::build(
++            revision,
++            store,
++            BTreeMap::from([(relation, binding)]),
++            &[RuntimeMaterializationSpec {
++                id: test_materialization_id(),
++                query: RelExpr::Scan(relation),
++            }],
++            &registry,
++        )
++        .expect("semantically equal bag bootstrap is currently accepted");
++
++        let delta = scan_delta(relation, &[], &[2], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let cell = RuntimeRevisionCell::new(runtime);
++        let prepared = prepare_runtime_cell_revision(&cell, 501, &mutations, &registry).unwrap();
++        let _ = prepared.seal(&cell).unwrap().publish();
++        let after = cell.snapshot().unwrap();
++
++        let logical = after.revision().state().model.relations[&relation]
++            .iter()
++            .map(|row| match row.as_slice() {
++                [Value::I64(v)] => *v,
++                _ => unreachable!(),
++            })
++            .collect::<Vec<_>>();
++        let maintained = runtime_maintained_i64_values(&after, &context, &registry);
++        assert_eq!(maintained, logical, "published maintained state diverged from authoritative revision");
++    }
++
++
++    #[test]
++    fn hostile_resolved_leaf_delete_preserves_authoritative_scan_order() {
++        let (context, registry, relation, _binding, runtime) =
++            scan_runtime_bundle(600, 4600, &[1, 2, 3]);
++        let delta = scan_delta(relation, &[], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let cell = RuntimeRevisionCell::new(runtime);
++        let prepared = prepare_runtime_cell_revision(&cell, 601, &mutations, &registry).unwrap();
++        let _ = prepared.seal(&cell).unwrap().publish();
++        let after = cell.snapshot().unwrap();
++
++        let logical = after.revision().state().model.relations[&relation]
++            .iter()
++            .map(|row| match row.as_slice() {
++                [Value::I64(v)] => *v,
++                _ => unreachable!(),
++            })
++            .collect::<Vec<_>>();
++        let maintained = after
++            .materialization(test_materialization_id())
++            .unwrap()
++            .output_value(&context, &registry)
++            .unwrap()
++            .rows()
++            .iter()
++            .map(|row| match row.as_slice() {
++                [Value::I64(v)] => *v,
++                _ => unreachable!(),
++            })
++            .collect::<Vec<_>>();
++
++        assert_eq!(logical, vec![2, 3]);
++        assert_eq!(maintained, logical, "maintained Scan leaked swap_remove order");
++    }
++
+ }

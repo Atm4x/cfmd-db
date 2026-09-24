@@ -1,0 +1,18 @@
+   Compiling kernel-schema v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-schema)
+    Finished `release` profile [optimized] target(s) in 1.09s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_schema-bc9b99a2e36c1a23)
+
+running 10 tests
+test tests::free_type_variable_is_rejected ... ok
+test tests::open_capability_is_not_closed_sum ... ok
+test tests::naked_recursive_variable_is_rejected ... ok
+test tests::context_requires_all_semantic_modules_referenced_by_schema ... ok
+test tests::recursive_document_type_is_guarded_and_valid ... ok
+test tests::rename_preserves_semantic_identity ... ok
+test tests::semantic_environment_is_explicitly_versioned ... ok
+test tests::set_relation_requires_one_equivalence_per_column ... ok
+test tests::subtype_diamond_is_coherent_but_cycles_are_rejected ... ok
+test tests::subtype_adjacency_matches_direct_relation_scan_reference ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

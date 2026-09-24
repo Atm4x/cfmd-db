@@ -1,0 +1,9 @@
+PASS49 STATIC AUDIT
+declared_tests=356
+kernel_plan_tests=128
+rust_loc=48233
+allow_sites=19
+unsafe_sites=0
+todo_sites=0
+external_cargo_sources=0
+old_pairwise_symbols=0

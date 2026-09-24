@@ -1,0 +1,1944 @@
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/ARCHITECTURE.md ./ARCHITECTURE.md
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/ARCHITECTURE.md	2026-09-19 23:44:41.243944810 +0000
++++ ./ARCHITECTURE.md	2026-09-20 00:09:19.362724211 +0000
+@@ -39,3 +39,12 @@
+ - a durable COMMIT is recovery authority even if the process dies before runtime root publication/ACK;
+ - these tests establish process-crash behavior only and are not a claim about sudden machine power loss or other filesystem implementations;
+ - client transaction/idempotency identity remains required to resolve ACK-loss retries at the API boundary.
++
++Pass36 durable control-plane note:
++
++- every external semantic commit may carry a nominal `ClientTransactionId`; the checksummed WAL PREPARE binds that ID to one source/target logical descriptor, and committed outcomes are retained across checkpoint generations for idempotent ACK-loss retry;
++- published generation authority now includes `metadata-N.cfdm`, containing durable maintained-materialization specifications and committed transaction outcomes. The final manifest binds its checksum alongside the checkpoint checksum;
++- `DurableRuntime::open` reconstructs materializations from durable specs rather than trusting caller configuration;
++- `DurableRuntimeSupervisor` is the normal process-level owner for `RecoveryRequired` / uncertain-COMMIT reopen and same-ID outcome resolution/retry;
++- executable semantic-module implementations remain externally deployed and are validated against durable pinned digests; they are not yet packaged as durable-store artifacts;
++- schema/Γ/lifecycle mutation tails remain outside the relation-data WAL descriptor and require a future general revision-change protocol.
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/CFMD_IDEAL_DB_SPEC.md ./CFMD_IDEAL_DB_SPEC.md
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/CFMD_IDEAL_DB_SPEC.md	2026-09-19 23:48:30.589615170 +0000
++++ ./CFMD_IDEAL_DB_SPEC.md	2026-09-20 00:09:19.197123517 +0000
+@@ -885,7 +885,7 @@
+ - §52.1–52.12 — universal change existence, Impact, approximation boundary, PlanIR direction;
+ - ранние §17–18 использованы только там, где идеи сохранились после поздних falsifier’ов (immutable schema versions, lenses, typed change, identity separation, physical independence).
+ 
+-Implementation corrections/status наложены из verified Pass09–Pass35, с текущей точкой **Pass35 / 282 declared tests**. Pass28 первоначально был source-audited без toolchain, затем открыт заново под Rust 1.98.1, исправлен и прошёл полный gate до форка Pass29. Примечание: preserved Pass22 source audit показывает 216 declared tests; Pass22 report недосчитал 2.
++Implementation corrections/status наложены из verified Pass09–Pass36, с текущей точкой **Pass36 / 287 declared tests**. Pass28 первоначально был source-audited без toolchain, затем открыт заново под Rust 1.98.1, исправлен и прошёл полный gate до форка Pass29. Примечание: preserved Pass22 source audit показывает 216 declared tests; Pass22 report недосчитал 2.
+ 
+ 
+ ---
+@@ -1072,3 +1072,19 @@
+ - **OPEN:** cross-platform/filesystem durability semantics, durable materialization configuration, durable schema/Γ/lifecycle transaction records, revision-DAG parent encoding, checkpoint streaming/migration, COW candidates, and production supervisor/group-commit/replication work remain outside this pass.
+ 
+ Practical next target: add durable client transaction identity and an explicit transaction-outcome/retry protocol, then decide whether to generalize durable schema/Γ mutation or integrate the already-verified Agent-2 semantic-index design.
++
++## Pass36 implementation correction — durable client identity, generation metadata, recovery supervisor
++
++Status after Pass36: **VERIFIED**.
++
++- **VERIFIED:** external retry identity is now explicit `ClientTransactionId`, encoded in the checksummed logical WAL PREPARE. Recovery records exact committed transaction outcomes; exact same-ID/same-target retry is idempotent, while reuse for another target is rejected.
++- **VERIFIED:** client transaction outcomes survive checkpoint rotation and obsolete-generation compaction because the committed outcome ledger is carried in durable generation metadata, not only in the active WAL tail.
++- **VERIFIED:** maintained materialization configuration is durable generation authority. `metadata-N.cfdm` stores exact `MaterializationId + RelExpr` specifications and is checksummed by manifest v2. Missing/corrupt published metadata is corruption.
++- **VERIFIED:** `DurableRuntime::open` no longer accepts materialization specs from its caller. It selects checkpoint, WAL and metadata from one published generation, replays logical authority, then rebuilds physical and maintained state.
++- **VERIFIED:** `DurableRuntimeSupervisor` owns the normal fail-stop recovery path. An uncertain durable COMMIT or `RuntimeRecoveryRequired` causes reopen from published authority, transaction-outcome lookup and either an idempotent `AlreadyCommitted`, explicit conflict or same-ID retry.
++- **UNCHANGED AUTHORITY RULE:** stable row handles, indexes, layouts, materialized results and process-local root identity remain reconstructible/non-durable authority. Generation metadata persists materialization *specification*, not materialized result state.
++- **OPEN:** semantic-module implementation deployment remains external; the durable `SemanticContext` pins module digests/contracts but does not package executable implementations.
++- **OPEN:** current WAL tail still represents relation-data revisions under unchanged pinned Γ. Schema/Γ/lifecycle/field transitions need a general durable revision-change representation consistent with `kernel-transport`.
++- **OPEN:** durable format migration, transaction-outcome retention/GC, online materialization-config mutation, checkpoint/metadata streaming, power-loss/cross-filesystem testing, revision-DAG ancestry, group commit/replication and COW runtime candidates.
++
++Practical next target if durability remains the priority: design and falsify a general durable revision-change protocol for schema/Γ/lifecycle transitions rather than extending the relation-data descriptor with ad-hoc flags.
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/Cargo.lock ./Cargo.lock
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/Cargo.lock	2026-09-19 23:20:21.282245815 +0000
++++ ./Cargo.lock	2026-09-19 23:54:10.934109445 +0000
+@@ -15,6 +15,7 @@
+ version = "0.1.0"
+ dependencies = [
+  "kernel-model",
++ "kernel-query",
+  "kernel-revision",
+  "kernel-schema",
+  "kernel-semantics",
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-durability/Cargo.toml ./crates/kernel-durability/Cargo.toml
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-durability/Cargo.toml	2026-09-19 23:18:20.642688149 +0000
++++ ./crates/kernel-durability/Cargo.toml	2026-09-19 23:51:28.162288129 +0000
+@@ -6,6 +6,7 @@
+ 
+ [dependencies]
+ kernel-model = { path = "../kernel-model" }
++kernel-query = { path = "../kernel-query" }
+ kernel-revision = { path = "../kernel-revision" }
+ kernel-schema = { path = "../kernel-schema" }
+ kernel-semantics = { path = "../kernel-semantics" }
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-durability/src/lib.rs ./crates/kernel-durability/src/lib.rs
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-durability/src/lib.rs	2026-09-19 23:19:28.471422904 +0000
++++ ./crates/kernel-durability/src/lib.rs	2026-09-20 00:01:47.693843218 +0000
+@@ -4,16 +4,19 @@
+ use std::path::{Path, PathBuf};
+ 
+ use kernel_model::Value;
+-use kernel_types::{EntityId, RevisionId, SemanticId, SemanticRevision};
++use kernel_types::{
++    ClientTransactionId, EntityId, MaterializationId, RevisionId, SemanticId, SemanticRevision,
++};
+ 
+ mod checkpoint;
++mod metadata;
+ mod store;
+ 
+ pub use store::{DurableGenerationReceipt, DurableRevisionStore};
+ 
+ pub const MAGIC: [u8; 4] = *b"CFMW";
+ pub const FORMAT_VERSION: u16 = 1;
+-pub const MUTATION_CODEC_VERSION: u16 = 1;
++pub const MUTATION_CODEC_VERSION: u16 = 2;
+ pub const HEADER_LEN: usize = 36;
+ pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+ const MAX_COLLECTION_LEN: usize = 1_000_000;
+@@ -28,14 +31,28 @@
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct DurableRevisionDescriptor {
++    pub transaction_id: ClientTransactionId,
+     pub source_revision: RevisionId,
+     pub target_revision: RevisionId,
+     pub semantic_revision: SemanticRevision,
+     pub relation_mutations: Vec<DurableRelationMutation>,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DurableMaterializationSpec {
++    pub id: MaterializationId,
++    pub query: kernel_query::RelExpr,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DurableTransactionOutcome {
++    Unknown,
++    Committed { target_revision: RevisionId },
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct DurablePrepareToken {
++    transaction_id: ClientTransactionId,
+     target_revision: RevisionId,
+     prepare_lsn: u64,
+     prepare_payload_crc32c: u32,
+@@ -43,6 +60,11 @@
+ 
+ impl DurablePrepareToken {
+     #[must_use]
++    pub const fn transaction_id(self) -> ClientTransactionId {
++        self.transaction_id
++    }
++
++    #[must_use]
+     pub const fn target_revision(self) -> RevisionId {
+         self.target_revision
+     }
+@@ -99,6 +121,7 @@
+     last_good_offset: usize,
+     next_lsn: u64,
+     tail_status: TailStatus,
++    committed_transactions: BTreeMap<ClientTransactionId, RevisionId>,
+ }
+ 
+ impl RecoveryScan {
+@@ -135,6 +158,24 @@
+     pub const fn tail_status(&self) -> &TailStatus {
+         &self.tail_status
+     }
++
++    #[must_use]
++    pub fn transaction_outcome(
++        &self,
++        transaction_id: ClientTransactionId,
++    ) -> DurableTransactionOutcome {
++        self.committed_transactions
++            .get(&transaction_id)
++            .copied()
++            .map_or(DurableTransactionOutcome::Unknown, |target_revision| {
++                DurableTransactionOutcome::Committed { target_revision }
++            })
++    }
++
++    #[must_use]
++    pub const fn committed_transactions(&self) -> &BTreeMap<ClientTransactionId, RevisionId> {
++        &self.committed_transactions
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -356,6 +397,7 @@
+         )?;
+         self.barrier()?;
+         Ok(DurablePrepareToken {
++            transaction_id: descriptor.transaction_id,
+             target_revision: descriptor.target_revision,
+             prepare_lsn: frame.lsn,
+             prepare_payload_crc32c: frame.payload_crc32c,
+@@ -444,6 +486,7 @@
+         )?;
+         self.barrier();
+         Ok(DurablePrepareToken {
++            transaction_id: descriptor.transaction_id,
+             target_revision: descriptor.target_revision,
+             prepare_lsn: frame.lsn,
+             prepare_payload_crc32c: frame.payload_crc32c,
+@@ -506,7 +549,9 @@
+     durable_head: RevisionId,
+     prepares_by_lsn: BTreeMap<u64, (DurableRevisionDescriptor, u32)>,
+     prepare_identity: BTreeMap<RevisionId, DurableRevisionDescriptor>,
++    prepare_transaction_identity: BTreeMap<ClientTransactionId, DurableRevisionDescriptor>,
+     commits: BTreeMap<RevisionId, CommitRecord>,
++    transactions: BTreeMap<ClientTransactionId, RevisionId>,
+     committed: Vec<CommittedRevision>,
+ }
+ 
+@@ -517,7 +562,9 @@
+             durable_head: base_revision,
+             prepares_by_lsn: BTreeMap::new(),
+             prepare_identity: BTreeMap::new(),
++            prepare_transaction_identity: BTreeMap::new(),
+             commits: BTreeMap::new(),
++            transactions: BTreeMap::new(),
+             committed: Vec::new(),
+         }
+     }
+@@ -537,6 +584,14 @@
+                     reason,
+                 }
+             })?;
++        if let Some(existing_target) = self.transactions.get(&descriptor.transaction_id)
++            && *existing_target != descriptor.target_revision
++        {
++            return Err(DurabilityError::Protocol {
++                offset: frame.offset,
++                reason: "transaction id already committed to another revision",
++            });
++        }
+         if let Some(existing) = self.prepare_identity.get(&frame.revision) {
+             if existing != &descriptor {
+                 return Err(DurabilityError::Protocol {
+@@ -548,6 +603,20 @@
+             self.prepare_identity
+                 .insert(frame.revision, descriptor.clone());
+         }
++        if let Some(existing) = self
++            .prepare_transaction_identity
++            .get(&descriptor.transaction_id)
++        {
++            if existing != &descriptor {
++                return Err(DurabilityError::Protocol {
++                    offset: frame.offset,
++                    reason: "transaction id reused by conflicting prepare",
++                });
++            }
++        } else {
++            self.prepare_transaction_identity
++                .insert(descriptor.transaction_id, descriptor.clone());
++        }
+         self.prepares_by_lsn
+             .insert(frame.lsn, (descriptor, frame.payload_crc));
+         Ok(())
+@@ -595,6 +664,17 @@
+                 reason: "revision transition does not advance identity",
+             });
+         }
++        if let Some(existing_target) = self.transactions.get(&descriptor.transaction_id) {
++            if *existing_target != descriptor.target_revision {
++                return Err(DurabilityError::Protocol {
++                    offset: frame.offset,
++                    reason: "transaction id conflicts with prior committed revision",
++                });
++            }
++        } else {
++            self.transactions
++                .insert(descriptor.transaction_id, descriptor.target_revision);
++        }
+         self.commits.insert(frame.revision, record.clone());
+         self.committed.push(CommittedRevision {
+             descriptor: descriptor.clone(),
+@@ -618,6 +698,7 @@
+             last_good_offset,
+             next_lsn,
+             tail_status,
++            committed_transactions: self.transactions,
+         }
+     }
+ }
+@@ -774,6 +855,7 @@
+ fn encode_prepare_payload(descriptor: &DurableRevisionDescriptor) -> Result<Vec<u8>, CodecError> {
+     let mut out = Vec::new();
+     push_u16(&mut out, MUTATION_CODEC_VERSION);
++    push_u128(&mut out, descriptor.transaction_id.raw());
+     push_u64(&mut out, descriptor.source_revision.raw());
+     push_u64(&mut out, descriptor.semantic_revision.schema.raw());
+     push_u64(&mut out, descriptor.semantic_revision.environment.raw());
+@@ -799,6 +881,7 @@
+     if cursor.u16()? != MUTATION_CODEC_VERSION {
+         return Err("unsupported mutation codec version");
+     }
++    let transaction_id = ClientTransactionId::new(cursor.u128()?);
+     let source_revision = RevisionId::new(cursor.u64()?);
+     let semantic_revision = SemanticRevision::new(
+         kernel_types::SchemaRevisionId::new(cursor.u64()?),
+@@ -823,6 +906,7 @@
+     }
+     cursor.finish()?;
+     Ok(DurableRevisionDescriptor {
++        transaction_id,
+         source_revision,
+         target_revision,
+         semantic_revision,
+@@ -1211,6 +1295,7 @@
+ 
+     fn descriptor(source: u64, target: u64, value: Value) -> DurableRevisionDescriptor {
+         DurableRevisionDescriptor {
++            transaction_id: ClientTransactionId::new(u128::from(target)),
+             source_revision: RevisionId::new(source),
+             target_revision: RevisionId::new(target),
+             semantic_revision: SemanticRevision::new(
+@@ -1359,6 +1444,24 @@
+     }
+ 
+     #[test]
++    fn scanner_rejects_transaction_id_reuse_for_different_prepare() {
++        let mut wal = SimulatedRevisionWal::new();
++        let first = descriptor(1, 2, Value::I64(7));
++        let mut second = descriptor(1, 3, Value::I64(8));
++        second.transaction_id = first.transaction_id;
++        wal.durably_prepare(&first).unwrap();
++        wal.durably_prepare(&second).unwrap();
++
++        assert!(matches!(
++            scan_wal(wal.crash_image(), RevisionId::new(1)),
++            Err(DurabilityError::Protocol {
++                reason: "transaction id reused by conflicting prepare",
++                ..
++            })
++        ));
++    }
++
++    #[test]
+     fn scanner_rejects_conflicting_duplicate_prepare() {
+         let mut wal = SimulatedRevisionWal::new();
+         wal.durably_prepare(&descriptor(1, 2, Value::I64(7)))
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-durability/src/metadata.rs ./crates/kernel-durability/src/metadata.rs
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-durability/src/metadata.rs	1970-01-01 00:00:00.000000000 +0000
++++ ./crates/kernel-durability/src/metadata.rs	2026-09-19 23:59:45.949049977 +0000
+@@ -0,0 +1,357 @@
++use std::collections::BTreeMap;
++
++use kernel_query::{AggregateSpec, OrderDirection, RelExpr};
++use kernel_types::{ClientTransactionId, MaterializationId, RevisionId, SemanticId};
++
++use super::{
++    CodecError, Cursor, DurableMaterializationSpec, encode_value, push_len, push_u64, push_u128,
++};
++
++const METADATA_CODEC_VERSION: u16 = 1;
++const MAX_QUERY_DEPTH: usize = 128;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct DurableStoreMetadata {
++    pub materializations: Vec<DurableMaterializationSpec>,
++    pub committed_transactions: BTreeMap<ClientTransactionId, RevisionId>,
++}
++
++pub(crate) fn encode(metadata: &DurableStoreMetadata) -> Result<Vec<u8>, CodecError> {
++    let mut out = Vec::new();
++    out.extend_from_slice(&METADATA_CODEC_VERSION.to_le_bytes());
++    push_len(&mut out, metadata.materializations.len())?;
++    let mut previous = None;
++    for spec in &metadata.materializations {
++        if previous.is_some_and(|id: MaterializationId| id >= spec.id) {
++            return Err(CodecError::CollectionTooLarge);
++        }
++        previous = Some(spec.id);
++        push_u128(&mut out, spec.id.raw());
++        encode_rel_expr(&mut out, &spec.query, 0)?;
++    }
++    push_len(&mut out, metadata.committed_transactions.len())?;
++    for (transaction_id, target_revision) in &metadata.committed_transactions {
++        push_u128(&mut out, transaction_id.raw());
++        push_u64(&mut out, target_revision.raw());
++    }
++    Ok(out)
++}
++
++pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str> {
++    let mut cursor = Cursor::new(bytes);
++    if cursor.u16()? != METADATA_CODEC_VERSION {
++        return Err("unsupported durable metadata codec version");
++    }
++    let materialization_count = cursor.len()?;
++    let mut materializations = Vec::with_capacity(materialization_count);
++    let mut previous = None;
++    for _ in 0..materialization_count {
++        let id = MaterializationId::new(cursor.u128()?);
++        if previous.is_some_and(|prior: MaterializationId| prior >= id) {
++            return Err("materialization ids are not strictly sorted and unique");
++        }
++        previous = Some(id);
++        materializations.push(DurableMaterializationSpec {
++            id,
++            query: decode_rel_expr(&mut cursor, 0)?,
++        });
++    }
++
++    let transaction_count = cursor.len()?;
++    let mut committed_transactions = BTreeMap::new();
++    let mut previous_transaction = None;
++    for _ in 0..transaction_count {
++        let transaction_id = ClientTransactionId::new(cursor.u128()?);
++        if previous_transaction.is_some_and(|prior: ClientTransactionId| prior >= transaction_id) {
++            return Err("transaction ids are not strictly sorted and unique");
++        }
++        previous_transaction = Some(transaction_id);
++        let target_revision = RevisionId::new(cursor.u64()?);
++        committed_transactions.insert(transaction_id, target_revision);
++    }
++    cursor.finish()?;
++    Ok(DurableStoreMetadata {
++        materializations,
++        committed_transactions,
++    })
++}
++
++fn encode_rel_expr(out: &mut Vec<u8>, expr: &RelExpr, depth: usize) -> Result<(), CodecError> {
++    if depth > MAX_QUERY_DEPTH {
++        return Err(CodecError::ValueNestingTooDeep);
++    }
++    match expr {
++        RelExpr::Scan(relation) => {
++            out.push(0);
++            push_u128(out, relation.raw());
++        }
++        RelExpr::FilterEqConst {
++            input,
++            column,
++            value,
++            equivalence,
++        } => {
++            out.push(1);
++            encode_rel_expr(out, input, depth + 1)?;
++            push_usize(out, *column)?;
++            encode_value(out, value, 0)?;
++            push_u128(out, equivalence.raw());
++        }
++        RelExpr::Project { input, columns } => {
++            out.push(2);
++            encode_rel_expr(out, input, depth + 1)?;
++            push_len(out, columns.len())?;
++            for column in columns {
++                push_usize(out, *column)?;
++            }
++        }
++        RelExpr::JoinEq {
++            left,
++            right,
++            left_column,
++            right_column,
++            equivalence,
++        } => {
++            out.push(3);
++            encode_rel_expr(out, left, depth + 1)?;
++            encode_rel_expr(out, right, depth + 1)?;
++            push_usize(out, *left_column)?;
++            push_usize(out, *right_column)?;
++            push_u128(out, equivalence.raw());
++        }
++        RelExpr::Distinct {
++            input,
++            column_equivalences,
++        } => {
++            out.push(4);
++            encode_rel_expr(out, input, depth + 1)?;
++            encode_semantic_ids(out, column_equivalences)?;
++        }
++        RelExpr::Group {
++            input,
++            group_columns,
++            group_equivalences,
++            aggregate,
++        } => {
++            out.push(5);
++            encode_rel_expr(out, input, depth + 1)?;
++            push_len(out, group_columns.len())?;
++            for column in group_columns {
++                push_usize(out, *column)?;
++            }
++            encode_semantic_ids(out, group_equivalences)?;
++            encode_aggregate(out, aggregate)?;
++        }
++        RelExpr::TopKWithTies {
++            input,
++            column,
++            ordering,
++            direction,
++            k,
++        } => {
++            out.push(6);
++            encode_rel_expr(out, input, depth + 1)?;
++            push_usize(out, *column)?;
++            push_u128(out, ordering.raw());
++            out.push(match direction {
++                OrderDirection::Ascending => 0,
++                OrderDirection::Descending => 1,
++            });
++            push_usize(out, *k)?;
++        }
++        RelExpr::PromoteToBag(input) => {
++            out.push(7);
++            encode_rel_expr(out, input, depth + 1)?;
++        }
++    }
++    Ok(())
++}
++
++fn decode_rel_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<RelExpr, &'static str> {
++    if depth > MAX_QUERY_DEPTH {
++        return Err("query nesting exceeds hard limit");
++    }
++    match cursor.u8()? {
++        0 => Ok(RelExpr::Scan(SemanticId::new(cursor.u128()?))),
++        1 => Ok(RelExpr::FilterEqConst {
++            input: Box::new(decode_rel_expr(cursor, depth + 1)?),
++            column: decode_usize(cursor)?,
++            value: cursor.value(0)?,
++            equivalence: SemanticId::new(cursor.u128()?),
++        }),
++        2 => {
++            let input = Box::new(decode_rel_expr(cursor, depth + 1)?);
++            let count = cursor.len()?;
++            let mut columns = Vec::with_capacity(count);
++            for _ in 0..count {
++                columns.push(decode_usize(cursor)?);
++            }
++            Ok(RelExpr::Project { input, columns })
++        }
++        3 => Ok(RelExpr::JoinEq {
++            left: Box::new(decode_rel_expr(cursor, depth + 1)?),
++            right: Box::new(decode_rel_expr(cursor, depth + 1)?),
++            left_column: decode_usize(cursor)?,
++            right_column: decode_usize(cursor)?,
++            equivalence: SemanticId::new(cursor.u128()?),
++        }),
++        4 => Ok(RelExpr::Distinct {
++            input: Box::new(decode_rel_expr(cursor, depth + 1)?),
++            column_equivalences: decode_semantic_ids(cursor)?,
++        }),
++        5 => {
++            let input = Box::new(decode_rel_expr(cursor, depth + 1)?);
++            let count = cursor.len()?;
++            let mut group_columns = Vec::with_capacity(count);
++            for _ in 0..count {
++                group_columns.push(decode_usize(cursor)?);
++            }
++            Ok(RelExpr::Group {
++                input,
++                group_columns,
++                group_equivalences: decode_semantic_ids(cursor)?,
++                aggregate: decode_aggregate(cursor)?,
++            })
++        }
++        6 => {
++            let input = Box::new(decode_rel_expr(cursor, depth + 1)?);
++            let column = decode_usize(cursor)?;
++            let ordering = SemanticId::new(cursor.u128()?);
++            let direction = match cursor.u8()? {
++                0 => OrderDirection::Ascending,
++                1 => OrderDirection::Descending,
++                _ => return Err("invalid order direction"),
++            };
++            let k = decode_usize(cursor)?;
++            Ok(RelExpr::TopKWithTies {
++                input,
++                column,
++                ordering,
++                direction,
++                k,
++            })
++        }
++        7 => Ok(RelExpr::PromoteToBag(Box::new(decode_rel_expr(
++            cursor,
++            depth + 1,
++        )?))),
++        _ => Err("unknown durable relation expression tag"),
++    }
++}
++
++fn encode_aggregate(out: &mut Vec<u8>, aggregate: &AggregateSpec) -> Result<(), CodecError> {
++    match aggregate {
++        AggregateSpec::Count { result_equivalence } => {
++            out.push(0);
++            push_u128(out, result_equivalence.raw());
++        }
++        AggregateSpec::ExactF64Sum {
++            value_column,
++            result_equivalence,
++        } => {
++            out.push(1);
++            push_usize(out, *value_column)?;
++            push_u128(out, result_equivalence.raw());
++        }
++    }
++    Ok(())
++}
++
++fn decode_aggregate(cursor: &mut Cursor<'_>) -> Result<AggregateSpec, &'static str> {
++    match cursor.u8()? {
++        0 => Ok(AggregateSpec::Count {
++            result_equivalence: SemanticId::new(cursor.u128()?),
++        }),
++        1 => Ok(AggregateSpec::ExactF64Sum {
++            value_column: decode_usize(cursor)?,
++            result_equivalence: SemanticId::new(cursor.u128()?),
++        }),
++        _ => Err("unknown durable aggregate tag"),
++    }
++}
++
++fn encode_semantic_ids(out: &mut Vec<u8>, ids: &[SemanticId]) -> Result<(), CodecError> {
++    push_len(out, ids.len())?;
++    for id in ids {
++        push_u128(out, id.raw());
++    }
++    Ok(())
++}
++
++fn decode_semantic_ids(cursor: &mut Cursor<'_>) -> Result<Vec<SemanticId>, &'static str> {
++    let count = cursor.len()?;
++    let mut ids = Vec::with_capacity(count);
++    for _ in 0..count {
++        ids.push(SemanticId::new(cursor.u128()?));
++    }
++    Ok(ids)
++}
++
++fn push_usize(out: &mut Vec<u8>, value: usize) -> Result<(), CodecError> {
++    let value = u64::try_from(value).map_err(|_| CodecError::LengthOverflow)?;
++    push_u64(out, value);
++    Ok(())
++}
++
++fn decode_usize(cursor: &mut Cursor<'_>) -> Result<usize, &'static str> {
++    usize::try_from(cursor.u64()?).map_err(|_| "usize value overflow")
++}
++
++#[cfg(test)]
++mod tests {
++    use kernel_model::Value;
++    use kernel_query::{AggregateSpec, OrderDirection, RelExpr};
++    use kernel_types::{ClientTransactionId, MaterializationId, RevisionId, SemanticId};
++
++    use super::*;
++
++    #[test]
++    fn metadata_roundtrip_covers_all_current_query_variants_and_transactions() {
++        let eq = SemanticId::new(90);
++        let ordering = SemanticId::new(91);
++        let left = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(SemanticId::new(1))),
++            column: 0,
++            value: Value::Text("A".into()),
++            equivalence: eq,
++        };
++        let query = RelExpr::TopKWithTies {
++            input: Box::new(RelExpr::Group {
++                input: Box::new(RelExpr::Distinct {
++                    input: Box::new(RelExpr::JoinEq {
++                        left: Box::new(RelExpr::Project {
++                            input: Box::new(left),
++                            columns: vec![0, 1],
++                        }),
++                        right: Box::new(RelExpr::PromoteToBag(Box::new(RelExpr::Scan(
++                            SemanticId::new(2),
++                        )))),
++                        left_column: 0,
++                        right_column: 0,
++                        equivalence: eq,
++                    }),
++                    column_equivalences: vec![eq, eq],
++                }),
++                group_columns: vec![0],
++                group_equivalences: vec![eq],
++                aggregate: AggregateSpec::ExactF64Sum {
++                    value_column: 1,
++                    result_equivalence: eq,
++                },
++            }),
++            column: 0,
++            ordering,
++            direction: OrderDirection::Descending,
++            k: 5,
++        };
++        let metadata = DurableStoreMetadata {
++            materializations: vec![DurableMaterializationSpec {
++                id: MaterializationId::new(7),
++                query,
++            }],
++            committed_transactions: [(ClientTransactionId::new(11), RevisionId::new(12))].into(),
++        };
++        let bytes = encode(&metadata).unwrap();
++        assert_eq!(decode(&bytes).unwrap(), metadata);
++    }
++}
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-durability/src/store.rs ./crates/kernel-durability/src/store.rs
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-durability/src/store.rs	2026-09-19 23:39:46.271719938 +0000
++++ ./crates/kernel-durability/src/store.rs	2026-09-20 00:01:47.694040241 +0000
+@@ -1,15 +1,16 @@
++use std::collections::BTreeMap;
+ use std::fs::{self, File, OpenOptions};
+ use std::io::Write;
+ use std::path::{Path, PathBuf};
+ 
+ use kernel_revision::Revision;
+ use kernel_semantics::SemanticRegistry;
+-use kernel_types::RevisionId;
++use kernel_types::{ClientTransactionId, RevisionId};
+ 
+ use super::{
+-    DurabilityError, DurableCommitReceipt, DurablePrepareToken, DurableRevisionDescriptor,
+-    FileRevisionWal, RecoveryScan, RevisionDurability, checkpoint, crc32c, read_u16, read_u32,
+-    read_u64,
++    DurabilityError, DurableCommitReceipt, DurableMaterializationSpec, DurablePrepareToken,
++    DurableRevisionDescriptor, DurableTransactionOutcome, FileRevisionWal, RecoveryScan,
++    RevisionDurability, checkpoint, crc32c, metadata, read_u16, read_u32, read_u64,
+ };
+ 
+ const CHECKPOINT_MAGIC: [u8; 4] = *b"CFCP";
+@@ -17,14 +18,19 @@
+ const CHECKPOINT_HEADER_LEN: usize = 32;
+ const MAX_CHECKPOINT_LEN: usize = 512 * 1024 * 1024;
+ const MANIFEST_MAGIC: [u8; 4] = *b"CFMF";
+-const MANIFEST_FORMAT_VERSION: u16 = 1;
+-const MANIFEST_LEN: usize = 32;
++const MANIFEST_FORMAT_VERSION: u16 = 2;
++const MANIFEST_LEN: usize = 36;
++const METADATA_MAGIC: [u8; 4] = *b"CFDM";
++const METADATA_FILE_VERSION: u16 = 1;
++const METADATA_HEADER_LEN: usize = 20;
++const MAX_METADATA_LEN: usize = 64 * 1024 * 1024;
+ const LOCK_FILE_NAME: &str = ".cfmd-durability.lock";
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum StoreFaultPoint {
+     AfterCheckpointSync,
+     AfterWalSync,
++    AfterMetadataSync,
+     AfterPrerequisiteDirectorySync,
+     AfterPendingManifestSync,
+     AfterManifestRename,
+@@ -55,6 +61,7 @@
+     generation: u64,
+     base_revision: RevisionId,
+     checkpoint_crc32c: u32,
++    metadata_crc32c: u32,
+ }
+ 
+ #[derive(Debug)]
+@@ -65,6 +72,8 @@
+     checkpoint: Revision,
+     durable_head: RevisionId,
+     wal: FileRevisionWal,
++    materialization_specs: Vec<DurableMaterializationSpec>,
++    committed_transactions: BTreeMap<ClientTransactionId, RevisionId>,
+     poisoned: bool,
+ }
+ 
+@@ -73,12 +82,26 @@
+         directory: impl AsRef<Path>,
+         base_revision: &Revision,
+     ) -> Result<Self, DurabilityError> {
+-        Self::create_with_hook(directory.as_ref(), base_revision, &mut NoStoreFault)
++        Self::create_with_materializations(directory, base_revision, &[])
++    }
++
++    pub fn create_with_materializations(
++        directory: impl AsRef<Path>,
++        base_revision: &Revision,
++        materialization_specs: &[DurableMaterializationSpec],
++    ) -> Result<Self, DurabilityError> {
++        Self::create_with_hook(
++            directory.as_ref(),
++            base_revision,
++            materialization_specs,
++            &mut NoStoreFault,
++        )
+     }
+ 
+     fn create_with_hook(
+         directory: &Path,
+         base_revision: &Revision,
++        materialization_specs: &[DurableMaterializationSpec],
+         hook: &mut impl StoreFaultHook,
+     ) -> Result<Self, DurabilityError> {
+         let directory = directory.to_path_buf();
+@@ -98,6 +121,14 @@
+         let mut wal = FileRevisionWal::create(&wal_path)?;
+         wal.barrier()?;
+         hook.hit(StoreFaultPoint::AfterWalSync);
++        let committed_transactions = BTreeMap::new();
++        let metadata_record = metadata::DurableStoreMetadata {
++            materializations: materialization_specs.to_vec(),
++            committed_transactions: committed_transactions.clone(),
++        };
++        let metadata_file = metadata_path(&directory, generation);
++        let metadata_crc32c = write_metadata_file(&metadata_file, &metadata_record)?;
++        hook.hit(StoreFaultPoint::AfterMetadataSync);
+         sync_directory(&directory)?;
+         hook.hit(StoreFaultPoint::AfterPrerequisiteDirectorySync);
+         publish_manifest_with_hook(
+@@ -106,6 +137,7 @@
+                 generation,
+                 base_revision: base_revision.id(),
+                 checkpoint_crc32c,
++                metadata_crc32c,
+             },
+             hook,
+         )?;
+@@ -116,6 +148,8 @@
+             checkpoint: base_revision.clone(),
+             durable_head: base_revision.id(),
+             wal,
++            materialization_specs: materialization_specs.to_vec(),
++            committed_transactions,
+             poisoned: false,
+         })
+     }
+@@ -142,6 +176,24 @@
+                 reason: "manifest base revision does not match checkpoint",
+             });
+         }
++        let metadata_file = metadata_path(&directory, manifest.generation);
++        let metadata_bytes = fs::read(&metadata_file).map_err(|error| {
++            if error.kind() == std::io::ErrorKind::NotFound {
++                DurabilityError::Corruption {
++                    offset: 0,
++                    reason: "published durable metadata file is missing",
++                }
++            } else {
++                DurabilityError::Io(error)
++            }
++        })?;
++        if crc32c(&metadata_bytes) != manifest.metadata_crc32c {
++            return Err(DurabilityError::Corruption {
++                offset: 0,
++                reason: "published durable metadata file checksum mismatch",
++            });
++        }
++        let metadata = decode_metadata_file(&metadata_bytes)?;
+         let wal_file = wal_path(&directory, manifest.generation);
+         if !wal_file.is_file() {
+             return Err(DurabilityError::Corruption {
+@@ -150,6 +202,17 @@
+             });
+         }
+         let (wal, scan) = FileRevisionWal::open_recovered(&wal_file, checkpoint.id())?;
++        let mut committed_transactions = metadata.committed_transactions;
++        for (&transaction_id, &target_revision) in scan.committed_transactions() {
++            if let Some(existing) = committed_transactions.insert(transaction_id, target_revision)
++                && existing != target_revision
++            {
++                return Err(DurabilityError::Protocol {
++                    offset: 0,
++                    reason: "checkpoint transaction ledger conflicts with WAL tail",
++                });
++            }
++        }
+         Ok((
+             Self {
+                 directory,
+@@ -158,6 +221,8 @@
+                 checkpoint,
+                 durable_head: scan.durable_revision(),
+                 wal,
++                materialization_specs: metadata.materializations,
++                committed_transactions,
+                 poisoned: false,
+             },
+             scan,
+@@ -189,6 +254,24 @@
+         self.wal.path()
+     }
+ 
++    #[must_use]
++    pub fn materialization_specs(&self) -> &[DurableMaterializationSpec] {
++        &self.materialization_specs
++    }
++
++    #[must_use]
++    pub fn transaction_outcome(
++        &self,
++        transaction_id: ClientTransactionId,
++    ) -> DurableTransactionOutcome {
++        self.committed_transactions
++            .get(&transaction_id)
++            .copied()
++            .map_or(DurableTransactionOutcome::Unknown, |target_revision| {
++                DurableTransactionOutcome::Committed { target_revision }
++            })
++    }
++
+     pub fn rotate_checkpoint(
+         &mut self,
+         revision: &Revision,
+@@ -222,6 +305,13 @@
+         let mut wal = FileRevisionWal::create(&wal_file)?;
+         wal.barrier()?;
+         hook.hit(StoreFaultPoint::AfterWalSync);
++        let metadata_record = metadata::DurableStoreMetadata {
++            materializations: self.materialization_specs.clone(),
++            committed_transactions: self.committed_transactions.clone(),
++        };
++        let metadata_file = metadata_path(&self.directory, generation);
++        let metadata_crc32c = write_metadata_file(&metadata_file, &metadata_record)?;
++        hook.hit(StoreFaultPoint::AfterMetadataSync);
+         sync_directory(&self.directory)?;
+         hook.hit(StoreFaultPoint::AfterPrerequisiteDirectorySync);
+         publish_manifest_with_hook(
+@@ -230,6 +320,7 @@
+                 generation,
+                 base_revision: revision.id(),
+                 checkpoint_crc32c,
++                metadata_crc32c,
+             },
+             hook,
+         )?;
+@@ -261,7 +352,8 @@
+             };
+             let generation = parse_generation_name(name, "manifest-", ".cfmf")
+                 .or_else(|| parse_generation_name(name, "checkpoint-", ".cfcp"))
+-                .or_else(|| parse_generation_name(name, "wal-", ".cfmw"));
++                .or_else(|| parse_generation_name(name, "wal-", ".cfmw"))
++                .or_else(|| parse_generation_name(name, "metadata-", ".cfdm"));
+             let is_pending = parse_generation_name(name, "pending-manifest-", ".tmp").is_some();
+             if is_pending || generation.is_some_and(|generation| generation != self.generation) {
+                 hook.hit(StoreFaultPoint::BeforeCompactionRemove);
+@@ -283,6 +375,16 @@
+         if self.poisoned {
+             return Err(DurabilityError::Poisoned);
+         }
++        if let Some(existing_target) = self.committed_transactions.get(&descriptor.transaction_id) {
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: if *existing_target == descriptor.target_revision {
++                    "transaction is already committed"
++                } else {
++                    "transaction id already committed to another revision"
++                },
++            });
++        }
+         if descriptor.source_revision != self.durable_head {
+             return Err(DurabilityError::Protocol {
+                 offset: 0,
+@@ -299,8 +401,20 @@
+         if self.poisoned {
+             return Err(DurabilityError::Poisoned);
+         }
++        let transaction_id = prepared.transaction_id();
+         let receipt = self.wal.durably_commit(prepared)?;
+         self.durable_head = receipt.target_revision();
++        if let Some(existing) = self
++            .committed_transactions
++            .insert(transaction_id, receipt.target_revision())
++            && existing != receipt.target_revision()
++        {
++            self.poisoned = true;
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: "committed transaction id changed target revision",
++            });
++        }
+         Ok(receipt)
+     }
+ }
+@@ -328,6 +442,10 @@
+     directory.join(format!("manifest-{generation:020}.cfmf"))
+ }
+ 
++fn metadata_path(directory: &Path, generation: u64) -> PathBuf {
++    directory.join(format!("metadata-{generation:020}.cfdm"))
++}
++
+ fn write_checkpoint_file(path: &Path, revision: &Revision) -> Result<u32, DurabilityError> {
+     let payload = checkpoint::encode_revision(revision)?;
+     if payload.len() > MAX_CHECKPOINT_LEN {
+@@ -414,6 +532,72 @@
+     Ok(revision)
+ }
+ 
++fn write_metadata_file(
++    path: &Path,
++    metadata: &metadata::DurableStoreMetadata,
++) -> Result<u32, DurabilityError> {
++    let payload = metadata::encode(metadata)?;
++    if payload.len() > MAX_METADATA_LEN {
++        return Err(DurabilityError::PayloadTooLarge);
++    }
++    let payload_len = u64::try_from(payload.len()).map_err(|_| DurabilityError::PayloadTooLarge)?;
++    let payload_crc = crc32c(&payload);
++    let mut header = [0_u8; METADATA_HEADER_LEN];
++    header[0..4].copy_from_slice(&METADATA_MAGIC);
++    header[4..6].copy_from_slice(&METADATA_FILE_VERSION.to_le_bytes());
++    header[6..8].copy_from_slice(&0_u16.to_le_bytes());
++    header[8..16].copy_from_slice(&payload_len.to_le_bytes());
++    header[16..20].copy_from_slice(&payload_crc.to_le_bytes());
++    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
++    file.write_all(&header)?;
++    file.write_all(&payload)?;
++    file.sync_all()?;
++    let mut complete = Vec::with_capacity(header.len() + payload.len());
++    complete.extend_from_slice(&header);
++    complete.extend_from_slice(&payload);
++    Ok(crc32c(&complete))
++}
++
++fn decode_metadata_file(bytes: &[u8]) -> Result<metadata::DurableStoreMetadata, DurabilityError> {
++    if bytes.len() < METADATA_HEADER_LEN {
++        return Err(DurabilityError::Corruption {
++            offset: 0,
++            reason: "durable metadata header truncated",
++        });
++    }
++    let header = &bytes[..METADATA_HEADER_LEN];
++    if header[..4] != METADATA_MAGIC
++        || read_u16(&header[4..6]) != METADATA_FILE_VERSION
++        || read_u16(&header[6..8]) != 0
++    {
++        return Err(DurabilityError::Corruption {
++            offset: 0,
++            reason: "durable metadata magic/version/flags mismatch",
++        });
++    }
++    let payload_len =
++        usize::try_from(read_u64(&header[8..16])).map_err(|_| DurabilityError::Corruption {
++            offset: 0,
++            reason: "durable metadata payload length overflow",
++        })?;
++    if payload_len > MAX_METADATA_LEN
++        || METADATA_HEADER_LEN.checked_add(payload_len) != Some(bytes.len())
++    {
++        return Err(DurabilityError::Corruption {
++            offset: 0,
++            reason: "durable metadata payload length mismatch",
++        });
++    }
++    let payload = &bytes[METADATA_HEADER_LEN..];
++    if crc32c(payload) != read_u32(&header[16..20]) {
++        return Err(DurabilityError::Corruption {
++            offset: 0,
++            reason: "durable metadata payload checksum mismatch",
++        });
++    }
++    metadata::decode(payload).map_err(|reason| DurabilityError::Corruption { offset: 0, reason })
++}
++
+ fn publish_manifest_with_hook(
+     directory: &Path,
+     manifest: ManifestRecord,
+@@ -447,8 +631,9 @@
+     bytes[8..16].copy_from_slice(&manifest.generation.to_le_bytes());
+     bytes[16..24].copy_from_slice(&manifest.base_revision.raw().to_le_bytes());
+     bytes[24..28].copy_from_slice(&manifest.checkpoint_crc32c.to_le_bytes());
+-    let checksum = crc32c(&bytes[..28]);
+-    bytes[28..32].copy_from_slice(&checksum.to_le_bytes());
++    bytes[28..32].copy_from_slice(&manifest.metadata_crc32c.to_le_bytes());
++    let checksum = crc32c(&bytes[..32]);
++    bytes[32..36].copy_from_slice(&checksum.to_le_bytes());
+     bytes
+ }
+ 
+@@ -468,7 +653,7 @@
+             reason: "manifest magic/version/flags mismatch",
+         });
+     }
+-    if crc32c(&bytes[..28]) != read_u32(&bytes[28..32]) {
++    if crc32c(&bytes[..32]) != read_u32(&bytes[32..36]) {
+         return Err(DurabilityError::Corruption {
+             offset: 0,
+             reason: "manifest checksum mismatch",
+@@ -478,6 +663,7 @@
+         generation: read_u64(&bytes[8..16]),
+         base_revision: RevisionId::new(read_u64(&bytes[16..24])),
+         checkpoint_crc32c: read_u32(&bytes[24..28]),
++        metadata_crc32c: read_u32(&bytes[28..32]),
+     })
+ }
+ 
+@@ -528,6 +714,7 @@
+         let generation = parse_generation_name(name, "manifest-", ".cfmf")
+             .or_else(|| parse_generation_name(name, "checkpoint-", ".cfcp"))
+             .or_else(|| parse_generation_name(name, "wal-", ".cfmw"))
++            .or_else(|| parse_generation_name(name, "metadata-", ".cfdm"))
+             .or_else(|| parse_generation_name(name, "pending-manifest-", ".tmp"));
+         if let Some(generation) = generation {
+             highest = highest.max(generation);
+@@ -631,6 +818,7 @@
+         match point {
+             StoreFaultPoint::AfterCheckpointSync => "after-checkpoint-sync",
+             StoreFaultPoint::AfterWalSync => "after-wal-sync",
++            StoreFaultPoint::AfterMetadataSync => "after-metadata-sync",
+             StoreFaultPoint::AfterPrerequisiteDirectorySync => "after-prerequisite-directory-sync",
+             StoreFaultPoint::AfterPendingManifestSync => "after-pending-manifest-sync",
+             StoreFaultPoint::AfterManifestRename => "after-manifest-rename",
+@@ -645,6 +833,7 @@
+         [
+             StoreFaultPoint::AfterCheckpointSync,
+             StoreFaultPoint::AfterWalSync,
++            StoreFaultPoint::AfterMetadataSync,
+             StoreFaultPoint::AfterPrerequisiteDirectorySync,
+             StoreFaultPoint::AfterPendingManifestSync,
+             StoreFaultPoint::AfterManifestRename,
+@@ -702,6 +891,7 @@
+         inserted: i64,
+     ) -> DurableRevisionDescriptor {
+         DurableRevisionDescriptor {
++            transaction_id: ClientTransactionId::new(u128::from(target_revision)),
+             source_revision: base.id(),
+             target_revision: RevisionId::new(target_revision),
+             semantic_revision: base.semantic_revision(),
+@@ -719,6 +909,7 @@
+         let (base, registry, relation) = setup_revision(10, &[1]);
+         let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
+         let descriptor = DurableRevisionDescriptor {
++            transaction_id: ClientTransactionId::new(11),
+             source_revision: RevisionId::new(10),
+             target_revision: RevisionId::new(11),
+             semantic_revision: base.semantic_revision(),
+@@ -747,6 +938,7 @@
+         let (next, _, _) = setup_revision(21, &[1, 2]);
+         let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
+         let descriptor = DurableRevisionDescriptor {
++            transaction_id: ClientTransactionId::new(21),
+             source_revision: RevisionId::new(20),
+             target_revision: RevisionId::new(21),
+             semantic_revision: base.semantic_revision(),
+@@ -822,15 +1014,45 @@
+         store.compact_obsolete_generations().unwrap();
+         assert!(!checkpoint_path(&dir, 1).exists());
+         assert!(!wal_path(&dir, 1).exists());
++        assert!(!metadata_path(&dir, 1).exists());
+         assert!(!manifest_path(&dir, 1).exists());
+         assert!(checkpoint_path(&dir, 2).exists());
+         assert!(wal_path(&dir, 2).exists());
++        assert!(metadata_path(&dir, 2).exists());
+         assert!(manifest_path(&dir, 2).exists());
+         drop(store);
+         fs::remove_dir_all(dir).unwrap();
+     }
+ 
+     #[test]
++    fn published_manifest_requires_exact_durable_metadata_sidecar() {
++        let dir = test_dir("metadata-authority");
++        let (base, registry, _) = setup_revision(59, &[1]);
++        let store = DurableRevisionStore::create(&dir, &base).unwrap();
++        drop(store);
++        let path = metadata_path(&dir, 1);
++        let original = fs::read(&path).unwrap();
++        fs::remove_file(&path).unwrap();
++        assert!(matches!(
++            DurableRevisionStore::open(&dir, &registry),
++            Err(DurabilityError::Corruption {
++                reason: "published durable metadata file is missing",
++                ..
++            })
++        ));
++        fs::write(&path, &original).unwrap();
++        let mut corrupt = original;
++        let last = corrupt.len() - 1;
++        corrupt[last] ^= 0x40;
++        fs::write(&path, corrupt).unwrap();
++        assert!(matches!(
++            DurableRevisionStore::open(&dir, &registry),
++            Err(DurabilityError::Corruption { .. })
++        ));
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
+     fn published_manifest_with_missing_wal_is_corruption_not_empty_segment() {
+         let dir = test_dir("missing-wal");
+         let (base, registry, _) = setup_revision(60, &[1]);
+@@ -892,6 +1114,7 @@
+         let points = [
+             (StoreFaultPoint::AfterCheckpointSync, 1),
+             (StoreFaultPoint::AfterWalSync, 1),
++            (StoreFaultPoint::AfterMetadataSync, 1),
+             (StoreFaultPoint::AfterPrerequisiteDirectorySync, 1),
+             (StoreFaultPoint::AfterPendingManifestSync, 1),
+             (StoreFaultPoint::AfterManifestRename, 2),
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-plan/src/lib.rs ./crates/kernel-plan/src/lib.rs
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-plan/src/lib.rs	2026-09-19 23:40:00.242784736 +0000
++++ ./crates/kernel-plan/src/lib.rs	2026-09-20 00:04:27.081995510 +0000
+@@ -7,8 +7,9 @@
+ };
+ 
+ use kernel_durability::{
+-    DurabilityError, DurableCommitReceipt, DurableGenerationReceipt, DurableRelationMutation,
+-    DurableRevisionDescriptor, DurableRevisionStore, RecoveryScan, RevisionDurability,
++    DurabilityError, DurableCommitReceipt, DurableGenerationReceipt, DurableMaterializationSpec,
++    DurableRelationMutation, DurableRevisionDescriptor, DurableRevisionStore,
++    DurableTransactionOutcome, RecoveryScan, RevisionDurability,
+ };
+ use kernel_model::Value;
+ use kernel_query::{
+@@ -16,7 +17,7 @@
+     RelationDelta, RelationValue, StorageResolvedRelationDelta,
+ };
+ pub use kernel_types::StableRowHandle as PhysicalRowId;
+-use kernel_types::{RevisionId, SemanticId};
++use kernel_types::{ClientTransactionId, RevisionId, SemanticId};
+ 
+ static NEXT_RUNTIME_ROOT_ID: AtomicU64 = AtomicU64::new(1);
+ 
+@@ -540,8 +541,12 @@
+     }
+ 
+     #[must_use]
+-    pub fn durable_descriptor(&self) -> DurableRevisionDescriptor {
++    pub fn durable_descriptor(
++        &self,
++        transaction_id: ClientTransactionId,
++    ) -> DurableRevisionDescriptor {
+         DurableRevisionDescriptor {
++            transaction_id,
+             source_revision: self.source_revision,
+             target_revision: self.target_revision,
+             semantic_revision: self.semantic_revision,
+@@ -561,8 +566,14 @@
+ #[derive(Debug)]
+ pub enum DurableRuntimeCommitError {
+     Runtime(PhysicalExecutionError),
++    Recovery(RuntimeRecoveryError),
+     PrepareDurability(DurabilityError),
+     CommitDurabilityUncertain(DurabilityError),
++    TransactionIdConflict {
++        transaction_id: ClientTransactionId,
++        committed_target: RevisionId,
++        requested_target: RevisionId,
++    },
+ }
+ 
+ impl From<PhysicalExecutionError> for DurableRuntimeCommitError {
+@@ -577,9 +588,16 @@
+     pub output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum DurableRuntimeCommitOutcome {
++    Committed(DurableRuntimeCommitReceipt),
++    AlreadyCommitted { target_revision: RevisionId },
++}
++
+ #[derive(Debug)]
+ pub enum DurableRuntimeCheckpointError {
+     Runtime(PhysicalExecutionError),
++    Recovery(RuntimeRecoveryError),
+     DurabilityUncertain(DurabilityError),
+ }
+ 
+@@ -639,6 +657,7 @@
+     revision: kernel_revision::Revision,
+     physical: PhysicalStore,
+     relation_layouts: BTreeMap<SemanticId, LayoutBinding>,
++    materialization_specs: BTreeMap<kernel_types::MaterializationId, RelExpr>,
+     materializations: BTreeMap<kernel_types::MaterializationId, MaterializedRelPlanState>,
+ }
+ 
+@@ -677,6 +696,16 @@
+     durability: Mutex<DurableRevisionStore>,
+ }
+ 
++/// Process-level owner that can discard a fail-stopped runtime, reopen the
++/// authoritative durable generation, and resolve an uncertain client commit
++/// before retrying it under the same transaction identity.
++#[derive(Debug)]
++pub struct DurableRuntimeSupervisor {
++    directory: std::path::PathBuf,
++    registry: kernel_semantics::SemanticRegistry,
++    runtime: Mutex<Option<DurableRuntime>>,
++}
++
+ /// Fully prepared but not yet freshness-sealed revision transition.
+ #[derive(Debug, PartialEq, Eq)]
+ pub struct PreparedRuntimeRevisionTransition {
+@@ -711,6 +740,7 @@
+         physical.bind_revision(revision.id())?;
+ 
+         let mut materializations = BTreeMap::new();
++        let mut materialization_spec_map = BTreeMap::new();
+         for spec in materialization_specs {
+             if materializations.contains_key(&spec.id) {
+                 return Err(PhysicalExecutionError::DuplicateMaterialization(spec.id));
+@@ -729,6 +759,7 @@
+                 maintained.attach_storage_rows(relation, &rows)?;
+             }
+             maintained.bind_revision(revision.id())?;
++            materialization_spec_map.insert(spec.id, spec.query.clone());
+             materializations.insert(spec.id, maintained);
+         }
+ 
+@@ -740,6 +771,7 @@
+             revision,
+             physical,
+             relation_layouts,
++            materialization_specs: materialization_spec_map,
+             materializations,
+         })
+     }
+@@ -849,6 +881,17 @@
+         &self.materializations
+     }
+ 
++    #[must_use]
++    pub fn durable_materialization_specs(&self) -> Vec<DurableMaterializationSpec> {
++        self.materialization_specs
++            .iter()
++            .map(|(&id, query)| DurableMaterializationSpec {
++                id,
++                query: query.clone(),
++            })
++            .collect()
++    }
++
+     #[cfg(test)]
+     fn test_clone(&self) -> Self {
+         Self {
+@@ -856,6 +899,7 @@
+             revision: self.revision.clone(),
+             physical: self.physical.clone(),
+             relation_layouts: self.relation_layouts.clone(),
++            materialization_specs: self.materialization_specs.clone(),
+             materializations: self.materializations.clone(),
+         }
+     }
+@@ -950,6 +994,7 @@
+             revision: request.target_revision.clone(),
+             physical: candidate_store,
+             relation_layouts: self.relation_layouts.clone(),
++            materialization_specs: self.materialization_specs.clone(),
+             materializations: candidate_materializations,
+         };
+         let descriptor = RevisionCommitDescriptor {
+@@ -1057,11 +1102,12 @@
+     /// treat the durable outcome as uncertain until WAL recovery.
+     pub(crate) fn commit_revision_durable<D: RevisionDurability>(
+         &self,
++        transaction_id: ClientTransactionId,
+         request: &RevisionTransitionRequest<'_>,
+         durability: &mut D,
+     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+         let prepared = self.prepare_revision(request)?;
+-        let durable_descriptor = prepared.descriptor().durable_descriptor();
++        let durable_descriptor = prepared.descriptor().durable_descriptor(transaction_id);
+         let durable_prepare = durability
+             .durably_prepare(&durable_descriptor)
+             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+@@ -1143,6 +1189,7 @@
+             revision: live.revision.clone(),
+             physical,
+             relation_layouts: live.relation_layouts.clone(),
++            materialization_specs: live.materialization_specs.clone(),
+             materializations: live.materializations.clone(),
+         };
+         *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
+@@ -1155,7 +1202,12 @@
+         root: RuntimeRevisionBundle,
+         directory: impl AsRef<std::path::Path>,
+     ) -> Result<Self, DurabilityError> {
+-        let durability = DurableRevisionStore::create(directory, root.revision())?;
++        let materialization_specs = root.durable_materialization_specs();
++        let durability = DurableRevisionStore::create_with_materializations(
++            directory,
++            root.revision(),
++            &materialization_specs,
++        )?;
+         Ok(Self {
+             cell: RuntimeRevisionCell::new(root),
+             durability: Mutex::new(durability),
+@@ -1164,14 +1216,21 @@
+ 
+     pub fn open(
+         directory: impl AsRef<std::path::Path>,
+-        materialization_specs: &[RuntimeMaterializationSpec],
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, RuntimeRecoveryError> {
+         let (durability, scan) = DurableRevisionStore::open(directory, registry)?;
++        let materialization_specs = durability
++            .materialization_specs()
++            .iter()
++            .map(|spec| RuntimeMaterializationSpec {
++                id: spec.id,
++                query: spec.query.clone(),
++            })
++            .collect::<Vec<_>>();
+         let root = recover_runtime_bundle(
+             durability.checkpoint_revision(),
+             &scan,
+-            materialization_specs,
++            &materialization_specs,
+             registry,
+         )?;
+         if root.revision().id() != durability.durable_head() {
+@@ -1189,13 +1248,42 @@
+ 
+     pub fn commit_revision(
+         &self,
++        transaction_id: ClientTransactionId,
+         request: &RevisionTransitionRequest<'_>,
+-    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
++    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+         let mut durability = self.durability.lock().map_err(|_| {
+             let _ = self.cell.force_recovery_required();
+             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
+         })?;
+-        self.cell.commit_revision_durable(request, &mut *durability)
++        match durability.transaction_outcome(transaction_id) {
++            DurableTransactionOutcome::Unknown => {}
++            DurableTransactionOutcome::Committed { target_revision }
++                if target_revision == request.target_revision.id() =>
++            {
++                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision });
++            }
++            DurableTransactionOutcome::Committed { target_revision } => {
++                return Err(DurableRuntimeCommitError::TransactionIdConflict {
++                    transaction_id,
++                    committed_target: target_revision,
++                    requested_target: request.target_revision.id(),
++                });
++            }
++        }
++        self.cell
++            .commit_revision_durable(transaction_id, request, &mut *durability)
++            .map(DurableRuntimeCommitOutcome::Committed)
++    }
++
++    pub fn transaction_outcome(
++        &self,
++        transaction_id: ClientTransactionId,
++    ) -> Result<DurableTransactionOutcome, DurabilityError> {
++        let durability = self
++            .durability
++            .lock()
++            .map_err(|_| DurabilityError::Poisoned)?;
++        Ok(durability.transaction_outcome(transaction_id))
+     }
+ 
+     pub fn checkpoint(&self) -> Result<DurableGenerationReceipt, DurableRuntimeCheckpointError> {
+@@ -1225,6 +1313,154 @@
+     }
+ }
+ 
++impl DurableRuntimeSupervisor {
++    pub fn create(
++        root: RuntimeRevisionBundle,
++        directory: impl AsRef<std::path::Path>,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, DurabilityError> {
++        let directory = directory.as_ref().to_path_buf();
++        let runtime = DurableRuntime::create(root, &directory)?;
++        Ok(Self {
++            directory,
++            registry: registry.clone(),
++            runtime: Mutex::new(Some(runtime)),
++        })
++    }
++
++    pub fn open(
++        directory: impl AsRef<std::path::Path>,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, RuntimeRecoveryError> {
++        let directory = directory.as_ref().to_path_buf();
++        let runtime = DurableRuntime::open(&directory, registry)?;
++        Ok(Self {
++            directory,
++            registry: registry.clone(),
++            runtime: Mutex::new(Some(runtime)),
++        })
++    }
++
++    fn reopen_locked(&self, slot: &mut Option<DurableRuntime>) -> Result<(), RuntimeRecoveryError> {
++        drop(slot.take());
++        let recovered = DurableRuntime::open(&self.directory, &self.registry)?;
++        *slot = Some(recovered);
++        Ok(())
++    }
++
++    pub fn recover(&self) -> Result<(), RuntimeRecoveryError> {
++        let mut slot = self
++            .runtime
++            .lock()
++            .map_err(|_| RuntimeRecoveryError::Durability(DurabilityError::Poisoned))?;
++        self.reopen_locked(&mut slot)
++    }
++
++    pub fn snapshot(&self) -> Result<RuntimeRevisionSnapshot, RuntimeRecoveryError> {
++        let mut slot = self
++            .runtime
++            .lock()
++            .map_err(|_| RuntimeRecoveryError::Durability(DurabilityError::Poisoned))?;
++        let result = slot
++            .as_ref()
++            .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
++            .snapshot();
++        match result {
++            Ok(snapshot) => Ok(snapshot),
++            Err(PhysicalExecutionError::RuntimeRecoveryRequired) => {
++                self.reopen_locked(&mut slot)?;
++                slot.as_ref()
++                    .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
++                    .snapshot()
++                    .map_err(RuntimeRecoveryError::from)
++            }
++            Err(error) => Err(RuntimeRecoveryError::Runtime(error)),
++        }
++    }
++
++    pub fn transaction_outcome(
++        &self,
++        transaction_id: ClientTransactionId,
++    ) -> Result<DurableTransactionOutcome, DurabilityError> {
++        let slot = self.runtime.lock().map_err(|_| DurabilityError::Poisoned)?;
++        slot.as_ref()
++            .ok_or(DurabilityError::Poisoned)?
++            .transaction_outcome(transaction_id)
++    }
++
++    pub fn commit_revision(
++        &self,
++        transaction_id: ClientTransactionId,
++        request: &RevisionTransitionRequest<'_>,
++    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
++        let mut slot = self
++            .runtime
++            .lock()
++            .map_err(|_| DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned))?;
++        let first = slot
++            .as_ref()
++            .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
++            .commit_revision(transaction_id, request);
++        let must_recover = matches!(
++            first,
++            Err(DurableRuntimeCommitError::CommitDurabilityUncertain(_)
++                | DurableRuntimeCommitError::Runtime(
++                    PhysicalExecutionError::RuntimeRecoveryRequired
++                ))
++        );
++        if !must_recover {
++            return first;
++        }
++
++        self.reopen_locked(&mut slot)
++            .map_err(DurableRuntimeCommitError::Recovery)?;
++        let runtime = slot
++            .as_ref()
++            .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?;
++        match runtime
++            .transaction_outcome(transaction_id)
++            .map_err(DurableRuntimeCommitError::PrepareDurability)?
++        {
++            DurableTransactionOutcome::Committed { target_revision }
++                if target_revision == request.target_revision.id() =>
++            {
++                Ok(DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision })
++            }
++            DurableTransactionOutcome::Committed { target_revision } => {
++                Err(DurableRuntimeCommitError::TransactionIdConflict {
++                    transaction_id,
++                    committed_target: target_revision,
++                    requested_target: request.target_revision.id(),
++                })
++            }
++            DurableTransactionOutcome::Unknown => runtime.commit_revision(transaction_id, request),
++        }
++    }
++
++    pub fn checkpoint(&self) -> Result<DurableGenerationReceipt, DurableRuntimeCheckpointError> {
++        let mut slot = self.runtime.lock().map_err(|_| {
++            DurableRuntimeCheckpointError::DurabilityUncertain(DurabilityError::Poisoned)
++        })?;
++        let first = slot
++            .as_ref()
++            .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
++            .checkpoint();
++        if !matches!(
++            first,
++            Err(DurableRuntimeCheckpointError::Runtime(
++                PhysicalExecutionError::RuntimeRecoveryRequired
++            ))
++        ) {
++            return first;
++        }
++        self.reopen_locked(&mut slot)
++            .map_err(DurableRuntimeCheckpointError::Recovery)?;
++        slot.as_ref()
++            .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
++            .checkpoint()
++    }
++}
++
+ impl PreparedRuntimeRevisionTransition {
+     #[must_use]
+     pub const fn descriptor(&self) -> &RevisionCommitDescriptor {
+@@ -9019,6 +9255,7 @@
+ 
+         let receipt = cell
+             .commit_revision_durable(
++                ClientTransactionId::new(1001),
+                 &RevisionTransitionRequest {
+                     target_revision: &target,
+                     mutations: &mutations,
+@@ -9066,6 +9303,7 @@
+         let target_a = target_revision_for(snapshot.root(), 400, &mutations_a, &registry);
+         drop(snapshot);
+         cell.commit_revision_durable(
++            ClientTransactionId::new(1002),
+             &RevisionTransitionRequest {
+                 target_revision: &target_a,
+                 mutations: &mutations_a,
+@@ -9084,6 +9322,7 @@
+         let target_b = target_revision_for(snapshot.root(), 900, &mutations_b, &registry);
+         drop(snapshot);
+         cell.commit_revision_durable(
++            ClientTransactionId::new(1003),
+             &RevisionTransitionRequest {
+                 target_revision: &target_b,
+                 mutations: &mutations_b,
+@@ -9139,6 +9378,7 @@
+ 
+         assert!(matches!(
+             cell.commit_revision_durable(
++                ClientTransactionId::new(1004),
+                 &RevisionTransitionRequest {
+                     target_revision: &target,
+                     mutations: &mutations,
+@@ -9214,6 +9454,7 @@
+ 
+         assert!(matches!(
+             cell.commit_revision_durable(
++                ClientTransactionId::new(1005),
+                 &RevisionTransitionRequest {
+                     target_revision: &target,
+                     mutations: &mutations,
+@@ -9332,10 +9573,6 @@
+     fn durable_runtime_owner_restarts_from_checkpoint_plus_wal_tail() {
+         let dir = durable_test_dir("restart-tail");
+         let (context, registry, relation, _, root) = scan_runtime_bundle(500, 1200, &[1, 2]);
+-        let specs = [RuntimeMaterializationSpec {
+-            id: test_materialization_id(),
+-            query: RelExpr::Scan(relation),
+-        }];
+         let runtime = DurableRuntime::create(root, &dir).unwrap();
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+@@ -9346,15 +9583,18 @@
+         let target = target_revision_for(snapshot.root(), 501, &mutations, &registry);
+         drop(snapshot);
+         runtime
+-            .commit_revision(&RevisionTransitionRequest {
+-                target_revision: &target,
+-                mutations: &mutations,
+-                registry: &registry,
+-            })
++            .commit_revision(
++                ClientTransactionId::new(2001),
++                &RevisionTransitionRequest {
++                    target_revision: &target,
++                    mutations: &mutations,
++                    registry: &registry,
++                },
++            )
+             .unwrap();
+         drop(runtime);
+ 
+-        let reopened = DurableRuntime::open(&dir, &specs, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(501));
+         assert_eq!(
+@@ -9377,10 +9617,6 @@
+     fn durable_runtime_checkpoint_rotates_base_then_replays_only_new_tail() {
+         let dir = durable_test_dir("checkpoint-tail");
+         let (context, registry, relation, _, root) = scan_runtime_bundle(510, 1201, &[1, 2]);
+-        let specs = [RuntimeMaterializationSpec {
+-            id: test_materialization_id(),
+-            query: RelExpr::Scan(relation),
+-        }];
+         let runtime = DurableRuntime::create(root, &dir).unwrap();
+ 
+         let delta_a = scan_delta(relation, &[3], &[1], &context, &registry);
+@@ -9392,11 +9628,14 @@
+         let target_a = target_revision_for(snapshot.root(), 511, &mutations_a, &registry);
+         drop(snapshot);
+         runtime
+-            .commit_revision(&RevisionTransitionRequest {
+-                target_revision: &target_a,
+-                mutations: &mutations_a,
+-                registry: &registry,
+-            })
++            .commit_revision(
++                ClientTransactionId::new(2002),
++                &RevisionTransitionRequest {
++                    target_revision: &target_a,
++                    mutations: &mutations_a,
++                    registry: &registry,
++                },
++            )
+             .unwrap();
+         let checkpoint = runtime.checkpoint().unwrap();
+         assert_eq!(checkpoint.generation, 2);
+@@ -9411,15 +9650,18 @@
+         let target_b = target_revision_for(snapshot.root(), 512, &mutations_b, &registry);
+         drop(snapshot);
+         runtime
+-            .commit_revision(&RevisionTransitionRequest {
+-                target_revision: &target_b,
+-                mutations: &mutations_b,
+-                registry: &registry,
+-            })
++            .commit_revision(
++                ClientTransactionId::new(2003),
++                &RevisionTransitionRequest {
++                    target_revision: &target_b,
++                    mutations: &mutations_b,
++                    registry: &registry,
++                },
++            )
+             .unwrap();
+         drop(runtime);
+ 
+-        let reopened = DurableRuntime::open(&dir, &specs, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(512));
+         assert_eq!(
+@@ -9437,16 +9679,12 @@
+     #[test]
+     fn durable_runtime_compaction_preserves_reopenability() {
+         let dir = durable_test_dir("compact");
+-        let (_, registry, relation, _, root) = scan_runtime_bundle(520, 1202, &[1, 2]);
+-        let specs = [RuntimeMaterializationSpec {
+-            id: test_materialization_id(),
+-            query: RelExpr::Scan(relation),
+-        }];
++        let (_, registry, _relation, _, root) = scan_runtime_bundle(520, 1202, &[1, 2]);
+         let runtime = DurableRuntime::create(root, &dir).unwrap();
+         runtime.checkpoint().unwrap();
+         runtime.compact_obsolete_generations().unwrap();
+         drop(runtime);
+-        let reopened = DurableRuntime::open(&dir, &specs, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
+         assert_eq!(
+             reopened.snapshot().unwrap().revision_id(),
+             RevisionId::new(520)
+@@ -9489,10 +9727,12 @@
+         const DIR_ENV: &str = "CFMD_PLAN_COMMIT_CRASH_DIR";
+         let dir = durable_test_dir("commit-before-publish");
+         let (context, registry, relation, _, root) = scan_runtime_bundle(530, 1203, &[1, 2]);
+-        let specs = [RuntimeMaterializationSpec {
+-            id: test_materialization_id(),
+-            query: RelExpr::Scan(relation),
++        let retry_delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let retry_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &retry_delta,
+         }];
++        let retry_target = target_revision_for(&root, 531, &retry_mutations, &registry);
+         drop(DurableRuntime::create(root, &dir).unwrap());
+         let marker = dir.join(".cfmd-plan-crash-ready");
+         let _ = std::fs::remove_file(&marker);
+@@ -9520,7 +9760,22 @@
+         let _ = child.wait().unwrap();
+         let _ = std::fs::remove_file(&marker);
+ 
+-        let reopened = DurableRuntime::open(&dir, &specs, &registry).unwrap();
++        let reopened = DurableRuntimeSupervisor::open(&dir, &registry).unwrap();
++        assert!(matches!(
++            reopened
++                .commit_revision(
++                    ClientTransactionId::new(1006),
++                    &RevisionTransitionRequest {
++                        target_revision: &retry_target,
++                        mutations: &retry_mutations,
++                        registry: &registry,
++                    },
++                )
++                .unwrap(),
++            DurableRuntimeCommitOutcome::AlreadyCommitted {
++                target_revision: RevisionId(531)
++            }
++        ));
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(531));
+         assert_eq!(
+@@ -9563,6 +9818,7 @@
+             crash_marker: dir.join(".cfmd-plan-crash-ready"),
+         };
+         let _ = cell.commit_revision_durable(
++            ClientTransactionId::new(1006),
+             &RevisionTransitionRequest {
+                 target_revision: &target,
+                 mutations: &mutations,
+@@ -9572,4 +9828,150 @@
+         );
+         panic!("worker must exit after durable COMMIT and before publish");
+     }
++
++    #[test]
++    fn client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent() {
++        let dir = durable_test_dir("transaction-idempotency");
++        let (context, registry, relation, _, root) = scan_runtime_bundle(540, 1204, &[1, 2]);
++        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let transaction_id = ClientTransactionId::new(0xabc);
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let snapshot = runtime.snapshot().unwrap();
++        let target = target_revision_for(snapshot.root(), 541, &mutations, &registry);
++        drop(snapshot);
++
++        assert!(matches!(
++            runtime
++                .commit_revision(
++                    transaction_id,
++                    &RevisionTransitionRequest {
++                        target_revision: &target,
++                        mutations: &mutations,
++                        registry: &registry,
++                    },
++                )
++                .unwrap(),
++            DurableRuntimeCommitOutcome::Committed(_)
++        ));
++        assert_eq!(
++            runtime.transaction_outcome(transaction_id).unwrap(),
++            DurableTransactionOutcome::Committed {
++                target_revision: RevisionId::new(541)
++            }
++        );
++        runtime.checkpoint().unwrap();
++        runtime.compact_obsolete_generations().unwrap();
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
++        assert_eq!(
++            reopened.transaction_outcome(transaction_id).unwrap(),
++            DurableTransactionOutcome::Committed {
++                target_revision: RevisionId::new(541)
++            }
++        );
++        assert!(matches!(
++            reopened
++                .commit_revision(
++                    transaction_id,
++                    &RevisionTransitionRequest {
++                        target_revision: &target,
++                        mutations: &mutations,
++                        registry: &registry,
++                    },
++                )
++                .unwrap(),
++            DurableRuntimeCommitOutcome::AlreadyCommitted {
++                target_revision: RevisionId(541)
++            }
++        ));
++        assert!(
++            reopened
++                .snapshot()
++                .unwrap()
++                .materialization(test_materialization_id())
++                .is_some()
++        );
++
++        let next_delta = scan_delta(relation, &[4], &[2], &context, &registry);
++        let next_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &next_delta,
++        }];
++        let live = reopened.snapshot().unwrap();
++        let next_target = target_revision_for(live.root(), 542, &next_mutations, &registry);
++        drop(live);
++        assert!(matches!(
++            reopened.commit_revision(
++                transaction_id,
++                &RevisionTransitionRequest {
++                    target_revision: &next_target,
++                    mutations: &next_mutations,
++                    registry: &registry,
++                },
++            ),
++            Err(DurableRuntimeCommitError::TransactionIdConflict {
++                committed_target: RevisionId(541),
++                requested_target: RevisionId(542),
++                ..
++            })
++        ));
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn supervisor_recovers_fail_stopped_runtime_and_retries_same_transaction() {
++        let dir = durable_test_dir("supervisor-recovery");
++        let (context, registry, relation, _, root) = scan_runtime_bundle(550, 1205, &[1, 2]);
++        let supervisor = DurableRuntimeSupervisor::create(root, &dir, &registry).unwrap();
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let snapshot = supervisor.snapshot().unwrap();
++        let target = target_revision_for(snapshot.root(), 551, &mutations, &registry);
++        drop(snapshot);
++
++        {
++            let slot = supervisor.runtime.lock().unwrap();
++            slot.as_ref()
++                .unwrap()
++                .cell
++                .force_recovery_required()
++                .unwrap();
++        }
++
++        let transaction_id = ClientTransactionId::new(0xdef);
++        assert!(matches!(
++            supervisor
++                .commit_revision(
++                    transaction_id,
++                    &RevisionTransitionRequest {
++                        target_revision: &target,
++                        mutations: &mutations,
++                        registry: &registry,
++                    },
++                )
++                .unwrap(),
++            DurableRuntimeCommitOutcome::Committed(_)
++        ));
++        assert_eq!(
++            supervisor.snapshot().unwrap().revision_id(),
++            RevisionId::new(551)
++        );
++        assert_eq!(
++            supervisor.transaction_outcome(transaction_id).unwrap(),
++            DurableTransactionOutcome::Committed {
++                target_revision: RevisionId::new(551)
++            }
++        );
++        drop(supervisor);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
+ }
+diff -ruN '--exclude=target' '--exclude=MANIFEST.sha256' '--exclude=PASS36_*' '--exclude=IMPLEMENTATION_REPORT.md' '--exclude=IMPLEMENTATION_REPORT_pass36.md' /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-types/src/lib.rs ./crates/kernel-types/src/lib.rs
+--- /mnt/data/cfmd_pass35_work/cfmd_workspace_pass35/crates/kernel-types/src/lib.rs	2026-09-19 21:33:43.734788524 +0000
++++ ./crates/kernel-types/src/lib.rs	2026-09-19 23:51:28.161605262 +0000
+@@ -31,6 +31,7 @@
+ semantic_id!(SemanticEnvId, u64);
+ semantic_id!(RevisionId, u64);
+ semantic_id!(MaterializationId, u128);
++semantic_id!(ClientTransactionId, u128);
+ 
+ /// Stable storage identity for one physical row slot.
+ ///

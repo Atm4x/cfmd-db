@@ -1,0 +1,19 @@
+Production source changed relative to Pass64:
+crates/kernel-model/src/lib.rs
+crates/kernel-validation/src/lib.rs
+crates/kernel-revision/src/lib.rs
+crates/kernel-plan/src/lib.rs
+
+Pass65 documentation/evidence:
+PASS65_REPORT.md
+IMPLEMENTATION_REPORT_pass65.md
+PASS65_RND_PROGRAM5_REVIEW.md
+PASS65_SOURCE_DIFF.txt
+PASS65_CHANGED_FILES.txt
+ARCHITECTURE.md
+IMPLEMENTATION_REPORT.md
+CFMD_IDEAL_DB_SPEC.md
+evidence/pass65/
+
+Historical audit correction only:
+PASS64_REPORT.md (standalone packaging status corrected; no source change)

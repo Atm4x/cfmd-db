@@ -1,0 +1,20 @@
+PASS40 FINAL STATIC AUDIT
+duplicate physical canonical bucket declarations:
+shared semantic bucket consumers:
+crates/kernel-plan/src/lib.rs:2810:        kernel_semantic_index::SemanticBucketIndex<kernel_semantics::CanonicalEqKey, PhysicalRowId>,
+crates/kernel-plan/src/lib.rs:2836:        let mut index = kernel_semantic_index::SemanticBucketIndex::new(
+crates/kernel-query/src/lib.rs:736:        kernel_semantic_index::SemanticBucketIndex<kernel_semantics::CanonicalEqKey, IndexedRowId>,
+crates/kernel-query/src/lib.rs:816:        let mut index = kernel_semantic_index::SemanticBucketIndex::new(
+crates/kernel-query/src/lib.rs:3805:    index: kernel_semantic_index::SemanticBucketIndex<
+crates/kernel-query/src/lib.rs:3839:        let mut index = kernel_semantic_index::SemanticBucketIndex::new(
+crates/kernel-semantic-index/src/lib.rs:67:pub struct SemanticBucketIndex<K, I> {
+crates/kernel-semantic-index/src/lib.rs:73:impl<K, I> SemanticBucketIndex<K, I>
+crates/kernel-semantic-index/src/lib.rs:178:            SemanticBucketIndex::new(SemanticIndexBinding::new(&context, vec![dependency]));
+crates/kernel-semantic-index/src/lib.rs:192:        let mut index = SemanticBucketIndex::new(SemanticIndexBinding::new(&context, Vec::new()));
+crates/kernel-semantic-index/src/lib.rs:202:        let mut index = SemanticBucketIndex::new(SemanticIndexBinding::new(&context, Vec::new()));
+debug_assert side-effect scan:
+crates/kernel-query/src/lib.rs:938:            debug_assert!(removed_key.is_some());
+crates/kernel-query/src/lib.rs:939:            debug_assert!(removed_row.is_some());
+crates/kernel-query/src/lib.rs:3962:            debug_assert!(removed_key.is_some());
+crates/kernel-query/src/lib.rs:3963:            debug_assert!(removed_row.is_some());
+unsafe scan:

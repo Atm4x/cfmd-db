@@ -1,0 +1,13 @@
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.lean text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+vendor/** linguist-vendored
+artifacts/** linguist-generated
+docs/history/** linguist-documentation

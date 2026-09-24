@@ -1,0 +1,1566 @@
+=== crates/kernel-aggregate/src/lib.rs ===
+--- /mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-aggregate/src/lib.rs	2026-09-19 16:36:16.000000000 +0000
++++ crates/kernel-aggregate/src/lib.rs	2026-09-20 02:43:45.895105496 +0000
+@@ -224,6 +224,14 @@
+         }
+     }
+ 
++    #[must_use]
++    pub fn is_one(&self) -> bool {
++        match &self.0 {
++            CountRepr::Small(value) => *value == 1,
++            CountRepr::Big(value) => value.bit_len() == 1 && value.shr_to_u64(0) == 1,
++        }
++    }
++
+     pub fn finish_i64(&self) -> Result<i64, AggregateError> {
+         match &self.0 {
+             CountRepr::Small(value) => {
+\n=== crates/kernel-query/src/lib.rs ===
+--- /mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-query/src/lib.rs	2026-09-20 02:11:34.661544828 +0000
++++ crates/kernel-query/src/lib.rs	2026-09-20 02:48:16.404537668 +0000
+@@ -1781,7 +1781,10 @@
+         };
+         if !matches!(join.storage, MaintainedJoinStorage::I64 { .. })
+             || !group.fast_i64_count
+-            || !matches!(top_k.storage, MaintainedTopKStorage::I64(_))
++            || !matches!(
++                top_k.storage,
++                MaintainedTopKStorage::I64Scalar(_) | MaintainedTopKStorage::I64Rows(_)
++            )
+         {
+             return Ok(None);
+         }
+@@ -3345,30 +3348,35 @@
+                 result_type: self.result_type.clone(),
+             });
+         }
+-        let remove_index = self
+-            .i64_lookup
+-            .as_ref()
+-            .and_then(|lookup| lookup.get(&removed_key).copied())
+-            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-        let remove_before = self.groups[remove_index].count.finish_i64()?;
+         let insert_existing = self
+             .i64_lookup
+             .as_ref()
+             .and_then(|lookup| lookup.get(&inserted_key).copied());
+-        if remove_before == 1 && insert_existing.is_none() {
++        if insert_existing.is_none() {
+             let lookup = self
+                 .i64_lookup
+                 .as_mut()
+                 .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-            lookup.remove(&removed_key);
+-            lookup.insert(inserted_key, remove_index);
+-            self.groups[remove_index].key = vec![Value::I64(inserted_key)];
+-            return Ok(RelationDelta {
+-                removed: vec![vec![Value::I64(removed_key), Value::I64(1)]],
+-                inserted: vec![vec![Value::I64(inserted_key), Value::I64(1)]],
+-                result_type: self.result_type.clone(),
+-            });
++            let remove_index = lookup
++                .remove(&removed_key)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            if self.groups[remove_index].count.is_one() {
++                lookup.insert(inserted_key, remove_index);
++                self.groups[remove_index].key = vec![Value::I64(inserted_key)];
++                return Ok(RelationDelta {
++                    removed: vec![vec![Value::I64(removed_key), Value::I64(1)]],
++                    inserted: vec![vec![Value::I64(inserted_key), Value::I64(1)]],
++                    result_type: self.result_type.clone(),
++                });
++            }
++            lookup.insert(removed_key, remove_index);
+         }
++        let remove_index = self
++            .i64_lookup
++            .as_ref()
++            .and_then(|lookup| lookup.get(&removed_key).copied())
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        let remove_before = self.groups[remove_index].count.finish_i64()?;
+         self.groups[remove_index].count.remove_one()?;
+         let remove_after = if self.groups[remove_index].count.is_zero() {
+             None
+@@ -3818,7 +3826,8 @@
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ enum MaintainedTopKStorage {
+-    I64(BTreeMap<i64, Vec<Row>>),
++    I64Scalar(BTreeMap<i64, usize>),
++    I64Rows(BTreeMap<i64, Vec<Row>>),
+     SemanticOrdered {
+         encoder: kernel_semantics::ResolvedPrimitiveOrdering,
+         rows: IndexedOrderedRows,
+@@ -4066,7 +4075,28 @@
+             ))
+         );
+         let rows = input_value.into_rows();
+-        let storage = if use_i64 {
++        let scalar_i64 = use_i64
++            && input_type.columns.len() == 1
++            && relation_column_equivalences(&input_type).len() == 1
++            && matches!(
++                registry
++                    .resolve_primitive_equivalence(
++                        context,
++                        relation_column_equivalences(&input_type)[0],
++                    )?
++                    .map(|resolved| resolved.bind_right(&Value::I64(0))),
++                Some(Ok(kernel_semantics::BoundPrimitivePredicate::I64(0)))
++            );
++        let storage = if scalar_i64 {
++            let mut buckets = BTreeMap::<i64, usize>::new();
++            for row in rows {
++                let [Value::I64(key)] = row.as_slice() else {
++                    return Err(RelQueryError::TypeMismatch);
++                };
++                *buckets.entry(*key).or_default() += 1;
++            }
++            MaintainedTopKStorage::I64Scalar(buckets)
++        } else if use_i64 {
+             let mut buckets = BTreeMap::<i64, Vec<Row>>::new();
+             for row in rows {
+                 let Value::I64(key) = row.get(*column).ok_or(RelQueryError::ColumnOutOfBounds)?
+@@ -4075,7 +4105,7 @@
+                 };
+                 buckets.entry(*key).or_default().push(row);
+             }
+-            MaintainedTopKStorage::I64(buckets)
++            MaintainedTopKStorage::I64Rows(buckets)
+         } else {
+             let encoder = registry.resolve_primitive_ordering(context, *ordering)?;
+             MaintainedTopKStorage::SemanticOrdered {
+@@ -4105,7 +4135,8 @@
+     #[must_use]
+     pub fn row_count(&self) -> usize {
+         match &self.storage {
+-            MaintainedTopKStorage::I64(buckets) => buckets.values().map(Vec::len).sum(),
++            MaintainedTopKStorage::I64Scalar(buckets) => buckets.values().sum(),
++            MaintainedTopKStorage::I64Rows(buckets) => buckets.values().map(Vec::len).sum(),
+             MaintainedTopKStorage::SemanticOrdered { rows, .. } => rows.index.len(),
+         }
+     }
+@@ -4137,11 +4168,15 @@
+         if input_delta.result_type != self.input_type {
+             return Err(RelQueryError::TypeMismatch);
+         }
++        if matches!(self.storage, MaintainedTopKStorage::I64Scalar(_)) {
++            return self.apply_i64_scalar_delta(input_delta);
++        }
+         MaterializedSetSupportState::validate_row_shapes(&input_delta.removed, &self.input_type)?;
+         MaterializedSetSupportState::validate_row_shapes(&input_delta.inserted, &self.input_type)?;
+         let before = self.output_value();
+         match &mut self.storage {
+-            MaintainedTopKStorage::I64(buckets) => Self::apply_i64_delta(
++            MaintainedTopKStorage::I64Scalar(_) => unreachable!("scalar path returned above"),
++            MaintainedTopKStorage::I64Rows(buckets) => Self::apply_i64_delta(
+                 buckets,
+                 input_delta,
+                 self.column,
+@@ -4165,6 +4200,196 @@
+         relation_delta_between_values(&before, &after, self.result_type.clone(), context, registry)
+     }
+ 
++    fn apply_i64_scalar_delta(
++        &mut self,
++        input_delta: &RelationDelta,
++    ) -> Result<RelationDelta, RelQueryError> {
++        let before =
++            Self::i64_scalar_output_counts_for(self.i64_scalar_buckets()?, self.direction, self.k);
++        let is_set = matches!(
++            self.input_type.semantics,
++            kernel_schema::RelationSemantics::Set { .. }
++        );
++        if let ([removed], [inserted]) = (
++            input_delta.removed.as_slice(),
++            input_delta.inserted.as_slice(),
++        ) {
++            let [Value::I64(removed_key)] = removed.as_slice() else {
++                return Err(RelQueryError::TypeMismatch);
++            };
++            let [Value::I64(inserted_key)] = inserted.as_slice() else {
++                return Err(RelQueryError::TypeMismatch);
++            };
++            self.apply_i64_scalar_single_replace(*removed_key, *inserted_key, is_set)?;
++        } else {
++            self.apply_i64_scalar_general(input_delta, is_set)?;
++        }
++        let after =
++            Self::i64_scalar_output_counts_for(self.i64_scalar_buckets()?, self.direction, self.k);
++        Ok(Self::i64_scalar_output_delta(
++            &before,
++            &after,
++            self.result_type.clone(),
++        ))
++    }
++
++    fn i64_scalar_buckets(&self) -> Result<&BTreeMap<i64, usize>, RelQueryError> {
++        let MaintainedTopKStorage::I64Scalar(buckets) = &self.storage else {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        };
++        Ok(buckets)
++    }
++
++    fn i64_scalar_buckets_mut(&mut self) -> Result<&mut BTreeMap<i64, usize>, RelQueryError> {
++        let MaintainedTopKStorage::I64Scalar(buckets) = &mut self.storage else {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        };
++        Ok(buckets)
++    }
++
++    fn apply_i64_scalar_single_replace(
++        &mut self,
++        removed_key: i64,
++        inserted_key: i64,
++        is_set: bool,
++    ) -> Result<(), RelQueryError> {
++        let buckets = self.i64_scalar_buckets()?;
++        let removed_count = buckets.get(&removed_key).copied().unwrap_or(0);
++        if removed_count == 0 {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        let inserted_count = buckets.get(&inserted_key).copied().unwrap_or(0);
++        let inserted_after = if removed_key == inserted_key {
++            inserted_count
++        } else {
++            inserted_count.saturating_add(1)
++        };
++        if is_set && inserted_after > 1 {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        if removed_key == inserted_key {
++            return Ok(());
++        }
++        let buckets = self.i64_scalar_buckets_mut()?;
++        if removed_count == 1 {
++            buckets.remove(&removed_key);
++        } else {
++            buckets.insert(removed_key, removed_count - 1);
++        }
++        buckets.insert(inserted_key, inserted_after);
++        Ok(())
++    }
++
++    fn apply_i64_scalar_general(
++        &mut self,
++        input_delta: &RelationDelta,
++        is_set: bool,
++    ) -> Result<(), RelQueryError> {
++        let mut changes = BTreeMap::<i64, (usize, usize)>::new();
++        for row in &input_delta.removed {
++            let [Value::I64(key)] = row.as_slice() else {
++                return Err(RelQueryError::TypeMismatch);
++            };
++            changes.entry(*key).or_default().0 += 1;
++        }
++        for row in &input_delta.inserted {
++            let [Value::I64(key)] = row.as_slice() else {
++                return Err(RelQueryError::TypeMismatch);
++            };
++            changes.entry(*key).or_default().1 += 1;
++        }
++        let buckets = self.i64_scalar_buckets()?;
++        let mut planned = Vec::with_capacity(changes.len());
++        for (key, (removed, inserted)) in changes {
++            let current = buckets.get(&key).copied().unwrap_or(0);
++            if removed > current {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
++            }
++            let next = current - removed + inserted;
++            if is_set && next > 1 {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
++            }
++            planned.push((key, next));
++        }
++        let buckets = self.i64_scalar_buckets_mut()?;
++        for (key, next) in planned {
++            if next == 0 {
++                buckets.remove(&key);
++            } else {
++                buckets.insert(key, next);
++            }
++        }
++        Ok(())
++    }
++
++    fn i64_scalar_output_counts_for(
++        buckets: &BTreeMap<i64, usize>,
++        direction: OrderDirection,
++        k: usize,
++    ) -> Vec<(i64, usize)> {
++        if k == 0 {
++            return Vec::new();
++        }
++        let mut out = Vec::new();
++        let mut rows = 0usize;
++        match direction {
++            OrderDirection::Ascending => {
++                for (&key, &count) in buckets {
++                    out.push((key, count));
++                    rows = rows.saturating_add(count);
++                    if rows >= k {
++                        break;
++                    }
++                }
++            }
++            OrderDirection::Descending => {
++                for (&key, &count) in buckets.iter().rev() {
++                    out.push((key, count));
++                    rows = rows.saturating_add(count);
++                    if rows >= k {
++                        break;
++                    }
++                }
++            }
++        }
++        out
++    }
++
++    fn i64_scalar_output_delta(
++        before: &[(i64, usize)],
++        after: &[(i64, usize)],
++        result_type: RelType,
++    ) -> RelationDelta {
++        let mut inserted = Vec::new();
++        let mut removed = Vec::new();
++        for &(key, old) in before {
++            let new = after
++                .iter()
++                .find_map(|(candidate, count)| (*candidate == key).then_some(*count))
++                .unwrap_or(0);
++            removed.extend((new..old).map(|_| vec![Value::I64(key)]));
++        }
++        for &(key, new) in after {
++            let old = before
++                .iter()
++                .find_map(|(candidate, count)| (*candidate == key).then_some(*count))
++                .unwrap_or(0);
++            inserted.extend((old..new).map(|_| vec![Value::I64(key)]));
++        }
++        RelationDelta {
++            inserted,
++            removed,
++            result_type,
++        }
++    }
++
++    fn i64_scalar_output_rows(&self, buckets: &BTreeMap<i64, usize>) -> Vec<Row> {
++        Self::i64_scalar_output_counts_for(buckets, self.direction, self.k)
++            .into_iter()
++            .flat_map(|(key, count)| (0..count).map(move |_| vec![Value::I64(key)]))
++            .collect()
++    }
++
+     fn apply_i64_delta(
+         buckets: &mut BTreeMap<i64, Vec<Row>>,
+         input_delta: &RelationDelta,
+@@ -4255,7 +4480,8 @@
+ 
+     fn output_value(&self) -> RelationValue {
+         let rows = match &self.storage {
+-            MaintainedTopKStorage::I64(buckets) => self.i64_output_rows(buckets),
++            MaintainedTopKStorage::I64Scalar(buckets) => self.i64_scalar_output_rows(buckets),
++            MaintainedTopKStorage::I64Rows(buckets) => self.i64_output_rows(buckets),
+             MaintainedTopKStorage::SemanticOrdered { rows, .. } => {
+                 rows.output_rows(self.direction, self.k)
+             }
+\n=== crates/kernel-plan/src/lib.rs ===
+--- /mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-plan/src/lib.rs	2026-09-20 02:27:52.349499067 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 02:58:08.271791878 +0000
+@@ -152,6 +152,161 @@
+         }
+     }
+ 
++    fn from_values_like(
++        template: &Self,
++        values: Vec<Value>,
++    ) -> Result<Self, PhysicalExecutionError> {
++        match template {
++            Self::Unit(_) => {
++                if values.iter().all(|value| matches!(value, Value::Unit)) {
++                    Ok(Self::Unit(values.len()))
++                } else {
++                    Err(PhysicalExecutionError::PhysicalTypeMismatch)
++                }
++            }
++            Self::Bool(_) => values
++                .into_iter()
++                .map(|value| match value {
++                    Value::Bool(value) => Ok(value),
++                    _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                })
++                .collect::<Result<Vec<_>, _>>()
++                .map(Self::Bool),
++            Self::I64(_) => values
++                .into_iter()
++                .map(|value| match value {
++                    Value::I64(value) => Ok(value),
++                    _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                })
++                .collect::<Result<Vec<_>, _>>()
++                .map(Self::I64),
++            Self::F64Bits(_) => values
++                .into_iter()
++                .map(|value| match value {
++                    Value::F64Bits(value) => Ok(value),
++                    _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                })
++                .collect::<Result<Vec<_>, _>>()
++                .map(Self::F64Bits),
++            Self::Text(_) => values
++                .into_iter()
++                .map(|value| match value {
++                    Value::Text(value) => Ok(value),
++                    _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                })
++                .collect::<Result<Vec<_>, _>>()
++                .map(Self::Text),
++            Self::LiveEntityIds { entity_type, .. } => values
++                .into_iter()
++                .map(|value| match value {
++                    Value::LiveEntityRef {
++                        entity_type: value_type,
++                        id,
++                    } if value_type == *entity_type => Ok(id),
++                    _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                })
++                .collect::<Result<Vec<_>, _>>()
++                .map(|values| Self::LiveEntityIds {
++                    entity_type: *entity_type,
++                    values,
++                }),
++            Self::HistoricalEntityIds { entity_type, .. } => values
++                .into_iter()
++                .map(|value| match value {
++                    Value::HistoricalEntityId {
++                        entity_type: value_type,
++                        id,
++                    } if value_type == *entity_type => Ok(id),
++                    _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                })
++                .collect::<Result<Vec<_>, _>>()
++                .map(|values| Self::HistoricalEntityIds {
++                    entity_type: *entity_type,
++                    values,
++                }),
++        }
++    }
++
++    fn select_positions(&self, positions: &[usize]) -> Result<Self, PhysicalExecutionError> {
++        Ok(match self {
++            Self::Unit(_) => Self::Unit(positions.len()),
++            Self::Bool(values) => Self::Bool(
++                positions
++                    .iter()
++                    .map(|&position| {
++                        values
++                            .get(position)
++                            .copied()
++                            .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
++                    })
++                    .collect::<Result<Vec<_>, _>>()?,
++            ),
++            Self::I64(values) => Self::I64(
++                positions
++                    .iter()
++                    .map(|&position| {
++                        values
++                            .get(position)
++                            .copied()
++                            .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
++                    })
++                    .collect::<Result<Vec<_>, _>>()?,
++            ),
++            Self::F64Bits(values) => Self::F64Bits(
++                positions
++                    .iter()
++                    .map(|&position| {
++                        values
++                            .get(position)
++                            .copied()
++                            .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
++                    })
++                    .collect::<Result<Vec<_>, _>>()?,
++            ),
++            Self::Text(values) => Self::Text(
++                positions
++                    .iter()
++                    .map(|&position| {
++                        values
++                            .get(position)
++                            .cloned()
++                            .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
++                    })
++                    .collect::<Result<Vec<_>, _>>()?,
++            ),
++            Self::LiveEntityIds {
++                entity_type,
++                values,
++            } => Self::LiveEntityIds {
++                entity_type: *entity_type,
++                values: positions
++                    .iter()
++                    .map(|&position| {
++                        values
++                            .get(position)
++                            .copied()
++                            .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
++                    })
++                    .collect::<Result<Vec<_>, _>>()?,
++            },
++            Self::HistoricalEntityIds {
++                entity_type,
++                values,
++            } => Self::HistoricalEntityIds {
++                entity_type: *entity_type,
++                values: positions
++                    .iter()
++                    .map(|&position| {
++                        values
++                            .get(position)
++                            .copied()
++                            .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
++                    })
++                    .collect::<Result<Vec<_>, _>>()?,
++            },
++        })
++    }
++
+     fn swap_remove_at(&mut self, index: usize) {
+         match self {
+             Self::Unit(len) => *len -= 1,
+@@ -2931,6 +3086,7 @@
+     pub fused_join_project_hits: usize,
+     pub typed_batch_chain_hits: usize,
+     pub typed_stateful_batch_hits: usize,
++    pub typed_stateful_producer_hits: usize,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -3448,6 +3604,12 @@
+         return Ok(Some(rows));
+     }
+     if let Some((rows, batch_stats)) =
++        try_execute_typed_stateful_producer_chain(plan, store, context, registry)?
++    {
++        merge_execution_stats(stats, batch_stats);
++        return Ok(Some(rows));
++    }
++    if let Some((rows, batch_stats)) =
+         try_execute_typed_stateful_batch(plan, store, context, registry)?
+     {
+         merge_execution_stats(stats, batch_stats);
+@@ -3812,6 +3974,9 @@
+     target.typed_stateful_batch_hits = target
+         .typed_stateful_batch_hits
+         .saturating_add(source.typed_stateful_batch_hits);
++    target.typed_stateful_producer_hits = target
++        .typed_stateful_producer_hits
++        .saturating_add(source.typed_stateful_producer_hits);
+ }
+ 
+ struct TypedBatchSelection<'a> {
+@@ -3910,6 +4075,682 @@
+     ))
+ }
+ 
++#[derive(Debug)]
++struct OwnedTypedBatch {
++    columns: Vec<NativeColumn>,
++    positions: Vec<usize>,
++    stats: ExecutionStats,
++}
++
++impl OwnedTypedBatch {
++    fn dense(
++        columns: Vec<NativeColumn>,
++        stats: ExecutionStats,
++    ) -> Result<Self, PhysicalExecutionError> {
++        let len = columns.first().map_or(0, NativeColumn::len);
++        if columns.iter().any(|column| column.len() != len) {
++            return Err(PhysicalExecutionError::ColumnShapeMismatch);
++        }
++        Ok(Self {
++            columns,
++            positions: (0..len).collect(),
++            stats,
++        })
++    }
++
++    fn project(&mut self, projection: &[usize]) -> Result<(), PhysicalExecutionError> {
++        let mut columns = Vec::with_capacity(projection.len());
++        for &column in projection {
++            columns.push(
++                self.columns
++                    .get(column)
++                    .cloned()
++                    .ok_or(RelQueryError::ColumnOutOfBounds)?,
++            );
++        }
++        self.columns = columns;
++        Ok(())
++    }
++
++    fn filter(
++        &mut self,
++        column: usize,
++        value: &Value,
++        equivalence: SemanticId,
++        env: &StatefulBatchEnv<'_>,
++    ) -> Result<(), PhysicalExecutionError> {
++        let physical = self
++            .columns
++            .get(column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        let Some(resolved) = env
++            .registry
++            .resolve_primitive_equivalence(env.context, equivalence)?
++        else {
++            return Err(PhysicalExecutionError::UnsupportedPhysicalPlan);
++        };
++        let bound = resolved.bind_right(value)?;
++        if !typed_column_bound_compatible(physical, &bound) {
++            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++        }
++        let mut selected = Vec::with_capacity(self.positions.len());
++        for &position in &self.positions {
++            self.stats.values_read = self.stats.values_read.saturating_add(1);
++            if typed_column_matches_bound(physical, position, &bound)? {
++                selected.push(position);
++            }
++        }
++        self.positions = selected;
++        Ok(())
++    }
++
++    fn materialize(mut self) -> (Vec<kernel_query::Row>, ExecutionStats) {
++        let mut rows = Vec::with_capacity(self.positions.len());
++        for position in self.positions {
++            let mut row = Vec::with_capacity(self.columns.len());
++            for column in &self.columns {
++                row.push(column.value_at(position));
++            }
++            self.stats.values_read = self.stats.values_read.saturating_add(self.columns.len());
++            rows.push(row);
++        }
++        self.stats.typed_stateful_producer_hits =
++            self.stats.typed_stateful_producer_hits.saturating_add(1);
++        (rows, self.stats)
++    }
++}
++
++fn try_execute_typed_stateful_producer_chain(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<(Vec<kernel_query::Row>, ExecutionStats)>, PhysicalExecutionError> {
++    if !matches!(
++        plan,
++        Plan::Project { .. } | Plan::FilterEqConst { .. } | Plan::PromoteToBag(_)
++    ) {
++        return Ok(None);
++    }
++    let env = StatefulBatchEnv { context, registry };
++    let Some(batch) = try_produce_typed_stateful_batch(plan, store, &env)? else {
++        return Ok(None);
++    };
++    Ok(Some(batch.materialize()))
++}
++
++fn try_produce_typed_stateful_batch(
++    plan: &Plan,
++    store: &PhysicalStore,
++    env: &StatefulBatchEnv<'_>,
++) -> Result<Option<OwnedTypedBatch>, PhysicalExecutionError> {
++    match plan {
++        Plan::Project { input, columns } => {
++            let Some(mut batch) = try_produce_typed_stateful_batch(input, store, env)? else {
++                return Ok(None);
++            };
++            batch.project(columns)?;
++            Ok(Some(batch))
++        }
++        Plan::FilterEqConst {
++            input,
++            column,
++            value,
++            equivalence,
++        } => {
++            let Some(mut batch) = try_produce_typed_stateful_batch(input, store, env)? else {
++                return Ok(None);
++            };
++            batch.filter(*column, value, *equivalence, env)?;
++            Ok(Some(batch))
++        }
++        Plan::PromoteToBag(input) => try_produce_typed_stateful_batch(input, store, env),
++        Plan::Group {
++            input,
++            group_columns,
++            group_equivalences,
++            aggregate,
++            algorithm: GroupAlgorithm::LinearReplay,
++        } => produce_typed_group(
++            input,
++            GroupBatchSpec {
++                group_columns,
++                group_equivalences,
++                aggregate,
++            },
++            store,
++            env,
++        ),
++        Plan::TopKWithTies {
++            input,
++            column,
++            ordering,
++            direction,
++            k,
++            algorithm: TopKAlgorithm::FullSort,
++        } => produce_typed_top_k(
++            input,
++            TopKBatchSpec {
++                column: *column,
++                ordering: *ordering,
++                direction: *direction,
++                k: *k,
++            },
++            store,
++            env,
++        ),
++        Plan::Scan { .. } | Plan::Distinct { .. } | Plan::JoinEq { .. } => Ok(None),
++    }
++}
++
++fn produce_typed_group(
++    input: &Plan,
++    spec: GroupBatchSpec<'_>,
++    store: &PhysicalStore,
++    env: &StatefulBatchEnv<'_>,
++) -> Result<Option<OwnedTypedBatch>, PhysicalExecutionError> {
++    if let Some(selection) = execute_typed_batch_selection(input, store, env.context, env.registry)?
++    {
++        return produce_group_from_raw_selection(selection, spec, env).map(Some);
++    }
++    let Some(batch) = try_produce_typed_stateful_batch(input, store, env)? else {
++        return Ok(None);
++    };
++    produce_group_from_owned_batch(batch, spec, env).map(Some)
++}
++
++fn produce_group_from_raw_selection(
++    selection: TypedBatchSelection<'_>,
++    spec: GroupBatchSpec<'_>,
++    env: &StatefulBatchEnv<'_>,
++) -> Result<OwnedTypedBatch, PhysicalExecutionError> {
++    validate_group_batch_spec(spec)?;
++    let TypedBatchSelection {
++        program,
++        positions,
++        mut stats,
++    } = selection;
++    let NativeRelation::TypedColumnar { columns, .. } = &program.installed.data else {
++        return Err(PhysicalExecutionError::UnsupportedPhysicalPlan);
++    };
++    let physical_group_columns = resolve_group_columns(&program.columns, spec.group_columns)?;
++    let output_columns = produce_group_columns(
++        columns,
++        &program.columns,
++        &positions,
++        &physical_group_columns,
++        spec,
++        env,
++        &mut stats,
++    )?
++    .ok_or(PhysicalExecutionError::UnsupportedPhysicalPlan)?;
++    OwnedTypedBatch::dense(output_columns, stats)
++}
++
++fn produce_group_from_owned_batch(
++    batch: OwnedTypedBatch,
++    spec: GroupBatchSpec<'_>,
++    env: &StatefulBatchEnv<'_>,
++) -> Result<OwnedTypedBatch, PhysicalExecutionError> {
++    validate_group_batch_spec(spec)?;
++    let OwnedTypedBatch {
++        columns,
++        positions,
++        mut stats,
++    } = batch;
++    let logical_columns = (0..columns.len()).collect::<Vec<_>>();
++    let group_columns = resolve_group_columns(&logical_columns, spec.group_columns)?;
++    let output_columns = produce_group_columns(
++        &columns,
++        &logical_columns,
++        &positions,
++        &group_columns,
++        spec,
++        env,
++        &mut stats,
++    )?
++    .ok_or(PhysicalExecutionError::UnsupportedPhysicalPlan)?;
++    OwnedTypedBatch::dense(output_columns, stats)
++}
++
++fn validate_group_batch_spec(spec: GroupBatchSpec<'_>) -> Result<(), PhysicalExecutionError> {
++    if spec.group_columns.len() != spec.group_equivalences.len() {
++        return Err(RelQueryError::TypeMismatch.into());
++    }
++    Ok(())
++}
++
++fn resolve_group_columns(
++    logical_columns: &[usize],
++    group_columns: &[usize],
++) -> Result<Vec<usize>, PhysicalExecutionError> {
++    group_columns
++        .iter()
++        .map(|column| {
++            logical_columns
++                .get(*column)
++                .copied()
++                .ok_or_else(|| RelQueryError::ColumnOutOfBounds.into())
++        })
++        .collect()
++}
++
++fn produce_group_columns(
++    columns: &[NativeColumn],
++    logical_columns: &[usize],
++    positions: &[usize],
++    physical_group_columns: &[usize],
++    spec: GroupBatchSpec<'_>,
++    env: &StatefulBatchEnv<'_>,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<NativeColumn>>, PhysicalExecutionError> {
++    if let Some(output_columns) = try_produce_exact_i64_group_columns(
++        logical_columns,
++        columns,
++        positions,
++        physical_group_columns,
++        spec,
++        env,
++        stats,
++    )? {
++        return Ok(Some(output_columns));
++    }
++    produce_primitive_group_columns(
++        logical_columns,
++        columns,
++        positions,
++        physical_group_columns,
++        spec,
++        env,
++        stats,
++    )
++}
++
++fn try_produce_exact_i64_group_columns(
++    logical_columns: &[usize],
++    columns: &[NativeColumn],
++    positions: &[usize],
++    physical_group_columns: &[usize],
++    spec: GroupBatchSpec<'_>,
++    env: &StatefulBatchEnv<'_>,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<NativeColumn>>, PhysicalExecutionError> {
++    if spec.group_columns.len() != 1
++        || !equivalence_is_i64_exact(spec.group_equivalences[0], env.context, env.registry)?
++    {
++        return Ok(None);
++    }
++    let Some(NativeColumn::I64(keys)) = columns.get(physical_group_columns[0]) else {
++        return Ok(None);
++    };
++    let mut lookup = BTreeMap::<i64, usize>::new();
++    let mut output_keys = Vec::<i64>::new();
++    match spec.aggregate {
++        AggregateSpec::Count { .. } => {
++            let mut counts = Vec::<kernel_aggregate::ExactCount>::new();
++            for &position in positions {
++                let key = keys[position];
++                let index = *lookup.entry(key).or_insert_with(|| {
++                    let index = output_keys.len();
++                    output_keys.push(key);
++                    counts.push(kernel_aggregate::ExactCount::default());
++                    index
++                });
++                counts[index].add_one();
++            }
++            stats.values_read = stats.values_read.saturating_add(positions.len());
++            let output_counts = counts
++                .into_iter()
++                .map(|count| count.finish_i64().map_err(RelQueryError::from))
++                .collect::<Result<Vec<_>, _>>()?;
++            Ok(Some(vec![
++                NativeColumn::I64(output_keys),
++                NativeColumn::I64(output_counts),
++            ]))
++        }
++        AggregateSpec::ExactF64Sum { value_column, .. } => {
++            let physical_value_column = *logical_columns
++                .get(*value_column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            let Some(NativeColumn::F64Bits(values)) = columns.get(physical_value_column) else {
++                return Ok(None);
++            };
++            let mut sums = Vec::<kernel_aggregate::ExactF64Sum>::new();
++            for &position in positions {
++                let key = keys[position];
++                let index = *lookup.entry(key).or_insert_with(|| {
++                    let index = output_keys.len();
++                    output_keys.push(key);
++                    sums.push(kernel_aggregate::ExactF64Sum::default());
++                    index
++                });
++                sums[index]
++                    .add(f64::from_bits(values[position]))
++                    .map_err(RelQueryError::from)?;
++            }
++            stats.values_read = stats
++                .values_read
++                .saturating_add(positions.len().saturating_mul(2));
++            Ok(Some(vec![
++                NativeColumn::I64(output_keys),
++                NativeColumn::F64Bits(sums.into_iter().map(|sum| sum.finish().to_bits()).collect()),
++            ]))
++        }
++    }
++}
++
++fn produce_primitive_group_columns(
++    logical_columns: &[usize],
++    columns: &[NativeColumn],
++    positions: &[usize],
++    physical_group_columns: &[usize],
++    spec: GroupBatchSpec<'_>,
++    env: &StatefulBatchEnv<'_>,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<NativeColumn>>, PhysicalExecutionError> {
++    let mut encoders = Vec::with_capacity(spec.group_equivalences.len());
++    for &equivalence in spec.group_equivalences {
++        let Some(encoder) = env
++            .registry
++            .resolve_primitive_equivalence(env.context, equivalence)?
++        else {
++            return Ok(None);
++        };
++        encoders.push(encoder);
++    }
++    let Some(accumulation) = accumulate_primitive_groups(
++        logical_columns,
++        columns,
++        positions,
++        physical_group_columns,
++        spec,
++        &encoders,
++        stats,
++    )?
++    else {
++        return Ok(None);
++    };
++    finish_primitive_group_columns(
++        columns,
++        physical_group_columns,
++        spec.aggregate,
++        &accumulation.representatives,
++        accumulation.aggregates,
++    )
++    .map(Some)
++}
++
++struct PrimitiveGroupAccumulation {
++    representatives: Vec<Vec<Value>>,
++    aggregates: Vec<TypedGroupState>,
++}
++
++fn accumulate_primitive_groups(
++    logical_columns: &[usize],
++    columns: &[NativeColumn],
++    positions: &[usize],
++    physical_group_columns: &[usize],
++    spec: GroupBatchSpec<'_>,
++    encoders: &[kernel_semantics::ResolvedPrimitiveEquivalence],
++    stats: &mut ExecutionStats,
++) -> Result<Option<PrimitiveGroupAccumulation>, PhysicalExecutionError> {
++    let mut lookup = BTreeMap::<Vec<kernel_semantics::CanonicalEqKey>, usize>::new();
++    let mut representatives = Vec::<Vec<Value>>::new();
++    let mut aggregates = Vec::<TypedGroupState>::new();
++    if positions.is_empty() && spec.group_columns.is_empty() {
++        representatives.push(Vec::new());
++        aggregates.push(new_typed_group_state(spec.aggregate));
++    }
++    for &position in positions {
++        let mut canonical = Vec::with_capacity(physical_group_columns.len());
++        let mut representative = Vec::with_capacity(physical_group_columns.len());
++        for (&physical_column, encoder) in physical_group_columns.iter().zip(encoders) {
++            let value = columns
++                .get(physical_column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?
++                .value_at(position);
++            canonical.push(encoder.canonical_key(&value)?);
++            representative.push(value);
++        }
++        stats.values_read = stats
++            .values_read
++            .saturating_add(physical_group_columns.len());
++        let index = if let Some(index) = lookup.get(&canonical).copied() {
++            index
++        } else {
++            let index = representatives.len();
++            lookup.insert(canonical, index);
++            representatives.push(representative);
++            aggregates.push(new_typed_group_state(spec.aggregate));
++            index
++        };
++        if !update_typed_group_state(
++            &mut aggregates[index],
++            spec.aggregate,
++            logical_columns,
++            columns,
++            position,
++            stats,
++        )? {
++            return Ok(None);
++        }
++    }
++    Ok(Some(PrimitiveGroupAccumulation {
++        representatives,
++        aggregates,
++    }))
++}
++
++fn update_typed_group_state(
++    aggregate_state: &mut TypedGroupState,
++    aggregate: &AggregateSpec,
++    logical_columns: &[usize],
++    columns: &[NativeColumn],
++    position: usize,
++    execution_stats: &mut ExecutionStats,
++) -> Result<bool, PhysicalExecutionError> {
++    match (aggregate_state, aggregate) {
++        (TypedGroupState::Count(count), AggregateSpec::Count { .. }) => count.add_one(),
++        (TypedGroupState::ExactF64Sum(sum), AggregateSpec::ExactF64Sum { value_column, .. }) => {
++            let physical_value_column = *logical_columns
++                .get(*value_column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            let Some(NativeColumn::F64Bits(values)) = columns.get(physical_value_column) else {
++                return Ok(false);
++            };
++            sum.add(f64::from_bits(values[position]))
++                .map_err(RelQueryError::from)?;
++            execution_stats.values_read = execution_stats.values_read.saturating_add(1);
++        }
++        _ => return Err(RelQueryError::TypeMismatch.into()),
++    }
++    Ok(true)
++}
++
++fn finish_primitive_group_columns(
++    columns: &[NativeColumn],
++    physical_group_columns: &[usize],
++    aggregate: &AggregateSpec,
++    representatives: &[Vec<Value>],
++    aggregates: Vec<TypedGroupState>,
++) -> Result<Vec<NativeColumn>, PhysicalExecutionError> {
++    let mut output_columns = Vec::with_capacity(physical_group_columns.len() + 1);
++    for (key_index, &physical_column) in physical_group_columns.iter().enumerate() {
++        let values = representatives
++            .iter()
++            .map(|key| key[key_index].clone())
++            .collect::<Vec<_>>();
++        output_columns.push(NativeColumn::from_values_like(
++            columns
++                .get(physical_column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?,
++            values,
++        )?);
++    }
++    match aggregate {
++        AggregateSpec::Count { .. } => output_columns.push(NativeColumn::I64(
++            aggregates
++                .into_iter()
++                .map(|state| match state {
++                    TypedGroupState::Count(count) => {
++                        count.finish_i64().map_err(RelQueryError::from)
++                    }
++                    TypedGroupState::ExactF64Sum(_) => Err(RelQueryError::TypeMismatch),
++                })
++                .collect::<Result<Vec<_>, _>>()?,
++        )),
++        AggregateSpec::ExactF64Sum { .. } => output_columns.push(NativeColumn::F64Bits(
++            aggregates
++                .into_iter()
++                .map(|state| match state {
++                    TypedGroupState::ExactF64Sum(sum) => Ok(sum.finish().to_bits()),
++                    TypedGroupState::Count(_) => Err(RelQueryError::TypeMismatch),
++                })
++                .collect::<Result<Vec<_>, RelQueryError>>()?,
++        )),
++    }
++    Ok(output_columns)
++}
++
++fn produce_typed_top_k(
++    input: &Plan,
++    spec: TopKBatchSpec,
++    store: &PhysicalStore,
++    env: &StatefulBatchEnv<'_>,
++) -> Result<Option<OwnedTypedBatch>, PhysicalExecutionError> {
++    if let Some(selection) = execute_typed_batch_selection(input, store, env.context, env.registry)?
++    {
++        return produce_top_k_from_raw_selection(selection, spec, env).map(Some);
++    }
++    let Some(batch) = try_produce_typed_stateful_batch(input, store, env)? else {
++        return Ok(None);
++    };
++    produce_top_k_from_owned_batch(batch, spec, env).map(Some)
++}
++
++fn produce_top_k_from_raw_selection(
++    selection: TypedBatchSelection<'_>,
++    spec: TopKBatchSpec,
++    env: &StatefulBatchEnv<'_>,
++) -> Result<OwnedTypedBatch, PhysicalExecutionError> {
++    let TypedBatchSelection {
++        program,
++        mut positions,
++        mut stats,
++    } = selection;
++    let NativeRelation::TypedColumnar { columns, .. } = &program.installed.data else {
++        return Err(PhysicalExecutionError::UnsupportedPhysicalPlan);
++    };
++    retain_top_k_positions(
++        columns,
++        &program.columns,
++        &mut positions,
++        spec,
++        env,
++        &mut stats,
++    )?;
++    let compact = select_logical_columns(columns, &program.columns, &positions)?;
++    OwnedTypedBatch::dense(compact, stats)
++}
++
++fn produce_top_k_from_owned_batch(
++    batch: OwnedTypedBatch,
++    spec: TopKBatchSpec,
++    env: &StatefulBatchEnv<'_>,
++) -> Result<OwnedTypedBatch, PhysicalExecutionError> {
++    let OwnedTypedBatch {
++        columns,
++        mut positions,
++        mut stats,
++    } = batch;
++    let logical_columns = (0..columns.len()).collect::<Vec<_>>();
++    retain_top_k_positions(
++        &columns,
++        &logical_columns,
++        &mut positions,
++        spec,
++        env,
++        &mut stats,
++    )?;
++    let compact = select_logical_columns(&columns, &logical_columns, &positions)?;
++    OwnedTypedBatch::dense(compact, stats)
++}
++
++fn retain_top_k_positions(
++    columns: &[NativeColumn],
++    logical_columns: &[usize],
++    positions: &mut Vec<usize>,
++    spec: TopKBatchSpec,
++    env: &StatefulBatchEnv<'_>,
++    stats: &mut ExecutionStats,
++) -> Result<(), PhysicalExecutionError> {
++    if spec.k == 0 || positions.is_empty() {
++        positions.clear();
++        return Ok(());
++    }
++    let physical_column = *logical_columns
++        .get(spec.column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    let order_column = columns
++        .get(physical_column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    if matches!(
++        env.registry.ordering_domain(env.context, spec.ordering)?,
++        kernel_semantics::OrderingDomain::I64
++    ) && let NativeColumn::I64(values) = order_column
++    {
++        select_top_k_i64_positions(positions, values, spec.direction, spec.k, stats);
++        return Ok(());
++    }
++    sort_typed_top_k_positions(positions, order_column, spec, env, stats)?;
++    retain_semantic_top_k_ties(positions, order_column, spec, env, stats)
++}
++
++fn retain_semantic_top_k_ties(
++    positions: &mut Vec<usize>,
++    order_column: &NativeColumn,
++    spec: TopKBatchSpec,
++    env: &StatefulBatchEnv<'_>,
++    stats: &mut ExecutionStats,
++) -> Result<(), PhysicalExecutionError> {
++    if spec.k >= positions.len() {
++        return Ok(());
++    }
++    let threshold = order_column.value_at(positions[spec.k - 1]);
++    stats.values_read = stats.values_read.saturating_add(1);
++    let mut keep = spec.k;
++    while keep < positions.len() {
++        let candidate = order_column.value_at(positions[keep]);
++        stats.values_read = stats.values_read.saturating_add(1);
++        if env
++            .registry
++            .compare(env.context, spec.ordering, &candidate, &threshold)?
++            != std::cmp::Ordering::Equal
++        {
++            break;
++        }
++        keep += 1;
++    }
++    positions.truncate(keep);
++    Ok(())
++}
++
++fn select_logical_columns(
++    columns: &[NativeColumn],
++    logical_columns: &[usize],
++    positions: &[usize],
++) -> Result<Vec<NativeColumn>, PhysicalExecutionError> {
++    logical_columns
++        .iter()
++        .map(|&column| {
++            columns
++                .get(column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?
++                .select_positions(positions)
++        })
++        .collect()
++}
++
+ fn try_execute_typed_stateful_batch(
+     plan: &Plan,
+     store: &PhysicalStore,
+@@ -4383,7 +5224,11 @@
+             .iter()
+             .map(|&position| values[position])
+             .collect::<Vec<_>>();
+-        let (_, threshold, _) = keys.select_nth_unstable(k - 1);
++        let threshold_index = match direction {
++            OrderDirection::Ascending => k - 1,
++            OrderDirection::Descending => keys.len() - k,
++        };
++        let (_, threshold, _) = keys.select_nth_unstable(threshold_index);
+         let threshold = *threshold;
+         match direction {
+             OrderDirection::Ascending => {
+@@ -10052,6 +10897,306 @@
+     }
+ 
+     #[test]
++    fn typed_group_top_k_producer_chain_stays_columnar_until_final_output() {
++        let relation = sid(420);
++        let equivalence = sid(421);
++        let (mut context, mut registry) = two_i64_column_context(relation, equivalence, 55);
++        let ordering = sid(422);
++        let ordering_digest =
++            registry.install_ordering(kernel_semantics::OrderingModule::I64Ascending);
++        context.environment.pin_module(ordering, ordering_digest);
++        let group = RelExpr::Group {
++            input: Box::new(RelExpr::Scan(relation)),
++            group_columns: vec![1],
++            group_equivalences: vec![equivalence],
++            aggregate: AggregateSpec::Count {
++                result_equivalence: equivalence,
++            },
++        };
++        let top_k = RelExpr::TopKWithTies {
++            input: Box::new(group),
++            column: 1,
++            ordering,
++            direction: OrderDirection::Ascending,
++            k: 1,
++        };
++        let filtered = RelExpr::FilterEqConst {
++            input: Box::new(top_k),
++            column: 1,
++            value: Value::I64(1),
++            equivalence,
++        };
++        let logical = RelExpr::Project {
++            input: Box::new(filtered),
++            columns: vec![0],
++        };
++        let binding = LayoutBinding {
++            id: LayoutId(975),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let source = [(0_i64, 10_i64), (0, 10), (0, 20), (0, 30), (0, 30)];
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![
++                    NativeColumn::I64(source.iter().map(|row| row.0).collect()),
++                    NativeColumn::I64(source.iter().map(|row| row.1).collect()),
++                ])
++                .unwrap(),
++            )
++            .unwrap();
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            source
++                .iter()
++                .map(|(left, right)| vec![Value::I64(*left), Value::I64(*right)])
++                .collect(),
++        );
++        assert_eq!(
++            native,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(native.rows(), &[vec![Value::I64(20)]]);
++        assert_eq!(stats.typed_stateful_producer_hits, 1);
++        assert_eq!(stats.typed_stateful_batch_hits, 0);
++    }
++
++    #[test]
++    fn typed_text_group_producer_uses_primitive_canonical_keys() {
++        let relation = sid(423);
++        let text_equivalence = sid(424);
++        let count_equivalence = sid(425);
++        let mut registry = SemanticRegistry::default();
++        let text_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let count_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(56));
++        environment.pin_module(text_equivalence, text_digest);
++        environment.pin_module(count_equivalence, count_digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(56));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![text_equivalence],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let logical = RelExpr::Project {
++            input: Box::new(RelExpr::Group {
++                input: Box::new(RelExpr::Scan(relation)),
++                group_columns: vec![0],
++                group_equivalences: vec![text_equivalence],
++                aggregate: AggregateSpec::Count {
++                    result_equivalence: count_equivalence,
++                },
++            }),
++            columns: vec![0],
++        };
++        let binding = LayoutBinding {
++            id: LayoutId(976),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let values = vec!["A".to_owned(), "a".to_owned(), "B".to_owned()];
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::Text(values.clone())]).unwrap(),
++            )
++            .unwrap();
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            values
++                .into_iter()
++                .map(|value| vec![Value::Text(value)])
++                .collect(),
++        );
++        assert_eq!(
++            native,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(stats.typed_stateful_producer_hits, 1);
++    }
++
++    #[test]
++    fn typed_f64_top_k_producer_stays_columnar_until_project_boundary() {
++        let relation = sid(426);
++        let equivalence = sid(427);
++        let ordering = sid(428);
++        let mut registry = SemanticRegistry::default();
++        let equivalence_digest = registry.install_equivalence(EquivalenceModule::F64Bitwise);
++        let ordering_digest = registry.install_ordering(kernel_semantics::OrderingModule::F64Total);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(57));
++        environment.pin_module(equivalence, equivalence_digest);
++        environment.pin_module(ordering, ordering_digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(57));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::F64)],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let logical = RelExpr::Project {
++            input: Box::new(RelExpr::TopKWithTies {
++                input: Box::new(RelExpr::Scan(relation)),
++                column: 0,
++                ordering,
++                direction: OrderDirection::Ascending,
++                k: 2,
++            }),
++            columns: vec![0],
++        };
++        let binding = LayoutBinding {
++            id: LayoutId(977),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let values = [-0.0_f64, 1.0, -1.0, 0.0];
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::F64Bits(
++                    values.iter().map(|value| value.to_bits()).collect(),
++                )])
++                .unwrap(),
++            )
++            .unwrap();
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            values
++                .into_iter()
++                .map(|value| vec![Value::F64Bits(value.to_bits())])
++                .collect(),
++        );
++        assert_eq!(
++            native,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(stats.typed_stateful_producer_hits, 1);
++    }
++
++    #[test]
++    fn typed_top_k_can_feed_group_without_row_materialization() {
++        let relation = sid(429);
++        let equivalence = sid(430);
++        let (mut context, mut registry) = two_i64_column_context(relation, equivalence, 58);
++        let ordering = sid(431);
++        let ordering_digest =
++            registry.install_ordering(kernel_semantics::OrderingModule::I64Ascending);
++        context.environment.pin_module(ordering, ordering_digest);
++        let top_k = RelExpr::TopKWithTies {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 1,
++            ordering,
++            direction: OrderDirection::Descending,
++            k: 2,
++        };
++        let group = RelExpr::Group {
++            input: Box::new(top_k),
++            group_columns: vec![0],
++            group_equivalences: vec![equivalence],
++            aggregate: AggregateSpec::Count {
++                result_equivalence: equivalence,
++            },
++        };
++        let logical = RelExpr::Project {
++            input: Box::new(group),
++            columns: vec![0, 1],
++        };
++        let binding = LayoutBinding {
++            id: LayoutId(978),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let source = [(1_i64, 10_i64), (1, 20), (2, 30), (2, 40)];
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![
++                    NativeColumn::I64(source.iter().map(|row| row.0).collect()),
++                    NativeColumn::I64(source.iter().map(|row| row.1).collect()),
++                ])
++                .unwrap(),
++            )
++            .unwrap();
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            source
++                .iter()
++                .map(|(key, value)| vec![Value::I64(*key), Value::I64(*value)])
++                .collect(),
++        );
++        assert_eq!(
++            native,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(native.rows(), &[vec![Value::I64(2), Value::I64(2)]]);
++        assert_eq!(stats.typed_stateful_producer_hits, 1);
++    }
++
++    #[test]
++    fn typed_i64_top_k_descending_selects_high_threshold_with_ties() {
++        let mut positions = vec![0, 1, 2, 3, 4];
++        let values = [1_i64, 9, 8, 8, 2];
++        let mut stats = ExecutionStats::default();
++        select_top_k_i64_positions(
++            &mut positions,
++            &values,
++            OrderDirection::Descending,
++            2,
++            &mut stats,
++        );
++        assert_eq!(
++            positions
++                .iter()
++                .map(|&position| values[position])
++                .collect::<Vec<_>>(),
++            vec![9, 8, 8]
++        );
++    }
++
++    #[test]
+     fn native_group_count_matches_logical_reference_including_empty_global_group() {
+         let (context, registry, relation) = planning_context();
+         for (group_columns, rows) in [

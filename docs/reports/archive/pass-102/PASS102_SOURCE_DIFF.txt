@@ -1,0 +1,732 @@
+--- /mnt/data/cfmd_pass102_env/work/pass101_base/crates/kernel-query/src/lib.rs	2026-09-23 03:11:57.000000000 +0000
++++ crates/kernel-query/src/lib.rs	2026-09-23 10:55:28.248150140 +0000
+@@ -2518,27 +2518,6 @@
+         relation_value_from_rows(rows, &self.result_type)
+     }
+ 
+-    fn apply_input_deltas(
+-        &mut self,
+-        left_delta: &RelationDelta,
+-        right_delta: &RelationDelta,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<RelationDelta, RelQueryError> {
+-        if left_delta.result_type != self.left_type || right_delta.result_type != self.right_type {
+-            return Err(RelQueryError::TypeMismatch);
+-        }
+-        let planned = self.plan_delta_views(
+-            &left_delta.as_delta_view(),
+-            &right_delta.as_delta_view(),
+-            context,
+-            registry,
+-        )?;
+-        let effect = materialize_delta_view(&planned.effect, self.result_type.clone())?;
+-        self.commit_patch(planned.patch);
+-        Ok(effect)
+-    }
+-
+     fn plan_delta_views<LD: DeltaView<Row>, RD: DeltaView<Row>>(
+         &self,
+         left_delta: &LD,
+@@ -3222,6 +3201,8 @@
+     revision: Option<kernel_types::RevisionId>,
+ }
+ 
++type MaintainedDelta = AdaptiveDelta<Row, 4>;
++
+ /// Correctness-first prepared maintained-plan transition.
+ ///
+ /// The full source snapshot is retained intentionally so commit freshness is an
+@@ -3686,7 +3667,7 @@
+             return Err(RelQueryError::InconsistentIncrementalDelta);
+         }
+         self.transition_epoch = next_epoch;
+-        Ok(output)
++        materialize_delta_view(&output, self.result_type.clone())
+     }
+ 
+     /// Attaches authoritative storage row identities to every `Scan` of one
+@@ -3881,7 +3862,7 @@
+         self.apply_resolved_leaf_deltas(deltas)?;
+         let output = self.propagate_resolved_deltas_inner(deltas, context, registry)?;
+         self.transition_epoch = next_epoch;
+-        Ok(output)
++        materialize_delta_view(&output, self.result_type.clone())
+     }
+ 
+     fn validate_resolved_leaf_deltas(
+@@ -4006,73 +3987,69 @@
+         deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<RelationDelta, RelQueryError> {
++    ) -> Result<MaintainedDelta, RelQueryError> {
+         match Arc::make_mut(&mut self.node) {
+-            MaintainedRelPlanNode::Scan { relation, .. } => Ok(deltas.get(relation).map_or_else(
+-                || RelationDelta {
+-                    inserted: Vec::new(),
+-                    removed: Vec::new(),
+-                    result_type: self.result_type.clone(),
+-                },
+-                |resolved| resolved.delta.clone(),
+-            )),
++            MaintainedRelPlanNode::Scan { relation, .. } => Ok(deltas
++                .get(relation)
++                .map_or_else(MaintainedDelta::default, |resolved| {
++                    maintained_delta_from_view(&resolved.delta.as_delta_view())
++                })),
+             MaintainedRelPlanNode::Filter {
+                 input,
+                 column,
+                 value,
+                 equivalence,
+-            } => rel_delta_filter(
+-                input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+-                *column,
+-                value,
+-                *equivalence,
+-                context,
+-                registry,
+-            ),
++            } => {
++                let input_delta =
++                    input.propagate_resolved_deltas_inner(deltas, context, registry)?;
++                filter_delta_view(
++                    &input_delta,
++                    &input.result_type,
++                    *column,
++                    value,
++                    *equivalence,
++                    context,
++                    registry,
++                )
++            }
+             MaintainedRelPlanNode::FilterColumns {
+                 input,
+                 left_column,
+                 right_column,
+                 equivalence,
+-            } => rel_delta_filter_columns(
+-                input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+-                *left_column,
+-                *right_column,
+-                *equivalence,
+-                context,
+-                registry,
+-            ),
+-            MaintainedRelPlanNode::ProjectBag { input, columns } => rel_delta_project_bag(
+-                input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+-                columns,
+-                &self.query,
+-                context,
+-                registry,
+-            ),
++            } => {
++                let input_delta =
++                    input.propagate_resolved_deltas_inner(deltas, context, registry)?;
++                filter_columns_delta_view(
++                    &input_delta,
++                    &input.result_type,
++                    *left_column,
++                    *right_column,
++                    *equivalence,
++                    context,
++                    registry,
++                )
++            }
++            MaintainedRelPlanNode::ProjectBag { input, columns } => {
++                let input_delta =
++                    input.propagate_resolved_deltas_inner(deltas, context, registry)?;
++                project_bag_delta_view(&input_delta, columns, &self.result_type, context, registry)
++            }
+             MaintainedRelPlanNode::ProjectSet {
+                 input,
+                 columns,
+                 supports,
+             } => {
+                 let delta = input.propagate_resolved_deltas_inner(deltas, context, registry)?;
+-                supports.apply_rows_delta(
+-                    project_rows(delta.inserted, columns)?,
+-                    project_rows(delta.removed, columns)?,
+-                    context,
+-                    registry,
+-                )
++                let projected = project_delta_view(&delta, columns)?;
++                apply_set_support_delta_view(supports, &projected, context, registry)
+             }
+             MaintainedRelPlanNode::Distinct { input, supports } => {
+                 let delta = input.propagate_resolved_deltas_inner(deltas, context, registry)?;
+-                supports.apply_rows_delta(delta.inserted, delta.removed, context, registry)
++                apply_set_support_delta_view(supports, &delta, context, registry)
+             }
+             MaintainedRelPlanNode::PromoteToBag { input } => {
+-                let delta = input.propagate_resolved_deltas_inner(deltas, context, registry)?;
+-                Ok(RelationDelta {
+-                    inserted: delta.inserted,
+-                    removed: delta.removed,
+-                    result_type: self.result_type.clone(),
+-                })
++                input.propagate_resolved_deltas_inner(deltas, context, registry)
+             }
+             MaintainedRelPlanNode::Blocker { left, right, state } => {
+                 BlockerUpdate { left, right, state }.propagate_resolved(deltas, context, registry)
+@@ -4081,18 +4058,18 @@
+                 let left_delta = left.propagate_resolved_deltas_inner(deltas, context, registry)?;
+                 let right_delta =
+                     right.propagate_resolved_deltas_inner(deltas, context, registry)?;
+-                state.apply_input_deltas(&left_delta, &right_delta, context, registry)
++                apply_join_delta_views(state, &left_delta, &right_delta, context, registry)
++            }
++            MaintainedRelPlanNode::Group { input, state } => {
++                let input_delta =
++                    input.propagate_resolved_deltas_inner(deltas, context, registry)?;
++                apply_group_delta_view(state, &input_delta, context, registry)
++            }
++            MaintainedRelPlanNode::TopK { input, state } => {
++                let input_delta =
++                    input.propagate_resolved_deltas_inner(deltas, context, registry)?;
++                apply_topk_delta_view(state, &input_delta, context, registry)
+             }
+-            MaintainedRelPlanNode::Group { input, state } => state.apply_input_delta(
+-                &input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+-                context,
+-                registry,
+-            ),
+-            MaintainedRelPlanNode::TopK { input, state } => state.apply_input_delta(
+-                &input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+-                context,
+-                registry,
+-            ),
+         }
+     }
+ 
+@@ -4232,7 +4209,7 @@
+     fn apply_relation_deltas_inner(
+         &mut self,
+         apply: &mut RelationDeltaApplyContext<'_>,
+-    ) -> Result<RelationDelta, RelQueryError> {
++    ) -> Result<MaintainedDelta, RelQueryError> {
+         match Arc::make_mut(&mut self.node) {
+             MaintainedRelPlanNode::Scan {
+                 relation, value, ..
+@@ -4244,8 +4221,9 @@
+                 equivalence,
+             } => {
+                 let input_delta = input.apply_relation_deltas_inner(apply)?;
+-                rel_delta_filter(
+-                    input_delta,
++                filter_delta_view(
++                    &input_delta,
++                    &input.result_type,
+                     *column,
+                     value,
+                     *equivalence,
+@@ -4260,8 +4238,9 @@
+                 equivalence,
+             } => {
+                 let input_delta = input.apply_relation_deltas_inner(apply)?;
+-                rel_delta_filter_columns(
+-                    input_delta,
++                filter_columns_delta_view(
++                    &input_delta,
++                    &input.result_type,
+                     *left_column,
+                     *right_column,
+                     *equivalence,
+@@ -4271,10 +4250,10 @@
+             }
+             MaintainedRelPlanNode::ProjectBag { input, columns } => {
+                 let input_delta = input.apply_relation_deltas_inner(apply)?;
+-                rel_delta_project_bag(
+-                    input_delta,
++                project_bag_delta_view(
++                    &input_delta,
+                     columns,
+-                    &self.query,
++                    &self.result_type,
+                     apply.context,
+                     apply.registry,
+                 )
+@@ -4288,12 +4267,7 @@
+                 apply_distinct_node(input, supports, apply)
+             }
+             MaintainedRelPlanNode::PromoteToBag { input } => {
+-                let input_delta = input.apply_relation_deltas_inner(apply)?;
+-                Ok(RelationDelta {
+-                    inserted: input_delta.inserted,
+-                    removed: input_delta.removed,
+-                    result_type: self.result_type.clone(),
+-                })
++                input.apply_relation_deltas_inner(apply)
+             }
+             MaintainedRelPlanNode::Blocker { left, right, state } => {
+                 BlockerUpdate { left, right, state }.apply(apply)
+@@ -4301,15 +4275,21 @@
+             MaintainedRelPlanNode::Join { left, right, state } => {
+                 let left_delta = left.apply_relation_deltas_inner(apply)?;
+                 let right_delta = right.apply_relation_deltas_inner(apply)?;
+-                state.apply_input_deltas(&left_delta, &right_delta, apply.context, apply.registry)
++                apply_join_delta_views(
++                    state,
++                    &left_delta,
++                    &right_delta,
++                    apply.context,
++                    apply.registry,
++                )
+             }
+             MaintainedRelPlanNode::Group { input, state } => {
+                 let input_delta = input.apply_relation_deltas_inner(apply)?;
+-                state.apply_input_delta(&input_delta, apply.context, apply.registry)
++                apply_group_delta_view(state, &input_delta, apply.context, apply.registry)
+             }
+             MaintainedRelPlanNode::TopK { input, state } => {
+                 let input_delta = input.apply_relation_deltas_inner(apply)?;
+-                state.apply_input_delta(&input_delta, apply.context, apply.registry)
++                apply_topk_delta_view(state, &input_delta, apply.context, apply.registry)
+             }
+         }
+     }
+@@ -4346,48 +4326,266 @@
+         relation: kernel_types::SemanticId,
+         value: &mut RelationValue,
+         result_type: &RelType,
+-    ) -> Result<RelationDelta, RelQueryError> {
++    ) -> Result<MaintainedDelta, RelQueryError> {
+         let edge = self.next_edge(relation)?;
+         apply_scan_relation_delta(edge, value, result_type, self.deltas, self.validated_frames)
+     }
+ }
+ 
++fn apply_join_delta_views(
++    state: &mut MaterializedJoinDeltaState,
++    left_delta: &impl DeltaView<Row>,
++    right_delta: &impl DeltaView<Row>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let planned = state.plan_delta_views(left_delta, right_delta, context, registry)?;
++    let effect = planned.effect;
++    state.commit_join_patch(planned.patch);
++    Ok(effect)
++}
++
++fn apply_blocker_delta_views(
++    state: &mut MaterializedBlockerDeltaState,
++    left_delta: &impl DeltaView<Row>,
++    right_delta: &impl DeltaView<Row>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let planned = state.plan_delta_views(left_delta, right_delta, context, registry)?;
++    let effect = planned.effect;
++    state.commit_patch(planned.patch);
++    Ok(effect)
++}
++
++fn apply_group_delta_view(
++    state: &mut MaterializedGroupDeltaState,
++    input_delta: &impl DeltaView<Row>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let planned = state.plan_delta_view(input_delta, context, registry)?;
++    let effect = planned.effect;
++    state.commit_group_patch(planned.patch, context, registry)?;
++    Ok(effect)
++}
++
++fn apply_topk_delta_view(
++    state: &mut MaterializedTopKDeltaState,
++    input_delta: &impl DeltaView<Row>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let planned = state.plan_delta_view(input_delta, context, registry)?;
++    let effect = planned.effect;
++    state.commit_topk_patch(planned.patch);
++    Ok(effect)
++}
++
++fn filter_delta_view(
++    input_delta: &impl DeltaView<Row>,
++    input_type: &RelType,
++    column: usize,
++    value: &Value,
++    equivalence: kernel_types::SemanticId,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let column_type = input_type
++        .columns
++        .get(column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    validate_query_equivalence(equivalence, column_type, context, registry)?;
++    let input_equivalence = relation_column_equivalence(input_type, column)?;
++    if !registry.equivalence_refines(context, input_equivalence, equivalence)? {
++        return Err(RelQueryError::EquivalenceNotCongruentWithInputEquality);
++    }
++    if !value_shape_matches_type(value, column_type) {
++        return Err(RelQueryError::TypeMismatch);
++    }
++
++    let mut output = MaintainedDelta::default();
++    let mut error = None;
++    input_delta.visit(|weight, row| {
++        if weight == 0 || error.is_some() {
++            return;
++        }
++        let Some(candidate) = row.get(column) else {
++            error = Some(RelQueryError::ColumnOutOfBounds);
++            return;
++        };
++        match registry.equivalent(context, equivalence, candidate, value) {
++            Ok(true) => output.push_weighted(weight, row.clone()),
++            Ok(false) => {}
++            Err(cause) => error = Some(cause.into()),
++        }
++    });
++    error.map_or(Ok(output), Err)
++}
++
++fn filter_columns_delta_view(
++    input_delta: &impl DeltaView<Row>,
++    input_type: &RelType,
++    left_column: usize,
++    right_column: usize,
++    equivalence: kernel_types::SemanticId,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let left_type = input_type
++        .columns
++        .get(left_column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    let right_type = input_type
++        .columns
++        .get(right_column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    if !query_types_compatible(left_type, right_type, &context.schema) {
++        return Err(RelQueryError::TypeMismatch);
++    }
++    validate_query_equivalence(equivalence, left_type, context, registry)?;
++    validate_query_equivalence(equivalence, right_type, context, registry)?;
++    let left_input_equivalence = relation_column_equivalence(input_type, left_column)?;
++    let right_input_equivalence = relation_column_equivalence(input_type, right_column)?;
++    if !registry.equivalence_refines(context, left_input_equivalence, equivalence)?
++        || !registry.equivalence_refines(context, right_input_equivalence, equivalence)?
++    {
++        return Err(RelQueryError::EquivalenceNotCongruentWithInputEquality);
++    }
++
++    let mut output = MaintainedDelta::default();
++    let mut error = None;
++    input_delta.visit(|weight, row| {
++        if weight == 0 || error.is_some() {
++            return;
++        }
++        let Some(left) = row.get(left_column) else {
++            error = Some(RelQueryError::ColumnOutOfBounds);
++            return;
++        };
++        let Some(right) = row.get(right_column) else {
++            error = Some(RelQueryError::ColumnOutOfBounds);
++            return;
++        };
++        match registry.equivalent(context, equivalence, left, right) {
++            Ok(true) => output.push_weighted(weight, row.clone()),
++            Ok(false) => {}
++            Err(cause) => error = Some(cause.into()),
++        }
++    });
++    error.map_or(Ok(output), Err)
++}
++
++fn project_bag_delta_view(
++    input_delta: &impl DeltaView<Row>,
++    columns: &[usize],
++    result_type: &RelType,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let (inserted, removed) = collect_projected_signed_rows(input_delta, columns)?;
++    let column_equivalences = relation_column_equivalences(result_type);
++    let normalized_inserted =
++        unmatched_semantic_rows(&inserted, &removed, column_equivalences, context, registry)?;
++    let normalized_removed =
++        unmatched_semantic_rows(&removed, &inserted, column_equivalences, context, registry)?;
++    Ok(maintained_delta_from_rows(
++        normalized_inserted,
++        normalized_removed,
++    ))
++}
++
++fn collect_projected_signed_rows(
++    input_delta: &impl DeltaView<Row>,
++    columns: &[usize],
++) -> Result<(Vec<Row>, Vec<Row>), RelQueryError> {
++    let mut inserted = Vec::new();
++    let mut removed = Vec::new();
++    let mut error = None;
++    input_delta.visit(|weight, row| {
++        if weight == 0 || error.is_some() {
++            return;
++        }
++        let magnitude = if weight < 0 {
++            let Some(value) = weight.checked_neg() else {
++                error = Some(RelQueryError::InconsistentIncrementalDelta);
++                return;
++            };
++            value
++        } else {
++            weight
++        };
++        let Ok(magnitude) = usize::try_from(magnitude) else {
++            error = Some(RelQueryError::InconsistentIncrementalDelta);
++            return;
++        };
++        let projected = match project_row(row, columns) {
++            Ok(projected) => projected,
++            Err(cause) => {
++                error = Some(cause);
++                return;
++            }
++        };
++        let target = if weight < 0 {
++            &mut removed
++        } else {
++            &mut inserted
++        };
++        if target.try_reserve(magnitude).is_err() {
++            error = Some(RelQueryError::InconsistentIncrementalDelta);
++            return;
++        }
++        target.extend(std::iter::repeat_n(projected, magnitude));
++    });
++    error.map_or(Ok((inserted, removed)), Err)
++}
++
+ fn apply_project_set_node(
+     input: &mut MaterializedRelPlanState,
+     columns: &[usize],
+     supports: &mut MaterializedSetSupportState,
+     apply: &mut RelationDeltaApplyContext<'_>,
+-) -> Result<RelationDelta, RelQueryError> {
++) -> Result<MaintainedDelta, RelQueryError> {
+     let input_delta = input.apply_relation_deltas_inner(apply)?;
+-    let mut projected = AdaptiveDelta::<Row, 4>::default();
+-    let mut projection_error = None;
+-    input_delta.as_delta_view().visit(|weight, row| {
+-        if projection_error.is_some() {
++    let projected = project_delta_view(&input_delta, columns)?;
++    apply_set_support_delta_view(supports, &projected, apply.context, apply.registry)
++}
++
++fn apply_distinct_node(
++    input: &mut MaterializedRelPlanState,
++    supports: &mut MaterializedSetSupportState,
++    apply: &mut RelationDeltaApplyContext<'_>,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let input_delta = input.apply_relation_deltas_inner(apply)?;
++    apply_set_support_delta_view(supports, &input_delta, apply.context, apply.registry)
++}
++
++fn project_delta_view(
++    input_delta: &impl DeltaView<Row>,
++    columns: &[usize],
++) -> Result<MaintainedDelta, RelQueryError> {
++    let mut projected = MaintainedDelta::default();
++    let mut error = None;
++    input_delta.visit(|weight, row| {
++        if weight == 0 || error.is_some() {
+             return;
+         }
+         match project_row(row, columns) {
+             Ok(row) => projected.push_weighted(weight, row),
+-            Err(error) => projection_error = Some(error),
++            Err(cause) => error = Some(cause),
+         }
+     });
+-    if let Some(error) = projection_error {
+-        return Err(error);
+-    }
+-    let planned = supports.plan_delta_view(&projected, apply.context, apply.registry)?;
+-    let effect = materialize_delta_view(&planned.effect, supports.result_type.clone())?;
+-    supports.commit_support_patch(planned.patch);
+-    Ok(effect)
++    error.map_or(Ok(projected), Err)
+ }
+ 
+-fn apply_distinct_node(
+-    input: &mut MaterializedRelPlanState,
++fn apply_set_support_delta_view(
+     supports: &mut MaterializedSetSupportState,
+-    apply: &mut RelationDeltaApplyContext<'_>,
+-) -> Result<RelationDelta, RelQueryError> {
+-    let input_delta = input.apply_relation_deltas_inner(apply)?;
+-    let planned =
+-        supports.plan_delta_view(&input_delta.as_delta_view(), apply.context, apply.registry)?;
+-    let effect = materialize_delta_view(&planned.effect, supports.result_type.clone())?;
++    input_delta: &impl DeltaView<Row>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<MaintainedDelta, RelQueryError> {
++    let planned = supports.plan_delta_view(input_delta, context, registry)?;
++    let effect = planned.effect;
+     supports.commit_support_patch(planned.patch);
+     Ok(effect)
+ }
+@@ -4404,25 +4602,29 @@
+         deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<RelationDelta, RelQueryError> {
++    ) -> Result<MaintainedDelta, RelQueryError> {
+         let left_delta = self
+             .left
+             .propagate_resolved_deltas_inner(deltas, context, registry)?;
+         let right_delta = self
+             .right
+             .propagate_resolved_deltas_inner(deltas, context, registry)?;
+-        self.state
+-            .apply_input_deltas(&left_delta, &right_delta, context, registry)
++        apply_blocker_delta_views(self.state, &left_delta, &right_delta, context, registry)
+     }
+ 
+     fn apply(
+         self,
+         apply: &mut RelationDeltaApplyContext<'_>,
+-    ) -> Result<RelationDelta, RelQueryError> {
++    ) -> Result<MaintainedDelta, RelQueryError> {
+         let left_delta = self.left.apply_relation_deltas_inner(apply)?;
+         let right_delta = self.right.apply_relation_deltas_inner(apply)?;
+-        self.state
+-            .apply_input_deltas(&left_delta, &right_delta, apply.context, apply.registry)
++        apply_blocker_delta_views(
++            self.state,
++            &left_delta,
++            &right_delta,
++            apply.context,
++            apply.registry,
++        )
+     }
+ }
+ 
+@@ -4435,14 +4637,10 @@
+         CompiledDeltaEdgeIdentity,
+         ValidatedTransitionFrame<RelationMutationPlan, RelationDelta>,
+     >,
+-) -> Result<RelationDelta, RelQueryError> {
++) -> Result<MaintainedDelta, RelQueryError> {
+     let relation = edge.relation();
+     let Some(_delta) = deltas.get(&relation) else {
+-        return Ok(RelationDelta {
+-            inserted: Vec::new(),
+-            removed: Vec::new(),
+-            result_type: result_type.clone(),
+-        });
++        return Ok(MaintainedDelta::default());
+     };
+     let frame = validated_frames
+         .remove(&edge)
+@@ -4455,7 +4653,7 @@
+         return Err(RelQueryError::TypeMismatch);
+     }
+     MaterializedJoinDeltaState::commit_relation_mutation(value, plan);
+-    Ok(delta)
++    Ok(maintained_delta_from_relation_delta(delta))
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -6603,6 +6801,8 @@
+     delta: &D,
+     result_type: RelType,
+ ) -> Result<RelationDelta, RelQueryError> {
++    #[cfg(test)]
++    RELATION_DELTA_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+     let mut inserted = Vec::new();
+     let mut removed = Vec::new();
+     let mut error = None;
+@@ -6644,6 +6844,46 @@
+     })
+ }
+ 
++#[cfg(test)]
++std::thread_local! {
++    static RELATION_DELTA_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++}
++
++#[cfg(test)]
++fn reset_relation_delta_materialization_count() {
++    RELATION_DELTA_MATERIALIZATIONS.with(|count| count.set(0));
++}
++
++#[cfg(test)]
++fn relation_delta_materialization_count() -> usize {
++    RELATION_DELTA_MATERIALIZATIONS.with(std::cell::Cell::get)
++}
++
++fn maintained_delta_from_relation_delta(delta: RelationDelta) -> MaintainedDelta {
++    maintained_delta_from_rows(delta.inserted, delta.removed)
++}
++
++fn maintained_delta_from_view(delta: &impl DeltaView<Row>) -> MaintainedDelta {
++    let mut output = MaintainedDelta::default();
++    delta.visit(|weight, row| {
++        if weight != 0 {
++            output.push_weighted(weight, row.clone());
++        }
++    });
++    output
++}
++
++fn maintained_delta_from_rows(inserted: Vec<Row>, removed: Vec<Row>) -> MaintainedDelta {
++    let mut delta = MaintainedDelta::default();
++    for row in removed {
++        delta.push_weighted(-1, row);
++    }
++    for row in inserted {
++        delta.push_weighted(1, row);
++    }
++    delta
++}
++
+ fn rel_delta_project_set(
+     input: &RelExpr,
+     input_delta: RelationDelta,
+@@ -14483,9 +14723,11 @@
+         .unwrap();
+         let mut resolved_map = BTreeMap::new();
+         resolved_map.insert(left, resolved);
++        reset_relation_delta_materialization_count();
+         let resolved_output = resolved_state
+             .apply_storage_resolved_deltas(&resolved_map, &context, &registry)
+             .unwrap();
++        assert_eq!(relation_delta_materialization_count(), 1);
+         assert!(
+             relation_deltas_semantically_equivalent(
+                 &resolved_output,
+@@ -14546,9 +14788,11 @@
+                 &registry,
+             )
+             .unwrap();
++            reset_relation_delta_materialization_count();
+             let maintained = state
+                 .apply_relation_deltas(&deltas, &context, &registry)
+                 .unwrap();
++            assert_eq!(relation_delta_materialization_count(), 1);
+             assert!(
+                 relation_deltas_semantically_equivalent(&maintained, &oracle, &context, &registry,)
+                     .unwrap()
+@@ -14570,10 +14814,12 @@
+                 result_type: left_type,
+             },
+         );
++        reset_relation_delta_materialization_count();
+         assert_eq!(
+             state.apply_relation_deltas(&invalid, &context, &registry),
+             Err(RelQueryError::InconsistentIncrementalDelta)
+         );
++        assert_eq!(relation_delta_materialization_count(), 0);
+         assert_eq!(state, before);
+     }
+ 

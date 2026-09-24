@@ -1,0 +1,1479 @@
+--- /mnt/data/cfmd_pass29_work/cfmd_workspace_pass29/Cargo.lock	2026-09-19 12:08:18.000000000 +0000
++++ /mnt/data/cfmd_pass30_work/cfmd_workspace_pass30/Cargo.lock	2026-09-19 21:35:30.003953090 +0000
+@@ -75,6 +75,7 @@
+  "kernel-model",
+  "kernel-proof",
+  "kernel-query",
++ "kernel-revision",
+  "kernel-schema",
+  "kernel-semantics",
+  "kernel-types",
+--- /mnt/data/cfmd_pass29_work/cfmd_workspace_pass29/crates/kernel-types/src/lib.rs	2026-09-19 18:47:18.000000000 +0000
++++ /mnt/data/cfmd_pass30_work/cfmd_workspace_pass30/crates/kernel-types/src/lib.rs	2026-09-19 21:33:43.734788524 +0000
+@@ -30,6 +30,7 @@
+ semantic_id!(SchemaRevisionId, u64);
+ semantic_id!(SemanticEnvId, u64);
+ semantic_id!(RevisionId, u64);
++semantic_id!(MaterializationId, u128);
+ 
+ /// Stable storage identity for one physical row slot.
+ ///
+--- /mnt/data/cfmd_pass29_work/cfmd_workspace_pass29/crates/kernel-query/src/lib.rs	2026-09-19 20:47:31.552512596 +0000
++++ /mnt/data/cfmd_pass30_work/cfmd_workspace_pass30/crates/kernel-query/src/lib.rs	2026-09-19 21:35:44.542219898 +0000
+@@ -404,6 +404,25 @@
+     pub fn is_empty(&self) -> bool {
+         self.inserted.is_empty() && self.removed.is_empty()
+     }
++
++    pub fn apply_to_value(
++        &self,
++        old: RelationValue,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelationValue, RelQueryError> {
++        apply_relation_delta_to_value(old, self, context, registry)
++    }
++
++    pub fn between_values(
++        old: &RelationValue,
++        next: &RelationValue,
++        result_type: RelType,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, RelQueryError> {
++        relation_delta_between_values(old, next, result_type, context, registry)
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -1790,6 +1809,32 @@
+         &self.result_type
+     }
+ 
++    #[must_use]
++    pub fn scan_relations(&self) -> BTreeSet<kernel_types::SemanticId> {
++        let mut relations = BTreeSet::new();
++        self.collect_scan_relations(&mut relations);
++        relations
++    }
++
++    fn collect_scan_relations(&self, relations: &mut BTreeSet<kernel_types::SemanticId>) {
++        match &self.node {
++            MaintainedRelPlanNode::Scan { relation, .. } => {
++                relations.insert(*relation);
++            }
++            MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::ProjectBag { input, .. }
++            | MaintainedRelPlanNode::ProjectSet { input, .. }
++            | MaintainedRelPlanNode::Distinct { input, .. }
++            | MaintainedRelPlanNode::PromoteToBag { input }
++            | MaintainedRelPlanNode::Group { input, .. }
++            | MaintainedRelPlanNode::TopK { input, .. } => input.collect_scan_relations(relations),
++            MaintainedRelPlanNode::Join { left, right, .. } => {
++                left.collect_scan_relations(relations);
++                right.collect_scan_relations(relations);
++            }
++        }
++    }
++
+     pub fn output_value(
+         &self,
+         context: &kernel_schema::SemanticContext,
+@@ -4520,7 +4565,8 @@
+         }
+     }
+ 
+-    fn into_rows(self) -> Vec<Row> {
++    #[must_use]
++    pub fn into_rows(self) -> Vec<Row> {
+         match self {
+             Self::Bag(rows) | Self::Set { rows, .. } => rows,
+         }
+--- /mnt/data/cfmd_pass29_work/cfmd_workspace_pass29/crates/kernel-plan/Cargo.toml	2026-09-19 12:08:17.000000000 +0000
++++ /mnt/data/cfmd_pass30_work/cfmd_workspace_pass30/crates/kernel-plan/Cargo.toml	2026-09-19 21:33:44.648843154 +0000
+@@ -9,6 +9,7 @@
+ kernel-model = { path = "../kernel-model" }
+ kernel-proof = { path = "../kernel-proof" }
+ kernel-query = { path = "../kernel-query" }
++kernel-revision = { path = "../kernel-revision" }
+ kernel-schema = { path = "../kernel-schema" }
+ kernel-semantics = { path = "../kernel-semantics" }
+ kernel-types = { path = "../kernel-types" }
+--- /mnt/data/cfmd_pass29_work/cfmd_workspace_pass29/crates/kernel-plan/src/lib.rs	2026-09-19 21:02:24.397062915 +0000
++++ /mnt/data/cfmd_pass30_work/cfmd_workspace_pass30/crates/kernel-plan/src/lib.rs	2026-09-19 21:40:29.026613033 +0000
+@@ -452,41 +452,82 @@
+ /// relation; callers normalize multiple edits to one relation before prepare.
+ pub struct RevisionRelationMutation<'a> {
+     pub relation: SemanticId,
+-    pub layout: LayoutBinding,
+     pub delta: &'a RelationDelta,
+ }
+ 
+-/// Data-plane portion of one source->target revision transition.
++/// One maintained query registered under the authoritative runtime revision.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RuntimeMaterializationSpec {
++    pub id: kernel_types::MaterializationId,
++    pub query: RelExpr,
++}
++
++/// Logical descriptor carried across the pre-durable seal boundary.
++///
++/// It intentionally contains semantic relation deltas rather than physical row
++/// handles/layout mutations. A later WAL layer can serialize this descriptor
++/// without making reconstructible physical state durable authority.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RevisionCommitDescriptor {
++    source_revision: RevisionId,
++    target_revision: RevisionId,
++    semantic_revision: kernel_types::SemanticRevision,
++    relation_deltas: BTreeMap<SemanticId, RelationDelta>,
++}
++
++impl RevisionCommitDescriptor {
++    #[must_use]
++    pub const fn source_revision(&self) -> RevisionId {
++        self.source_revision
++    }
++
++    #[must_use]
++    pub const fn target_revision(&self) -> RevisionId {
++        self.target_revision
++    }
++
++    #[must_use]
++    pub const fn semantic_revision(&self) -> kernel_types::SemanticRevision {
++        self.semantic_revision
++    }
++
++    #[must_use]
++    pub const fn relation_deltas(&self) -> &BTreeMap<SemanticId, RelationDelta> {
++        &self.relation_deltas
++    }
++}
++
++/// Complete logical source->target revision transition request.
+ ///
+-/// `source_revision` is deliberately not caller supplied: it is taken from the
+-/// live `RuntimeRevisionBundle`, eliminating one class of cross-revision misuse.
++/// The target is an already validated `kernel_revision::Revision`. The source
++/// revision and pinned semantic context come from the live runtime bundle.
+ pub struct RevisionTransitionRequest<'a> {
+-    pub target_revision: RevisionId,
++    pub target_revision: &'a kernel_revision::Revision,
+     pub mutations: &'a [RevisionRelationMutation<'a>],
+-    pub context: &'a kernel_schema::SemanticContext,
+     pub registry: &'a kernel_semantics::SemanticRegistry,
+ }
+ 
+-/// Reader-visible owner for one coherent runtime revision.
++/// Reader-visible owner for one coherent authoritative revision.
+ ///
+-/// The physical store and maintained query state cannot be mutably borrowed
+-/// independently through this type. Publication replaces the whole bundle in
+-/// one assignment after a prepared transition has been sealed.
++/// The logical revision, authoritative physical relation layouts, and every
++/// registered maintained materialization are published together. Bootstrap
++/// constructs maintained states from the revision itself rather than trusting
++/// arbitrary externally supplied snapshots.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct RuntimeRevisionBundle {
+-    revision: RevisionId,
++    revision: kernel_revision::Revision,
+     physical: PhysicalStore,
+-    maintained: MaterializedRelPlanState,
++    relation_layouts: BTreeMap<SemanticId, LayoutBinding>,
++    materializations: BTreeMap<kernel_types::MaterializationId, MaterializedRelPlanState>,
+ }
+ 
+ /// Fully prepared but not yet freshness-sealed revision transition.
+ #[derive(Debug, PartialEq, Eq)]
+ pub struct PreparedRuntimeRevisionTransition {
+-    source_revision: RevisionId,
+-    target_revision: RevisionId,
++    descriptor: RevisionCommitDescriptor,
+     source_state: Box<RuntimeRevisionBundle>,
+     candidate: Box<RuntimeRevisionBundle>,
+-    output_delta: RelationDelta,
++    output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
+ }
+ 
+ /// Exclusive pre-publication capability.
+@@ -498,31 +539,131 @@
+ pub struct SealedRuntimeRevisionTransition<'a> {
+     live: &'a mut RuntimeRevisionBundle,
+     candidate: RuntimeRevisionBundle,
+-    source_revision: RevisionId,
+-    target_revision: RevisionId,
+-    output_delta: RelationDelta,
++    descriptor: RevisionCommitDescriptor,
++    output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
+ }
+ 
+ impl RuntimeRevisionBundle {
+-    pub fn new(
+-        revision: RevisionId,
++    pub fn build(
++        revision: kernel_revision::Revision,
+         mut physical: PhysicalStore,
+-        mut maintained: MaterializedRelPlanState,
++        relation_layouts: BTreeMap<SemanticId, LayoutBinding>,
++        materialization_specs: &[RuntimeMaterializationSpec],
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, PhysicalExecutionError> {
+-        physical.bind_revision(revision)?;
+-        maintained
+-            .bind_revision(revision)
+-            .map_err(PhysicalExecutionError::from)?;
++        Self::validate_physical_snapshot(&revision, &physical, &relation_layouts, registry)?;
++        physical.bind_revision(revision.id())?;
++
++        let mut materializations = BTreeMap::new();
++        for spec in materialization_specs {
++            if materializations.contains_key(&spec.id) {
++                return Err(PhysicalExecutionError::DuplicateMaterialization(spec.id));
++            }
++            let mut maintained = MaterializedRelPlanState::build(
++                &spec.query,
++                &revision.state().model,
++                revision.semantic_context(),
++                registry,
++            )?;
++            for relation in maintained.scan_relations() {
++                let layout = relation_layouts.get(&relation).copied().ok_or(
++                    PhysicalExecutionError::MissingRuntimeRelationBinding(relation),
++                )?;
++                let handles = physical.logical_row_handles(relation, layout)?;
++                maintained.attach_storage_handles(relation, &handles)?;
++            }
++            maintained.bind_revision(revision.id())?;
++            materializations.insert(spec.id, maintained);
++        }
++
+         Ok(Self {
+             revision,
+             physical,
+-            maintained,
++            relation_layouts,
++            materializations,
+         })
+     }
+ 
++    fn validate_physical_snapshot(
++        revision: &kernel_revision::Revision,
++        physical: &PhysicalStore,
++        relation_layouts: &BTreeMap<SemanticId, LayoutBinding>,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        if physical.revision().is_some() {
++            return Err(PhysicalExecutionError::RevisionBindingMismatch);
++        }
++        let schema_relations = revision
++            .semantic_context()
++            .schema
++            .relations()
++            .map(|relation| relation.id)
++            .collect::<BTreeSet<_>>();
++        if relation_layouts.len() != physical.relations.len()
++            || relation_layouts.keys().copied().collect::<BTreeSet<_>>() != schema_relations
++        {
++            return Err(PhysicalExecutionError::PhysicalRelationRegistryMismatch);
++        }
++
++        for relation in schema_relations {
++            let logical_rows = revision
++                .state()
++                .model
++                .relations
++                .get(&relation)
++                .cloned()
++                .unwrap_or_default();
++            let layout = relation_layouts.get(&relation).copied().ok_or(
++                PhysicalExecutionError::MissingRuntimeRelationBinding(relation),
++            )?;
++            let installed = physical.installed(relation, layout)?;
++            let rows = installed
++                .scan_positions()
++                .map(|position| materialize_native_row(&installed.data, position))
++                .collect::<Result<Vec<_>, _>>()?;
++            let result_type =
++                RelExpr::Scan(relation).typecheck(revision.semantic_context(), registry)?;
++            let to_exact_value = |rows| match &result_type.semantics {
++                kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
++                kernel_schema::RelationSemantics::Set {
++                    column_equivalences,
++                } => RelationValue::Set {
++                    rows,
++                    column_equivalences: column_equivalences.clone(),
++                },
++            };
++            let physical_value = to_exact_value(rows);
++            let logical_value = to_exact_value(logical_rows);
++            let difference = RelationDelta::between_values(
++                &logical_value,
++                &physical_value,
++                result_type,
++                revision.semantic_context(),
++                registry,
++            )?;
++            if !difference.is_empty() {
++                return Err(PhysicalExecutionError::LogicalPhysicalStateMismatch(
++                    relation,
++                ));
++            }
++        }
++
++        for (&relation, &layout) in relation_layouts {
++            if !physical.relations.contains_key(&(relation, layout.id)) {
++                return Err(PhysicalExecutionError::PhysicalRelationRegistryMismatch);
++            }
++        }
++        Ok(())
++    }
++
+     #[must_use]
+-    pub const fn revision(&self) -> RevisionId {
+-        self.revision
++    pub const fn revision(&self) -> &kernel_revision::Revision {
++        &self.revision
++    }
++
++    #[must_use]
++    pub const fn revision_id(&self) -> RevisionId {
++        self.revision.id()
+     }
+ 
+     #[must_use]
+@@ -531,8 +672,23 @@
+     }
+ 
+     #[must_use]
+-    pub const fn maintained_plan(&self) -> &MaterializedRelPlanState {
+-        &self.maintained
++    pub fn relation_layout(&self, relation: SemanticId) -> Option<LayoutBinding> {
++        self.relation_layouts.get(&relation).copied()
++    }
++
++    #[must_use]
++    pub fn materialization(
++        &self,
++        id: kernel_types::MaterializationId,
++    ) -> Option<&MaterializedRelPlanState> {
++        self.materializations.get(&id)
++    }
++
++    #[must_use]
++    pub const fn materializations(
++        &self,
++    ) -> &BTreeMap<kernel_types::MaterializationId, MaterializedRelPlanState> {
++        &self.materializations
+     }
+ 
+     /// Reconstructible physical-index mutation remains legal between semantic
+@@ -541,96 +697,163 @@
+     pub fn install_i64_index(
+         &mut self,
+         index: I64IndexBinding,
+-        context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+-        self.physical.install_i64_index(index, context, registry)
++        self.physical
++            .install_i64_index(index, self.revision.semantic_context(), registry)
+     }
+ 
+     pub fn prepare_revision(
+         &self,
+         request: &RevisionTransitionRequest<'_>,
+     ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
+-        if request.target_revision == self.revision {
++        let source_revision = self.revision.id();
++        let target_revision = request.target_revision.id();
++        if target_revision == source_revision {
+             return Err(PhysicalExecutionError::InvalidRevisionTransition);
+         }
++        if request.target_revision.semantic_context() != self.revision.semantic_context() {
++            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
++        }
+ 
+         let mut seen_relations = BTreeSet::new();
++        let mut relation_deltas = BTreeMap::new();
+         for mutation in request.mutations {
+             if !seen_relations.insert(mutation.relation) {
+                 return Err(PhysicalExecutionError::DuplicateRelationMutation(
+                     mutation.relation,
+                 ));
+             }
++            if !self.relation_layouts.contains_key(&mutation.relation) {
++                return Err(PhysicalExecutionError::MissingRuntimeRelationBinding(
++                    mutation.relation,
++                ));
++            }
++            relation_deltas.insert(mutation.relation, mutation.delta.clone());
+         }
+ 
+-        if self.physical.revision() != Some(self.revision)
+-            || self.maintained.revision() != Some(self.revision)
++        if self.physical.revision() != Some(source_revision)
++            || self
++                .materializations
++                .values()
++                .any(|state| state.revision() != Some(source_revision))
+         {
+             return Err(PhysicalExecutionError::RevisionBindingMismatch);
+         }
+ 
++        self.validate_target_logical_state(request)?;
++
+         let mut candidate_store = self.physical.clone();
+         let mut certified = BTreeMap::new();
+         for mutation in request.mutations {
++            let layout = self.relation_layouts[&mutation.relation];
+             let delta = candidate_store.apply_relation_delta_certified_in_place(
+                 mutation.relation,
+-                mutation.layout,
++                layout,
+                 mutation.delta,
+-                request.context,
++                self.revision.semantic_context(),
+                 request.registry,
+             )?;
+             certified.insert(mutation.relation, delta);
+         }
+-        candidate_store.revision = Some(request.target_revision);
++        candidate_store.revision = Some(target_revision);
+ 
+-        let prepared_plan = self
+-            .maintained
+-            .prepare_storage_certified_deltas_for_revision(
+-                self.revision,
+-                request.target_revision,
+-                &certified,
+-                request.context,
++        let mut candidate_materializations = BTreeMap::new();
++        let mut output_deltas = BTreeMap::new();
++        for (&id, maintained) in &self.materializations {
++            let dependencies = maintained.scan_relations();
++            let relevant = certified
++                .iter()
++                .filter(|(relation, _)| dependencies.contains(relation))
++                .map(|(relation, delta)| (*relation, delta.clone()))
++                .collect::<BTreeMap<_, _>>();
++            let prepared_plan = maintained.prepare_storage_certified_deltas_for_revision(
++                source_revision,
++                target_revision,
++                &relevant,
++                self.revision.semantic_context(),
+                 request.registry,
+             )?;
+-        let (candidate_plan, output_delta) = prepared_plan
+-            .into_candidate_if_current(&self.maintained)
+-            .map_err(|error| match error {
+-                RelQueryError::StalePreparedTransition => {
+-                    PhysicalExecutionError::StalePreparedTransition
+-                }
+-                other => PhysicalExecutionError::Query(other),
+-            })?;
++            let (candidate_plan, output_delta) = prepared_plan
++                .into_candidate_if_current(maintained)
++                .map_err(|error| match error {
++                    RelQueryError::StalePreparedTransition => {
++                        PhysicalExecutionError::StalePreparedTransition
++                    }
++                    other => PhysicalExecutionError::Query(other),
++                })?;
++            candidate_materializations.insert(id, candidate_plan);
++            output_deltas.insert(id, output_delta);
++        }
+ 
+         let candidate = RuntimeRevisionBundle {
+-            revision: request.target_revision,
++            revision: request.target_revision.clone(),
+             physical: candidate_store,
+-            maintained: candidate_plan,
++            relation_layouts: self.relation_layouts.clone(),
++            materializations: candidate_materializations,
++        };
++        let descriptor = RevisionCommitDescriptor {
++            source_revision,
++            target_revision,
++            semantic_revision: self.revision.semantic_revision(),
++            relation_deltas,
+         };
+         Ok(PreparedRuntimeRevisionTransition {
+-            source_revision: self.revision,
+-            target_revision: request.target_revision,
++            descriptor,
+             source_state: Box::new(self.clone()),
+             candidate: Box::new(candidate),
+-            output_delta,
++            output_deltas,
+         })
+     }
++
++    fn validate_target_logical_state(
++        &self,
++        request: &RevisionTransitionRequest<'_>,
++    ) -> Result<(), PhysicalExecutionError> {
++        let mut expected = self.revision.state().clone();
++        for mutation in request.mutations {
++            let relation = RelExpr::Scan(mutation.relation);
++            let old = relation.evaluate(
++                &expected.model,
++                self.revision.semantic_context(),
++                request.registry,
++            )?;
++            let next = mutation.delta.apply_to_value(
++                old,
++                self.revision.semantic_context(),
++                request.registry,
++            )?;
++            expected
++                .model
++                .relations
++                .insert(mutation.relation, next.into_rows());
++        }
++        if &expected != request.target_revision.state() {
++            return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
++        }
++        Ok(())
++    }
+ }
+ 
+ impl PreparedRuntimeRevisionTransition {
+     #[must_use]
++    pub const fn descriptor(&self) -> &RevisionCommitDescriptor {
++        &self.descriptor
++    }
++
++    #[must_use]
+     pub const fn source_revision(&self) -> RevisionId {
+-        self.source_revision
++        self.descriptor.source_revision
+     }
+ 
+     #[must_use]
+     pub const fn target_revision(&self) -> RevisionId {
+-        self.target_revision
++        self.descriptor.target_revision
+     }
+ 
+     #[must_use]
+-    pub fn output_delta(&self) -> &RelationDelta {
+-        &self.output_delta
++    pub const fn output_deltas(&self) -> &BTreeMap<kernel_types::MaterializationId, RelationDelta> {
++        &self.output_deltas
+     }
+ 
+     /// Performs the last fallible freshness check and retains exclusive access
+@@ -639,41 +862,47 @@
+         self,
+         live: &mut RuntimeRevisionBundle,
+     ) -> Result<SealedRuntimeRevisionTransition<'_>, PhysicalExecutionError> {
+-        if live != self.source_state.as_ref() || live.revision != self.source_revision {
++        if live != self.source_state.as_ref()
++            || live.revision.id() != self.descriptor.source_revision
++        {
+             return Err(PhysicalExecutionError::StalePreparedTransition);
+         }
+         Ok(SealedRuntimeRevisionTransition {
+             live,
+             candidate: *self.candidate,
+-            source_revision: self.source_revision,
+-            target_revision: self.target_revision,
+-            output_delta: self.output_delta,
++            descriptor: self.descriptor,
++            output_deltas: self.output_deltas,
+         })
+     }
+ }
+ 
+ impl SealedRuntimeRevisionTransition<'_> {
+     #[must_use]
++    pub const fn descriptor(&self) -> &RevisionCommitDescriptor {
++        &self.descriptor
++    }
++
++    #[must_use]
+     pub const fn source_revision(&self) -> RevisionId {
+-        self.source_revision
++        self.descriptor.source_revision
+     }
+ 
+     #[must_use]
+     pub const fn target_revision(&self) -> RevisionId {
+-        self.target_revision
++        self.descriptor.target_revision
+     }
+ 
+     #[must_use]
+-    pub fn output_delta(&self) -> &RelationDelta {
+-        &self.output_delta
++    pub const fn output_deltas(&self) -> &BTreeMap<kernel_types::MaterializationId, RelationDelta> {
++        &self.output_deltas
+     }
+ 
+     /// Infallible reader-visible publication. No semantic validation, freshness
+     /// check, row lookup or index planning occurs after the seal boundary.
+     #[must_use]
+-    pub fn publish(self) -> RelationDelta {
++    pub fn publish(self) -> BTreeMap<kernel_types::MaterializationId, RelationDelta> {
+         *self.live = self.candidate;
+-        self.output_delta
++        self.output_deltas
+     }
+ }
+ 
+@@ -1070,6 +1299,12 @@
+     RevisionBindingMismatch,
+     InvalidRevisionTransition,
+     DuplicateRelationMutation(SemanticId),
++    DuplicateMaterialization(kernel_types::MaterializationId),
++    MissingRuntimeRelationBinding(SemanticId),
++    PhysicalRelationRegistryMismatch,
++    LogicalPhysicalStateMismatch(SemanticId),
++    LogicalRevisionMutationMismatch,
++    SemanticContextTransitionRequiresRebuild,
+     RevisionBoundMutationRequiresPreparedTransition,
+     TransitionEpochExhausted,
+ }
+@@ -4851,7 +5086,7 @@
+         TypeExpr,
+     };
+     use kernel_semantics::{EquivalenceModule, SemanticRegistry};
+-    use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId};
++    use kernel_types::{MaterializationId, RevisionId, SchemaRevisionId, SemanticEnvId};
+ 
+     use super::*;
+ 
+@@ -5853,6 +6088,72 @@
+         assert_eq!(maintained, before);
+     }
+ 
++    fn test_materialization_id() -> MaterializationId {
++        MaterializationId::new(1)
++    }
++
++    fn target_revision_for(
++        runtime: &RuntimeRevisionBundle,
++        target_revision: u64,
++        mutations: &[RevisionRelationMutation<'_>],
++        registry: &SemanticRegistry,
++    ) -> kernel_revision::Revision {
++        let mut state = runtime.revision().state().clone();
++        for mutation in mutations {
++            let relation = RelExpr::Scan(mutation.relation);
++            let old = relation
++                .evaluate(
++                    &state.model,
++                    runtime.revision().semantic_context(),
++                    registry,
++                )
++                .unwrap();
++            let next = mutation
++                .delta
++                .apply_to_value(old, runtime.revision().semantic_context(), registry)
++                .unwrap();
++            state
++                .model
++                .relations
++                .insert(mutation.relation, next.into_rows());
++        }
++        kernel_revision::Revision::build(
++            RevisionId::new(target_revision),
++            runtime.revision().semantic_context(),
++            registry,
++            state,
++        )
++        .unwrap()
++    }
++
++    fn revision_with_same_state(
++        runtime: &RuntimeRevisionBundle,
++        target_revision: u64,
++        registry: &SemanticRegistry,
++    ) -> kernel_revision::Revision {
++        kernel_revision::Revision::build(
++            RevisionId::new(target_revision),
++            runtime.revision().semantic_context(),
++            registry,
++            runtime.revision().state().clone(),
++        )
++        .unwrap()
++    }
++
++    fn prepare_runtime_revision(
++        runtime: &RuntimeRevisionBundle,
++        target_revision: u64,
++        mutations: &[RevisionRelationMutation<'_>],
++        registry: &SemanticRegistry,
++    ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
++        let target = target_revision_for(runtime, target_revision, mutations, registry);
++        runtime.prepare_revision(&RevisionTransitionRequest {
++            target_revision: &target,
++            mutations,
++            registry,
++        })
++    }
++
+     fn scan_runtime_bundle(
+         revision: u64,
+         layout_id: u64,
+@@ -5877,8 +6178,6 @@
+         let mut model = kernel_model::FiniteModel::default();
+         model.relations.insert(relation, rows);
+         let query = RelExpr::Scan(relation);
+-        let mut maintained =
+-            MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+         let mut store = PhysicalStore::default();
+         store
+             .install(
+@@ -5887,14 +6186,27 @@
+                 NativeRelation::typed_columnar(vec![NativeColumn::I64(values.to_vec())]).unwrap(),
+             )
+             .unwrap();
+-        maintained
+-            .attach_storage_handles(
+-                relation,
+-                &store.logical_row_handles(relation, binding).unwrap(),
+-            )
+-            .unwrap();
+-        let runtime =
+-            RuntimeRevisionBundle::new(RevisionId::new(revision), store, maintained).unwrap();
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(revision),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let runtime = RuntimeRevisionBundle::build(
++            revision,
++            store,
++            BTreeMap::from([(relation, binding)]),
++            &[RuntimeMaterializationSpec {
++                id: test_materialization_id(),
++                query,
++            }],
++            &registry,
++        )
++        .unwrap();
+         (context, registry, relation, binding, runtime)
+     }
+ 
+@@ -5949,7 +6261,8 @@
+         registry: &SemanticRegistry,
+     ) -> Vec<i64> {
+         let mut values = runtime
+-            .maintained_plan()
++            .materialization(test_materialization_id())
++            .unwrap()
+             .output_value(context, registry)
+             .unwrap()
+             .rows()
+@@ -5970,38 +6283,42 @@
+         let delta = scan_delta(relation, &[4], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &delta,
+         }];
+         let before = runtime.clone();
+-        let prepared = runtime
+-            .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(41),
+-                mutations: &mutations,
+-                context: &context,
+-                registry: &registry,
+-            })
+-            .unwrap();
++        let prepared = prepare_runtime_revision(&runtime, 41, &mutations, &registry).unwrap();
+ 
+         assert_eq!(prepared.source_revision(), RevisionId::new(40));
+         assert_eq!(prepared.target_revision(), RevisionId::new(41));
+-        assert_eq!(prepared.output_delta(), &delta);
++        assert_eq!(prepared.descriptor().relation_deltas()[&relation], delta);
++        assert_eq!(prepared.output_deltas()[&test_materialization_id()], delta);
+         assert_eq!(runtime, before);
+ 
+         let sealed = prepared.seal(&mut runtime).unwrap();
+         assert_eq!(sealed.source_revision(), RevisionId::new(40));
+         assert_eq!(sealed.target_revision(), RevisionId::new(41));
+-        assert_eq!(sealed.output_delta(), &delta);
++        assert_eq!(sealed.descriptor().relation_deltas()[&relation], delta);
+         let emitted = sealed.publish();
+ 
+-        assert_eq!(emitted, delta);
+-        assert_eq!(runtime.revision(), RevisionId::new(41));
++        assert_eq!(emitted[&test_materialization_id()], delta);
++        assert_eq!(runtime.revision_id(), RevisionId::new(41));
++        assert_eq!(
++            runtime.revision().state().model.relations[&relation],
++            vec![
++                vec![Value::I64(2)],
++                vec![Value::I64(3)],
++                vec![Value::I64(4)],
++            ]
++        );
+         assert_eq!(
+             runtime.physical_store().revision(),
+             Some(RevisionId::new(41))
+         );
+         assert_eq!(
+-            runtime.maintained_plan().revision(),
++            runtime
++                .materialization(test_materialization_id())
++                .unwrap()
++                .revision(),
+             Some(RevisionId::new(41))
+         );
+         assert_eq!(
+@@ -6015,49 +6332,50 @@
+     }
+ 
+     #[test]
+-    fn failed_prepare_does_not_publish_candidate() {
+-        let (context, registry, relation, binding, runtime) = scan_runtime_bundle(50, 962, &[1, 2]);
++    fn semantic_context_change_is_rejected_without_publication() {
++        let (context, registry, relation, _, runtime) = scan_runtime_bundle(50, 962, &[1, 2]);
+         let mut wrong_context = context.clone();
+         wrong_context.schema.revision = SchemaRevisionId::new(999_962);
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &delta,
+         }];
++        let mut target_state = runtime.revision().state().clone();
++        target_state
++            .model
++            .relations
++            .insert(relation, vec![vec![Value::I64(2)], vec![Value::I64(3)]]);
++        let target = kernel_revision::Revision::build(
++            RevisionId::new(51),
++            &wrong_context,
++            &registry,
++            target_state,
++        )
++        .unwrap();
+         let before = runtime.clone();
+ 
+-        assert!(
+-            runtime
+-                .prepare_revision(&RevisionTransitionRequest {
+-                    target_revision: RevisionId::new(51),
+-                    mutations: &mutations,
+-                    context: &wrong_context,
+-                    registry: &registry,
+-                })
+-                .is_err()
++        assert_eq!(
++            runtime.prepare_revision(&RevisionTransitionRequest {
++                target_revision: &target,
++                mutations: &mutations,
++                registry: &registry,
++            }),
++            Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild)
+         );
+         assert_eq!(runtime, before);
+     }
+ 
+     #[test]
+     fn prepared_transition_rejects_different_same_revision_bundle() {
+-        let (context, registry, relation, binding, source) = scan_runtime_bundle(60, 963, &[1, 2]);
++        let (context, registry, relation, _, source) = scan_runtime_bundle(60, 963, &[1, 2]);
+         let (_, _, _, _, mut different) = scan_runtime_bundle(60, 963, &[7, 8]);
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &delta,
+         }];
+-        let prepared = source
+-            .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(61),
+-                mutations: &mutations,
+-                context: &context,
+-                registry: &registry,
+-            })
+-            .unwrap();
++        let prepared = prepare_runtime_revision(&source, 61, &mutations, &registry).unwrap();
+         let different_before = different.clone();
+ 
+         assert!(matches!(
+@@ -6074,17 +6392,9 @@
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &delta,
+         }];
+-        let prepared = runtime
+-            .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(71),
+-                mutations: &mutations,
+-                context: &context,
+-                registry: &registry,
+-            })
+-            .unwrap();
++        let prepared = prepare_runtime_revision(&runtime, 71, &mutations, &registry).unwrap();
+         runtime
+             .install_i64_index(
+                 I64IndexBinding {
+@@ -6093,7 +6403,6 @@
+                     key_column: 0,
+                     equivalence: sid(101),
+                 },
+-                &context,
+                 &registry,
+             )
+             .unwrap();
+@@ -6108,36 +6417,19 @@
+ 
+     #[test]
+     fn competing_prepared_transitions_from_same_revision_cannot_both_publish() {
+-        let (context, registry, relation, binding, mut runtime) =
+-            scan_runtime_bundle(100, 967, &[1, 2]);
++        let (context, registry, relation, _, mut runtime) = scan_runtime_bundle(100, 967, &[1, 2]);
+         let delta_a = scan_delta(relation, &[3], &[1], &context, &registry);
+         let delta_b = scan_delta(relation, &[4], &[2], &context, &registry);
+         let mutations_a = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &delta_a,
+         }];
+         let mutations_b = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &delta_b,
+         }];
+-        let prepared_a = runtime
+-            .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(101),
+-                mutations: &mutations_a,
+-                context: &context,
+-                registry: &registry,
+-            })
+-            .unwrap();
+-        let prepared_b = runtime
+-            .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(102),
+-                mutations: &mutations_b,
+-                context: &context,
+-                registry: &registry,
+-            })
+-            .unwrap();
++        let prepared_a = prepare_runtime_revision(&runtime, 101, &mutations_a, &registry).unwrap();
++        let prepared_b = prepare_runtime_revision(&runtime, 102, &mutations_b, &registry).unwrap();
+ 
+         let _ = prepared_a.seal(&mut runtime).unwrap().publish();
+         let after_a = runtime.clone();
+@@ -6146,7 +6438,7 @@
+             Err(PhysicalExecutionError::StalePreparedTransition)
+         ));
+         assert_eq!(runtime, after_a);
+-        assert_eq!(runtime.revision(), RevisionId::new(101));
++        assert_eq!(runtime.revision_id(), RevisionId::new(101));
+     }
+ 
+     #[test]
+@@ -6162,16 +6454,9 @@
+         let first = scan_delta(relation, &[3], &[1], &context, &registry);
+         let first_mutations = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &first,
+         }];
+-        let _ = runtime
+-            .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(111),
+-                mutations: &first_mutations,
+-                context: &context,
+-                registry: &registry,
+-            })
++        let _ = prepare_runtime_revision(&runtime, 111, &first_mutations, &registry)
+             .unwrap()
+             .seal(&mut runtime)
+             .unwrap()
+@@ -6190,16 +6475,9 @@
+         let second = scan_delta(relation, &[4], &[3], &context, &registry);
+         let second_mutations = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &second,
+         }];
+-        let _ = runtime
+-            .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(112),
+-                mutations: &second_mutations,
+-                context: &context,
+-                registry: &registry,
+-            })
++        let _ = prepare_runtime_revision(&runtime, 112, &second_mutations, &registry)
+             .unwrap()
+             .seal(&mut runtime)
+             .unwrap()
+@@ -6215,7 +6493,7 @@
+             .unwrap();
+ 
+         assert_eq!(reused_again.generation, 2);
+-        assert_eq!(runtime.revision(), RevisionId::new(112));
++        assert_eq!(runtime.revision_id(), RevisionId::new(112));
+         assert_eq!(
+             runtime_physical_i64_values(&runtime, relation, binding),
+             vec![2, 4]
+@@ -6228,54 +6506,256 @@
+ 
+     #[test]
+     fn revision_prepare_rejects_same_source_and_target_without_mutation() {
+-        let (context, registry, relation, binding, runtime) =
+-            scan_runtime_bundle(119, 970, &[1, 2]);
++        let (context, registry, relation, _, runtime) = scan_runtime_bundle(119, 970, &[1, 2]);
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &delta,
+         }];
++        let target = target_revision_for(&runtime, 119, &mutations, &registry);
+         let before = runtime.clone();
+ 
+-        assert!(matches!(
++        assert_eq!(
+             runtime.prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(119),
++                target_revision: &target,
+                 mutations: &mutations,
+-                context: &context,
+                 registry: &registry,
+             }),
+             Err(PhysicalExecutionError::InvalidRevisionTransition)
+-        ));
++        );
+         assert_eq!(runtime, before);
+     }
+ 
+     #[test]
+     fn sealed_transition_drop_aborts_without_publication() {
+-        let (context, registry, relation, binding, mut runtime) =
+-            scan_runtime_bundle(125, 971, &[1, 2]);
++        let (context, registry, relation, _, mut runtime) = scan_runtime_bundle(125, 971, &[1, 2]);
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let before = runtime.clone();
++        let prepared = prepare_runtime_revision(&runtime, 126, &mutations, &registry).unwrap();
++        let sealed = prepared.seal(&mut runtime).unwrap();
++        assert_eq!(sealed.source_revision(), RevisionId::new(125));
++        assert_eq!(sealed.target_revision(), RevisionId::new(126));
++        drop(sealed);
++
++        assert_eq!(runtime, before);
++        assert_eq!(runtime.revision_id(), RevisionId::new(125));
++    }
++
++    #[test]
++    fn bootstrap_rejects_logical_physical_divergence() {
++        let (context, registry, relation) = planning_context();
++        let binding = LayoutBinding {
++            id: LayoutId(972),
++            family: LayoutFamily::Columnar,
++        };
++        let mut model = kernel_model::FiniteModel::default();
++        model
++            .relations
++            .insert(relation, vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(130),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 9])]).unwrap(),
++            )
++            .unwrap();
++
++        assert!(matches!(
++            RuntimeRevisionBundle::build(
++                revision,
++                store,
++                BTreeMap::from([(relation, binding)]),
++                &[RuntimeMaterializationSpec {
++                    id: test_materialization_id(),
++                    query: RelExpr::Scan(relation),
++                }],
++                &registry,
++            ),
++            Err(PhysicalExecutionError::LogicalPhysicalStateMismatch(found)) if found == relation
++        ));
++    }
++
++    #[test]
++    fn target_revision_state_must_match_logical_mutation_descriptor() {
++        let (context, registry, relation, _, runtime) = scan_runtime_bundle(140, 973, &[1, 2]);
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+-            layout: binding,
+             delta: &delta,
+         }];
++        let mismatched_target = revision_with_same_state(&runtime, 141, &registry);
+         let before = runtime.clone();
++
++        assert_eq!(
++            runtime.prepare_revision(&RevisionTransitionRequest {
++                target_revision: &mismatched_target,
++                mutations: &mutations,
++                registry: &registry,
++            }),
++            Err(PhysicalExecutionError::LogicalRevisionMutationMismatch)
++        );
++        assert_eq!(runtime, before);
++    }
++
++    #[test]
++    fn materialization_registry_advances_all_registered_plans_atomically() {
++        let (context, registry, relation) = planning_context();
++        let binding = LayoutBinding {
++            id: LayoutId(974),
++            family: LayoutFamily::Columnar,
++        };
++        let mut model = kernel_model::FiniteModel::default();
++        model
++            .relations
++            .insert(relation, vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(150),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 2])]).unwrap(),
++            )
++            .unwrap();
++        let scan_id = MaterializationId::new(10);
++        let filter_id = MaterializationId::new(11);
++        let filter_query = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            value: Value::I64(2),
++            equivalence: sid(101),
++        };
++        let mut runtime = RuntimeRevisionBundle::build(
++            revision,
++            store,
++            BTreeMap::from([(relation, binding)]),
++            &[
++                RuntimeMaterializationSpec {
++                    id: scan_id,
++                    query: RelExpr::Scan(relation),
++                },
++                RuntimeMaterializationSpec {
++                    id: filter_id,
++                    query: filter_query.clone(),
++                },
++            ],
++            &registry,
++        )
++        .unwrap();
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let target = target_revision_for(&runtime, 151, &mutations, &registry);
+         let prepared = runtime
+             .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(126),
++                target_revision: &target,
+                 mutations: &mutations,
+-                context: &context,
+                 registry: &registry,
+             })
+             .unwrap();
+-        let sealed = prepared.seal(&mut runtime).unwrap();
+-        assert_eq!(sealed.source_revision(), RevisionId::new(125));
+-        assert_eq!(sealed.target_revision(), RevisionId::new(126));
+-        drop(sealed);
++        assert_eq!(
++            prepared.descriptor().semantic_revision(),
++            context.revision()
++        );
++        assert_eq!(prepared.output_deltas()[&scan_id], delta);
++        assert!(prepared.output_deltas()[&filter_id].is_empty());
++        let emitted = prepared.seal(&mut runtime).unwrap().publish();
++
++        assert_eq!(emitted.len(), 2);
++        assert_eq!(runtime.revision_id(), RevisionId::new(151));
++        for id in [scan_id, filter_id] {
++            assert_eq!(
++                runtime.materialization(id).unwrap().revision(),
++                Some(RevisionId::new(151))
++            );
++        }
++        let expected_filter = filter_query
++            .evaluate(&runtime.revision().state().model, &context, &registry)
++            .unwrap();
++        assert_eq!(
++            runtime
++                .materialization(filter_id)
++                .unwrap()
++                .output_value(&context, &registry)
++                .unwrap(),
++            expected_filter
++        );
++    }
+ 
+-        assert_eq!(runtime, before);
+-        assert_eq!(runtime.revision(), RevisionId::new(125));
++    #[test]
++    fn duplicate_materialization_id_is_rejected_at_bootstrap() {
++        let (context, registry, relation) = planning_context();
++        let binding = LayoutBinding {
++            id: LayoutId(975),
++            family: LayoutFamily::Columnar,
++        };
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(relation, vec![vec![Value::I64(1)]]);
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(160),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1])]).unwrap(),
++            )
++            .unwrap();
++        let duplicate = MaterializationId::new(99);
++
++        assert_eq!(
++            RuntimeRevisionBundle::build(
++                revision,
++                store,
++                BTreeMap::from([(relation, binding)]),
++                &[
++                    RuntimeMaterializationSpec {
++                        id: duplicate,
++                        query: RelExpr::Scan(relation),
++                    },
++                    RuntimeMaterializationSpec {
++                        id: duplicate,
++                        query: RelExpr::Scan(relation),
++                    },
++                ],
++                &registry,
++            ),
++            Err(PhysicalExecutionError::DuplicateMaterialization(duplicate))
++        );
+     }
+ 
+     #[test]
+@@ -6416,8 +6896,6 @@
+         model
+             .relations
+             .insert(right, vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
+-        let mut maintained =
+-            MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+         let mut store = PhysicalStore::default();
+         store
+             .install(
+@@ -6433,20 +6911,27 @@
+                 NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 2])]).unwrap(),
+             )
+             .unwrap();
+-        maintained
+-            .attach_storage_handles(
+-                left,
+-                &store.logical_row_handles(left, left_binding).unwrap(),
+-            )
+-            .unwrap();
+-        maintained
+-            .attach_storage_handles(
+-                right,
+-                &store.logical_row_handles(right, right_binding).unwrap(),
+-            )
+-            .unwrap();
+-        let runtime =
+-            RuntimeRevisionBundle::new(RevisionId::new(revision), store, maintained).unwrap();
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(revision),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let runtime = RuntimeRevisionBundle::build(
++            revision,
++            store,
++            BTreeMap::from([(left, left_binding), (right, right_binding)]),
++            &[RuntimeMaterializationSpec {
++                id: test_materialization_id(),
++                query: query.clone(),
++            }],
++            &registry,
++        )
++        .unwrap();
+         (
+             context,
+             registry,
+@@ -6468,47 +6953,37 @@
+         let mutations = [
+             RevisionRelationMutation {
+                 relation: left,
+-                layout: left_binding,
+                 delta: &left_delta,
+             },
+             RevisionRelationMutation {
+                 relation: right,
+-                layout: right_binding,
+                 delta: &right_delta,
+             },
+         ];
+         let before = runtime.clone();
+-        let prepared = runtime
+-            .prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(201),
+-                mutations: &mutations,
+-                context: &context,
+-                registry: &registry,
+-            })
+-            .unwrap();
++        let prepared = prepare_runtime_revision(&runtime, 201, &mutations, &registry).unwrap();
+         assert_eq!(runtime, before);
+         let _ = prepared.seal(&mut runtime).unwrap().publish();
+ 
+-        let mut final_model = kernel_model::FiniteModel::default();
+-        final_model
+-            .relations
+-            .insert(left, vec![vec![Value::I64(2)], vec![Value::I64(3)]]);
+-        final_model
+-            .relations
+-            .insert(right, vec![vec![Value::I64(1)], vec![Value::I64(3)]]);
+-        let reference = query.evaluate(&final_model, &context, &registry).unwrap();
++        let reference = query
++            .evaluate(&runtime.revision().state().model, &context, &registry)
++            .unwrap();
+         let maintained = runtime
+-            .maintained_plan()
++            .materialization(test_materialization_id())
++            .unwrap()
+             .output_value(&context, &registry)
+             .unwrap();
+ 
+-        assert_eq!(runtime.revision(), RevisionId::new(201));
++        assert_eq!(runtime.revision_id(), RevisionId::new(201));
+         assert_eq!(
+             runtime.physical_store().revision(),
+             Some(RevisionId::new(201))
+         );
+         assert_eq!(
+-            runtime.maintained_plan().revision(),
++            runtime
++                .materialization(test_materialization_id())
++                .unwrap()
++                .revision(),
+             Some(RevisionId::new(201))
+         );
+         assert_eq!(
+@@ -6525,30 +7000,27 @@
+ 
+     #[test]
+     fn failure_in_second_relation_of_batch_leaves_live_bundle_unchanged() {
+-        let (context, registry, left, right, left_binding, right_binding, _, runtime) =
+-            join_runtime_bundle(210);
++        let (context, registry, left, right, _, _, _, runtime) = join_runtime_bundle(210);
+         let left_delta = scan_delta(left, &[3], &[1], &context, &registry);
+         let invalid_right_delta = scan_delta(right, &[3], &[99], &context, &registry);
+         let mutations = [
+             RevisionRelationMutation {
+                 relation: left,
+-                layout: left_binding,
+                 delta: &left_delta,
+             },
+             RevisionRelationMutation {
+                 relation: right,
+-                layout: right_binding,
+                 delta: &invalid_right_delta,
+             },
+         ];
++        let target = revision_with_same_state(&runtime, 211, &registry);
+         let before = runtime.clone();
+ 
+         assert!(
+             runtime
+                 .prepare_revision(&RevisionTransitionRequest {
+-                    target_revision: RevisionId::new(211),
++                    target_revision: &target,
+                     mutations: &mutations,
+-                    context: &context,
+                     registry: &registry,
+                 })
+                 .is_err()
+@@ -6558,29 +7030,26 @@
+ 
+     #[test]
+     fn duplicate_relation_in_revision_batch_is_rejected_before_prepare() {
+-        let (context, registry, relation, binding, runtime) =
+-            scan_runtime_bundle(220, 982, &[1, 2]);
++        let (context, registry, relation, _, runtime) = scan_runtime_bundle(220, 982, &[1, 2]);
+         let first = scan_delta(relation, &[3], &[1], &context, &registry);
+         let second = scan_delta(relation, &[4], &[2], &context, &registry);
+         let mutations = [
+             RevisionRelationMutation {
+                 relation,
+-                layout: binding,
+                 delta: &first,
+             },
+             RevisionRelationMutation {
+                 relation,
+-                layout: binding,
+                 delta: &second,
+             },
+         ];
++        let target = revision_with_same_state(&runtime, 221, &registry);
+         let before = runtime.clone();
+ 
+         assert!(matches!(
+             runtime.prepare_revision(&RevisionTransitionRequest {
+-                target_revision: RevisionId::new(221),
++                target_revision: &target,
+                 mutations: &mutations,
+-                context: &context,
+                 registry: &registry,
+             }),
+             Err(PhysicalExecutionError::DuplicateRelationMutation(found)) if found == relation

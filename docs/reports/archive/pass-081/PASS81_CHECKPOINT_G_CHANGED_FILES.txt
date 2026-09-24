@@ -1,0 +1,13 @@
+crates/kernel-change/Cargo.toml
+crates/kernel-change/src/lib.rs
+crates/kernel-lens/Cargo.toml
+crates/kernel-lens/src/lib.rs
+crates/kernel-query/src/lib.rs
+crates/kernel-transport/src/lib.rs
+PASS81_INTEGRATION_LEDGER.md
+PASS81_CHECKPOINT_C_WRITE_FOUNDATION.md
+PASS81_CHECKPOINT_D_DEPENDENT_LENS.md
+PASS81_CHECKPOINT_E_WRITABLE_VIEW.md
+PASS81_CHECKPOINT_F_REWRITE_LAWS.md
+PASS81_CHECKPOINT_G_WRITE_RND_INTEGRATION.md
+PASS81_CHECKPOINT_G_CHANGED_FILES.txt

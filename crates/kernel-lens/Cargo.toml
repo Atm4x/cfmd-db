@@ -1,0 +1,16 @@
+[package]
+name = "kernel-lens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-change = { path = "../kernel-change" }
+kernel-model = { path = "../kernel-model" }
+kernel-query = { path = "../kernel-query" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true

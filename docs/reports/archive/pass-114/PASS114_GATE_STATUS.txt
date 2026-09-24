@@ -1,0 +1,9 @@
+freeze_utc=2026-09-23T16:19:19Z
+status=16B_CLOSURE_CANDIDATE_FULL_WORKSPACE_TEST_INCOMPLETE
+fmt=PASS
+workspace_check=PASS
+workspace_strict_clippy=PASS
+kernel_auth_tests=12_passed_0_failed
+kernel_durability_tests=86_passed_0_failed
+full_workspace_tests=INCOMPLETE_due_external_tool_timeout_after_no_observed_failures
+source_frozen=true

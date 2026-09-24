@@ -1,0 +1,4 @@
+n=1000 one_join=15214 one_group=4487 one_top=7452
+n=1000 maintained_tree_ns=4795
+n=10000 one_join=22284 one_group=7895 one_top=9957
+n=10000 maintained_tree_ns=6544

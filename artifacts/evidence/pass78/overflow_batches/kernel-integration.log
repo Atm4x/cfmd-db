@@ -1,0 +1,13 @@
+   Compiling kernel-retention v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-retention)
+   Compiling kernel-durability v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-durability)
+   Compiling storage-memory v0.1.0 (/mnt/data/cfmd_pass78_work/crates/storage-memory)
+   Compiling kernel-plan v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-plan)
+   Compiling kernel-integration v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-integration)
+    Finished `release` profile [optimized] target(s) in 17.30s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_integration-d5c403c730e24275)
+
+running 1 test
+test tests::vertical_slice_preserves_semantics_across_layers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

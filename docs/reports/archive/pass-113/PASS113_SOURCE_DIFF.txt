@@ -1,0 +1,1492 @@
+--- /mnt/data/cfmd_pass112_p18_lean/crates/kernel-durability/src/lib.rs	2026-09-23 01:55:20.000000000 +0000
++++ crates/kernel-durability/src/lib.rs	2026-09-23 15:29:19.168206712 +0000
+@@ -20,9 +20,11 @@
+ 
+ pub use replication::{
+     DurableSequencerOrder, ReplicaId, ReplicatedEffectEnvelope, ReplicationBranchHead,
+-    ReplicationBranchId, ReplicationEffectStage, ReplicationEffectVote, ReplicationIngestOutcome,
+-    ReplicationMembership, ReplicationMembershipChange, ReplicationMembershipVote,
+-    ReplicationQuorumCertificate, replicated_effect_id, replicated_origin,
++    ReplicationBranchId, ReplicationDecisionLock, ReplicationDecisionVote, ReplicationEffectStage,
++    ReplicationEffectVote, ReplicationIngestOutcome, ReplicationJointMembershipCertificate,
++    ReplicationLeaderCertificate, ReplicationLeaderVote, ReplicationMembership,
++    ReplicationMembershipChange, ReplicationMembershipVote, ReplicationQuorumCertificate,
++    ReplicationTermPromise, replicated_effect_id, replicated_origin,
+ };
+ 
+ pub use store::{
+--- /mnt/data/cfmd_pass112_p18_lean/crates/kernel-durability/src/replication.rs	2026-09-23 01:55:20.000000000 +0000
++++ crates/kernel-durability/src/replication.rs	2026-09-23 15:37:40.312492316 +0000
+@@ -21,6 +21,12 @@
+ const KIND_PUBLISH: u8 = 5;
+ const KIND_EFFECT_VOTE: u8 = 6;
+ const KIND_MEMBERSHIP_VOTE: u8 = 7;
++const KIND_TERM_PROMISE: u8 = 8;
++const KIND_LEADER_VOTE: u8 = 9;
++const KIND_LEADER_CERTIFICATE: u8 = 10;
++const KIND_DECISION_VOTE: u8 = 11;
++const KIND_DECISION_LOCK: u8 = 12;
++const KIND_JOINT_MEMBERSHIP_CERTIFICATE: u8 = 13;
+ 
+ /// Stable origin namespace for replicated causal event identities.
+ /// Origin zero is reserved for the local store's existing effect allocator.
+@@ -160,6 +166,69 @@
+     pub next: ReplicationMembership,
+ }
+ 
++/// Durable promise that one membership voter will not vote in a lower term.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ReplicationTermPromise {
++    pub voter: ReplicaId,
++    pub membership_epoch: u64,
++    pub term: u64,
++}
++
++/// Durable vote-for-leader. One voter may vote for only one candidate in one term.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ReplicationLeaderVote {
++    pub voter: ReplicaId,
++    pub membership_epoch: u64,
++    pub term: u64,
++    pub candidate: ReplicaId,
++}
++
++/// Quorum-backed leader authority for one membership epoch and term.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ReplicationLeaderCertificate {
++    pub membership_epoch: u64,
++    pub term: u64,
++    pub leader: ReplicaId,
++    pub acknowledged_by: BTreeSet<ReplicaId>,
++}
++
++/// Term-bound vote for one globally ordered decision position.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ReplicationDecisionVote {
++    pub voter: ReplicaId,
++    pub membership_epoch: u64,
++    pub term: u64,
++    pub leader: ReplicaId,
++    pub position: u64,
++    pub effect: RevisionEffectId,
++    pub carried_from_term: Option<u64>,
++}
++
++/// Durable quorum lock. Once a position is locked, later terms may only carry
++/// the same value forward and must name the prior lock term explicitly.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ReplicationDecisionLock {
++    pub membership_epoch: u64,
++    pub term: u64,
++    pub leader: ReplicaId,
++    pub position: u64,
++    pub effect: RevisionEffectId,
++    pub acknowledged_by: BTreeSet<ReplicaId>,
++    pub carried_from_term: Option<u64>,
++}
++
++/// Joint-consensus evidence for a membership transition. The same successor
++/// configuration is acknowledged by quorums of both the old and new sets.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ReplicationJointMembershipCertificate {
++    pub previous_membership_epoch: u64,
++    pub term: u64,
++    pub leader: ReplicaId,
++    pub next: ReplicationMembership,
++    pub acknowledged_by_previous: BTreeSet<ReplicaId>,
++    pub acknowledged_by_next: BTreeSet<ReplicaId>,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+ pub enum ReplicationEffectStage {
+     Received,
+@@ -188,6 +257,12 @@
+     quorum_certificates: BTreeMap<RevisionEffectId, ReplicationQuorumCertificate>,
+     effect_votes: BTreeMap<(u64, u64, ReplicaId), RevisionEffectId>,
+     membership_votes: BTreeMap<(u64, ReplicaId), ReplicationMembershipVote>,
++    promised_terms: BTreeMap<(u64, ReplicaId), u64>,
++    leader_votes: BTreeMap<(u64, u64, ReplicaId), ReplicaId>,
++    leader_certificates: BTreeMap<(u64, u64), ReplicationLeaderCertificate>,
++    decision_votes: BTreeMap<(u64, u64, u64, ReplicaId), ReplicationDecisionVote>,
++    decision_locks: BTreeMap<u64, ReplicationDecisionLock>,
++    joint_membership_certificates: BTreeMap<u64, ReplicationJointMembershipCertificate>,
+     published_effects: BTreeSet<RevisionEffectId>,
+     published_branches: BTreeMap<ReplicationBranchId, ReplicationBranchHead>,
+     poisoned: bool,
+@@ -219,6 +294,12 @@
+             quorum_certificates: BTreeMap::new(),
+             effect_votes: BTreeMap::new(),
+             membership_votes: BTreeMap::new(),
++            promised_terms: BTreeMap::new(),
++            leader_votes: BTreeMap::new(),
++            leader_certificates: BTreeMap::new(),
++            decision_votes: BTreeMap::new(),
++            decision_locks: BTreeMap::new(),
++            joint_membership_certificates: BTreeMap::new(),
+             published_effects: BTreeSet::new(),
+             published_branches: BTreeMap::new(),
+             poisoned: false,
+@@ -264,6 +345,25 @@
+     }
+ 
+     #[must_use]
++    pub(crate) fn promised_term(&self, membership_epoch: u64, voter: ReplicaId) -> Option<u64> {
++        self.promised_terms.get(&(membership_epoch, voter)).copied()
++    }
++
++    #[must_use]
++    pub(crate) fn leader_certificate(
++        &self,
++        membership_epoch: u64,
++        term: u64,
++    ) -> Option<&ReplicationLeaderCertificate> {
++        self.leader_certificates.get(&(membership_epoch, term))
++    }
++
++    #[must_use]
++    pub(crate) fn decision_lock(&self, position: u64) -> Option<&ReplicationDecisionLock> {
++        self.decision_locks.get(&position)
++    }
++
++    #[must_use]
+     pub(crate) fn effect_stage(&self, id: RevisionEffectId) -> Option<ReplicationEffectStage> {
+         if self.published_effects.contains(&id) {
+             Some(ReplicationEffectStage::Published)
+@@ -418,6 +518,156 @@
+         Ok(())
+     }
+ 
++    pub(crate) fn record_term_promise(
++        &mut self,
++        promise: ReplicationTermPromise,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.validate_term_member(promise.membership_epoch, promise.voter, promise.term)?;
++        let key = (promise.membership_epoch, promise.voter);
++        if let Some(existing) = self.promised_terms.get(&key) {
++            if promise.term < *existing {
++                return Err(protocol("replication term promise regressed"));
++            }
++            if promise.term == *existing {
++                return Ok(());
++            }
++        }
++        self.append_frame(KIND_TERM_PROMISE, &encode_term_promise(&promise))?;
++        self.promised_terms.insert(key, promise.term);
++        Ok(())
++    }
++
++    pub(crate) fn record_leader_vote(
++        &mut self,
++        vote: ReplicationLeaderVote,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.validate_leader_vote(&vote)?;
++        let key = (vote.membership_epoch, vote.term, vote.voter);
++        if let Some(existing) = self.leader_votes.get(&key) {
++            return if *existing == vote.candidate {
++                Ok(())
++            } else {
++                Err(protocol(
++                    "replication voter already voted for another leader in this term",
++                ))
++            };
++        }
++        self.append_frame(KIND_LEADER_VOTE, &encode_leader_vote(&vote))?;
++        self.promised_terms
++            .entry((vote.membership_epoch, vote.voter))
++            .and_modify(|term| *term = (*term).max(vote.term))
++            .or_insert(vote.term);
++        self.leader_votes.insert(key, vote.candidate);
++        Ok(())
++    }
++
++    pub(crate) fn certify_leader(
++        &mut self,
++        certificate: ReplicationLeaderCertificate,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        if let Some(existing) = self
++            .leader_certificates
++            .get(&(certificate.membership_epoch, certificate.term))
++        {
++            return if existing == &certificate {
++                Ok(())
++            } else {
++                Err(protocol(
++                    "replication term already has a different leader certificate",
++                ))
++            };
++        }
++        self.validate_leader_certificate(&certificate)?;
++        let payload = encode_leader_certificate(&certificate)?;
++        self.append_frame(KIND_LEADER_CERTIFICATE, &payload)?;
++        self.leader_certificates.insert(
++            (certificate.membership_epoch, certificate.term),
++            certificate,
++        );
++        Ok(())
++    }
++
++    pub(crate) fn record_decision_vote(
++        &mut self,
++        vote: ReplicationDecisionVote,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.validate_decision_vote(&vote)?;
++        let key = (vote.membership_epoch, vote.term, vote.position, vote.voter);
++        if let Some(existing) = self.decision_votes.get(&key) {
++            return if existing == &vote {
++                Ok(())
++            } else {
++                Err(protocol(
++                    "replication voter already accepted another value in this term/position",
++                ))
++            };
++        }
++        self.append_frame(KIND_DECISION_VOTE, &encode_decision_vote(&vote))?;
++        self.decision_votes.insert(key, vote);
++        Ok(())
++    }
++
++    pub(crate) fn lock_decision(
++        &mut self,
++        lock: ReplicationDecisionLock,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        if let Some(existing) = self.decision_locks.get(&lock.position) {
++            if existing == &lock {
++                return Ok(());
++            }
++            if lock.term <= existing.term {
++                return Err(protocol("replication decision lock did not advance term"));
++            }
++        }
++        self.validate_decision_lock(&lock)?;
++        let payload = encode_decision_lock(&lock)?;
++        self.append_frame(KIND_DECISION_LOCK, &payload)?;
++        self.decision_locks.insert(lock.position, lock);
++        Ok(())
++    }
++
++    pub(crate) fn certify_joint_membership(
++        &mut self,
++        certificate: ReplicationJointMembershipCertificate,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        if let Some(existing) = self
++            .joint_membership_certificates
++            .get(&certificate.next.epoch)
++        {
++            return if existing == &certificate {
++                Ok(())
++            } else {
++                Err(protocol(
++                    "replication successor epoch already has a different joint certificate",
++                ))
++            };
++        }
++        self.validate_joint_membership_certificate(&certificate)?;
++        let payload = encode_joint_membership_certificate(&certificate)?;
++        self.append_frame(KIND_JOINT_MEMBERSHIP_CERTIFICATE, &payload)?;
++        self.joint_membership_certificates
++            .insert(certificate.next.epoch, certificate);
++        Ok(())
++    }
++
+     pub(crate) fn certify_quorum(
+         &mut self,
+         certificate: ReplicationQuorumCertificate,
+@@ -501,6 +751,41 @@
+                         }
+                     }
+                 }
++                if self
++                    .leader_certificates
++                    .keys()
++                    .any(|(epoch, _)| *epoch == current.epoch)
++                {
++                    let term = decision_term.expect("non-empty old quorum has a decision term");
++                    if !self
++                        .leader_certificates
++                        .contains_key(&(current.epoch, term))
++                    {
++                        return Err(protocol(
++                            "replication membership change is not bound to a certified leader term",
++                        ));
++                    }
++                    if term < self.highest_promised_term(current.epoch) {
++                        return Err(protocol(
++                            "replication membership change uses a stale consensus term",
++                        ));
++                    }
++                    let joint = self
++                        .joint_membership_certificates
++                        .get(&change.next.epoch)
++                        .ok_or_else(|| {
++                            protocol("replication membership change lacks joint quorum certificate")
++                        })?;
++                    if joint.previous_membership_epoch != current.epoch
++                        || joint.term != term
++                        || joint.next != change.next
++                        || joint.acknowledged_by_previous != change.acknowledged_by_previous
++                    {
++                        return Err(protocol(
++                            "replication membership change does not match joint quorum certificate",
++                        ));
++                    }
++                }
+             }
+         }
+         if self.memberships.contains_key(&change.next.epoch) {
+@@ -522,6 +807,284 @@
+         Ok(())
+     }
+ 
++    fn validate_term_member(
++        &self,
++        membership_epoch: u64,
++        voter: ReplicaId,
++        term: u64,
++    ) -> Result<(), DurabilityError> {
++        if term == 0 {
++            return Err(protocol("replication consensus term is zero"));
++        }
++        let current = self
++            .current_membership()
++            .ok_or_else(|| protocol("replication consensus has no durable membership"))?;
++        if current.epoch != membership_epoch {
++            return Err(protocol(
++                "replication consensus uses a stale membership epoch",
++            ));
++        }
++        if !current.members.contains(&voter) {
++            return Err(protocol(
++                "replication consensus references a non-member replica",
++            ));
++        }
++        Ok(())
++    }
++
++    fn highest_promised_term(&self, membership_epoch: u64) -> u64 {
++        self.promised_terms
++            .iter()
++            .filter_map(|((epoch, _), term)| (*epoch == membership_epoch).then_some(*term))
++            .max()
++            .unwrap_or(0)
++    }
++
++    fn validate_leader_vote(&self, vote: &ReplicationLeaderVote) -> Result<(), DurabilityError> {
++        self.validate_term_member(vote.membership_epoch, vote.voter, vote.term)?;
++        let current = self
++            .current_membership()
++            .expect("validated membership exists");
++        if !current.members.contains(&vote.candidate) {
++            return Err(protocol(
++                "replication leader candidate is not a membership voter",
++            ));
++        }
++        if self
++            .promised_terms
++            .get(&(vote.membership_epoch, vote.voter))
++            .is_some_and(|promised| *promised > vote.term)
++        {
++            return Err(protocol("replication leader vote uses a stale term"));
++        }
++        if self
++            .leader_votes
++            .get(&(vote.membership_epoch, vote.term, vote.voter))
++            .is_some_and(|candidate| *candidate != vote.candidate)
++        {
++            return Err(protocol(
++                "replication voter already voted for another leader in this term",
++            ));
++        }
++        Ok(())
++    }
++
++    fn validate_leader_certificate(
++        &self,
++        certificate: &ReplicationLeaderCertificate,
++    ) -> Result<(), DurabilityError> {
++        self.validate_term_member(
++            certificate.membership_epoch,
++            certificate.leader,
++            certificate.term,
++        )?;
++        let current = self
++            .current_membership()
++            .expect("validated membership exists");
++        validate_acknowledgements(
++            current,
++            &certificate.acknowledged_by,
++            "replication leader certificate lacks configured quorum",
++        )?;
++        if certificate.term < self.highest_promised_term(certificate.membership_epoch) {
++            return Err(protocol(
++                "replication leader certificate is fenced by a higher promised term",
++            ));
++        }
++        for voter in &certificate.acknowledged_by {
++            if self
++                .leader_votes
++                .get(&(certificate.membership_epoch, certificate.term, *voter))
++                != Some(&certificate.leader)
++            {
++                return Err(protocol(
++                    "replication leader certificate lacks durable vote evidence",
++                ));
++            }
++        }
++        Ok(())
++    }
++
++    fn validate_decision_vote(
++        &self,
++        vote: &ReplicationDecisionVote,
++    ) -> Result<(), DurabilityError> {
++        self.validate_term_member(vote.membership_epoch, vote.voter, vote.term)?;
++        let certificate = self
++            .leader_certificates
++            .get(&(vote.membership_epoch, vote.term))
++            .ok_or_else(|| {
++                protocol("replication decision vote has no durable leader certificate")
++            })?;
++        if certificate.leader != vote.leader {
++            return Err(protocol(
++                "replication decision vote names a different leader",
++            ));
++        }
++        if vote.term < self.highest_promised_term(vote.membership_epoch) {
++            return Err(protocol("replication decision vote uses a stale term"));
++        }
++        let envelope = self.effects.get(&vote.effect).ok_or_else(|| {
++            protocol("replication decision vote references a non-local-durable effect")
++        })?;
++        if envelope.ordered_by.position != vote.position {
++            return Err(protocol(
++                "replication decision vote position does not match effect ordering",
++            ));
++        }
++        if let Some(lock) = self.decision_locks.get(&vote.position) {
++            if lock.effect != vote.effect {
++                return Err(protocol(
++                    "replication decision conflicts with a durable locked value",
++                ));
++            }
++            if vote.term > lock.term && vote.carried_from_term != Some(lock.term) {
++                return Err(protocol(
++                    "replication later-term decision did not carry forward the durable lock",
++                ));
++            }
++        } else if vote.carried_from_term.is_some() {
++            return Err(protocol(
++                "replication decision claims a carry-forward without a prior lock",
++            ));
++        }
++        if self
++            .decision_votes
++            .get(&(vote.membership_epoch, vote.term, vote.position, vote.voter))
++            .is_some_and(|existing| existing != vote)
++        {
++            return Err(protocol(
++                "replication voter already accepted another value in this term/position",
++            ));
++        }
++        Ok(())
++    }
++
++    fn validate_decision_lock(
++        &self,
++        lock: &ReplicationDecisionLock,
++    ) -> Result<(), DurabilityError> {
++        self.validate_term_member(lock.membership_epoch, lock.leader, lock.term)?;
++        let current = self
++            .current_membership()
++            .expect("validated membership exists");
++        validate_acknowledgements(
++            current,
++            &lock.acknowledged_by,
++            "replication decision lock lacks configured quorum",
++        )?;
++        let certificate = self
++            .leader_certificates
++            .get(&(lock.membership_epoch, lock.term))
++            .ok_or_else(|| {
++                protocol("replication decision lock has no durable leader certificate")
++            })?;
++        if certificate.leader != lock.leader {
++            return Err(protocol(
++                "replication decision lock names a different leader",
++            ));
++        }
++        if lock.term < self.highest_promised_term(lock.membership_epoch) {
++            return Err(protocol("replication decision lock uses a stale term"));
++        }
++        for voter in &lock.acknowledged_by {
++            let vote = self
++                .decision_votes
++                .get(&(lock.membership_epoch, lock.term, lock.position, *voter))
++                .ok_or_else(|| protocol("replication decision lock lacks durable vote evidence"))?;
++            if vote.effect != lock.effect
++                || vote.leader != lock.leader
++                || vote.carried_from_term != lock.carried_from_term
++            {
++                return Err(protocol(
++                    "replication decision lock vote evidence does not match",
++                ));
++            }
++        }
++        if let Some(existing) = self.decision_locks.get(&lock.position) {
++            if existing.effect != lock.effect {
++                return Err(protocol(
++                    "replication decision lock conflicts with prior locked value",
++                ));
++            }
++            if lock.term <= existing.term {
++                return Err(protocol("replication decision lock did not advance term"));
++            }
++            if lock.carried_from_term != Some(existing.term) {
++                return Err(protocol(
++                    "replication later-term lock did not carry forward prior lock term",
++                ));
++            }
++        } else if lock.carried_from_term.is_some() {
++            return Err(protocol(
++                "replication decision lock claims carry-forward without prior lock",
++            ));
++        }
++        Ok(())
++    }
++
++    fn validate_joint_membership_certificate(
++        &self,
++        certificate: &ReplicationJointMembershipCertificate,
++    ) -> Result<(), DurabilityError> {
++        certificate.next.validate()?;
++        let current = self
++            .current_membership()
++            .ok_or_else(|| protocol("joint membership certificate has no previous membership"))?;
++        if current.epoch != certificate.previous_membership_epoch {
++            return Err(protocol(
++                "joint membership certificate uses a stale previous epoch",
++            ));
++        }
++        if certificate.next.epoch <= current.epoch {
++            return Err(protocol(
++                "joint membership certificate successor epoch did not advance",
++            ));
++        }
++        let leader = self
++            .leader_certificates
++            .get(&(current.epoch, certificate.term))
++            .ok_or_else(|| {
++                protocol("joint membership certificate has no durable leader certificate")
++            })?;
++        if leader.leader != certificate.leader {
++            return Err(protocol(
++                "joint membership certificate names a different leader",
++            ));
++        }
++        if certificate.term < self.highest_promised_term(current.epoch) {
++            return Err(protocol(
++                "joint membership certificate is fenced by a higher promised term",
++            ));
++        }
++        validate_acknowledgements(
++            current,
++            &certificate.acknowledged_by_previous,
++            "joint membership certificate lacks previous-membership quorum",
++        )?;
++        validate_acknowledgements(
++            &certificate.next,
++            &certificate.acknowledged_by_next,
++            "joint membership certificate lacks successor-membership quorum",
++        )?;
++        for voter in &certificate.acknowledged_by_previous {
++            let vote = self
++                .membership_votes
++                .get(&(current.epoch, *voter))
++                .ok_or_else(|| {
++                    protocol(
++                        "joint membership certificate lacks durable old-membership vote evidence",
++                    )
++                })?;
++            if vote.term != certificate.term || vote.next != certificate.next {
++                return Err(protocol(
++                    "joint membership certificate vote evidence does not match",
++                ));
++            }
++        }
++        Ok(())
++    }
++
+     fn validate_quorum_certificate(
+         &self,
+         certificate: &ReplicationQuorumCertificate,
+@@ -550,6 +1113,27 @@
+             .expect("validated certificate references local-durable effect")
+             .ordered_by
+             .position;
++        if self
++            .leader_certificates
++            .keys()
++            .any(|(epoch, _)| *epoch == current.epoch)
++        {
++            let lock = self
++                .decision_locks
++                .get(&position)
++                .ok_or_else(|| protocol("replication quorum lacks consensus decision lock"))?;
++            if lock.effect != certificate.effect || lock.membership_epoch != current.epoch {
++                return Err(protocol(
++                    "replication quorum does not match consensus decision lock",
++                ));
++            }
++        }
++        let position = self
++            .effects
++            .get(&certificate.effect)
++            .expect("validated certificate references local-durable effect")
++            .ordered_by
++            .position;
+         for voter in &certificate.acknowledged_by {
+             if self
+                 .effect_votes
+@@ -798,6 +1382,79 @@
+         Ok(())
+     }
+ 
++    fn replay_consensus_frame(
++        &mut self,
++        kind: u8,
++        payload: &[u8],
++        offset: usize,
++    ) -> Result<bool, DurabilityError> {
++        match kind {
++            KIND_TERM_PROMISE => {
++                let promise = decode_term_promise(payload)
++                    .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
++                self.validate_term_member(promise.membership_epoch, promise.voter, promise.term)?;
++                let key = (promise.membership_epoch, promise.voter);
++                if self
++                    .promised_terms
++                    .get(&key)
++                    .is_some_and(|term| *term > promise.term)
++                {
++                    return Err(corruption(
++                        offset,
++                        "replication term promise regressed during replay",
++                    ));
++                }
++                self.promised_terms.insert(key, promise.term);
++            }
++            KIND_LEADER_VOTE => {
++                let vote = decode_leader_vote(payload)
++                    .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
++                self.validate_leader_vote(&vote)?;
++                self.promised_terms
++                    .entry((vote.membership_epoch, vote.voter))
++                    .and_modify(|term| *term = (*term).max(vote.term))
++                    .or_insert(vote.term);
++                self.leader_votes.insert(
++                    (vote.membership_epoch, vote.term, vote.voter),
++                    vote.candidate,
++                );
++            }
++            KIND_LEADER_CERTIFICATE => {
++                let certificate = decode_leader_certificate(payload)
++                    .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
++                self.validate_leader_certificate(&certificate)?;
++                self.leader_certificates.insert(
++                    (certificate.membership_epoch, certificate.term),
++                    certificate,
++                );
++            }
++            KIND_DECISION_VOTE => {
++                let vote = decode_decision_vote(payload)
++                    .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
++                self.validate_decision_vote(&vote)?;
++                self.decision_votes.insert(
++                    (vote.membership_epoch, vote.term, vote.position, vote.voter),
++                    vote,
++                );
++            }
++            KIND_DECISION_LOCK => {
++                let lock = decode_decision_lock(payload)
++                    .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
++                self.validate_decision_lock(&lock)?;
++                self.decision_locks.insert(lock.position, lock);
++            }
++            KIND_JOINT_MEMBERSHIP_CERTIFICATE => {
++                let certificate = decode_joint_membership_certificate(payload)
++                    .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
++                self.validate_joint_membership_certificate(&certificate)?;
++                self.joint_membership_certificates
++                    .insert(certificate.next.epoch, certificate);
++            }
++            _ => return Ok(false),
++        }
++        Ok(true)
++    }
++
+     fn replay(&mut self, bytes: &[u8]) -> Result<usize, DurabilityError> {
+         let mut offset = 0;
+         while bytes.len().saturating_sub(offset) >= FRAME_HEADER_LEN {
+@@ -890,6 +1547,7 @@
+                     self.membership_votes
+                         .insert((vote.previous_membership_epoch, vote.voter), vote);
+                 }
++                _ if self.replay_consensus_frame(kind, payload, offset)? => {}
+                 _ => return Err(corruption(offset, "unknown replication journal frame kind")),
+             }
+             offset = end;
+@@ -955,6 +1613,231 @@
+     })
+ }
+ 
++fn encode_term_promise(promise: &ReplicationTermPromise) -> Vec<u8> {
++    let mut out = Vec::new();
++    push_u64(&mut out, promise.voter.raw());
++    push_u64(&mut out, promise.membership_epoch);
++    push_u64(&mut out, promise.term);
++    out
++}
++
++fn decode_term_promise(bytes: &[u8]) -> Result<ReplicationTermPromise, &'static str> {
++    let mut cursor = Cursor::new(bytes);
++    let promise = ReplicationTermPromise {
++        voter: ReplicaId::new(cursor.u64()?),
++        membership_epoch: cursor.u64()?,
++        term: cursor.u64()?,
++    };
++    cursor.finish()?;
++    Ok(promise)
++}
++
++fn encode_leader_vote(vote: &ReplicationLeaderVote) -> Vec<u8> {
++    let mut out = Vec::new();
++    push_u64(&mut out, vote.voter.raw());
++    push_u64(&mut out, vote.membership_epoch);
++    push_u64(&mut out, vote.term);
++    push_u64(&mut out, vote.candidate.raw());
++    out
++}
++
++fn decode_leader_vote(bytes: &[u8]) -> Result<ReplicationLeaderVote, &'static str> {
++    let mut cursor = Cursor::new(bytes);
++    let vote = ReplicationLeaderVote {
++        voter: ReplicaId::new(cursor.u64()?),
++        membership_epoch: cursor.u64()?,
++        term: cursor.u64()?,
++        candidate: ReplicaId::new(cursor.u64()?),
++    };
++    cursor.finish()?;
++    Ok(vote)
++}
++
++fn encode_leader_certificate(
++    certificate: &ReplicationLeaderCertificate,
++) -> Result<Vec<u8>, CodecError> {
++    let mut out = Vec::new();
++    push_u64(&mut out, certificate.membership_epoch);
++    push_u64(&mut out, certificate.term);
++    push_u64(&mut out, certificate.leader.raw());
++    push_len(&mut out, certificate.acknowledged_by.len())?;
++    for voter in &certificate.acknowledged_by {
++        push_u64(&mut out, voter.raw());
++    }
++    Ok(out)
++}
++
++fn decode_leader_certificate(bytes: &[u8]) -> Result<ReplicationLeaderCertificate, &'static str> {
++    let mut cursor = Cursor::new(bytes);
++    let membership_epoch = cursor.u64()?;
++    let term = cursor.u64()?;
++    let leader = ReplicaId::new(cursor.u64()?);
++    let acknowledged_by = decode_replica_set(
++        &mut cursor,
++        "replication leader certificate acknowledgements are not sorted and unique",
++    )?;
++    cursor.finish()?;
++    Ok(ReplicationLeaderCertificate {
++        membership_epoch,
++        term,
++        leader,
++        acknowledged_by,
++    })
++}
++
++fn encode_optional_term(out: &mut Vec<u8>, term: Option<u64>) {
++    match term {
++        None => push_u64(out, 0),
++        Some(term) => push_u64(out, term),
++    }
++}
++
++fn decode_optional_term(cursor: &mut Cursor<'_>) -> Result<Option<u64>, &'static str> {
++    match cursor.u64()? {
++        0 => Ok(None),
++        term => Ok(Some(term)),
++    }
++}
++
++fn encode_decision_vote(vote: &ReplicationDecisionVote) -> Vec<u8> {
++    let mut out = Vec::new();
++    push_u64(&mut out, vote.voter.raw());
++    push_u64(&mut out, vote.membership_epoch);
++    push_u64(&mut out, vote.term);
++    push_u64(&mut out, vote.leader.raw());
++    push_u64(&mut out, vote.position);
++    push_u128(&mut out, vote.effect.0);
++    encode_optional_term(&mut out, vote.carried_from_term);
++    out
++}
++
++fn decode_decision_vote(bytes: &[u8]) -> Result<ReplicationDecisionVote, &'static str> {
++    let mut cursor = Cursor::new(bytes);
++    let vote = ReplicationDecisionVote {
++        voter: ReplicaId::new(cursor.u64()?),
++        membership_epoch: cursor.u64()?,
++        term: cursor.u64()?,
++        leader: ReplicaId::new(cursor.u64()?),
++        position: cursor.u64()?,
++        effect: RevisionEffectId(cursor.u128()?),
++        carried_from_term: decode_optional_term(&mut cursor)?,
++    };
++    cursor.finish()?;
++    Ok(vote)
++}
++
++fn encode_decision_lock(lock: &ReplicationDecisionLock) -> Result<Vec<u8>, CodecError> {
++    let mut out = Vec::new();
++    push_u64(&mut out, lock.membership_epoch);
++    push_u64(&mut out, lock.term);
++    push_u64(&mut out, lock.leader.raw());
++    push_u64(&mut out, lock.position);
++    push_u128(&mut out, lock.effect.0);
++    encode_optional_term(&mut out, lock.carried_from_term);
++    push_len(&mut out, lock.acknowledged_by.len())?;
++    for voter in &lock.acknowledged_by {
++        push_u64(&mut out, voter.raw());
++    }
++    Ok(out)
++}
++
++fn decode_decision_lock(bytes: &[u8]) -> Result<ReplicationDecisionLock, &'static str> {
++    let mut cursor = Cursor::new(bytes);
++    let membership_epoch = cursor.u64()?;
++    let term = cursor.u64()?;
++    let leader = ReplicaId::new(cursor.u64()?);
++    let position = cursor.u64()?;
++    let effect = RevisionEffectId(cursor.u128()?);
++    let carried_from_term = decode_optional_term(&mut cursor)?;
++    let acknowledged_by = decode_replica_set(
++        &mut cursor,
++        "replication decision lock acknowledgements are not sorted and unique",
++    )?;
++    cursor.finish()?;
++    Ok(ReplicationDecisionLock {
++        membership_epoch,
++        term,
++        leader,
++        position,
++        effect,
++        acknowledged_by,
++        carried_from_term,
++    })
++}
++
++fn encode_membership_value(
++    out: &mut Vec<u8>,
++    membership: &ReplicationMembership,
++) -> Result<(), CodecError> {
++    push_u64(out, membership.epoch);
++    push_len(out, membership.members.len())?;
++    for member in &membership.members {
++        push_u64(out, member.raw());
++    }
++    push_len(out, membership.quorum_size)?;
++    Ok(())
++}
++
++fn decode_membership_value(cursor: &mut Cursor<'_>) -> Result<ReplicationMembership, &'static str> {
++    let epoch = cursor.u64()?;
++    let members = decode_replica_set(
++        cursor,
++        "joint membership certificate members are not sorted and unique",
++    )?;
++    let quorum_size = cursor.len()?;
++    Ok(ReplicationMembership {
++        epoch,
++        members,
++        quorum_size,
++    })
++}
++
++fn encode_joint_membership_certificate(
++    certificate: &ReplicationJointMembershipCertificate,
++) -> Result<Vec<u8>, CodecError> {
++    let mut out = Vec::new();
++    push_u64(&mut out, certificate.previous_membership_epoch);
++    push_u64(&mut out, certificate.term);
++    push_u64(&mut out, certificate.leader.raw());
++    encode_membership_value(&mut out, &certificate.next)?;
++    push_len(&mut out, certificate.acknowledged_by_previous.len())?;
++    for voter in &certificate.acknowledged_by_previous {
++        push_u64(&mut out, voter.raw());
++    }
++    push_len(&mut out, certificate.acknowledged_by_next.len())?;
++    for voter in &certificate.acknowledged_by_next {
++        push_u64(&mut out, voter.raw());
++    }
++    Ok(out)
++}
++
++fn decode_joint_membership_certificate(
++    bytes: &[u8],
++) -> Result<ReplicationJointMembershipCertificate, &'static str> {
++    let mut cursor = Cursor::new(bytes);
++    let previous_membership_epoch = cursor.u64()?;
++    let term = cursor.u64()?;
++    let leader = ReplicaId::new(cursor.u64()?);
++    let next = decode_membership_value(&mut cursor)?;
++    let acknowledged_by_previous = decode_replica_set(
++        &mut cursor,
++        "joint membership previous acknowledgements are not sorted and unique",
++    )?;
++    let acknowledged_by_next = decode_replica_set(
++        &mut cursor,
++        "joint membership next acknowledgements are not sorted and unique",
++    )?;
++    cursor.finish()?;
++    Ok(ReplicationJointMembershipCertificate {
++        previous_membership_epoch,
++        term,
++        leader,
++        next,
++        acknowledged_by_previous,
++        acknowledged_by_next,
++    })
++}
++
+ fn validate_acknowledgements(
+     membership: &ReplicationMembership,
+     acknowledged_by: &BTreeSet<ReplicaId>,
+--- /mnt/data/cfmd_pass112_p18_lean/crates/kernel-durability/src/store.rs	2026-09-23 14:20:37.533963764 +0000
++++ crates/kernel-durability/src/store.rs	2026-09-23 15:37:41.338662341 +0000
+@@ -16,11 +16,13 @@
+     DurablePhysicalArtifactSpec, DurablePrepareToken, DurableRevisionChange,
+     DurableRevisionDescriptor, DurableRevisionEffectRecord, DurableTransactionIntent,
+     DurableTransactionKey, DurableTransactionOutcome, FileRevisionWal, IdempotencyEpoch,
+-    RecoveryScan, ReplicatedEffectEnvelope, ReplicationBranchHead, ReplicationBranchId,
+-    ReplicationEffectStage, ReplicationEffectVote, ReplicationIngestOutcome, ReplicationMembership,
++    RecoveryScan, ReplicaId, ReplicatedEffectEnvelope, ReplicationBranchHead, ReplicationBranchId,
++    ReplicationDecisionLock, ReplicationDecisionVote, ReplicationEffectStage,
++    ReplicationEffectVote, ReplicationIngestOutcome, ReplicationJointMembershipCertificate,
++    ReplicationLeaderCertificate, ReplicationLeaderVote, ReplicationMembership,
+     ReplicationMembershipChange, ReplicationMembershipVote, ReplicationQuorumCertificate,
+-    RevisionDurability, canonical_physical_artifact_specs, checkpoint, crc32c, metadata, read_u16,
+-    read_u32, read_u64,
++    ReplicationTermPromise, RevisionDurability, canonical_physical_artifact_specs, checkpoint,
++    crc32c, metadata, read_u16, read_u32, read_u64,
+ };
+ use crate::replication::ReplicationAuthorityJournal;
+ 
+@@ -1576,6 +1578,89 @@
+         self.replication.record_membership_vote(vote)
+     }
+ 
++    #[must_use]
++    pub fn replication_promised_term(
++        &self,
++        membership_epoch: u64,
++        voter: ReplicaId,
++    ) -> Option<u64> {
++        self.replication.promised_term(membership_epoch, voter)
++    }
++
++    #[must_use]
++    pub fn replication_leader_certificate(
++        &self,
++        membership_epoch: u64,
++        term: u64,
++    ) -> Option<&ReplicationLeaderCertificate> {
++        self.replication.leader_certificate(membership_epoch, term)
++    }
++
++    #[must_use]
++    pub fn replication_decision_lock(&self, position: u64) -> Option<&ReplicationDecisionLock> {
++        self.replication.decision_lock(position)
++    }
++
++    pub fn durably_record_replication_term_promise(
++        &mut self,
++        promise: ReplicationTermPromise,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.replication.record_term_promise(promise)
++    }
++
++    pub fn durably_record_replication_leader_vote(
++        &mut self,
++        vote: ReplicationLeaderVote,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.replication.record_leader_vote(vote)
++    }
++
++    pub fn durably_certify_replication_leader(
++        &mut self,
++        certificate: ReplicationLeaderCertificate,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.replication.certify_leader(certificate)
++    }
++
++    pub fn durably_certify_replication_joint_membership(
++        &mut self,
++        certificate: ReplicationJointMembershipCertificate,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.replication.certify_joint_membership(certificate)
++    }
++
++    pub fn durably_record_replication_decision_vote(
++        &mut self,
++        vote: ReplicationDecisionVote,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.replication.record_decision_vote(vote)
++    }
++
++    pub fn durably_lock_replication_decision(
++        &mut self,
++        lock: ReplicationDecisionLock,
++    ) -> Result<(), DurabilityError> {
++        if self.poisoned {
++            return Err(DurabilityError::Poisoned);
++        }
++        self.replication.lock_decision(lock)
++    }
++
+     /// Advances one replicated effect from `LocalDurable` to `QuorumDurable`.
+     pub fn durably_certify_replicated_effect_quorum(
+         &mut self,
+@@ -3438,10 +3523,12 @@
+     use super::*;
+     use crate::{
+         DurableRelationMutation, DurableRevisionDescriptor, DurableSequencerOrder, ReplicaId,
+-        ReplicatedEffectEnvelope, ReplicationBranchId, ReplicationEffectStage,
+-        ReplicationEffectVote, ReplicationIngestOutcome, ReplicationMembership,
++        ReplicatedEffectEnvelope, ReplicationBranchId, ReplicationDecisionLock,
++        ReplicationDecisionVote, ReplicationEffectStage, ReplicationEffectVote,
++        ReplicationIngestOutcome, ReplicationJointMembershipCertificate,
++        ReplicationLeaderCertificate, ReplicationLeaderVote, ReplicationMembership,
+         ReplicationMembershipChange, ReplicationMembershipVote, ReplicationQuorumCertificate,
+-        replicated_effect_id,
++        ReplicationTermPromise, replicated_effect_id,
+     };
+ 
+     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+@@ -5073,6 +5160,48 @@
+         }
+     }
+ 
++    fn certify_replication_leader(
++        store: &mut DurableRevisionStore,
++        membership_epoch: u64,
++        term: u64,
++        leader: u64,
++        voters: &[u64],
++    ) {
++        for voter in voters {
++            store
++                .durably_record_replication_leader_vote(ReplicationLeaderVote {
++                    voter: ReplicaId::new(*voter),
++                    membership_epoch,
++                    term,
++                    candidate: ReplicaId::new(leader),
++                })
++                .unwrap();
++        }
++        store
++            .durably_certify_replication_leader(ReplicationLeaderCertificate {
++                membership_epoch,
++                term,
++                leader: ReplicaId::new(leader),
++                acknowledged_by: voters.iter().copied().map(ReplicaId::new).collect(),
++            })
++            .unwrap();
++    }
++
++    fn record_consensus_decision_votes(
++        store: &mut DurableRevisionStore,
++        template: ReplicationDecisionVote,
++        voters: &[u64],
++    ) {
++        for voter in voters {
++            store
++                .durably_record_replication_decision_vote(ReplicationDecisionVote {
++                    voter: ReplicaId::new(*voter),
++                    ..template
++                })
++                .unwrap();
++        }
++    }
++
+     fn record_effect_votes(
+         store: &mut DurableRevisionStore,
+         effect: RevisionEffectId,
+@@ -5334,6 +5463,330 @@
+                 ..
+             })
+         ));
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn replication_term_and_leader_authority_fences_stale_leader_and_survives_restart() {
++        let dir = test_dir("replication-term-leader-authority");
++        let (base, registry, _) = setup_revision(2_601, &[1]);
++        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
++        store
++            .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
++            .unwrap();
++
++        certify_replication_leader(&mut store, 1, 5, 1, &[1, 2]);
++        assert!(store.replication_leader_certificate(1, 5).is_some());
++
++        assert!(matches!(
++            store.durably_record_replication_leader_vote(ReplicationLeaderVote {
++                voter: ReplicaId::new(1),
++                membership_epoch: 1,
++                term: 5,
++                candidate: ReplicaId::new(2),
++            }),
++            Err(DurabilityError::Protocol {
++                reason: "replication voter already voted for another leader in this term",
++                ..
++            })
++        ));
++        store
++            .durably_record_replication_term_promise(ReplicationTermPromise {
++                voter: ReplicaId::new(2),
++                membership_epoch: 1,
++                term: 6,
++            })
++            .unwrap();
++        assert!(matches!(
++            store.durably_record_replication_leader_vote(ReplicationLeaderVote {
++                voter: ReplicaId::new(2),
++                membership_epoch: 1,
++                term: 5,
++                candidate: ReplicaId::new(1),
++            }),
++            Err(DurabilityError::Protocol {
++                reason: "replication leader vote uses a stale term",
++                ..
++            })
++        ));
++        assert!(matches!(
++            store.durably_record_replication_term_promise(ReplicationTermPromise {
++                voter: ReplicaId::new(2),
++                membership_epoch: 1,
++                term: 5,
++            }),
++            Err(DurabilityError::Protocol {
++                reason: "replication term promise regressed",
++                ..
++            })
++        ));
++        assert!(matches!(
++            store.durably_certify_replication_leader(ReplicationLeaderCertificate {
++                membership_epoch: 1,
++                term: 5,
++                leader: ReplicaId::new(1),
++                acknowledged_by: [ReplicaId::new(1), ReplicaId::new(2)].into_iter().collect(),
++            }),
++            Ok(())
++        ));
++        drop(store);
++
++        let (reopened, _) = DurableRevisionStore::open(&dir).unwrap();
++        assert_eq!(
++            reopened.replication_promised_term(1, ReplicaId::new(2)),
++            Some(6)
++        );
++        assert_eq!(
++            reopened
++                .replication_leader_certificate(1, 5)
++                .unwrap()
++                .leader,
++            ReplicaId::new(1)
++        );
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    #[allow(clippy::too_many_lines)]
++    fn replication_decision_lock_requires_leader_quorum_and_safe_carry_forward() {
++        let dir = test_dir("replication-decision-lock-carry-forward");
++        let (base, registry, _) = setup_revision(2_610, &[1]);
++        let semantic_revision = base.semantic_revision();
++        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
++        store
++            .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
++            .unwrap();
++
++        let first = replicated_relation_effect!(
++            201,
++            1,
++            201,
++            base.id(),
++            RevisionId::new(2_611),
++            BTreeSet::new(),
++            semantic_revision,
++            70
++        );
++        let first_id = first.effect.id;
++        store.durably_ingest_replicated_effect(first).unwrap();
++        let mut conflicting = replicated_relation_effect!(
++            202,
++            1,
++            202,
++            base.id(),
++            RevisionId::new(2_612),
++            BTreeSet::new(),
++            semantic_revision,
++            70
++        );
++        conflicting.ordered_by.sequencer = ReplicaId::new(100);
++        conflicting.ordered_by.epoch = 8;
++        let conflicting_id = conflicting.effect.id;
++        store.durably_ingest_replicated_effect(conflicting).unwrap();
++
++        certify_replication_leader(&mut store, 1, 5, 1, &[1, 2]);
++        record_consensus_decision_votes(
++            &mut store,
++            ReplicationDecisionVote {
++                voter: ReplicaId::new(1),
++                membership_epoch: 1,
++                term: 5,
++                leader: ReplicaId::new(1),
++                position: 70,
++                effect: first_id,
++                carried_from_term: None,
++            },
++            &[1, 2],
++        );
++        record_effect_votes(&mut store, first_id, 1, &[1, 2]);
++        assert!(matches!(
++            store.durably_certify_replicated_effect_quorum(quorum_certificate(
++                first_id,
++                1,
++                &[1, 2]
++            )),
++            Err(DurabilityError::Protocol {
++                reason: "replication quorum lacks consensus decision lock",
++                ..
++            })
++        ));
++        store
++            .durably_lock_replication_decision(ReplicationDecisionLock {
++                membership_epoch: 1,
++                term: 5,
++                leader: ReplicaId::new(1),
++                position: 70,
++                effect: first_id,
++                acknowledged_by: [ReplicaId::new(1), ReplicaId::new(2)].into_iter().collect(),
++                carried_from_term: None,
++            })
++            .unwrap();
++        store
++            .durably_certify_replicated_effect_quorum(quorum_certificate(first_id, 1, &[1, 2]))
++            .unwrap();
++
++        certify_replication_leader(&mut store, 1, 6, 2, &[1, 2]);
++
++        assert!(matches!(
++            store.durably_record_replication_decision_vote(ReplicationDecisionVote {
++                voter: ReplicaId::new(1),
++                membership_epoch: 1,
++                term: 6,
++                leader: ReplicaId::new(2),
++                position: 70,
++                effect: conflicting_id,
++                carried_from_term: Some(5),
++            }),
++            Err(DurabilityError::Protocol {
++                reason: "replication decision conflicts with a durable locked value",
++                ..
++            })
++        ));
++        assert!(matches!(
++            store.durably_record_replication_decision_vote(ReplicationDecisionVote {
++                voter: ReplicaId::new(1),
++                membership_epoch: 1,
++                term: 6,
++                leader: ReplicaId::new(2),
++                position: 70,
++                effect: first_id,
++                carried_from_term: None,
++            }),
++            Err(DurabilityError::Protocol {
++                reason: "replication later-term decision did not carry forward the durable lock",
++                ..
++            })
++        ));
++        record_consensus_decision_votes(
++            &mut store,
++            ReplicationDecisionVote {
++                voter: ReplicaId::new(1),
++                membership_epoch: 1,
++                term: 6,
++                leader: ReplicaId::new(2),
++                position: 70,
++                effect: first_id,
++                carried_from_term: Some(5),
++            },
++            &[1, 2],
++        );
++        store
++            .durably_lock_replication_decision(ReplicationDecisionLock {
++                membership_epoch: 1,
++                term: 6,
++                leader: ReplicaId::new(2),
++                position: 70,
++                effect: first_id,
++                acknowledged_by: [ReplicaId::new(1), ReplicaId::new(2)].into_iter().collect(),
++                carried_from_term: Some(5),
++            })
++            .unwrap();
++        assert_eq!(store.replication_decision_lock(70).unwrap().term, 6);
++        drop(store);
++
++        let (reopened, _) = DurableRevisionStore::open(&dir).unwrap();
++        let lock = reopened.replication_decision_lock(70).unwrap();
++        assert_eq!(lock.effect, first_id);
++        assert_eq!(lock.term, 6);
++        assert_eq!(lock.carried_from_term, Some(5));
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn replication_joint_membership_requires_old_and_new_quorums_in_certified_term() {
++        let dir = test_dir("replication-joint-membership");
++        let (base, registry, _) = setup_revision(2_620, &[1]);
++        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
++        store
++            .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
++            .unwrap();
++        certify_replication_leader(&mut store, 1, 10, 1, &[1, 2]);
++
++        let next = membership_change(2, &[4, 5, 6], 2, &[1, 2]);
++        record_membership_votes(&mut store, 1, 10, &next.next, &[1, 2]);
++        assert!(matches!(
++            store.durably_install_replication_membership(next.clone()),
++            Err(DurabilityError::Protocol {
++                reason: "replication membership change lacks joint quorum certificate",
++                ..
++            })
++        ));
++        assert!(matches!(
++            store.durably_certify_replication_joint_membership(
++                ReplicationJointMembershipCertificate {
++                    previous_membership_epoch: 1,
++                    term: 10,
++                    leader: ReplicaId::new(1),
++                    next: next.next.clone(),
++                    acknowledged_by_previous: [ReplicaId::new(1), ReplicaId::new(2)]
++                        .into_iter()
++                        .collect(),
++                    acknowledged_by_next: [ReplicaId::new(4)].into_iter().collect(),
++                }
++            ),
++            Err(DurabilityError::Protocol {
++                reason: "joint membership certificate lacks successor-membership quorum",
++                ..
++            })
++        ));
++        store
++            .durably_certify_replication_joint_membership(ReplicationJointMembershipCertificate {
++                previous_membership_epoch: 1,
++                term: 10,
++                leader: ReplicaId::new(1),
++                next: next.next.clone(),
++                acknowledged_by_previous: [ReplicaId::new(1), ReplicaId::new(2)]
++                    .into_iter()
++                    .collect(),
++                acknowledged_by_next: [ReplicaId::new(4), ReplicaId::new(5)].into_iter().collect(),
++            })
++            .unwrap();
++        store.durably_install_replication_membership(next).unwrap();
++        assert_eq!(store.current_replication_membership().unwrap().epoch, 2);
++        drop(store);
++
++        let (reopened, _) = DurableRevisionStore::open(&dir).unwrap();
++        assert_eq!(reopened.current_replication_membership().unwrap().epoch, 2);
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn replication_joint_membership_is_fenced_by_later_term_promise() {
++        let dir = test_dir("replication-joint-membership-stale-term");
++        let (base, registry, _) = setup_revision(2_630, &[1]);
++        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
++        store
++            .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
++            .unwrap();
++        certify_replication_leader(&mut store, 1, 10, 1, &[1, 2]);
++        let next = membership_change(2, &[4, 5, 6], 2, &[1, 2]);
++        record_membership_votes(&mut store, 1, 10, &next.next, &[1, 2]);
++        store
++            .durably_certify_replication_joint_membership(ReplicationJointMembershipCertificate {
++                previous_membership_epoch: 1,
++                term: 10,
++                leader: ReplicaId::new(1),
++                next: next.next.clone(),
++                acknowledged_by_previous: [ReplicaId::new(1), ReplicaId::new(2)]
++                    .into_iter()
++                    .collect(),
++                acknowledged_by_next: [ReplicaId::new(4), ReplicaId::new(5)].into_iter().collect(),
++            })
++            .unwrap();
++        store
++            .durably_record_replication_term_promise(ReplicationTermPromise {
++                voter: ReplicaId::new(3),
++                membership_epoch: 1,
++                term: 11,
++            })
++            .unwrap();
++        assert!(matches!(
++            store.durably_install_replication_membership(next),
++            Err(DurabilityError::Protocol {
++                reason: "replication membership change uses a stale consensus term",
++                ..
++            })
++        ));
+         fs::remove_dir_all(dir).unwrap();
+     }
+ 

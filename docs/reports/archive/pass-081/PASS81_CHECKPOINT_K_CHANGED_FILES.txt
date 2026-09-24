@@ -1,0 +1,6 @@
+crates/kernel-durability/src/lib.rs
+crates/kernel-durability/src/metadata.rs
+crates/kernel-durability/src/store.rs
+PASS81_INTEGRATION_LEDGER.md
+PASS81_CHECKPOINT_K_ATOMIC_MIGRATION.md
+PASS81_CHECKPOINT_K_CHANGED_FILES.txt

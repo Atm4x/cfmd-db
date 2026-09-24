@@ -1,0 +1,5 @@
+PASS101 source frozen before nominal 20-minute boundary.
+Baseline: cfmd_workspace_pass100_join_bilinearpullback_complete.zip
+Production source fingerprint: a3ec9fd4bb2f13bda9020d2aa8d6131f04b09ae8f4be88675e7d412d05a41f46
+V5 Stage 4.5 BlockerZeroCrossing is complete; Stage 4 is complete.
+No Stage 5 source integration is claimed in this checkpoint.

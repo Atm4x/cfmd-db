@@ -1,0 +1,65 @@
+=== process 1 ===
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=273649
+native_ns_per_iter_median=301070
+native_ns_per_iter_max=377652
+baseline_ns_per_iter_min=256000
+baseline_ns_per_iter_median=280362
+baseline_ns_per_iter_max=438870
+native_over_baseline_milli=1073
+=== process 2 ===
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=274452
+native_ns_per_iter_median=289060
+native_ns_per_iter_max=382492
+baseline_ns_per_iter_min=240933
+baseline_ns_per_iter_median=249630
+baseline_ns_per_iter_max=290767
+native_over_baseline_milli=1157
+=== process 3 ===
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=279588
+native_ns_per_iter_median=299954
+native_ns_per_iter_max=495617
+baseline_ns_per_iter_min=248725
+baseline_ns_per_iter_median=264404
+baseline_ns_per_iter_max=320924
+native_over_baseline_milli=1134
+=== process 4 ===
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=275434
+native_ns_per_iter_median=295185
+native_ns_per_iter_max=375405
+baseline_ns_per_iter_min=253925
+baseline_ns_per_iter_median=262823
+baseline_ns_per_iter_max=353787
+native_over_baseline_milli=1123
+=== process 5 ===
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=281454
+native_ns_per_iter_median=311769
+native_ns_per_iter_max=397071
+baseline_ns_per_iter_min=244265
+baseline_ns_per_iter_median=273532
+baseline_ns_per_iter_max=412569
+native_over_baseline_milli=1139

@@ -1,0 +1,17 @@
+[package]
+name = "kernel-revision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-identity = { path = "../kernel-identity" }
+kernel-lifecycle = { path = "../kernel-lifecycle" }
+kernel-model = { path = "../kernel-model" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-types = { path = "../kernel-types" }
+kernel-validation = { path = "../kernel-validation" }
+
+[lints]
+workspace = true

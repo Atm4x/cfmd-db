@@ -1,0 +1,2 @@
+    Checking kernel-integration v0.1.0 (/mnt/data/pass64_work/crates/kernel-integration)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s

@@ -1,0 +1,4 @@
+   Compiling kernel-lens v0.1.0 (/mnt/data/cfmd_pass75_work/crates/kernel-lens)
+   Compiling kernel-fixpoint v0.1.0 (/mnt/data/cfmd_pass75_work/crates/kernel-fixpoint)
+   Compiling kernel-integration v0.1.0 (/mnt/data/cfmd_pass75_work/crates/kernel-integration)
+    Finished `release` profile [optimized] target(s) in 0.48s

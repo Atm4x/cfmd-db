@@ -1,0 +1,11 @@
+Pass46 static audit
+production source changed: crates/kernel-plan/src/lib.rs only
+new Clippy allow sites: 0 (Pass45=14, Pass46=14)
+unsafe in crates/: 0
+TODO/FIXME/todo!/unimplemented! in crates/: 0
+external Cargo registry/git sources: 0
+debug_assert mutation-pattern hits: 0
+declared Rust tests: 347
+kernel-plan declared tests: 119 (118 normal + 1 ignored diagnostic benchmark)
+Rust LOC under crates/: 46869
+source freeze sha256 kernel-plan/lib.rs: 3c114459632ea49433207fb79133f8adfa860ab5206a1481d661beaf7e70f720

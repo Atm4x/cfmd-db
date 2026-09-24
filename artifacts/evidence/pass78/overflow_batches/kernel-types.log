@@ -1,0 +1,8 @@
+   Compiling kernel-types v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-types)
+    Finished `release` profile [optimized] target(s) in 0.10s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_types-0e5d97c15e95c140)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,25 @@
+RUN 1
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=622
+baseline_median_ns=136
+ratio_milli=4573
+RUN 2
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=640
+baseline_median_ns=137
+ratio_milli=4671
+RUN 3
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=614
+baseline_median_ns=137
+ratio_milli=4481
+RUN 4
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=676
+baseline_median_ns=138
+ratio_milli=4898
+RUN 5
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=630
+baseline_median_ns=137
+ratio_milli=4598

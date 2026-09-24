@@ -1,0 +1,692 @@
+diff -ru --exclude target --exclude MANIFEST.sha256 /mnt/data/cfmd_workspace_pass17/cfmd_workspace_pass17/CFMD_IDEAL_DB_SPEC.md ./CFMD_IDEAL_DB_SPEC.md
+--- /mnt/data/cfmd_workspace_pass17/cfmd_workspace_pass17/CFMD_IDEAL_DB_SPEC.md	2026-09-19 13:51:47.985608109 +0000
++++ ./CFMD_IDEAL_DB_SPEC.md	2026-09-19 14:16:40.346618709 +0000
+@@ -650,9 +650,26 @@
+ 
+ ---
+ 
++
++## 17.7 Pass18 correction — stable-slot updates and clone-free atomic commit
++
++**[VERIFIED/PARTIAL]** Pass17 stable handles still used dense `Vec::remove` and cloned the complete relation plus every bound index before applying a delta. Pass18 separates stable logical row identity from dense physical position more sharply:
++
++- physical deletion uses `swap_remove`, so only the removed handle and at most one moved row position are repaired;
++- logical scan/insertion order is reconstructed through the stable handle→position layer, so physical compaction cannot leak into Bag/Set query output order;
++- `apply_relation_delta` is now two-phase: first plan and validate the complete relation/index mutation, then mutate in place; invalid user deltas are rejected before the first mutation;
++- compatible persisted I64 indexes are also used as **candidate locators for removal**, followed by full semantic-row equality, so an index accelerates update planning without becoming the source of truth.
++
++A hostile atomicity test proves missing removals and wrong-typed inserts leave the complete `PhysicalStore` unchanged. A structural test proves deleting a dense slot repairs only the swapped row position.
++
++The clone-tax falsifier changed sharply. Before two-phase commit, removing the first row scaled roughly 0.12 ms (10k) → 1.54 ms (100k) → 4.41 ms (300k) without an index, and up to ~37.5 ms at 300k with a persisted index because full state was cloned. After Pass18, first-row deletion is only a few microseconds and no longer scales with relation size. Removing the last row still costs O(n) without an index because semantic row resolution scans; with the persisted I64 index, the 300k case falls from ~17 ms to ~0.012 ms.
++
++**Remaining physical caveat:** stable handles are monotonically allocated and deleted handle slots remain in the handle→position table. High-churn relations therefore need bounded chunk/epoch compaction or another indirection scheme; Pass18 closes O(n) dense-position repair, not long-term handle-space growth.
++
++
+ # 18. Матрица «идеал ↔ реализация»
+ 
+-| Компонент идеальной БД | Статус после Pass17 | Что ещё нужно |
++| Компонент идеальной БД | Статус после Pass18 | Что ещё нужно |
+ |---|---|---|
+ | `Revision=(S,Γ,M)` | **VERIFIED core shape** | durable persistent engine |
+ | Algebraic structural types | **VERIFIED broad** | fuller surface elaboration |
+@@ -672,7 +689,7 @@
+ | Checked certificates | **VERIFIED architecture** | proof-assistant mechanization |
+ | Small PlanIR | **VERIFIED prototype** | richer batch/fixpoint/source contracts |
+ | Native typed columnar | **VERIFIED** | general batch-to-batch pipeline |
+-| Indexed Join | **PARTIAL/VERIFIED architecture** | stable `PhysicalRowId` payload + atomic delta maintenance работают; закрыть ~10–20% prebuilt gap, убрать O(n) dense-position repair on delete, добавить other key types/costing |
++| Indexed Join | **PARTIAL/VERIFIED architecture** | stable `PhysicalRowId` payload + atomic delta maintenance работают; закрыть ~10–20% prebuilt gap, O(n) dense-position repair и full-state clone на validated delta закрыты; добавить other key types/costing, general candidate-location и bounded handle-space compaction |
+ | Physical Group/TopK | **VERIFIED correctness** | maintained state / better algorithms |
+ | OrderedView/pagination | **OPEN** | explicit semantic/runtime type |
+ | WAL/recovery/compaction | **OPEN** | engine layer |
+@@ -725,21 +742,22 @@
+ 
+ ---
+ 
+-# 21. Текущий главный implementation frontier после Pass17
++# 21. Текущий главный implementation frontier после Pass18
+ 
+ Приоритеты, если новый falsifier не меняет архитектуру:
+ 
+ 1. **General typed batch pipeline.** Уйти от узкой fusion `Scan→FilterEqConst→Project`; downstream operators и Join output должны передавать typed batches/row handles без промежуточных `Vec<Value>` rows.
+-2. **Stable-slot physical relation storage.** `PhysicalRowId` уже стабилен, но dense `Vec::remove` требует O(n) position repair; перейти к slot/tombstone/chunk scheme или другой структуре без mandatory shift cost, не протекая physical order в Bag/Set semantics.
+-3. **Indexed joins для других semantic key classes.** Bool, F64Bitwise, Text equivalence/collation, nominal IDs; planner cost selection и prepared contract specialization.
+-4. **Stateful TopK.** Maintained order-statistics, ties и explicit ordering semantics.
+-5. **Stateful Group.** Count и deletion-capable exact/reproducible F64 aggregate state/provenance.
+-6. **Long-lived Join/TopK/Group derivative state** и единый ownership lifecycle physical artifacts.
+-7. **Other physical layouts:** KeyValue, AdjacencyList/CSR, DenseArray, Inverted, Custom.
+-8. **OrderedView/pagination.** Явный semantic order + pinned revision cursor semantics.
+-9. **Durability:** WAL/recovery, persistent indexes/materializations, compaction, crash tests.
+-10. **Concurrency/distribution:** observation repair scheduler, replication/consensus/merge coherence.
+-11. **Formal closure:** surface elaboration theorem, Dq theorem, merge cube, retention IFC, proof checker mechanization.
++2. **Bounded stable-handle/chunk lifecycle.** O(n) dense-position repair уже закрыт `swap_remove`, но monotone `PhysicalRowId` оставляет tombstones в handle→position metadata. Нужен chunk/epoch/indirection design с bounded metadata и сохранением live handles.
++3. **General update-location/index planning.** Persisted I64 index уже ускоряет removal candidate lookup, но unindexed/unsupported-key delete всё ещё может делать O(n) semantic scan. Нужны other key classes, выбор лучшего index и cost/selectivity rules.
++4. **Close remaining I64 Join execution gap.** Persisted prebuilt path всё ещё примерно на ~10% выше hand-written baseline на текущем microbenchmark; не лечить benchmark-specific shortcuts.
++5. **Stateful TopK.** Maintained order-statistics, ties и explicit ordering semantics.
++6. **Stateful Group.** Count и deletion-capable exact/reproducible F64 aggregate state/provenance.
++7. **Long-lived Join/TopK/Group derivative state** и единый ownership lifecycle physical artifacts.
++8. **Other physical layouts:** KeyValue, AdjacencyList/CSR, DenseArray, Inverted, Custom.
++9. **OrderedView/pagination.** Явный semantic order + pinned revision cursor semantics.
++10. **Durability:** WAL/recovery, persistent indexes/materializations, compaction, crash tests.
++11. **Concurrency/distribution:** observation repair scheduler, replication/consensus/merge coherence.
++12. **Formal closure:** surface elaboration theorem, Dq theorem, merge cube, retention IFC, proof checker mechanization.
+ 
+ ---
+ 
+@@ -796,5 +814,5 @@
+ - §52.1–52.12 — universal change existence, Impact, approximation boundary, PlanIR direction;
+ - ранние §17–18 использованы только там, где идеи сохранились после поздних falsifier’ов (immutable schema versions, lenses, typed change, identity separation, physical independence).
+ 
+-Implementation corrections/status наложены из verified Pass09–Pass17, с текущей точкой **Pass17 / 194 tests**.
++Implementation corrections/status наложены из verified Pass09–Pass18, с текущей точкой **Pass18 / 196 tests**.
+ 
+diff -ru --exclude target --exclude MANIFEST.sha256 /mnt/data/cfmd_workspace_pass17/cfmd_workspace_pass17/IMPLEMENTATION_REPORT.md ./IMPLEMENTATION_REPORT.md
+--- /mnt/data/cfmd_workspace_pass17/cfmd_workspace_pass17/IMPLEMENTATION_REPORT.md	2026-09-19 13:50:04.511223727 +0000
++++ ./IMPLEMENTATION_REPORT.md	2026-09-19 14:15:25.498274780 +0000
+@@ -281,3 +281,16 @@
+ Performance on the 20k unique-key persisted self-join improved from Pass16's ~1.32x hand-written prebuilt-index gap to roughly 1.10–1.14x in final runs, while persisted reuse remains about half the runtime of rebuilding the index per query. The remaining physical issue is no longer logical-row duplication; it is typed batch/output materialization plus dense-position maintenance after deletes.
+ 
+ See `PASS17_REPORT.md` and the updated `CFMD_IDEAL_DB_SPEC.md` for the exact normative correction and remaining frontier.
++
++# Pass18 update — stable-slot mutation and atomic prevalidated delta commit
++
++Pass18 changes only the physical/update layer; the logical kernel remains unchanged.
++
++- Dense relation deletion uses stable `PhysicalRowId` + `swap_remove`; only one moved position is repaired.
++- Logical scan order is decoupled from dense physical order and remains deterministic after compaction.
++- `PhysicalStore::apply_relation_delta` no longer clones whole relations/indexes. It plans and validates all semantic/physical/index edits first, then commits them in place.
++- Invalid removals or wrong-typed insertions are proven by regression test to leave the whole store unchanged.
++- Persisted I64 indexes are used for update candidate location, followed by full semantic row equality.
++- 300k last-row removal improves from ~17 ms linear scan to ~0.012 ms with persisted index; first-row update no longer pays full-state clone cost.
++- New storage debt: monotonically allocated row handles leave tombstones in the handle-position table; bounded chunk/epoch compaction remains open.
++- Final gate: 196 tests debug+release, fmt/clippy/build/rustdoc PASS, overflow-check plan/integration PASS.
+Only in .: IMPLEMENTATION_REPORT_pass18.md
+Only in .: PASS18_DELTA_UPDATE_BENCH.txt
+Only in .: PASS18_DELTA_UPDATE_BENCH_AFTER.txt
+Only in .: PASS18_DELTA_UPDATE_BENCH_FINAL.txt
+Only in .: PASS18_DELTA_UPDATE_BENCH_INDEXED.txt
+Only in .: PASS18_DELTA_UPDATE_BENCH_REPEATS.txt
+Only in .: PASS18_REPORT.md
+Only in .: PASS18_SOURCE_DIFF.txt
+Only in ./crates/kernel-plan/examples: delta_update_bench.rs
+diff -ru --exclude target --exclude MANIFEST.sha256 /mnt/data/cfmd_workspace_pass17/cfmd_workspace_pass17/crates/kernel-plan/src/lib.rs ./crates/kernel-plan/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass17/cfmd_workspace_pass17/crates/kernel-plan/src/lib.rs	2026-09-19 13:44:57.107540343 +0000
++++ ./crates/kernel-plan/src/lib.rs	2026-09-19 14:11:24.426502274 +0000
+@@ -1,4 +1,4 @@
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, BTreeSet};
+ 
+ use kernel_model::Value;
+ use kernel_query::{
+@@ -97,23 +97,23 @@
+         }
+     }
+ 
+-    fn remove_at(&mut self, index: usize) {
++    fn swap_remove_at(&mut self, index: usize) {
+         match self {
+             Self::Unit(len) => *len -= 1,
+             Self::Bool(values) => {
+-                values.remove(index);
++                values.swap_remove(index);
+             }
+             Self::I64(values) => {
+-                values.remove(index);
++                values.swap_remove(index);
+             }
+             Self::F64Bits(values) => {
+-                values.remove(index);
++                values.swap_remove(index);
+             }
+             Self::Text(values) => {
+-                values.remove(index);
++                values.swap_remove(index);
+             }
+             Self::LiveEntityIds { values, .. } | Self::HistoricalEntityIds { values, .. } => {
+-                values.remove(index);
++                values.swap_remove(index);
+             }
+         }
+     }
+@@ -244,15 +244,27 @@
+     fn remove_row(&mut self, index: usize) -> Result<PhysicalRowId, PhysicalExecutionError> {
+         let id = self.row_id_at(index)?;
+         remove_native_row(&mut self.data, index)?;
+-        self.row_ids.remove(index);
++        self.row_ids.swap_remove(index);
+         self.positions_are_identity = false;
+         self.positions[id.0] = None;
+-        for (position, row_id) in self.row_ids.iter().copied().enumerate().skip(index) {
+-            self.positions[row_id.0] = Some(position);
++        if let Some(moved_id) = self.row_ids.get(index).copied() {
++            self.positions[moved_id.0] = Some(index);
+         }
+         Ok(id)
+     }
+ 
++    fn logical_positions(&self) -> impl Iterator<Item = usize> + '_ {
++        self.positions.iter().filter_map(|position| *position)
++    }
++
++    fn scan_positions(&self) -> Box<dyn Iterator<Item = usize> + '_> {
++        if self.positions_are_identity {
++            Box::new(0..self.row_ids.len())
++        } else {
++            Box::new(self.logical_positions())
++        }
++    }
++
+     fn push_row(
+         &mut self,
+         row: &kernel_query::Row,
+@@ -312,8 +324,9 @@
+     }
+ 
+     /// Atomically applies a semantic relation delta to the installed physical relation and to
+-    /// every persisted I64 index bound to that exact relation/layout. All updates are prepared on
+-    /// clones first; an inconsistent delta leaves both relation and indexes unchanged.
++    /// every persisted I64 index bound to that exact relation/layout. The complete mutation is
++    /// planned and validated before any state is changed, so user-visible validation failures do
++    /// not require cloning the relation or its materialized indexes.
+     pub fn apply_relation_delta(
+         &mut self,
+         relation: SemanticId,
+@@ -323,28 +336,44 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+         let key = (relation, layout.id);
+-        let mut next_relation = self.relations.get(&key).cloned().ok_or(
++        let installed =
++            self.relations
++                .get(&key)
++                .ok_or(PhysicalExecutionError::MissingPhysicalRelation {
++                    relation,
++                    layout: layout.id,
++                })?;
++        let candidate_index = self
++            .i64_indexes
++            .iter()
++            .find(|(binding, _)| binding.relation == relation && binding.layout.id == layout.id)
++            .map(|(_, state)| state);
++        let physical_delta = plan_installed_relation_delta(
++            installed,
++            candidate_index,
++            relation,
++            delta,
++            context,
++            registry,
++        )?;
++        for (binding, state) in &self.i64_indexes {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.validate_physical_delta(&physical_delta)?;
++            }
++        }
++
++        let installed = self.relations.get_mut(&key).ok_or(
+             PhysicalExecutionError::MissingPhysicalRelation {
+                 relation,
+                 layout: layout.id,
+             },
+         )?;
+-        let physical_delta =
+-            apply_installed_relation_delta(&mut next_relation, relation, delta, context, registry)?;
+-
+-        let mut next_indexes = Vec::new();
+-        for (binding, state) in &self.i64_indexes {
++        apply_planned_relation_delta(installed, &physical_delta)?;
++        for (binding, state) in &mut self.i64_indexes {
+             if binding.relation == relation && binding.layout.id == layout.id {
+-                let mut next_state = state.clone();
+-                next_state.apply_physical_delta(&physical_delta)?;
+-                next_indexes.push((*binding, next_state));
++                state.apply_physical_delta(&physical_delta)?;
+             }
+         }
+-
+-        self.relations.insert(key, next_relation);
+-        for (binding, state) in next_indexes {
+-            self.i64_indexes.insert(binding, state);
+-        }
+         Ok(())
+     }
+ 
+@@ -364,14 +393,6 @@
+             },
+         )
+     }
+-
+-    fn get(
+-        &self,
+-        relation: SemanticId,
+-        binding: LayoutBinding,
+-    ) -> Result<&NativeRelation, PhysicalExecutionError> {
+-        Ok(&self.installed(relation, binding)?.data)
+-    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -470,6 +491,31 @@
+         }
+         Ok(())
+     }
++
++    fn validate_physical_delta(
++        &self,
++        delta: &PhysicalRelationDelta,
++    ) -> Result<(), PhysicalExecutionError> {
++        for (row_id, row) in &delta.removed {
++            let key = match row.get(self.binding.key_column) {
++                Some(Value::I64(value)) => *value,
++                _ => return Err(PhysicalExecutionError::PhysicalTypeMismatch),
++            };
++            if !self
++                .buckets
++                .get(&key)
++                .is_some_and(|bucket| bucket.contains(row_id))
++            {
++                return Err(RelQueryError::InconsistentIncrementalDelta.into());
++            }
++        }
++        for (_, row) in &delta.inserted {
++            if !matches!(row.get(self.binding.key_column), Some(Value::I64(_))) {
++                return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+@@ -1039,7 +1085,20 @@
+     context: &kernel_schema::SemanticContext,
+     stats: &mut ExecutionStats,
+ ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
+-    match store.get(relation, layout)? {
++    let installed = store.installed(relation, layout)?;
++    if !installed.positions_are_identity {
++        let row_count = installed.logical_positions().count();
++        stats.scanned_rows = stats.scanned_rows.saturating_add(row_count);
++        stats.values_read = stats
++            .values_read
++            .saturating_add(native_column_count(&installed.data).saturating_mul(row_count));
++        let mut rows = Vec::with_capacity(row_count);
++        for position in installed.logical_positions() {
++            rows.push(materialize_native_row(&installed.data, position)?);
++        }
++        return Ok(rows);
++    }
++    match &installed.data {
+         NativeRelation::RowStore(rows) => {
+             stats.scanned_rows = stats.scanned_rows.saturating_add(rows.len());
+             stats.values_read = stats
+@@ -1194,12 +1253,26 @@
+     registry: &kernel_semantics::SemanticRegistry,
+     stats: &mut ExecutionStats,
+ ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
++    let installed = store.installed(relation, layout)?;
++    if !installed.positions_are_identity {
++        let rows = scan_rows(store, relation, layout, context, stats)?;
++        let filtered = filter_rows(
++            rows,
++            predicate_column,
++            predicate_value,
++            equivalence,
++            context,
++            registry,
++            stats,
++        )?;
++        return project_rows(filtered, projection, stats);
++    }
+     let resolved = registry.resolve_primitive_equivalence(context, equivalence)?;
+     let bound = resolved
+         .as_ref()
+         .map(|resolved| resolved.bind_right(predicate_value))
+         .transpose()?;
+-    match store.get(relation, layout)? {
++    match &installed.data {
+         NativeRelation::I64Columnar { columns, row_count }
+             if matches!(
+                 bound,
+@@ -1793,7 +1866,8 @@
+         return Ok(None);
+     }
+ 
+-    let left_data = store.get(left_relation, left_layout)?;
++    let left_installed = store.installed(left_relation, left_layout)?;
++    let left_data = &left_installed.data;
+     let right_installed = store.installed(right_relation, right_layout)?;
+     let right_data = &right_installed.data;
+     validate_indexable_i64_relation(context, left_relation, left_data)?;
+@@ -1810,7 +1884,8 @@
+         let left_i64_columns = native_all_i64_columns(left_data);
+         let right_i64_columns = native_all_i64_columns(right_data);
+         let mut out = Vec::with_capacity(left_keys.len());
+-        for (left_index, key) in left_keys.iter().copied().enumerate() {
++        for left_index in left_installed.scan_positions() {
++            let key = left_keys[left_index];
+             if let Some(right_rows) = index.probe(key) {
+                 for right_row_id in right_rows {
+                     let right_index = right_installed
+@@ -1844,11 +1919,13 @@
+ 
+     stats.ephemeral_index_builds = stats.ephemeral_index_builds.saturating_add(1);
+     let mut right_index: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+-    for (row_index, key) in right_keys.iter().copied().enumerate() {
++    for row_index in right_installed.scan_positions() {
++        let key = right_keys[row_index];
+         right_index.entry(key).or_default().push(row_index);
+     }
+     let mut out = Vec::with_capacity(left_keys.len());
+-    for (left_index, key) in left_keys.iter().copied().enumerate() {
++    for left_index in left_installed.scan_positions() {
++        let key = left_keys[left_index];
+         if let Some(right_rows) = right_index.get(&key) {
+             for right_index in right_rows {
+                 let mut row = Vec::with_capacity(
+@@ -1896,8 +1973,9 @@
+     }
+ }
+ 
+-fn apply_installed_relation_delta(
+-    relation: &mut InstalledRelation,
++fn plan_installed_relation_delta(
++    relation: &InstalledRelation,
++    candidate_index: Option<&MaterializedI64IndexState>,
+     relation_id: SemanticId,
+     delta: &RelationDelta,
+     context: &kernel_schema::SemanticContext,
+@@ -1927,26 +2005,139 @@
+         removed: Vec::with_capacity(delta.removed.len()),
+         inserted: Vec::with_capacity(delta.inserted.len()),
+     };
++    let mut reserved = BTreeSet::new();
+     for removed in &delta.removed {
+-        let mut found = None;
+-        for index in 0..native_row_count(&relation.data) {
+-            let existing = materialize_native_row(&relation.data, index)?;
+-            if semantic_rows_equal(&existing, removed, equivalences, context, registry)? {
+-                found = Some(index);
+-                break;
+-            }
+-        }
+-        let index = found.ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-        let row_id = relation.remove_row(index)?;
++        let found = find_removed_row_id(
++            relation,
++            candidate_index,
++            removed,
++            &reserved,
++            equivalences,
++            context,
++            registry,
++        )?;
++        let row_id = found.ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        reserved.insert(row_id);
+         physical.removed.push((row_id, removed.clone()));
+     }
+-    for inserted in &delta.inserted {
+-        let row_id = relation.push_row(inserted)?;
++    for (next_row_id, inserted) in (relation.positions.len()..).zip(&delta.inserted) {
++        validate_native_row(&relation.data, inserted)?;
++        let row_id = PhysicalRowId(next_row_id);
+         physical.inserted.push((row_id, inserted.clone()));
+     }
+     Ok(physical)
+ }
+ 
++fn find_removed_row_id(
++    relation: &InstalledRelation,
++    candidate_index: Option<&MaterializedI64IndexState>,
++    removed: &kernel_query::Row,
++    reserved: &BTreeSet<PhysicalRowId>,
++    equivalences: &[SemanticId],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<PhysicalRowId>, PhysicalExecutionError> {
++    if let Some(index) = candidate_index
++        && let Some(Value::I64(key)) = removed.get(index.binding.key_column)
++        && let Some(candidates) = index.probe(*key)
++    {
++        for row_id in candidates {
++            if reserved.contains(row_id) {
++                continue;
++            }
++            let Some(position) = relation.position(*row_id) else {
++                continue;
++            };
++            let existing = materialize_native_row(&relation.data, position)?;
++            if semantic_rows_equal(&existing, removed, equivalences, context, registry)? {
++                return Ok(Some(*row_id));
++            }
++        }
++        return Ok(None);
++    }
++    for position in 0..native_row_count(&relation.data) {
++        let row_id = relation.row_id_at(position)?;
++        if reserved.contains(&row_id) {
++            continue;
++        }
++        let existing = materialize_native_row(&relation.data, position)?;
++        if semantic_rows_equal(&existing, removed, equivalences, context, registry)? {
++            return Ok(Some(row_id));
++        }
++    }
++    Ok(None)
++}
++
++fn apply_planned_relation_delta(
++    relation: &mut InstalledRelation,
++    delta: &PhysicalRelationDelta,
++) -> Result<(), PhysicalExecutionError> {
++    for (row_id, _) in &delta.removed {
++        let position = relation
++            .position(*row_id)
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        let removed = relation.remove_row(position)?;
++        if removed != *row_id {
++            return Err(RelQueryError::InconsistentIncrementalDelta.into());
++        }
++    }
++    for (expected_id, row) in &delta.inserted {
++        let inserted = relation.push_row(row)?;
++        if inserted != *expected_id {
++            return Err(RelQueryError::InconsistentIncrementalDelta.into());
++        }
++    }
++    Ok(())
++}
++
++fn validate_native_row(
++    data: &NativeRelation,
++    row: &kernel_query::Row,
++) -> Result<(), PhysicalExecutionError> {
++    if row.len() != native_column_count(data) {
++        return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++    }
++    match data {
++        NativeRelation::RowStore(_) | NativeRelation::Columnar { .. } => Ok(()),
++        NativeRelation::I64Columnar { .. } => row
++            .iter()
++            .all(|value| matches!(value, Value::I64(_)))
++            .then_some(())
++            .ok_or(PhysicalExecutionError::PhysicalTypeMismatch),
++        NativeRelation::TypedColumnar { columns, .. } => columns
++            .iter()
++            .zip(row)
++            .all(|(column, value)| native_column_accepts_value(column, value))
++            .then_some(())
++            .ok_or(PhysicalExecutionError::PhysicalTypeMismatch),
++    }
++}
++
++fn native_column_accepts_value(column: &NativeColumn, value: &Value) -> bool {
++    match (column, value) {
++        (NativeColumn::Unit(_), Value::Unit)
++        | (NativeColumn::Bool(_), Value::Bool(_))
++        | (NativeColumn::I64(_), Value::I64(_))
++        | (NativeColumn::F64Bits(_), Value::F64Bits(_))
++        | (NativeColumn::Text(_), Value::Text(_)) => true,
++        (
++            NativeColumn::LiveEntityIds { entity_type, .. },
++            Value::LiveEntityRef {
++                entity_type: value_type,
++                ..
++            },
++        )
++        | (
++            NativeColumn::HistoricalEntityIds { entity_type, .. },
++            Value::HistoricalEntityId {
++                entity_type: value_type,
++                ..
++            },
++        ) => entity_type == value_type,
++        _ => false,
++    }
++}
++
+ fn native_row_count(data: &NativeRelation) -> usize {
+     match data {
+         NativeRelation::RowStore(rows) => rows.len(),
+@@ -1991,14 +2182,14 @@
+             if row_index >= rows.len() {
+                 return Err(PhysicalExecutionError::ColumnShapeMismatch);
+             }
+-            rows.remove(row_index);
++            rows.swap_remove(row_index);
+         }
+         NativeRelation::Columnar { columns, row_count } => {
+             if row_index >= *row_count {
+                 return Err(PhysicalExecutionError::ColumnShapeMismatch);
+             }
+             for column in columns {
+-                column.remove(row_index);
++                column.swap_remove(row_index);
+             }
+             *row_count -= 1;
+         }
+@@ -2007,7 +2198,7 @@
+                 return Err(PhysicalExecutionError::ColumnShapeMismatch);
+             }
+             for column in columns {
+-                column.remove(row_index);
++                column.swap_remove(row_index);
+             }
+             *row_count -= 1;
+         }
+@@ -2016,7 +2207,7 @@
+                 return Err(PhysicalExecutionError::ColumnShapeMismatch);
+             }
+             for column in columns {
+-                column.remove_at(row_index);
++                column.swap_remove_at(row_index);
+             }
+             *row_count -= 1;
+         }
+@@ -3212,6 +3403,57 @@
+     }
+ 
+     #[test]
++    fn invalid_relation_delta_is_rejected_before_relation_or_index_mutation() {
++        let (context, registry, relation) = planning_context();
++        let binding = LayoutBinding {
++            id: LayoutId(942),
++            family: LayoutFamily::Columnar,
++        };
++        let index_binding = I64IndexBinding {
++            relation,
++            layout: binding,
++            key_column: 0,
++            equivalence: sid(101),
++        };
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 2, 3])]).unwrap(),
++            )
++            .unwrap();
++        store
++            .install_i64_index(index_binding, &context, &registry)
++            .unwrap();
++        let before = store.clone();
++        let result_type = RelExpr::Scan(relation)
++            .typecheck(&context, &registry)
++            .unwrap();
++        let missing_remove = RelationDelta {
++            inserted: vec![vec![Value::I64(4)]],
++            removed: vec![vec![Value::I64(99)]],
++            result_type: result_type.clone(),
++        };
++        assert_eq!(
++            store.apply_relation_delta(relation, binding, &missing_remove, &context, &registry),
++            Err(RelQueryError::InconsistentIncrementalDelta.into())
++        );
++        assert_eq!(store, before);
++
++        let wrong_insert = RelationDelta {
++            inserted: vec![vec![Value::Text("wrong".into())]],
++            removed: Vec::new(),
++            result_type,
++        };
++        assert_eq!(
++            store.apply_relation_delta(relation, binding, &wrong_insert, &context, &registry),
++            Err(PhysicalExecutionError::PhysicalTypeMismatch)
++        );
++        assert_eq!(store, before);
++    }
++
++    #[test]
+     fn atomic_relation_delta_updates_relation_and_persisted_index_together() {
+         let (context, registry, relation) = planning_context();
+         let logical = RelExpr::JoinEq {
+@@ -3446,6 +3688,50 @@
+     }
+ 
+     #[test]
++    fn dense_slot_delete_repairs_only_the_swapped_row_position() {
++        let relation = sid(362);
++        let equivalence = sid(363);
++        let (context, registry) = two_i64_column_context(relation, equivalence, 37);
++        let binding = LayoutBinding {
++            id: LayoutId(941),
++            family: LayoutFamily::Columnar,
++        };
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![
++                    NativeColumn::I64((0_i64..8).collect()),
++                    NativeColumn::I64((100_i64..108).collect()),
++                ])
++                .unwrap(),
++            )
++            .unwrap();
++        let result_type = RelExpr::Scan(relation)
++            .typecheck(&context, &registry)
++            .unwrap();
++        let delta = RelationDelta {
++            inserted: Vec::new(),
++            removed: vec![vec![Value::I64(2), Value::I64(102)]],
++            result_type,
++        };
++        store
++            .apply_relation_delta(relation, binding, &delta, &context, &registry)
++            .unwrap();
++
++        let installed = store.installed(relation, binding).unwrap();
++        assert_eq!(installed.position(PhysicalRowId(2)), None);
++        assert_eq!(installed.position(PhysicalRowId(7)), Some(2));
++        assert_eq!(installed.position(PhysicalRowId(3)), Some(3));
++        assert_eq!(installed.position(PhysicalRowId(6)), Some(6));
++        assert_eq!(
++            installed.logical_positions().collect::<Vec<_>>(),
++            vec![0, 1, 3, 4, 5, 6, 2]
++        );
++    }
++
++    #[test]
+     fn reinstalling_physical_relation_invalidates_persisted_i64_index() {
+         let (context, registry, relation) = planning_context();
+         let binding = LayoutBinding {

@@ -1,0 +1,30 @@
+[package]
+name = "kernel-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-fixpoint = { path = "../kernel-fixpoint" }
+kernel-change = { path = "../kernel-change" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-grounded-closure = { path = "../kernel-grounded-closure" }
+kernel-durability = { path = "../kernel-durability" }
+kernel-aggregate = { path = "../kernel-aggregate" }
+kernel-model = { path = "../kernel-model" }
+kernel-proof = { path = "../kernel-proof" }
+kernel-query = { path = "../kernel-query" }
+kernel-revision = { path = "../kernel-revision" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-semantic-index = { path = "../kernel-semantic-index" }
+kernel-types = { path = "../kernel-types" }
+kernel-transport = { path = "../kernel-transport" }
+kernel-validation = { path = "../kernel-validation" }
+kernel-violation = { path = "../kernel-violation" }
+
+[dev-dependencies]
+kernel-lens = { path = "../kernel-lens" }
+
+[lints]
+workspace = true

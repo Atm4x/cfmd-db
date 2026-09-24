@@ -1,0 +1,19 @@
+CFMD Pass30 final verification summary
+Toolchain: Rust 1.98.1
+
+PASS cargo fmt --all -- --check
+PASS cargo check --workspace --all-targets
+PASS cargo test --workspace --all-targets
+PASS cargo clippy --workspace --all-targets -- -D warnings
+PASS cargo test --workspace --all-targets --release
+PASS cargo build --workspace --release
+PASS RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+PASS RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release
+
+Static state:
+241 declared workspace #[test] tests
+59 kernel-plan library tests
+19 workspace crates
+29,818 Rust LOC
+0 external Cargo source entries
+0 unsafe occurrences under crates/

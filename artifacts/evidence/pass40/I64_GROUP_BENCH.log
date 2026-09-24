@@ -1,0 +1,10 @@
+Pass40 Rust 1.98.1 release benchmark: kernel-query/examples/maintained_group_bench.rs
+rows/groups=50000, rounds=7, iterations_per_round=100
+
+run1 maintained_median_ns=378 baseline_median_ns=155 ratio=2.438x
+run2 maintained_median_ns=350 baseline_median_ns=141 ratio=2.482x
+run3 maintained_median_ns=363 baseline_median_ns=149 ratio=2.436x
+
+median-by-maintained: 363 ns vs 149 ns = ~2.44x
+Historical pre-Pass40 gap reported around 4.8x on the same benchmark family.
+Conclusion: materially improved, not CLOSED; constant-factor gap remains.

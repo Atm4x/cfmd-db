@@ -1,0 +1,241 @@
+   Compiling kernel-query v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-query)
+   Compiling kernel-plan v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-plan)
+   Compiling kernel-revision v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-revision)
+   Compiling kernel-lifecycle v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-lifecycle)
+   Compiling kernel-integration v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-integration)
+    Finished `release` profile [optimized] target(s) in 18.13s
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_durability-54f47a4b1cdbe4f1)
+
+running 40 tests
+test metadata::tests::i64_recipe_collapse_preserves_manual_pin ... ok
+test metadata::tests::metadata_v4_decodes_without_physical_artifact_manifest ... ok
+test checkpoint::tests::full_revision_checkpoint_codec_roundtrips_schema_semantics_lifecycle_and_model ... ok
+test metadata::tests::metadata_roundtrip_covers_all_current_query_variants_and_transactions ... ok
+test metadata::tests::physical_artifact_recipe_collapse_preserves_manual_pin ... ok
+test metadata::tests::physical_artifact_recipe_v1_remains_decodable ... ok
+test metadata::tests::physical_artifact_recipe_v2_remains_decodable_after_observable_atom_recipe ... ok
+test metadata::tests::physical_artifact_recipe_version_is_fail_closed ... ok
+test store::tests::crash_worker_checkpoint_rotation ... ok
+test store::tests::crash_worker_compaction ... ok
+test store::tests::crash_worker_wal_boundary ... ok
+test store::tests::checkpoint_rotation_publishes_new_generation_and_resets_wal_base ... ok
+test store::tests::compaction_keeps_only_active_generation_artifacts ... ok
+test store::tests::published_manifest_requires_exact_durable_metadata_sidecar ... ok
+test store::tests::published_manifest_does_not_fallback_when_checkpoint_is_corrupt ... ok
+test store::tests::published_manifest_with_missing_wal_is_corruption_not_empty_segment ... ok
+test store::tests::store_reopens_exact_checkpoint_and_committed_wal_tail ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test store::tests::subprocess_kill_after_commit_recovers_committed_head_without_ack ... ok
+
+running 1 test
+test store::tests::subprocess_kill_after_prepare_recovers_previous_committed_head ... ok
+test store::tests::unpublished_orphan_generation_is_ignored_and_next_rotation_skips_it ... ok
+
+running 1 test
+test tests::crc32c_known_vector ... ok
+test tests::create_never_truncates_an_existing_wal ... ok
+test tests::duplicate_identical_prepare_and_commit_are_idempotent ... ok
+test tests::durable_prepare_without_commit_is_not_visible ... ok
+test tests::every_prefix_exposes_only_durable_commits ... ok
+test tests::file_open_recovered_truncates_safe_torn_tail_and_continues_lsn ... ok
+test tests::full_revision_prepare_payload_roundtrips_and_revalidates_target ... ok
+test tests::mutation_codec_v2_relation_data_remains_readable ... ok
+test tests::every_single_bit_corruption_of_committed_stream_is_rejected ... ok
+test tests::scanner_distinguishes_short_garbage_tail_from_hidden_full_frame ... ok
+test tests::scanner_rejects_commit_whose_source_is_not_durable_head ... ok
+test tests::scanner_rejects_conflicting_duplicate_commit ... ok
+test tests::scanner_rejects_conflicting_duplicate_prepare ... ok
+test tests::scanner_rejects_non_monotone_lsn_even_with_valid_checksums ... ok
+test tests::scanner_rejects_same_target_transaction_reuse_with_different_delta ... ok
+test tests::scanner_rejects_transaction_id_reuse_for_different_prepare ... ok
+test tests::value_codec_roundtrips_all_shapes ... ok
+test tests::relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test store::tests::subprocess_kill_during_compaction_never_removes_active_generation ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test store::tests::subprocess_kill_checkpoint_manifest_matrix_preserves_authority_boundary ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_integration-ea1f6f9afc0ab18a)
+
+running 1 test
+test tests::vertical_slice_preserves_semantics_across_layers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_lifecycle-deb641cdb6403e21)
+
+running 12 tests
+test tests::benchmark_dense_local_id_lifecycle_against_entity_tree_walk ... ignored, diagnostic release benchmark
+test tests::benchmark_maintained_dense_lifecycle_local_cut_against_full_tree_recompute ... ignored, diagnostic release benchmark
+test tests::dense_local_id_projection_matches_reference_reachability_including_dead_cycle ... ok
+test tests::contradictory_fact_edits_are_typed_conflicts ... ok
+test tests::maintained_dense_lifecycle_matches_exact_lfp_through_cycle_death_and_resurrection ... ok
+test tests::dense_local_id_projection_matches_reference_on_all_three_node_graphs ... ok
+test tests::merge_composes_intents_before_gc ... ok
+test tests::non_conflicting_intent_merge_is_commutative ... ok
+test tests::normalization_is_idempotent ... ok
+test tests::lifecycle_reference_is_unary_grounded_closure_on_all_three_node_graphs ... ok
+test tests::exhaustive_small_graphs_normalize_idempotently ... ok
+test tests::maintained_dense_lifecycle_matches_reference_for_all_single_fact_toggles_on_three_nodes ... ok
+
+test result: ok. 10 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_query-7b8f7cce65925a72)
+
+running 76 tests
+test relational_tests::canonical_relation_multiset_matches_reference_for_structural_composite_rows ... ok
+test relational_tests::coarser_query_equality_is_safe_over_finer_relation_equality ... ok
+test relational_tests::differential_program_classifies_state_and_matches_recompute_oracle ... ok
+test relational_tests::composite_primitive_group_uses_semantic_index_and_matches_recompute ... ok
+test relational_tests::differential_program_rejects_semantic_context_drift ... ok
+test relational_tests::equality_operators_reject_representative_observing_refinements ... ok
+test relational_tests::distinct_supports_schema_derived_structural_product_equality ... ok
+test relational_tests::exact_f64_group_sum_is_reproducible_and_semantically_typed ... ok
+test relational_tests::exact_f64_group_sum_rejects_non_finite_input_explicitly ... ok
+test relational_tests::exact_query_typecheck_rejects_ambiguous_untyped_constant_but_accepts_annotated_one ... ok
+test relational_tests::filter_accepts_structural_option_literal_with_derived_equivalence ... ok
+test relational_tests::filter_accepts_guarded_recursive_literal_with_recursive_equivalence ... ok
+test relational_tests::filter_and_distinct_use_semantic_equality_not_rust_equality ... ok
+test relational_tests::filter_rejects_equality_that_can_observe_relation_representatives ... ok
+test relational_tests::filter_rejects_reference_literal_with_wrong_nominal_type_before_execution ... ok
+test relational_tests::generic_group_count_respects_semantic_group_equality ... ok
+test relational_tests::generic_group_count_uses_monoid_identity_for_empty_global_group ... ok
+test relational_tests::join_preserves_bag_multiplicity_and_uses_pinned_equality ... ok
+test relational_tests::join_rejects_unrelated_entity_reference_types ... ok
+test relational_tests::maintained_plan_clone_uses_cow_and_isolates_mutation ... ok
+test relational_tests::long_lived_materialized_distinct_state_survives_sequential_model_changes ... ok
+test relational_tests::long_lived_materialized_project_state_survives_sequential_model_changes ... ok
+test relational_tests::materialized_exact_f64_group_state_matches_recompute_with_deletions ... ok
+test relational_tests::materialized_f64_total_top_k_uses_order_index_across_hostile_values ... ok
+test relational_tests::materialized_global_group_count_preserves_empty_identity_row ... ok
+test relational_tests::materialized_group_input_delta_rejects_malformed_or_underflowing_change_atomically ... ok
+test relational_tests::materialized_group_count_state_matches_recompute_across_sequential_changes ... ok
+test relational_tests::materialized_i64_top_k_matches_recompute_across_threshold_and_tie_changes ... ok
+test relational_tests::materialized_join_i64_two_sided_delta_matches_recompute_and_is_atomic ... ok
+test relational_tests::materialized_join_generic_preserves_ascii_ci_semantics ... ok
+test relational_tests::materialized_set_support_state_is_context_bound_and_atomic_on_error ... ok
+test relational_tests::materialized_i64_count_fast_path_matches_recompute_sequentially ... ok
+test relational_tests::materialized_set_support_state_updates_without_rebuilding_old_rows ... ok
+test relational_tests::materialized_top_k_generic_text_ordering_preserves_semantic_ties ... ok
+test relational_tests::materialized_top_k_rejects_missing_removal_atomically ... ok
+test relational_tests::observation_guard_uses_dtc_for_exact_fiber_impact_and_keeps_oracle_parity ... ok
+test relational_tests::optimized_bag_project_cancels_projected_replacement_pairs ... ok
+test relational_tests::materialized_support_state_matches_set_projection_oracle_over_all_small_transitions ... ok
+test relational_tests::materialized_support_state_matches_distinct_oracle_over_all_small_transitions ... ok
+test relational_tests::optimized_delta_matches_oracle_over_small_hostile_bag_state_space ... ok
+test relational_tests::optimized_distinct_support_counts_survive_duplicate_removal ... ok
+test relational_tests::optimized_global_group_count_handles_empty_identity_transitions ... ok
+test relational_tests::optimized_distinct_matches_oracle_over_small_hostile_state_space ... ok
+test relational_tests::optimized_exact_f64_group_local_replay_matches_oracle ... ok
+test relational_tests::optimized_promote_to_bag_transports_input_delta ... ok
+test relational_tests::optimized_scan_filter_project_delta_matches_recompute_oracle ... ok
+test relational_tests::optimized_group_count_local_replay_matches_oracle_across_group_birth_and_death ... ok
+test relational_tests::optimized_set_project_uses_support_counts_when_projection_hides_a_removal ... ok
+test relational_tests::optimized_set_project_matches_oracle_over_small_support_state_space ... ok
+test relational_tests::optimized_top_k_local_replay_matches_oracle_across_threshold_changes ... ok
+test relational_tests::pass55_canonical_relation_multiset_benchmark ... ignored, diagnostic benchmark; run explicitly in release mode
+test relational_tests::prepared_query_pins_full_semantic_context_not_only_revision_numbers ... ok
+test relational_tests::owned_join_group_top_k_tree_matches_recompute_across_leaf_deltas ... ok
+test relational_tests::prepared_semantic_query_can_rebind_across_same_contract_implementation_upgrade ... ok
+test relational_tests::recursive_maintained_plan_supports_distinct_and_promote_to_bag ... ok
+test relational_tests::relational_bag_impact_detects_multiplicity_change ... ok
+test relational_tests::relational_bag_impact_ignores_physical_row_order ... ok
+test relational_tests::relational_impact_uses_bag_semantics_not_rust_row_representation ... ok
+test relational_tests::recursive_maintained_plan_owns_nontrivial_join_group_top_k_tree ... ok
+test relational_tests::scan_preserves_set_semantics_from_schema ... ok
+test relational_tests::storage_resolved_removal_rejects_handle_payload_mismatch ... ok
+test relational_tests::structural_and_primitive_group_uses_canonical_lookup_and_matches_recompute ... ok
+test relational_tests::structural_join_equivalence_uses_canonical_index_and_delta_matches_oracle ... ok
+test relational_tests::top_k_rejects_ordering_with_wrong_semantic_domain_before_execution ... ok
+test relational_tests::top_k_requires_ordering_congruent_with_relation_equality ... ok
+test relational_tests::top_k_with_ties_is_exact_without_observing_physical_row_order ... ok
+test relational_tests::typecheck_rejects_wrong_constant_type_on_empty_relation ... ok
+test relational_tests::optimized_join_local_replay_matches_oracle_over_two_sided_state_space ... ok
+test relational_tests::typecheck_rejects_wrong_equality_even_for_empty_relation ... ok
+test tests::impact_can_certify_unchanged_result_without_host_callback ... ok
+test tests::integer_overflow_is_not_plan_dependent_wraparound ... ok
+test tests::logical_errors_are_deterministic_values_of_query_semantics ... ok
+test tests::optimized_sequence_length_delta_matches_from_scratch ... ok
+test tests::universal_derivative_satisfies_from_scratch_law ... ok
+test relational_tests::semantic_indexed_join_accepts_same_call_remove_insert_replacement ... ok
+test relational_tests::optimized_composed_set_distinct_join_promote_pipeline_matches_oracle ... ok
+
+test result: ok. 75 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests examples/maintained_group_bench.rs (/mnt/data/cfmd_pass80_final_target/release/examples/maintained_group_bench-dbce696d3b1e1cc5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/maintained_state_tree_bench.rs (/mnt/data/cfmd_pass80_final_target/release/examples/maintained_state_tree_bench-90ce6410cc05ff7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/maintained_top_k_bench.rs (/mnt/data/cfmd_pass80_final_target/release/examples/maintained_top_k_bench-0b4b2366abf96f2c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/semantic_index_join_bench.rs (/mnt/data/cfmd_pass80_final_target/release/examples/semantic_index_join_bench-0effd5e69b4354d1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_revision-f053a080cfb62bc3)
+
+running 6 tests
+test tests::certified_relation_update_matches_full_normalization_for_dangling_live_ref_rows ... ok
+test tests::construction_always_runs_registry_and_typed_validation ... ok
+test tests::certified_relation_update_revalidates_the_pinned_semantic_registry ... ok
+test tests::relation_update_reuses_revision_local_derivatives_and_rejects_static_changes ... ok
+test tests::revision_owns_one_shared_dense_identity_projection_for_physical_derivatives ... ok
+test tests::revision_pins_full_context_not_only_numeric_ids ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/storage_memory-b94c34da2ce3ab38)
+
+running 16 tests
+test tests::commit_rejects_pinned_but_uninstalled_semantic_module_even_when_empty ... ok
+test tests::commit_normalizes_lifecycle_and_pins_semantics ... ok
+test tests::bijective_identity_edge_becomes_mergeable_after_intent_conjugation ... ok
+test tests::criss_cross_history_exposes_ambiguous_merge_base_instead_of_guessing ... ok
+test tests::conservative_environment_extension_is_transparent_only_toward_extended_context ... ok
+test tests::diamond_has_unique_merge_base ... ok
+test tests::definitional_transport_is_an_identity_data_rewrite_inside_lca_merge ... ok
+test tests::genuine_semantic_law_migration_is_not_transparent_to_lifecycle_history ... ok
+test tests::identical_revision_numbers_cannot_alias_different_schema_contents ... ok
+test tests::equivalent_semantic_implementation_transport_is_transparent_to_lifecycle_merge ... ok
+test tests::identity_retention_domain_preserves_gc_pruned_atom_for_cross_branch_rescue ... ok
+test tests::lifecycle_merge_uses_semantic_intents_from_lca_not_pruned_snapshots ... ok
+test tests::lifecycle_rewrite_cannot_silently_cross_semantic_revision ... ok
+test tests::snapshot_commit_also_requires_explicit_semantic_transport ... ok
+test tests::same_semantic_context_requires_explicit_identity_coordinate_choice ... ok
+test tests::typed_field_transport_commits_as_first_class_revision_edge ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

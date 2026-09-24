@@ -1,0 +1,2 @@
+    Checking kernel-semantics v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-semantics)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.73s

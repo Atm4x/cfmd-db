@@ -1,0 +1,14 @@
+Production source vs Pass101:
+crates/kernel-query/src/lib.rs
+
+Checkpoint/report files added or advanced:
+CFMD_IDEAL_DB_SPEC.md
+CFMD_IDEAL_DB_SPEC_PASS102.md
+IMPLEMENTATION_REPORT.md
+IMPLEMENTATION_REPORT_pass102.md
+PASS102_REPORT.md
+PASS102_HISTORICAL_LEDGER.md
+PASS102_CHANGED_FILES.txt
+PASS102_FREEZE.txt
+PASS102_SOURCE_DIFF.txt
+MANIFEST.sha256

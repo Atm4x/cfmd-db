@@ -1,0 +1,13 @@
+workspace_crates=25
+rust_files_all=60
+rust_lines_all=118076
+rust_nonblank_lines_all=112080
+rust_source_files=44
+rust_source_lines=115297
+lean_files=2
+lean_lines=814
+formal_python_lines=250
+rust_test_attributes=769
+current_project_docs_lines=899
+historical_archive_files=618
+evidence_files=828

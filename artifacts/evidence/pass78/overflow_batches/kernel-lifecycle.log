@@ -1,0 +1,19 @@
+   Compiling kernel-lifecycle v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-lifecycle)
+    Finished `release` profile [optimized] target(s) in 1.42s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_lifecycle-eea361c10997026e)
+
+running 11 tests
+test tests::benchmark_dense_local_id_lifecycle_against_entity_tree_walk ... ignored, diagnostic release benchmark
+test tests::benchmark_maintained_dense_lifecycle_local_cut_against_full_tree_recompute ... ignored, diagnostic release benchmark
+test tests::dense_local_id_projection_matches_reference_reachability_including_dead_cycle ... ok
+test tests::contradictory_fact_edits_are_typed_conflicts ... ok
+test tests::maintained_dense_lifecycle_matches_exact_lfp_through_cycle_death_and_resurrection ... ok
+test tests::merge_composes_intents_before_gc ... ok
+test tests::non_conflicting_intent_merge_is_commutative ... ok
+test tests::normalization_is_idempotent ... ok
+test tests::dense_local_id_projection_matches_reference_on_all_three_node_graphs ... ok
+test tests::exhaustive_small_graphs_normalize_idempotently ... ok
+test tests::maintained_dense_lifecycle_matches_reference_for_all_single_fact_toggles_on_three_nodes ... ok
+
+test result: ok. 9 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

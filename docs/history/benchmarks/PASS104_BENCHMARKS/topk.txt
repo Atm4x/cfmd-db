@@ -1,0 +1,6 @@
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=579
+baseline_median_ns=715
+ratio_milli=809
+full_replay_median_like_ns=302080
+maintained_vs_full_replay_milli=1

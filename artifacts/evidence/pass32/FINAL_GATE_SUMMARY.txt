@@ -1,0 +1,22 @@
+PASS32 FINAL GATE SUMMARY
+Toolchain: Rust 1.98.1
+
+PASS cargo fmt --all -- --check                     -> CARGO_FMT_CHECK_FINAL.txt
+PASS cargo check --workspace --all-targets          -> CARGO_CHECK_FINAL.txt
+PASS cargo test --workspace --all-targets           -> CARGO_TEST_FINAL.txt
+PASS cargo clippy --workspace --all-targets -- -D warnings -> CARGO_CLIPPY_FINAL.txt
+PASS cargo test --workspace --all-targets --release -> CARGO_TEST_RELEASE_FINAL3.txt
+PASS cargo build --workspace --release              -> CARGO_BUILD_RELEASE_FINAL2.txt
+PASS RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps -> CARGO_DOC_STRICT_FINAL2.txt
+PASS RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release -> CARGO_TEST_RELEASE_OVERFLOW_FINAL3.txt
+
+Earlier timeout diagnostic logs are preserved but are not failed tests; all affected commands were rerun separately to completion after the final source change.
+
+Metrics:
+260 declared tests
+65 kernel-plan tests
+13 kernel-durability tests
+20 workspace crates
+31,959 Rust LOC
+0 external Cargo source entries
+0 unsafe occurrences under crates/

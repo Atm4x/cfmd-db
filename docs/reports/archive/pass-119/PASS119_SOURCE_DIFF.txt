@@ -1,0 +1,29 @@
+Changed vs Pass118:
+CFMD_IDEAL_DB_SPEC.md
+IMPLEMENTATION_REPORT.md
+formal/lean/README.md
+formal/lean/check_all.sh
+
+New vs Pass118:
+HISTORICAL_PROBLEMS_LEDGER_PASS119.md
+IMPLEMENTATION_REPORT_pass119.md
+PASS118_MANIFEST.sha256
+PASS119_EVIDENCE/all_formal_gates.log
+PASS119_EVIDENCE/p20_formal_gate.log
+PASS119_EVIDENCE/pass118_production_byte_identity.log
+PASS119_EVIDENCE/pass118_production_manifest_subset.sha256
+PASS119_EVIDENCE/surface_kernel_sha256.txt
+PASS119_FORMAL_P20_PROOF.md
+PASS119_FORMAL_SHA256.txt
+PASS119_FREEZE_TIME.txt
+PASS119_HISTORICAL_LEDGER.md
+PASS119_REPORT.md
+PASS120_FRONTIER_13.md
+formal/lean/CFMD/SurfaceKernel.lean
+formal/lean/__pycache__/check_refinement.cpython-313.pyc
+formal/lean/__pycache__/check_surface_refinement.cpython-313.pyc
+formal/lean/check_surface.sh
+formal/lean/check_surface_refinement.py
+
+Missing vs Pass118:
+

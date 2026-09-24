@@ -1,0 +1,13 @@
+RUN 1
+n=1000 one_join=15953 one_group=28664 one_top=8012
+n=1000 maintained_tree_ns=4817
+n=10000 one_join=22965 one_group=7791 one_top=10305
+n=10000 maintained_tree_ns=11127
+RUN 2
+n=1000 one_join=821868 one_group=5413 one_top=108225
+n=1000 maintained_tree_ns=38341
+n=10000 one_join=432952 one_group=129123 one_top=337892
+n=10000 maintained_tree_ns=20040
+RUN 3
+n=1000 one_join=14664 one_group=4875 one_top=7638
+n=1000 maintained_tree_ns=4777

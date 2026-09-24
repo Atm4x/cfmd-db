@@ -1,0 +1,10 @@
+   Compiling kernel-plan v0.1.0 (/mnt/data/cfmd_workspace_pass44/crates/kernel-plan)
+    Finished `release` profile [optimized] target(s) in 8.17s
+     Running unittests src/lib.rs (target/release/deps/kernel_plan-177b99e53f78f745)
+
+running 1 test
+PASS44_MULTIWAY_BENCH baseline_median_ns=5025458 optimized_median_ns=32148 ratio_milli=156322
+test tests::pass44_multiway_join_reassociation_benchmark ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.06s
+

@@ -1,0 +1,7 @@
+crates/kernel-plan/src/algebraic_native.rs
+crates/kernel-plan/src/lib.rs
+crates/kernel-semantic-index/src/lib.rs
+crates/kernel-semantics/src/anchor_pullback.rs
+crates/kernel-semantics/src/lib.rs
+crates/kernel-semantics/src/observable.rs
+crates/kernel-types/src/lib.rs

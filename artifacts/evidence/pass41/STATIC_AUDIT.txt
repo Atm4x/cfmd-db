@@ -1,0 +1,29 @@
+PASS41 STATIC AUDIT
+Sun Sep 20 03:00:49 UTC 2026
+
+Changed production source SHA-256:
+98f933f9f9ca167e9435681612088c4c659f13ffbfcb2712ab2a02a81520a5a1  crates/kernel-aggregate/src/lib.rs
+cdd9ef77d6c39811b6249770a5c4bdd4cb62b56839cd8f0a32b1250c1f85b145  crates/kernel-query/src/lib.rs
+c398c24fec0a05273b4c4f06d34d7cd1f860ff264af7d5f514afb3f0481bf0a2  crates/kernel-plan/src/lib.rs
+
+declared_tests=316
+rust_loc=41710
+crate_count=21
+unsafe_hits=0
+
+debug_assert mutation audit candidates:
+crates/kernel-plan/src/lib.rs:3001:            debug_assert!(previous.is_none());
+crates/kernel-query/src/lib.rs:830:            debug_assert!(previous_key.is_none());
+crates/kernel-query/src/lib.rs:831:            debug_assert!(previous_row.is_none());
+crates/kernel-query/src/lib.rs:938:            debug_assert!(removed_key.is_some());
+crates/kernel-query/src/lib.rs:939:            debug_assert!(removed_row.is_some());
+crates/kernel-query/src/lib.rs:944:            debug_assert!(previous_key.is_none());
+crates/kernel-query/src/lib.rs:945:            debug_assert!(previous_row.is_none());
+crates/kernel-query/src/lib.rs:3862:            debug_assert!(previous_key.is_none());
+crates/kernel-query/src/lib.rs:3863:            debug_assert!(previous_row.is_none());
+crates/kernel-query/src/lib.rs:3971:            debug_assert!(removed_key.is_some());
+crates/kernel-query/src/lib.rs:3972:            debug_assert!(removed_row.is_some());
+crates/kernel-query/src/lib.rs:3977:            debug_assert!(previous_key.is_none());
+crates/kernel-query/src/lib.rs:3978:            debug_assert!(previous_row.is_none());
+
+TODO/FIXME/HACK changed production files:

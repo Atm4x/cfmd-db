@@ -1,0 +1,9 @@
+ Documenting kernel-transport v0.1.0 (/mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-transport)
+ Documenting kernel-durability v0.1.0 (/mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-durability)
+ Documenting kernel-integration v0.1.0 (/mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-integration)
+ Documenting storage-memory v0.1.0 (/mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/storage-memory)
+ Documenting kernel-plan v0.1.0 (/mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-plan)
+ Documenting kernel-query v0.1.0 (/mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-query)
+ Documenting kernel-semantic-index v0.1.0 (/mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/crates/kernel-semantic-index)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.25s
+   Generated /mnt/data/cfmd_pass40_work/cfmd_workspace_pass40/target/doc/kernel_aggregate/index.html and 20 other files

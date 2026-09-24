@@ -1,0 +1,23 @@
+=== 02_check ===
+    Checking kernel-retention v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-retention)
+    Checking kernel-validation v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-validation)
+    Checking kernel-transport v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-transport)
+    Checking kernel-query v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-query)
+    Checking kernel-durability v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-durability)
+    Checking storage-memory v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/storage-memory)
+    Checking kernel-integration v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-integration)
+    Checking kernel-revision v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-revision)
+    Checking kernel-fixpoint v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-fixpoint)
+    Checking kernel-semantics v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-semantics)
+    Checking kernel-lens v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-lens)
+    Checking kernel-model v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-model)
+    Checking kernel-lifecycle v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-lifecycle)
+    Checking kernel-semantic-index v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-semantic-index)
+    Checking kernel-identity v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-identity)
+    Checking kernel-schema v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-schema)
+    Checking kernel-change v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-change)
+    Checking kernel-aggregate v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-aggregate)
+    Checking kernel-proof v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-proof)
+    Checking kernel-types v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-types)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.38s
+PASS

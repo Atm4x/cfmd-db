@@ -1,0 +1,1534 @@
+--- /mnt/data/pass69_baseline/crates/kernel-plan/src/lib.rs	2026-09-21 00:50:28.000000000 +0000
++++ /mnt/data/pass68_work/crates/kernel-plan/src/lib.rs	2026-09-21 01:22:37.577825129 +0000
+@@ -23,6 +23,11 @@
+ 
+ pub mod algebraic_native;
+ 
++const _: () = assert!(
++    kernel_semantic_index::KEY_ENCODING_REVISION
++        == kernel_semantics::CANONICAL_EQ_KEY_ENCODING_VERSION as u64
++);
++
+ static NEXT_RUNTIME_ROOT_ID: AtomicU64 = AtomicU64::new(1);
+ 
+ fn saturating_usize_sum(values: impl Iterator<Item = usize>) -> usize {
+@@ -3333,10 +3338,12 @@
+     relation: SemanticId,
+     layout: LayoutBinding,
+     delta: &PhysicalRelationDelta,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<(), PhysicalExecutionError> {
+     for (binding, state) in states {
+         if binding.relation == relation && binding.layout.id == layout.id {
+-            state.validate_physical_delta(delta)?;
++            state.validate_physical_delta(delta, context, registry)?;
+         }
+     }
+     Ok(())
+@@ -3347,10 +3354,12 @@
+     relation: SemanticId,
+     layout: LayoutBinding,
+     delta: &PhysicalRelationDelta,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<(), PhysicalExecutionError> {
+     for (binding, state) in states {
+         if binding.relation == relation && binding.layout.id == layout.id {
+-            Arc::make_mut(state).apply_physical_delta(delta)?;
++            Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
+         }
+     }
+     Ok(())
+@@ -3983,7 +3992,14 @@
+                 state.validate_physical_delta(delta)?;
+             }
+         }
+-        validate_semantic_index_family_delta(&self.semantic_indexes, relation, layout, delta)?;
++        validate_semantic_index_family_delta(
++            &self.semantic_indexes,
++            relation,
++            layout,
++            delta,
++            context,
++            registry,
++        )?;
+         for (binding, state) in self.semantic_quotient_factors.iter() {
+             if binding.relation == relation && binding.layout.id == layout.id {
+                 state.validate_physical_delta(delta, context, registry)?;
+@@ -4026,6 +4042,8 @@
+                 relation,
+                 layout,
+                 delta,
++                context,
++                registry,
+             )?;
+         }
+         if self
+@@ -4391,7 +4409,11 @@
+                 self.semantic_quotient_supports_mut()
+                     .get_mut(&binding)
+                     .is_some_and(|state| {
+-                        Arc::make_mut(state).try_apply_monotone_deletion(&leaf_updates, context)
++                        Arc::make_mut(state).try_apply_monotone_deletion(
++                            &leaf_updates,
++                            context,
++                            registry,
++                        )
+                     })
+             };
+             if locally_maintained {
+@@ -4553,7 +4575,52 @@
+     }
+ }
+ 
+-fn resolve_semantic_index_binding(
++fn resolve_semantic_key_binding(
++    binding: &SemanticIndexBinding,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<
++    (
++        Vec<ResolvedSemanticIndexKeyPart>,
++        Vec<kernel_semantic_index::SemanticModuleBinding>,
++    ),
++    PhysicalExecutionError,
++> {
++    if binding.key_parts.is_empty() {
++        return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++    }
++    let definition = context
++        .schema
++        .relation(binding.relation)
++        .ok_or(RelQueryError::UnknownRelation(binding.relation))?;
++    let mut resolved = Vec::with_capacity(binding.key_parts.len());
++    let mut dependencies = Vec::new();
++    for part in &binding.key_parts {
++        if part.column >= definition.columns.len() {
++            return Err(RelQueryError::ColumnOutOfBounds.into());
++        }
++        if let Some(module) = registry.resolve_primitive_equivalence(context, part.equivalence)? {
++            resolved.push(ResolvedSemanticIndexKeyPart::Primitive(module));
++        } else {
++            registry.equivalence_domain(context, part.equivalence)?;
++            resolved.push(ResolvedSemanticIndexKeyPart::Structural(part.equivalence));
++        }
++        dependencies.extend(
++            registry
++                .canonical_equivalence_dependencies(context, part.equivalence)?
++                .into_iter()
++                .map(|dependency| kernel_semantic_index::SemanticModuleBinding {
++                    semantic_id: dependency.semantic_id,
++                    module_digest: dependency.module_digest,
++                }),
++        );
++    }
++    dependencies.sort_unstable();
++    dependencies.dedup();
++    Ok((resolved, dependencies))
++}
++
++fn resolve_primitive_semantic_index_binding(
+     binding: &SemanticIndexBinding,
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+@@ -4587,13 +4654,42 @@
+         });
+         resolved.push(module);
+     }
++    dependencies.sort_unstable();
++    dependencies.dedup();
+     Ok((resolved, dependencies))
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum ResolvedSemanticIndexKeyPart {
++    Primitive(kernel_semantics::ResolvedPrimitiveEquivalence),
++    Structural(SemanticId),
++}
++
++fn semantic_key_dependencies_for_equivalences(
++    equivalences: impl IntoIterator<Item = SemanticId>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Vec<kernel_semantic_index::SemanticModuleBinding>, PhysicalExecutionError> {
++    let mut dependencies = BTreeSet::new();
++    for equivalence in equivalences {
++        dependencies.extend(
++            registry
++                .canonical_equivalence_dependencies(context, equivalence)?
++                .into_iter()
++                .map(|dependency| kernel_semantic_index::SemanticModuleBinding {
++                    semantic_id: dependency.semantic_id,
++                    module_digest: dependency.module_digest,
++                }),
++        );
++    }
++    Ok(dependencies.into_iter().collect())
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct MaterializedSemanticIndexState {
+     binding: SemanticIndexBinding,
+-    resolved: Vec<kernel_semantics::ResolvedPrimitiveEquivalence>,
++    resolved: Vec<ResolvedSemanticIndexKeyPart>,
++    key_binding: kernel_semantic_index::SemanticIndexBinding,
+     index: kernel_semantic_index::SemanticBucketIndex<
+         Vec<kernel_semantics::CanonicalEqKey>,
+         PhysicalRowId,
+@@ -4607,19 +4703,20 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, PhysicalExecutionError> {
+-        let (resolved, dependencies) = resolve_semantic_index_binding(&binding, context, registry)?;
+-        let mut index = kernel_semantic_index::SemanticBucketIndex::new(
+-            kernel_semantic_index::SemanticIndexBinding::new(context, dependencies),
+-        );
++        let (resolved, dependencies) = resolve_semantic_key_binding(&binding, context, registry)?;
++        let key_binding =
++            kernel_semantic_index::SemanticIndexBinding::new(context, dependencies.clone());
++        let mut index = kernel_semantic_index::SemanticBucketIndex::new(key_binding.clone());
+         for row_index in relation.scan_positions() {
+             let row = materialize_native_row(&relation.data, row_index)?;
+-            let key = semantic_index_row_key(&binding, &resolved, &row)?;
++            let key = semantic_index_state_row_key(&binding, &resolved, context, registry, &row)?;
+             let previous = index.insert(relation.row_id_at(row_index)?, key);
+             debug_assert!(previous.is_none());
+         }
+         Ok(Self {
+             binding,
+             resolved,
++            key_binding,
+             index,
+         })
+     }
+@@ -4629,19 +4726,9 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<bool, PhysicalExecutionError> {
+-        if self.binding.key_parts.len() != self.resolved.len() {
+-            return Ok(false);
+-        }
+-        for (part, expected) in self.binding.key_parts.iter().zip(&self.resolved) {
+-            let Some(actual) = registry.resolve_primitive_equivalence(context, part.equivalence)?
+-            else {
+-                return Ok(false);
+-            };
+-            if &actual != expected {
+-                return Ok(false);
+-            }
+-        }
+-        Ok(true)
++        let (resolved, dependencies) =
++            resolve_semantic_key_binding(&self.binding, context, registry)?;
++        Ok(resolved == self.resolved && self.key_binding.is_valid_for(context, &dependencies))
+     }
+ 
+     #[must_use]
+@@ -4657,45 +4744,62 @@
+     fn probe_values(
+         &self,
+         values: &[&Value],
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Option<&[PhysicalRowId]>, PhysicalExecutionError> {
+         if values.len() != self.resolved.len() {
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+         }
+         let key = self
+-            .resolved
++            .binding
++            .key_parts
+             .iter()
++            .zip(&self.resolved)
+             .zip(values)
+-            .map(|(resolved, value)| resolved.canonical_key(value))
+-            .collect::<Result<Vec<_>, _>>()?;
++            .map(|((_part, resolved), value)| match resolved {
++                ResolvedSemanticIndexKeyPart::Primitive(module) => {
++                    module.canonical_key(value).map_err(Into::into)
++                }
++                ResolvedSemanticIndexKeyPart::Structural(equivalence) => registry
++                    .canonical_equivalence_key(context, *equivalence, value)
++                    .map_err(Into::into),
++            })
++            .collect::<Result<Vec<_>, PhysicalExecutionError>>()?;
+         Ok(self.index.bucket(&key))
+     }
+ 
+     fn probe_value(
+         &self,
+         value: &Value,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Option<&[PhysicalRowId]>, PhysicalExecutionError> {
+-        self.probe_values(&[value])
++        self.probe_values(&[value], context, registry)
+     }
+ 
+     fn row_key(
+         &self,
+         row: &kernel_query::Row,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
+-        semantic_index_row_key(&self.binding, &self.resolved, row)
++        semantic_index_state_row_key(&self.binding, &self.resolved, context, registry, row)
+     }
+ 
+     fn validate_physical_delta(
+         &self,
+         delta: &PhysicalRelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+         for (row_id, row) in &delta.removed {
+-            let key = self.row_key(row)?;
++            let key = self.row_key(row, context, registry)?;
+             if self.index.key_for(row_id) != Some(&key) {
+                 return Err(RelQueryError::InconsistentIncrementalDelta.into());
+             }
+         }
+         for (_, row) in &delta.inserted {
+-            let _ = self.row_key(row)?;
++            let _ = self.row_key(row, context, registry)?;
+         }
+         Ok(())
+     }
+@@ -4703,15 +4807,17 @@
+     fn apply_physical_delta(
+         &mut self,
+         delta: &PhysicalRelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+         for (row_id, row) in &delta.removed {
+-            let key = self.row_key(row)?;
++            let key = self.row_key(row, context, registry)?;
+             if self.index.key_for(row_id) != Some(&key) || self.index.remove(row_id).is_none() {
+                 return Err(RelQueryError::InconsistentIncrementalDelta.into());
+             }
+         }
+         for (row_id, row) in &delta.inserted {
+-            let key = self.row_key(row)?;
++            let key = self.row_key(row, context, registry)?;
+             if self.index.insert(*row_id, key).is_some() {
+                 return Err(RelQueryError::InconsistentIncrementalDelta.into());
+             }
+@@ -4720,10 +4826,37 @@
+     }
+ }
+ 
++fn semantic_index_state_row_key(
++    binding: &SemanticIndexBinding,
++    resolved: &[ResolvedSemanticIndexKeyPart],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    row: &kernel_query::Row,
++) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
++    binding
++        .key_parts
++        .iter()
++        .zip(resolved)
++        .map(|(part, resolved)| {
++            let value = row
++                .get(part.column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            match resolved {
++                ResolvedSemanticIndexKeyPart::Primitive(module) => {
++                    module.canonical_key(value).map_err(Into::into)
++                }
++                ResolvedSemanticIndexKeyPart::Structural(equivalence) => registry
++                    .canonical_equivalence_key(context, *equivalence, value)
++                    .map_err(Into::into),
++            }
++        })
++        .collect()
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct MaterializedSemanticQuotientFactorState {
+     binding: SemanticIndexBinding,
+-    semantic_context: kernel_schema::SemanticContext,
++    key_binding: kernel_semantic_index::SemanticIndexBinding,
+     buckets: BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, Vec<PhysicalRowId>>,
+     reverse: BTreeMap<PhysicalRowId, Vec<kernel_semantics::CanonicalEqKey>>,
+ }
+@@ -4738,16 +4871,8 @@
+         if binding.key_parts.is_empty() {
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+         }
+-        let definition = context
+-            .schema
+-            .relation(binding.relation)
+-            .ok_or(RelQueryError::UnknownRelation(binding.relation))?;
+-        for part in &binding.key_parts {
+-            if part.column >= definition.columns.len() {
+-                return Err(RelQueryError::ColumnOutOfBounds.into());
+-            }
+-            registry.equivalence_domain(context, part.equivalence)?;
+-        }
++        let (_, dependencies) = resolve_semantic_key_binding(&binding, context, registry)?;
++        let key_binding = kernel_semantic_index::SemanticIndexBinding::new(context, dependencies);
+         let mut buckets = BTreeMap::new();
+         let mut reverse = BTreeMap::new();
+         for row_index in relation.scan_positions() {
+@@ -4764,7 +4889,7 @@
+         }
+         Ok(Self {
+             binding,
+-            semantic_context: context.clone(),
++            key_binding,
+             buckets,
+             reverse,
+         })
+@@ -4775,13 +4900,8 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<bool, PhysicalExecutionError> {
+-        if context != &self.semantic_context {
+-            return Ok(false);
+-        }
+-        for part in &self.binding.key_parts {
+-            registry.equivalence_domain(context, part.equivalence)?;
+-        }
+-        Ok(true)
++        let (_, dependencies) = resolve_semantic_key_binding(&self.binding, context, registry)?;
++        Ok(self.key_binding.is_valid_for(context, &dependencies))
+     }
+ 
+     #[must_use]
+@@ -4894,6 +5014,7 @@
+ struct MaterializedSemanticStatisticsState {
+     binding: SemanticIndexBinding,
+     resolved: Vec<kernel_semantics::ResolvedPrimitiveEquivalence>,
++    key_binding: kernel_semantic_index::SemanticIndexBinding,
+     counts: BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, usize>,
+     row_count: usize,
+ }
+@@ -4905,7 +5026,9 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, PhysicalExecutionError> {
+-        let (resolved, _) = resolve_semantic_index_binding(&binding, context, registry)?;
++        let (resolved, dependencies) =
++            resolve_primitive_semantic_index_binding(&binding, context, registry)?;
++        let key_binding = kernel_semantic_index::SemanticIndexBinding::new(context, dependencies);
+         let mut counts = BTreeMap::new();
+         for row_index in relation.scan_positions() {
+             let row = materialize_native_row(&relation.data, row_index)?;
+@@ -4918,6 +5041,7 @@
+         Ok(Self {
+             binding,
+             resolved,
++            key_binding,
+             counts,
+             row_count: native_row_count(&relation.data),
+         })
+@@ -4928,19 +5052,9 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<bool, PhysicalExecutionError> {
+-        if self.binding.key_parts.len() != self.resolved.len() {
+-            return Ok(false);
+-        }
+-        for (part, expected) in self.binding.key_parts.iter().zip(&self.resolved) {
+-            let Some(actual) = registry.resolve_primitive_equivalence(context, part.equivalence)?
+-            else {
+-                return Ok(false);
+-            };
+-            if &actual != expected {
+-                return Ok(false);
+-            }
+-        }
+-        Ok(true)
++        let (resolved, dependencies) =
++            resolve_primitive_semantic_index_binding(&self.binding, context, registry)?;
++        Ok(resolved == self.resolved && self.key_binding.is_valid_for(context, &dependencies))
+     }
+ 
+     fn row_key(
+@@ -8225,7 +8339,7 @@
+             continue;
+         }
+         let matching_rows = index
+-            .probe_values(&values)?
++            .probe_values(&values, context, registry)?
+             .map_or(0, <[PhysicalRowId]>::len);
+         if SemanticAccessCostModel::choose_filter(row_count, matching_rows)
+             == SemanticAccessPath::FullScan
+@@ -8256,7 +8370,7 @@
+         return Ok(None);
+     };
+ 
+-    let Some(row_ids) = index.probe_values(&values)? else {
++    let Some(row_ids) = index.probe_values(&values, context, registry)? else {
+         stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+         return Ok(Some(Vec::new()));
+     };
+@@ -8366,7 +8480,7 @@
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct MaterializedSemanticQuotientSupportState {
+     binding: SemanticQuotientSupportBinding,
+-    semantic_context: kernel_schema::SemanticContext,
++    key_binding: kernel_semantic_index::SemanticIndexBinding,
+     handles: Vec<Vec<PhysicalRowId>>,
+     constraints: Vec<SemanticQuotientConstraint>,
+     base_masks: Vec<Vec<u64>>,
+@@ -8380,6 +8494,22 @@
+ }
+ 
+ impl MaterializedSemanticQuotientSupportState {
++    fn compatible_with(
++        &self,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<bool, PhysicalExecutionError> {
++        let dependencies = semantic_key_dependencies_for_equivalences(
++            self.binding
++                .specs
++                .iter()
++                .map(|(equivalence, _)| *equivalence),
++            context,
++            registry,
++        )?;
++        Ok(self.key_binding.is_valid_for(context, &dependencies))
++    }
++
+     fn supports_relation(&self, relation: SemanticId, layout: LayoutBinding) -> bool {
+         self.binding
+             .leaves
+@@ -8393,8 +8523,9 @@
+         &mut self,
+         leaf_updates: &[(usize, Vec<PhysicalRowId>)],
+         context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> bool {
+-        if &self.semantic_context != context || leaf_updates.is_empty() {
++        if !matches!(self.compatible_with(context, registry), Ok(true)) || leaf_updates.is_empty() {
+             return false;
+         }
+         let mut remaps = Vec::with_capacity(leaf_updates.len());
+@@ -8717,7 +8848,7 @@
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<Option<Vec<SemanticQuotientComponentRefreshLeafPatch>>, PhysicalExecutionError> {
+-    if &state.semantic_context != context || leaf_updates.is_empty() {
++    if !state.compatible_with(context, registry)? || leaf_updates.is_empty() {
+         return Ok(None);
+     }
+     let mut patches = Vec::with_capacity(leaf_updates.len());
+@@ -9272,6 +9403,12 @@
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<Option<MaterializedSemanticQuotientSupportState>, PhysicalExecutionError> {
++    let dependencies = semantic_key_dependencies_for_equivalences(
++        binding.specs.iter().map(|(equivalence, _)| *equivalence),
++        context,
++        registry,
++    )?;
++    let key_binding = kernel_semantic_index::SemanticIndexBinding::new(context, dependencies);
+     let leaves = semantic_quotient_support_leaves(&binding, store)?;
+     let handles = leaves
+         .iter()
+@@ -9294,7 +9431,7 @@
+     let base_masks = quotient_support_masks(&handles, &constraints);
+     Ok(Some(MaterializedSemanticQuotientSupportState {
+         binding,
+-        semantic_context: context.clone(),
++        key_binding,
+         handles,
+         constraints,
+         base_masks,
+@@ -9460,7 +9597,9 @@
+     let maintained_support = support_binding
+         .as_ref()
+         .and_then(|binding| store.semantic_quotient_support(binding))
+-        .filter(|state| state.semantic_context == *context && state.handles == handles);
++        .filter(|state| {
++            state.handles == handles && matches!(state.compatible_with(context, registry), Ok(true))
++        });
+ 
+     let owned_constraints;
+     let owned_masks;
+@@ -10680,6 +10819,8 @@
+     inputs: &RightScanJoinInputs<'_>,
+     resolved: Option<&kernel_semantics::ResolvedPrimitiveEquivalence>,
+     store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
+     stats: &mut ExecutionStats,
+ ) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
+     let binding = SemanticIndexBinding::single(
+@@ -10712,7 +10853,7 @@
+             .ok_or(RelQueryError::ColumnOutOfBounds)?;
+         stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+         stats.values_read = stats.values_read.saturating_add(1);
+-        if let Some(right_ids) = index.probe_value(left_key)? {
++        if let Some(right_ids) = index.probe_value(left_key, context, registry)? {
+             for right_id in right_ids {
+                 let position = inputs
+                     .right
+@@ -10829,7 +10970,7 @@
+             .ok_or(RelQueryError::ColumnOutOfBounds)?;
+         stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+         stats.values_read = stats.values_read.saturating_add(1);
+-        if let Some(right_ids) = index.probe_value(left_key)? {
++        if let Some(right_ids) = index.probe_value(left_key, context, registry)? {
+             for right_id in right_ids {
+                 let position = inputs
+                     .right
+@@ -10897,9 +11038,14 @@
+         JoinAccessFamily::PersistedI64 => {
+             try_join_rows_with_persisted_i64(&inputs, resolved.as_ref(), store, stats)
+         }
+-        JoinAccessFamily::PersistedSemantic => {
+-            try_join_rows_with_persisted_semantic(&inputs, resolved.as_ref(), store, stats)
+-        }
++        JoinAccessFamily::PersistedSemantic => try_join_rows_with_persisted_semantic(
++            &inputs,
++            resolved.as_ref(),
++            store,
++            context,
++            registry,
++            stats,
++        ),
+         JoinAccessFamily::EphemeralI64 => {
+             join_rows_with_ephemeral_i64(&inputs, resolved.as_ref(), stats)
+         }
+@@ -12228,7 +12374,7 @@
+         }
+         stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+         stats.values_read = stats.values_read.saturating_add(values.len());
+-        if let Some(right_ids) = index.probe_values(&values)? {
++        if let Some(right_ids) = index.probe_values(&values, context, registry)? {
+             for right_id in right_ids {
+                 let right_position = right_installed
+                     .position(*right_id)
+@@ -12309,7 +12455,7 @@
+             .ok_or(RelQueryError::ColumnOutOfBounds)?;
+         stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+         stats.values_read = stats.values_read.saturating_add(1);
+-        if let Some(right_ids) = index.probe_value(left_key)? {
++        if let Some(right_ids) = index.probe_value(left_key, context, registry)? {
+             for right_id in right_ids {
+                 let right_position = right_installed
+                     .position(*right_id)
+@@ -12411,7 +12557,7 @@
+             .ok_or(RelQueryError::ColumnOutOfBounds)?;
+         stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+         stats.values_read = stats.values_read.saturating_add(1);
+-        if let Some(right_ids) = transient_index.probe_value(left_key)? {
++        if let Some(right_ids) = transient_index.probe_value(left_key, context, registry)? {
+             for right_id in right_ids {
+                 let right_position = right_installed
+                     .position(*right_id)
+@@ -13962,7 +14108,7 @@
+         })
+         .collect::<Result<Vec<_>, _>>()?;
+     let matching_rows = state
+-        .probe_values(&values)?
++        .probe_values(&values, context, registry)?
+         .map_or(0, <[PhysicalRowId]>::len);
+     let estimated_bytes = semantic_index_estimated_retained_bytes(&state);
+     let scan_work = row_count as u128;
+@@ -19984,6 +20130,112 @@
+         assert_structural_quotient_factor_hits(&prepared, &store, &registry, 1);
+     }
+ 
++    #[test]
++    fn persisted_structural_semantic_index_is_consumed_and_delta_maintained() {
++        let relation = sid(1_220);
++        let structural = sid(1_221);
++        let ci = sid(1_222);
++        let unrelated = sid(1_223);
++        let mut registry = SemanticRegistry::default();
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let unrelated_digest =
++            registry.install_equivalence_revision(EquivalenceModule::I64Exact, 1);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(1_220));
++        environment.pin_module(ci, ci_digest);
++        environment.pin_module(unrelated, unrelated_digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(1_220));
++        schema
++            .define_structural_equivalence(
++                structural,
++                StructuralEquivalenceDef::Option { inner: ci },
++            )
++            .unwrap();
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Option(Box::new(TypeExpr::Scalar(
++                    ScalarType::Text,
++                )))],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![structural],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let layout = LayoutBinding {
++            id: LayoutId(1_220),
++            family: LayoutFamily::RowStore,
++        };
++        let option_text = |value: &str| Value::Option(Some(Box::new(Value::Text(value.into()))));
++        let mut rows = vec![vec![option_text("Alpha")], vec![option_text("alpha")]];
++        for index in 0..64 {
++            rows.push(vec![option_text(&format!("other-{index}"))]);
++        }
++        let mut store = PhysicalStore::default();
++        store
++            .install(relation, layout, NativeRelation::row_store(rows))
++            .unwrap();
++        let binding = SemanticIndexBinding::single(relation, layout, 0, structural);
++        store
++            .install_semantic_index(binding.clone(), &context, &registry)
++            .unwrap();
++        let index = store.semantic_index(&binding).unwrap();
++
++        let mut unrelated_gamma_change = context.clone();
++        let unrelated_v2 = registry.install_equivalence_revision(EquivalenceModule::I64Exact, 2);
++        unrelated_gamma_change
++            .environment
++            .pin_module(unrelated, unrelated_v2);
++        assert!(
++            index
++                .compatible_with(&unrelated_gamma_change, &registry)
++                .unwrap(),
++            "unrelated Γ module drift must not invalidate structural key cache"
++        );
++
++        let mut leaf_gamma_change = context.clone();
++        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        leaf_gamma_change.environment.pin_module(ci, exact_digest);
++        assert!(
++            !index
++                .compatible_with(&leaf_gamma_change, &registry)
++                .unwrap(),
++            "canonical leaf digest drift must force structural key rebuild"
++        );
++
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, layout);
++        let query = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            value: option_text("ALPHA"),
++            equivalence: structural,
++        };
++        let prepared = prepare_with_catalog(query, &context, &registry, &catalog).unwrap();
++        let (before, before_stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(before.rows().len(), 2);
++        assert_eq!(before_stats.persisted_index_hits, 1);
++
++        let delta = RelationDelta {
++            inserted: vec![vec![option_text("ALpHa")]],
++            removed: vec![vec![option_text("alpha")]],
++            result_type: RelExpr::Scan(relation)
++                .typecheck(&context, &registry)
++                .unwrap(),
++        };
++        store
++            .apply_relation_delta(relation, layout, &delta, &context, &registry)
++            .unwrap();
++        let index = store.semantic_index(&binding).unwrap();
++        assert_eq!(index.row_count(), 66);
++        let (after, after_stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(after.rows().len(), 2);
++        assert_eq!(after_stats.persisted_index_hits, 1);
++    }
++
+     fn local_dq_quotient_fixture() -> (
+         SemanticContext,
+         SemanticRegistry,
+@@ -22658,7 +22910,7 @@
+         assert_eq!(index.row_count(), 3);
+         assert_eq!(
+             index
+-                .probe_value(&Value::Text("A".into()))
++                .probe_value(&Value::Text("A".into()), &context, &registry)
+                 .unwrap()
+                 .unwrap()
+                 .len(),
+@@ -22666,7 +22918,7 @@
+         );
+         assert_eq!(
+             index
+-                .probe_value(&Value::Text("c".into()))
++                .probe_value(&Value::Text("c".into()), &context, &registry)
+                 .unwrap()
+                 .unwrap()
+                 .len(),
+--- /mnt/data/pass69_baseline/crates/kernel-semantic-index/src/lib.rs	2026-09-20 21:44:05.000000000 +0000
++++ /mnt/data/pass68_work/crates/kernel-semantic-index/src/lib.rs	2026-09-21 01:23:02.653521227 +0000
+@@ -5,6 +5,14 @@
+ 
+ pub const KEY_ENCODING_REVISION: u64 = 1;
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SemanticIndexCompatibility {
++    Compatible,
++    RebuildSemanticRevision,
++    RebuildDependencies,
++    RebuildKeyEncoding,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct SemanticModuleBinding {
+     pub semantic_id: SemanticId,
+@@ -30,6 +38,26 @@
+         }
+     }
+ 
++    /// Reconstructs a binding descriptor read from persistent metadata.
++    ///
++    /// Callers must run [`Self::compatibility`] before reusing the associated
++    /// derived cache. Historical key revisions are represented explicitly so
++    /// they fail closed into rebuild rather than being silently reinterpreted.
++    #[must_use]
++    pub fn from_persisted(
++        semantic_revision: SemanticRevision,
++        mut dependencies: Vec<SemanticModuleBinding>,
++        key_encoding_revision: u64,
++    ) -> Self {
++        dependencies.sort_unstable();
++        dependencies.dedup();
++        Self {
++            semantic_revision,
++            dependencies,
++            key_encoding_revision,
++        }
++    }
++
+     #[must_use]
+     pub const fn semantic_revision(&self) -> SemanticRevision {
+         self.semantic_revision
+@@ -51,15 +79,28 @@
+         context: &SemanticContext,
+         dependencies: &[SemanticModuleBinding],
+     ) -> bool {
+-        if self.semantic_revision != context.revision()
+-            || self.key_encoding_revision != KEY_ENCODING_REVISION
+-        {
+-            return false;
++        self.compatibility(context, dependencies) == SemanticIndexCompatibility::Compatible
++    }
++
++    #[must_use]
++    pub fn compatibility(
++        &self,
++        context: &SemanticContext,
++        dependencies: &[SemanticModuleBinding],
++    ) -> SemanticIndexCompatibility {
++        if self.key_encoding_revision != KEY_ENCODING_REVISION {
++            return SemanticIndexCompatibility::RebuildKeyEncoding;
++        }
++        if self.semantic_revision != context.revision() {
++            return SemanticIndexCompatibility::RebuildSemanticRevision;
+         }
+         let mut dependencies = dependencies.to_vec();
+         dependencies.sort_unstable();
+         dependencies.dedup();
+-        self.dependencies == dependencies
++        if self.dependencies != dependencies {
++            return SemanticIndexCompatibility::RebuildDependencies;
++        }
++        SemanticIndexCompatibility::Compatible
+     }
+ }
+ 
+@@ -279,4 +320,46 @@
+         let three = index.estimated_retained_bytes(String::capacity);
+         assert!(empty < one && one < two && two < three);
+     }
++
++    #[test]
++    fn compatibility_reports_exact_rebuild_reason() {
++        let context = context();
++        let dependency = SemanticModuleBinding {
++            semantic_id: SemanticId::new(3),
++            module_digest: ModuleDigest([9; 32]),
++        };
++        let binding = SemanticIndexBinding::new(&context, vec![dependency]);
++        assert_eq!(
++            binding.compatibility(&context, &[dependency]),
++            SemanticIndexCompatibility::Compatible
++        );
++
++        let next_context = SemanticContext {
++            schema: Schema::new(SchemaRevisionId::new(8)),
++            environment: SemanticEnvironment::new(SemanticEnvId::new(11)),
++        };
++        assert_eq!(
++            binding.compatibility(&next_context, &[dependency]),
++            SemanticIndexCompatibility::RebuildSemanticRevision
++        );
++        assert_eq!(
++            binding.compatibility(
++                &context,
++                &[SemanticModuleBinding {
++                    semantic_id: dependency.semantic_id,
++                    module_digest: ModuleDigest([8; 32]),
++                }]
++            ),
++            SemanticIndexCompatibility::RebuildDependencies
++        );
++        assert_eq!(
++            SemanticIndexBinding::from_persisted(
++                context.revision(),
++                vec![dependency],
++                KEY_ENCODING_REVISION + 1,
++            )
++            .compatibility(&context, &[dependency]),
++            SemanticIndexCompatibility::RebuildKeyEncoding
++        );
++    }
+ }
+--- /mnt/data/pass69_baseline/crates/kernel-semantics/src/lib.rs	2026-09-20 17:04:25.000000000 +0000
++++ /mnt/data/pass68_work/crates/kernel-semantics/src/lib.rs	2026-09-21 01:26:35.100199772 +0000
+@@ -21,6 +21,13 @@
+     }
+ }
+ 
++fn canonical_dependency_children(definition: &StructuralEquivalenceDef) -> Vec<SemanticId> {
++    match definition {
++        StructuralEquivalenceDef::Var { binder } => vec![*binder],
++        _ => structural_equivalence_children(definition),
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum EquivalenceDomain {
+     Unit,
+@@ -144,6 +151,413 @@
+     Map(Vec<(Self, Self)>),
+ }
+ 
++/// Stable durable encoding revision for [`CanonicalEqKey`].
++///
++/// This is deliberately independent from Rust enum layout and `Ord`
++/// implementation details. Any change to the byte contract must introduce a
++/// new decoder revision rather than silently reinterpreting persisted keys.
++pub const CANONICAL_EQ_KEY_ENCODING_VERSION: u32 = 1;
++
++const CANONICAL_EQ_KEY_MAGIC: [u8; 4] = *b"CEK\0";
++const CANONICAL_EQ_KEY_TUPLE_MAGIC: [u8; 4] = *b"CKT\0";
++const MAX_CANONICAL_EQ_KEY_DEPTH: usize = 256;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CanonicalEqKeyCodecError {
++    Truncated,
++    InvalidMagic,
++    UnsupportedVersion(u32),
++    UnknownTag(u8),
++    InvalidUtf8,
++    LengthOverflow,
++    NonCanonicalShape,
++    TrailingBytes,
++    DepthLimitExceeded,
++}
++
++/// Encodes one canonical equality key using the explicit durable format.
++#[must_use]
++pub fn encode_canonical_eq_key(key: &CanonicalEqKey) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    bytes.extend_from_slice(&CANONICAL_EQ_KEY_MAGIC);
++    bytes.extend_from_slice(&CANONICAL_EQ_KEY_ENCODING_VERSION.to_be_bytes());
++    encode_canonical_eq_key_payload(key, &mut bytes);
++    bytes
++}
++
++/// Decodes one canonical equality key and rejects unknown format revisions.
++pub fn decode_canonical_eq_key(bytes: &[u8]) -> Result<CanonicalEqKey, CanonicalEqKeyCodecError> {
++    let mut cursor = CanonicalKeyCursor::new(bytes);
++    if cursor.take_array::<4>()? != CANONICAL_EQ_KEY_MAGIC {
++        return Err(CanonicalEqKeyCodecError::InvalidMagic);
++    }
++    let version = u32::from_be_bytes(cursor.take_array()?);
++    if version != CANONICAL_EQ_KEY_ENCODING_VERSION {
++        return Err(CanonicalEqKeyCodecError::UnsupportedVersion(version));
++    }
++    let key = decode_canonical_eq_key_payload(&mut cursor, 0)?;
++    if !cursor.is_empty() {
++        return Err(CanonicalEqKeyCodecError::TrailingBytes);
++    }
++    if !canonical_eq_key_shape_is_canonical(&key) {
++        return Err(CanonicalEqKeyCodecError::NonCanonicalShape);
++    }
++    Ok(key)
++}
++
++/// Encodes an ordered composite semantic-index key without relying on Rust
++/// `Vec` layout. Individual tuple components use the same recursive payload
++/// grammar as [`encode_canonical_eq_key`].
++#[must_use]
++pub fn encode_canonical_eq_key_tuple(keys: &[CanonicalEqKey]) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    bytes.extend_from_slice(&CANONICAL_EQ_KEY_TUPLE_MAGIC);
++    bytes.extend_from_slice(&CANONICAL_EQ_KEY_ENCODING_VERSION.to_be_bytes());
++    encode_len(keys.len(), &mut bytes);
++    for key in keys {
++        encode_canonical_eq_key_payload(key, &mut bytes);
++    }
++    bytes
++}
++
++/// Decodes one ordered composite semantic-index key.
++pub fn decode_canonical_eq_key_tuple(
++    bytes: &[u8],
++) -> Result<Vec<CanonicalEqKey>, CanonicalEqKeyCodecError> {
++    let mut cursor = CanonicalKeyCursor::new(bytes);
++    if cursor.take_array::<4>()? != CANONICAL_EQ_KEY_TUPLE_MAGIC {
++        return Err(CanonicalEqKeyCodecError::InvalidMagic);
++    }
++    let version = u32::from_be_bytes(cursor.take_array()?);
++    if version != CANONICAL_EQ_KEY_ENCODING_VERSION {
++        return Err(CanonicalEqKeyCodecError::UnsupportedVersion(version));
++    }
++    let len = cursor.collection_len(1)?;
++    let mut keys = Vec::with_capacity(len);
++    for _ in 0..len {
++        let key = decode_canonical_eq_key_payload(&mut cursor, 0)?;
++        if !canonical_eq_key_shape_is_canonical(&key) {
++            return Err(CanonicalEqKeyCodecError::NonCanonicalShape);
++        }
++        keys.push(key);
++    }
++    if !cursor.is_empty() {
++        return Err(CanonicalEqKeyCodecError::TrailingBytes);
++    }
++    Ok(keys)
++}
++
++fn encode_canonical_eq_key_payload(key: &CanonicalEqKey, bytes: &mut Vec<u8>) {
++    match key {
++        CanonicalEqKey::Unit => bytes.push(0),
++        CanonicalEqKey::Bool(value) => {
++            bytes.push(1);
++            bytes.push(u8::from(*value));
++        }
++        CanonicalEqKey::I64(value) => {
++            bytes.push(2);
++            bytes.extend_from_slice(&value.to_be_bytes());
++        }
++        CanonicalEqKey::F64Bits(value) => {
++            bytes.push(3);
++            bytes.extend_from_slice(&value.to_be_bytes());
++        }
++        CanonicalEqKey::TextExact(value) => encode_string_key(4, value, bytes),
++        CanonicalEqKey::TextAsciiCaseInsensitive(value) => encode_string_key(5, value, bytes),
++        CanonicalEqKey::LiveEntityId { entity_type, id } => {
++            encode_entity_key(6, *entity_type, *id, bytes);
++        }
++        CanonicalEqKey::HistoricalEntityId { entity_type, id } => {
++            encode_entity_key(7, *entity_type, *id, bytes);
++        }
++        CanonicalEqKey::Product(fields) => {
++            bytes.push(8);
++            encode_len(fields.len(), bytes);
++            for (field, value) in fields {
++                bytes.extend_from_slice(&field.raw().to_be_bytes());
++                encode_canonical_eq_key_payload(value, bytes);
++            }
++        }
++        CanonicalEqKey::OptionNone => bytes.push(9),
++        CanonicalEqKey::OptionSome(value) => encode_boxed_key(10, value, bytes),
++        CanonicalEqKey::Variant { tag, value } => {
++            bytes.push(11);
++            bytes.extend_from_slice(&tag.raw().to_be_bytes());
++            encode_canonical_eq_key_payload(value, bytes);
++        }
++        CanonicalEqKey::Seq(values) => encode_key_vec(12, values, bytes),
++        CanonicalEqKey::Set(values) => encode_key_vec(13, values, bytes),
++        CanonicalEqKey::Bag(entries) => {
++            bytes.push(14);
++            encode_len(entries.len(), bytes);
++            for (key, count) in entries {
++                encode_canonical_eq_key_payload(key, bytes);
++                bytes.extend_from_slice(&count.to_be_bytes());
++            }
++        }
++        CanonicalEqKey::Map(entries) => {
++            bytes.push(15);
++            encode_len(entries.len(), bytes);
++            for (key, value) in entries {
++                encode_canonical_eq_key_payload(key, bytes);
++                encode_canonical_eq_key_payload(value, bytes);
++            }
++        }
++    }
++}
++
++fn encode_len(len: usize, bytes: &mut Vec<u8>) {
++    let len = u64::try_from(len).unwrap_or(u64::MAX);
++    bytes.extend_from_slice(&len.to_be_bytes());
++}
++
++fn encode_string_key(tag: u8, value: &str, bytes: &mut Vec<u8>) {
++    bytes.push(tag);
++    encode_len(value.len(), bytes);
++    bytes.extend_from_slice(value.as_bytes());
++}
++
++fn encode_entity_key(
++    tag: u8,
++    entity_type: SemanticId,
++    id: kernel_types::EntityId,
++    bytes: &mut Vec<u8>,
++) {
++    bytes.push(tag);
++    bytes.extend_from_slice(&entity_type.raw().to_be_bytes());
++    bytes.extend_from_slice(&id.raw().to_be_bytes());
++}
++
++fn encode_boxed_key(tag: u8, value: &CanonicalEqKey, bytes: &mut Vec<u8>) {
++    bytes.push(tag);
++    encode_canonical_eq_key_payload(value, bytes);
++}
++
++fn encode_key_vec(tag: u8, values: &[CanonicalEqKey], bytes: &mut Vec<u8>) {
++    bytes.push(tag);
++    encode_len(values.len(), bytes);
++    for value in values {
++        encode_canonical_eq_key_payload(value, bytes);
++    }
++}
++
++fn decode_canonical_eq_key_payload(
++    cursor: &mut CanonicalKeyCursor<'_>,
++    depth: usize,
++) -> Result<CanonicalEqKey, CanonicalEqKeyCodecError> {
++    if depth > MAX_CANONICAL_EQ_KEY_DEPTH {
++        return Err(CanonicalEqKeyCodecError::DepthLimitExceeded);
++    }
++    let child_depth = depth.saturating_add(1);
++    let tag = cursor.u8()?;
++    match tag {
++        0 => Ok(CanonicalEqKey::Unit),
++        1 => match cursor.u8()? {
++            0 => Ok(CanonicalEqKey::Bool(false)),
++            1 => Ok(CanonicalEqKey::Bool(true)),
++            _ => Err(CanonicalEqKeyCodecError::NonCanonicalShape),
++        },
++        2 => Ok(CanonicalEqKey::I64(i64::from_be_bytes(
++            cursor.take_array()?,
++        ))),
++        3 => Ok(CanonicalEqKey::F64Bits(u64::from_be_bytes(
++            cursor.take_array()?,
++        ))),
++        4 => cursor.string().map(CanonicalEqKey::TextExact),
++        5 => cursor
++            .string()
++            .map(CanonicalEqKey::TextAsciiCaseInsensitive),
++        6 => decode_entity_key(cursor, false),
++        7 => decode_entity_key(cursor, true),
++        8 => decode_product_key(cursor, child_depth),
++        9 => Ok(CanonicalEqKey::OptionNone),
++        10 => decode_canonical_eq_key_payload(cursor, child_depth)
++            .map(Box::new)
++            .map(CanonicalEqKey::OptionSome),
++        11 => {
++            let tag = SemanticId::new(u128::from_be_bytes(cursor.take_array()?));
++            let value = Box::new(decode_canonical_eq_key_payload(cursor, child_depth)?);
++            Ok(CanonicalEqKey::Variant { tag, value })
++        }
++        12 => decode_key_vec(cursor, child_depth).map(CanonicalEqKey::Seq),
++        13 => decode_key_vec(cursor, child_depth).map(CanonicalEqKey::Set),
++        14 => decode_bag_key(cursor, child_depth),
++        15 => decode_map_key(cursor, child_depth),
++        other => Err(CanonicalEqKeyCodecError::UnknownTag(other)),
++    }
++}
++
++fn decode_entity_key(
++    cursor: &mut CanonicalKeyCursor<'_>,
++    historical: bool,
++) -> Result<CanonicalEqKey, CanonicalEqKeyCodecError> {
++    let entity_type = SemanticId::new(u128::from_be_bytes(cursor.take_array()?));
++    let id = kernel_types::EntityId::new(u128::from_be_bytes(cursor.take_array()?));
++    Ok(if historical {
++        CanonicalEqKey::HistoricalEntityId { entity_type, id }
++    } else {
++        CanonicalEqKey::LiveEntityId { entity_type, id }
++    })
++}
++
++fn decode_product_key(
++    cursor: &mut CanonicalKeyCursor<'_>,
++    depth: usize,
++) -> Result<CanonicalEqKey, CanonicalEqKeyCodecError> {
++    let len = cursor.collection_len(17)?;
++    let mut fields = Vec::with_capacity(len);
++    for _ in 0..len {
++        let field = SemanticId::new(u128::from_be_bytes(cursor.take_array()?));
++        fields.push((field, decode_canonical_eq_key_payload(cursor, depth)?));
++    }
++    Ok(CanonicalEqKey::Product(fields))
++}
++
++fn decode_key_vec(
++    cursor: &mut CanonicalKeyCursor<'_>,
++    depth: usize,
++) -> Result<Vec<CanonicalEqKey>, CanonicalEqKeyCodecError> {
++    let len = cursor.collection_len(1)?;
++    (0..len)
++        .map(|_| decode_canonical_eq_key_payload(cursor, depth))
++        .collect()
++}
++
++fn decode_bag_key(
++    cursor: &mut CanonicalKeyCursor<'_>,
++    depth: usize,
++) -> Result<CanonicalEqKey, CanonicalEqKeyCodecError> {
++    let len = cursor.collection_len(9)?;
++    let mut entries = Vec::with_capacity(len);
++    for _ in 0..len {
++        let key = decode_canonical_eq_key_payload(cursor, depth)?;
++        let count = u64::from_be_bytes(cursor.take_array()?);
++        entries.push((key, count));
++    }
++    Ok(CanonicalEqKey::Bag(entries))
++}
++
++fn decode_map_key(
++    cursor: &mut CanonicalKeyCursor<'_>,
++    depth: usize,
++) -> Result<CanonicalEqKey, CanonicalEqKeyCodecError> {
++    let len = cursor.collection_len(2)?;
++    let mut entries = Vec::with_capacity(len);
++    for _ in 0..len {
++        let key = decode_canonical_eq_key_payload(cursor, depth)?;
++        let value = decode_canonical_eq_key_payload(cursor, depth)?;
++        entries.push((key, value));
++    }
++    Ok(CanonicalEqKey::Map(entries))
++}
++
++fn canonical_eq_key_shape_is_canonical(key: &CanonicalEqKey) -> bool {
++    match key {
++        CanonicalEqKey::Product(fields) => {
++            fields.windows(2).all(|pair| pair[0].0 < pair[1].0)
++                && fields
++                    .iter()
++                    .all(|(_, child)| canonical_eq_key_shape_is_canonical(child))
++        }
++        CanonicalEqKey::OptionSome(value) | CanonicalEqKey::Variant { value, .. } => {
++            canonical_eq_key_shape_is_canonical(value)
++        }
++        CanonicalEqKey::Seq(values) => values.iter().all(canonical_eq_key_shape_is_canonical),
++        CanonicalEqKey::Set(values) => {
++            values.windows(2).all(|pair| pair[0] < pair[1])
++                && values.iter().all(canonical_eq_key_shape_is_canonical)
++        }
++        CanonicalEqKey::Bag(entries) => {
++            entries.windows(2).all(|pair| pair[0].0 < pair[1].0)
++                && entries
++                    .iter()
++                    .all(|(child, count)| *count > 0 && canonical_eq_key_shape_is_canonical(child))
++        }
++        CanonicalEqKey::Map(entries) => {
++            entries.windows(2).all(|pair| pair[0].0 < pair[1].0)
++                && entries.iter().all(|(entry_key, value)| {
++                    canonical_eq_key_shape_is_canonical(entry_key)
++                        && canonical_eq_key_shape_is_canonical(value)
++                })
++        }
++        CanonicalEqKey::Unit
++        | CanonicalEqKey::Bool(_)
++        | CanonicalEqKey::I64(_)
++        | CanonicalEqKey::F64Bits(_)
++        | CanonicalEqKey::TextExact(_)
++        | CanonicalEqKey::LiveEntityId { .. }
++        | CanonicalEqKey::HistoricalEntityId { .. }
++        | CanonicalEqKey::OptionNone => true,
++        CanonicalEqKey::TextAsciiCaseInsensitive(value) => value == &value.to_ascii_lowercase(),
++    }
++}
++
++struct CanonicalKeyCursor<'a> {
++    bytes: &'a [u8],
++    offset: usize,
++}
++
++impl<'a> CanonicalKeyCursor<'a> {
++    const fn new(bytes: &'a [u8]) -> Self {
++        Self { bytes, offset: 0 }
++    }
++
++    fn is_empty(&self) -> bool {
++        self.offset == self.bytes.len()
++    }
++
++    fn take(&mut self, len: usize) -> Result<&'a [u8], CanonicalEqKeyCodecError> {
++        let end = self
++            .offset
++            .checked_add(len)
++            .ok_or(CanonicalEqKeyCodecError::LengthOverflow)?;
++        let slice = self
++            .bytes
++            .get(self.offset..end)
++            .ok_or(CanonicalEqKeyCodecError::Truncated)?;
++        self.offset = end;
++        Ok(slice)
++    }
++
++    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], CanonicalEqKeyCodecError> {
++        self.take(N)?
++            .try_into()
++            .map_err(|_| CanonicalEqKeyCodecError::Truncated)
++    }
++
++    fn u8(&mut self) -> Result<u8, CanonicalEqKeyCodecError> {
++        self.take(1).map(|slice| slice[0])
++    }
++
++    fn len(&mut self) -> Result<usize, CanonicalEqKeyCodecError> {
++        usize::try_from(u64::from_be_bytes(self.take_array()?))
++            .map_err(|_| CanonicalEqKeyCodecError::LengthOverflow)
++    }
++
++    fn remaining(&self) -> usize {
++        self.bytes.len().saturating_sub(self.offset)
++    }
++
++    fn collection_len(
++        &mut self,
++        minimum_entry_bytes: usize,
++    ) -> Result<usize, CanonicalEqKeyCodecError> {
++        let len = self.len()?;
++        if len > self.remaining() / minimum_entry_bytes {
++            return Err(CanonicalEqKeyCodecError::Truncated);
++        }
++        Ok(len)
++    }
++
++    fn string(&mut self) -> Result<String, CanonicalEqKeyCodecError> {
++        let len = self.len()?;
++        let bytes = self.take(len)?;
++        std::str::from_utf8(bytes)
++            .map(str::to_owned)
++            .map_err(|_| CanonicalEqKeyCodecError::InvalidUtf8)
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct ResolvedPrimitiveEquivalence {
+     equivalence: SemanticId,
+@@ -151,6 +565,12 @@
+     contract: EquivalenceModule,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct CanonicalEquivalenceDependency {
++    pub semantic_id: SemanticId,
++    pub module_digest: ModuleDigest,
++}
++
+ impl ResolvedPrimitiveEquivalence {
+     #[must_use]
+     pub const fn equivalence(&self) -> SemanticId {
+@@ -834,7 +1254,7 @@
+                 continue;
+             }
+             if let Some(definition) = definitions.get(&id) {
+-                pending.extend(structural_equivalence_children(definition));
++                pending.extend(canonical_dependency_children(definition));
+             }
+         }
+         if let Some(unrooted) = definitions.keys().find(|id| !reachable.contains(id)) {
+@@ -1053,6 +1473,40 @@
+         self.canonical_equivalence_key_unchecked(context, equivalence, value)
+     }
+ 
++    /// Returns the primitive module closure that defines one canonical key law.
++    ///
++    /// Structural equivalence nodes are schema-pinned and therefore do not
++    /// need executable digests of their own. Primitive/plugin leaves do: a
++    /// persisted key cache is compatible only when every leaf keeps the exact
++    /// pinned implementation digest.
++    pub fn canonical_equivalence_dependencies(
++        &self,
++        context: &SemanticContext,
++        equivalence: SemanticId,
++    ) -> Result<Vec<CanonicalEquivalenceDependency>, SemanticError> {
++        self.equivalence_domain(context, equivalence)?;
++        let mut pending = vec![equivalence];
++        let mut visited = BTreeSet::new();
++        let mut dependencies = BTreeSet::new();
++        while let Some(current) = pending.pop() {
++            if !visited.insert(current) {
++                continue;
++            }
++            if let Some(definition) = context.schema.structural_equivalence(current) {
++                pending.extend(canonical_dependency_children(definition));
++                continue;
++            }
++            let resolved = self
++                .resolve_primitive_equivalence(context, current)?
++                .ok_or(SemanticError::WrongModuleKind(current))?;
++            dependencies.insert(CanonicalEquivalenceDependency {
++                semantic_id: current,
++                module_digest: resolved.module_digest(),
++            });
++        }
++        Ok(dependencies.into_iter().collect())
++    }
++
+     fn canonical_equivalence_key_unchecked(
+         &self,
+         context: &SemanticContext,
+@@ -3462,4 +3916,150 @@
+             ],
+         );
+     }
++
++    #[test]
++    fn canonical_eq_key_codec_roundtrips_recursive_structures_and_rejects_version_drift() {
++        let key = CanonicalEqKey::Product(vec![
++            (
++                SemanticId::new(1),
++                CanonicalEqKey::OptionSome(Box::new(CanonicalEqKey::Seq(vec![
++                    CanonicalEqKey::TextAsciiCaseInsensitive("alpha".into()),
++                    CanonicalEqKey::I64(-7),
++                ]))),
++            ),
++            (
++                SemanticId::new(2),
++                CanonicalEqKey::Map(vec![
++                    (
++                        CanonicalEqKey::TextExact("a".into()),
++                        CanonicalEqKey::Bag(vec![(CanonicalEqKey::Bool(false), 2)]),
++                    ),
++                    (
++                        CanonicalEqKey::TextExact("b".into()),
++                        CanonicalEqKey::Set(vec![CanonicalEqKey::I64(1), CanonicalEqKey::I64(2)]),
++                    ),
++                ]),
++            ),
++        ]);
++        let encoded = encode_canonical_eq_key(&key);
++        assert_eq!(decode_canonical_eq_key(&encoded), Ok(key));
++
++        let mut future = encoded.clone();
++        future[4..8].copy_from_slice(&(CANONICAL_EQ_KEY_ENCODING_VERSION + 1).to_be_bytes());
++        assert_eq!(
++            decode_canonical_eq_key(&future),
++            Err(CanonicalEqKeyCodecError::UnsupportedVersion(
++                CANONICAL_EQ_KEY_ENCODING_VERSION + 1
++            ))
++        );
++
++        let tuple = vec![
++            CanonicalEqKey::I64(9),
++            CanonicalEqKey::TextExact("x".into()),
++        ];
++        assert_eq!(
++            decode_canonical_eq_key_tuple(&encode_canonical_eq_key_tuple(&tuple)),
++            Ok(tuple)
++        );
++    }
++
++    #[test]
++    fn canonical_eq_key_v1_has_golden_bytes_independent_of_rust_layout() {
++        let key = CanonicalEqKey::Product(vec![
++            (
++                SemanticId::new(1),
++                CanonicalEqKey::TextAsciiCaseInsensitive("a".into()),
++            ),
++            (SemanticId::new(2), CanonicalEqKey::I64(-1)),
++        ]);
++        assert_eq!(
++            encode_canonical_eq_key(&key),
++            vec![
++                67, 69, 75, 0, 0, 0, 0, 1, 8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++                0, 0, 0, 0, 0, 1, 5, 0, 0, 0, 0, 0, 0, 0, 1, 97, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++                0, 0, 0, 0, 2, 2, 255, 255, 255, 255, 255, 255, 255, 255,
++            ]
++        );
++    }
++
++    #[test]
++    fn canonical_eq_key_codec_rejects_noncanonical_and_hostile_lengths() {
++        let noncanonical =
++            CanonicalEqKey::Set(vec![CanonicalEqKey::I64(2), CanonicalEqKey::I64(1)]);
++        assert_eq!(
++            decode_canonical_eq_key(&encode_canonical_eq_key(&noncanonical)),
++            Err(CanonicalEqKeyCodecError::NonCanonicalShape)
++        );
++        let noncanonical_ci = CanonicalEqKey::TextAsciiCaseInsensitive("Alpha".into());
++        assert_eq!(
++            decode_canonical_eq_key(&encode_canonical_eq_key(&noncanonical_ci)),
++            Err(CanonicalEqKeyCodecError::NonCanonicalShape)
++        );
++
++        let mut hostile = Vec::from(CANONICAL_EQ_KEY_MAGIC);
++        hostile.extend_from_slice(&CANONICAL_EQ_KEY_ENCODING_VERSION.to_be_bytes());
++        hostile.push(13);
++        hostile.extend_from_slice(&u64::MAX.to_be_bytes());
++        assert_eq!(
++            decode_canonical_eq_key(&hostile),
++            Err(CanonicalEqKeyCodecError::Truncated)
++        );
++
++        let mut too_deep = Vec::from(CANONICAL_EQ_KEY_MAGIC);
++        too_deep.extend_from_slice(&CANONICAL_EQ_KEY_ENCODING_VERSION.to_be_bytes());
++        too_deep.extend(std::iter::repeat_n(10_u8, MAX_CANONICAL_EQ_KEY_DEPTH + 1));
++        too_deep.push(0);
++        assert_eq!(
++            decode_canonical_eq_key(&too_deep),
++            Err(CanonicalEqKeyCodecError::DepthLimitExceeded)
++        );
++    }
++
++    #[test]
++    fn structural_canonical_dependency_closure_tracks_only_primitive_leaf_digests() {
++        let ci = SemanticId::new(82_000);
++        let exact = SemanticId::new(82_001);
++        let product = SemanticId::new(82_002);
++        let set = SemanticId::new(82_003);
++        let field_a = SemanticId::new(82_004);
++        let field_b = SemanticId::new(82_005);
++        let mut registry = SemanticRegistry::default();
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let exact_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut schema = Schema::new(SchemaRevisionId::new(82_000));
++        schema
++            .define_structural_equivalence(set, StructuralEquivalenceDef::Set { element: ci })
++            .unwrap();
++        schema
++            .define_structural_equivalence(
++                product,
++                StructuralEquivalenceDef::Product {
++                    fields: BTreeMap::from([(field_a, set), (field_b, exact)]),
++                },
++            )
++            .unwrap();
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(82_000));
++        environment.pin_module(ci, ci_digest);
++        environment.pin_module(exact, exact_digest);
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++
++        assert_eq!(
++            registry
++                .canonical_equivalence_dependencies(&context, product)
++                .unwrap(),
++            vec![
++                CanonicalEquivalenceDependency {
++                    semantic_id: ci,
++                    module_digest: ci_digest,
++                },
++                CanonicalEquivalenceDependency {
++                    semantic_id: exact,
++                    module_digest: exact_digest,
++                },
++            ]
++        );
++    }
+ }

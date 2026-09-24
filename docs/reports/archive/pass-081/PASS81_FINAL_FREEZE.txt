@@ -1,0 +1,10 @@
+PASS81 FINAL — WRITE-R&D INTEGRATION CONVERGED
+checkpoint=AZ
+freeze_utc=2026-09-22T17:03:23Z
+AY_baseline_tests=600_passed_0_failed_8_ignored
+AZ_kernel_change_tests=39_passed_0_failed_0_ignored
+final_fmt=PASS
+final_distributed_check_23_crates=PASS
+final_distributed_clippy_23_crates=PASS
+kernel_change_sha256=452212ac11bff6825e8de02e03d1279f5d828b2beab4bfaf1faec6770ae915fb
+historical_compound_open=22

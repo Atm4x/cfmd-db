@@ -1,0 +1,20 @@
+Pass37 verification — Rust 1.98.1
+
+cargo fmt --all -- --check                                  PASS
+cargo check --workspace --all-targets                       PASS
+cargo test --workspace --all-targets                        PASS
+cargo clippy --workspace --all-targets -- -D warnings       PASS
+cargo test --workspace --all-targets --release              PASS
+cargo build --workspace --release                           PASS
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps  PASS
+RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release PASS
+
+Metrics:
+293 declared tests
+78 kernel-plan tests
+65 kernel-query tests
+32 kernel-durability tests
+20 crates
+36,756 Rust LOC
+0 external Cargo sources
+0 unsafe

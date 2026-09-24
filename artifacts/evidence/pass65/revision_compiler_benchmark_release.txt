@@ -1,0 +1,8 @@
+relations=40 rows_per_relation=5000
+full_compiler_ns=3406633
+certified_compiler_ns=293583
+compiler_ratio=11.604
+candidate_state_clone_ns=4330525
+full_runs=[3643041, 3429106, 3313435, 3756779, 3406633, 3397120, 3345563]
+certified_runs=[371968, 293583, 292472, 295175, 298270, 290439, 286092]
+candidate_clone_runs=[4330525, 4501588, 4795611, 4226933, 4712608, 4234374, 4226763]

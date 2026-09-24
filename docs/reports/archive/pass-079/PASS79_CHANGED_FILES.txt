@@ -1,0 +1,10 @@
+Cargo.toml
+Cargo.lock
+crates/kernel-fixpoint/Cargo.toml
+crates/kernel-fixpoint/src/lib.rs
+crates/kernel-grounded-closure/Cargo.toml
+crates/kernel-grounded-closure/src/lib.rs
+crates/kernel-lifecycle/Cargo.toml
+crates/kernel-lifecycle/src/lib.rs
+crates/kernel-semantics/Cargo.toml
+crates/kernel-semantics/src/anchor_pullback.rs

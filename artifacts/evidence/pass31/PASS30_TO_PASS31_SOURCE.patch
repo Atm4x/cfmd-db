@@ -1,0 +1,1464 @@
+--- /mnt/data/cfmd_pass30_work/cfmd_workspace_pass30/crates/kernel-plan/src/lib.rs	2026-09-19 21:40:29.026613033 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-19 22:01:21.782128245 +0000
+@@ -1,13 +1,45 @@
+-use std::collections::{BTreeMap, BTreeSet};
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    sync::{
++        Arc, RwLock, RwLockWriteGuard,
++        atomic::{AtomicU64, Ordering},
++    },
++};
+ 
+ use kernel_model::Value;
+ use kernel_query::{
+     AggregateSpec, MaterializedRelPlanState, OrderDirection, RelExpr, RelQueryError, RelType,
+-    RelationDelta, RelationValue, StorageCertifiedRelationDelta,
++    RelationDelta, RelationValue, StorageResolvedRelationDelta,
+ };
+ pub use kernel_types::StableRowHandle as PhysicalRowId;
+ use kernel_types::{RevisionId, SemanticId};
+ 
++static NEXT_RUNTIME_ROOT_ID: AtomicU64 = AtomicU64::new(1);
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct RuntimeRootVersion(u64);
++
++impl RuntimeRootVersion {
++    #[must_use]
++    pub const fn raw(self) -> u64 {
++        self.0
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct RuntimeRootIdentity {
++    root_id: u64,
++    version: RuntimeRootVersion,
++}
++
++fn allocate_runtime_root_id() -> Result<u64, PhysicalExecutionError> {
++    NEXT_RUNTIME_ROOT_ID
++        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
++            current.checked_add(1)
++        })
++        .map_err(|_| PhysicalExecutionError::RuntimeRootIdentityExhausted)
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct LayoutId(pub u128);
+ 
+@@ -432,18 +464,18 @@
+     source_revision: Option<RevisionId>,
+     source_state: Box<PhysicalStore>,
+     candidate: Box<PhysicalStore>,
+-    certified_delta: StorageCertifiedRelationDelta,
++    resolved_delta: StorageResolvedRelationDelta,
+ }
+ 
+ impl PreparedPhysicalStoreTransition {
+     fn into_candidate_if_current(
+         self,
+         current: &PhysicalStore,
+-    ) -> Result<(PhysicalStore, StorageCertifiedRelationDelta), PhysicalExecutionError> {
++    ) -> Result<(PhysicalStore, StorageResolvedRelationDelta), PhysicalExecutionError> {
+         if !current.can_commit_prepared(&self) {
+             return Err(PhysicalExecutionError::StalePreparedTransition);
+         }
+-        Ok((*self.candidate, self.certified_delta))
++        Ok((*self.candidate, self.resolved_delta))
+     }
+ }
+ 
+@@ -513,31 +545,50 @@
+ /// registered maintained materialization are published together. Bootstrap
+ /// constructs maintained states from the revision itself rather than trusting
+ /// arbitrary externally supplied snapshots.
+-#[derive(Debug, Clone, PartialEq, Eq)]
++#[derive(Debug, PartialEq, Eq)]
+ pub struct RuntimeRevisionBundle {
++    root_identity: RuntimeRootIdentity,
+     revision: kernel_revision::Revision,
+     physical: PhysicalStore,
+     relation_layouts: BTreeMap<SemanticId, LayoutBinding>,
+     materializations: BTreeMap<kernel_types::MaterializationId, MaterializedRelPlanState>,
+ }
+ 
++/// Immutable reader snapshot of one coherent runtime root.
++///
++/// Readers retain the old `Arc` across publication, so a writer can swap the
++/// live root without exposing a mixed logical/physical/materialized revision.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RuntimeRevisionSnapshot {
++    root: Arc<RuntimeRevisionBundle>,
++}
++
++/// Synchronization/publication owner for one runtime root lineage.
++///
++/// Writers publish by replacing one `Arc<RuntimeRevisionBundle>` under the
++/// write lock. Readers only clone the current `Arc` and never observe partial
++/// field mutation.
++#[derive(Debug)]
++pub struct RuntimeRevisionCell {
++    root: RwLock<Arc<RuntimeRevisionBundle>>,
++}
++
+ /// Fully prepared but not yet freshness-sealed revision transition.
+ #[derive(Debug, PartialEq, Eq)]
+ pub struct PreparedRuntimeRevisionTransition {
+     descriptor: RevisionCommitDescriptor,
+-    source_state: Box<RuntimeRevisionBundle>,
++    source_identity: RuntimeRootIdentity,
+     candidate: Box<RuntimeRevisionBundle>,
+     output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
+ }
+ 
+ /// Exclusive pre-publication capability.
+ ///
+-/// The mutable borrow of the live bundle is held from successful freshness
+-/// validation until `publish` or guard drop. A later WAL layer can therefore
+-/// append/fsync its COMMIT marker while this guard exists without allowing the
+-/// runtime source state to become stale in between.
++/// The write guard is held from successful freshness validation until
++/// `publish` or guard drop. A later WAL layer can append/fsync its COMMIT marker
++/// while this guard exists without allowing the live root to advance first.
+ pub struct SealedRuntimeRevisionTransition<'a> {
+-    live: &'a mut RuntimeRevisionBundle,
++    live: RwLockWriteGuard<'a, Arc<RuntimeRevisionBundle>>,
+     candidate: RuntimeRevisionBundle,
+     descriptor: RevisionCommitDescriptor,
+     output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
+@@ -551,6 +602,7 @@
+         materialization_specs: &[RuntimeMaterializationSpec],
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, PhysicalExecutionError> {
++        let root_id = allocate_runtime_root_id()?;
+         Self::validate_physical_snapshot(&revision, &physical, &relation_layouts, registry)?;
+         physical.bind_revision(revision.id())?;
+ 
+@@ -577,6 +629,10 @@
+         }
+ 
+         Ok(Self {
++            root_identity: RuntimeRootIdentity {
++                root_id,
++                version: RuntimeRootVersion(0),
++            },
+             revision,
+             physical,
+             relation_layouts,
+@@ -667,6 +723,11 @@
+     }
+ 
+     #[must_use]
++    pub const fn root_version(&self) -> RuntimeRootVersion {
++        self.root_identity.version
++    }
++
++    #[must_use]
+     pub const fn physical_store(&self) -> &PhysicalStore {
+         &self.physical
+     }
+@@ -691,19 +752,18 @@
+         &self.materializations
+     }
+ 
+-    /// Reconstructible physical-index mutation remains legal between semantic
+-    /// revisions, but it invalidates already prepared transitions via exact
+-    /// source-state freshness.
+-    pub fn install_i64_index(
+-        &mut self,
+-        index: I64IndexBinding,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<(), PhysicalExecutionError> {
+-        self.physical
+-            .install_i64_index(index, self.revision.semantic_context(), registry)
++    #[cfg(test)]
++    fn test_clone(&self) -> Self {
++        Self {
++            root_identity: self.root_identity,
++            revision: self.revision.clone(),
++            physical: self.physical.clone(),
++            relation_layouts: self.relation_layouts.clone(),
++            materializations: self.materializations.clone(),
++        }
+     }
+ 
+-    pub fn prepare_revision(
++    fn prepare_revision(
+         &self,
+         request: &RevisionTransitionRequest<'_>,
+     ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
+@@ -715,6 +775,12 @@
+         if request.target_revision.semantic_context() != self.revision.semantic_context() {
+             return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+         }
++        let candidate_version = self
++            .root_identity
++            .version
++            .0
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
+ 
+         let mut seen_relations = BTreeSet::new();
+         let mut relation_deltas = BTreeMap::new();
+@@ -744,17 +810,17 @@
+         self.validate_target_logical_state(request)?;
+ 
+         let mut candidate_store = self.physical.clone();
+-        let mut certified = BTreeMap::new();
++        let mut resolved = BTreeMap::new();
+         for mutation in request.mutations {
+             let layout = self.relation_layouts[&mutation.relation];
+-            let delta = candidate_store.apply_relation_delta_certified_in_place(
++            let delta = candidate_store.apply_relation_delta_resolved_in_place(
+                 mutation.relation,
+                 layout,
+                 mutation.delta,
+                 self.revision.semantic_context(),
+                 request.registry,
+             )?;
+-            certified.insert(mutation.relation, delta);
++            resolved.insert(mutation.relation, delta);
+         }
+         candidate_store.revision = Some(target_revision);
+ 
+@@ -762,31 +828,28 @@
+         let mut output_deltas = BTreeMap::new();
+         for (&id, maintained) in &self.materializations {
+             let dependencies = maintained.scan_relations();
+-            let relevant = certified
++            let relevant = resolved
+                 .iter()
+                 .filter(|(relation, _)| dependencies.contains(relation))
+                 .map(|(relation, delta)| (*relation, delta.clone()))
+                 .collect::<BTreeMap<_, _>>();
+-            let prepared_plan = maintained.prepare_storage_certified_deltas_for_revision(
+-                source_revision,
+-                target_revision,
+-                &relevant,
+-                self.revision.semantic_context(),
+-                request.registry,
+-            )?;
+-            let (candidate_plan, output_delta) = prepared_plan
+-                .into_candidate_if_current(maintained)
+-                .map_err(|error| match error {
+-                    RelQueryError::StalePreparedTransition => {
+-                        PhysicalExecutionError::StalePreparedTransition
+-                    }
+-                    other => PhysicalExecutionError::Query(other),
+-                })?;
++            let (candidate_plan, output_delta) = maintained
++                .candidate_from_storage_resolved_deltas_for_revision(
++                    source_revision,
++                    target_revision,
++                    &relevant,
++                    self.revision.semantic_context(),
++                    request.registry,
++                )?;
+             candidate_materializations.insert(id, candidate_plan);
+             output_deltas.insert(id, output_delta);
+         }
+ 
+         let candidate = RuntimeRevisionBundle {
++            root_identity: RuntimeRootIdentity {
++                root_id: self.root_identity.root_id,
++                version: RuntimeRootVersion(candidate_version),
++            },
+             revision: request.target_revision.clone(),
+             physical: candidate_store,
+             relation_layouts: self.relation_layouts.clone(),
+@@ -800,7 +863,7 @@
+         };
+         Ok(PreparedRuntimeRevisionTransition {
+             descriptor,
+-            source_state: Box::new(self.clone()),
++            source_identity: self.root_identity,
+             candidate: Box::new(candidate),
+             output_deltas,
+         })
+@@ -835,6 +898,85 @@
+     }
+ }
+ 
++impl RuntimeRevisionSnapshot {
++    #[must_use]
++    pub fn root(&self) -> &RuntimeRevisionBundle {
++        self.root.as_ref()
++    }
++
++    #[must_use]
++    pub fn root_version(&self) -> RuntimeRootVersion {
++        self.root.root_identity.version
++    }
++}
++
++impl std::ops::Deref for RuntimeRevisionSnapshot {
++    type Target = RuntimeRevisionBundle;
++
++    fn deref(&self) -> &Self::Target {
++        self.root.as_ref()
++    }
++}
++
++impl RuntimeRevisionCell {
++    #[must_use]
++    pub fn new(root: RuntimeRevisionBundle) -> Self {
++        Self {
++            root: RwLock::new(Arc::new(root)),
++        }
++    }
++
++    pub fn snapshot(&self) -> Result<RuntimeRevisionSnapshot, PhysicalExecutionError> {
++        let root = self
++            .root
++            .read()
++            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?
++            .clone();
++        Ok(RuntimeRevisionSnapshot { root })
++    }
++
++    pub fn prepare_revision(
++        &self,
++        request: &RevisionTransitionRequest<'_>,
++    ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
++        self.snapshot()?.prepare_revision(request)
++    }
++
++    /// Reconstructible index publication is also a whole-root swap. Existing
++    /// readers keep their prior immutable snapshot while new readers observe
++    /// the incremented root version under the same semantic revision.
++    pub fn install_i64_index(
++        &self,
++        index: I64IndexBinding,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        let mut live = self
++            .root
++            .write()
++            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
++        let next_version = live
++            .root_identity
++            .version
++            .0
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
++        let mut physical = live.physical.clone();
++        physical.install_i64_index(index, live.revision.semantic_context(), registry)?;
++        let candidate = RuntimeRevisionBundle {
++            root_identity: RuntimeRootIdentity {
++                root_id: live.root_identity.root_id,
++                version: RuntimeRootVersion(next_version),
++            },
++            revision: live.revision.clone(),
++            physical,
++            relation_layouts: live.relation_layouts.clone(),
++            materializations: live.materializations.clone(),
++        };
++        *live = Arc::new(candidate);
++        Ok(())
++    }
++}
++
+ impl PreparedRuntimeRevisionTransition {
+     #[must_use]
+     pub const fn descriptor(&self) -> &RevisionCommitDescriptor {
+@@ -856,19 +998,24 @@
+         &self.output_deltas
+     }
+ 
+-    /// Performs the last fallible freshness check and retains exclusive access
+-    /// to the live bundle until publication or abort-by-drop.
++    /// Performs the last fallible freshness check while acquiring the sole
++    /// writer-publication guard. After this succeeds the live root cannot
++    /// advance until `publish` or guard drop.
+     pub fn seal(
+         self,
+-        live: &mut RuntimeRevisionBundle,
++        live: &RuntimeRevisionCell,
+     ) -> Result<SealedRuntimeRevisionTransition<'_>, PhysicalExecutionError> {
+-        if live != self.source_state.as_ref()
+-            || live.revision.id() != self.descriptor.source_revision
++        let guard = live
++            .root
++            .write()
++            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
++        if guard.root_identity != self.source_identity
++            || guard.revision.id() != self.descriptor.source_revision
+         {
+             return Err(PhysicalExecutionError::StalePreparedTransition);
+         }
+         Ok(SealedRuntimeRevisionTransition {
+-            live,
++            live: guard,
+             candidate: *self.candidate,
+             descriptor: self.descriptor,
+             output_deltas: self.output_deltas,
+@@ -900,8 +1047,8 @@
+     /// Infallible reader-visible publication. No semantic validation, freshness
+     /// check, row lookup or index planning occurs after the seal boundary.
+     #[must_use]
+-    pub fn publish(self) -> BTreeMap<kernel_types::MaterializationId, RelationDelta> {
+-        *self.live = self.candidate;
++    pub fn publish(mut self) -> BTreeMap<kernel_types::MaterializationId, RelationDelta> {
++        *self.live = Arc::new(self.candidate);
+         self.output_deltas
+     }
+ }
+@@ -970,7 +1117,7 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+-        self.apply_relation_delta_certified(relation, layout, delta, context, registry)?;
++        self.apply_relation_delta_resolved(relation, layout, delta, context, registry)?;
+         Ok(())
+     }
+ 
+@@ -978,25 +1125,25 @@
+     /// stable row identities selected/allocated by that transition. Maintained
+     /// query plans can consume this receipt without resolving the same semantic
+     /// rows a second time.
+-    pub fn apply_relation_delta_certified(
++    pub fn apply_relation_delta_resolved(
+         &mut self,
+         relation: SemanticId,
+         layout: LayoutBinding,
+         delta: &RelationDelta,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<StorageCertifiedRelationDelta, PhysicalExecutionError> {
++    ) -> Result<StorageResolvedRelationDelta, PhysicalExecutionError> {
+         if self.revision.is_some() {
+             return Err(PhysicalExecutionError::RevisionBoundMutationRequiresPreparedTransition);
+         }
+         let prepared =
+-            self.prepare_relation_delta_certified(relation, layout, delta, context, registry)?;
+-        let (candidate, certified) = prepared.into_candidate_if_current(self)?;
++            self.prepare_relation_delta_resolved(relation, layout, delta, context, registry)?;
++        let (candidate, resolved) = prepared.into_candidate_if_current(self)?;
+         *self = candidate;
+-        Ok(certified)
++        Ok(resolved)
+     }
+ 
+-    fn prepare_relation_delta_certified(
++    fn prepare_relation_delta_resolved(
+         &self,
+         relation: SemanticId,
+         layout: LayoutBinding,
+@@ -1008,14 +1155,14 @@
+             return Err(PhysicalExecutionError::RevisionBoundMutationRequiresPreparedTransition);
+         }
+         let mut candidate = self.clone();
+-        let certified_delta = candidate
+-            .apply_relation_delta_certified_in_place(relation, layout, delta, context, registry)?;
++        let resolved_delta = candidate
++            .apply_relation_delta_resolved_in_place(relation, layout, delta, context, registry)?;
+         Ok(PreparedPhysicalStoreTransition {
+             source_epoch: self.transition_epoch,
+             source_revision: None,
+             source_state: Box::new(self.clone()),
+             candidate: Box::new(candidate),
+-            certified_delta,
++            resolved_delta,
+         })
+     }
+ 
+@@ -1055,14 +1202,14 @@
+                 .is_none_or(|revision| self.revision == Some(revision))
+     }
+ 
+-    fn apply_relation_delta_certified_in_place(
++    fn apply_relation_delta_resolved_in_place(
+         &mut self,
+         relation: SemanticId,
+         layout: LayoutBinding,
+         delta: &RelationDelta,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<StorageCertifiedRelationDelta, PhysicalExecutionError> {
++    ) -> Result<StorageResolvedRelationDelta, PhysicalExecutionError> {
+         let key = (relation, layout.id);
+         let installed =
+             self.relations
+@@ -1107,7 +1254,7 @@
+             }
+         }
+         self.transition_epoch = next_epoch;
+-        Ok(StorageCertifiedRelationDelta::new(
++        Ok(StorageResolvedRelationDelta::from_parts(
+             relation,
+             delta.clone(),
+             physical_delta.removed.iter().map(|(id, _)| *id).collect(),
+@@ -1307,6 +1454,9 @@
+     SemanticContextTransitionRequiresRebuild,
+     RevisionBoundMutationRequiresPreparedTransition,
+     TransitionEpochExhausted,
++    RuntimeRootIdentityExhausted,
++    RuntimeRootVersionExhausted,
++    RuntimePublicationPoisoned,
+ }
+ 
+ impl From<RelQueryError> for PhysicalExecutionError {
+@@ -6019,7 +6169,7 @@
+     }
+ 
+     #[test]
+-    fn storage_certified_delta_updates_recursive_scan_without_semantic_relookup() {
++    fn storage_resolved_delta_updates_recursive_scan_without_semantic_relookup() {
+         let (context, registry, relation) = planning_context();
+         let binding = LayoutBinding {
+             id: LayoutId(960),
+@@ -6058,13 +6208,13 @@
+             removed: vec![vec![Value::I64(1)]],
+             result_type,
+         };
+-        let certified = store
+-            .apply_relation_delta_certified(relation, binding, &delta, &context, &registry)
++        let resolved = store
++            .apply_relation_delta_resolved(relation, binding, &delta, &context, &registry)
+             .unwrap();
+-        let mut certified_map = BTreeMap::new();
+-        certified_map.insert(relation, certified.clone());
++        let mut resolved_map = BTreeMap::new();
++        resolved_map.insert(relation, resolved.clone());
+         let emitted = maintained
+-            .apply_storage_certified_deltas(&certified_map, &context, &registry)
++            .apply_storage_resolved_deltas(&resolved_map, &context, &registry)
+             .unwrap();
+         assert_eq!(emitted, delta);
+ 
+@@ -6082,7 +6232,7 @@
+ 
+         let before = maintained.clone();
+         assert_eq!(
+-            maintained.apply_storage_certified_deltas(&certified_map, &context, &registry),
++            maintained.apply_storage_resolved_deltas(&resolved_map, &context, &registry),
+             Err(RelQueryError::InconsistentIncrementalDelta)
+         );
+         assert_eq!(maintained, before);
+@@ -6154,6 +6304,21 @@
+         })
+     }
+ 
++    fn prepare_runtime_cell_revision(
++        runtime: &RuntimeRevisionCell,
++        target_revision: u64,
++        mutations: &[RevisionRelationMutation<'_>],
++        registry: &SemanticRegistry,
++    ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
++        let snapshot = runtime.snapshot()?;
++        let target = target_revision_for(snapshot.root(), target_revision, mutations, registry);
++        runtime.prepare_revision(&RevisionTransitionRequest {
++            target_revision: &target,
++            mutations,
++            registry,
++        })
++    }
++
+     fn scan_runtime_bundle(
+         revision: u64,
+         layout_id: u64,
+@@ -6278,14 +6443,14 @@
+ 
+     #[test]
+     fn revision_prepare_is_invisible_until_sealed_publish() {
+-        let (context, registry, relation, binding, mut runtime) =
++        let (context, registry, relation, binding, runtime) =
+             scan_runtime_bundle(40, 961, &[1, 2, 3]);
+         let delta = scan_delta(relation, &[4], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+             delta: &delta,
+         }];
+-        let before = runtime.clone();
++        let before = runtime.test_clone();
+         let prepared = prepare_runtime_revision(&runtime, 41, &mutations, &registry).unwrap();
+ 
+         assert_eq!(prepared.source_revision(), RevisionId::new(40));
+@@ -6294,11 +6459,13 @@
+         assert_eq!(prepared.output_deltas()[&test_materialization_id()], delta);
+         assert_eq!(runtime, before);
+ 
+-        let sealed = prepared.seal(&mut runtime).unwrap();
++        let cell = RuntimeRevisionCell::new(runtime);
++        let sealed = prepared.seal(&cell).unwrap();
+         assert_eq!(sealed.source_revision(), RevisionId::new(40));
+         assert_eq!(sealed.target_revision(), RevisionId::new(41));
+         assert_eq!(sealed.descriptor().relation_deltas()[&relation], delta);
+         let emitted = sealed.publish();
++        let runtime = cell.snapshot().unwrap();
+ 
+         assert_eq!(emitted[&test_materialization_id()], delta);
+         assert_eq!(runtime.revision_id(), RevisionId::new(41));
+@@ -6332,6 +6499,67 @@
+     }
+ 
+     #[test]
++    fn reader_snapshot_remains_on_old_root_after_atomic_publication() {
++        let (context, registry, relation, binding, runtime) =
++            scan_runtime_bundle(45, 976, &[1, 2, 3]);
++        let cell = RuntimeRevisionCell::new(runtime);
++        let old_reader = cell.snapshot().unwrap();
++        assert_eq!(old_reader.root_version().raw(), 0);
++
++        let delta = scan_delta(relation, &[4], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let prepared = prepare_runtime_cell_revision(&cell, 46, &mutations, &registry).unwrap();
++        let _ = prepared.seal(&cell).unwrap().publish();
++        let new_reader = cell.snapshot().unwrap();
++
++        assert_eq!(old_reader.revision_id(), RevisionId::new(45));
++        assert_eq!(new_reader.revision_id(), RevisionId::new(46));
++        assert_eq!(old_reader.root_version().raw(), 0);
++        assert_eq!(new_reader.root_version().raw(), 1);
++        assert_eq!(
++            runtime_physical_i64_values(&old_reader, relation, binding),
++            vec![1, 2, 3]
++        );
++        assert_eq!(
++            runtime_physical_i64_values(&new_reader, relation, binding),
++            vec![2, 3, 4]
++        );
++        assert_eq!(
++            runtime_maintained_i64_values(&old_reader, &context, &registry),
++            vec![1, 2, 3]
++        );
++        assert_eq!(
++            runtime_maintained_i64_values(&new_reader, &context, &registry),
++            vec![2, 3, 4]
++        );
++    }
++
++    #[test]
++    fn prepared_transition_cannot_cross_identical_runtime_root_lineages() {
++        let (context, registry, relation, _, source) = scan_runtime_bundle(47, 977, &[1, 2]);
++        let (_, _, _, _, identical) = scan_runtime_bundle(47, 977, &[1, 2]);
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let prepared = prepare_runtime_revision(&source, 48, &mutations, &registry).unwrap();
++        let wrong_cell = RuntimeRevisionCell::new(identical);
++
++        assert!(matches!(
++            prepared.seal(&wrong_cell),
++            Err(PhysicalExecutionError::StalePreparedTransition)
++        ));
++        assert_eq!(
++            wrong_cell.snapshot().unwrap().revision_id(),
++            RevisionId::new(47)
++        );
++    }
++
++    #[test]
+     fn semantic_context_change_is_rejected_without_publication() {
+         let (context, registry, relation, _, runtime) = scan_runtime_bundle(50, 962, &[1, 2]);
+         let mut wrong_context = context.clone();
+@@ -6353,7 +6581,7 @@
+             target_state,
+         )
+         .unwrap();
+-        let before = runtime.clone();
++        let before = runtime.test_clone();
+ 
+         assert_eq!(
+             runtime.prepare_revision(&RevisionTransitionRequest {
+@@ -6369,55 +6597,59 @@
+     #[test]
+     fn prepared_transition_rejects_different_same_revision_bundle() {
+         let (context, registry, relation, _, source) = scan_runtime_bundle(60, 963, &[1, 2]);
+-        let (_, _, _, _, mut different) = scan_runtime_bundle(60, 963, &[7, 8]);
++        let (_, _, _, _, different) = scan_runtime_bundle(60, 963, &[7, 8]);
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+             delta: &delta,
+         }];
+         let prepared = prepare_runtime_revision(&source, 61, &mutations, &registry).unwrap();
+-        let different_before = different.clone();
++        let different_before = different.test_clone();
++        let different_cell = RuntimeRevisionCell::new(different);
+ 
+         assert!(matches!(
+-            prepared.seal(&mut different),
++            prepared.seal(&different_cell),
+             Err(PhysicalExecutionError::StalePreparedTransition)
+         ));
+-        assert_eq!(different, different_before);
++        assert_eq!(different_cell.snapshot().unwrap().root(), &different_before);
+     }
+ 
+     #[test]
+     fn physical_index_change_after_prepare_makes_transition_stale() {
+-        let (context, registry, relation, binding, mut runtime) =
+-            scan_runtime_bundle(70, 964, &[1, 2]);
++        let (context, registry, relation, binding, runtime) = scan_runtime_bundle(70, 964, &[1, 2]);
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+             delta: &delta,
+         }];
+         let prepared = prepare_runtime_revision(&runtime, 71, &mutations, &registry).unwrap();
+-        runtime
+-            .install_i64_index(
+-                I64IndexBinding {
+-                    relation,
+-                    layout: binding,
+-                    key_column: 0,
+-                    equivalence: sid(101),
+-                },
+-                &registry,
+-            )
+-            .unwrap();
+-        let after_index = runtime.clone();
++        let cell = RuntimeRevisionCell::new(runtime);
++        let before_index = cell.snapshot().unwrap();
++        cell.install_i64_index(
++            I64IndexBinding {
++                relation,
++                layout: binding,
++                key_column: 0,
++                equivalence: sid(101),
++            },
++            &registry,
++        )
++        .unwrap();
++        let after_index = cell.snapshot().unwrap();
++        assert_eq!(before_index.revision_id(), after_index.revision_id());
++        assert_eq!(before_index.root_version().raw(), 0);
++        assert_eq!(after_index.root_version().raw(), 1);
+ 
+         assert!(matches!(
+-            prepared.seal(&mut runtime),
++            prepared.seal(&cell),
+             Err(PhysicalExecutionError::StalePreparedTransition)
+         ));
+-        assert_eq!(runtime, after_index);
++        assert_eq!(cell.snapshot().unwrap(), after_index);
+     }
+ 
+     #[test]
+     fn competing_prepared_transitions_from_same_revision_cannot_both_publish() {
+-        let (context, registry, relation, _, mut runtime) = scan_runtime_bundle(100, 967, &[1, 2]);
++        let (context, registry, relation, _, runtime) = scan_runtime_bundle(100, 967, &[1, 2]);
+         let delta_a = scan_delta(relation, &[3], &[1], &context, &registry);
+         let delta_b = scan_delta(relation, &[4], &[2], &context, &registry);
+         let mutations_a = [RevisionRelationMutation {
+@@ -6430,38 +6662,41 @@
+         }];
+         let prepared_a = prepare_runtime_revision(&runtime, 101, &mutations_a, &registry).unwrap();
+         let prepared_b = prepare_runtime_revision(&runtime, 102, &mutations_b, &registry).unwrap();
++        let cell = RuntimeRevisionCell::new(runtime);
+ 
+-        let _ = prepared_a.seal(&mut runtime).unwrap().publish();
+-        let after_a = runtime.clone();
++        let _ = prepared_a.seal(&cell).unwrap().publish();
++        let after_a = cell.snapshot().unwrap();
+         assert!(matches!(
+-            prepared_b.seal(&mut runtime),
++            prepared_b.seal(&cell),
+             Err(PhysicalExecutionError::StalePreparedTransition)
+         ));
+-        assert_eq!(runtime, after_a);
+-        assert_eq!(runtime.revision_id(), RevisionId::new(101));
++        assert_eq!(cell.snapshot().unwrap(), after_a);
++        assert_eq!(after_a.revision_id(), RevisionId::new(101));
+     }
+ 
+     #[test]
+     fn sequential_transitions_carry_revision_and_stable_handles_forward() {
+-        let (context, registry, relation, binding, mut runtime) =
++        let (context, registry, relation, binding, runtime) =
+             scan_runtime_bundle(110, 968, &[1, 2]);
+         let initial_handles = runtime
+             .physical_store()
+             .logical_row_handles(relation, binding)
+             .unwrap();
+         assert_eq!(initial_handles[0].generation, 0);
++        let cell = RuntimeRevisionCell::new(runtime);
+ 
+         let first = scan_delta(relation, &[3], &[1], &context, &registry);
+         let first_mutations = [RevisionRelationMutation {
+             relation,
+             delta: &first,
+         }];
+-        let _ = prepare_runtime_revision(&runtime, 111, &first_mutations, &registry)
++        let _ = prepare_runtime_cell_revision(&cell, 111, &first_mutations, &registry)
+             .unwrap()
+-            .seal(&mut runtime)
++            .seal(&cell)
+             .unwrap()
+             .publish();
+-        let first_handles = runtime
++        let first_snapshot = cell.snapshot().unwrap();
++        let first_handles = first_snapshot
+             .physical_store()
+             .logical_row_handles(relation, binding)
+             .unwrap();
+@@ -6471,17 +6706,19 @@
+             .find(|handle| handle.slot == initial_handles[0].slot)
+             .unwrap();
+         assert_eq!(reused.generation, 1);
++        drop(first_snapshot);
+ 
+         let second = scan_delta(relation, &[4], &[3], &context, &registry);
+         let second_mutations = [RevisionRelationMutation {
+             relation,
+             delta: &second,
+         }];
+-        let _ = prepare_runtime_revision(&runtime, 112, &second_mutations, &registry)
++        let _ = prepare_runtime_cell_revision(&cell, 112, &second_mutations, &registry)
+             .unwrap()
+-            .seal(&mut runtime)
++            .seal(&cell)
+             .unwrap()
+             .publish();
++        let runtime = cell.snapshot().unwrap();
+         let second_handles = runtime
+             .physical_store()
+             .logical_row_handles(relation, binding)
+@@ -6513,7 +6750,7 @@
+             delta: &delta,
+         }];
+         let target = target_revision_for(&runtime, 119, &mutations, &registry);
+-        let before = runtime.clone();
++        let before = runtime.test_clone();
+ 
+         assert_eq!(
+             runtime.prepare_revision(&RevisionTransitionRequest {
+@@ -6528,20 +6765,22 @@
+ 
+     #[test]
+     fn sealed_transition_drop_aborts_without_publication() {
+-        let (context, registry, relation, _, mut runtime) = scan_runtime_bundle(125, 971, &[1, 2]);
++        let (context, registry, relation, _, runtime) = scan_runtime_bundle(125, 971, &[1, 2]);
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+             delta: &delta,
+         }];
+-        let before = runtime.clone();
++        let before = runtime.test_clone();
+         let prepared = prepare_runtime_revision(&runtime, 126, &mutations, &registry).unwrap();
+-        let sealed = prepared.seal(&mut runtime).unwrap();
++        let cell = RuntimeRevisionCell::new(runtime);
++        let sealed = prepared.seal(&cell).unwrap();
+         assert_eq!(sealed.source_revision(), RevisionId::new(125));
+         assert_eq!(sealed.target_revision(), RevisionId::new(126));
+         drop(sealed);
+ 
+-        assert_eq!(runtime, before);
++        let runtime = cell.snapshot().unwrap();
++        assert_eq!(runtime.root(), &before);
+         assert_eq!(runtime.revision_id(), RevisionId::new(125));
+     }
+ 
+@@ -6599,7 +6838,7 @@
+             delta: &delta,
+         }];
+         let mismatched_target = revision_with_same_state(&runtime, 141, &registry);
+-        let before = runtime.clone();
++        let before = runtime.test_clone();
+ 
+         assert_eq!(
+             runtime.prepare_revision(&RevisionTransitionRequest {
+@@ -6649,7 +6888,7 @@
+             value: Value::I64(2),
+             equivalence: sid(101),
+         };
+-        let mut runtime = RuntimeRevisionBundle::build(
++        let runtime = RuntimeRevisionBundle::build(
+             revision,
+             store,
+             BTreeMap::from([(relation, binding)]),
+@@ -6685,7 +6924,9 @@
+         );
+         assert_eq!(prepared.output_deltas()[&scan_id], delta);
+         assert!(prepared.output_deltas()[&filter_id].is_empty());
+-        let emitted = prepared.seal(&mut runtime).unwrap().publish();
++        let cell = RuntimeRevisionCell::new(runtime);
++        let emitted = prepared.seal(&cell).unwrap().publish();
++        let runtime = cell.snapshot().unwrap();
+ 
+         assert_eq!(emitted.len(), 2);
+         assert_eq!(runtime.revision_id(), RevisionId::new(151));
+@@ -6804,7 +7045,7 @@
+         );
+         assert_eq!(store, store_before);
+ 
+-        let certified = StorageCertifiedRelationDelta::new(
++        let resolved = StorageResolvedRelationDelta::from_parts(
+             relation,
+             delta,
+             vec![handles[0]],
+@@ -6813,11 +7054,11 @@
+                 generation: handles[0].generation + 1,
+             }],
+         );
+-        let mut certified_map = BTreeMap::new();
+-        certified_map.insert(relation, certified);
++        let mut resolved_map = BTreeMap::new();
++        resolved_map.insert(relation, resolved);
+         let plan_before = maintained.clone();
+         assert_eq!(
+-            maintained.apply_storage_certified_deltas(&certified_map, &context, &registry),
++            maintained.apply_storage_resolved_deltas(&resolved_map, &context, &registry),
+             Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition)
+         );
+         assert_eq!(maintained, plan_before);
+@@ -6946,7 +7187,7 @@
+ 
+     #[test]
+     fn multi_relation_revision_publishes_one_coherent_join_snapshot() {
+-        let (context, registry, left, right, left_binding, right_binding, query, mut runtime) =
++        let (context, registry, left, right, left_binding, right_binding, query, runtime) =
+             join_runtime_bundle(200);
+         let left_delta = scan_delta(left, &[3], &[1], &context, &registry);
+         let right_delta = scan_delta(right, &[3], &[2], &context, &registry);
+@@ -6960,10 +7201,12 @@
+                 delta: &right_delta,
+             },
+         ];
+-        let before = runtime.clone();
++        let before = runtime.test_clone();
+         let prepared = prepare_runtime_revision(&runtime, 201, &mutations, &registry).unwrap();
+         assert_eq!(runtime, before);
+-        let _ = prepared.seal(&mut runtime).unwrap().publish();
++        let cell = RuntimeRevisionCell::new(runtime);
++        let _ = prepared.seal(&cell).unwrap().publish();
++        let runtime = cell.snapshot().unwrap();
+ 
+         let reference = query
+             .evaluate(&runtime.revision().state().model, &context, &registry)
+@@ -7014,7 +7257,7 @@
+             },
+         ];
+         let target = revision_with_same_state(&runtime, 211, &registry);
+-        let before = runtime.clone();
++        let before = runtime.test_clone();
+ 
+         assert!(
+             runtime
+@@ -7044,7 +7287,7 @@
+             },
+         ];
+         let target = revision_with_same_state(&runtime, 221, &registry);
+-        let before = runtime.clone();
++        let before = runtime.test_clone();
+ 
+         assert!(matches!(
+             runtime.prepare_revision(&RevisionTransitionRequest {
+--- /mnt/data/cfmd_pass30_work/cfmd_workspace_pass30/crates/kernel-query/src/lib.rs	2026-09-19 21:35:44.542219898 +0000
++++ crates/kernel-query/src/lib.rs	2026-09-19 22:01:21.886122719 +0000
+@@ -358,23 +358,28 @@
+     pub result_type: RelType,
+ }
+ 
+-/// A relation delta whose row identities were resolved by the authoritative
+-/// storage layer before the maintained query tree sees the change.
++/// Cross-crate row-identity evidence for a relation delta.
+ ///
+-/// The row payload is still carried for operator semantics, while handles let
+-/// `Scan` update its local snapshot without repeating semantic membership
+-/// search over the whole base relation.
++/// This value is deliberately **not** a semantic certificate or publication
++/// capability: callers may construct it, and every maintained leaf validates
++/// the supplied handles against its current storage-handle snapshot before it
++/// can produce a detached candidate. Authoritative publication remains owned
++/// by `kernel-plan::RuntimeRevisionCell`.
++///
++/// The row payload is carried for operator semantics, while handles let `Scan`
++/// update its local snapshot without repeating semantic membership search over
++/// the whole base relation.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+-pub struct StorageCertifiedRelationDelta {
++pub struct StorageResolvedRelationDelta {
+     relation: kernel_types::SemanticId,
+     delta: RelationDelta,
+     removed_handles: Vec<kernel_types::StableRowHandle>,
+     inserted_handles: Vec<kernel_types::StableRowHandle>,
+ }
+ 
+-impl StorageCertifiedRelationDelta {
++impl StorageResolvedRelationDelta {
+     #[must_use]
+-    pub fn new(
++    pub fn from_parts(
+         relation: kernel_types::SemanticId,
+         delta: RelationDelta,
+         removed_handles: Vec<kernel_types::StableRowHandle>,
+@@ -1585,7 +1590,7 @@
+ /// exact state check rather than an epoch-only heuristic. A later implementation
+ /// may replace this clone with a collision-resistant state/version identity.
+ #[derive(Debug, PartialEq, Eq)]
+-pub struct PreparedMaterializedRelPlanTransition {
++struct PreparedMaterializedRelPlanTransition {
+     source_epoch: u64,
+     source_revision: Option<kernel_types::RevisionId>,
+     source_state: Box<MaterializedRelPlanState>,
+@@ -1594,12 +1599,7 @@
+ }
+ 
+ impl PreparedMaterializedRelPlanTransition {
+-    #[must_use]
+-    pub fn output_delta(&self) -> &RelationDelta {
+-        &self.output_delta
+-    }
+-
+-    pub fn into_candidate_if_current(
++    fn into_candidate_if_current(
+         self,
+         current: &MaterializedRelPlanState,
+     ) -> Result<(MaterializedRelPlanState, RelationDelta), RelQueryError> {
+@@ -2005,9 +2005,9 @@
+         self.transition_epoch
+     }
+ 
+-    fn prepare_storage_certified_deltas(
++    fn prepare_storage_resolved_deltas(
+         &self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<PreparedMaterializedRelPlanTransition, RelQueryError> {
+@@ -2016,7 +2016,7 @@
+         }
+         let mut candidate = self.clone();
+         let output_delta =
+-            candidate.apply_storage_certified_deltas_in_place(deltas, context, registry)?;
++            candidate.apply_storage_resolved_deltas_in_place(deltas, context, registry)?;
+         Ok(PreparedMaterializedRelPlanTransition {
+             source_epoch: self.transition_epoch,
+             source_revision: None,
+@@ -2026,14 +2026,17 @@
+         })
+     }
+ 
+-    pub fn prepare_storage_certified_deltas_for_revision(
++    /// Builds a detached candidate for a revision-bound maintained plan from
++    /// storage-resolved row identities. This does not mutate or publish the
++    /// source state; authoritative publication remains owned by `kernel-plan`.
++    pub fn candidate_from_storage_resolved_deltas_for_revision(
+         &self,
+         source_revision: kernel_types::RevisionId,
+         target_revision: kernel_types::RevisionId,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<PreparedMaterializedRelPlanTransition, RelQueryError> {
++    ) -> Result<(Self, RelationDelta), RelQueryError> {
+         if source_revision == target_revision {
+             return Err(RelQueryError::InvalidRevisionTransition);
+         }
+@@ -2042,15 +2045,9 @@
+         }
+         let mut candidate = self.clone();
+         let output_delta =
+-            candidate.apply_storage_certified_deltas_in_place(deltas, context, registry)?;
++            candidate.apply_storage_resolved_deltas_in_place(deltas, context, registry)?;
+         candidate.revision = Some(target_revision);
+-        Ok(PreparedMaterializedRelPlanTransition {
+-            source_epoch: self.transition_epoch,
+-            source_revision: Some(source_revision),
+-            source_state: Box::new(self.clone()),
+-            candidate: Box::new(candidate),
+-            output_delta,
+-        })
++        Ok((candidate, output_delta))
+     }
+ 
+     #[must_use]
+@@ -2064,52 +2061,52 @@
+             && self.query == prepared.candidate.query
+     }
+ 
+-    /// Applies storage-certified base-table deltas without repeating semantic
++    /// Applies storage-resolved base-table deltas without repeating semantic
+     /// membership search inside `Scan` nodes. Revision-bound states must use the
+     /// joint prepared-transition path instead of this legacy convenience entrypoint.
+-    pub fn apply_storage_certified_deltas(
++    pub fn apply_storage_resolved_deltas(
+         &mut self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<RelationDelta, RelQueryError> {
+         if self.revision.is_some() {
+             return Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition);
+         }
+-        let prepared = self.prepare_storage_certified_deltas(deltas, context, registry)?;
++        let prepared = self.prepare_storage_resolved_deltas(deltas, context, registry)?;
+         let (candidate, output_delta) = prepared.into_candidate_if_current(self)?;
+         *self = candidate;
+         Ok(output_delta)
+     }
+ 
+-    fn apply_storage_certified_deltas_in_place(
++    fn apply_storage_resolved_deltas_in_place(
+         &mut self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<RelationDelta, RelQueryError> {
+         if context != &self.semantic_context {
+             return Err(RelQueryError::SemanticRevisionMismatch);
+         }
+-        for (relation, certified) in deltas {
+-            if *relation != certified.relation || !self.contains_scan_relation(*relation) {
++        for (relation, resolved) in deltas {
++            if *relation != resolved.relation || !self.contains_scan_relation(*relation) {
+                 return Err(RelQueryError::UnknownRelation(*relation));
+             }
+         }
+-        self.validate_certified_leaf_deltas(deltas, context, registry)?;
++        self.validate_resolved_leaf_deltas(deltas, context, registry)?;
+         let next_epoch = self
+             .transition_epoch
+             .checked_add(1)
+             .ok_or(RelQueryError::TransitionEpochExhausted)?;
+-        self.apply_certified_leaf_deltas(deltas)?;
+-        let output = self.propagate_certified_deltas_inner(deltas, context, registry)?;
++        self.apply_resolved_leaf_deltas(deltas)?;
++        let output = self.propagate_resolved_deltas_inner(deltas, context, registry)?;
+         self.transition_epoch = next_epoch;
+         Ok(output)
+     }
+ 
+-    fn validate_certified_leaf_deltas(
++    fn validate_resolved_leaf_deltas(
+         &self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), RelQueryError> {
+@@ -2117,23 +2114,23 @@
+             MaintainedRelPlanNode::Scan {
+                 relation, handles, ..
+             } => {
+-                let Some(certified) = deltas.get(relation) else {
++                let Some(resolved) = deltas.get(relation) else {
+                     return Ok(());
+                 };
+-                if certified.delta.result_type != self.result_type
+-                    || certified.removed_handles.len() != certified.delta.removed.len()
+-                    || certified.inserted_handles.len() != certified.delta.inserted.len()
++                if resolved.delta.result_type != self.result_type
++                    || resolved.removed_handles.len() != resolved.delta.removed.len()
++                    || resolved.inserted_handles.len() != resolved.delta.inserted.len()
+                 {
+                     return Err(RelQueryError::TypeMismatch);
+                 }
+                 MaterializedSetSupportState::validate_rows(
+-                    &certified.delta.removed,
++                    &resolved.delta.removed,
+                     &self.result_type,
+                     context,
+                     registry,
+                 )?;
+                 MaterializedSetSupportState::validate_rows(
+-                    &certified.delta.inserted,
++                    &resolved.delta.inserted,
+                     &self.result_type,
+                     context,
+                     registry,
+@@ -2142,12 +2139,12 @@
+                     .as_ref()
+                     .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                 let mut seen = BTreeSet::new();
+-                for id in &certified.removed_handles {
++                for id in &resolved.removed_handles {
+                     if !handles.positions.contains_key(id) || !seen.insert(*id) {
+                         return Err(RelQueryError::InconsistentIncrementalDelta);
+                     }
+                 }
+-                for id in &certified.inserted_handles {
++                for id in &resolved.inserted_handles {
+                     if handles.positions.contains_key(id) || !seen.insert(*id) {
+                         return Err(RelQueryError::InconsistentIncrementalDelta);
+                     }
+@@ -2161,18 +2158,18 @@
+             | MaintainedRelPlanNode::PromoteToBag { input }
+             | MaintainedRelPlanNode::Group { input, .. }
+             | MaintainedRelPlanNode::TopK { input, .. } => {
+-                input.validate_certified_leaf_deltas(deltas, context, registry)
++                input.validate_resolved_leaf_deltas(deltas, context, registry)
+             }
+             MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.validate_certified_leaf_deltas(deltas, context, registry)?;
+-                right.validate_certified_leaf_deltas(deltas, context, registry)
++                left.validate_resolved_leaf_deltas(deltas, context, registry)?;
++                right.validate_resolved_leaf_deltas(deltas, context, registry)
+             }
+         }
+     }
+ 
+-    fn apply_certified_leaf_deltas(
++    fn apply_resolved_leaf_deltas(
+         &mut self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+     ) -> Result<(), RelQueryError> {
+         match &mut self.node {
+             MaintainedRelPlanNode::Scan {
+@@ -2180,20 +2177,20 @@
+                 value,
+                 handles,
+             } => {
+-                let Some(certified) = deltas.get(relation) else {
++                let Some(resolved) = deltas.get(relation) else {
+                     return Ok(());
+                 };
+                 let handles = handles
+                     .as_mut()
+                     .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-                for id in &certified.removed_handles {
++                for id in &resolved.removed_handles {
+                     handles.remove(value, *id)?;
+                 }
+-                for (id, row) in certified
++                for (id, row) in resolved
+                     .inserted_handles
+                     .iter()
+                     .copied()
+-                    .zip(certified.delta.inserted.iter().cloned())
++                    .zip(resolved.delta.inserted.iter().cloned())
+                 {
+                     handles.insert(value, id, row)?;
+                 }
+@@ -2205,19 +2202,17 @@
+             | MaintainedRelPlanNode::Distinct { input, .. }
+             | MaintainedRelPlanNode::PromoteToBag { input }
+             | MaintainedRelPlanNode::Group { input, .. }
+-            | MaintainedRelPlanNode::TopK { input, .. } => {
+-                input.apply_certified_leaf_deltas(deltas)
+-            }
++            | MaintainedRelPlanNode::TopK { input, .. } => input.apply_resolved_leaf_deltas(deltas),
+             MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.apply_certified_leaf_deltas(deltas)?;
+-                right.apply_certified_leaf_deltas(deltas)
++                left.apply_resolved_leaf_deltas(deltas)?;
++                right.apply_resolved_leaf_deltas(deltas)
+             }
+         }
+     }
+ 
+-    fn propagate_certified_deltas_inner(
++    fn propagate_resolved_deltas_inner(
+         &mut self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<RelationDelta, RelQueryError> {
+@@ -2228,7 +2223,7 @@
+                     removed: Vec::new(),
+                     result_type: self.result_type.clone(),
+                 },
+-                |certified| certified.delta.clone(),
++                |resolved| resolved.delta.clone(),
+             )),
+             MaintainedRelPlanNode::Filter {
+                 input,
+@@ -2236,7 +2231,7 @@
+                 value,
+                 equivalence,
+             } => rel_delta_filter(
+-                input.propagate_certified_deltas_inner(deltas, context, registry)?,
++                input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+                 *column,
+                 value,
+                 *equivalence,
+@@ -2244,7 +2239,7 @@
+                 registry,
+             ),
+             MaintainedRelPlanNode::ProjectBag { input, columns } => rel_delta_project_bag(
+-                input.propagate_certified_deltas_inner(deltas, context, registry)?,
++                input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+                 columns,
+                 &self.query,
+                 context,
+@@ -2255,7 +2250,7 @@
+                 columns,
+                 supports,
+             } => {
+-                let delta = input.propagate_certified_deltas_inner(deltas, context, registry)?;
++                let delta = input.propagate_resolved_deltas_inner(deltas, context, registry)?;
+                 supports.apply_rows_delta(
+                     project_rows(delta.inserted, columns)?,
+                     project_rows(delta.removed, columns)?,
+@@ -2264,11 +2259,11 @@
+                 )
+             }
+             MaintainedRelPlanNode::Distinct { input, supports } => {
+-                let delta = input.propagate_certified_deltas_inner(deltas, context, registry)?;
++                let delta = input.propagate_resolved_deltas_inner(deltas, context, registry)?;
+                 supports.apply_rows_delta(delta.inserted, delta.removed, context, registry)
+             }
+             MaintainedRelPlanNode::PromoteToBag { input } => {
+-                let delta = input.propagate_certified_deltas_inner(deltas, context, registry)?;
++                let delta = input.propagate_resolved_deltas_inner(deltas, context, registry)?;
+                 Ok(RelationDelta {
+                     inserted: delta.inserted,
+                     removed: delta.removed,
+@@ -2276,19 +2271,18 @@
+                 })
+             }
+             MaintainedRelPlanNode::Join { left, right, state } => {
+-                let left_delta =
+-                    left.propagate_certified_deltas_inner(deltas, context, registry)?;
++                let left_delta = left.propagate_resolved_deltas_inner(deltas, context, registry)?;
+                 let right_delta =
+-                    right.propagate_certified_deltas_inner(deltas, context, registry)?;
++                    right.propagate_resolved_deltas_inner(deltas, context, registry)?;
+                 state.apply_input_deltas(&left_delta, &right_delta, context, registry)
+             }
+             MaintainedRelPlanNode::Group { input, state } => state.apply_input_delta(
+-                &input.propagate_certified_deltas_inner(deltas, context, registry)?,
++                &input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+                 context,
+                 registry,
+             ),
+             MaintainedRelPlanNode::TopK { input, state } => state.apply_input_delta(
+-                &input.propagate_certified_deltas_inner(deltas, context, registry)?,
++                &input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+                 context,
+                 registry,
+             ),
+@@ -9054,8 +9048,8 @@
+         let left_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
+         let right_type = RelExpr::Scan(right).typecheck(&context, &registry).unwrap();
+ 
+-        let mut certified_state = state.clone();
+-        certified_state
++        let mut resolved_state = state.clone();
++        resolved_state
+             .attach_storage_handles(
+                 left,
+                 &[
+@@ -9074,7 +9068,7 @@
+                 ],
+             )
+             .unwrap();
+-        certified_state
++        resolved_state
+             .attach_storage_handles(
+                 right,
+                 &[
+@@ -9089,14 +9083,14 @@
+                 ],
+             )
+             .unwrap();
+-        let certified_delta = RelationDelta {
++        let resolved_delta = RelationDelta {
+             inserted: vec![vec![Value::I64(1), Value::I64(1)]],
+             removed: vec![vec![Value::I64(2), Value::I64(1)]],
+             result_type: left_type.clone(),
+         };
+-        let certified = StorageCertifiedRelationDelta::new(
++        let resolved = StorageResolvedRelationDelta::from_parts(
+             left,
+-            certified_delta.clone(),
++            resolved_delta.clone(),
+             vec![kernel_types::StableRowHandle {
+                 slot: 1,
+                 generation: 0,
+@@ -9106,40 +9100,38 @@
+                 generation: 1,
+             }],
+         );
+-        let mut certified_next = old.clone();
+-        certified_next.relations.get_mut(&left).unwrap().remove(1);
+-        certified_next
++        let mut resolved_next = old.clone();
++        resolved_next.relations.get_mut(&left).unwrap().remove(1);
++        resolved_next
+             .relations
+             .get_mut(&left)
+             .unwrap()
+             .push(vec![Value::I64(1), Value::I64(1)]);
+-        let certified_oracle = rel_delta_by_recompute(
++        let resolved_oracle = rel_delta_by_recompute(
+             &query,
+             &old,
+-            &Change::Replace(certified_next.clone()),
++            &Change::Replace(resolved_next.clone()),
+             &context,
+             &registry,
+         )
+         .unwrap();
+-        let mut certified_map = BTreeMap::new();
+-        certified_map.insert(left, certified);
+-        let certified_output = certified_state
+-            .apply_storage_certified_deltas(&certified_map, &context, &registry)
++        let mut resolved_map = BTreeMap::new();
++        resolved_map.insert(left, resolved);
++        let resolved_output = resolved_state
++            .apply_storage_resolved_deltas(&resolved_map, &context, &registry)
+             .unwrap();
+         assert!(
+             relation_deltas_semantically_equivalent(
+-                &certified_output,
+-                &certified_oracle,
++                &resolved_output,
++                &resolved_oracle,
+                 &context,
+                 &registry,
+             )
+             .unwrap()
+         );
+         assert_eq!(
+-            certified_state.output_value(&context, &registry).unwrap(),
+-            query
+-                .evaluate(&certified_next, &context, &registry)
+-                .unwrap()
++            resolved_state.output_value(&context, &registry).unwrap(),
++            query.evaluate(&resolved_next, &context, &registry).unwrap()
+         );
+ 
+         let steps = [
+--- /mnt/data/cfmd_pass30_work/cfmd_workspace_pass30/crates/kernel-plan/examples/storage_plan_bridge_bench.rs	2026-09-19 18:54:25.000000000 +0000
++++ crates/kernel-plan/examples/storage_plan_bridge_bench.rs	2026-09-19 21:58:58.568385976 +0000
+@@ -127,13 +127,13 @@
+         let handles = store.logical_row_handles(relation, binding).unwrap();
+         state.attach_storage_handles(relation, &handles).unwrap();
+         let certified = store
+-            .apply_relation_delta_certified(relation, binding, &delta, &context, &registry)
++            .apply_relation_delta_resolved(relation, binding, &delta, &context, &registry)
+             .unwrap();
+         let mut certified_map = BTreeMap::new();
+         certified_map.insert(relation, certified);
+         let start = Instant::now();
+         state
+-            .apply_storage_certified_deltas(black_box(&certified_map), &context, &registry)
++            .apply_storage_resolved_deltas(black_box(&certified_map), &context, &registry)
+             .unwrap();
+         certified_samples.push(start.elapsed().as_nanos());
+         black_box(state);
+@@ -160,7 +160,7 @@
+         state.attach_storage_handles(relation, &handles).unwrap();
+         let start = Instant::now();
+         let certified = store
+-            .apply_relation_delta_certified(
++            .apply_relation_delta_resolved(
+                 relation,
+                 binding,
+                 black_box(&delta),
+@@ -171,7 +171,7 @@
+         let mut certified_map = BTreeMap::new();
+         certified_map.insert(relation, certified);
+         state
+-            .apply_storage_certified_deltas(&certified_map, &context, &registry)
++            .apply_storage_resolved_deltas(&certified_map, &context, &registry)
+             .unwrap();
+         end_to_end_samples.push(start.elapsed().as_nanos());
+         black_box((state, store));

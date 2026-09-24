@@ -1,0 +1,4 @@
+51e58383b9f9192378d648c5d0c3bcd2a6ef305d00acdb145418d222a845d7c3  crates/kernel-auth/src/lib.rs
+169f961497fc4d17a3ac71e42e00e733fe395e9f659ae2ae637c308cdbf94219  crates/kernel-durability/src/lib.rs
+6a3ced3e37d3f2470d90a97fc756586390f175a079f702008404585414d8e987  crates/kernel-durability/src/metadata.rs
+40910fd5da952ea6c44a99df730d563b3bd356d0684d6b6aa673be310b1df98f  crates/kernel-durability/src/store.rs

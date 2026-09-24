@@ -1,0 +1,13 @@
+Pass47 static audit
+production source changed vs Pass46: crates/kernel-plan/src/lib.rs only
+production source freeze SHA-256: a7e53284cbbbf742b61e01b10267e978f52aea0df1a2a08813d8f680fd34eafa
+Rust test declarations: 349
+kernel-plan test declarations: 121 (120 normal + 1 ignored diagnostic benchmark)
+workspace crates: 21
+Rust LOC under crates/: 47310
+external Cargo sources: 0
+unsafe occurrences under crates/: 0
+TODO/FIXME/todo!/unimplemented! under crates/: 0
+#[allow(...)] sites: 19, unchanged from Pass46
+historical OPEN after Pass47: 22
+new independent OPEN in Pass47: 0

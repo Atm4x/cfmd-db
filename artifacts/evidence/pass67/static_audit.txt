@@ -1,0 +1,9 @@
+=== STATIC AUDIT ===
+unsafe tokens: 0
+#[allow] attrs: 19
+TODO/FIXME/todo!/unimplemented!: 0
+Rust LOC: 59205
+Cargo crates: 21
+test attrs workspace: 421
+kernel-plan test attrs: 165
+external Cargo sources:

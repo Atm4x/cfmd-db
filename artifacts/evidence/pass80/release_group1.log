@@ -1,0 +1,96 @@
+   Compiling kernel-lens v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-lens)
+   Compiling kernel-identity v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-identity)
+   Compiling kernel-retention v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-retention)
+   Compiling kernel-schema v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-schema)
+   Compiling kernel-aggregate v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-aggregate)
+   Compiling kernel-change v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-change)
+   Compiling kernel-types v0.1.0 (/mnt/data/cfmd_pass80_work/crates/kernel-types)
+    Finished `release` profile [optimized] target(s) in 1.56s
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_aggregate-a18de5b7b07318e8)
+
+running 8 tests
+test tests::exact_count_decrement_is_checked_and_demotes_after_big_boundary ... ok
+test tests::exact_count_is_mergeable_and_checks_result_range ... ok
+test tests::exact_count_promotes_losslessly_when_small_representation_overflows ... ok
+test tests::catastrophic_cancellation_is_exact_and_order_independent ... ok
+test tests::exact_f64_sum_removal_is_an_exact_inverse ... ok
+test tests::merge_is_reproducible_across_partitions ... ok
+test tests::non_finite_inputs_are_explicitly_rejected ... ok
+test tests::subnormal_values_sum_exactly ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_change-381d22cca4f5e62e)
+
+running 3 tests
+test tests::invalid_splice_is_not_silently_clamped ... ok
+test tests::set_change_round_trips ... ok
+test tests::sequence_splice_has_exact_checked_semantics ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_identity-806ad34189ee0e11)
+
+running 5 tests
+test tests::dense_entity_ids_round_trip_external_identity_without_reusing_semantics ... ok
+test tests::bijective_transports_form_a_groupoid_under_composition ... ok
+test tests::dense_entity_set_is_a_compact_exact_local_id_extent ... ok
+test tests::merge_is_not_identity_transport ... ok
+test tests::split_is_not_identity_transport ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_lens-affeeead7ac5fd53)
+
+running 2 tests
+test tests::composed_lens_is_lawful ... ok
+test tests::product_field_lens_preserves_complement_and_laws ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_model-1ab27cc6cd868671)
+
+running 9 tests
+test tests::database_state_clone_path_copies_only_the_mutated_relation ... ok
+test tests::historical_identity_may_outlive_entity ... ok
+test tests::indexed_lifecycle_restriction_preserves_previous_dangling_reference_semantics ... ok
+test tests::normalization_removes_dead_entities_from_carriers_and_owned_fields ... ok
+test tests::relation_sensitivity_recompile_shares_unaffected_partitions ... ok
+test tests::reverse_live_ref_sensitivity_indexes_nested_fields_and_relation_rows ... ok
+test tests::set_and_map_equality_are_explicit_semantic_inputs ... ok
+test tests::structural_values_are_identity_free_until_reference_is_explicit ... ok
+test tests::surviving_entity_cannot_keep_dangling_live_reference ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_retention-c398571208563b30)
+
+running 3 tests
+test tests::explicit_dataflow_joins_retention_labels ... ok
+test tests::overflow_is_explicit_in_tracked_arithmetic ... ok
+test tests::branch_condition_taints_result_through_pc_label ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_schema-bc9b99a2e36c1a23)
+
+running 10 tests
+test tests::free_type_variable_is_rejected ... ok
+test tests::context_requires_all_semantic_modules_referenced_by_schema ... ok
+test tests::open_capability_is_not_closed_sum ... ok
+test tests::naked_recursive_variable_is_rejected ... ok
+test tests::recursive_document_type_is_guarded_and_valid ... ok
+test tests::rename_preserves_semantic_identity ... ok
+test tests::semantic_environment_is_explicitly_versioned ... ok
+test tests::set_relation_requires_one_equivalence_per_column ... ok
+test tests::subtype_diamond_is_coherent_but_cycles_are_rejected ... ok
+test tests::subtype_adjacency_matches_direct_relation_scan_reference ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass80_final_target/release/deps/kernel_types-24402fa99134aabb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

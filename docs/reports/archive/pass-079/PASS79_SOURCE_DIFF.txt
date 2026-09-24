@@ -1,0 +1,1367 @@
+--- cfmd_pass78_work/Cargo.toml	2026-09-20 01:30:01.000000000 +0000
++++ cfmd_pass79_work/Cargo.toml	2026-09-21 16:51:35.004845696 +0000
+@@ -6,6 +6,7 @@
+   "crates/kernel-change",
+   "crates/kernel-query",
+   "crates/kernel-fixpoint",
++  "crates/kernel-grounded-closure",
+   "crates/kernel-aggregate",
+   "crates/kernel-lens",
+   "crates/kernel-lifecycle",
+--- cfmd_pass78_work/Cargo.lock	2026-09-20 19:34:40.000000000 +0000
++++ cfmd_pass79_work/Cargo.lock	2026-09-21 16:56:34.919278520 +0000
+@@ -26,11 +26,16 @@
+ name = "kernel-fixpoint"
+ version = "0.1.0"
+ dependencies = [
++ "kernel-grounded-closure",
+  "kernel-proof",
+  "kernel-types",
+ ]
+ 
+ [[package]]
++name = "kernel-grounded-closure"
++version = "0.1.0"
++
++[[package]]
+ name = "kernel-identity"
+ version = "0.1.0"
+ dependencies = [
+@@ -67,6 +72,7 @@
+ name = "kernel-lifecycle"
+ version = "0.1.0"
+ dependencies = [
++ "kernel-grounded-closure",
+  "kernel-identity",
+  "kernel-types",
+ ]
+@@ -154,6 +160,7 @@
+ name = "kernel-semantics"
+ version = "0.1.0"
+ dependencies = [
++ "kernel-grounded-closure",
+  "kernel-model",
+  "kernel-proof",
+  "kernel-schema",
+diff -ruN cfmd_pass78_work/crates/kernel-fixpoint/Cargo.toml cfmd_pass79_work/crates/kernel-fixpoint/Cargo.toml
+--- cfmd_pass78_work/crates/kernel-fixpoint/Cargo.toml	2026-09-19 03:00:08.000000000 +0000
++++ cfmd_pass79_work/crates/kernel-fixpoint/Cargo.toml	2026-09-21 16:55:46.798271667 +0000
+@@ -5,6 +5,7 @@
+ license.workspace = true
+ 
+ [dependencies]
++kernel-grounded-closure = { path = "../kernel-grounded-closure" }
+ kernel-types = { path = "../kernel-types" }
+ kernel-proof = { path = "../kernel-proof" }
+ 
+diff -ruN cfmd_pass78_work/crates/kernel-fixpoint/src/lib.rs cfmd_pass79_work/crates/kernel-fixpoint/src/lib.rs
+--- cfmd_pass78_work/crates/kernel-fixpoint/src/lib.rs	2026-09-20 17:03:09.000000000 +0000
++++ cfmd_pass79_work/crates/kernel-fixpoint/src/lib.rs	2026-09-21 16:55:46.798421870 +0000
+@@ -1,5 +1,12 @@
+-use std::collections::{BTreeMap, BTreeSet, VecDeque};
++use std::collections::{BTreeMap, BTreeSet};
+ 
++#[cfg(test)]
++use std::collections::VecDeque;
++
++use kernel_grounded_closure::{
++    GroundedAtomId, GroundedClosureError, GroundedProgram, GroundedRule, GroundedWitness,
++    solve as solve_grounded_closure,
++};
+ use kernel_types::EntityId;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -29,6 +36,13 @@
+     NotClosedUnderEdge { parent: EntityId, child: EntityId },
+     CertificateContainsOutsideUniverse(EntityId),
+     MissingSeed(EntityId),
++    GroundedClosure(GroundedClosureError),
++}
++
++impl From<GroundedClosureError> for FixpointError {
++    fn from(value: GroundedClosureError) -> Self {
++        Self::GroundedClosure(value)
++    }
+ }
+ 
+ impl ReachabilityProgram {
+@@ -52,32 +66,43 @@
+ 
+ pub fn solve(program: &ReachabilityProgram) -> Result<ReachabilityCertificate, FixpointError> {
+     program.validate()?;
+-    let mut outgoing = BTreeMap::<EntityId, Vec<EntityId>>::new();
+-    for &(left, right) in &program.edges {
+-        outgoing.entry(left).or_default().push(right);
+-    }
++    let entity_by_atom = program.universe.iter().copied().collect::<Vec<_>>();
++    let atom_by_entity = entity_by_atom
++        .iter()
++        .enumerate()
++        .map(|(index, &entity)| (entity, GroundedAtomId::new(index)))
++        .collect::<BTreeMap<_, _>>();
++    let rule_edges = program.edges.iter().copied().collect::<Vec<_>>();
++    let rules = rule_edges
++        .iter()
++        .map(|&(parent, child)| {
++            GroundedRule::new([atom_by_entity[&parent]], atom_by_entity[&child])
++        })
++        .collect::<Vec<_>>();
++    let seeds = program
++        .seeds
++        .iter()
++        .map(|seed| atom_by_entity[seed])
++        .collect::<Vec<_>>();
++    let grounded = GroundedProgram::new(entity_by_atom.len(), seeds, rules)?;
++    let (grounded_certificate, _) = solve_grounded_closure(&grounded);
++
+     let mut reachable = BTreeSet::new();
+     let mut rank = BTreeMap::new();
+     let mut parent = BTreeMap::new();
+-    let mut queue = VecDeque::new();
+-
+-    for &seed in &program.seeds {
+-        reachable.insert(seed);
+-        rank.insert(seed, 0);
+-        queue.push_back(seed);
+-    }
+-
+-    while let Some(current) = queue.pop_front() {
+-        let current_rank = rank[&current];
+-        if let Some(neighbors) = outgoing.get(&current) {
+-            for &right in neighbors {
+-                if !reachable.insert(right) {
+-                    continue;
+-                }
+-                rank.insert(right, current_rank + 1);
+-                parent.insert(right, current);
+-                queue.push_back(right);
+-            }
++    for atom in grounded_certificate.live_atoms() {
++        let entity = entity_by_atom[atom.index()];
++        reachable.insert(entity);
++        rank.insert(
++            entity,
++            grounded_certificate
++                .rank(atom)
++                .ok_or(FixpointError::MissingRank(entity))?,
++        );
++        if let Some(GroundedWitness::Rule(rule_id)) = grounded_certificate.witness(atom) {
++            let (witness_parent, witness_child) = rule_edges[rule_id.index()];
++            debug_assert_eq!(witness_child, entity);
++            parent.insert(entity, witness_parent);
+         }
+     }
+ 
+diff -ruN cfmd_pass78_work/crates/kernel-grounded-closure/Cargo.toml cfmd_pass79_work/crates/kernel-grounded-closure/Cargo.toml
+--- cfmd_pass78_work/crates/kernel-grounded-closure/Cargo.toml	1970-01-01 00:00:00.000000000 +0000
++++ cfmd_pass79_work/crates/kernel-grounded-closure/Cargo.toml	2026-09-21 16:51:34.525712709 +0000
+@@ -0,0 +1,8 @@
++[package]
++name = "kernel-grounded-closure"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++
++[lints]
++workspace = true
+diff -ruN cfmd_pass78_work/crates/kernel-grounded-closure/src/lib.rs cfmd_pass79_work/crates/kernel-grounded-closure/src/lib.rs
+--- cfmd_pass78_work/crates/kernel-grounded-closure/src/lib.rs	1970-01-01 00:00:00.000000000 +0000
++++ cfmd_pass79_work/crates/kernel-grounded-closure/src/lib.rs	2026-09-21 16:53:46.872577008 +0000
+@@ -0,0 +1,874 @@
++use std::collections::{BTreeSet, VecDeque};
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct GroundedAtomId(usize);
++
++impl GroundedAtomId {
++    #[must_use]
++    pub const fn new(index: usize) -> Self {
++        Self(index)
++    }
++
++    #[must_use]
++    pub const fn index(self) -> usize {
++        self.0
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct GroundedRuleId(usize);
++
++impl GroundedRuleId {
++    #[must_use]
++    pub const fn new(index: usize) -> Self {
++        Self(index)
++    }
++
++    #[must_use]
++    pub const fn index(self) -> usize {
++        self.0
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct GroundedRule {
++    body: Vec<GroundedAtomId>,
++    head: GroundedAtomId,
++    enabled: bool,
++}
++
++impl GroundedRule {
++    #[must_use]
++    pub fn new(body: impl IntoIterator<Item = GroundedAtomId>, head: GroundedAtomId) -> Self {
++        let mut body = body.into_iter().collect::<Vec<_>>();
++        body.sort_unstable();
++        body.dedup();
++        Self {
++            body,
++            head,
++            enabled: true,
++        }
++    }
++
++    #[must_use]
++    pub fn disabled(body: impl IntoIterator<Item = GroundedAtomId>, head: GroundedAtomId) -> Self {
++        let mut rule = Self::new(body, head);
++        rule.enabled = false;
++        rule
++    }
++
++    #[must_use]
++    pub fn body(&self) -> &[GroundedAtomId] {
++        &self.body
++    }
++
++    #[must_use]
++    pub const fn head(&self) -> GroundedAtomId {
++        self.head
++    }
++
++    #[must_use]
++    pub const fn enabled(&self) -> bool {
++        self.enabled
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum GroundedClosureError {
++    AtomOutsideUniverse(GroundedAtomId),
++    RuleOutsideProgram(GroundedRuleId),
++    CertificateShapeMismatch,
++    LiveAtomMissingRank(GroundedAtomId),
++    LiveAtomMissingWitness(GroundedAtomId),
++    DeadAtomHasProofState(GroundedAtomId),
++    SeedWitnessForNonSeed(GroundedAtomId),
++    SeedHasNonZeroRank(GroundedAtomId),
++    WitnessRuleDisabled(GroundedRuleId),
++    WitnessRuleHeadMismatch {
++        atom: GroundedAtomId,
++        rule: GroundedRuleId,
++    },
++    WitnessPremiseDead {
++        atom: GroundedAtomId,
++        premise: GroundedAtomId,
++    },
++    WitnessRankNotStrictlySmaller {
++        atom: GroundedAtomId,
++        premise: GroundedAtomId,
++    },
++    MissingSeed(GroundedAtomId),
++    NotClosedUnderRule(GroundedRuleId),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct GroundedProgram {
++    atom_count: usize,
++    seeds: BTreeSet<GroundedAtomId>,
++    rules: Vec<GroundedRule>,
++}
++
++impl GroundedProgram {
++    pub fn new(
++        atom_count: usize,
++        seeds: impl IntoIterator<Item = GroundedAtomId>,
++        rules: Vec<GroundedRule>,
++    ) -> Result<Self, GroundedClosureError> {
++        let seeds = seeds.into_iter().collect::<BTreeSet<_>>();
++        let program = Self {
++            atom_count,
++            seeds,
++            rules,
++        };
++        program.validate()?;
++        Ok(program)
++    }
++
++    pub fn validate(&self) -> Result<(), GroundedClosureError> {
++        for &seed in &self.seeds {
++            self.validate_atom(seed)?;
++        }
++        for rule in &self.rules {
++            self.validate_atom(rule.head)?;
++            for &atom in &rule.body {
++                self.validate_atom(atom)?;
++            }
++        }
++        Ok(())
++    }
++
++    #[must_use]
++    pub const fn atom_count(&self) -> usize {
++        self.atom_count
++    }
++
++    #[must_use]
++    pub fn seeds(&self) -> &BTreeSet<GroundedAtomId> {
++        &self.seeds
++    }
++
++    #[must_use]
++    pub fn rules(&self) -> &[GroundedRule] {
++        &self.rules
++    }
++
++    fn validate_atom(&self, atom: GroundedAtomId) -> Result<(), GroundedClosureError> {
++        if atom.index() < self.atom_count {
++            Ok(())
++        } else {
++            Err(GroundedClosureError::AtomOutsideUniverse(atom))
++        }
++    }
++
++    fn validate_rule(&self, rule: GroundedRuleId) -> Result<(), GroundedClosureError> {
++        if rule.index() < self.rules.len() {
++            Ok(())
++        } else {
++            Err(GroundedClosureError::RuleOutsideProgram(rule))
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum GroundedWitness {
++    Seed,
++    Rule(GroundedRuleId),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct GroundedCertificate {
++    live: Vec<bool>,
++    rank: Vec<Option<usize>>,
++    witness: Vec<Option<GroundedWitness>>,
++}
++
++impl GroundedCertificate {
++    #[must_use]
++    pub fn is_live(&self, atom: GroundedAtomId) -> bool {
++        self.live.get(atom.index()).copied().unwrap_or(false)
++    }
++
++    #[must_use]
++    pub fn rank(&self, atom: GroundedAtomId) -> Option<usize> {
++        self.rank.get(atom.index()).copied().flatten()
++    }
++
++    #[must_use]
++    pub fn witness(&self, atom: GroundedAtomId) -> Option<GroundedWitness> {
++        self.witness.get(atom.index()).copied().flatten()
++    }
++
++    pub fn live_atoms(&self) -> impl Iterator<Item = GroundedAtomId> + '_ {
++        self.live
++            .iter()
++            .enumerate()
++            .filter_map(|(index, &live)| live.then_some(GroundedAtomId::new(index)))
++    }
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct GroundedWorkStats {
++    pub incidence_updates: usize,
++    pub dependency_walks: usize,
++    pub rule_fires: usize,
++    pub affected_atoms: usize,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct GroundedIncidenceIndex {
++    dependents: Vec<Vec<GroundedRuleId>>,
++    by_head: Vec<Vec<GroundedRuleId>>,
++}
++
++impl GroundedIncidenceIndex {
++    #[must_use]
++    pub fn compile(program: &GroundedProgram) -> Self {
++        let mut dependents = vec![Vec::new(); program.atom_count];
++        let mut by_head = vec![Vec::new(); program.atom_count];
++        for (index, rule) in program.rules.iter().enumerate() {
++            let rule_id = GroundedRuleId::new(index);
++            by_head[rule.head.index()].push(rule_id);
++            for &atom in &rule.body {
++                dependents[atom.index()].push(rule_id);
++            }
++        }
++        Self {
++            dependents,
++            by_head,
++        }
++    }
++}
++
++struct SolverState {
++    live: Vec<bool>,
++    rank: Vec<Option<usize>>,
++    witness: Vec<Option<GroundedWitness>>,
++    fired: Vec<bool>,
++    queue: VecDeque<GroundedAtomId>,
++    stats: GroundedWorkStats,
++}
++
++impl SolverState {
++    fn fire_rule(&mut self, program: &GroundedProgram, rule_id: GroundedRuleId) {
++        if self.fired[rule_id.index()] {
++            return;
++        }
++        self.fired[rule_id.index()] = true;
++        self.stats.rule_fires = self.stats.rule_fires.saturating_add(1);
++        let rule = &program.rules[rule_id.index()];
++        if self.live[rule.head.index()] {
++            return;
++        }
++        let max_rank = rule
++            .body
++            .iter()
++            .filter_map(|atom| self.rank[atom.index()])
++            .max();
++        let rank = max_rank.map_or(0, |value| value.saturating_add(1));
++        self.live[rule.head.index()] = true;
++        self.rank[rule.head.index()] = Some(rank);
++        self.witness[rule.head.index()] = Some(GroundedWitness::Rule(rule_id));
++        self.queue.push_back(rule.head);
++    }
++}
++
++#[must_use]
++pub fn solve(program: &GroundedProgram) -> (GroundedCertificate, GroundedWorkStats) {
++    let index = GroundedIncidenceIndex::compile(program);
++    solve_indexed(program, &index)
++}
++
++#[must_use]
++pub fn solve_indexed(
++    program: &GroundedProgram,
++    index: &GroundedIncidenceIndex,
++) -> (GroundedCertificate, GroundedWorkStats) {
++    let mut remaining = vec![0_usize; program.rules.len()];
++    let mut state = SolverState {
++        live: vec![false; program.atom_count],
++        rank: vec![None; program.atom_count],
++        witness: vec![None; program.atom_count],
++        fired: vec![false; program.rules.len()],
++        queue: VecDeque::new(),
++        stats: GroundedWorkStats::default(),
++    };
++
++    for &seed in &program.seeds {
++        if !state.live[seed.index()] {
++            state.live[seed.index()] = true;
++            state.rank[seed.index()] = Some(0);
++            state.witness[seed.index()] = Some(GroundedWitness::Seed);
++            state.queue.push_back(seed);
++        }
++    }
++    for (index, rule) in program.rules.iter().enumerate() {
++        if rule.enabled {
++            remaining[index] = rule.body.len();
++        }
++    }
++    for (index, &left) in remaining.iter().enumerate() {
++        if program.rules[index].enabled && left == 0 {
++            state.fire_rule(program, GroundedRuleId::new(index));
++        }
++    }
++    while let Some(atom) = state.queue.pop_front() {
++        for &rule_id in &index.dependents[atom.index()] {
++            if state.fired[rule_id.index()] || remaining[rule_id.index()] == 0 {
++                continue;
++            }
++            state.stats.incidence_updates = state.stats.incidence_updates.saturating_add(1);
++            remaining[rule_id.index()] -= 1;
++            if remaining[rule_id.index()] == 0 {
++                state.fire_rule(program, rule_id);
++            }
++        }
++    }
++
++    (
++        GroundedCertificate {
++            live: state.live,
++            rank: state.rank,
++            witness: state.witness,
++        },
++        state.stats,
++    )
++}
++
++pub fn check(
++    program: &GroundedProgram,
++    certificate: &GroundedCertificate,
++) -> Result<(), GroundedClosureError> {
++    if certificate.live.len() != program.atom_count
++        || certificate.rank.len() != program.atom_count
++        || certificate.witness.len() != program.atom_count
++    {
++        return Err(GroundedClosureError::CertificateShapeMismatch);
++    }
++
++    for index in 0..program.atom_count {
++        let atom = GroundedAtomId::new(index);
++        if !certificate.live[index] {
++            if certificate.rank[index].is_some() || certificate.witness[index].is_some() {
++                return Err(GroundedClosureError::DeadAtomHasProofState(atom));
++            }
++            continue;
++        }
++        let rank =
++            certificate.rank[index].ok_or(GroundedClosureError::LiveAtomMissingRank(atom))?;
++        let witness =
++            certificate.witness[index].ok_or(GroundedClosureError::LiveAtomMissingWitness(atom))?;
++        match witness {
++            GroundedWitness::Seed => {
++                if !program.seeds.contains(&atom) {
++                    return Err(GroundedClosureError::SeedWitnessForNonSeed(atom));
++                }
++                if rank != 0 {
++                    return Err(GroundedClosureError::SeedHasNonZeroRank(atom));
++                }
++            }
++            GroundedWitness::Rule(rule_id) => {
++                let rule = program
++                    .rules
++                    .get(rule_id.index())
++                    .ok_or(GroundedClosureError::RuleOutsideProgram(rule_id))?;
++                if !rule.enabled {
++                    return Err(GroundedClosureError::WitnessRuleDisabled(rule_id));
++                }
++                if rule.head != atom {
++                    return Err(GroundedClosureError::WitnessRuleHeadMismatch {
++                        atom,
++                        rule: rule_id,
++                    });
++                }
++                for &premise in &rule.body {
++                    if !certificate.live[premise.index()] {
++                        return Err(GroundedClosureError::WitnessPremiseDead { atom, premise });
++                    }
++                    let premise_rank = certificate.rank[premise.index()]
++                        .ok_or(GroundedClosureError::LiveAtomMissingRank(premise))?;
++                    if premise_rank >= rank {
++                        return Err(GroundedClosureError::WitnessRankNotStrictlySmaller {
++                            atom,
++                            premise,
++                        });
++                    }
++                }
++            }
++        }
++    }
++
++    for &seed in &program.seeds {
++        if !certificate.live[seed.index()] {
++            return Err(GroundedClosureError::MissingSeed(seed));
++        }
++    }
++    for (index, rule) in program.rules.iter().enumerate() {
++        if rule.enabled
++            && rule.body.iter().all(|atom| certificate.live[atom.index()])
++            && !certificate.live[rule.head.index()]
++        {
++            return Err(GroundedClosureError::NotClosedUnderRule(
++                GroundedRuleId::new(index),
++            ));
++        }
++    }
++    Ok(())
++}
++
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct GroundedUpdate {
++    pub add_seeds: Vec<GroundedAtomId>,
++    pub remove_seeds: Vec<GroundedAtomId>,
++    pub enable_rules: Vec<GroundedRuleId>,
++    pub disable_rules: Vec<GroundedRuleId>,
++}
++
++pub fn apply_update(
++    program: &mut GroundedProgram,
++    old: &GroundedCertificate,
++    update: &GroundedUpdate,
++) -> Result<(GroundedCertificate, GroundedWorkStats), GroundedClosureError> {
++    validate_update(program, update)?;
++    check(program, old)?;
++    let index = GroundedIncidenceIndex::compile(program);
++    apply_update_indexed(program, &index, old, update)
++}
++
++pub fn apply_update_indexed(
++    program: &mut GroundedProgram,
++    index: &GroundedIncidenceIndex,
++    old: &GroundedCertificate,
++    update: &GroundedUpdate,
++) -> Result<(GroundedCertificate, GroundedWorkStats), GroundedClosureError> {
++    validate_update(program, update)?;
++    check(program, old)?;
++    let old_program = program.clone();
++
++    for &seed in &update.remove_seeds {
++        program.seeds.remove(&seed);
++    }
++    for &rule_id in &update.disable_rules {
++        program.rules[rule_id.index()].enabled = false;
++    }
++
++    let mut direct = BTreeSet::new();
++    for &seed in &update.remove_seeds {
++        if old.is_live(seed) && old.witness(seed) == Some(GroundedWitness::Seed) {
++            direct.insert(seed);
++        }
++    }
++    for &rule_id in &update.disable_rules {
++        let rule = &old_program.rules[rule_id.index()];
++        if rule.enabled
++            && old.is_live(rule.head)
++            && old.witness(rule.head) == Some(GroundedWitness::Rule(rule_id))
++        {
++            direct.insert(rule.head);
++        }
++    }
++
++    let (mut certificate, mut stats) = if direct.is_empty() {
++        (old.clone(), GroundedWorkStats::default())
++    } else {
++        local_recompute_after_deletion_indexed(program, index, old, &direct)
++    };
++
++    for &seed in &update.add_seeds {
++        program.seeds.insert(seed);
++    }
++    for &rule_id in &update.enable_rules {
++        program.rules[rule_id.index()].enabled = true;
++    }
++    incremental_insertions(program, index, &mut certificate, update, &mut stats);
++    check(program, &certificate)?;
++    Ok((certificate, stats))
++}
++
++fn validate_update(
++    program: &GroundedProgram,
++    update: &GroundedUpdate,
++) -> Result<(), GroundedClosureError> {
++    for &atom in update.add_seeds.iter().chain(&update.remove_seeds) {
++        program.validate_atom(atom)?;
++    }
++    for &rule in update.enable_rules.iter().chain(&update.disable_rules) {
++        program.validate_rule(rule)?;
++    }
++    Ok(())
++}
++
++fn incremental_insertions(
++    program: &GroundedProgram,
++    index: &GroundedIncidenceIndex,
++    certificate: &mut GroundedCertificate,
++    update: &GroundedUpdate,
++    stats: &mut GroundedWorkStats,
++) {
++    let mut queue = VecDeque::new();
++    for &seed in &update.add_seeds {
++        if !certificate.is_live(seed) {
++            certificate.live[seed.index()] = true;
++            certificate.rank[seed.index()] = Some(0);
++            certificate.witness[seed.index()] = Some(GroundedWitness::Seed);
++            queue.push_back(seed);
++        }
++    }
++
++    for &rule_id in &update.enable_rules {
++        let rule = &program.rules[rule_id.index()];
++        if !rule.enabled || certificate.is_live(rule.head) {
++            continue;
++        }
++        if rule.body.iter().all(|atom| certificate.is_live(*atom)) {
++            stats.rule_fires = stats.rule_fires.saturating_add(1);
++            derive_from_rule(certificate, program, rule_id, &mut queue);
++        }
++    }
++
++    while let Some(atom) = queue.pop_front() {
++        for &rule_id in &index.dependents[atom.index()] {
++            let rule = &program.rules[rule_id.index()];
++            if !rule.enabled || certificate.is_live(rule.head) {
++                continue;
++            }
++            stats.incidence_updates = stats.incidence_updates.saturating_add(1);
++            if rule
++                .body
++                .iter()
++                .all(|premise| certificate.is_live(*premise))
++            {
++                stats.rule_fires = stats.rule_fires.saturating_add(1);
++                derive_from_rule(certificate, program, rule_id, &mut queue);
++            }
++        }
++    }
++}
++
++fn derive_from_rule(
++    certificate: &mut GroundedCertificate,
++    program: &GroundedProgram,
++    rule_id: GroundedRuleId,
++    queue: &mut VecDeque<GroundedAtomId>,
++) {
++    let rule = &program.rules[rule_id.index()];
++    if certificate.is_live(rule.head) {
++        return;
++    }
++    let max_rank = rule
++        .body
++        .iter()
++        .filter_map(|atom| certificate.rank(*atom))
++        .max();
++    certificate.live[rule.head.index()] = true;
++    certificate.rank[rule.head.index()] = Some(max_rank.map_or(0, |rank| rank.saturating_add(1)));
++    certificate.witness[rule.head.index()] = Some(GroundedWitness::Rule(rule_id));
++    queue.push_back(rule.head);
++}
++
++#[must_use]
++pub fn local_recompute_after_deletion(
++    program: &GroundedProgram,
++    old: &GroundedCertificate,
++    direct: &BTreeSet<GroundedAtomId>,
++) -> (GroundedCertificate, GroundedWorkStats) {
++    let index = GroundedIncidenceIndex::compile(program);
++    local_recompute_after_deletion_indexed(program, &index, old, direct)
++}
++
++#[must_use]
++pub fn local_recompute_after_deletion_indexed(
++    program: &GroundedProgram,
++    index: &GroundedIncidenceIndex,
++    old: &GroundedCertificate,
++    direct: &BTreeSet<GroundedAtomId>,
++) -> (GroundedCertificate, GroundedWorkStats) {
++    let mut witness_children = vec![Vec::new(); program.atom_count];
++    for atom_index in 0..program.atom_count {
++        let atom = GroundedAtomId::new(atom_index);
++        let Some(GroundedWitness::Rule(rule_id)) = old.witness(atom) else {
++            continue;
++        };
++        for &premise in &program.rules[rule_id.index()].body {
++            witness_children[premise.index()].push(atom);
++        }
++    }
++
++    let mut affected = vec![false; program.atom_count];
++    let mut queue = VecDeque::new();
++    let mut stats = GroundedWorkStats::default();
++    for &atom in direct {
++        if old.is_live(atom) && !affected[atom.index()] {
++            affected[atom.index()] = true;
++            queue.push_back(atom);
++        }
++    }
++    while let Some(atom) = queue.pop_front() {
++        for &child in &witness_children[atom.index()] {
++            stats.dependency_walks = stats.dependency_walks.saturating_add(1);
++            if old.is_live(child) && !affected[child.index()] {
++                affected[child.index()] = true;
++                queue.push_back(child);
++            }
++        }
++    }
++
++    let mut certificate = old.clone();
++    for (index, &is_affected) in affected.iter().enumerate() {
++        if is_affected {
++            certificate.live[index] = false;
++            certificate.rank[index] = None;
++            certificate.witness[index] = None;
++        }
++    }
++    for &seed in &program.seeds {
++        if affected[seed.index()] {
++            certificate.live[seed.index()] = true;
++            certificate.rank[seed.index()] = Some(0);
++            certificate.witness[seed.index()] = Some(GroundedWitness::Seed);
++        }
++    }
++
++    let mut local_dependents = vec![Vec::new(); program.atom_count];
++    let mut remaining = vec![usize::MAX; program.rules.len()];
++    let mut fired = vec![false; program.rules.len()];
++    let mut work = VecDeque::new();
++    stats.affected_atoms = affected.iter().filter(|&&value| value).count();
++
++    let mut seen_rule = vec![false; program.rules.len()];
++    for (head_index, &is_affected) in affected.iter().enumerate() {
++        if !is_affected {
++            continue;
++        }
++        for &rule_id in &index.by_head[head_index] {
++            if seen_rule[rule_id.index()] {
++                continue;
++            }
++            seen_rule[rule_id.index()] = true;
++            let rule = &program.rules[rule_id.index()];
++            if !rule.enabled {
++                continue;
++            }
++            remaining[rule_id.index()] = rule
++                .body
++                .iter()
++                .filter(|atom| !certificate.is_live(**atom))
++                .count();
++            for &premise in &rule.body {
++                if affected[premise.index()] {
++                    local_dependents[premise.index()].push(rule_id);
++                }
++            }
++            if remaining[rule_id.index()] == 0 {
++                fired[rule_id.index()] = true;
++                stats.rule_fires = stats.rule_fires.saturating_add(1);
++                if !certificate.is_live(rule.head) {
++                    derive_from_rule(&mut certificate, program, rule_id, &mut work);
++                }
++            }
++        }
++    }
++
++    while let Some(atom) = work.pop_front() {
++        for &rule_id in &local_dependents[atom.index()] {
++            if fired[rule_id.index()] || remaining[rule_id.index()] == 0 {
++                continue;
++            }
++            stats.incidence_updates = stats.incidence_updates.saturating_add(1);
++            remaining[rule_id.index()] -= 1;
++            if remaining[rule_id.index()] == 0 {
++                fired[rule_id.index()] = true;
++                stats.rule_fires = stats.rule_fires.saturating_add(1);
++                let head = program.rules[rule_id.index()].head;
++                if !certificate.is_live(head) {
++                    derive_from_rule(&mut certificate, program, rule_id, &mut work);
++                }
++            }
++        }
++    }
++    (certificate, stats)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[derive(Clone)]
++    struct Rng(usize);
++
++    impl Rng {
++        fn next(&mut self) -> usize {
++            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++            self.0
++        }
++
++        fn usize(&mut self, n: usize) -> usize {
++            self.next() % n.max(1)
++        }
++
++        fn bool(&mut self, numerator: usize, denominator: usize) -> bool {
++            self.usize(denominator) < numerator
++        }
++    }
++
++    fn atom(index: usize) -> GroundedAtomId {
++        GroundedAtomId::new(index)
++    }
++
++    fn random_program(rng: &mut Rng, atoms: usize, rules: usize) -> GroundedProgram {
++        let seeds = (0..atoms)
++            .filter(|_| rng.bool(1, 5))
++            .map(atom)
++            .collect::<Vec<_>>();
++        let rules = (0..rules)
++            .map(|_| {
++                let arity = rng.usize(4);
++                let body = (0..arity)
++                    .map(|_| atom(rng.usize(atoms)))
++                    .collect::<Vec<_>>();
++                let head = atom(rng.usize(atoms));
++                GroundedRule::new(body, head)
++            })
++            .collect::<Vec<_>>();
++        GroundedProgram::new(atoms, seeds, rules).unwrap()
++    }
++
++    fn naive_live(program: &GroundedProgram) -> Vec<bool> {
++        let mut live = vec![false; program.atom_count];
++        for &seed in &program.seeds {
++            live[seed.index()] = true;
++        }
++        loop {
++            let mut changed = false;
++            for rule in &program.rules {
++                if !rule.enabled || live[rule.head.index()] {
++                    continue;
++                }
++                if rule.body.iter().all(|premise| live[premise.index()]) {
++                    live[rule.head.index()] = true;
++                    changed = true;
++                }
++            }
++            if !changed {
++                return live;
++            }
++        }
++    }
++
++    #[test]
++    fn randomized_solver_matches_naive_and_certificate() {
++        let mut rng = Rng(1);
++        for _ in 0..2_000 {
++            let atoms = 1 + rng.usize(18);
++            let rules = rng.usize(50);
++            let program = random_program(&mut rng, atoms, rules);
++            let (certificate, _) = solve(&program);
++            assert_eq!(certificate.live.clone(), naive_live(&program));
++            assert_eq!(check(&program, &certificate), Ok(()));
++        }
++    }
++
++    #[test]
++    fn groundless_cycle_remains_dead() {
++        let program = GroundedProgram::new(
++            2,
++            [],
++            vec![
++                GroundedRule::new([atom(0)], atom(1)),
++                GroundedRule::new([atom(1)], atom(0)),
++            ],
++        )
++        .unwrap();
++        let (certificate, _) = solve(&program);
++        assert!(!certificate.is_live(atom(0)));
++        assert!(!certificate.is_live(atom(1)));
++        assert_eq!(check(&program, &certificate), Ok(()));
++    }
++
++    #[test]
++    fn genuine_hyperrule_requires_all_premises() {
++        let rules = vec![GroundedRule::new([atom(0), atom(1)], atom(2))];
++        let one = GroundedProgram::new(3, [atom(0)], rules.clone()).unwrap();
++        assert!(!solve(&one).0.is_live(atom(2)));
++        let both = GroundedProgram::new(3, [atom(0), atom(1)], rules).unwrap();
++        assert!(solve(&both).0.is_live(atom(2)));
++    }
++
++    #[test]
++    fn randomized_mixed_updates_match_full_rebuild() {
++        let mut rng = Rng(7);
++        let mut program = random_program(&mut rng, 40, 100);
++        let (mut certificate, _) = solve(&program);
++        for _ in 0..5_000 {
++            let mut update = GroundedUpdate::default();
++            match rng.usize(4) {
++                0 => update.add_seeds.push(atom(rng.usize(program.atom_count()))),
++                1 => update
++                    .remove_seeds
++                    .push(atom(rng.usize(program.atom_count()))),
++                2 => update
++                    .enable_rules
++                    .push(GroundedRuleId::new(rng.usize(program.rules().len()))),
++                _ => update
++                    .disable_rules
++                    .push(GroundedRuleId::new(rng.usize(program.rules().len()))),
++            }
++            let (next, _) = apply_update(&mut program, &certificate, &update).unwrap();
++            let full = solve(&program).0;
++            assert_eq!(
++                next.live_atoms().collect::<Vec<_>>(),
++                full.live_atoms().collect::<Vec<_>>()
++            );
++            certificate = next;
++        }
++    }
++
++    #[test]
++    fn deleting_non_witness_rule_does_no_invalidation_work() {
++        let mut program = GroundedProgram::new(
++            4,
++            [atom(0), atom(1)],
++            vec![
++                GroundedRule::new([atom(0)], atom(2)),
++                GroundedRule::new([atom(1)], atom(2)),
++                GroundedRule::new([atom(2)], atom(3)),
++            ],
++        )
++        .unwrap();
++        let (certificate, _) = solve(&program);
++        assert_eq!(
++            certificate.witness(atom(2)),
++            Some(GroundedWitness::Rule(GroundedRuleId::new(0)))
++        );
++        let update = GroundedUpdate {
++            disable_rules: vec![GroundedRuleId::new(1)],
++            ..GroundedUpdate::default()
++        };
++        let (same, stats) = apply_update(&mut program, &certificate, &update).unwrap();
++        assert_eq!(
++            same.live_atoms().collect::<Vec<_>>(),
++            certificate.live_atoms().collect::<Vec<_>>()
++        );
++        assert_eq!(stats.affected_atoms, 0);
++    }
++
++    #[test]
++    fn deleting_grounding_seed_kills_self_supported_cycle() {
++        let mut program = GroundedProgram::new(
++            3,
++            [atom(0)],
++            vec![
++                GroundedRule::new([atom(0)], atom(1)),
++                GroundedRule::new([atom(1)], atom(2)),
++                GroundedRule::new([atom(2)], atom(1)),
++            ],
++        )
++        .unwrap();
++        let (certificate, _) = solve(&program);
++        let update = GroundedUpdate {
++            remove_seeds: vec![atom(0)],
++            ..GroundedUpdate::default()
++        };
++        let (next, stats) = apply_update(&mut program, &certificate, &update).unwrap();
++        assert!(next.live_atoms().next().is_none());
++        assert_eq!(stats.affected_atoms, 3);
++    }
++}
+diff -ruN cfmd_pass78_work/crates/kernel-lifecycle/Cargo.toml cfmd_pass79_work/crates/kernel-lifecycle/Cargo.toml
+--- cfmd_pass78_work/crates/kernel-lifecycle/Cargo.toml	2026-09-20 18:42:26.000000000 +0000
++++ cfmd_pass79_work/crates/kernel-lifecycle/Cargo.toml	2026-09-21 16:56:33.675279639 +0000
+@@ -10,3 +10,6 @@
+ 
+ [lints]
+ workspace = true
++
++[dev-dependencies]
++kernel-grounded-closure = { path = "../kernel-grounded-closure" }
+diff -ruN cfmd_pass78_work/crates/kernel-lifecycle/src/lib.rs cfmd_pass79_work/crates/kernel-lifecycle/src/lib.rs
+--- cfmd_pass78_work/crates/kernel-lifecycle/src/lib.rs	2026-09-20 19:33:56.000000000 +0000
++++ cfmd_pass79_work/crates/kernel-lifecycle/src/lib.rs	2026-09-21 16:56:48.112915619 +0000
+@@ -404,6 +404,40 @@
+         EntityId::new(raw)
+     }
+ 
++    fn grounded_live_entities(graph: &LifecycleGraph) -> BTreeSet<EntityId> {
++        use kernel_grounded_closure::{GroundedAtomId, GroundedProgram, GroundedRule, solve};
++
++        let entity_by_atom = graph.entities.iter().copied().collect::<Vec<_>>();
++        let atom_by_entity = entity_by_atom
++            .iter()
++            .enumerate()
++            .map(|(index, &entity)| (entity, GroundedAtomId::new(index)))
++            .collect::<BTreeMap<_, _>>();
++        let seeds = graph
++            .roots
++            .iter()
++            .filter_map(|root| atom_by_entity.get(root).copied())
++            .collect::<Vec<_>>();
++        let mut rules = Vec::new();
++        for (parent, children) in &graph.keeps_alive {
++            let Some(&parent_atom) = atom_by_entity.get(parent) else {
++                continue;
++            };
++            for child in children {
++                let Some(&child_atom) = atom_by_entity.get(child) else {
++                    continue;
++                };
++                rules.push(GroundedRule::new([parent_atom], child_atom));
++            }
++        }
++        let program = GroundedProgram::new(entity_by_atom.len(), seeds, rules).unwrap();
++        solve(&program)
++            .0
++            .live_atoms()
++            .map(|atom| entity_by_atom[atom.index()])
++            .collect()
++    }
++
+     #[test]
+     fn dense_local_id_projection_matches_reference_reachability_including_dead_cycle() {
+         let mut graph = LifecycleGraph::default();
+@@ -459,6 +493,41 @@
+             }
+         }
+     }
++
++    #[test]
++    fn lifecycle_reference_is_unary_grounded_closure_on_all_three_node_graphs() {
++        let nodes = [id(1), id(2), id(3)];
++        let directed_edges = [
++            (nodes[0], nodes[1]),
++            (nodes[0], nodes[2]),
++            (nodes[1], nodes[0]),
++            (nodes[1], nodes[2]),
++            (nodes[2], nodes[0]),
++            (nodes[2], nodes[1]),
++        ];
++
++        for root_mask in 0_u8..8 {
++            for edge_mask in 0_u8..64 {
++                let mut graph = LifecycleGraph::default();
++                graph.entities.extend(nodes);
++                for (index, node) in nodes.iter().enumerate() {
++                    if root_mask & (1 << index) != 0 {
++                        graph.roots.insert(*node);
++                    }
++                }
++                for (index, (parent, child)) in directed_edges.iter().enumerate() {
++                    if edge_mask & (1 << index) != 0 {
++                        graph.keeps_alive.entry(*parent).or_default().insert(*child);
++                    }
++                }
++                assert_eq!(
++                    grounded_live_entities(&graph),
++                    graph.live_entities(),
++                    "root_mask={root_mask}, edge_mask={edge_mask}"
++                );
++            }
++        }
++    }
+ 
+     #[test]
+     fn maintained_dense_lifecycle_matches_exact_lfp_through_cycle_death_and_resurrection() {
+diff -ruN cfmd_pass78_work/crates/kernel-semantics/Cargo.toml cfmd_pass79_work/crates/kernel-semantics/Cargo.toml
+--- cfmd_pass78_work/crates/kernel-semantics/Cargo.toml	2026-09-19 03:17:20.000000000 +0000
++++ cfmd_pass79_work/crates/kernel-semantics/Cargo.toml	2026-09-21 16:51:35.695926116 +0000
+@@ -5,6 +5,7 @@
+ license.workspace = true
+ 
+ [dependencies]
++kernel-grounded-closure = { path = "../kernel-grounded-closure" }
+ kernel-model = { path = "../kernel-model" }
+ kernel-proof = { path = "../kernel-proof" }
+ kernel-schema = { path = "../kernel-schema" }
+diff -ruN cfmd_pass78_work/crates/kernel-semantics/src/anchor_pullback.rs cfmd_pass79_work/crates/kernel-semantics/src/anchor_pullback.rs
+--- cfmd_pass78_work/crates/kernel-semantics/src/anchor_pullback.rs	2026-09-21 14:30:26.616882258 +0000
++++ cfmd_pass79_work/crates/kernel-semantics/src/anchor_pullback.rs	2026-09-21 16:53:33.882608192 +0000
+@@ -1,5 +1,9 @@
+ use std::collections::{BTreeMap, BTreeSet, VecDeque};
+ 
++use kernel_grounded_closure::{
++    GroundedAtomId, GroundedClosureError, GroundedIncidenceIndex, GroundedProgram, GroundedRule,
++    solve_indexed as solve_grounded_closure,
++};
+ use kernel_types::{EqClassId, RevisionObservableId, SemanticRevision};
+ 
+ use crate::observable::{CertifiedSemanticMorphism, ObservableError, RevisionObservableCatalog};
+@@ -25,6 +29,7 @@
+         existing: EqClassId,
+         proposed: EqClassId,
+     },
++    GroundedClosure(GroundedClosureError),
+ }
+ 
+ impl From<ObservableError> for AnchorPullbackError {
+@@ -33,18 +38,18 @@
+     }
+ }
+ 
++impl From<GroundedClosureError> for AnchorPullbackError {
++    fn from(value: GroundedClosureError) -> Self {
++        Self::GroundedClosure(value)
++    }
++}
++
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+ pub struct DeterminantClosureStats {
+     pub incidence_updates: usize,
+     pub target_attempts: usize,
+ }
+ 
+-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+-struct DeterminantRule {
+-    source: BTreeSet<RevisionObservableId>,
+-    target: BTreeSet<RevisionObservableId>,
+-}
+-
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct DeterminantTheory {
+     revision: SemanticRevision,
+@@ -52,8 +57,10 @@
+     coordinate_order: Vec<RevisionObservableId>,
+     coordinates: BTreeSet<RevisionObservableId>,
+     morphisms: Vec<CertifiedSemanticMorphism>,
+-    rules: Vec<DeterminantRule>,
+-    dependents: BTreeMap<RevisionObservableId, Vec<usize>>,
++    atom_by_coordinate: BTreeMap<RevisionObservableId, GroundedAtomId>,
++    coordinate_by_atom: Vec<RevisionObservableId>,
++    grounded_rules: Vec<GroundedRule>,
++    grounded_index: GroundedIncidenceIndex,
+ }
+ 
+ impl DeterminantTheory {
+@@ -73,7 +80,17 @@
+             catalog.definition(*coordinate)?;
+         }
+ 
+-        let mut rules = Vec::with_capacity(morphisms.len());
++        let coordinate_by_atom = coordinate_order.clone();
++        let atom_by_coordinate = coordinate_by_atom
++            .iter()
++            .enumerate()
++            .map(|(index, &coordinate)| (coordinate, GroundedAtomId::new(index)))
++            .collect::<BTreeMap<_, _>>();
++
++        let mut normalized_rules = Vec::<(
++            BTreeSet<RevisionObservableId>,
++            BTreeSet<RevisionObservableId>,
++        )>::new();
+         for morphism in &morphisms {
+             if morphism.revision() != catalog.revision() {
+                 return Err(AnchorPullbackError::MorphismRevisionMismatch);
+@@ -89,18 +106,28 @@
+                 }
+             }
+             if !target.is_subset(&source) {
+-                rules.push(DeterminantRule { source, target });
++                normalized_rules.push((source, target));
+             }
+         }
+-        rules.sort();
+-        rules.dedup();
++        normalized_rules.sort();
++        normalized_rules.dedup();
+ 
+-        let mut dependents = BTreeMap::<RevisionObservableId, Vec<usize>>::new();
+-        for (rule_index, rule) in rules.iter().enumerate() {
+-            for source in &rule.source {
+-                dependents.entry(*source).or_default().push(rule_index);
+-            }
+-        }
++        let mut grounded_rules = Vec::new();
++        for (source, targets) in &normalized_rules {
++            let body = source
++                .iter()
++                .map(|coordinate| atom_by_coordinate[coordinate])
++                .collect::<Vec<_>>();
++            for target in targets {
++                grounded_rules.push(GroundedRule::new(
++                    body.iter().copied(),
++                    atom_by_coordinate[target],
++                ));
++            }
++        }
++        let empty_program =
++            GroundedProgram::new(coordinate_by_atom.len(), [], grounded_rules.clone())?;
++        let grounded_index = GroundedIncidenceIndex::compile(&empty_program);
+ 
+         Ok(Self {
+             revision: catalog.revision(),
+@@ -108,8 +135,10 @@
+             coordinate_order,
+             coordinates: coordinate_set,
+             morphisms,
+-            rules,
+-            dependents,
++            atom_by_coordinate,
++            coordinate_by_atom,
++            grounded_rules,
++            grounded_index,
+         })
+     }
+ 
+@@ -146,56 +175,37 @@
+     ) -> Result<(BTreeSet<RevisionObservableId>, DeterminantClosureStats), AnchorPullbackError>
+     {
+         self.validate_coordinate_set(seed)?;
+-        let mut known = seed.clone();
+-        let mut remaining = Vec::with_capacity(self.rules.len());
+-        let mut fired = vec![false; self.rules.len()];
+-        let mut queue = VecDeque::new();
+-        let mut stats = DeterminantClosureStats::default();
+-
+-        for rule in &self.rules {
+-            remaining.push(
+-                rule.source
++        let grounded_seed = seed
++            .iter()
++            .map(|coordinate| self.atom_by_coordinate[coordinate])
++            .collect::<BTreeSet<_>>();
++        let seed_incidence_count = self
++            .grounded_rules
++            .iter()
++            .map(|rule| {
++                rule.body()
+                     .iter()
+-                    .filter(|coord| !known.contains(coord))
+-                    .count(),
+-            );
+-        }
+-
+-        for (rule_index, rule) in self.rules.iter().enumerate() {
+-            if remaining[rule_index] == 0 {
+-                fired[rule_index] = true;
+-                for target in &rule.target {
+-                    stats.target_attempts = stats.target_attempts.saturating_add(1);
+-                    if known.insert(*target) {
+-                        queue.push_back(*target);
+-                    }
+-                }
+-            }
+-        }
+-
+-        while let Some(coordinate) = queue.pop_front() {
+-            let Some(rule_ids) = self.dependents.get(&coordinate) else {
+-                continue;
+-            };
+-            for &rule_index in rule_ids {
+-                if fired[rule_index] || remaining[rule_index] == 0 {
+-                    continue;
+-                }
+-                stats.incidence_updates = stats.incidence_updates.saturating_add(1);
+-                remaining[rule_index] -= 1;
+-                if remaining[rule_index] == 0 {
+-                    fired[rule_index] = true;
+-                    for target in &self.rules[rule_index].target {
+-                        stats.target_attempts = stats.target_attempts.saturating_add(1);
+-                        if known.insert(*target) {
+-                            queue.push_back(*target);
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        Ok((known, stats))
++                    .filter(|atom| grounded_seed.contains(atom))
++                    .count()
++            })
++            .sum::<usize>();
++        let program = GroundedProgram::new(
++            self.coordinate_by_atom.len(),
++            grounded_seed,
++            self.grounded_rules.clone(),
++        )?;
++        let (certificate, work) = solve_grounded_closure(&program, &self.grounded_index);
++        let closure = certificate
++            .live_atoms()
++            .map(|atom| self.coordinate_by_atom[atom.index()])
++            .collect::<BTreeSet<_>>();
++        Ok((
++            closure,
++            DeterminantClosureStats {
++                incidence_updates: work.incidence_updates.saturating_sub(seed_incidence_count),
++                target_attempts: work.rule_fires,
++            },
++        ))
+     }
+ 
+     pub fn stable_inclusion_minimal_generator(

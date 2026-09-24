@@ -1,0 +1,4 @@
+crates/kernel-query/src/lib.rs
+crates/kernel-query/src/linear_island.rs
+crates/kernel-query/src/sealed_group_v3.rs
+crates/kernel-query/src/execgraph.rs

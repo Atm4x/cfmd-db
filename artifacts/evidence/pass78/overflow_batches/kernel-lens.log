@@ -1,0 +1,10 @@
+   Compiling kernel-lens v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-lens)
+    Finished `release` profile [optimized] target(s) in 0.34s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_lens-4d3dbef60c35fb64)
+
+running 2 tests
+test tests::product_field_lens_preserves_complement_and_laws ... ok
+test tests::composed_lens_is_lawful ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

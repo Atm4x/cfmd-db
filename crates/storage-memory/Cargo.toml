@@ -1,0 +1,22 @@
+[package]
+name = "storage-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-types = { path = "../kernel-types" }
+kernel-model = { path = "../kernel-model" }
+kernel-revision = { path = "../kernel-revision" }
+kernel-transport = { path = "../kernel-transport" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-lifecycle = { path = "../kernel-lifecycle" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-validation = { path = "../kernel-validation" }
+
+[dev-dependencies]
+kernel-query = { path = "../kernel-query" }
+
+[lints]
+workspace = true

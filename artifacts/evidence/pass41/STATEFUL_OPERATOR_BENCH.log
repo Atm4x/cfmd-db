@@ -1,0 +1,88 @@
+PASS41 FINAL RELEASE MICROBENCHMARKS
+Sun Sep 20 02:53:15 UTC 2026
+=== maintained_group_bench x7 ===
+-- run 1 --
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=326
+baseline_median_ns=168
+ratio_milli=1940
+-- run 2 --
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=326
+baseline_median_ns=163
+ratio_milli=2000
+-- run 3 --
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=331
+baseline_median_ns=169
+ratio_milli=1958
+-- run 4 --
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=334
+baseline_median_ns=169
+ratio_milli=1976
+-- run 5 --
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=316
+baseline_median_ns=159
+ratio_milli=1987
+-- run 6 --
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=319
+baseline_median_ns=162
+ratio_milli=1969
+-- run 7 --
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=327
+baseline_median_ns=164
+ratio_milli=1993
+=== maintained_top_k_bench x7 ===
+-- run 1 --
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=749
+baseline_median_ns=112
+ratio_milli=6687
+full_replay_median_like_ns=320896
+maintained_vs_full_replay_milli=2
+-- run 2 --
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=761
+baseline_median_ns=113
+ratio_milli=6734
+full_replay_median_like_ns=312546
+maintained_vs_full_replay_milli=2
+-- run 3 --
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=779
+baseline_median_ns=116
+ratio_milli=6715
+full_replay_median_like_ns=340114
+maintained_vs_full_replay_milli=2
+-- run 4 --
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=769
+baseline_median_ns=115
+ratio_milli=6686
+full_replay_median_like_ns=336969
+maintained_vs_full_replay_milli=2
+-- run 5 --
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=733
+baseline_median_ns=116
+ratio_milli=6318
+full_replay_median_like_ns=324549
+maintained_vs_full_replay_milli=2
+-- run 6 --
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=721
+baseline_median_ns=109
+ratio_milli=6614
+full_replay_median_like_ns=309318
+maintained_vs_full_replay_milli=2
+-- run 7 --
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=764
+baseline_median_ns=105
+ratio_milli=7276
+full_replay_median_like_ns=320739
+maintained_vs_full_replay_milli=2

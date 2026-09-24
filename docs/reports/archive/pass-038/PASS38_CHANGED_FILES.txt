@@ -1,0 +1,15 @@
+ARCHITECTURE.md
+CFMD_IDEAL_DB_SPEC.md
+IMPLEMENTATION_REPORT.md
+IMPLEMENTATION_REPORT_pass38.md
+PASS38_REPORT.md
+PASS38_SOURCE_DIFF.txt
+crates/kernel-durability/src/lib.rs
+crates/kernel-durability/src/metadata.rs
+crates/kernel-durability/src/store.rs
+crates/kernel-plan/src/lib.rs
+crates/kernel-semantics/src/lib.rs
+evidence/pass38/FINAL_GATE.txt
+evidence/pass38/OVERFLOW_RELEASE_TEST.log
+evidence/pass38/RELEASE_TEST.log
+evidence/pass38/STATIC_AUTHORITY_AUDIT.md

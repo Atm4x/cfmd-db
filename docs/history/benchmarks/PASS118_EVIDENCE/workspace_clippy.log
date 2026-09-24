@@ -1,0 +1,4 @@
+    Checking kernel-durability v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-durability)
+    Checking kernel-plan v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-plan)
+    Checking kernel-integration v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-integration)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.44s

@@ -1,0 +1,5 @@
+Final gate policy notes
+
+- The first cold `cargo test --workspace --all-targets --release` attempts exceeded the external command window while compiling. They are not counted as PASS or FAIL. The warmed full workspace invocation completed successfully.
+- The first `RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release` attempt likewise exceeded the external command window during its separate compilation fingerprint. The warmed full workspace invocation completed successfully.
+- No production source changed after the 2026-09-21 12:55:45 UTC freeze. `PASS75_SOURCE_FREEZE.sha256` and `PASS75_SOURCE_POST_GATE.sha256` are byte-identical.

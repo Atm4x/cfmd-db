@@ -1,0 +1,11 @@
+Rust 1.98.1 (48a229cea 2026-09-01)
+cargo fmt --all -- --check: PASS
+cargo check --workspace --all-targets: PASS
+cargo test --workspace --all-targets: PASS
+cargo clippy --workspace --all-targets -- -D warnings: PASS
+cargo test --workspace --all-targets --release: PASS
+cargo build --workspace --release: PASS
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps: PASS
+RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release: PASS
+source freeze: 2026-09-20 15:58:25 +03:00
+freeze lifted: NO

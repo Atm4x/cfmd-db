@@ -1,0 +1,121 @@
+--- /mnt/data/cfmd_pass107_execgraph_v4_runtime/crates/kernel-query/src/lib.rs	2026-09-23 13:09:05.617609867 +0000
++++ /mnt/data/cfmd_pass108_execgraph_v4_flattening/crates/kernel-query/src/lib.rs	2026-09-23 13:25:42.538850466 +0000
+@@ -3407,19 +3407,49 @@
+ /// the leaf boundary: callers provide exact deltas for changed base relations and the
+ /// tree propagates exact operator deltas through its owned children without replaying
+ /// the model or re-evaluating nested expressions.
+-#[derive(Debug, Clone, PartialEq, Eq)]
++#[derive(Debug)]
+ pub struct MaterializedRelPlanState {
+     query: RelExpr,
+     semantic_context: kernel_schema::SemanticContext,
+     differential: Arc<RelDifferentialProgram>,
+     result_type: RelType,
+     node: Arc<MaintainedRelPlanNode>,
++    execgraph_scratch: UnifiedTransitionScratch<MaintainedDelta>,
+     transition_epoch: u64,
+     revision: Option<kernel_types::RevisionId>,
+ }
+ 
+ type MaintainedDelta = AdaptiveDelta<Row, 4>;
+ 
++impl Clone for MaterializedRelPlanState {
++    fn clone(&self) -> Self {
++        Self {
++            query: self.query.clone(),
++            semantic_context: self.semantic_context.clone(),
++            differential: Arc::clone(&self.differential),
++            result_type: self.result_type.clone(),
++            node: Arc::clone(&self.node),
++            execgraph_scratch: UnifiedTransitionScratch::default(),
++            transition_epoch: self.transition_epoch,
++            revision: self.revision,
++        }
++    }
++}
++
++impl PartialEq for MaterializedRelPlanState {
++    fn eq(&self, other: &Self) -> bool {
++        self.query == other.query
++            && self.semantic_context == other.semantic_context
++            && self.differential == other.differential
++            && self.result_type == other.result_type
++            && self.node == other.node
++            && self.transition_epoch == other.transition_epoch
++            && self.revision == other.revision
++    }
++}
++
++impl Eq for MaterializedRelPlanState {}
++
+ impl MaterializedRelPlanState {
+     pub fn build(
+         query: &RelExpr,
+@@ -3453,6 +3483,7 @@
+             differential,
+             result_type,
+             node: Arc::new(node),
++            execgraph_scratch: UnifiedTransitionScratch::default(),
+             transition_epoch: 0,
+             revision: None,
+         })
+@@ -4446,10 +4477,31 @@
+     }
+ 
+     fn plan_relation_deltas_execgraph(
++        &mut self,
++        validated_frames: &mut ValidatedLeafTransitionFrames,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<GraphPatchSet, RelQueryError> {
++        let mut scratch = std::mem::take(&mut self.execgraph_scratch);
++        let result = self.plan_relation_deltas_execgraph_with_scratch(
++            validated_frames,
++            context,
++            registry,
++            &mut scratch,
++        );
++        if result.is_err() {
++            scratch.reset();
++        }
++        self.execgraph_scratch = scratch;
++        result
++    }
++
++    fn plan_relation_deltas_execgraph_with_scratch(
+         &self,
+         validated_frames: &mut ValidatedLeafTransitionFrames,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
++        scratch: &mut UnifiedTransitionScratch<MaintainedDelta>,
+     ) -> Result<GraphPatchSet, RelQueryError> {
+         let graph = self.differential.physical_program().execution_graph();
+         let program = graph.transition_program();
+@@ -4462,8 +4514,8 @@
+         let mut patches = (0..graph.node_count())
+             .map(|_| None)
+             .collect::<Vec<Option<GraphNodePatch>>>();
+-        let mut scratch = UnifiedTransitionScratch::<MaintainedDelta>::default();
+         scratch.ensure_nodes(graph.node_count());
++        scratch.reset();
+         let mut root_effect = MaintainedDelta::default();
+         let mut next_edge_ordinal = 0_u32;
+ 
+@@ -4492,7 +4544,7 @@
+             if node_id == program.root() {
+                 root_effect = effect;
+             } else if effect.support_len() != 0
+-                && let Err(error) = program.deliver_output(node_id, effect, &mut scratch)
++                && let Err(error) = program.deliver_output(node_id, effect, scratch)
+             {
+                 scratch.reset();
+                 return Err(error);
+@@ -4524,7 +4576,7 @@
+             if node_id == program.root() {
+                 root_effect = planned.effect;
+             } else if planned.effect.support_len() != 0
+-                && let Err(error) = program.deliver_output(node_id, planned.effect, &mut scratch)
++                && let Err(error) = program.deliver_output(node_id, planned.effect, scratch)
+             {
+                 scratch.reset();
+                 return Err(error);

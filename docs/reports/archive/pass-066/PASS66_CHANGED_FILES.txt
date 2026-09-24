@@ -1,0 +1,16 @@
+Production source changed from Pass65:
+crates/kernel-model/src/lib.rs
+crates/kernel-plan/src/lib.rs
+crates/kernel-transport/src/lib.rs
+crates/storage-memory/src/lib.rs
+
+Pass66 checkpoint/documentation additions or updates:
+PASS66_REPORT.md
+IMPLEMENTATION_REPORT_pass66.md
+CFMD_IDEAL_DB_SPEC.md
+ARCHITECTURE.md
+IMPLEMENTATION_REPORT.md
+evidence/pass66/*
+PASS66_CHANGED_FILES.txt
+PASS66_SOURCE_DIFF.txt
+MANIFEST.sha256

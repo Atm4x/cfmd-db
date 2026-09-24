@@ -1,0 +1,73 @@
+   Compiling kernel-identity v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-identity)
+   Compiling kernel-change v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-change)
+    Finished `release` profile [optimized] target(s) in 0.69s
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_aggregate-a18de5b7b07318e8)
+
+running 8 tests
+test tests::exact_count_is_mergeable_and_checks_result_range ... ok
+test tests::catastrophic_cancellation_is_exact_and_order_independent ... ok
+test tests::exact_count_promotes_losslessly_when_small_representation_overflows ... ok
+test tests::exact_count_decrement_is_checked_and_demotes_after_big_boundary ... ok
+test tests::exact_f64_sum_removal_is_an_exact_inverse ... ok
+test tests::non_finite_inputs_are_explicitly_rejected ... ok
+test tests::merge_is_reproducible_across_partitions ... ok
+test tests::subnormal_values_sum_exactly ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_change-381d22cca4f5e62e)
+
+running 3 tests
+test tests::sequence_splice_has_exact_checked_semantics ... ok
+test tests::invalid_splice_is_not_silently_clamped ... ok
+test tests::set_change_round_trips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_fixpoint-4c5795bd67325b2f)
+
+running 5 tests
+test tests::checker_rejects_closed_but_nonleast_superset_without_witness ... ok
+test tests::checker_rejects_nonclosed_candidate ... ok
+test tests::generic_solver_boundary_exposes_only_checked_certificate_after_verification ... ok
+test tests::solver_emits_checkable_least_fixpoint_certificate ... ok
+test tests::adjacency_lowering_preserves_relation_scan_certificate_exactly ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_identity-806ad34189ee0e11)
+
+running 5 tests
+test tests::bijective_transports_form_a_groupoid_under_composition ... ok
+test tests::merge_is_not_identity_transport ... ok
+test tests::dense_entity_ids_round_trip_external_identity_without_reusing_semantics ... ok
+test tests::dense_entity_set_is_a_compact_exact_local_id_extent ... ok
+test tests::split_is_not_identity_transport ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_lens-affeeead7ac5fd53)
+
+running 2 tests
+test tests::composed_lens_is_lawful ... ok
+test tests::product_field_lens_preserves_complement_and_laws ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_lifecycle-58dcdc9d3c89ba1f)
+
+running 11 tests
+test tests::benchmark_dense_local_id_lifecycle_against_entity_tree_walk ... ignored, diagnostic release benchmark
+test tests::benchmark_maintained_dense_lifecycle_local_cut_against_full_tree_recompute ... ignored, diagnostic release benchmark
+test tests::contradictory_fact_edits_are_typed_conflicts ... ok
+test tests::dense_local_id_projection_matches_reference_reachability_including_dead_cycle ... ok
+test tests::maintained_dense_lifecycle_matches_exact_lfp_through_cycle_death_and_resurrection ... ok
+test tests::merge_composes_intents_before_gc ... ok
+test tests::non_conflicting_intent_merge_is_commutative ... ok
+test tests::normalization_is_idempotent ... ok
+test tests::dense_local_id_projection_matches_reference_on_all_three_node_graphs ... ok
+test tests::exhaustive_small_graphs_normalize_idempotently ... ok
+test tests::maintained_dense_lifecycle_matches_reference_for_all_single_fact_toggles_on_three_nodes ... ok
+
+test result: ok. 9 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

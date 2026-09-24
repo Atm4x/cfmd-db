@@ -1,0 +1,8 @@
+$ cargo run --release -p kernel-query --example semantic_index_join_bench
+   Compiling kernel-query v0.1.0 (/mnt/data/cfmd_workspace_pass43/crates/kernel-query)
+    Finished `release` profile [optimized] target(s) in 0.61s
+     Running `target/release/examples/semantic_index_join_bench`
+workload=TextAsciiCaseInsensitive,left_rows=1,delta_rows=1,rounds=7
+rows=1000,indexed_median_ns=1256,legacy_scan_median_ns=437,scan_over_indexed_x1000=347
+rows=10000,indexed_median_ns=1236,legacy_scan_median_ns=4618,scan_over_indexed_x1000=3736
+rows=50000,indexed_median_ns=1326,legacy_scan_median_ns=24596,scan_over_indexed_x1000=18549

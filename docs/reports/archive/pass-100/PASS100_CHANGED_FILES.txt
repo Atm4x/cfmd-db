@@ -1,0 +1,13 @@
+Production source vs Pass99:
+crates/kernel-query/src/lib.rs
+
+Checkpoint/report files added or advanced:
+CFMD_IDEAL_DB_SPEC.md
+CFMD_IDEAL_DB_SPEC_PASS100.md
+IMPLEMENTATION_REPORT.md
+IMPLEMENTATION_REPORT_pass100.md
+PASS100_REPORT.md
+PASS100_HISTORICAL_LEDGER.md
+PASS100_CHANGED_FILES.txt
+PASS100_FREEZE.txt
+MANIFEST.sha256

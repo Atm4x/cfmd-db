@@ -1,0 +1,29 @@
+--- process 1 ---
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=739
+baseline_median_ns=160
+ratio_milli=4618
+--- process 2 ---
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=712
+baseline_median_ns=159
+ratio_milli=4477
+--- process 3 ---
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=685
+baseline_median_ns=153
+ratio_milli=4477
+--- process 4 ---
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=767
+baseline_median_ns=160
+ratio_milli=4793
+--- process 5 ---
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=702
+baseline_median_ns=154
+ratio_milli=4558
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=710
+baseline_median_ns=159
+ratio_milli=4465

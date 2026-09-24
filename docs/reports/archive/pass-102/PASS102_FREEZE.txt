@@ -1,0 +1,6 @@
+PASS102 source frozen before nominal 20-minute boundary.
+Baseline: cfmd_workspace_pass101_blocker_stage4_complete.zip
+Production source fingerprint: dffeef1669763a37c9f48f7a753acc25d048513ea2005aefd2b17be1e5e64964
+kernel-query source hash: 743e86dc8a96237d936e548944e2d57f511bb1ffc4808e6040f0ddce9a841e62
+V5 Stage 5 is complete: recursive maintained internal edges use AdaptiveDelta/DeltaView and RelationDelta materializes only at root/public compatibility boundaries.
+Stage 6 is not claimed in this checkpoint; historical #21/#22 remain open.

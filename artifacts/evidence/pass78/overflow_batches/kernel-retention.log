@@ -1,0 +1,11 @@
+   Compiling kernel-retention v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-retention)
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_retention-2b033122be1983a1)
+
+running 3 tests
+test tests::branch_condition_taints_result_through_pc_label ... ok
+test tests::explicit_dataflow_joins_retention_labels ... ok
+test tests::overflow_is_explicit_in_tracked_arithmetic ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

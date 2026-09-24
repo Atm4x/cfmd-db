@@ -1,0 +1,36 @@
+== maintained_group_bench post-unification 7 process runs ==
+-- run 1
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=365
+baseline_median_ns=155
+ratio_milli=2354
+-- run 2
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=365
+baseline_median_ns=152
+ratio_milli=2401
+-- run 3
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=379
+baseline_median_ns=162
+ratio_milli=2339
+-- run 4
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=381
+baseline_median_ns=161
+ratio_milli=2366
+-- run 5
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=361
+baseline_median_ns=150
+ratio_milli=2406
+-- run 6
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=370
+baseline_median_ns=156
+ratio_milli=2371
+-- run 7
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=365
+baseline_median_ns=159
+ratio_milli=2295

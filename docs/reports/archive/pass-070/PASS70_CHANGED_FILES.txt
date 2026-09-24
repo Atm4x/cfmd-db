@@ -1,0 +1,4 @@
+crates/kernel-plan/src/algebraic_native.rs
+crates/kernel-plan/src/lib.rs
+crates/kernel-semantic-index/src/lib.rs
+crates/kernel-semantics/src/lib.rs

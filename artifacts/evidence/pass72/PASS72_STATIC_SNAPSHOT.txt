@@ -1,0 +1,11 @@
+declared_tests=444
+kernel_plan_declared_tests=177
+workspace_debug_passed=436
+workspace_debug_failed=0
+workspace_debug_ignored=8
+crates=21
+rust_loc=62901
+external_cargo_sources=0
+unsafe_hits=0
+allow_attrs=19
+todo_fixme_unimplemented_hits=0

@@ -1,0 +1,29 @@
+Pass52 static audit
+Rust tests: 358
+kernel-plan tests: 130 (129 normal + 1 ignored diagnostic benchmark)
+crates: 21
+Rust LOC: 49389
+#[allow(...)] sites: 19 (pre-existing; Pass52 added none)
+unsafe tokens in crates/: 0
+external Cargo registry/git sources: 0
+TODO/FIXME/todo!/unimplemented! markers: 0
+
+Pass52 production symbols:
+661:    semantic_quotient_support_local_delta_updates: u64,
+3078:    pub const fn semantic_quotient_support_local_delta_updates(&self) -> u64 {
+3079:        self.semantic_quotient_support_local_delta_updates
+3254:                    .is_some_and(|state| state.try_apply_monotone_deletion(&leaf_updates, context));
+3256:                self.semantic_quotient_support_local_delta_updates = self
+3257:                    .semantic_quotient_support_local_delta_updates
+6899:    fn try_apply_monotone_deletion(
+6915:            let Some(remap) = deletion_ordinal_remap(current, next) else {
+6941:        propagate_quotient_support_deletions(
+6990:fn deletion_ordinal_remap(
+7051:fn propagate_quotient_support_deletions(
+15689:        propagate_quotient_support_deletions(&handles, &constraints, &mut masks, &[0]);
+16009:    fn gamma_quotient_support_uses_local_dq_for_arbitrary_deletions() {
+16012:        let local_before = store.semantic_quotient_support_local_delta_updates();
+16022:            store.semantic_quotient_support_local_delta_updates(),
+16053:            store.semantic_quotient_support_local_delta_updates(),
+16073:            store.semantic_quotient_support_local_delta_updates(),
+16097:            store.semantic_quotient_support_local_delta_updates(),

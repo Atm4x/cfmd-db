@@ -1,0 +1,8 @@
+rows=20000
+cfmd_ns_min=6701569
+cfmd_ns_median=7093476
+cfmd_ns_max=7426880
+baseline_ns_min=5556509
+baseline_ns_median=5937457
+baseline_ns_max=7114511
+cfmd_over_baseline_milli=1194

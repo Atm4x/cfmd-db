@@ -1,0 +1,7 @@
+PASS115 GATES
+fmt: PASS
+workspace check: PASS
+strict workspace Clippy -D warnings: PASS
+kernel-durability unit tests: 91 passed / 0 failed
+replication transport multiprocess integration: 2 passed / 0 failed
+full workspace: 738 declared / 730 passed / 0 failed / 8 ignored

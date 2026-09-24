@@ -1,0 +1,21 @@
+--- process 1 ---
+rows=20000
+ephemeral_ns_median=6188580
+persisted_ns_median=2990453
+baseline_prebuilt_ns_median=2750626
+persisted_over_baseline_milli=1087
+persisted_over_ephemeral_milli=483
+--- process 2 ---
+rows=20000
+ephemeral_ns_median=6280015
+persisted_ns_median=3107991
+baseline_prebuilt_ns_median=2798961
+persisted_over_baseline_milli=1110
+persisted_over_ephemeral_milli=494
+--- process 3 ---
+rows=20000
+ephemeral_ns_median=6042733
+persisted_ns_median=3006674
+baseline_prebuilt_ns_median=2735171
+persisted_over_baseline_milli=1099
+persisted_over_ephemeral_milli=497

@@ -1,0 +1,6 @@
+formal/lean/CFMD/Publication.lean
+formal/lean/README.md
+formal/lean/check.sh
+formal/lean/check_all.sh
+formal/lean/check_refinement.py
+formal/lean/lean-version.txt

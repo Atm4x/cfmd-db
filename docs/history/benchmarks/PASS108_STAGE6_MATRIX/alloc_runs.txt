@@ -1,0 +1,10 @@
+RUN 1
+stage6_alloc samples=400 median_alloc_calls=139 p90_alloc_calls=139 max_alloc_calls=144
+RUN 2
+stage6_alloc samples=400 median_alloc_calls=139 p90_alloc_calls=139 max_alloc_calls=144
+RUN 3
+stage6_alloc samples=400 median_alloc_calls=139 p90_alloc_calls=139 max_alloc_calls=144
+RUN 4
+stage6_alloc samples=400 median_alloc_calls=139 p90_alloc_calls=139 max_alloc_calls=144
+RUN 5
+stage6_alloc samples=400 median_alloc_calls=139 p90_alloc_calls=139 max_alloc_calls=144

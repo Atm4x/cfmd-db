@@ -1,0 +1,30 @@
+CFMD Pass33 static audit
+
+Rust toolchain: rustc/cargo 1.98.1 local offline toolchain.
+Production source changed after final successful gate: NO.
+
+Declared tests: 263
+kernel-plan tests: 67
+kernel-query tests: 65
+kernel-durability tests: 13
+workspace crates: 20
+Rust LOC under crates/: 32273
+external Cargo sources: 0
+unsafe occurrences under crates/: 0
+
+Hostile fixes:
+- exact ordered physical row/handle bootstrap binding
+- maintained Scan logical order independent of dense swap_remove
+- resolved removal handle->exact-row validation
+- actual physical removed row representative propagated
+- uncertain durable COMMIT => RuntimeRecoveryRequired fail-stop
+
+Final gates:
+- cargo fmt --all -- --check: PASS
+- cargo check --workspace --all-targets: PASS
+- cargo test --workspace --all-targets: PASS
+- cargo clippy --workspace --all-targets -- -D warnings: PASS
+- cargo test --workspace --all-targets --release: PASS
+- cargo build --workspace --release: PASS
+- RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps: PASS
+- RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release: PASS

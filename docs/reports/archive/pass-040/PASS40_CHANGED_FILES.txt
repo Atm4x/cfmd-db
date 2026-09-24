@@ -1,0 +1,6 @@
+Production/source files changed from Pass39:
+Cargo.lock
+crates/kernel-plan/Cargo.toml
+crates/kernel-plan/src/lib.rs
+crates/kernel-query/src/lib.rs
+crates/kernel-semantic-index/src/lib.rs

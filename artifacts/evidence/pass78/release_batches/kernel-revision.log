@@ -1,0 +1,14 @@
+   Compiling kernel-revision v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-revision)
+    Finished `release` profile [optimized] target(s) in 1.77s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_revision-bc239be2a8fccbfc)
+
+running 6 tests
+test tests::certified_relation_update_revalidates_the_pinned_semantic_registry ... ok
+test tests::certified_relation_update_matches_full_normalization_for_dangling_live_ref_rows ... ok
+test tests::construction_always_runs_registry_and_typed_validation ... ok
+test tests::relation_update_reuses_revision_local_derivatives_and_rejects_static_changes ... ok
+test tests::revision_owns_one_shared_dense_identity_projection_for_physical_derivatives ... ok
+test tests::revision_pins_full_context_not_only_numeric_ids ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

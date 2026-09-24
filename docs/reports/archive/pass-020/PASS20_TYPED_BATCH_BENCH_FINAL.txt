@@ -1,0 +1,30 @@
+=== process 1 ===
+rows=100000
+matches=1562
+typed_batch_chain_hits=1
+typed_values_read=107812
+typed_batch_ns_median=206280
+row_materialized_ns_median=1926122
+handwritten_ns_median=129834
+typed_over_row_milli=107
+typed_over_handwritten_milli=1588
+=== process 2 ===
+rows=100000
+matches=1562
+typed_batch_chain_hits=1
+typed_values_read=107812
+typed_batch_ns_median=193332
+row_materialized_ns_median=2218864
+handwritten_ns_median=187399
+typed_over_row_milli=87
+typed_over_handwritten_milli=1031
+=== process 3 ===
+rows=100000
+matches=1562
+typed_batch_chain_hits=1
+typed_values_read=107812
+typed_batch_ns_median=161604
+row_materialized_ns_median=1935236
+handwritten_ns_median=127518
+typed_over_row_milli=83
+typed_over_handwritten_milli=1267

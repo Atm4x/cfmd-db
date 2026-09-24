@@ -1,0 +1,2 @@
+a1492241e54c943e33161a93ff021f273ea8af8bd98addcbcef8c95deba44ae7  crates/kernel-query/src/lib.rs
+c0acc60172c906ce463a1ddb9d1b10684bd11409323ee3a07c9f20c46f14438d  crates/kernel-query/src/execgraph.rs

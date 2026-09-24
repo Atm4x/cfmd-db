@@ -1,0 +1,6 @@
+=== 06_build_release ===
+   Compiling kernel-lens v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-lens)
+   Compiling kernel-fixpoint v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-fixpoint)
+   Compiling kernel-integration v0.1.0 (/mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-integration)
+    Finished `release` profile [optimized] target(s) in 0.41s
+PASS

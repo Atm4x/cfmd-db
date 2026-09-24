@@ -1,0 +1,16 @@
+./INTEGRATION_GUIDE_PASS72.md: OK
+./README.md: OK
+./RND_PROGRAM9_CLOSEOUT_REPORT_PASS72.md: OK
+./changed_files/crates/kernel-durability/src/lib.rs: OK
+./changed_files/crates/kernel-durability/src/metadata.rs: OK
+./changed_files/crates/kernel-plan/src/lib.rs: OK
+./evidence/pass72_patch_dryrun.log: OK
+./evidence/program9_codec_hostiles.log: OK
+./evidence/program9_recovery_hostiles.log: OK
+./evidence/release_build.log: OK
+./evidence/rustdoc.log: OK
+./evidence/workspace_clippy.log: OK
+./evidence/workspace_debug_tests.log: OK
+./evidence/workspace_release_overflow_tests.log: OK
+./evidence/workspace_release_tests.log: OK
+./patches/program9_pass72.patch: OK

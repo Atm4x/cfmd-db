@@ -1,0 +1,80 @@
+
+=== static audit ===
+canonical key APIs:
+119:pub enum CanonicalEqKey {
+158:    pub fn canonical_key(&self, value: &Value) -> Result<CanonicalEqKey, SemanticError> {
+160:            (EquivalenceModule::UnitExact, Value::Unit) => CanonicalEqKey::Unit,
+161:            (EquivalenceModule::BoolExact, Value::Bool(value)) => CanonicalEqKey::Bool(*value),
+162:            (EquivalenceModule::I64Exact, Value::I64(value)) => CanonicalEqKey::I64(*value),
+164:                CanonicalEqKey::F64Bits(*value)
+167:                CanonicalEqKey::TextExact(value.clone())
+170:                CanonicalEqKey::TextAsciiCaseInsensitive(value.to_ascii_lowercase())
+178:            ) if actual == &entity_type => CanonicalEqKey::LiveEntityId {
+188:            ) if actual == &entity_type => CanonicalEqKey::HistoricalEntityId {
+324:pub enum CanonicalOrderKey {
+354:    pub fn canonical_key(&self, value: &Value) -> Result<CanonicalOrderKey, SemanticError> {
+356:            (OrderingModule::I64Ascending, Value::I64(value)) => CanonicalOrderKey::I64(*value),
+360:                CanonicalOrderKey::F64Total(sortable)
+363:                CanonicalOrderKey::TextBinary(value.clone())
+366:                CanonicalOrderKey::TextAsciiCaseInsensitive(value.to_ascii_lowercase())
+369:                CanonicalOrderKey::TextAsciiCaseInsensitiveThenBinary(
+1007:    pub fn resolve_primitive_equivalence(
+1033:    pub fn resolve_primitive_ordering(
+1939:            .resolve_primitive_equivalence(&context, eq)
+2914:                .resolve_primitive_equivalence(&context, semantic)
+2942:                .resolve_primitive_equivalence(&context, semantic)
+2996:                .resolve_primitive_ordering(&context, ordering)
+3050:            .resolve_primitive_ordering(&context, ordering)
+
+semantic index crate:
+6:pub const KEY_ENCODING_REVISION: u64 = 1;
+15:pub struct SemanticIndexBinding {
+21:impl SemanticIndexBinding {
+29:            key_encoding_revision: KEY_ENCODING_REVISION,
+55:            || self.key_encoding_revision != KEY_ENCODING_REVISION
+67:pub struct SemanticBucketIndex<K, I> {
+68:    binding: SemanticIndexBinding,
+73:impl<K, I> SemanticBucketIndex<K, I>
+79:    pub fn new(binding: SemanticIndexBinding) -> Self {
+88:    pub const fn binding(&self) -> &SemanticIndexBinding {
+169:            SemanticBucketIndex::new(SemanticIndexBinding::new(&context, vec![dependency]));
+183:        let mut index = SemanticBucketIndex::new(SemanticIndexBinding::new(&context, Vec::new()));
+197:        let binding = SemanticIndexBinding::new(&context, vec![dependency]);
+
+join/group/topk production paths:
+748:struct SemanticIndexedJoinStorage {
+760:    SemanticIndexed(Box<SemanticIndexedJoinStorage>),
+761:    GenericScan {
+1035:            MaintainedJoinStorage::SemanticIndexed(Box::new(SemanticIndexedJoinStorage {
+1041:            MaintainedJoinStorage::GenericScan {
+1079:            MaintainedJoinStorage::SemanticIndexed(storage) => {
+1101:            MaintainedJoinStorage::GenericScan { left, right } => join_relation_values(
+1171:            MaintainedJoinStorage::SemanticIndexed(storage) => Self::apply_semantic_indexed_deltas(
+1188:            MaintainedJoinStorage::GenericScan { left, right } => Self::apply_generic_deltas(
+2951:    semantic_lookup: Option<BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, usize>>,
+3028:        let semantic_lookup = group_encoders.as_ref().map(|_| BTreeMap::new());
+3052:            semantic_lookup,
+3366:        if let Some(lookup) = &self.semantic_lookup {
+3472:        } else if self.semantic_lookup.is_some() {
+3476:            if let Some(lookup) = &mut self.semantic_lookup {
+3490:        } else if self.semantic_lookup.is_some() {
+3494:            if let Some(lookup) = &mut self.semantic_lookup {
+3505:            } else if self.semantic_lookup.is_some() {
+3509:                if let Some(lookup) = &mut self.semantic_lookup {
+3720:    SemanticOrdered {
+3979:            MaintainedTopKStorage::SemanticOrdered {
+4007:            MaintainedTopKStorage::SemanticOrdered { rows, .. } => rows.index.len(),
+4050:            MaintainedTopKStorage::SemanticOrdered { encoder, rows } => {
+4157:            MaintainedTopKStorage::SemanticOrdered { rows, .. } => {
+7109:        assert!(state.semantic_lookup.is_some());
+9154:            MaintainedTopKStorage::SemanticOrdered { .. }
+9356:            MaintainedJoinStorage::SemanticIndexed(_)
+10022:        assert!(state.semantic_lookup.is_some());
+10120:            MaintainedTopKStorage::SemanticOrdered { .. }
+10248:            MaintainedJoinStorage::GenericScan { .. }
+
+side-effectful debug_assert audit:
+crates/kernel-query/src/lib.rs:938:            debug_assert!(removed_key.is_some());
+crates/kernel-query/src/lib.rs:939:            debug_assert!(removed_row.is_some());
+crates/kernel-query/src/lib.rs:3860:            debug_assert!(removed_key.is_some());
+crates/kernel-query/src/lib.rs:3861:            debug_assert!(removed_row.is_some());

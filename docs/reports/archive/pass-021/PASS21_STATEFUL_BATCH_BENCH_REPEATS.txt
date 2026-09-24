@@ -1,0 +1,30 @@
+--- process 1 ---
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1
+group_typed_ns=6265385
+group_baseline_ns=4625503
+group_typed_over_baseline=1.355
+top_typed_ns=310680
+top_baseline_ns=646731
+top_typed_over_baseline=0.480
+--- process 2 ---
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1
+group_typed_ns=3665074
+group_baseline_ns=3894225
+group_typed_over_baseline=0.941
+top_typed_ns=521687
+top_baseline_ns=688007
+top_typed_over_baseline=0.758
+--- process 3 ---
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1
+group_typed_ns=3408225
+group_baseline_ns=3333730
+group_typed_over_baseline=1.022
+top_typed_ns=329983
+top_baseline_ns=656097
+top_typed_over_baseline=0.503

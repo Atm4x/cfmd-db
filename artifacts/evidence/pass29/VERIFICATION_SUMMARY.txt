@@ -1,0 +1,7 @@
+All eight Pass29 verification gates exited 0.
+kernel-plan lib tests: 55
+workspace declared #[test]: 237
+Rust LOC: 29302
+workspace crates: 19
+unsafe blocks: 0
+Cargo.lock external source entries: 0

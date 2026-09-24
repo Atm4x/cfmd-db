@@ -1,0 +1,13 @@
+[package]
+name = "kernel-fixpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-grounded-closure = { path = "../kernel-grounded-closure" }
+kernel-types = { path = "../kernel-types" }
+kernel-proof = { path = "../kernel-proof" }
+
+[lints]
+workspace = true

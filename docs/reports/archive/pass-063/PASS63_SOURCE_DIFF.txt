@@ -1,0 +1,1239 @@
+--- /mnt/data/pass63_baseline/cfmd_workspace_pass62/crates/kernel-identity/src/lib.rs	2026-09-20 19:34:50.000000000 +0000
++++ /mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-identity/src/lib.rs	2026-09-20 21:47:22.765510012 +0000
+@@ -124,6 +124,23 @@
+         self.external_by_local.is_empty()
+     }
+ 
++    /// Deterministic retained-size estimate for physical budgeting.
++    /// `BTree` allocator/node overhead is intentionally not part of this value.
++    #[must_use]
++    pub fn estimated_retained_bytes(&self) -> usize {
++        std::mem::size_of::<Self>()
++            .saturating_add(
++                self.external_by_local
++                    .capacity()
++                    .saturating_mul(std::mem::size_of::<EntityId>()),
++            )
++            .saturating_add(
++                self.local_by_external
++                    .len()
++                    .saturating_mul(std::mem::size_of::<(EntityId, LocalEntityId)>()),
++            )
++    }
++
+     #[must_use]
+     pub fn local(&self, external: EntityId) -> Option<LocalEntityId> {
+         self.local_by_external.get(&external).copied()
+--- /mnt/data/pass63_baseline/cfmd_workspace_pass62/crates/kernel-plan/src/algebraic_native.rs	2026-09-20 21:17:06.000000000 +0000
++++ /mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-plan/src/algebraic_native.rs	2026-09-20 21:45:25.112199238 +0000
+@@ -114,6 +114,80 @@
+         self.len() == 0
+     }
+ 
++    pub(crate) fn estimated_heap_bytes(&self) -> usize {
++        match &self.storage {
++            AlgebraicStorage::Empty => 0,
++            AlgebraicStorage::Scalar(column) => column.estimated_heap_bytes(),
++            AlgebraicStorage::Product { fields, .. } => {
++                fields.iter().fold(0, |bytes, (_, child)| {
++                    bytes
++                        .saturating_add(std::mem::size_of::<(SemanticId, AlgebraicNativeColumn)>())
++                        .saturating_add(child.estimated_heap_bytes())
++                })
++            }
++            AlgebraicStorage::Sum {
++                tags,
++                payload_index,
++                variants,
++            } => {
++                let mut bytes = tags
++                    .capacity()
++                    .saturating_mul(std::mem::size_of::<SemanticId>())
++                    .saturating_add(
++                        payload_index
++                            .capacity()
++                            .saturating_mul(std::mem::size_of::<u32>()),
++                    );
++                for child in variants.values() {
++                    bytes = bytes
++                        .saturating_add(std::mem::size_of::<(SemanticId, AlgebraicNativeColumn)>())
++                        .saturating_add(child.estimated_heap_bytes());
++                }
++                bytes
++            }
++            AlgebraicStorage::Option {
++                payload_index,
++                payload,
++            } => payload_index
++                .capacity()
++                .saturating_mul(std::mem::size_of::<Option<u32>>())
++                .saturating_add(std::mem::size_of::<AlgebraicNativeColumn>())
++                .saturating_add(payload.estimated_heap_bytes()),
++            AlgebraicStorage::Seq { offsets, payload }
++            | AlgebraicStorage::Set {
++                offsets, payload, ..
++            } => offsets
++                .capacity()
++                .saturating_mul(std::mem::size_of::<u32>())
++                .saturating_add(std::mem::size_of::<AlgebraicNativeColumn>())
++                .saturating_add(payload.estimated_heap_bytes()),
++            AlgebraicStorage::Bag {
++                offsets,
++                payload,
++                counts,
++                ..
++            } => offsets
++                .capacity()
++                .saturating_mul(std::mem::size_of::<u32>())
++                .saturating_add(counts.capacity().saturating_mul(std::mem::size_of::<u64>()))
++                .saturating_add(std::mem::size_of::<AlgebraicNativeColumn>())
++                .saturating_add(payload.estimated_heap_bytes()),
++            AlgebraicStorage::Map {
++                offsets,
++                keys,
++                values,
++                ..
++            } => offsets
++                .capacity()
++                .saturating_mul(std::mem::size_of::<u32>())
++                .saturating_add(2 * std::mem::size_of::<AlgebraicNativeColumn>())
++                .saturating_add(keys.estimated_heap_bytes())
++                .saturating_add(values.estimated_heap_bytes()),
++            AlgebraicStorage::Recursive(child) => std::mem::size_of::<AlgebraicNativeColumn>()
++                .saturating_add(child.estimated_heap_bytes()),
++        }
++    }
++
+     pub fn value_at(&self, index: usize) -> Result<Value, PhysicalExecutionError> {
+         match &self.storage {
+             AlgebraicStorage::Empty => Err(PhysicalExecutionError::ColumnShapeMismatch),
+--- /mnt/data/pass63_baseline/cfmd_workspace_pass62/crates/kernel-plan/src/lib.rs	2026-09-20 21:10:50.000000000 +0000
++++ /mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-plan/src/lib.rs	2026-09-20 21:51:07.022637954 +0000
+@@ -25,6 +25,10 @@
+ 
+ static NEXT_RUNTIME_ROOT_ID: AtomicU64 = AtomicU64::new(1);
+ 
++fn saturating_usize_sum(values: impl Iterator<Item = usize>) -> usize {
++    values.fold(0_usize, usize::saturating_add)
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct RuntimeRootVersion(u64);
+ 
+@@ -182,6 +186,29 @@
+         }
+     }
+ 
++    fn estimated_heap_bytes(&self) -> usize {
++        match self {
++            Self::Unit(_) => 0,
++            Self::Bool(values) => values.capacity().div_ceil(8),
++            Self::I64(values) => values.capacity().saturating_mul(std::mem::size_of::<i64>()),
++            Self::F64Bits(values) => values.capacity().saturating_mul(std::mem::size_of::<u64>()),
++            Self::Text(values) => values
++                .capacity()
++                .saturating_mul(std::mem::size_of::<String>())
++                .saturating_add(saturating_usize_sum(values.iter().map(String::capacity))),
++            Self::Algebraic(column) => {
++                std::mem::size_of::<algebraic_native::AlgebraicNativeColumn>()
++                    .saturating_add(column.estimated_heap_bytes())
++            }
++            Self::LiveEntityIds { values, .. } | Self::HistoricalEntityIds { values, .. } => values
++                .capacity()
++                .saturating_mul(std::mem::size_of::<kernel_types::EntityId>()),
++            Self::DenseLiveEntityIds { values, .. } => values
++                .capacity()
++                .saturating_mul(std::mem::size_of::<LocalEntityId>()),
++        }
++    }
++
+     fn value_at(&self, index: usize) -> Value {
+         match self {
+             Self::Unit(_) => Value::Unit,
+@@ -596,6 +623,82 @@
+     }
+ }
+ 
++fn value_heap_bytes(value: &Value) -> usize {
++    match value {
++        Value::Unit
++        | Value::Bool(_)
++        | Value::I64(_)
++        | Value::F64Bits(_)
++        | Value::LiveEntityRef { .. }
++        | Value::HistoricalEntityId { .. } => 0,
++        Value::Text(value) => value.capacity(),
++        Value::Product(values) => values.values().fold(0, |bytes, value| {
++            bytes
++                .saturating_add(std::mem::size_of::<(SemanticId, Value)>())
++                .saturating_add(value_heap_bytes(value))
++        }),
++        Value::Option(value) => value.as_deref().map_or(0, |value| {
++            std::mem::size_of::<Value>().saturating_add(value_heap_bytes(value))
++        }),
++        Value::Variant { value, .. } => {
++            std::mem::size_of::<Value>().saturating_add(value_heap_bytes(value))
++        }
++        Value::Seq(values)
++        | Value::Set {
++            elements: values, ..
++        } => values
++            .capacity()
++            .saturating_mul(std::mem::size_of::<Value>())
++            .saturating_add(saturating_usize_sum(values.iter().map(value_heap_bytes))),
++        Value::Bag { entries, .. } => entries
++            .capacity()
++            .saturating_mul(std::mem::size_of::<(Value, u64)>())
++            .saturating_add(saturating_usize_sum(
++                entries.iter().map(|(value, _)| value_heap_bytes(value)),
++            )),
++        Value::Map { entries, .. } => entries
++            .capacity()
++            .saturating_mul(std::mem::size_of::<(Value, Value)>())
++            .saturating_add(saturating_usize_sum(entries.iter().map(|(key, value)| {
++                value_heap_bytes(key).saturating_add(value_heap_bytes(value))
++            }))),
++    }
++}
++
++fn native_relation_estimated_heap_bytes(relation: &NativeRelation) -> usize {
++    match relation {
++        NativeRelation::RowStore(rows) => rows
++            .capacity()
++            .saturating_mul(std::mem::size_of::<kernel_query::Row>())
++            .saturating_add(saturating_usize_sum(rows.iter().map(|row| {
++                row.capacity()
++                    .saturating_mul(std::mem::size_of::<Value>())
++                    .saturating_add(saturating_usize_sum(row.iter().map(value_heap_bytes)))
++            }))),
++        NativeRelation::Columnar { columns, .. } => columns
++            .capacity()
++            .saturating_mul(std::mem::size_of::<Vec<Value>>())
++            .saturating_add(saturating_usize_sum(columns.iter().map(|column| {
++                column
++                    .capacity()
++                    .saturating_mul(std::mem::size_of::<Value>())
++                    .saturating_add(saturating_usize_sum(column.iter().map(value_heap_bytes)))
++            }))),
++        NativeRelation::I64Columnar { columns, .. } => columns
++            .capacity()
++            .saturating_mul(std::mem::size_of::<Vec<i64>>())
++            .saturating_add(saturating_usize_sum(columns.iter().map(|column| {
++                column.capacity().saturating_mul(std::mem::size_of::<i64>())
++            }))),
++        NativeRelation::TypedColumnar { columns, .. } => columns
++            .capacity()
++            .saturating_mul(std::mem::size_of::<NativeColumn>())
++            .saturating_add(saturating_usize_sum(
++                columns.iter().map(NativeColumn::estimated_heap_bytes),
++            )),
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct PhysicalRowSlot {
+     generation: u64,
+@@ -615,6 +718,29 @@
+     scan_order_is_physical: bool,
+ }
+ 
++fn installed_relation_estimated_retained_bytes(relation: &InstalledRelation) -> usize {
++    std::mem::size_of::<InstalledRelation>()
++        .saturating_add(native_relation_estimated_heap_bytes(&relation.data))
++        .saturating_add(
++            relation
++                .row_ids
++                .capacity()
++                .saturating_mul(std::mem::size_of::<PhysicalRowId>()),
++        )
++        .saturating_add(
++            relation
++                .slots
++                .capacity()
++                .saturating_mul(std::mem::size_of::<PhysicalRowSlot>()),
++        )
++        .saturating_add(
++            relation
++                .free_slots
++                .capacity()
++                .saturating_mul(std::mem::size_of::<usize>()),
++        )
++}
++
+ impl InstalledRelation {
+     fn new(data: NativeRelation) -> Self {
+         let row_count = native_row_count(&data);
+@@ -811,6 +937,38 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++enum ManagedPhysicalArtifact {
++    I64Index(I64IndexBinding),
++    SemanticIndex(SemanticIndexBinding),
++    SemanticQuotientFactor(SemanticIndexBinding),
++    SemanticQuotientSupport(SemanticQuotientSupportBinding),
++    SemanticStatistics(SemanticIndexBinding),
++}
++
++impl ManagedPhysicalArtifact {
++    fn touches_relation_layout(&self, relation: SemanticId, layout: LayoutBinding) -> bool {
++        match self {
++            Self::I64Index(binding) => {
++                binding.relation == relation && binding.layout.id == layout.id
++            }
++            Self::SemanticIndex(binding)
++            | Self::SemanticQuotientFactor(binding)
++            | Self::SemanticStatistics(binding) => {
++                binding.relation == relation && binding.layout.id == layout.id
++            }
++            Self::SemanticQuotientSupport(binding) => {
++                binding
++                    .leaves
++                    .iter()
++                    .any(|(candidate_relation, candidate_layout, _)| {
++                        *candidate_relation == relation && candidate_layout.id == layout.id
++                    })
++            }
++        }
++    }
++}
++
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+ pub struct PhysicalStore {
+     relations: BTreeMap<(SemanticId, LayoutId), Arc<InstalledRelation>>,
+@@ -821,7 +979,7 @@
+     semantic_quotient_supports:
+         BTreeMap<SemanticQuotientSupportBinding, Arc<MaterializedSemanticQuotientSupportState>>,
+     semantic_statistics: BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticStatisticsState>>,
+-    advisor_managed_semantic_indexes: BTreeSet<SemanticIndexBinding>,
++    advisor_managed_artifacts: BTreeSet<ManagedPhysicalArtifact>,
+     semantic_quotient_support_local_delta_updates: u64,
+     transition_epoch: u64,
+     revision: Option<RevisionId>,
+@@ -2958,8 +3116,8 @@
+             .retain(|_, state| !state.supports_relation(relation, binding));
+         self.semantic_statistics
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+-        self.advisor_managed_semantic_indexes
+-            .retain(|index| index.relation != relation || index.layout.id != binding.id);
++        self.advisor_managed_artifacts
++            .retain(|artifact| !artifact.touches_relation_layout(relation, binding));
+         self.transition_epoch = next_epoch;
+         self.state_identity = Arc::new(());
+         Ok(())
+@@ -3026,6 +3184,87 @@
+         Ok(Some(state.snapshot()))
+     }
+ 
++    #[must_use]
++    pub fn artifact_memory_report(&self) -> PhysicalArtifactMemoryReport {
++        let mut report = PhysicalArtifactMemoryReport::default();
++        let mut add = |family: PhysicalArtifactFamily, bytes: usize, advisor_managed: bool| {
++            let entry = report.families.entry(family).or_default();
++            entry.artifacts = entry.artifacts.saturating_add(1);
++            entry.advisor_managed_artifacts = entry
++                .advisor_managed_artifacts
++                .saturating_add(usize::from(advisor_managed));
++            entry.estimated_retained_bytes = entry.estimated_retained_bytes.saturating_add(bytes);
++            report.total_estimated_retained_bytes =
++                report.total_estimated_retained_bytes.saturating_add(bytes);
++        };
++        let mut dense_identity_maps = BTreeSet::new();
++        for state in self.relations.values() {
++            add(
++                PhysicalArtifactFamily::RelationLayout,
++                installed_relation_estimated_retained_bytes(state),
++                false,
++            );
++            if let NativeRelation::TypedColumnar { columns, .. } = &state.data {
++                for column in columns {
++                    if let NativeColumn::DenseLiveEntityIds { ids, .. } = column {
++                        let identity = Arc::as_ptr(ids) as usize;
++                        if dense_identity_maps.insert(identity) {
++                            add(
++                                PhysicalArtifactFamily::SharedDenseIdentityMap,
++                                ids.estimated_retained_bytes(),
++                                false,
++                            );
++                        }
++                    }
++                }
++            }
++        }
++        for (binding, state) in &self.i64_indexes {
++            add(
++                PhysicalArtifactFamily::I64Index,
++                i64_index_estimated_retained_bytes(state),
++                self.advisor_managed_artifacts
++                    .contains(&ManagedPhysicalArtifact::I64Index(*binding)),
++            );
++        }
++        for (binding, state) in &self.semantic_indexes {
++            add(
++                PhysicalArtifactFamily::SemanticIndex,
++                semantic_index_estimated_retained_bytes(state),
++                self.advisor_managed_artifacts
++                    .contains(&ManagedPhysicalArtifact::SemanticIndex(binding.clone())),
++            );
++        }
++        for (binding, state) in &self.semantic_quotient_factors {
++            add(
++                PhysicalArtifactFamily::SemanticQuotientFactor,
++                quotient_factor_estimated_retained_bytes(state),
++                self.advisor_managed_artifacts.contains(
++                    &ManagedPhysicalArtifact::SemanticQuotientFactor(binding.clone()),
++                ),
++            );
++        }
++        for (binding, state) in &self.semantic_quotient_supports {
++            add(
++                PhysicalArtifactFamily::SemanticQuotientSupport,
++                quotient_support_estimated_retained_bytes(state),
++                self.advisor_managed_artifacts.contains(
++                    &ManagedPhysicalArtifact::SemanticQuotientSupport(binding.clone()),
++                ),
++            );
++        }
++        for (binding, state) in &self.semantic_statistics {
++            add(
++                PhysicalArtifactFamily::SemanticStatistics,
++                semantic_statistics_estimated_retained_bytes(state),
++                self.advisor_managed_artifacts.contains(
++                    &ManagedPhysicalArtifact::SemanticStatistics(binding.clone()),
++                ),
++            );
++        }
++        report
++    }
++
+     pub fn install_semantic_index(
+         &mut self,
+         index: SemanticIndexBinding,
+@@ -3039,7 +3278,8 @@
+             .transition_epoch
+             .checked_add(1)
+             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
+-        self.advisor_managed_semantic_indexes.remove(&index);
++        self.advisor_managed_artifacts
++            .remove(&ManagedPhysicalArtifact::SemanticIndex(index.clone()));
+         self.semantic_indexes.insert(index, Arc::new(state));
+         self.transition_epoch = next_epoch;
+         self.state_identity = Arc::new(());
+@@ -3053,15 +3293,19 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<SemanticIndexAdvisorReport, PhysicalExecutionError> {
+-        let (selected, managed_key_cells, mut report) =
++        let (selected, managed_key_cells, managed_estimated_bytes, mut report) =
+             semantic_index_advisor_selection(self, workload, policy, context, registry)?;
+         let prepared_states =
+             self.prepare_advised_semantic_indexes(&selected, context, registry)?;
+         let evicted = self
+-            .advisor_managed_semantic_indexes
++            .advisor_managed_artifacts
+             .iter()
+-            .filter(|binding| !selected.contains(*binding))
+-            .cloned()
++            .filter_map(|artifact| match artifact {
++                ManagedPhysicalArtifact::SemanticIndex(binding) if !selected.contains(binding) => {
++                    Some(binding.clone())
++                }
++                _ => None,
++            })
+             .collect::<Vec<_>>();
+         let changed = !evicted.is_empty() || !prepared_states.is_empty();
+         let next_epoch = if changed {
+@@ -3076,15 +3320,16 @@
+ 
+         for binding in &evicted {
+             self.semantic_indexes.remove(binding);
+-            self.advisor_managed_semantic_indexes.remove(binding);
++            self.advisor_managed_artifacts
++                .remove(&ManagedPhysicalArtifact::SemanticIndex(binding.clone()));
+             report.evicted.push(binding.clone());
+         }
+         for (binding, state) in prepared_states {
+             let existed = self.semantic_indexes.contains_key(&binding);
+             self.semantic_indexes
+                 .insert(binding.clone(), Arc::new(state));
+-            self.advisor_managed_semantic_indexes
+-                .insert(binding.clone());
++            self.advisor_managed_artifacts
++                .insert(ManagedPhysicalArtifact::SemanticIndex(binding.clone()));
+             if existed {
+                 report.rebuilt.push(binding);
+             } else {
+@@ -3095,7 +3340,10 @@
+             if report.created.contains(&binding) || report.rebuilt.contains(&binding) {
+                 continue;
+             }
+-            if self.advisor_managed_semantic_indexes.contains(&binding) {
++            if self
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticIndex(binding.clone()))
++            {
+                 report.retained.push(binding);
+             } else {
+                 report.reused_existing.push(binding);
+@@ -3106,6 +3354,7 @@
+             self.state_identity = Arc::new(());
+         }
+         report.managed_key_cells = managed_key_cells;
++        report.managed_estimated_bytes = managed_estimated_bytes;
+         Ok(report)
+     }
+ 
+@@ -4476,12 +4725,19 @@
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct SemanticIndexAdvisorPolicy {
+     pub max_managed_key_cells: usize,
++    /// Budget for advisor-owned semantic indexes only.
++    pub max_managed_estimated_bytes: usize,
++    /// Global estimated retained-byte ceiling including fixed relation layouts
++    /// and physical families that this advisor is not allowed to evict.
++    pub max_total_estimated_bytes: usize,
+ }
+ 
+ impl Default for SemanticIndexAdvisorPolicy {
+     fn default() -> Self {
+         Self {
+             max_managed_key_cells: usize::MAX,
++            max_managed_estimated_bytes: usize::MAX,
++            max_total_estimated_bytes: usize::MAX,
+         }
+     }
+ }
+@@ -4496,6 +4752,35 @@
+     pub rejected_unprofitable: Vec<SemanticIndexBinding>,
+     pub rejected_budget: Vec<SemanticIndexBinding>,
+     pub managed_key_cells: usize,
++    pub managed_estimated_bytes: usize,
++    pub fixed_estimated_bytes: usize,
++    pub total_estimated_bytes_after: usize,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub enum PhysicalArtifactFamily {
++    RelationLayout,
++    SharedDenseIdentityMap,
++    I64Index,
++    SemanticIndex,
++    SemanticQuotientFactor,
++    SemanticQuotientSupport,
++    SemanticStatistics,
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct PhysicalArtifactFamilyMemory {
++    pub artifacts: usize,
++    pub advisor_managed_artifacts: usize,
++    pub estimated_retained_bytes: usize,
++}
++
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct PhysicalArtifactMemoryReport {
++    pub families: BTreeMap<PhysicalArtifactFamily, PhysicalArtifactFamilyMemory>,
++    /// Deterministic retained-size estimate. This is an allocator-independent
++    /// planning quantity, not an RSS or exact heap-allocation measurement.
++    pub total_estimated_retained_bytes: usize,
+ }
+ 
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+@@ -11688,6 +11973,7 @@
+     binding: SemanticIndexBinding,
+     savings_per_execution: u128,
+     key_cells: usize,
++    estimated_bytes: usize,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -11695,6 +11981,7 @@
+     binding: SemanticIndexBinding,
+     gross_savings: u128,
+     key_cells: usize,
++    estimated_bytes: usize,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -11702,10 +11989,236 @@
+     binding: SemanticIndexBinding,
+     net_savings: u128,
+     key_cells: usize,
++    estimated_bytes: usize,
+     compatible_existing: bool,
+     advisor_managed: bool,
+ }
+ 
++fn canonical_eq_key_heap_bytes(key: &kernel_semantics::CanonicalEqKey) -> usize {
++    use kernel_semantics::CanonicalEqKey;
++    match key {
++        CanonicalEqKey::Unit
++        | CanonicalEqKey::Bool(_)
++        | CanonicalEqKey::I64(_)
++        | CanonicalEqKey::F64Bits(_)
++        | CanonicalEqKey::OptionNone
++        | CanonicalEqKey::LiveEntityId { .. }
++        | CanonicalEqKey::HistoricalEntityId { .. } => 0,
++        CanonicalEqKey::TextExact(value) | CanonicalEqKey::TextAsciiCaseInsensitive(value) => {
++            value.capacity()
++        }
++        CanonicalEqKey::Product(fields) => fields
++            .capacity()
++            .saturating_mul(std::mem::size_of::<(SemanticId, CanonicalEqKey)>())
++            .saturating_add(saturating_usize_sum(
++                fields
++                    .iter()
++                    .map(|(_, value)| canonical_eq_key_heap_bytes(value)),
++            )),
++        CanonicalEqKey::OptionSome(value) | CanonicalEqKey::Variant { value, .. } => {
++            std::mem::size_of::<CanonicalEqKey>().saturating_add(canonical_eq_key_heap_bytes(value))
++        }
++        CanonicalEqKey::Seq(values) | CanonicalEqKey::Set(values) => values
++            .capacity()
++            .saturating_mul(std::mem::size_of::<CanonicalEqKey>())
++            .saturating_add(saturating_usize_sum(
++                values.iter().map(canonical_eq_key_heap_bytes),
++            )),
++        CanonicalEqKey::Bag(values) => values
++            .capacity()
++            .saturating_mul(std::mem::size_of::<(CanonicalEqKey, u64)>())
++            .saturating_add(saturating_usize_sum(
++                values
++                    .iter()
++                    .map(|(value, _)| canonical_eq_key_heap_bytes(value)),
++            )),
++        CanonicalEqKey::Map(values) => values
++            .capacity()
++            .saturating_mul(std::mem::size_of::<(CanonicalEqKey, CanonicalEqKey)>())
++            .saturating_add(saturating_usize_sum(values.iter().map(|(key, value)| {
++                canonical_eq_key_heap_bytes(key).saturating_add(canonical_eq_key_heap_bytes(value))
++            }))),
++    }
++}
++
++fn semantic_key_retained_bytes(key: &Vec<kernel_semantics::CanonicalEqKey>) -> usize {
++    std::mem::size_of::<Vec<kernel_semantics::CanonicalEqKey>>()
++        .saturating_add(
++            key.capacity()
++                .saturating_mul(std::mem::size_of::<kernel_semantics::CanonicalEqKey>()),
++        )
++        .saturating_add(saturating_usize_sum(
++            key.iter().map(canonical_eq_key_heap_bytes),
++        ))
++}
++
++fn semantic_key_heap_bytes(key: &Vec<kernel_semantics::CanonicalEqKey>) -> usize {
++    key.capacity()
++        .saturating_mul(std::mem::size_of::<kernel_semantics::CanonicalEqKey>())
++        .saturating_add(saturating_usize_sum(
++            key.iter().map(canonical_eq_key_heap_bytes),
++        ))
++}
++
++fn semantic_index_binding_heap_bytes(binding: &SemanticIndexBinding) -> usize {
++    binding
++        .key_parts
++        .capacity()
++        .saturating_mul(std::mem::size_of::<SemanticIndexKeyPart>())
++}
++
++fn semantic_index_estimated_retained_bytes(state: &MaterializedSemanticIndexState) -> usize {
++    std::mem::size_of::<SemanticIndexBinding>()
++        .saturating_add(semantic_index_binding_heap_bytes(&state.binding))
++        .saturating_add(
++            state
++                .resolved
++                .capacity()
++                .saturating_mul(std::mem::size_of::<
++                    kernel_semantics::ResolvedPrimitiveEquivalence,
++                >()),
++        )
++        .saturating_add(
++            state
++                .index
++                .estimated_retained_bytes(semantic_key_heap_bytes),
++        )
++}
++
++fn i64_index_estimated_retained_bytes(state: &MaterializedI64IndexState) -> usize {
++    state.buckets.iter().fold(
++        std::mem::size_of::<MaterializedI64IndexState>(),
++        |bytes, (_, identities)| {
++            bytes
++                .saturating_add(std::mem::size_of::<(i64, Vec<PhysicalRowId>)>())
++                .saturating_add(
++                    identities
++                        .capacity()
++                        .saturating_mul(std::mem::size_of::<PhysicalRowId>()),
++                )
++        },
++    )
++}
++
++fn quotient_factor_estimated_retained_bytes(
++    state: &MaterializedSemanticQuotientFactorState,
++) -> usize {
++    let mut bytes = std::mem::size_of::<MaterializedSemanticQuotientFactorState>()
++        .saturating_add(semantic_index_binding_heap_bytes(&state.binding));
++    for (key, identities) in &state.buckets {
++        bytes = bytes
++            .saturating_add(semantic_key_retained_bytes(key))
++            .saturating_add(std::mem::size_of::<Vec<PhysicalRowId>>())
++            .saturating_add(
++                identities
++                    .capacity()
++                    .saturating_mul(std::mem::size_of::<PhysicalRowId>()),
++            );
++    }
++    for key in state.reverse.values() {
++        bytes = bytes
++            .saturating_add(std::mem::size_of::<PhysicalRowId>())
++            .saturating_add(semantic_key_retained_bytes(key));
++    }
++    bytes
++}
++
++fn semantic_statistics_estimated_retained_bytes(
++    state: &MaterializedSemanticStatisticsState,
++) -> usize {
++    state.counts.iter().fold(
++        std::mem::size_of::<MaterializedSemanticStatisticsState>()
++            .saturating_add(semantic_index_binding_heap_bytes(&state.binding))
++            .saturating_add(
++                state
++                    .resolved
++                    .capacity()
++                    .saturating_mul(std::mem::size_of::<
++                        kernel_semantics::ResolvedPrimitiveEquivalence,
++                    >()),
++            ),
++        |bytes, (key, _)| {
++            bytes
++                .saturating_add(semantic_key_retained_bytes(key))
++                .saturating_add(std::mem::size_of::<usize>())
++        },
++    )
++}
++
++fn quotient_support_estimated_retained_bytes(
++    state: &MaterializedSemanticQuotientSupportState,
++) -> usize {
++    let mut bytes = std::mem::size_of::<MaterializedSemanticQuotientSupportState>()
++        .saturating_add(
++            state
++                .binding
++                .leaves
++                .capacity()
++                .saturating_mul(std::mem::size_of::<(SemanticId, LayoutBinding, usize)>()),
++        )
++        .saturating_add(
++            state
++                .binding
++                .specs
++                .capacity()
++                .saturating_mul(std::mem::size_of::<(SemanticId, Vec<MultiwayJoinColumnRef>)>()),
++        );
++    for (_, refs) in &state.binding.specs {
++        bytes = bytes.saturating_add(
++            refs.capacity()
++                .saturating_mul(std::mem::size_of::<MultiwayJoinColumnRef>()),
++        );
++    }
++    for handles in &state.handles {
++        bytes = bytes
++            .saturating_add(std::mem::size_of::<Vec<PhysicalRowId>>())
++            .saturating_add(
++                handles
++                    .capacity()
++                    .saturating_mul(std::mem::size_of::<PhysicalRowId>()),
++            );
++    }
++    for mask in &state.base_masks {
++        bytes = bytes
++            .saturating_add(std::mem::size_of::<Vec<u64>>())
++            .saturating_add(mask.capacity().saturating_mul(std::mem::size_of::<u64>()));
++    }
++    for constraint in &state.constraints {
++        bytes = bytes.saturating_add(
++            constraint
++                .leaves
++                .capacity()
++                .saturating_mul(std::mem::size_of::<SemanticQuotientLeaf>()),
++        );
++        for leaf in &constraint.leaves {
++            bytes =
++                bytes.saturating_add(leaf.keys.capacity().saturating_mul(std::mem::size_of::<
++                    Option<kernel_semantics::CanonicalEqKey>,
++                >()));
++            for key in leaf.keys.iter().flatten() {
++                bytes = bytes.saturating_add(canonical_eq_key_heap_bytes(key));
++            }
++            for (key, ordinals) in &leaf.buckets {
++                bytes = bytes
++                    .saturating_add(std::mem::size_of::<kernel_semantics::CanonicalEqKey>())
++                    .saturating_add(canonical_eq_key_heap_bytes(key))
++                    .saturating_add(std::mem::size_of::<Vec<u64>>())
++                    .saturating_add(
++                        ordinals
++                            .capacity()
++                            .saturating_mul(std::mem::size_of::<u64>()),
++                    );
++            }
++        }
++        for key in &constraint.common_keys {
++            bytes = bytes
++                .saturating_add(std::mem::size_of::<kernel_semantics::CanonicalEqKey>())
++                .saturating_add(canonical_eq_key_heap_bytes(key));
++        }
++    }
++    bytes
++}
++
+ fn semantic_index_advice_scores(
+     store: &PhysicalStore,
+     workload: &[SemanticIndexWorkloadSample],
+@@ -11726,6 +12239,7 @@
+                     binding: observation.binding.clone(),
+                     gross_savings: 0,
+                     key_cells: observation.key_cells,
++                    estimated_bytes: observation.estimated_bytes,
+                 });
+             entry.gross_savings = entry.gross_savings.saturating_add(
+                 observation
+@@ -11733,6 +12247,7 @@
+                     .saturating_mul(sample.expected_executions as u128),
+             );
+             entry.key_cells = entry.key_cells.max(observation.key_cells);
++            entry.estimated_bytes = entry.estimated_bytes.max(observation.estimated_bytes);
+         }
+     }
+     Ok(scores)
+@@ -11760,13 +12275,17 @@
+             report.rejected_unprofitable.push(score.binding);
+             continue;
+         }
+-        let advisor_managed = store
+-            .advisor_managed_semantic_indexes
+-            .contains(&score.binding);
++        let advisor_managed =
++            store
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticIndex(
++                    score.binding.clone(),
++                ));
+         choices.push(SemanticIndexAdviceChoice {
+             binding: score.binding,
+             net_savings: score.gross_savings - build_work,
+             key_cells: score.key_cells,
++            estimated_bytes: score.estimated_bytes,
+             compatible_existing,
+             advisor_managed,
+         });
+@@ -11782,12 +12301,20 @@
+     }
+ }
+ 
++const fn semantic_index_managed_estimated_bytes(choice: &SemanticIndexAdviceChoice) -> usize {
++    if choice.compatible_existing && !choice.advisor_managed {
++        0
++    } else {
++        choice.estimated_bytes
++    }
++}
++
+ fn compare_semantic_index_advice_choice(
+     left: &SemanticIndexAdviceChoice,
+     right: &SemanticIndexAdviceChoice,
+ ) -> std::cmp::Ordering {
+-    let left_cost = semantic_index_managed_cost(left);
+-    let right_cost = semantic_index_managed_cost(right);
++    let left_cost = semantic_index_managed_estimated_bytes(left);
++    let right_cost = semantic_index_managed_estimated_bytes(right);
+     match (left_cost, right_cost) {
+         (0, 0) => right
+             .net_savings
+@@ -11816,6 +12343,7 @@
+     (
+         BTreeSet<SemanticIndexBinding>,
+         usize,
++        usize,
+         SemanticIndexAdvisorReport,
+     ),
+     PhysicalExecutionError,
+@@ -11825,18 +12353,45 @@
+     let mut choices = semantic_index_advice_choices(store, scores, context, registry, &mut report)?;
+     choices.sort_by(compare_semantic_index_advice_choice);
+ 
++    let current_memory = store
++        .artifact_memory_report()
++        .total_estimated_retained_bytes;
++    let replaceable_managed_bytes = store
++        .semantic_indexes
++        .iter()
++        .filter(|(binding, _)| {
++            store
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticIndex((*binding).clone()))
++        })
++        .map(|(_, state)| semantic_index_estimated_retained_bytes(state));
++    let replaceable_managed_bytes = saturating_usize_sum(replaceable_managed_bytes);
++    let fixed_estimated_bytes = current_memory.saturating_sub(replaceable_managed_bytes);
+     let mut selected = BTreeSet::new();
+     let mut managed_key_cells = 0_usize;
++    let mut managed_estimated_bytes = 0_usize;
+     for choice in choices {
+-        let managed_cost = semantic_index_managed_cost(&choice);
+-        if managed_key_cells.saturating_add(managed_cost) > policy.max_managed_key_cells {
++        let managed_key_cost = semantic_index_managed_cost(&choice);
++        let managed_byte_cost = semantic_index_managed_estimated_bytes(&choice);
++        if managed_key_cells.saturating_add(managed_key_cost) > policy.max_managed_key_cells
++            || managed_estimated_bytes.saturating_add(managed_byte_cost)
++                > policy.max_managed_estimated_bytes
++            || fixed_estimated_bytes
++                .saturating_add(managed_estimated_bytes)
++                .saturating_add(managed_byte_cost)
++                > policy.max_total_estimated_bytes
++        {
+             report.rejected_budget.push(choice.binding);
+             continue;
+         }
+-        managed_key_cells = managed_key_cells.saturating_add(managed_cost);
++        managed_key_cells = managed_key_cells.saturating_add(managed_key_cost);
++        managed_estimated_bytes = managed_estimated_bytes.saturating_add(managed_byte_cost);
+         selected.insert(choice.binding);
+     }
+-    Ok((selected, managed_key_cells, report))
++    report.fixed_estimated_bytes = fixed_estimated_bytes;
++    report.total_estimated_bytes_after =
++        fixed_estimated_bytes.saturating_add(managed_estimated_bytes);
++    Ok((selected, managed_key_cells, managed_estimated_bytes, report))
+ }
+ 
+ fn semantic_index_state_for_advice<'a>(
+@@ -11921,12 +12476,14 @@
+     let matching_rows = state
+         .probe_values(&values)?
+         .map_or(0, <[PhysicalRowId]>::len);
++    let estimated_bytes = semantic_index_estimated_retained_bytes(&state);
+     let scan_work = row_count as u128;
+     let index_work = 1_u128.saturating_add(matching_rows as u128);
+     Ok(Some(SemanticIndexAdviceObservation {
+         binding,
+         savings_per_execution: scan_work.saturating_sub(index_work),
+         key_cells,
++        estimated_bytes,
+     }))
+ }
+ 
+@@ -12007,11 +12564,13 @@
+     let key_cells = right_rows.saturating_mul(binding.key_parts.len());
+     let state = semantic_index_state_for_advice(store, &binding, context, registry)?;
+     let distinct = state.distinct_key_count();
++    let estimated_bytes = semantic_index_estimated_retained_bytes(&state);
+     if left_rows == 0 || right_rows == 0 || distinct == 0 {
+         return Ok(Some(SemanticIndexAdviceObservation {
+             binding,
+             savings_per_execution: 0,
+             key_cells,
++            estimated_bytes,
+         }));
+     }
+     let nested_work = (left_rows as u128).saturating_mul(right_rows as u128);
+@@ -12021,6 +12580,7 @@
+         binding,
+         savings_per_execution: nested_work.saturating_sub(indexed_work),
+         key_cells,
++        estimated_bytes,
+     }))
+ }
+ 
+@@ -13846,6 +14406,51 @@
+         ));
+     }
+ 
++    #[test]
++    fn artifact_memory_report_deduplicates_shared_dense_identity_backing() {
++        let entity_type = sid(372);
++        let external = [
++            kernel_types::EntityId::new(10),
++            kernel_types::EntityId::new(20),
++            kernel_types::EntityId::new(30),
++        ];
++        let dense = Arc::new(
++            DenseEntityIds::compile(&external.into_iter().collect::<BTreeSet<_>>()).unwrap(),
++        );
++        let first =
++            NativeColumn::dense_live_entity_ids(entity_type, Arc::clone(&dense), external.to_vec())
++                .unwrap();
++        let second =
++            NativeColumn::dense_live_entity_ids(entity_type, Arc::clone(&dense), external.to_vec())
++                .unwrap();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                sid(373),
++                LayoutBinding {
++                    id: LayoutId(952),
++                    family: LayoutFamily::Columnar,
++                },
++                NativeRelation::typed_columnar(vec![first, second]).unwrap(),
++            )
++            .unwrap();
++        let memory = store.artifact_memory_report();
++        assert_eq!(
++            memory
++                .families
++                .get(&PhysicalArtifactFamily::SharedDenseIdentityMap)
++                .map(|entry| entry.artifacts),
++            Some(1)
++        );
++        assert_eq!(
++            memory
++                .families
++                .get(&PhysicalArtifactFamily::RelationLayout)
++                .map(|entry| entry.artifacts),
++            Some(1)
++        );
++    }
++
+     fn named_product(field: SemanticId, name: &str) -> Value {
+         Value::Product(BTreeMap::from([(field, Value::Text(name.to_owned()))]))
+     }
+@@ -17254,6 +17859,21 @@
+         assert_eq!(after_stats.multiway_join_maintained_quotient_key_hits, 0);
+     }
+ 
++    fn assert_quotient_artifact_memory_inventory(store: &PhysicalStore) {
++        let memory = store.artifact_memory_report();
++        for (family, expected) in [
++            (PhysicalArtifactFamily::SemanticStatistics, 3),
++            (PhysicalArtifactFamily::SemanticQuotientFactor, 3),
++            (PhysicalArtifactFamily::SemanticQuotientSupport, 1),
++        ] {
++            assert_eq!(
++                memory.families.get(&family).map(|entry| entry.artifacts),
++                Some(expected)
++            );
++        }
++        assert!(memory.total_estimated_retained_bytes > 0);
++    }
++
+     #[test]
+     fn prepared_gamma_quotient_factors_reuse_delta_maintained_canonical_keys() {
+         let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();
+@@ -17339,6 +17959,7 @@
+             &context,
+             (c, bindings[2]),
+         );
++        assert_quotient_artifact_memory_inventory(&store);
+     }
+ 
+     fn assert_structural_quotient_factor_hits(
+@@ -18992,8 +19613,22 @@
+         assert_eq!(report.created, vec![index.clone()]);
+         assert!(report.rejected_unprofitable.is_empty());
+         assert_eq!(report.managed_key_cells, 64);
++        assert!(report.managed_estimated_bytes > report.managed_key_cells);
+         assert_eq!(store.semantic_indexes.len(), 1);
+-        assert!(store.advisor_managed_semantic_indexes.contains(&index));
++        assert!(
++            store
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticIndex(index.clone()))
++        );
++        let memory = store.artifact_memory_report();
++        assert_eq!(
++            memory.families.get(&PhysicalArtifactFamily::SemanticIndex),
++            Some(&PhysicalArtifactFamilyMemory {
++                artifacts: 1,
++                advisor_managed_artifacts: 1,
++                estimated_retained_bytes: report.managed_estimated_bytes,
++            })
++        );
+ 
+         let (value, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
+         assert_eq!(value.rows(), &[vec![Value::Text("Needle".into())]]);
+@@ -19001,6 +19636,92 @@
+     }
+ 
+     #[test]
++    fn semantic_index_advisor_enforces_estimated_byte_budget() {
++        let relation = sid(368);
++        let equivalence = sid(369);
++        let values = (0..64)
++            .map(|index| {
++                if index == 37 {
++                    "Needle".to_owned()
++                } else {
++                    format!("row-{index}")
++                }
++            })
++            .collect::<Vec<_>>();
++        let (context, registry, layout, mut store, prepared) =
++            advisor_text_fixture(relation, equivalence, 45, 950, values);
++        let index = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        let report = store
++            .advise_semantic_indexes(
++                &[SemanticIndexWorkloadSample {
++                    plan: prepared.physical().clone(),
++                    expected_executions: 2,
++                }],
++                SemanticIndexAdvisorPolicy {
++                    max_managed_estimated_bytes: 1,
++                    ..SemanticIndexAdvisorPolicy::default()
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(report.rejected_budget, vec![index.clone()]);
++        assert!(report.created.is_empty());
++        assert_eq!(report.managed_estimated_bytes, 0);
++        assert!(store.semantic_index(&index).is_none());
++    }
++
++    #[test]
++    fn semantic_index_advisor_global_budget_counts_other_physical_families() {
++        let relation = sid(370);
++        let equivalence = sid(371);
++        let values = (0..64)
++            .map(|index| {
++                if index == 37 {
++                    "Needle".to_owned()
++                } else {
++                    format!("row-{index}")
++                }
++            })
++            .collect::<Vec<_>>();
++        let (context, registry, layout, mut store, prepared) =
++            advisor_text_fixture(relation, equivalence, 46, 951, values);
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        store
++            .install_semantic_statistics(binding.clone(), &context, &registry)
++            .unwrap();
++        let fixed = store
++            .artifact_memory_report()
++            .total_estimated_retained_bytes;
++        assert!(fixed > 0);
++
++        let report = store
++            .advise_semantic_indexes(
++                &[SemanticIndexWorkloadSample {
++                    plan: prepared.physical().clone(),
++                    expected_executions: 2,
++                }],
++                SemanticIndexAdvisorPolicy {
++                    max_total_estimated_bytes: fixed.saturating_add(1),
++                    ..SemanticIndexAdvisorPolicy::default()
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(report.fixed_estimated_bytes, fixed);
++        assert_eq!(report.total_estimated_bytes_after, fixed);
++        assert_eq!(report.rejected_budget, vec![binding.clone()]);
++        assert!(store.semantic_index(&binding).is_none());
++        assert!(
++            store
++                .semantic_statistics(&binding, &context, &registry)
++                .unwrap()
++                .is_some()
++        );
++    }
++
++    #[test]
+     fn semantic_index_advisor_discovers_access_path_below_project_boundary() {
+         let relation = sid(366);
+         let equivalence = sid(367);
+@@ -19165,6 +19886,7 @@
+             advisor_budget_fixture();
+         let policy = SemanticIndexAdvisorPolicy {
+             max_managed_key_cells: 64,
++            ..SemanticIndexAdvisorPolicy::default()
+         };
+ 
+         let first = store
+@@ -19191,6 +19913,7 @@
+                 }],
+                 SemanticIndexAdvisorPolicy {
+                     max_managed_key_cells: 0,
++                    ..SemanticIndexAdvisorPolicy::default()
+                 },
+                 &context,
+                 &registry,
+@@ -19200,7 +19923,11 @@
+         assert_eq!(second.reused_existing, vec![index_b.clone()]);
+         assert!(store.semantic_index(&index_a).is_none());
+         assert!(store.semantic_index(&index_b).is_some());
+-        assert!(!store.advisor_managed_semantic_indexes.contains(&index_b));
++        assert!(
++            !store
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticIndex(index_b.clone()))
++        );
+     }
+ 
+     #[test]
+--- /mnt/data/pass63_baseline/cfmd_workspace_pass62/crates/kernel-semantic-index/src/lib.rs	2026-09-20 10:18:10.000000000 +0000
++++ /mnt/data/pass63_work/cfmd_workspace_pass62/crates/kernel-semantic-index/src/lib.rs	2026-09-20 21:44:05.453245106 +0000
+@@ -121,6 +121,39 @@
+         self.reverse.get(identity)
+     }
+ 
++    /// Deterministic retained-size estimate for budget decisions.
++    ///
++    /// This accounts for owned key/identity payloads and vector capacities,
++    /// including the reverse-map key clone. Allocator/BTree node overhead is
++    /// intentionally outside the contract and must not be confused with RSS.
++    #[must_use]
++    pub fn estimated_retained_bytes(&self, key_heap_bytes: impl Fn(&K) -> usize) -> usize {
++        let mut bytes = std::mem::size_of::<Self>().saturating_add(
++            self.binding
++                .dependencies
++                .capacity()
++                .saturating_mul(std::mem::size_of::<SemanticModuleBinding>()),
++        );
++        for (key, identities) in &self.buckets {
++            bytes = bytes
++                .saturating_add(std::mem::size_of::<K>())
++                .saturating_add(key_heap_bytes(key))
++                .saturating_add(std::mem::size_of::<Vec<I>>())
++                .saturating_add(
++                    identities
++                        .capacity()
++                        .saturating_mul(std::mem::size_of::<I>()),
++                );
++        }
++        for key in self.reverse.values() {
++            bytes = bytes
++                .saturating_add(std::mem::size_of::<I>())
++                .saturating_add(std::mem::size_of::<K>())
++                .saturating_add(key_heap_bytes(key));
++        }
++        bytes
++    }
++
+     /// Inserts or rebinds one derivative identity, returning its previous key if present.
+     pub fn insert(&mut self, identity: I, key: K) -> Option<K> {
+         if self
+@@ -232,4 +265,18 @@
+         context.environment.revision = SemanticEnvId::new(12);
+         assert!(!binding.is_valid_for(&context, &[dependency]));
+     }
++
++    #[test]
++    fn retained_size_estimate_accounts_for_bucket_and_reverse_payloads() {
++        let context = context();
++        let mut index = SemanticBucketIndex::new(SemanticIndexBinding::new(&context, Vec::new()));
++        let empty = index.estimated_retained_bytes(String::capacity);
++        index.insert(1_u64, "alpha".to_owned());
++        let one = index.estimated_retained_bytes(String::capacity);
++        index.insert(2_u64, "alpha".to_owned());
++        let two = index.estimated_retained_bytes(String::capacity);
++        index.insert(3_u64, "a much larger retained semantic key".to_owned());
++        let three = index.estimated_retained_bytes(String::capacity);
++        assert!(empty < one && one < two && two < three);
++    }
+ }

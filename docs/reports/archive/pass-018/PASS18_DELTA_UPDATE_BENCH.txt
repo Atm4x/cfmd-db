@@ -1,0 +1,3 @@
+rows=10000 no_index_ns=123828 persisted_index_ns=389828
+rows=100000 no_index_ns=1542602 persisted_index_ns=8209027
+rows=300000 no_index_ns=4410545 persisted_index_ns=37508059

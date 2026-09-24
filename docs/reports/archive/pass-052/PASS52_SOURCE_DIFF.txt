@@ -1,0 +1,473 @@
+--- /mnt/data/pass52_kernel_plan_before.rs	2026-09-20 16:21:15.404498556 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 16:29:48.625025087 +0000
+@@ -658,6 +658,7 @@
+         BTreeMap<SemanticQuotientSupportBinding, MaterializedSemanticQuotientSupportState>,
+     semantic_statistics: BTreeMap<SemanticIndexBinding, MaterializedSemanticStatisticsState>,
+     advisor_managed_semantic_indexes: BTreeSet<SemanticIndexBinding>,
++    semantic_quotient_support_local_delta_updates: u64,
+     transition_epoch: u64,
+     revision: Option<RevisionId>,
+ }
+@@ -3071,6 +3072,13 @@
+         self.transition_epoch
+     }
+ 
++    /// Number of Γ-QCN support transitions maintained through the monotone local
++    /// deletion derivative rather than the exact Replace fallback.
++    #[must_use]
++    pub const fn semantic_quotient_support_local_delta_updates(&self) -> u64 {
++        self.semantic_quotient_support_local_delta_updates
++    }
++
+     #[must_use]
+     fn can_commit_prepared(&self, prepared: &PreparedPhysicalStoreTransition) -> bool {
+         self == prepared.source_state.as_ref()
+@@ -3124,7 +3132,13 @@
+         )?;
+         apply_planned_relation_delta(installed, &physical_delta)?;
+         self.apply_relation_derived_delta(relation, layout, &physical_delta)?;
+-        self.rebuild_semantic_quotient_supports_for_relation(relation, layout, context, registry)?;
++        self.maintain_semantic_quotient_supports_for_relation(
++            relation,
++            layout,
++            &physical_delta,
++            context,
++            registry,
++        )?;
+         self.transition_epoch = next_epoch;
+         let resolved_delta = RelationDelta {
+             inserted: physical_delta
+@@ -3204,10 +3218,11 @@
+         self.semantic_quotient_supports.get(binding)
+     }
+ 
+-    fn rebuild_semantic_quotient_supports_for_relation(
++    fn maintain_semantic_quotient_supports_for_relation(
+         &mut self,
+         relation: SemanticId,
+         layout: LayoutBinding,
++        delta: &PhysicalRelationDelta,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+@@ -3221,6 +3236,28 @@
+             })
+             .collect::<Vec<_>>();
+         for binding in bindings {
++            let leaf_updates = binding
++                .leaves
++                .iter()
++                .enumerate()
++                .filter(|(_, (candidate, candidate_layout, _))| {
++                    *candidate == relation && candidate_layout.id == layout.id
++                })
++                .map(|(leaf, (_, leaf_layout, _))| {
++                    Ok((leaf, self.logical_row_handles(relation, *leaf_layout)?))
++                })
++                .collect::<Result<Vec<_>, PhysicalExecutionError>>()?;
++            let locally_maintained = delta.inserted.is_empty()
++                && self
++                    .semantic_quotient_supports
++                    .get_mut(&binding)
++                    .is_some_and(|state| state.try_apply_monotone_deletion(&leaf_updates, context));
++            if locally_maintained {
++                self.semantic_quotient_support_local_delta_updates = self
++                    .semantic_quotient_support_local_delta_updates
++                    .saturating_add(1);
++                continue;
++            }
+             let state =
+                 build_semantic_quotient_support_state(binding.clone(), self, context, registry)?
+                     .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+@@ -6858,6 +6895,57 @@
+                 *candidate == relation && candidate_layout.id == layout.id
+             })
+     }
++
++    fn try_apply_monotone_deletion(
++        &mut self,
++        leaf_updates: &[(usize, Vec<PhysicalRowId>)],
++        context: &kernel_schema::SemanticContext,
++    ) -> bool {
++        if &self.semantic_context != context || leaf_updates.is_empty() {
++            return false;
++        }
++        let mut remaps = Vec::with_capacity(leaf_updates.len());
++        for (leaf, next) in leaf_updates {
++            let Some(current) = self.handles.get(*leaf) else {
++                return false;
++            };
++            if next.len() >= current.len() {
++                return false;
++            }
++            let Some(remap) = deletion_ordinal_remap(current, next) else {
++                return false;
++            };
++            remaps.push((*leaf, next, remap));
++        }
++
++        let mut changed_leaves = Vec::with_capacity(remaps.len());
++        for (leaf, next, remap) in remaps {
++            self.base_masks[leaf] = remap_ordinal_mask(&self.base_masks[leaf], &remap, next.len());
++            self.handles[leaf].clone_from(next);
++            for constraint in &mut self.constraints {
++                if let Some(quotient_leaf) = constraint
++                    .leaves
++                    .iter_mut()
++                    .find(|candidate| candidate.leaf == leaf)
++                {
++                    quotient_leaf.keys = remap
++                        .iter()
++                        .enumerate()
++                        .filter_map(|(old, new)| new.map(|_| quotient_leaf.keys[old].clone()))
++                        .collect();
++                    rebuild_quotient_leaf_buckets(quotient_leaf);
++                }
++            }
++            changed_leaves.push(leaf);
++        }
++        propagate_quotient_support_deletions(
++            &self.handles,
++            &self.constraints,
++            &mut self.base_masks,
++            &changed_leaves,
++        );
++        true
++    }
+ }
+ 
+ fn full_ordinal_mask(row_count: usize) -> Vec<u64> {
+@@ -6899,6 +6987,114 @@
+         .any(|(left, right)| left & right != 0)
+ }
+ 
++fn deletion_ordinal_remap(
++    current: &[PhysicalRowId],
++    next: &[PhysicalRowId],
++) -> Option<Vec<Option<usize>>> {
++    let mut remap = vec![None; current.len()];
++    let mut next_ordinal = 0;
++    for (old_ordinal, handle) in current.iter().enumerate() {
++        if next.get(next_ordinal) == Some(handle) {
++            remap[old_ordinal] = Some(next_ordinal);
++            next_ordinal += 1;
++        }
++    }
++    (next_ordinal == next.len()).then_some(remap)
++}
++
++fn remap_ordinal_mask(mask: &[u64], remap: &[Option<usize>], row_count: usize) -> Vec<u64> {
++    let mut next = vec![0_u64; row_count.div_ceil(64)];
++    for (old_ordinal, new_ordinal) in remap.iter().enumerate() {
++        let Some(new_ordinal) = new_ordinal else {
++            continue;
++        };
++        if mask_contains(mask, old_ordinal) {
++            next[*new_ordinal / 64] |= 1_u64 << (*new_ordinal % 64);
++        }
++    }
++    next
++}
++
++fn rebuild_quotient_leaf_buckets(leaf: &mut SemanticQuotientLeaf) {
++    leaf.buckets.clear();
++    let words = leaf.keys.len().div_ceil(64);
++    for (ordinal, key) in leaf.keys.iter().enumerate() {
++        let Some(key) = key else {
++            continue;
++        };
++        let bucket = leaf
++            .buckets
++            .entry(key.clone())
++            .or_insert_with(|| vec![0; words]);
++        bucket[ordinal / 64] |= 1_u64 << (ordinal % 64);
++    }
++}
++
++fn constraint_viable_keys(
++    constraint: &SemanticQuotientConstraint,
++    masks: &[Vec<u64>],
++) -> BTreeSet<kernel_semantics::CanonicalEqKey> {
++    constraint
++        .common_keys
++        .iter()
++        .filter(|key| {
++            constraint.leaves.iter().all(|leaf| {
++                leaf.buckets
++                    .get(*key)
++                    .is_some_and(|bucket| masks_intersect(bucket, &masks[leaf.leaf]))
++            })
++        })
++        .cloned()
++        .collect()
++}
++
++fn propagate_quotient_support_deletions(
++    handles: &[Vec<PhysicalRowId>],
++    constraints: &[SemanticQuotientConstraint],
++    masks: &mut [Vec<u64>],
++    changed_leaves: &[usize],
++) {
++    let mut constraints_by_leaf = vec![Vec::new(); handles.len()];
++    for (constraint_index, constraint) in constraints.iter().enumerate() {
++        for leaf in &constraint.leaves {
++            constraints_by_leaf[leaf.leaf].push(constraint_index);
++        }
++    }
++    let mut queued = vec![false; constraints.len()];
++    let mut queue = std::collections::VecDeque::new();
++    for leaf in changed_leaves {
++        for constraint in &constraints_by_leaf[*leaf] {
++            if !queued[*constraint] {
++                queued[*constraint] = true;
++                queue.push_back(*constraint);
++            }
++        }
++    }
++    while let Some(constraint_index) = queue.pop_front() {
++        queued[constraint_index] = false;
++        let constraint = &constraints[constraint_index];
++        let viable_keys = constraint_viable_keys(constraint, masks);
++        for quotient_leaf in &constraint.leaves {
++            let mut leaf_changed = false;
++            for (ordinal, key) in quotient_leaf.keys.iter().enumerate() {
++                if mask_contains(&masks[quotient_leaf.leaf], ordinal)
++                    && key.as_ref().is_none_or(|key| !viable_keys.contains(key))
++                {
++                    leaf_changed |= mask_clear(&mut masks[quotient_leaf.leaf], ordinal);
++                }
++            }
++            if leaf_changed {
++                for dependent in &constraints_by_leaf[quotient_leaf.leaf] {
++                    if !queued[*dependent] {
++                        queued[*dependent] = true;
++                        queue.push_back(*dependent);
++                    }
++                }
++            }
++        }
++    }
++}
++
+ fn leaf_row_by_handle(
+     store: &PhysicalStore,
+     leaf: &MultiwayJoinLeaf,
+@@ -15443,8 +15639,8 @@
+         let mut cache = SemanticQuotientKeyCache::new();
+         cache.insert((0, 0, q1), vec![a.clone()]);
+         cache.insert((1, 0, q1), vec![a, b]);
+-        cache.insert((1, 1, q2), vec![x, y.clone()]);
+-        cache.insert((2, 0, q2), vec![y]);
++        cache.insert((1, 1, q2), vec![x.clone(), y]);
++        cache.insert((2, 0, q2), vec![x]);
+         let q1_leaves = vec![
+             quotient_leaf_keys(0, &[0], q1, 1, &cache).unwrap(),
+             quotient_leaf_keys(1, &[0], q1, 2, &cache).unwrap(),
+@@ -15483,8 +15679,15 @@
+                 generation: 0,
+             }],
+         ];
+-        let masks = quotient_support_masks(&handles, &constraints);
+-        assert!(masks[2].iter().all(|word| *word == 0));
++        let mut masks = quotient_support_masks(&handles, &constraints);
++        assert!(mask_contains(&masks[0], 0));
++        assert!(mask_contains(&masks[1], 0));
++        assert!(!mask_contains(&masks[1], 1));
++        assert!(mask_contains(&masks[2], 0));
++
++        assert!(mask_clear(&mut masks[0], 0));
++        propagate_quotient_support_deletions(&handles, &constraints, &mut masks, &[0]);
++        assert!(masks.iter().all(|mask| mask.iter().all(|word| *word == 0)));
+     }
+ 
+     #[test]
+@@ -15718,6 +15921,189 @@
+         );
+     }
+ 
++    fn local_dq_quotient_fixture() -> (
++        SemanticContext,
++        SemanticRegistry,
++        [SemanticId; 3],
++        [LayoutBinding; 3],
++        RelExpr,
++        PreparedPlan,
++        PhysicalStore,
++        kernel_model::FiniteModel,
++    ) {
++        let (context, registry, relations @ [a, b, c], equivalence) = three_relation_i64_context();
++        let bindings = [1_093_u128, 1_094, 1_095].map(|id| LayoutBinding {
++            id: LayoutId(id),
++            family: LayoutFamily::Columnar,
++        });
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, binding) in relations.into_iter().zip(bindings) {
++            catalog.bind_relation(relation, binding);
++        }
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(a)),
++                right: Box::new(RelExpr::Scan(b)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            right: Box::new(RelExpr::Scan(c)),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let values = [
++            (1_i64..=20).collect::<Vec<_>>(),
++            vec![1_i64; 100],
++            (1_i64..=20).collect::<Vec<_>>(),
++        ];
++        let mut store = PhysicalStore::default();
++        let mut model = kernel_model::FiniteModel::default();
++        for ((relation, layout), relation_values) in relations.into_iter().zip(bindings).zip(values)
++        {
++            store
++                .install(
++                    relation,
++                    layout,
++                    NativeRelation::typed_columnar(vec![NativeColumn::I64(
++                        relation_values.clone(),
++                    )])
++                    .unwrap(),
++                )
++                .unwrap();
++            store
++                .install_semantic_statistics(
++                    SemanticIndexBinding::single(relation, layout, 0, equivalence),
++                    &context,
++                    &registry,
++                )
++                .unwrap();
++            model.relations.insert(
++                relation,
++                relation_values
++                    .into_iter()
++                    .map(|value| vec![Value::I64(value)])
++                    .collect(),
++            );
++        }
++        assert_eq!(
++            prepared
++                .materialize_semantic_quotient_factors(&mut store, &registry)
++                .unwrap(),
++            3
++        );
++        assert!(
++            prepared
++                .materialize_semantic_quotient_support(&mut store, &registry)
++                .unwrap()
++        );
++        (
++            context, registry, relations, bindings, logical, prepared, store, model,
++        )
++    }
++
++    #[test]
++    fn gamma_quotient_support_uses_local_dq_for_arbitrary_deletions() {
++        let (context, registry, [a, b, c], bindings, logical, prepared, mut store, mut model) =
++            local_dq_quotient_fixture();
++        let local_before = store.semantic_quotient_support_local_delta_updates();
++        let handles_before = store.logical_row_handles(c, bindings[2]).unwrap();
++        let suffix_delete = scan_delta(c, &[], &[20], &context, &registry);
++        store
++            .apply_relation_delta(c, bindings[2], &suffix_delete, &context, &registry)
++            .unwrap();
++        model.relations.get_mut(&c).unwrap().pop();
++        let handles_after = store.logical_row_handles(c, bindings[2]).unwrap();
++        assert_eq!(handles_after, handles_before[..handles_after.len()]);
++        assert_eq!(
++            store.semantic_quotient_support_local_delta_updates(),
++            local_before + 1
++        );
++        let maintained = store.semantic_quotient_supports.values().next().unwrap();
++        let current_handles = [a, b, c]
++            .into_iter()
++            .zip(bindings)
++            .map(|(relation, layout)| store.logical_row_handles(relation, layout).unwrap())
++            .collect::<Vec<_>>();
++        assert_eq!(maintained.handles, current_handles);
++        let (after_suffix, suffix_stats) =
++            prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            after_suffix,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(
++            suffix_stats.multiway_join_maintained_quotient_support_hits,
++            1
++        );
++
++        let interior_delete = scan_delta(c, &[], &[10], &context, &registry);
++        store
++            .apply_relation_delta(c, bindings[2], &interior_delete, &context, &registry)
++            .unwrap();
++        model
++            .relations
++            .get_mut(&c)
++            .unwrap()
++            .retain(|row| row != &vec![Value::I64(10)]);
++        assert_eq!(
++            store.semantic_quotient_support_local_delta_updates(),
++            local_before + 2
++        );
++        let (after_interior, interior_stats) =
++            prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            interior_stats.multiway_join_maintained_quotient_support_hits,
++            1
++        );
++        assert_eq!(
++            after_interior,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++
++        let duplicate_delete = scan_delta(b, &[], &[1], &context, &registry);
++        store
++            .apply_relation_delta(b, bindings[1], &duplicate_delete, &context, &registry)
++            .unwrap();
++        model.relations.get_mut(&b).unwrap().remove(0);
++        assert_eq!(
++            store.semantic_quotient_support_local_delta_updates(),
++            local_before + 3
++        );
++        let (after_duplicate, duplicate_stats) =
++            prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            after_duplicate,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(
++            duplicate_stats.multiway_join_maintained_quotient_support_hits,
++            1
++        );
++
++        let insertion = scan_delta(c, &[21], &[], &context, &registry);
++        store
++            .apply_relation_delta(c, bindings[2], &insertion, &context, &registry)
++            .unwrap();
++        model
++            .relations
++            .get_mut(&c)
++            .unwrap()
++            .push(vec![Value::I64(21)]);
++        assert_eq!(
++            store.semantic_quotient_support_local_delta_updates(),
++            local_before + 3
++        );
++        let (after_insert, _) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            after_insert,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++    }
++
+     #[test]
+     fn multiway_join_planner_reassociates_contiguous_tree_and_reuses_indexes_after_intermediate() {
+         let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();

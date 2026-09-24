@@ -1,0 +1,80 @@
+    Checking kernel-retention v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-retention)
+    Checking kernel-transport v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-transport)
+    Checking kernel-durability v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-durability)
+    Checking kernel-deployment v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-deployment)
+    Checking storage-memory v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/storage-memory)
+    Checking kernel-auth v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-auth)
+    Checking kernel-plan v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-plan)
+    Checking kernel-revision v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-revision)
+    Checking kernel-validation v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-validation)
+    Checking kernel-query v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-query)
+    Checking kernel-lens v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-lens)
+    Checking kernel-semantics v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-semantics)
+    Checking kernel-fixpoint v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-fixpoint)
+error[E0277]: `(dyn ExternalFreshnessAuthority + 'static)` cannot be sent between threads safely
+     --> crates/kernel-plan/src/lib.rs:36381:36
+      |
+36381 |           let _ = std::thread::spawn(move || {
+      |  _________________------------------_^
+      | |                 |
+      | |                 required by a bound introduced by this call
+36382 | |             let _guard = poisoned.runtime.lock().unwrap();
+36383 | |             panic!("intentional reconstructible runtime poison");
+36384 | |         })
+      | |_________^ `(dyn ExternalFreshnessAuthority + 'static)` cannot be sent between threads safely
+      |
+      = help: the trait `Send` is not implemented for `(dyn ExternalFreshnessAuthority + 'static)`
+      = note: required for `Unique<dyn ExternalFreshnessAuthority>` to implement `Send`
+note: required because it appears within the type `Box<(dyn ExternalFreshnessAuthority + 'static)>`
+     --> /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:234:11
+note: required because it appears within the type `kernel_durability::store::ExternalFreshnessState`
+     --> crates/kernel-durability/src/store.rs:119:8
+      |
+  119 | struct ExternalFreshnessState {
+      |        ^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<ExternalFreshnessState>`
+     --> /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/option.rs:598:9
+note: required because it appears within the type `kernel_durability::DurableRevisionStore`
+     --> crates/kernel-durability/src/store.rs:392:12
+      |
+  392 | pub struct DurableRevisionStore {
+      |            ^^^^^^^^^^^^^^^^^^^^
+      = note: required for `Mutex<DurableRevisionStore>` to implement `Send`
+note: required because it appears within the type `DurableRuntime`
+     --> crates/kernel-plan/src/lib.rs:2018:12
+      |
+ 2018 | pub struct DurableRuntime {
+      |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `std::option::Option<DurableRuntime>`
+     --> /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/option.rs:598:9
+      = note: required for `std::sync::Mutex<std::option::Option<DurableRuntime>>` to implement `Sync`
+note: required because it appears within the type `DurableRuntimeSupervisor`
+     --> crates/kernel-plan/src/lib.rs:2028:12
+      |
+ 2028 | pub struct DurableRuntimeSupervisor {
+      |            ^^^^^^^^^^^^^^^^^^^^^^^^
+      = note: required for `std::sync::Arc<DurableRuntimeSupervisor>` to implement `Send`
+note: required because it's used within this closure
+     --> crates/kernel-plan/src/lib.rs:36381:36
+      |
+36381 |         let _ = std::thread::spawn(move || {
+      |                                    ^^^^^^^
+note: required by a bound in `spawn`
+     --> /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/functions.rs:125:0
+      = note: the full name for the type has been written to '/mnt/data/cfmd_pass118_target/debug/deps/kernel_plan-f2cc1b5c8fefb9c7.long-type-11286603396673962016.txt'
+      = note: consider using `--verbose` to print the full type name to the console
+
+    Checking kernel-integration v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-integration)
+    Checking kernel-model v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-model)
+    Checking kernel-lifecycle v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-lifecycle)
+    Checking kernel-semantic-index v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-semantic-index)
+    Checking kernel-identity v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-identity)
+    Checking kernel-schema v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-schema)
+    Checking kernel-change v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-change)
+    Checking kernel-grounded-closure v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-grounded-closure)
+    Checking kernel-violation v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-violation)
+    Checking kernel-proof v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-proof)
+    Checking kernel-aggregate v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-aggregate)
+    Checking kernel-types v0.1.0 (/mnt/data/cfmd_pass118_p17/crates/kernel-types)
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `kernel-plan` (lib test) due to 1 previous error

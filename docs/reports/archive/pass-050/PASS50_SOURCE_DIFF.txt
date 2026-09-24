@@ -1,0 +1,899 @@
+diff -ruN --exclude target --exclude evidence --exclude '*.md' /mnt/data/cfmd_workspace_pass49/crates/kernel-plan/src/lib.rs /mnt/data/cfmd_workspace_pass50/crates/kernel-plan/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass49/crates/kernel-plan/src/lib.rs	2026-09-20 14:49:21.392039007 +0000
++++ /mnt/data/cfmd_workspace_pass50/crates/kernel-plan/src/lib.rs	2026-09-20 15:18:43.495496118 +0000
+@@ -653,6 +653,7 @@
+     relations: BTreeMap<(SemanticId, LayoutId), InstalledRelation>,
+     i64_indexes: BTreeMap<I64IndexBinding, MaterializedI64IndexState>,
+     semantic_indexes: BTreeMap<SemanticIndexBinding, MaterializedSemanticIndexState>,
++    semantic_quotient_factors: BTreeMap<SemanticIndexBinding, MaterializedSemanticIndexState>,
+     semantic_statistics: BTreeMap<SemanticIndexBinding, MaterializedSemanticStatisticsState>,
+     advisor_managed_semantic_indexes: BTreeSet<SemanticIndexBinding>,
+     transition_epoch: u64,
+@@ -2636,6 +2637,52 @@
+     )?)
+ }
+ 
++fn validate_semantic_index_family_context(
++    states: &BTreeMap<SemanticIndexBinding, MaterializedSemanticIndexState>,
++    relation: SemanticId,
++    layout: LayoutBinding,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<(), PhysicalExecutionError> {
++    for (binding, state) in states {
++        if binding.relation == relation
++            && binding.layout.id == layout.id
++            && !state.compatible_with(context, registry)?
++        {
++            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
++        }
++    }
++    Ok(())
++}
++
++fn validate_semantic_index_family_delta(
++    states: &BTreeMap<SemanticIndexBinding, MaterializedSemanticIndexState>,
++    relation: SemanticId,
++    layout: LayoutBinding,
++    delta: &PhysicalRelationDelta,
++) -> Result<(), PhysicalExecutionError> {
++    for (binding, state) in states {
++        if binding.relation == relation && binding.layout.id == layout.id {
++            state.validate_physical_delta(delta)?;
++        }
++    }
++    Ok(())
++}
++
++fn apply_semantic_index_family_delta(
++    states: &mut BTreeMap<SemanticIndexBinding, MaterializedSemanticIndexState>,
++    relation: SemanticId,
++    layout: LayoutBinding,
++    delta: &PhysicalRelationDelta,
++) -> Result<(), PhysicalExecutionError> {
++    for (binding, state) in states {
++        if binding.relation == relation && binding.layout.id == layout.id {
++            state.apply_physical_delta(delta)?;
++        }
++    }
++    Ok(())
++}
++
+ impl PhysicalStore {
+     pub fn install(
+         &mut self,
+@@ -2669,6 +2716,8 @@
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+         self.semantic_indexes
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
++        self.semantic_quotient_factors
++            .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+         self.semantic_statistics
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+         self.advisor_managed_semantic_indexes
+@@ -2846,6 +2895,90 @@
+         Ok(prepared)
+     }
+ 
++    fn validate_relation_semantic_context(
++        &self,
++        relation: SemanticId,
++        layout: LayoutBinding,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        validate_semantic_index_family_context(
++            &self.semantic_indexes,
++            relation,
++            layout,
++            context,
++            registry,
++        )?;
++        validate_semantic_index_family_context(
++            &self.semantic_quotient_factors,
++            relation,
++            layout,
++            context,
++            registry,
++        )?;
++        for (binding, state) in &self.semantic_statistics {
++            if binding.relation == relation
++                && binding.layout.id == layout.id
++                && !state.compatible_with(context, registry)?
++            {
++                return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
++            }
++        }
++        Ok(())
++    }
++
++    fn validate_relation_derived_delta(
++        &self,
++        relation: SemanticId,
++        layout: LayoutBinding,
++        delta: &PhysicalRelationDelta,
++    ) -> Result<(), PhysicalExecutionError> {
++        for (binding, state) in &self.i64_indexes {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.validate_physical_delta(delta)?;
++            }
++        }
++        validate_semantic_index_family_delta(&self.semantic_indexes, relation, layout, delta)?;
++        validate_semantic_index_family_delta(
++            &self.semantic_quotient_factors,
++            relation,
++            layout,
++            delta,
++        )?;
++        for (binding, state) in &self.semantic_statistics {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.validate_physical_delta(delta)?;
++            }
++        }
++        Ok(())
++    }
++
++    fn apply_relation_derived_delta(
++        &mut self,
++        relation: SemanticId,
++        layout: LayoutBinding,
++        delta: &PhysicalRelationDelta,
++    ) -> Result<(), PhysicalExecutionError> {
++        for (binding, state) in &mut self.i64_indexes {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.apply_physical_delta(delta)?;
++            }
++        }
++        apply_semantic_index_family_delta(&mut self.semantic_indexes, relation, layout, delta)?;
++        apply_semantic_index_family_delta(
++            &mut self.semantic_quotient_factors,
++            relation,
++            layout,
++            delta,
++        )?;
++        for (binding, state) in &mut self.semantic_statistics {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.apply_physical_delta(delta)?;
++            }
++        }
++        Ok(())
++    }
++
+     /// Atomically applies a semantic relation delta to the installed physical relation and to
+     /// every persisted I64 index bound to that exact relation/layout. The complete mutation is
+     /// planned and validated before any state is changed, so user-visible validation failures do
+@@ -2959,22 +3092,7 @@
+                     relation,
+                     layout: layout.id,
+                 })?;
+-        for (binding, state) in &self.semantic_indexes {
+-            if binding.relation == relation
+-                && binding.layout.id == layout.id
+-                && !state.compatible_with(context, registry)?
+-            {
+-                return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+-            }
+-        }
+-        for (binding, state) in &self.semantic_statistics {
+-            if binding.relation == relation
+-                && binding.layout.id == layout.id
+-                && !state.compatible_with(context, registry)?
+-            {
+-                return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+-            }
+-        }
++        self.validate_relation_semantic_context(relation, layout, context, registry)?;
+         let candidate_index = self
+             .i64_indexes
+             .iter()
+@@ -2988,21 +3106,7 @@
+             context,
+             registry,
+         )?;
+-        for (binding, state) in &self.i64_indexes {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                state.validate_physical_delta(&physical_delta)?;
+-            }
+-        }
+-        for (binding, state) in &self.semantic_indexes {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                state.validate_physical_delta(&physical_delta)?;
+-            }
+-        }
+-        for (binding, state) in &self.semantic_statistics {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                state.validate_physical_delta(&physical_delta)?;
+-            }
+-        }
++        self.validate_relation_derived_delta(relation, layout, &physical_delta)?;
+         let next_epoch = self
+             .transition_epoch
+             .checked_add(1)
+@@ -3015,21 +3119,7 @@
+             },
+         )?;
+         apply_planned_relation_delta(installed, &physical_delta)?;
+-        for (binding, state) in &mut self.i64_indexes {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                state.apply_physical_delta(&physical_delta)?;
+-            }
+-        }
+-        for (binding, state) in &mut self.semantic_indexes {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                state.apply_physical_delta(&physical_delta)?;
+-            }
+-        }
+-        for (binding, state) in &mut self.semantic_statistics {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                state.apply_physical_delta(&physical_delta)?;
+-            }
+-        }
++        self.apply_relation_derived_delta(relation, layout, &physical_delta)?;
+         self.transition_epoch = next_epoch;
+         let resolved_delta = RelationDelta {
+             inserted: physical_delta
+@@ -3095,6 +3185,13 @@
+         self.semantic_indexes.get(index)
+     }
+ 
++    fn semantic_quotient_factor(
++        &self,
++        index: &SemanticIndexBinding,
++    ) -> Option<&MaterializedSemanticIndexState> {
++        self.semantic_quotient_factors.get(index)
++    }
++
+     fn installed(
+         &self,
+         relation: SemanticId,
+@@ -3339,6 +3436,13 @@
+         self.index.distinct_key_count()
+     }
+ 
++    fn single_key_for(&self, row_id: PhysicalRowId) -> Option<&kernel_semantics::CanonicalEqKey> {
++        if self.binding.key_parts.len() != 1 {
++            return None;
++        }
++        self.index.key_for(&row_id).and_then(|key| key.first())
++    }
++
+     fn probe_values(
+         &self,
+         values: &[&Value],
+@@ -3569,6 +3673,8 @@
+     pub multiway_join_order_preserving_enumerations: usize,
+     pub multiway_join_semantic_quotient_constraints: usize,
+     pub multiway_join_semantic_quotient_pruned_rows: usize,
++    pub multiway_join_prepared_quotient_hits: usize,
++    pub multiway_join_maintained_quotient_key_hits: usize,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -4122,8 +4228,40 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(RelationValue, ExecutionStats), PhysicalExecutionError> {
++        self.execute_native_with_prepared_quotient(store, result_type, context, registry, None)
++    }
++
++    fn execute_native_with_prepared_quotient(
++        &self,
++        store: &PhysicalStore,
++        result_type: &RelType,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++        prepared_program: Option<&PreparedSemanticQuotientProgram>,
++    ) -> Result<(RelationValue, ExecutionStats), PhysicalExecutionError> {
+         let mut stats = ExecutionStats::default();
+-        let rows = self.execute_native_rows(store, context, registry, &mut stats)?;
++        let rows = if let Some(program) = prepared_program {
++            if let Some(rows) = try_execute_nway_order_preserving_join(
++                self,
++                Some(program),
++                store,
++                context,
++                registry,
++                &mut stats,
++            )? {
++                stats.multiway_join_reorders = stats.multiway_join_reorders.saturating_add(1);
++                stats.multiway_join_order_preserving_enumerations = stats
++                    .multiway_join_order_preserving_enumerations
++                    .saturating_add(1);
++                stats.multiway_join_prepared_quotient_hits =
++                    stats.multiway_join_prepared_quotient_hits.saturating_add(1);
++                rows
++            } else {
++                self.execute_native_rows(store, context, registry, &mut stats)?
++            }
++        } else {
++            self.execute_native_rows(store, context, registry, &mut stats)?
++        };
+         let value = match &result_type.semantics {
+             kernel_schema::RelationSemantics::Set {
+                 column_equivalences,
+@@ -4744,6 +4882,12 @@
+     target.multiway_join_semantic_quotient_pruned_rows = target
+         .multiway_join_semantic_quotient_pruned_rows
+         .saturating_add(source.multiway_join_semantic_quotient_pruned_rows);
++    target.multiway_join_prepared_quotient_hits = target
++        .multiway_join_prepared_quotient_hits
++        .saturating_add(source.multiway_join_prepared_quotient_hits);
++    target.multiway_join_maintained_quotient_key_hits = target
++        .multiway_join_maintained_quotient_key_hits
++        .saturating_add(source.multiway_join_maintained_quotient_key_hits);
+ }
+ 
+ struct TypedBatchSelection<'a> {
+@@ -6627,6 +6771,11 @@
+     registry: &'a kernel_semantics::SemanticRegistry,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct PreparedSemanticQuotientProgram {
++    specs: Vec<(SemanticId, Vec<MultiwayJoinColumnRef>)>,
++}
++
+ #[derive(Debug, Clone)]
+ struct SemanticQuotientLeaf {
+     leaf: usize,
+@@ -6779,6 +6928,122 @@
+         .collect())
+ }
+ 
++fn flatten_multiway_join_shape(
++    plan: &Plan,
++    context: &kernel_schema::SemanticContext,
++    leaf_count: &mut usize,
++    predicates: &mut Vec<MultiwayJoinPredicate>,
++) -> Result<Option<Vec<MultiwayJoinColumnRef>>, RelQueryError> {
++    match plan {
++        Plan::Scan {
++            relation,
++            algorithm: ScanAlgorithm::FullScan,
++            ..
++        } => {
++            let definition = context
++                .schema
++                .relation(*relation)
++                .ok_or(RelQueryError::UnknownRelation(*relation))?;
++            let leaf = *leaf_count;
++            *leaf_count = leaf.saturating_add(1);
++            Ok(Some(
++                (0..definition.columns.len())
++                    .map(|column| MultiwayJoinColumnRef { leaf, column })
++                    .collect(),
++            ))
++        }
++        Plan::JoinEq {
++            left,
++            right,
++            left_column,
++            right_column,
++            equivalence,
++            ..
++        } => {
++            let Some(mut left_columns) =
++                flatten_multiway_join_shape(left, context, leaf_count, predicates)?
++            else {
++                return Ok(None);
++            };
++            let Some(right_columns) =
++                flatten_multiway_join_shape(right, context, leaf_count, predicates)?
++            else {
++                return Ok(None);
++            };
++            let left_ref = left_columns
++                .get(*left_column)
++                .copied()
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            let right_ref = right_columns
++                .get(*right_column)
++                .copied()
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            predicates.push(MultiwayJoinPredicate {
++                left: left_ref,
++                right: right_ref,
++                equivalence: *equivalence,
++            });
++            left_columns.extend(right_columns);
++            Ok(Some(left_columns))
++        }
++        Plan::FilterEqColumns {
++            input,
++            left_column,
++            right_column,
++            equivalence,
++        } => {
++            let Some(columns) =
++                flatten_multiway_join_shape(input, context, leaf_count, predicates)?
++            else {
++                return Ok(None);
++            };
++            let left_ref = columns
++                .get(*left_column)
++                .copied()
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            let right_ref = columns
++                .get(*right_column)
++                .copied()
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            if left_ref.leaf == right_ref.leaf {
++                return Ok(None);
++            }
++            predicates.push(MultiwayJoinPredicate {
++                left: left_ref,
++                right: right_ref,
++                equivalence: *equivalence,
++            });
++            Ok(Some(columns))
++        }
++        _ => Ok(None),
++    }
++}
++
++fn prepare_semantic_quotient_program(
++    plan: &Plan,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<PreparedSemanticQuotientProgram>, RelQueryError> {
++    if !matches!(plan, Plan::JoinEq { .. } | Plan::FilterEqColumns { .. }) {
++        return Ok(None);
++    }
++    let mut leaf_count = 0;
++    let mut predicates = Vec::new();
++    let Some(_) = flatten_multiway_join_shape(plan, context, &mut leaf_count, &mut predicates)?
++    else {
++        return Ok(None);
++    };
++    if !(3..=8).contains(&leaf_count) {
++        return Ok(None);
++    }
++    let specs =
++        semantic_quotient_specs(&predicates, context, registry).map_err(|error| match error {
++            PhysicalExecutionError::Query(query) => query,
++            _ => RelQueryError::InconsistentIncrementalDelta,
++        })?;
++    Ok(Some(PreparedSemanticQuotientProgram { specs }))
++}
++
+ fn quotient_key_cache(
+     specs: &[(SemanticId, Vec<MultiwayJoinColumnRef>)],
+     leaves: &[MultiwayJoinLeaf],
+@@ -6798,8 +7063,36 @@
+             if cache.contains_key(&cache_key) {
+                 continue;
+             }
++            let factor_binding = SemanticIndexBinding::single(
++                leaves[endpoint.leaf].relation,
++                leaves[endpoint.leaf].layout,
++                endpoint.column,
++                *equivalence,
++            );
++            let maintained_factor =
++                if let Some(index) = store.semantic_quotient_factor(&factor_binding) {
++                    if index.compatible_with(context, registry)?
++                        && index.row_count() == handles[endpoint.leaf].len()
++                    {
++                        Some(index)
++                    } else {
++                        None
++                    }
++                } else {
++                    None
++                };
+             let mut keys = Vec::with_capacity(handles[endpoint.leaf].len());
+             for row_id in &handles[endpoint.leaf] {
++                if let Some(index) = maintained_factor {
++                    let key = index
++                        .single_key_for(*row_id)
++                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                    keys.push(key.clone());
++                    stats.multiway_join_maintained_quotient_key_hits = stats
++                        .multiway_join_maintained_quotient_key_hits
++                        .saturating_add(1);
++                    continue;
++                }
+                 let row = leaf_row_by_handle(store, &leaves[endpoint.leaf], *row_id)?;
+                 let value = row
+                     .get(endpoint.column)
+@@ -6865,18 +7158,36 @@
+     common
+ }
+ 
++struct SemanticQuotientBuildContext<'a> {
++    leaves: &'a [MultiwayJoinLeaf],
++    predicates: &'a [MultiwayJoinPredicate],
++    handles: &'a [Vec<PhysicalRowId>],
++    store: &'a PhysicalStore,
++    context: &'a kernel_schema::SemanticContext,
++    registry: &'a kernel_semantics::SemanticRegistry,
++}
++
+ fn build_semantic_quotient_constraints(
+-    leaves: &[MultiwayJoinLeaf],
+-    predicates: &[MultiwayJoinPredicate],
+-    handles: &[Vec<PhysicalRowId>],
+-    store: &PhysicalStore,
+-    context: &kernel_schema::SemanticContext,
+-    registry: &kernel_semantics::SemanticRegistry,
++    build: &SemanticQuotientBuildContext<'_>,
++    prepared_specs: Option<&[(SemanticId, Vec<MultiwayJoinColumnRef>)]>,
+     stats: &mut ExecutionStats,
+ ) -> Result<Option<Vec<SemanticQuotientConstraint>>, PhysicalExecutionError> {
+-    let specs = semantic_quotient_specs(predicates, context, registry)?;
+-    let Some(key_cache) =
+-        quotient_key_cache(&specs, leaves, handles, store, context, registry, stats)?
++    let owned_specs;
++    let specs = if let Some(prepared) = prepared_specs {
++        prepared
++    } else {
++        owned_specs = semantic_quotient_specs(build.predicates, build.context, build.registry)?;
++        &owned_specs
++    };
++    let Some(key_cache) = quotient_key_cache(
++        specs,
++        build.leaves,
++        build.handles,
++        build.store,
++        build.context,
++        build.registry,
++        stats,
++    )?
+     else {
+         return Ok(None);
+     };
+@@ -6894,8 +7205,8 @@
+             quotient_leaves.push(quotient_leaf_keys(
+                 leaf,
+                 &columns,
+-                equivalence,
+-                handles[leaf].len(),
++                *equivalence,
++                build.handles[leaf].len(),
+                 &key_cache,
+             )?);
+         }
+@@ -7085,6 +7396,7 @@
+ fn execute_order_preserving_quotient_join(
+     leaves: &[MultiwayJoinLeaf],
+     predicates: &[MultiwayJoinPredicate],
++    prepared_program: Option<&PreparedSemanticQuotientProgram>,
+     store: &PhysicalStore,
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+@@ -7097,8 +7409,18 @@
+     stats.scanned_rows = stats
+         .scanned_rows
+         .saturating_add(handles.iter().map(Vec::len).sum::<usize>());
++    let build = SemanticQuotientBuildContext {
++        leaves,
++        predicates,
++        handles: &handles,
++        store,
++        context,
++        registry,
++    };
+     let Some(constraints) = build_semantic_quotient_constraints(
+-        leaves, predicates, &handles, store, context, registry, stats,
++        &build,
++        prepared_program.map(|program| program.specs.as_slice()),
++        stats,
+     )?
+     else {
+         return Ok(None);
+@@ -7182,13 +7504,21 @@
+ fn estimated_quotient_build_work(
+     leaves: &[MultiwayJoinLeaf],
+     predicates: &[MultiwayJoinPredicate],
++    prepared_program: Option<&PreparedSemanticQuotientProgram>,
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<u128, PhysicalExecutionError> {
++    let owned_specs;
++    let quotient_specs = if let Some(program) = prepared_program {
++        program.specs.as_slice()
++    } else {
++        owned_specs = semantic_quotient_specs(predicates, context, registry)?;
++        &owned_specs
++    };
+     let mut specs = BTreeSet::new();
+-    for (equivalence, endpoints) in semantic_quotient_specs(predicates, context, registry)? {
++    for (equivalence, endpoints) in quotient_specs {
+         for endpoint in endpoints {
+-            specs.insert((endpoint.leaf, endpoint.column, equivalence));
++            specs.insert((endpoint.leaf, endpoint.column, *equivalence));
+         }
+     }
+     Ok(specs.into_iter().fold(0_u128, |work, (leaf, _, _)| {
+@@ -7374,6 +7704,7 @@
+ 
+ fn try_execute_nway_order_preserving_join(
+     plan: &Plan,
++    prepared_program: Option<&PreparedSemanticQuotientProgram>,
+     store: &PhysicalStore,
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+@@ -7405,6 +7736,7 @@
+         .saturating_add(estimated_quotient_build_work(
+             &leaves,
+             &predicates,
++            prepared_program,
+             context,
+             registry,
+         )?)
+@@ -7412,7 +7744,15 @@
+     if estimated_work >= contiguous.cost {
+         return Ok(None);
+     }
+-    execute_order_preserving_quotient_join(&leaves, &predicates, store, context, registry, stats)
++    execute_order_preserving_quotient_join(
++        &leaves,
++        &predicates,
++        prepared_program,
++        store,
++        context,
++        registry,
++        stats,
++    )
+ }
+ 
+ fn try_execute_multiway_join(
+@@ -7426,7 +7766,7 @@
+         return Ok(None);
+     }
+     if let Some(rows) =
+-        try_execute_nway_order_preserving_join(plan, store, context, registry, stats)?
++        try_execute_nway_order_preserving_join(plan, None, store, context, registry, stats)?
+     {
+         stats.multiway_join_reorders = stats.multiway_join_reorders.saturating_add(1);
+         stats.multiway_join_order_preserving_enumerations = stats
+@@ -11208,6 +11548,7 @@
+     lowering: kernel_proof::CheckedCertificate<LoweringChecker>,
+     result_type: RelType,
+     semantic_context: kernel_schema::SemanticContext,
++    semantic_quotient_program: Option<PreparedSemanticQuotientProgram>,
+ }
+ 
+ impl PreparedPlan {
+@@ -11248,8 +11589,13 @@
+         store: &PhysicalStore,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(RelationValue, ExecutionStats), PhysicalExecutionError> {
+-        self.physical()
+-            .execute_native(store, &self.result_type, &self.semantic_context, registry)
++        self.physical().execute_native_with_prepared_quotient(
++            store,
++            &self.result_type,
++            &self.semantic_context,
++            registry,
++            self.semantic_quotient_program.as_ref(),
++        )
+     }
+ 
+     pub fn execute_native(
+@@ -11263,6 +11609,74 @@
+         }
+         self.execute_native_pinned(store, registry)
+     }
++
++    /// Materializes the primitive canonical-key factors used by this prepared Γ-quotient
++    /// program as dedicated reconstructible physical state. Factor states reuse the same
++    /// canonical index implementation and atomic relation-delta maintenance law as ordinary
++    /// semantic indexes, but do not participate in access-path selection or index ownership.
++    pub fn materialize_semantic_quotient_factors(
++        &self,
++        store: &mut PhysicalStore,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<usize, PhysicalExecutionError> {
++        let Some(program) = &self.semantic_quotient_program else {
++            return Ok(0);
++        };
++        let mut leaves = Vec::new();
++        let mut predicates = Vec::new();
++        let Some(_) =
++            flatten_multiway_join_tree(self.physical(), store, &mut leaves, &mut predicates)?
++        else {
++            return Ok(0);
++        };
++        let mut bindings = BTreeSet::new();
++        for (equivalence, endpoints) in &program.specs {
++            for endpoint in endpoints {
++                let leaf = leaves
++                    .get(endpoint.leaf)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                bindings.insert(SemanticIndexBinding::single(
++                    leaf.relation,
++                    leaf.layout,
++                    endpoint.column,
++                    *equivalence,
++                ));
++            }
++        }
++        let mut prepared = Vec::new();
++        for binding in bindings {
++            let compatible = match store.semantic_quotient_factors.get(&binding) {
++                Some(state) => state.compatible_with(&self.semantic_context, registry)?,
++                None => false,
++            };
++            if compatible {
++                continue;
++            }
++            let relation = store.installed(binding.relation, binding.layout)?;
++            prepared.push((
++                binding.clone(),
++                MaterializedSemanticIndexState::build(
++                    binding,
++                    relation,
++                    &self.semantic_context,
++                    registry,
++                )?,
++            ));
++        }
++        if prepared.is_empty() {
++            return Ok(0);
++        }
++        let next_epoch = store
++            .transition_epoch
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
++        let count = prepared.len();
++        for (binding, state) in prepared {
++            store.semantic_quotient_factors.insert(binding, state);
++        }
++        store.transition_epoch = next_epoch;
++        Ok(count)
++    }
+ }
+ 
+ pub fn prepare_baseline(
+@@ -11273,10 +11687,13 @@
+     let prepared = logical.prepare(context, registry)?;
+     let result_type = prepared.result_type().clone();
+     let lowering = certify_baseline_lowering(logical)?;
++    let semantic_quotient_program =
++        prepare_semantic_quotient_program(&lowering.spec().physical, context, registry)?;
+     Ok(PreparedPlan {
+         lowering,
+         result_type,
+         semantic_context: context.clone(),
++        semantic_quotient_program,
+     })
+ }
+ 
+@@ -11312,10 +11729,13 @@
+     let prepared = logical.prepare(context, registry)?;
+     let result_type = prepared.result_type().clone();
+     let lowering = certify_lowering_with_catalog(logical, catalog)?;
++    let semantic_quotient_program =
++        prepare_semantic_quotient_program(&lowering.spec().physical, context, registry)?;
+     Ok(PreparedPlan {
+         lowering,
+         result_type,
+         semantic_context: context.clone(),
++        semantic_quotient_program,
+     })
+ }
+ 
+@@ -14703,6 +15123,7 @@
+         let native = execute_order_preserving_quotient_join(
+             &leaves,
+             &predicates,
++            None,
+             &store,
+             &context,
+             &registry,
+@@ -14945,10 +15366,114 @@
+         assert_eq!(native.rows().len(), 2);
+         assert_eq!(stats.multiway_join_order_preserving_enumerations, 1);
+         assert_eq!(stats.multiway_join_reorders, 1);
++        assert_eq!(stats.multiway_join_prepared_quotient_hits, 1);
+         assert_eq!(stats.scanned_rows, 2_003);
+     }
+ 
+     #[test]
++    fn prepared_gamma_quotient_factors_reuse_delta_maintained_canonical_keys() {
++        let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();
++        let bindings = [1_090_u128, 1_091, 1_092].map(|id| LayoutBinding {
++            id: LayoutId(id),
++            family: LayoutFamily::Columnar,
++        });
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, binding) in [a, b, c].into_iter().zip(bindings) {
++            catalog.bind_relation(relation, binding);
++        }
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(a)),
++                right: Box::new(RelExpr::Scan(b)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            right: Box::new(RelExpr::Scan(c)),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let values = [
++            (1_i64..=20).collect::<Vec<_>>(),
++            vec![1_i64; 100],
++            (1_i64..=20).collect::<Vec<_>>(),
++        ];
++        let mut store = PhysicalStore::default();
++        let mut model = kernel_model::FiniteModel::default();
++        for ((relation, layout), relation_values) in [a, b, c].into_iter().zip(bindings).zip(values)
++        {
++            store
++                .install(
++                    relation,
++                    layout,
++                    NativeRelation::typed_columnar(vec![NativeColumn::I64(
++                        relation_values.clone(),
++                    )])
++                    .unwrap(),
++                )
++                .unwrap();
++            store
++                .install_semantic_statistics(
++                    SemanticIndexBinding::single(relation, layout, 0, equivalence),
++                    &context,
++                    &registry,
++                )
++                .unwrap();
++            model.relations.insert(
++                relation,
++                relation_values
++                    .into_iter()
++                    .map(|value| vec![Value::I64(value)])
++                    .collect(),
++            );
++        }
++        assert_eq!(
++            prepared
++                .materialize_semantic_quotient_factors(&mut store, &registry)
++                .unwrap(),
++            3
++        );
++        assert_eq!(
++            prepared
++                .materialize_semantic_quotient_factors(&mut store, &registry)
++                .unwrap(),
++            0
++        );
++        let factor_binding = SemanticIndexBinding::single(a, bindings[0], 0, equivalence);
++        assert!(store.semantic_index(&factor_binding).is_none());
++        assert!(store.semantic_quotient_factor(&factor_binding).is_some());
++
++        let (before, before_stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            before,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(before_stats.multiway_join_prepared_quotient_hits, 1);
++        assert_eq!(before_stats.multiway_join_maintained_quotient_key_hits, 140);
++
++        let delta = scan_delta(c, &[21], &[20], &context, &registry);
++        store
++            .apply_relation_delta(c, bindings[2], &delta, &context, &registry)
++            .unwrap();
++        model.relations.get_mut(&c).unwrap().pop();
++        model
++            .relations
++            .get_mut(&c)
++            .unwrap()
++            .push(vec![Value::I64(21)]);
++        let (after, after_stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            after,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(after_stats.multiway_join_prepared_quotient_hits, 1);
++        assert_eq!(after_stats.multiway_join_maintained_quotient_key_hits, 140);
++    }
++
++    #[test]
+     fn multiway_join_planner_reassociates_contiguous_tree_and_reuses_indexes_after_intermediate() {
+         let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();
+         let bindings = [

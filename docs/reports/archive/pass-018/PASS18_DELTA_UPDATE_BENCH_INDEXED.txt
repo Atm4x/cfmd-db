@@ -1,0 +1,3 @@
+rows=10000 first_no_index_ns=431 first_persisted_index_ns=4188 last_no_index_ns=497409 last_persisted_index_ns=3060
+rows=100000 first_no_index_ns=4198 first_persisted_index_ns=5522 last_no_index_ns=7241314 last_persisted_index_ns=6342
+rows=300000 first_no_index_ns=4410 first_persisted_index_ns=11402 last_no_index_ns=17005650 last_persisted_index_ns=12133

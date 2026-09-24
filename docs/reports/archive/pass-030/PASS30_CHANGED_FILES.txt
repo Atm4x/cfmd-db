@@ -1,0 +1,13 @@
+Production/config changes relative to verified Pass29:
+Cargo.lock
+crates/kernel-types/src/lib.rs
+crates/kernel-query/src/lib.rs
+crates/kernel-plan/Cargo.toml
+crates/kernel-plan/src/lib.rs
+
+Pass30 documentation/evidence added or updated:
+PASS30_REPORT.md
+IMPLEMENTATION_REPORT_pass30.md
+PASS30_CHANGED_FILES.txt
+CFMD_IDEAL_DB_SPEC.md
+evidence/pass30/

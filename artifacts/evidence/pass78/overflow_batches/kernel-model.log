@@ -1,0 +1,17 @@
+   Compiling kernel-model v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-model)
+    Finished `release` profile [optimized] target(s) in 1.73s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_model-767d09c3047c18fe)
+
+running 9 tests
+test tests::normalization_removes_dead_entities_from_carriers_and_owned_fields ... ok
+test tests::indexed_lifecycle_restriction_preserves_previous_dangling_reference_semantics ... ok
+test tests::database_state_clone_path_copies_only_the_mutated_relation ... ok
+test tests::historical_identity_may_outlive_entity ... ok
+test tests::relation_sensitivity_recompile_shares_unaffected_partitions ... ok
+test tests::reverse_live_ref_sensitivity_indexes_nested_fields_and_relation_rows ... ok
+test tests::set_and_map_equality_are_explicit_semantic_inputs ... ok
+test tests::structural_values_are_identity_free_until_reference_is_explicit ... ok
+test tests::surviving_entity_cannot_keep_dangling_live_reference ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

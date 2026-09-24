@@ -1,0 +1,13 @@
+Pass32 intentional changed/new files vs Pass31:
+ARCHITECTURE.md
+CFMD_IDEAL_DB_SPEC.md
+Cargo.lock
+Cargo.toml
+PASS32_REPORT.md
+IMPLEMENTATION_REPORT_pass32.md
+crates/kernel-durability/Cargo.toml
+crates/kernel-durability/src/lib.rs
+crates/kernel-plan/Cargo.toml
+crates/kernel-plan/src/lib.rs
+evidence/pass32/*
+PASS32_KERNEL_PLAN_DIFF.txt

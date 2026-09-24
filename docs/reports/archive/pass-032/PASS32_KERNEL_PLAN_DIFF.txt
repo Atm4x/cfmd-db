@@ -1,0 +1,474 @@
+--- /mnt/data/cfmd_pass31_work/cfmd_workspace_pass31/crates/kernel-plan/src/lib.rs	2026-09-19 22:01:21.782128245 +0000
++++ /mnt/data/cfmd_pass32_work/cfmd_workspace_pass32/crates/kernel-plan/src/lib.rs	2026-09-19 22:24:46.119674295 +0000
+@@ -6,6 +6,10 @@
+     },
+ };
+ 
++use kernel_durability::{
++    DurabilityError, DurableCommitReceipt, DurableRelationMutation, DurableRevisionDescriptor,
++    RecoveryScan, RevisionDurability,
++};
+ use kernel_model::Value;
+ use kernel_query::{
+     AggregateSpec, MaterializedRelPlanState, OrderDirection, RelExpr, RelQueryError, RelType,
+@@ -66,6 +70,13 @@
+         id: LayoutId(0),
+         family: LayoutFamily::LogicalModelRows,
+     };
++
++    /// Deterministic correctness-first physical representation used when a
++    /// runtime root is rebuilt from semantic authority after recovery.
++    pub const RECOVERY_ROW_STORE: Self = Self {
++        id: LayoutId(1),
++        family: LayoutFamily::RowStore,
++    };
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+@@ -527,6 +538,70 @@
+     pub const fn relation_deltas(&self) -> &BTreeMap<SemanticId, RelationDelta> {
+         &self.relation_deltas
+     }
++
++    #[must_use]
++    pub fn durable_descriptor(&self) -> DurableRevisionDescriptor {
++        DurableRevisionDescriptor {
++            source_revision: self.source_revision,
++            target_revision: self.target_revision,
++            semantic_revision: self.semantic_revision,
++            relation_mutations: self
++                .relation_deltas
++                .iter()
++                .map(|(&relation, delta)| DurableRelationMutation {
++                    relation,
++                    inserted: delta.inserted.clone(),
++                    removed: delta.removed.clone(),
++                })
++                .collect(),
++        }
++    }
++}
++
++#[derive(Debug)]
++pub enum DurableRuntimeCommitError {
++    Runtime(PhysicalExecutionError),
++    PrepareDurability(DurabilityError),
++    CommitDurabilityUncertain(DurabilityError),
++}
++
++impl From<PhysicalExecutionError> for DurableRuntimeCommitError {
++    fn from(value: PhysicalExecutionError) -> Self {
++        Self::Runtime(value)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DurableRuntimeCommitReceipt {
++    pub durable: DurableCommitReceipt,
++    pub output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum RuntimeRecoveryError {
++    Durability(DurabilityError),
++    Runtime(PhysicalExecutionError),
++    Revision(kernel_revision::RevisionError),
++    BaseRevisionMismatch,
++    SemanticRevisionMismatch,
++}
++
++impl From<DurabilityError> for RuntimeRecoveryError {
++    fn from(value: DurabilityError) -> Self {
++        Self::Durability(value)
++    }
++}
++
++impl From<PhysicalExecutionError> for RuntimeRecoveryError {
++    fn from(value: PhysicalExecutionError) -> Self {
++        Self::Runtime(value)
++    }
++}
++
++impl From<kernel_revision::RevisionError> for RuntimeRecoveryError {
++    fn from(value: kernel_revision::RevisionError) -> Self {
++        Self::Revision(value)
++    }
+ }
+ 
+ /// Complete logical source->target revision transition request.
+@@ -942,6 +1017,41 @@
+         self.snapshot()?.prepare_revision(request)
+     }
+ 
++    /// Commits one runtime revision through the durable logical WAL boundary.
++    ///
++    /// The exact ordering is:
++    ///
++    /// 1. build the detached runtime candidate;
++    /// 2. durably append PREPARE;
++    /// 3. acquire the exclusive freshness seal;
++    /// 4. durably append COMMIT;
++    /// 5. publish the already-sealed runtime root infallibly.
++    ///
++    /// A stale transition discovered at step 3 leaves only an uncommitted
++    /// durable PREPARE, which recovery ignores. If the COMMIT durability call
++    /// returns an error, the runtime root is not published and the caller must
++    /// treat the durable outcome as uncertain until WAL recovery.
++    pub fn commit_revision_durable<D: RevisionDurability>(
++        &self,
++        request: &RevisionTransitionRequest<'_>,
++        durability: &mut D,
++    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
++        let prepared = self.prepare_revision(request)?;
++        let durable_descriptor = prepared.descriptor().durable_descriptor();
++        let durable_prepare = durability
++            .durably_prepare(&durable_descriptor)
++            .map_err(DurableRuntimeCommitError::PrepareDurability)?;
++        let sealed = prepared.seal(self)?;
++        let durable = durability
++            .durably_commit(durable_prepare)
++            .map_err(DurableRuntimeCommitError::CommitDurabilityUncertain)?;
++        let output_deltas = sealed.publish();
++        Ok(DurableRuntimeCommitReceipt {
++            durable,
++            output_deltas,
++        })
++    }
++
+     /// Reconstructible index publication is also a whole-root swap. Existing
+     /// readers keep their prior immutable snapshot while new readers observe
+     /// the incremented root version under the same semantic revision.
+@@ -1053,6 +1163,96 @@
+     }
+ }
+ 
++/// Replays the committed logical WAL tail over one exact durable base
++/// revision. The current Pass32 WAL intentionally supports relation-data
++/// transitions under an unchanged pinned semantic context; schema/Γ changes
++/// require a separate durable migration codec.
++pub fn replay_durable_revisions(
++    base_revision: &kernel_revision::Revision,
++    scan: &RecoveryScan,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<kernel_revision::Revision, RuntimeRecoveryError> {
++    if scan.base_revision() != base_revision.id() {
++        return Err(RuntimeRecoveryError::BaseRevisionMismatch);
++    }
++    let mut current = base_revision.clone();
++    for committed in scan.committed() {
++        let descriptor = &committed.descriptor;
++        if descriptor.source_revision != current.id() {
++            return Err(RuntimeRecoveryError::BaseRevisionMismatch);
++        }
++        if descriptor.semantic_revision != current.semantic_revision() {
++            return Err(RuntimeRecoveryError::SemanticRevisionMismatch);
++        }
++
++        let mut next_state = current.state().clone();
++        for mutation in &descriptor.relation_mutations {
++            let relation = RelExpr::Scan(mutation.relation);
++            let result_type = relation
++                .typecheck(current.semantic_context(), registry)
++                .map_err(PhysicalExecutionError::from)?;
++            let old = relation
++                .evaluate(&next_state.model, current.semantic_context(), registry)
++                .map_err(PhysicalExecutionError::from)?;
++            let delta = RelationDelta {
++                inserted: mutation.inserted.clone(),
++                removed: mutation.removed.clone(),
++                result_type,
++            };
++            let next = delta
++                .apply_to_value(old, current.semantic_context(), registry)
++                .map_err(PhysicalExecutionError::from)?;
++            next_state
++                .model
++                .relations
++                .insert(mutation.relation, next.into_rows());
++        }
++        current = kernel_revision::Revision::build(
++            descriptor.target_revision,
++            current.semantic_context(),
++            registry,
++            next_state,
++        )?;
++    }
++    Ok(current)
++}
++
++/// Reconstructs a reader-visible runtime root from an exact base revision and
++/// the committed logical WAL tail. Physical row handles, indexes and maintained
++/// state are regenerated rather than recovered as authority.
++pub fn recover_runtime_bundle(
++    base_revision: &kernel_revision::Revision,
++    scan: &RecoveryScan,
++    materialization_specs: &[RuntimeMaterializationSpec],
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<RuntimeRevisionBundle, RuntimeRecoveryError> {
++    let revision = replay_durable_revisions(base_revision, scan, registry)?;
++    let mut physical = PhysicalStore::default();
++    let mut relation_layouts = BTreeMap::new();
++    for relation in revision.semantic_context().schema.relations() {
++        let rows = revision
++            .state()
++            .model
++            .relations
++            .get(&relation.id)
++            .cloned()
++            .unwrap_or_default();
++        physical.install(
++            relation.id,
++            LayoutBinding::RECOVERY_ROW_STORE,
++            NativeRelation::row_store(rows),
++        )?;
++        relation_layouts.insert(relation.id, LayoutBinding::RECOVERY_ROW_STORE);
++    }
++    Ok(RuntimeRevisionBundle::build(
++        revision,
++        physical,
++        relation_layouts,
++        materialization_specs,
++        registry,
++    )?)
++}
++
+ impl PhysicalStore {
+     pub fn install(
+         &mut self,
+@@ -8618,4 +8818,236 @@
+         assert_eq!(relation.position(first), None);
+         assert_eq!(relation.position(current), Some(0));
+     }
++
++    #[test]
++    fn durable_commit_linearizes_before_runtime_publication_and_recovers_from_logical_wal() {
++        let (context, registry, relation, binding, runtime) =
++            scan_runtime_bundle(300, 980, &[1, 2]);
++        let base_revision = runtime.revision().clone();
++        let specs = [RuntimeMaterializationSpec {
++            id: test_materialization_id(),
++            query: RelExpr::Scan(relation),
++        }];
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let target = target_revision_for(&runtime, 301, &mutations, &registry);
++        let cell = RuntimeRevisionCell::new(runtime);
++        let mut wal = kernel_durability::SimulatedRevisionWal::new();
++
++        let receipt = cell
++            .commit_revision_durable(
++                &RevisionTransitionRequest {
++                    target_revision: &target,
++                    mutations: &mutations,
++                    registry: &registry,
++                },
++                &mut wal,
++            )
++            .unwrap();
++
++        assert_eq!(receipt.durable.target_revision(), RevisionId::new(301));
++        let live = cell.snapshot().unwrap();
++        assert_eq!(live.revision_id(), RevisionId::new(301));
++        assert_eq!(
++            runtime_physical_i64_values(live.root(), relation, binding),
++            vec![2, 3]
++        );
++
++        let scan = kernel_durability::scan_wal(wal.crash_image(), base_revision.id()).unwrap();
++        assert_eq!(scan.durable_revision(), RevisionId::new(301));
++        let recovered = recover_runtime_bundle(&base_revision, &scan, &specs, &registry).unwrap();
++        assert_eq!(recovered.revision(), live.revision());
++        assert_eq!(
++            runtime_physical_i64_values(&recovered, relation, LayoutBinding::RECOVERY_ROW_STORE,),
++            vec![2, 3]
++        );
++        assert_eq!(
++            runtime_maintained_i64_values(&recovered, &context, &registry),
++            vec![2, 3]
++        );
++    }
++
++    #[test]
++    fn durable_recovery_replays_multiple_nonconsecutive_revision_ids_idempotently() {
++        let (context, registry, relation, _, runtime) = scan_runtime_bundle(310, 981, &[1, 2]);
++        let base_revision = runtime.revision().clone();
++        let cell = RuntimeRevisionCell::new(runtime);
++        let mut wal = kernel_durability::SimulatedRevisionWal::new();
++
++        let delta_a = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations_a = [RevisionRelationMutation {
++            relation,
++            delta: &delta_a,
++        }];
++        let snapshot = cell.snapshot().unwrap();
++        let target_a = target_revision_for(snapshot.root(), 400, &mutations_a, &registry);
++        drop(snapshot);
++        cell.commit_revision_durable(
++            &RevisionTransitionRequest {
++                target_revision: &target_a,
++                mutations: &mutations_a,
++                registry: &registry,
++            },
++            &mut wal,
++        )
++        .unwrap();
++
++        let delta_b = scan_delta(relation, &[4], &[2], &context, &registry);
++        let mutations_b = [RevisionRelationMutation {
++            relation,
++            delta: &delta_b,
++        }];
++        let snapshot = cell.snapshot().unwrap();
++        let target_b = target_revision_for(snapshot.root(), 900, &mutations_b, &registry);
++        drop(snapshot);
++        cell.commit_revision_durable(
++            &RevisionTransitionRequest {
++                target_revision: &target_b,
++                mutations: &mutations_b,
++                registry: &registry,
++            },
++            &mut wal,
++        )
++        .unwrap();
++
++        let scan = kernel_durability::scan_wal(wal.crash_image(), base_revision.id()).unwrap();
++        let first = replay_durable_revisions(&base_revision, &scan, &registry).unwrap();
++        let second = replay_durable_revisions(&base_revision, &scan, &registry).unwrap();
++        assert_eq!(first, second);
++        assert_eq!(first.id(), RevisionId::new(900));
++        assert_eq!(first, *cell.snapshot().unwrap().revision());
++    }
++
++    struct FailCommitDurability {
++        inner: kernel_durability::SimulatedRevisionWal,
++    }
++
++    impl kernel_durability::RevisionDurability for FailCommitDurability {
++        fn durably_prepare(
++            &mut self,
++            descriptor: &kernel_durability::DurableRevisionDescriptor,
++        ) -> Result<kernel_durability::DurablePrepareToken, kernel_durability::DurabilityError>
++        {
++            self.inner.durably_prepare(descriptor)
++        }
++
++        fn durably_commit(
++            &mut self,
++            _prepared: kernel_durability::DurablePrepareToken,
++        ) -> Result<kernel_durability::DurableCommitReceipt, kernel_durability::DurabilityError>
++        {
++            Err(kernel_durability::DurabilityError::Poisoned)
++        }
++    }
++
++    #[test]
++    fn commit_durability_failure_after_seal_never_publishes_runtime_candidate() {
++        let (context, registry, relation, _, runtime) = scan_runtime_bundle(320, 982, &[1, 2]);
++        let base = runtime.test_clone();
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let target = target_revision_for(&runtime, 321, &mutations, &registry);
++        let cell = RuntimeRevisionCell::new(runtime);
++        let mut durability = FailCommitDurability {
++            inner: kernel_durability::SimulatedRevisionWal::new(),
++        };
++
++        assert!(matches!(
++            cell.commit_revision_durable(
++                &RevisionTransitionRequest {
++                    target_revision: &target,
++                    mutations: &mutations,
++                    registry: &registry,
++                },
++                &mut durability,
++            ),
++            Err(DurableRuntimeCommitError::CommitDurabilityUncertain(
++                kernel_durability::DurabilityError::Poisoned
++            ))
++        ));
++        assert_eq!(cell.snapshot().unwrap().root(), &base);
++        let scan =
++            kernel_durability::scan_wal(durability.inner.crash_image(), RevisionId::new(320))
++                .unwrap();
++        assert_eq!(scan.durable_revision(), RevisionId::new(320));
++    }
++
++    struct InvalidateAfterPrepare<'a> {
++        inner: kernel_durability::SimulatedRevisionWal,
++        live: &'a RuntimeRevisionCell,
++        index: I64IndexBinding,
++        registry: &'a SemanticRegistry,
++    }
++
++    impl kernel_durability::RevisionDurability for InvalidateAfterPrepare<'_> {
++        fn durably_prepare(
++            &mut self,
++            descriptor: &kernel_durability::DurableRevisionDescriptor,
++        ) -> Result<kernel_durability::DurablePrepareToken, kernel_durability::DurabilityError>
++        {
++            let prepared = self.inner.durably_prepare(descriptor)?;
++            self.live
++                .install_i64_index(self.index, self.registry)
++                .expect("reconstructible index publication");
++            Ok(prepared)
++        }
++
++        fn durably_commit(
++            &mut self,
++            prepared: kernel_durability::DurablePrepareToken,
++        ) -> Result<kernel_durability::DurableCommitReceipt, kernel_durability::DurabilityError>
++        {
++            self.inner.durably_commit(prepared)
++        }
++    }
++
++    #[test]
++    fn stale_after_durable_prepare_leaves_only_uncommitted_wal_prepare() {
++        let (context, registry, relation, binding, runtime) =
++            scan_runtime_bundle(330, 983, &[1, 2]);
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let target = target_revision_for(&runtime, 331, &mutations, &registry);
++        let cell = RuntimeRevisionCell::new(runtime);
++        let mut durability = InvalidateAfterPrepare {
++            inner: kernel_durability::SimulatedRevisionWal::new(),
++            live: &cell,
++            index: I64IndexBinding {
++                relation,
++                layout: binding,
++                key_column: 0,
++                equivalence: sid(101),
++            },
++            registry: &registry,
++        };
++
++        assert!(matches!(
++            cell.commit_revision_durable(
++                &RevisionTransitionRequest {
++                    target_revision: &target,
++                    mutations: &mutations,
++                    registry: &registry,
++                },
++                &mut durability,
++            ),
++            Err(DurableRuntimeCommitError::Runtime(
++                PhysicalExecutionError::StalePreparedTransition
++            ))
++        ));
++        assert_eq!(cell.snapshot().unwrap().revision_id(), RevisionId::new(330));
++        let scan =
++            kernel_durability::scan_wal(durability.inner.crash_image(), RevisionId::new(330))
++                .unwrap();
++        assert_eq!(scan.durable_revision(), RevisionId::new(330));
++        assert!(scan.committed().is_empty());
++    }
+ }

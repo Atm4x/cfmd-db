@@ -1,0 +1,32 @@
+    Checking kernel-types v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-types)
+    Checking kernel-proof v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-proof)
+    Checking kernel-aggregate v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-aggregate)
+    Checking kernel-change v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-change)
+    Checking kernel-identity v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-identity)
+    Checking kernel-schema v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-schema)
+    Checking kernel-retention v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-retention)
+    Checking kernel-lifecycle v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-lifecycle)
+    Checking kernel-semantic-index v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-semantic-index)
+    Checking kernel-model v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-model)
+    Checking kernel-semantics v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-semantics)
+    Checking kernel-lens v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-lens)
+    Checking kernel-fixpoint v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-fixpoint)
+    Checking kernel-query v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-query)
+    Checking kernel-validation v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-validation)
+    Checking kernel-revision v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-revision)
+    Checking kernel-durability v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-durability)
+    Checking kernel-transport v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-transport)
+    Checking storage-memory v0.1.0 (/mnt/data/pass71_rebuild/crates/storage-memory)
+    Checking kernel-plan v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-plan)
+    Checking kernel-integration v0.1.0 (/mnt/data/pass71_rebuild/crates/kernel-integration)
+error: this function has too many lines (102/100)
+     --> crates/kernel-plan/src/lib.rs:24956:5
+      |
+24956 |     fn durable_structural_semantic_index_rebuilds_and_serves_after_reopen() {
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_lines
+      = note: `-D clippy::too-many-lines` implied by `-D clippy::pedantic`
+      = help: to override `-D clippy::pedantic` add `#[allow(clippy::too_many_lines)]`
+
+error: could not compile `kernel-plan` (lib test) due to 1 previous error

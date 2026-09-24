@@ -1,0 +1,1522 @@
+--- /mnt/data/cfmd_pass108_execgraph_v4_flattening/crates/kernel-query/src/lib.rs	2026-09-23 13:25:42.538850466 +0000
++++ /mnt/data/cfmd_pass109_execgraph_v4_flat_state_arena/crates/kernel-query/src/lib.rs	2026-09-23 13:51:59.490483493 +0000
+@@ -3141,6 +3141,68 @@
+     },
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct FlatMaintainedRelPlanNode {
++    result_type: RelType,
++    kind: FlatMaintainedRelPlanNodeKind,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum FlatMaintainedRelPlanNodeKind {
++    Scan {
++        relation: kernel_types::SemanticId,
++        value: RelationValue,
++        handles: Option<MaintainedLeafHandles>,
++        canonical_lookup: Option<CanonicalRowPositionIndex>,
++    },
++    Filter {
++        input: NodeId,
++        column: usize,
++        value: Value,
++        equivalence: kernel_types::SemanticId,
++    },
++    FilterColumns {
++        input: NodeId,
++        left_column: usize,
++        right_column: usize,
++        equivalence: kernel_types::SemanticId,
++    },
++    ProjectBag {
++        input: NodeId,
++        columns: Vec<usize>,
++    },
++    ProjectSet {
++        input: NodeId,
++        columns: Vec<usize>,
++        supports: MaterializedSetSupportState,
++    },
++    Distinct {
++        input: NodeId,
++        supports: MaterializedSetSupportState,
++    },
++    PromoteToBag {
++        input: NodeId,
++    },
++    Blocker {
++        left: NodeId,
++        right: NodeId,
++        state: MaterializedBlockerDeltaState,
++    },
++    Join {
++        left: NodeId,
++        right: NodeId,
++        state: MaterializedJoinDeltaState,
++    },
++    Group {
++        input: NodeId,
++        state: MaterializedGroupDeltaState,
++    },
++    TopK {
++        input: NodeId,
++        state: MaterializedTopKDeltaState,
++    },
++}
++
+ #[derive(Debug)]
+ enum MaintainedGroupCommitPatch {
+     Sealed(sealed_group_v3::SealedGroupPatch),
+@@ -3373,47 +3435,94 @@
+         | MaintainedRelPlanNode::FilterColumns { input, .. }
+         | MaintainedRelPlanNode::ProjectBag { input, .. }
+         | MaintainedRelPlanNode::PromoteToBag { input } => {
+-            collect_maintained_state_requirements(input.node.as_ref(), out);
++            collect_maintained_state_requirements(
++                input
++                    .node
++                    .as_deref()
++                    .expect("construction tree child must exist"),
++                out,
++            );
+         }
+         MaintainedRelPlanNode::ProjectSet { input, .. }
+         | MaintainedRelPlanNode::Distinct { input, .. } => {
+-            collect_maintained_state_requirements(input.node.as_ref(), out);
++            collect_maintained_state_requirements(
++                input
++                    .node
++                    .as_deref()
++                    .expect("construction tree child must exist"),
++                out,
++            );
+             out.insert(RelDifferentialStateRequirement::SetSupport);
+         }
+         MaintainedRelPlanNode::Blocker { left, right, .. } => {
+-            collect_maintained_state_requirements(left.node.as_ref(), out);
+-            collect_maintained_state_requirements(right.node.as_ref(), out);
++            collect_maintained_state_requirements(
++                left.node
++                    .as_deref()
++                    .expect("construction tree child must exist"),
++                out,
++            );
++            collect_maintained_state_requirements(
++                right
++                    .node
++                    .as_deref()
++                    .expect("construction tree child must exist"),
++                out,
++            );
+             out.insert(RelDifferentialStateRequirement::BlockerMass);
+         }
+         MaintainedRelPlanNode::Join { left, right, .. } => {
+-            collect_maintained_state_requirements(left.node.as_ref(), out);
+-            collect_maintained_state_requirements(right.node.as_ref(), out);
++            collect_maintained_state_requirements(
++                left.node
++                    .as_deref()
++                    .expect("construction tree child must exist"),
++                out,
++            );
++            collect_maintained_state_requirements(
++                right
++                    .node
++                    .as_deref()
++                    .expect("construction tree child must exist"),
++                out,
++            );
+             out.insert(RelDifferentialStateRequirement::JoinFibers);
+         }
+         MaintainedRelPlanNode::Group { input, .. } => {
+-            collect_maintained_state_requirements(input.node.as_ref(), out);
++            collect_maintained_state_requirements(
++                input
++                    .node
++                    .as_deref()
++                    .expect("construction tree child must exist"),
++                out,
++            );
+             out.insert(RelDifferentialStateRequirement::GroupAnnotations);
+         }
+         MaintainedRelPlanNode::TopK { input, .. } => {
+-            collect_maintained_state_requirements(input.node.as_ref(), out);
++            collect_maintained_state_requirements(
++                input
++                    .node
++                    .as_deref()
++                    .expect("construction tree child must exist"),
++                out,
++            );
+             out.insert(RelDifferentialStateRequirement::OrderedCut);
+         }
+     }
+ }
+ 
+-/// Recursive owner for a maintained relational expression tree.
++/// Flat `NodeId` owner for maintained relational execution state.
+ ///
+-/// Construction is bottom-up from child snapshots. Maintenance is top-down only at
+-/// the leaf boundary: callers provide exact deltas for changed base relations and the
+-/// tree propagates exact operator deltas through its owned children without replaying
+-/// the model or re-evaluating nested expressions.
++/// Construction may use a temporary bottom-up tree to reuse the operator builders, but
++/// release states discard that tree after flattening. Runtime planning, validation,
++/// output reconstruction, and commit address authoritative state only through the
++/// compiled graph's stable postorder `NodeId` coordinates.
+ #[derive(Debug)]
+ pub struct MaterializedRelPlanState {
+     query: RelExpr,
+     semantic_context: kernel_schema::SemanticContext,
+     differential: Arc<RelDifferentialProgram>,
+     result_type: RelType,
+-    node: Arc<MaintainedRelPlanNode>,
++    node: Option<Arc<MaintainedRelPlanNode>>,
++    arena: Arc<Vec<Arc<FlatMaintainedRelPlanNode>>>,
+     execgraph_scratch: UnifiedTransitionScratch<MaintainedDelta>,
+     transition_epoch: u64,
+     revision: Option<kernel_types::RevisionId>,
+@@ -3428,7 +3537,8 @@
+             semantic_context: self.semantic_context.clone(),
+             differential: Arc::clone(&self.differential),
+             result_type: self.result_type.clone(),
+-            node: Arc::clone(&self.node),
++            node: self.node.as_ref().map(Arc::clone),
++            arena: Arc::clone(&self.arena),
+             execgraph_scratch: UnifiedTransitionScratch::default(),
+             transition_epoch: self.transition_epoch,
+             revision: self.revision,
+@@ -3442,7 +3552,7 @@
+             && self.semantic_context == other.semantic_context
+             && self.differential == other.differential
+             && self.result_type == other.result_type
+-            && self.node == other.node
++            && self.arena == other.arena
+             && self.transition_epoch == other.transition_epoch
+             && self.revision == other.revision
+     }
+@@ -3461,10 +3571,45 @@
+         let differential = Arc::new(RelDifferentialProgram::compile(query, context, registry)?);
+         let state = Self::build_subtree(query, old, context, registry, Arc::clone(&differential))?;
+         let mut bound_requirements = BTreeSet::new();
+-        collect_maintained_state_requirements(state.node.as_ref(), &mut bound_requirements);
++        collect_maintained_state_requirements(
++            state
++                .node
++                .as_deref()
++                .expect("construction tree must exist before flat-arena freeze"),
++            &mut bound_requirements,
++        );
+         if bound_requirements != differential.state_requirements() {
+             return Err(RelQueryError::InconsistentIncrementalDelta);
+         }
++        let mut state = state;
++        let mut arena = Vec::with_capacity(
++            state
++                .differential
++                .physical_program()
++                .execution_graph()
++                .node_count(),
++        );
++        let root = Self::flatten_runtime_arena(&state, &mut arena);
++        if root
++            != state
++                .differential
++                .physical_program()
++                .execution_graph()
++                .root()
++            || arena.len()
++                != state
++                    .differential
++                    .physical_program()
++                    .execution_graph()
++                    .node_count()
++        {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        state.arena = Arc::new(arena);
++        #[cfg(not(debug_assertions))]
++        {
++            state.node = None;
++        }
+         Ok(state)
+     }
+ 
+@@ -3482,13 +3627,113 @@
+             semantic_context: context.clone(),
+             differential,
+             result_type,
+-            node: Arc::new(node),
++            node: Some(Arc::new(node)),
++            arena: Arc::new(Vec::new()),
+             execgraph_scratch: UnifiedTransitionScratch::default(),
+             transition_epoch: 0,
+             revision: None,
+         })
+     }
+ 
++    fn flatten_runtime_arena(
++        state: &Self,
++        out: &mut Vec<Arc<FlatMaintainedRelPlanNode>>,
++    ) -> NodeId {
++        let kind = match state
++            .node
++            .as_deref()
++            .expect("construction tree must exist while flattening")
++        {
++            MaintainedRelPlanNode::Scan {
++                relation,
++                value,
++                handles,
++                canonical_lookup,
++            } => FlatMaintainedRelPlanNodeKind::Scan {
++                relation: *relation,
++                value: value.clone(),
++                handles: handles.clone(),
++                canonical_lookup: canonical_lookup.clone(),
++            },
++            MaintainedRelPlanNode::Filter {
++                input,
++                column,
++                value,
++                equivalence,
++            } => FlatMaintainedRelPlanNodeKind::Filter {
++                input: Self::flatten_runtime_arena(input, out),
++                column: *column,
++                value: value.clone(),
++                equivalence: *equivalence,
++            },
++            MaintainedRelPlanNode::FilterColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => FlatMaintainedRelPlanNodeKind::FilterColumns {
++                input: Self::flatten_runtime_arena(input, out),
++                left_column: *left_column,
++                right_column: *right_column,
++                equivalence: *equivalence,
++            },
++            MaintainedRelPlanNode::ProjectBag { input, columns } => {
++                FlatMaintainedRelPlanNodeKind::ProjectBag {
++                    input: Self::flatten_runtime_arena(input, out),
++                    columns: columns.clone(),
++                }
++            }
++            MaintainedRelPlanNode::ProjectSet {
++                input,
++                columns,
++                supports,
++            } => FlatMaintainedRelPlanNodeKind::ProjectSet {
++                input: Self::flatten_runtime_arena(input, out),
++                columns: columns.clone(),
++                supports: supports.clone(),
++            },
++            MaintainedRelPlanNode::Distinct { input, supports } => {
++                FlatMaintainedRelPlanNodeKind::Distinct {
++                    input: Self::flatten_runtime_arena(input, out),
++                    supports: supports.clone(),
++                }
++            }
++            MaintainedRelPlanNode::PromoteToBag { input } => {
++                FlatMaintainedRelPlanNodeKind::PromoteToBag {
++                    input: Self::flatten_runtime_arena(input, out),
++                }
++            }
++            MaintainedRelPlanNode::Blocker { left, right, state } => {
++                FlatMaintainedRelPlanNodeKind::Blocker {
++                    left: Self::flatten_runtime_arena(left, out),
++                    right: Self::flatten_runtime_arena(right, out),
++                    state: state.clone(),
++                }
++            }
++            MaintainedRelPlanNode::Join { left, right, state } => {
++                FlatMaintainedRelPlanNodeKind::Join {
++                    left: Self::flatten_runtime_arena(left, out),
++                    right: Self::flatten_runtime_arena(right, out),
++                    state: state.clone(),
++                }
++            }
++            MaintainedRelPlanNode::Group { input, state } => FlatMaintainedRelPlanNodeKind::Group {
++                input: Self::flatten_runtime_arena(input, out),
++                state: state.clone(),
++            },
++            MaintainedRelPlanNode::TopK { input, state } => FlatMaintainedRelPlanNodeKind::TopK {
++                input: Self::flatten_runtime_arena(input, out),
++                state: state.clone(),
++            },
++        };
++        let id = out.len();
++        out.push(Arc::new(FlatMaintainedRelPlanNode {
++            result_type: state.result_type.clone(),
++            kind,
++        }));
++        id
++    }
++
+     /// Exact Γ-DTC program whose state requirements are bound by this maintained tree.
+     ///
+     /// This is reconstructible execution metadata, not semantic authority. Construction
+@@ -3802,41 +4047,142 @@
+ 
+     #[must_use]
+     pub fn scan_relations(&self) -> BTreeSet<kernel_types::SemanticId> {
+-        let mut relations = BTreeSet::new();
+-        self.collect_scan_relations(&mut relations);
+-        relations
++        self.arena
++            .iter()
++            .filter_map(|node| match &node.kind {
++                FlatMaintainedRelPlanNodeKind::Scan { relation, .. } => Some(*relation),
++                _ => None,
++            })
++            .collect()
+     }
+ 
+-    fn collect_scan_relations(&self, relations: &mut BTreeSet<kernel_types::SemanticId>) {
+-        match self.node.as_ref() {
+-            MaintainedRelPlanNode::Scan { relation, .. } => {
+-                relations.insert(*relation);
++    pub fn output_value(
++        &self,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelationValue, RelQueryError> {
++        if context != &self.semantic_context {
++            return Err(RelQueryError::SemanticRevisionMismatch);
++        }
++        if self.arena.is_empty() {
++            return self.output_value_recursive(context, registry);
++        }
++        let root = self
++            .differential
++            .physical_program()
++            .execution_graph()
++            .root();
++        self.output_value_from_arena(root, context, registry)
++    }
++
++    fn output_value_from_arena(
++        &self,
++        node_id: NodeId,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelationValue, RelQueryError> {
++        let node = self
++            .arena
++            .get(node_id)
++            .map(Arc::as_ref)
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        match &node.kind {
++            FlatMaintainedRelPlanNodeKind::Scan { value, handles, .. } => {
++                let Some(handles) = handles else {
++                    return Ok(value.clone());
++                };
++                Ok(relation_value_from_rows(
++                    handles.ordered_rows(value)?,
++                    &node.result_type,
++                ))
+             }
+-            MaintainedRelPlanNode::Filter { input, .. }
+-            | MaintainedRelPlanNode::FilterColumns { input, .. }
+-            | MaintainedRelPlanNode::ProjectBag { input, .. }
+-            | MaintainedRelPlanNode::ProjectSet { input, .. }
+-            | MaintainedRelPlanNode::Distinct { input, .. }
+-            | MaintainedRelPlanNode::PromoteToBag { input }
+-            | MaintainedRelPlanNode::Group { input, .. }
+-            | MaintainedRelPlanNode::TopK { input, .. } => input.collect_scan_relations(relations),
+-            MaintainedRelPlanNode::Blocker { left, right, .. }
+-            | MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.collect_scan_relations(relations);
+-                right.collect_scan_relations(relations);
++            FlatMaintainedRelPlanNodeKind::Filter {
++                input,
++                column,
++                value,
++                equivalence,
++            } => {
++                let input_node = self
++                    .arena
++                    .get(*input)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let input_value = self.output_value_from_arena(*input, context, registry)?;
++                let input_delta = RelationDelta {
++                    inserted: input_value.into_rows(),
++                    removed: Vec::new(),
++                    result_type: input_node.result_type.clone(),
++                };
++                let filtered =
++                    rel_delta_filter(input_delta, *column, value, *equivalence, context, registry)?;
++                Ok(relation_value_from_rows(
++                    filtered.inserted,
++                    &node.result_type,
++                ))
+             }
++            FlatMaintainedRelPlanNodeKind::FilterColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => {
++                let input_node = self
++                    .arena
++                    .get(*input)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let input_value = self.output_value_from_arena(*input, context, registry)?;
++                let input_delta = RelationDelta {
++                    inserted: input_value.into_rows(),
++                    removed: Vec::new(),
++                    result_type: input_node.result_type.clone(),
++                };
++                let filtered = rel_delta_filter_columns(
++                    input_delta,
++                    *left_column,
++                    *right_column,
++                    *equivalence,
++                    context,
++                    registry,
++                )?;
++                Ok(relation_value_from_rows(
++                    filtered.inserted,
++                    &node.result_type,
++                ))
++            }
++            FlatMaintainedRelPlanNodeKind::ProjectBag { input, columns } => {
++                let rows = project_rows(
++                    self.output_value_from_arena(*input, context, registry)?
++                        .into_rows(),
++                    columns,
++                )?;
++                Ok(relation_value_from_rows(rows, &node.result_type))
++            }
++            FlatMaintainedRelPlanNodeKind::ProjectSet { supports, .. }
++            | FlatMaintainedRelPlanNodeKind::Distinct { supports, .. } => {
++                Ok(supports.output_value())
++            }
++            FlatMaintainedRelPlanNodeKind::PromoteToBag { input } => Ok(RelationValue::Bag(
++                self.output_value_from_arena(*input, context, registry)?
++                    .into_rows(),
++            )),
++            FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => Ok(state.output_value()),
++            FlatMaintainedRelPlanNodeKind::Join { state, .. } => {
++                state.output_value(context, registry)
++            }
++            FlatMaintainedRelPlanNodeKind::Group { state, .. } => state.output_value(),
++            FlatMaintainedRelPlanNodeKind::TopK { state, .. } => Ok(state.output_value()),
+         }
+     }
+ 
+-    pub fn output_value(
++    fn output_value_recursive(
+         &self,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<RelationValue, RelQueryError> {
+-        if context != &self.semantic_context {
+-            return Err(RelQueryError::SemanticRevisionMismatch);
+-        }
+-        match self.node.as_ref() {
++        let node = self
++            .node
++            .as_deref()
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        match node {
+             MaintainedRelPlanNode::Scan { value, handles, .. } => {
+                 let Some(handles) = handles else {
+                     return Ok(value.clone());
+@@ -3852,7 +4198,7 @@
+                 value,
+                 equivalence,
+             } => {
+-                let input_value = input.output_value(context, registry)?;
++                let input_value = input.output_value_recursive(context, registry)?;
+                 let input_delta = RelationDelta {
+                     inserted: input_value.into_rows(),
+                     removed: Vec::new(),
+@@ -3871,7 +4217,7 @@
+                 right_column,
+                 equivalence,
+             } => {
+-                let input_value = input.output_value(context, registry)?;
++                let input_value = input.output_value_recursive(context, registry)?;
+                 let input_delta = RelationDelta {
+                     inserted: input_value.into_rows(),
+                     removed: Vec::new(),
+@@ -3891,14 +4237,16 @@
+                 ))
+             }
+             MaintainedRelPlanNode::ProjectBag { input, columns } => {
+-                let rows =
+-                    project_rows(input.output_value(context, registry)?.into_rows(), columns)?;
++                let rows = project_rows(
++                    input.output_value_recursive(context, registry)?.into_rows(),
++                    columns,
++                )?;
+                 Ok(relation_value_from_rows(rows, &self.result_type))
+             }
+             MaintainedRelPlanNode::ProjectSet { supports, .. }
+             | MaintainedRelPlanNode::Distinct { supports, .. } => Ok(supports.output_value()),
+             MaintainedRelPlanNode::PromoteToBag { input } => Ok(RelationValue::Bag(
+-                input.output_value(context, registry)?.into_rows(),
++                input.output_value_recursive(context, registry)?.into_rows(),
+             )),
+             MaintainedRelPlanNode::Blocker { state, .. } => Ok(state.output_value()),
+             MaintainedRelPlanNode::Join { state, .. } => state.output_value(context, registry),
+@@ -3956,13 +4304,19 @@
+         #[cfg(debug_assertions)]
+         if !relation_values_semantically_equivalent(
+             &self.output_value(context, registry)?,
+-            &recursive_oracle.0.output_value(context, registry)?,
++            &recursive_oracle
++                .0
++                .output_value_recursive(context, registry)?,
+             &self.result_type,
+             context,
+             registry,
+         )? {
+             return Err(RelQueryError::InconsistentIncrementalDelta);
+         }
++        #[cfg(debug_assertions)]
++        {
++            self.node = recursive_oracle.0.node.as_ref().map(Arc::clone);
++        }
+         self.transition_epoch = next_epoch;
+         Ok(output)
+     }
+@@ -3981,18 +4335,61 @@
+             .checked_add(1)
+             .ok_or(RelQueryError::TransitionEpochExhausted)?;
+         let mut candidate = self.clone();
+-        candidate.attach_storage_rows_inner(relation, rows)?;
++        candidate.attach_storage_rows_arena(relation, rows)?;
++        #[cfg(debug_assertions)]
++        candidate.attach_storage_rows_recursive(relation, rows)?;
+         candidate.transition_epoch = next_epoch;
+         *self = candidate;
+         Ok(())
+     }
+ 
+-    fn attach_storage_rows_inner(
++    fn attach_storage_rows_arena(
++        &mut self,
++        relation: kernel_types::SemanticId,
++        rows: &[(kernel_types::StableRowHandle, Row)],
++    ) -> Result<(), RelQueryError> {
++        let arena = Arc::make_mut(&mut self.arena);
++        for node in arena {
++            let node = Arc::make_mut(node);
++            let FlatMaintainedRelPlanNodeKind::Scan {
++                relation: current,
++                value,
++                handles,
++                ..
++            } = &mut node.kind
++            else {
++                continue;
++            };
++            if *current != relation {
++                continue;
++            }
++            if value.rows().len() != rows.len()
++                || value
++                    .rows()
++                    .iter()
++                    .zip(rows.iter().map(|(_, row)| row))
++                    .any(|(logical, physical)| logical != physical)
++            {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
++            }
++            *handles = Some(MaintainedLeafHandles::new(
++                rows.iter().map(|(id, _)| *id).collect(),
++            )?);
++        }
++        Ok(())
++    }
++
++    #[cfg(debug_assertions)]
++    fn attach_storage_rows_recursive(
+         &mut self,
+         relation: kernel_types::SemanticId,
+         rows: &[(kernel_types::StableRowHandle, Row)],
+     ) -> Result<(), RelQueryError> {
+-        match Arc::make_mut(&mut self.node) {
++        match Arc::make_mut(
++            self.node
++                .as_mut()
++                .expect("debug construction tree must exist while binding storage rows"),
++        ) {
+             MaintainedRelPlanNode::Scan {
+                 relation: current,
+                 value,
+@@ -4024,12 +4421,12 @@
+             | MaintainedRelPlanNode::PromoteToBag { input }
+             | MaintainedRelPlanNode::Group { input, .. }
+             | MaintainedRelPlanNode::TopK { input, .. } => {
+-                input.attach_storage_rows_inner(relation, rows)
++                input.attach_storage_rows_recursive(relation, rows)
+             }
+             MaintainedRelPlanNode::Blocker { left, right, .. }
+             | MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.attach_storage_rows_inner(relation, rows)?;
+-                right.attach_storage_rows_inner(relation, rows)
++                left.attach_storage_rows_recursive(relation, rows)?;
++                right.attach_storage_rows_recursive(relation, rows)
+             }
+         }
+     }
+@@ -4140,13 +4537,19 @@
+         #[cfg(debug_assertions)]
+         if !relation_values_semantically_equivalent(
+             &self.output_value(context, registry)?,
+-            &recursive_oracle.0.output_value(context, registry)?,
++            &recursive_oracle
++                .0
++                .output_value_recursive(context, registry)?,
+             &self.result_type,
+             context,
+             registry,
+         )? {
+             return Err(RelQueryError::InconsistentIncrementalDelta);
+         }
++        #[cfg(debug_assertions)]
++        {
++            self.node = recursive_oracle.0.node.as_ref().map(Arc::clone);
++        }
+         self.transition_epoch = next_epoch;
+         Ok(output)
+     }
+@@ -4163,133 +4566,84 @@
+     ) -> Result<ValidatedLeafTransitionFrames, RelQueryError> {
+         let mut frames = BTreeMap::new();
+         let mut next_edge_ordinal = 0_u32;
+-        self.validate_resolved_leaf_frames_inner(
+-            deltas,
+-            context,
+-            registry,
+-            &mut next_edge_ordinal,
+-            &mut frames,
+-        )?;
+-        Ok(frames)
+-    }
+-
+-    #[allow(clippy::too_many_lines)]
+-    fn validate_resolved_leaf_frames_inner(
+-        &self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+-        next_edge_ordinal: &mut u32,
+-        frames: &mut ValidatedLeafTransitionFrames,
+-    ) -> Result<(), RelQueryError> {
+-        match self.node.as_ref() {
+-            MaintainedRelPlanNode::Scan {
++        for node in self.arena.iter().map(Arc::as_ref) {
++            let FlatMaintainedRelPlanNodeKind::Scan {
+                 relation,
+                 value,
+                 handles,
+                 ..
+-            } => {
+-                let edge = CompiledDeltaEdgeIdentity::new(*next_edge_ordinal, *relation);
+-                *next_edge_ordinal = next_edge_ordinal
+-                    .checked_add(1)
+-                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+-                let Some(resolved) = deltas.get(relation) else {
+-                    return Ok(());
+-                };
+-                if resolved.delta.result_type != self.result_type
+-                    || resolved.removed_handles.len() != resolved.delta.removed.len()
+-                    || resolved.inserted_handles.len() != resolved.delta.inserted.len()
+-                {
+-                    return Err(RelQueryError::TypeMismatch);
+-                }
+-                MaterializedSetSupportState::validate_rows(
+-                    &resolved.delta.removed,
+-                    &self.result_type,
+-                    context,
+-                    registry,
+-                )?;
+-                MaterializedSetSupportState::validate_rows(
+-                    &resolved.delta.inserted,
+-                    &self.result_type,
+-                    context,
+-                    registry,
+-                )?;
+-                let handles = handles
+-                    .as_ref()
+-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-                let mut seen = BTreeSet::new();
+-                for (id, row) in resolved
+-                    .removed_handles
+-                    .iter()
+-                    .copied()
+-                    .zip(&resolved.delta.removed)
+-                {
+-                    if !seen.insert(id) || handles.row_for_handle(value, id)? != row {
+-                        return Err(RelQueryError::InconsistentIncrementalDelta);
+-                    }
+-                }
+-                for id in &resolved.inserted_handles {
+-                    if handles.positions.contains_key(id) || !seen.insert(*id) {
+-                        return Err(RelQueryError::InconsistentIncrementalDelta);
+-                    }
++            } = &node.kind
++            else {
++                continue;
++            };
++            let edge = CompiledDeltaEdgeIdentity::new(next_edge_ordinal, *relation);
++            next_edge_ordinal = next_edge_ordinal
++                .checked_add(1)
++                .ok_or(RelQueryError::TransitionEpochExhausted)?;
++            let Some(resolved) = deltas.get(relation) else {
++                continue;
++            };
++            if resolved.delta.result_type != node.result_type
++                || resolved.removed_handles.len() != resolved.delta.removed.len()
++                || resolved.inserted_handles.len() != resolved.delta.inserted.len()
++            {
++                return Err(RelQueryError::TypeMismatch);
++            }
++            MaterializedSetSupportState::validate_rows(
++                &resolved.delta.removed,
++                &node.result_type,
++                context,
++                registry,
++            )?;
++            MaterializedSetSupportState::validate_rows(
++                &resolved.delta.inserted,
++                &node.result_type,
++                context,
++                registry,
++            )?;
++            let handles = handles
++                .as_ref()
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            let mut seen = BTreeSet::new();
++            for (id, row) in resolved
++                .removed_handles
++                .iter()
++                .copied()
++                .zip(&resolved.delta.removed)
++            {
++                if !seen.insert(id) || handles.row_for_handle(value, id)? != row {
++                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                 }
+-                let patch = StorageResolvedScanPatch {
+-                    removed_handles: resolved.removed_handles.clone(),
+-                    inserted: resolved
+-                        .inserted_handles
+-                        .iter()
+-                        .copied()
+-                        .zip(resolved.delta.inserted.iter().cloned())
+-                        .collect(),
+-                };
+-                if frames
+-                    .insert(
+-                        edge,
+-                        ValidatedTransitionFrame::new(
+-                            edge,
+-                            MaintainedScanCommitPatch::StorageResolved(patch),
+-                            resolved.delta.clone(),
+-                        ),
+-                    )
+-                    .is_some()
+-                {
++            }
++            for id in &resolved.inserted_handles {
++                if handles.positions.contains_key(id) || !seen.insert(*id) {
+                     return Err(RelQueryError::InconsistentIncrementalDelta);
+                 }
+-                Ok(())
+             }
+-            MaintainedRelPlanNode::Filter { input, .. }
+-            | MaintainedRelPlanNode::FilterColumns { input, .. }
+-            | MaintainedRelPlanNode::ProjectBag { input, .. }
+-            | MaintainedRelPlanNode::ProjectSet { input, .. }
+-            | MaintainedRelPlanNode::Distinct { input, .. }
+-            | MaintainedRelPlanNode::PromoteToBag { input }
+-            | MaintainedRelPlanNode::Group { input, .. }
+-            | MaintainedRelPlanNode::TopK { input, .. } => input
+-                .validate_resolved_leaf_frames_inner(
+-                    deltas,
+-                    context,
+-                    registry,
+-                    next_edge_ordinal,
+-                    frames,
+-                ),
+-            MaintainedRelPlanNode::Blocker { left, right, .. }
+-            | MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.validate_resolved_leaf_frames_inner(
+-                    deltas,
+-                    context,
+-                    registry,
+-                    next_edge_ordinal,
+-                    frames,
+-                )?;
+-                right.validate_resolved_leaf_frames_inner(
+-                    deltas,
+-                    context,
+-                    registry,
+-                    next_edge_ordinal,
+-                    frames,
++            let patch = StorageResolvedScanPatch {
++                removed_handles: resolved.removed_handles.clone(),
++                inserted: resolved
++                    .inserted_handles
++                    .iter()
++                    .copied()
++                    .zip(resolved.delta.inserted.iter().cloned())
++                    .collect(),
++            };
++            if frames
++                .insert(
++                    edge,
++                    ValidatedTransitionFrame::new(
++                        edge,
++                        MaintainedScanCommitPatch::StorageResolved(patch),
++                        resolved.delta.clone(),
++                    ),
+                 )
++                .is_some()
++            {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
+             }
+         }
++        Ok(frames)
+     }
+ 
+     fn commit_storage_resolved_scan_patch(
+@@ -4331,6 +4685,12 @@
+                 return Err(RelQueryError::UnknownRelation(*relation));
+             }
+         }
++        #[cfg(debug_assertions)]
++        let recursive_oracle = self.recursive_oracle_from_frames(
++            self.validate_resolved_leaf_frames(deltas, context, registry)?,
++            context,
++            registry,
++        )?;
+         let mut validated_frames = self.validate_resolved_leaf_frames(deltas, context, registry)?;
+         let next_epoch = self
+             .transition_epoch
+@@ -4339,7 +4699,32 @@
+         let planned =
+             self.plan_relation_deltas_execgraph(&mut validated_frames, context, registry)?;
+         let output = materialize_delta_view(&planned.root_effect, self.result_type.clone())?;
++        #[cfg(debug_assertions)]
++        if !relation_deltas_semantically_equivalent(
++            &output,
++            &recursive_oracle.1,
++            context,
++            registry,
++        )? {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
+         self.commit_graph_patch_set(planned);
++        #[cfg(debug_assertions)]
++        if !relation_values_semantically_equivalent(
++            &self.output_value(context, registry)?,
++            &recursive_oracle
++                .0
++                .output_value_recursive(context, registry)?,
++            &self.result_type,
++            context,
++            registry,
++        )? {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        #[cfg(debug_assertions)]
++        {
++            self.node = recursive_oracle.0.node.as_ref().map(Arc::clone);
++        }
+         self.transition_epoch = next_epoch;
+         Ok(output)
+     }
+@@ -4352,128 +4737,61 @@
+     ) -> Result<ValidatedLeafTransitionFrames, RelQueryError> {
+         let mut frames = BTreeMap::new();
+         let mut next_edge_ordinal = 0_u32;
+-        self.validate_leaf_deltas_inner(
+-            deltas,
+-            context,
+-            registry,
+-            &mut next_edge_ordinal,
+-            &mut frames,
+-        )?;
+-        Ok(frames)
+-    }
+-
+-    fn validate_leaf_deltas_inner(
+-        &self,
+-        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+-        next_edge_ordinal: &mut u32,
+-        frames: &mut ValidatedLeafTransitionFrames,
+-    ) -> Result<(), RelQueryError> {
+-        match self.node.as_ref() {
+-            MaintainedRelPlanNode::Scan {
++        for node in self.arena.iter().map(Arc::as_ref) {
++            let FlatMaintainedRelPlanNodeKind::Scan {
+                 relation,
+                 value,
+                 canonical_lookup,
+                 ..
+-            } => {
+-                let edge = CompiledDeltaEdgeIdentity::new(*next_edge_ordinal, *relation);
+-                *next_edge_ordinal = next_edge_ordinal
+-                    .checked_add(1)
+-                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+-                let Some(delta) = deltas.get(relation) else {
+-                    return Ok(());
+-                };
+-                if delta.result_type != self.result_type {
+-                    return Err(RelQueryError::TypeMismatch);
+-                }
+-                MaterializedSetSupportState::validate_rows(
+-                    &delta.removed,
+-                    &self.result_type,
+-                    context,
+-                    registry,
+-                )?;
+-                MaterializedSetSupportState::validate_rows(
+-                    &delta.inserted,
+-                    &self.result_type,
+-                    context,
+-                    registry,
+-                )?;
+-                let plan = MaterializedJoinDeltaState::plan_relation_mutation(
+-                    value,
+-                    delta,
+-                    &self.result_type,
+-                    canonical_lookup.as_ref(),
+-                    context,
+-                    registry,
+-                )?;
+-                if frames
+-                    .insert(
+-                        edge,
+-                        ValidatedTransitionFrame::new(
+-                            edge,
+-                            MaintainedScanCommitPatch::Semantic(plan),
+-                            delta.clone(),
+-                        ),
+-                    )
+-                    .is_some()
+-                {
+-                    return Err(RelQueryError::InconsistentIncrementalDelta);
+-                }
+-                Ok(())
++            } = &node.kind
++            else {
++                continue;
++            };
++            let edge = CompiledDeltaEdgeIdentity::new(next_edge_ordinal, *relation);
++            next_edge_ordinal = next_edge_ordinal
++                .checked_add(1)
++                .ok_or(RelQueryError::TransitionEpochExhausted)?;
++            let Some(delta) = deltas.get(relation) else {
++                continue;
++            };
++            if delta.result_type != node.result_type {
++                return Err(RelQueryError::TypeMismatch);
+             }
+-            MaintainedRelPlanNode::Filter { input, .. }
+-            | MaintainedRelPlanNode::FilterColumns { input, .. }
+-            | MaintainedRelPlanNode::ProjectBag { input, .. }
+-            | MaintainedRelPlanNode::ProjectSet { input, .. }
+-            | MaintainedRelPlanNode::Distinct { input, .. }
+-            | MaintainedRelPlanNode::PromoteToBag { input }
+-            | MaintainedRelPlanNode::Group { input, .. }
+-            | MaintainedRelPlanNode::TopK { input, .. } => input.validate_leaf_deltas_inner(
+-                deltas,
++            MaterializedSetSupportState::validate_rows(
++                &delta.removed,
++                &node.result_type,
+                 context,
+                 registry,
+-                next_edge_ordinal,
+-                frames,
+-            ),
+-            MaintainedRelPlanNode::Blocker { left, right, .. }
+-            | MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.validate_leaf_deltas_inner(
+-                    deltas,
+-                    context,
+-                    registry,
+-                    next_edge_ordinal,
+-                    frames,
+-                )?;
+-                right.validate_leaf_deltas_inner(
+-                    deltas,
+-                    context,
+-                    registry,
+-                    next_edge_ordinal,
+-                    frames,
++            )?;
++            MaterializedSetSupportState::validate_rows(
++                &delta.inserted,
++                &node.result_type,
++                context,
++                registry,
++            )?;
++            let plan = MaterializedJoinDeltaState::plan_relation_mutation(
++                value,
++                delta,
++                &node.result_type,
++                canonical_lookup.as_ref(),
++                context,
++                registry,
++            )?;
++            if frames
++                .insert(
++                    edge,
++                    ValidatedTransitionFrame::new(
++                        edge,
++                        MaintainedScanCommitPatch::Semantic(plan),
++                        delta.clone(),
++                    ),
+                 )
++                .is_some()
++            {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
+             }
+         }
+-    }
+-
+-    fn collect_postorder_states<'a>(&'a self, out: &mut Vec<&'a Self>) {
+-        match self.node.as_ref() {
+-            MaintainedRelPlanNode::Scan { .. } => {}
+-            MaintainedRelPlanNode::Filter { input, .. }
+-            | MaintainedRelPlanNode::FilterColumns { input, .. }
+-            | MaintainedRelPlanNode::ProjectBag { input, .. }
+-            | MaintainedRelPlanNode::ProjectSet { input, .. }
+-            | MaintainedRelPlanNode::Distinct { input, .. }
+-            | MaintainedRelPlanNode::PromoteToBag { input }
+-            | MaintainedRelPlanNode::Group { input, .. }
+-            | MaintainedRelPlanNode::TopK { input, .. } => input.collect_postorder_states(out),
+-            MaintainedRelPlanNode::Blocker { left, right, .. }
+-            | MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.collect_postorder_states(out);
+-                right.collect_postorder_states(out);
+-            }
+-        }
+-        out.push(self);
++        Ok(frames)
+     }
+ 
+     fn plan_relation_deltas_execgraph(
+@@ -4505,9 +4823,7 @@
+     ) -> Result<GraphPatchSet, RelQueryError> {
+         let graph = self.differential.physical_program().execution_graph();
+         let program = graph.transition_program();
+-        let mut states = Vec::with_capacity(graph.node_count());
+-        self.collect_postorder_states(&mut states);
+-        if states.len() != graph.node_count() {
++        if self.arena.len() != graph.node_count() {
+             return Err(RelQueryError::InconsistentIncrementalDelta);
+         }
+ 
+@@ -4519,8 +4835,8 @@
+         let mut root_effect = MaintainedDelta::default();
+         let mut next_edge_ordinal = 0_u32;
+ 
+-        for (node_id, state) in states.iter().enumerate() {
+-            let MaintainedRelPlanNode::Scan { relation, .. } = state.node.as_ref() else {
++        for (node_id, state) in self.arena.iter().enumerate() {
++            let FlatMaintainedRelPlanNodeKind::Scan { relation, .. } = &state.kind else {
+                 continue;
+             };
+             let edge = CompiledDeltaEdgeIdentity::new(next_edge_ordinal, *relation);
+@@ -4557,9 +4873,10 @@
+         }
+ 
+         while let Some((node_id, inbox)) = scratch.pop_next() {
+-            let state = states
++            let state = self
++                .arena
+                 .get(node_id)
+-                .copied()
++                .map(Arc::as_ref)
+                 .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+             let planned = match Self::plan_execgraph_node(state, inbox, context, registry) {
+                 Ok(planned) => planned,
+@@ -4590,16 +4907,18 @@
+     }
+ 
+     fn plan_execgraph_node(
+-        state: &Self,
++        state: &FlatMaintainedRelPlanNode,
+         mut inbox: NodeInbox<MaintainedDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<PlannedGraphNodeTransition, RelQueryError> {
+         let empty = MaintainedDelta::default;
+-        match state.node.as_ref() {
+-            MaintainedRelPlanNode::Scan { .. } => Err(RelQueryError::InconsistentIncrementalDelta),
+-            MaintainedRelPlanNode::Filter {
+-                input,
++        match &state.kind {
++            FlatMaintainedRelPlanNodeKind::Scan { .. } => {
++                Err(RelQueryError::InconsistentIncrementalDelta)
++            }
++            FlatMaintainedRelPlanNodeKind::Filter {
++                input: _,
+                 column,
+                 value,
+                 equivalence,
+@@ -4607,7 +4926,7 @@
+                 patch: None,
+                 effect: filter_delta_view(
+                     &inbox.take_unary().unwrap_or_else(empty),
+-                    &input.result_type,
++                    &state.result_type,
+                     *column,
+                     value,
+                     *equivalence,
+@@ -4615,8 +4934,8 @@
+                     registry,
+                 )?,
+             }),
+-            MaintainedRelPlanNode::FilterColumns {
+-                input,
++            FlatMaintainedRelPlanNodeKind::FilterColumns {
++                input: _,
+                 left_column,
+                 right_column,
+                 equivalence,
+@@ -4624,7 +4943,7 @@
+                 patch: None,
+                 effect: filter_columns_delta_view(
+                     &inbox.take_unary().unwrap_or_else(empty),
+-                    &input.result_type,
++                    &state.result_type,
+                     *left_column,
+                     *right_column,
+                     *equivalence,
+@@ -4632,17 +4951,19 @@
+                     registry,
+                 )?,
+             }),
+-            MaintainedRelPlanNode::ProjectBag { columns, .. } => Ok(PlannedGraphNodeTransition {
+-                patch: None,
+-                effect: project_bag_delta_view(
+-                    &inbox.take_unary().unwrap_or_else(empty),
+-                    columns,
+-                    &state.result_type,
+-                    context,
+-                    registry,
+-                )?,
+-            }),
+-            MaintainedRelPlanNode::ProjectSet {
++            FlatMaintainedRelPlanNodeKind::ProjectBag { columns, .. } => {
++                Ok(PlannedGraphNodeTransition {
++                    patch: None,
++                    effect: project_bag_delta_view(
++                        &inbox.take_unary().unwrap_or_else(empty),
++                        columns,
++                        &state.result_type,
++                        context,
++                        registry,
++                    )?,
++                })
++            }
++            FlatMaintainedRelPlanNodeKind::ProjectSet {
+                 columns, supports, ..
+             } => {
+                 let input = inbox.take_unary().unwrap_or_else(empty);
+@@ -4653,7 +4974,7 @@
+                     effect: planned.effect,
+                 })
+             }
+-            MaintainedRelPlanNode::Distinct { supports, .. } => {
++            FlatMaintainedRelPlanNodeKind::Distinct { supports, .. } => {
+                 let input = inbox.take_unary().unwrap_or_else(empty);
+                 let planned = supports.plan_delta_view(&input, context, registry)?;
+                 Ok(PlannedGraphNodeTransition {
+@@ -4661,28 +4982,28 @@
+                     effect: planned.effect,
+                 })
+             }
+-            MaintainedRelPlanNode::PromoteToBag { .. } => Ok(PlannedGraphNodeTransition {
++            FlatMaintainedRelPlanNodeKind::PromoteToBag { .. } => Ok(PlannedGraphNodeTransition {
+                 patch: None,
+                 effect: inbox.take_unary().unwrap_or_else(empty),
+             }),
+-            MaintainedRelPlanNode::Blocker { .. }
+-            | MaintainedRelPlanNode::Join { .. }
+-            | MaintainedRelPlanNode::Group { .. }
+-            | MaintainedRelPlanNode::TopK { .. } => {
++            FlatMaintainedRelPlanNodeKind::Blocker { .. }
++            | FlatMaintainedRelPlanNodeKind::Join { .. }
++            | FlatMaintainedRelPlanNodeKind::Group { .. }
++            | FlatMaintainedRelPlanNodeKind::TopK { .. } => {
+                 Self::plan_execgraph_stateful_node(state, inbox, context, registry)
+             }
+         }
+     }
+ 
+     fn plan_execgraph_stateful_node(
+-        state: &Self,
++        state: &FlatMaintainedRelPlanNode,
+         mut inbox: NodeInbox<MaintainedDelta>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<PlannedGraphNodeTransition, RelQueryError> {
+         let empty = MaintainedDelta::default;
+-        match state.node.as_ref() {
+-            MaintainedRelPlanNode::Blocker { state, .. } => {
++        match &state.kind {
++            FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => {
+                 let left = inbox.take_left().unwrap_or_else(empty);
+                 let right = inbox.take_right().unwrap_or_else(empty);
+                 let planned = state.plan_delta_views(&left, &right, context, registry)?;
+@@ -4691,7 +5012,7 @@
+                     effect: planned.effect,
+                 })
+             }
+-            MaintainedRelPlanNode::Join { state, .. } => {
++            FlatMaintainedRelPlanNodeKind::Join { state, .. } => {
+                 let left = inbox.take_left().unwrap_or_else(empty);
+                 let right = inbox.take_right().unwrap_or_else(empty);
+                 let planned = state.plan_delta_views(&left, &right, context, registry)?;
+@@ -4700,7 +5021,7 @@
+                     effect: planned.effect,
+                 })
+             }
+-            MaintainedRelPlanNode::Group { state, .. } => {
++            FlatMaintainedRelPlanNodeKind::Group { state, .. } => {
+                 let input = inbox.take_unary().unwrap_or_else(empty);
+                 let planned = state.plan_delta_view(&input, context, registry)?;
+                 let patch =
+@@ -4712,7 +5033,7 @@
+                     effect: planned.effect,
+                 })
+             }
+-            MaintainedRelPlanNode::TopK { state, .. } => {
++            FlatMaintainedRelPlanNodeKind::TopK { state, .. } => {
+                 let input = inbox.take_unary().unwrap_or_else(empty);
+                 let planned = state.plan_delta_view(&input, context, registry)?;
+                 Ok(PlannedGraphNodeTransition {
+@@ -4725,83 +5046,67 @@
+     }
+ 
+     fn commit_graph_patch_set(&mut self, mut patch_set: GraphPatchSet) {
+-        let mut next_node = 0usize;
+-        self.commit_graph_patches_postorder(&mut patch_set.nodes, &mut next_node);
+-        debug_assert_eq!(next_node, patch_set.nodes.len());
+-        debug_assert!(patch_set.nodes.iter().all(Option::is_none));
+-    }
+-
+-    fn commit_graph_patches_postorder(
+-        &mut self,
+-        patches: &mut [Option<GraphNodePatch>],
+-        next_node: &mut usize,
+-    ) {
+-        match Arc::make_mut(&mut self.node) {
+-            MaintainedRelPlanNode::Scan { .. } => {}
+-            MaintainedRelPlanNode::Filter { input, .. }
+-            | MaintainedRelPlanNode::FilterColumns { input, .. }
+-            | MaintainedRelPlanNode::ProjectBag { input, .. }
+-            | MaintainedRelPlanNode::ProjectSet { input, .. }
+-            | MaintainedRelPlanNode::Distinct { input, .. }
+-            | MaintainedRelPlanNode::PromoteToBag { input }
+-            | MaintainedRelPlanNode::Group { input, .. }
+-            | MaintainedRelPlanNode::TopK { input, .. } => {
+-                input.commit_graph_patches_postorder(patches, next_node);
+-            }
+-            MaintainedRelPlanNode::Blocker { left, right, .. }
+-            | MaintainedRelPlanNode::Join { left, right, .. } => {
+-                left.commit_graph_patches_postorder(patches, next_node);
+-                right.commit_graph_patches_postorder(patches, next_node);
+-            }
+-        }
+-
+-        let node_id = *next_node;
+-        *next_node += 1;
+-        let Some(patch) = patches.get_mut(node_id).and_then(Option::take) else {
+-            return;
+-        };
+-        match (Arc::make_mut(&mut self.node), patch) {
+-            (
+-                MaintainedRelPlanNode::Scan {
+-                    value,
+-                    handles,
+-                    canonical_lookup,
+-                    ..
+-                },
+-                GraphNodePatch::Scan(patch),
+-            ) => match patch {
+-                MaintainedScanCommitPatch::Semantic(plan) => {
+-                    MaterializedJoinDeltaState::commit_relation_mutation(
++        let arena = Arc::make_mut(&mut self.arena);
++        debug_assert_eq!(arena.len(), patch_set.nodes.len());
++        for (node_id, patch) in patch_set.nodes.iter_mut().enumerate() {
++            let Some(patch) = patch.take() else {
++                continue;
++            };
++            let node = Arc::make_mut(
++                arena
++                    .get_mut(node_id)
++                    .expect("execgraph patch NodeId must exist in flat arena"),
++            );
++            match (&mut node.kind, patch) {
++                (
++                    FlatMaintainedRelPlanNodeKind::Scan {
+                         value,
++                        handles,
+                         canonical_lookup,
+-                        plan,
+-                    );
+-                }
+-                MaintainedScanCommitPatch::StorageResolved(plan) => {
+-                    Self::commit_storage_resolved_scan_patch(value, handles, plan);
+-                    *canonical_lookup = None;
+-                }
+-            },
+-            (
+-                MaintainedRelPlanNode::ProjectSet { supports, .. }
+-                | MaintainedRelPlanNode::Distinct { supports, .. },
+-                GraphNodePatch::SetSupport(patch),
+-            ) => supports.commit_support_patch(patch),
+-            (MaintainedRelPlanNode::Blocker { state, .. }, GraphNodePatch::Blocker(patch)) => {
+-                state.commit_patch(patch);
+-            }
+-            (MaintainedRelPlanNode::Join { state, .. }, GraphNodePatch::Join(patch)) => {
+-                state.commit_join_patch(patch);
+-            }
+-            (MaintainedRelPlanNode::Group { state, .. }, GraphNodePatch::Group(patch)) => {
+-                let MaintainedGroupCommitPatch::Sealed(patch) = patch;
+-                sealed_group_v3::commit_sealed_group_patch(state, patch);
+-            }
+-            (MaintainedRelPlanNode::TopK { state, .. }, GraphNodePatch::TopK(patch)) => {
+-                state.commit_topk_patch(patch);
++                        ..
++                    },
++                    GraphNodePatch::Scan(patch),
++                ) => match patch {
++                    MaintainedScanCommitPatch::Semantic(plan) => {
++                        MaterializedJoinDeltaState::commit_relation_mutation(
++                            value,
++                            canonical_lookup,
++                            plan,
++                        );
++                    }
++                    MaintainedScanCommitPatch::StorageResolved(plan) => {
++                        Self::commit_storage_resolved_scan_patch(value, handles, plan);
++                        *canonical_lookup = None;
++                    }
++                },
++                (
++                    FlatMaintainedRelPlanNodeKind::ProjectSet { supports, .. }
++                    | FlatMaintainedRelPlanNodeKind::Distinct { supports, .. },
++                    GraphNodePatch::SetSupport(patch),
++                ) => supports.commit_support_patch(patch),
++                (
++                    FlatMaintainedRelPlanNodeKind::Blocker { state, .. },
++                    GraphNodePatch::Blocker(patch),
++                ) => state.commit_patch(patch),
++                (
++                    FlatMaintainedRelPlanNodeKind::Join { state, .. },
++                    GraphNodePatch::Join(patch),
++                ) => state.commit_join_patch(patch),
++                (
++                    FlatMaintainedRelPlanNodeKind::Group { state, .. },
++                    GraphNodePatch::Group(patch),
++                ) => {
++                    let MaintainedGroupCommitPatch::Sealed(patch) = patch;
++                    sealed_group_v3::commit_sealed_group_patch(state, patch);
++                }
++                (
++                    FlatMaintainedRelPlanNodeKind::TopK { state, .. },
++                    GraphNodePatch::TopK(patch),
++                ) => state.commit_topk_patch(patch),
++                _ => unreachable!("execgraph patch/flat-arena node mismatch"),
+             }
+-            _ => unreachable!("execgraph patch/node mismatch"),
+         }
++        debug_assert!(patch_set.nodes.iter().all(Option::is_none));
+     }
+ 
+     #[cfg(debug_assertions)]
+@@ -4833,7 +5138,11 @@
+         &self,
+         plan: &mut RelationDeltaPlanContext<'_>,
+     ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
+-        match self.node.as_ref() {
++        match self
++            .node
++            .as_deref()
++            .expect("debug recursive oracle tree must exist")
++        {
+             MaintainedRelPlanNode::Scan { relation, .. } => {
+                 plan.plan_scan(*relation, &self.result_type)
+             }
+@@ -5043,7 +5352,14 @@
+ 
+     #[cfg(debug_assertions)]
+     fn commit_relation_plan(&mut self, patch: MaintainedRelPlanPatch) {
+-        match (Arc::make_mut(&mut self.node), patch) {
++        match (
++            Arc::make_mut(
++                self.node
++                    .as_mut()
++                    .expect("debug recursive oracle tree must exist"),
++            ),
++            patch,
++        ) {
+             (
+                 MaintainedRelPlanNode::Scan {
+                     value,
+@@ -11623,7 +11939,7 @@
+         );
+         let state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+         let mut candidate = state.clone();
+-        assert!(Arc::ptr_eq(&state.node, &candidate.node));
++        assert!(Arc::ptr_eq(&state.arena, &candidate.arena));
+ 
+         let delta = RelationDelta {
+             inserted: vec![vec![Value::Text("Gamma".into()), Value::I64(3)]],
+@@ -11634,7 +11950,7 @@
+             .apply_relation_deltas(&BTreeMap::from([(relation, delta)]), &context, &registry)
+             .unwrap();
+ 
+-        assert!(!Arc::ptr_eq(&state.node, &candidate.node));
++        assert!(!Arc::ptr_eq(&state.arena, &candidate.arena));
+         assert_eq!(
+             state.output_value(&context, &registry).unwrap().rows(),
+             &[
+@@ -11651,6 +11967,31 @@
+         );
+     }
+ 
++    #[cfg(not(debug_assertions))]
++    #[test]
++    fn release_maintained_plan_discards_construction_tree_after_flattening() {
++        let (context, registry, _, relation, _) = setup();
++        let query = RelExpr::Project {
++            input: Box::new(RelExpr::Scan(relation)),
++            columns: vec![0],
++        };
++        let mut model = FiniteModel::default();
++        model.relations.insert(
++            relation,
++            vec![vec![Value::Text("Alpha".into()), Value::I64(1)]],
++        );
++        let state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
++        assert!(state.node.is_none());
++        assert_eq!(
++            state.arena.len(),
++            state
++                .differential
++                .physical_program()
++                .execution_graph()
++                .node_count()
++        );
++    }
++
+     #[test]
+     fn relation_delta_prepares_intent_bearing_gamma_rewrite_from_exact_endpoint() {
+         let (context, registry, _, relation, _) = setup();

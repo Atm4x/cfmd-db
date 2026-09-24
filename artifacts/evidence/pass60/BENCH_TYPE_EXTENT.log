@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_validation-cf3da7e4425e9636)
+
+running 1 test
+compile_ns=7810815 baseline_ns=198211042 dense_ns=4941448 ratio_milli=40111 probes=32768
+test tests::benchmark_dense_type_extent_membership_against_carrier_scan ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.21s
+

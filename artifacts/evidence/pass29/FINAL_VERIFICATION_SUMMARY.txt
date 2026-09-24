@@ -1,0 +1,14 @@
+PASS29 FINAL GATE: PASS
+Rust: 1.98.1
+Declared Rust #[test] tests: 237
+kernel-plan lib tests: 55 passed
+Workspace debug tests: PASS
+Workspace release tests: PASS
+Strict Clippy: PASS
+Release build: PASS
+Strict rustdoc: PASS
+Overflow-checked release tests: PASS
+Workspace crates: 19
+Rust LOC: 29302
+External Cargo source entries: 0
+unsafe blocks: 0

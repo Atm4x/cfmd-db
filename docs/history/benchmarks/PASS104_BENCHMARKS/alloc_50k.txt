@@ -1,0 +1,1 @@
+stage6_alloc samples=400 median_alloc_calls=142 p90_alloc_calls=142 max_alloc_calls=142

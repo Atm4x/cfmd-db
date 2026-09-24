@@ -1,0 +1,9 @@
+Pass40 static audit
+- unsafe Rust occurrences under crates/*.rs: 0
+- Cargo.lock external `source =` entries: 0
+- declared #[test] occurrences: 310
+- Rust LOC under crates/: 40316
+- old JoinAlgorithm::IndexedI64IfAvailable references: 0
+- new persisted semantic index is reconstructible physical state keyed by Stable PhysicalRowId handles, not semantic authority
+- index compatibility is re-resolved from pinned SemanticContext/registry before mutation/use; incompatible Γ is rejected for maintenance and skipped by query fast path
+- mutation-side debug_assert audit found no insert/remove/push/pop/entry/retain/clear/extend/append side effects in new kernel-plan path

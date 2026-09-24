@@ -1,0 +1,2 @@
+stage6 label=linear_join_group_topk samples=400 median_ns=6546597 p90_ns=7238800
+stage6 label=blocker_group_topk samples=400 median_ns=5578626 p90_ns=6189447

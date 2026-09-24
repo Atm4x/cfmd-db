@@ -1,0 +1,17 @@
+patching file crates/kernel-durability/src/lib.rs
+patching file crates/kernel-durability/src/metadata.rs
+patching file crates/kernel-plan/src/lib.rs
+Hunk #13 succeeded at 26589 (offset 1015 lines).
+Hunk #14 succeeded at 26615 (offset 1015 lines).
+Hunk #15 succeeded at 26629 (offset 1015 lines).
+Hunk #16 succeeded at 26678 (offset 1015 lines).
+Hunk #17 succeeded at 26715 (offset 1015 lines).
+Hunk #18 succeeded at 26741 (offset 1015 lines).
+Hunk #19 succeeded at 26760 (offset 1015 lines).
+Hunk #20 succeeded at 26779 (offset 1015 lines).
+Hunk #21 succeeded at 27053 (offset 1015 lines).
+Hunk #22 succeeded at 27122 (offset 1015 lines).
+Hunk #23 succeeded at 27325 (offset 1015 lines).
+Hunk #24 succeeded at 27338 (offset 1015 lines).
+Hunk #25 succeeded at 27389 (offset 1015 lines).
+Hunk #26 succeeded at 27442 (offset 1015 lines).

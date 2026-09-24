@@ -1,0 +1,3100 @@
+--- /mnt/data/cfmd_pass37_work/cfmd_workspace_pass37/crates/kernel-durability/src/lib.rs	2026-09-20 00:24:55.522441634 +0000
++++ crates/kernel-durability/src/lib.rs	2026-09-20 01:17:38.140842002 +0000
+@@ -4,6 +4,7 @@
+ use std::path::{Path, PathBuf};
+ 
+ use kernel_model::Value;
++use kernel_semantics::BuiltinSemanticModuleSpec;
+ use kernel_types::{
+     ClientTransactionId, EntityId, MaterializationId, RevisionId, SemanticId, SemanticRevision,
+ };
+@@ -16,7 +17,7 @@
+ 
+ pub const MAGIC: [u8; 4] = *b"CFMW";
+ pub const FORMAT_VERSION: u16 = 1;
+-pub const MUTATION_CODEC_VERSION: u16 = 3;
++pub const MUTATION_CODEC_VERSION: u16 = 4;
+ pub const HEADER_LEN: usize = 36;
+ pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+ const MAX_COLLECTION_LEN: usize = 1_000_000;
+@@ -38,6 +39,84 @@
+     FullRevision {
+         encoded_target_revision: Vec<u8>,
+     },
++    FullRevisionAndMaterializations {
++        encoded_target_revision: Vec<u8>,
++        materializations: Vec<DurableMaterializationSpec>,
++    },
++}
++
++/// Exact client-visible intent retained across WAL, checkpoint rotation and
++/// restart.  New transactions persist the canonical target Revision bytes and
++/// (when applicable) the complete materialization registry.  Legacy stores can
++/// still be decoded, but their old target-id-only entries are never treated as
++/// exact idempotency matches.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum DurableTransactionIntent {
++    Exact {
++        target_revision: RevisionId,
++        encoded_target_revision: Vec<u8>,
++        materializations: Option<Vec<DurableMaterializationSpec>>,
++        semantic_modules: Vec<BuiltinSemanticModuleSpec>,
++    },
++    LegacyTargetOnly {
++        target_revision: RevisionId,
++    },
++}
++
++impl DurableTransactionIntent {
++    pub fn revision(
++        target: &kernel_revision::Revision,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, CodecError> {
++        let semantic_modules = registry
++            .builtin_modules_for_context(target.semantic_context())
++            .map_err(|_| CodecError::SemanticModuleUnavailable)?;
++        Ok(Self::Exact {
++            target_revision: target.id(),
++            encoded_target_revision: checkpoint::encode_revision(target)?,
++            materializations: None,
++            semantic_modules,
++        })
++    }
++
++    pub fn revision_and_materializations(
++        target: &kernel_revision::Revision,
++        materializations: &[DurableMaterializationSpec],
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, CodecError> {
++        let mut materializations = materializations.to_vec();
++        materializations.sort_by_key(|spec| spec.id);
++        if materializations
++            .windows(2)
++            .any(|pair| pair[0].id == pair[1].id)
++        {
++            return Err(CodecError::CollectionTooLarge);
++        }
++        let semantic_modules = registry
++            .builtin_modules_for_context(target.semantic_context())
++            .map_err(|_| CodecError::SemanticModuleUnavailable)?;
++        Ok(Self::Exact {
++            target_revision: target.id(),
++            encoded_target_revision: checkpoint::encode_revision(target)?,
++            materializations: Some(materializations),
++            semantic_modules,
++        })
++    }
++
++    #[must_use]
++    pub const fn target_revision(&self) -> RevisionId {
++        match self {
++            Self::Exact {
++                target_revision, ..
++            }
++            | Self::LegacyTargetOnly { target_revision } => *target_revision,
++        }
++    }
++
++    #[must_use]
++    pub const fn is_exact(&self) -> bool {
++        matches!(self, Self::Exact { .. })
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -45,44 +124,80 @@
+     pub transaction_id: ClientTransactionId,
+     pub source_revision: RevisionId,
+     pub target_revision: RevisionId,
++    pub intent: DurableTransactionIntent,
+     pub change: DurableRevisionChange,
+ }
+ 
+ impl DurableRevisionDescriptor {
+-    #[must_use]
+     pub fn relation_data(
+         transaction_id: ClientTransactionId,
+         source_revision: RevisionId,
+-        target_revision: RevisionId,
++        target: &kernel_revision::Revision,
+         semantic_revision: SemanticRevision,
+         relation_mutations: Vec<DurableRelationMutation>,
+-    ) -> Self {
+-        Self {
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, CodecError> {
++        Ok(Self {
+             transaction_id,
+             source_revision,
+-            target_revision,
++            target_revision: target.id(),
++            intent: DurableTransactionIntent::revision(target, registry)?,
+             change: DurableRevisionChange::RelationData {
+                 semantic_revision,
+                 relation_mutations,
+             },
+-        }
++        })
+     }
+ 
+     pub fn full_revision(
+         transaction_id: ClientTransactionId,
+         source_revision: RevisionId,
+         target: &kernel_revision::Revision,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, CodecError> {
+         Ok(Self {
+             transaction_id,
+             source_revision,
+             target_revision: target.id(),
++            intent: DurableTransactionIntent::revision(target, registry)?,
+             change: DurableRevisionChange::FullRevision {
+                 encoded_target_revision: checkpoint::encode_revision(target)?,
+             },
+         })
+     }
+ 
++    pub fn full_revision_and_materializations(
++        transaction_id: ClientTransactionId,
++        source_revision: RevisionId,
++        target: &kernel_revision::Revision,
++        materializations: &[DurableMaterializationSpec],
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, CodecError> {
++        let intent = DurableTransactionIntent::revision_and_materializations(
++            target,
++            materializations,
++            registry,
++        )?;
++        let DurableTransactionIntent::Exact {
++            encoded_target_revision,
++            materializations: Some(materializations),
++            ..
++        } = intent.clone()
++        else {
++            unreachable!("combined durable intent is exact and carries materializations")
++        };
++        Ok(Self {
++            transaction_id,
++            source_revision,
++            target_revision: target.id(),
++            intent,
++            change: DurableRevisionChange::FullRevisionAndMaterializations {
++                encoded_target_revision,
++                materializations,
++            },
++        })
++    }
++
+     pub fn decode_full_revision(
+         &self,
+         registry: &kernel_semantics::SemanticRegistry,
+@@ -91,6 +206,10 @@
+             DurableRevisionChange::RelationData { .. } => Ok(None),
+             DurableRevisionChange::FullRevision {
+                 encoded_target_revision,
++            }
++            | DurableRevisionChange::FullRevisionAndMaterializations {
++                encoded_target_revision,
++                ..
+             } => {
+                 let revision = checkpoint::decode_revision(encoded_target_revision, registry)?;
+                 if revision.id() != self.target_revision {
+@@ -188,7 +307,7 @@
+     last_good_offset: usize,
+     next_lsn: u64,
+     tail_status: TailStatus,
+-    committed_transactions: BTreeMap<ClientTransactionId, RevisionId>,
++    committed_transactions: BTreeMap<ClientTransactionId, DurableTransactionIntent>,
+ }
+ 
+ impl RecoveryScan {
+@@ -231,18 +350,28 @@
+         &self,
+         transaction_id: ClientTransactionId,
+     ) -> DurableTransactionOutcome {
+-        self.committed_transactions
+-            .get(&transaction_id)
+-            .copied()
+-            .map_or(DurableTransactionOutcome::Unknown, |target_revision| {
+-                DurableTransactionOutcome::Committed { target_revision }
+-            })
++        self.committed_transactions.get(&transaction_id).map_or(
++            DurableTransactionOutcome::Unknown,
++            |intent| DurableTransactionOutcome::Committed {
++                target_revision: intent.target_revision(),
++            },
++        )
+     }
+ 
+     #[must_use]
+-    pub const fn committed_transactions(&self) -> &BTreeMap<ClientTransactionId, RevisionId> {
++    pub const fn committed_transactions(
++        &self,
++    ) -> &BTreeMap<ClientTransactionId, DurableTransactionIntent> {
+         &self.committed_transactions
+     }
++
++    #[must_use]
++    pub fn transaction_intent(
++        &self,
++        transaction_id: ClientTransactionId,
++    ) -> Option<&DurableTransactionIntent> {
++        self.committed_transactions.get(&transaction_id)
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -308,6 +437,7 @@
+     LengthOverflow,
+     CollectionTooLarge,
+     ValueNestingTooDeep,
++    SemanticModuleUnavailable,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -618,7 +748,7 @@
+     prepare_identity: BTreeMap<RevisionId, DurableRevisionDescriptor>,
+     prepare_transaction_identity: BTreeMap<ClientTransactionId, DurableRevisionDescriptor>,
+     commits: BTreeMap<RevisionId, CommitRecord>,
+-    transactions: BTreeMap<ClientTransactionId, RevisionId>,
++    transactions: BTreeMap<ClientTransactionId, DurableTransactionIntent>,
+     committed: Vec<CommittedRevision>,
+ }
+ 
+@@ -651,12 +781,12 @@
+                     reason,
+                 }
+             })?;
+-        if let Some(existing_target) = self.transactions.get(&descriptor.transaction_id)
+-            && *existing_target != descriptor.target_revision
++        if let Some(existing_intent) = self.transactions.get(&descriptor.transaction_id)
++            && existing_intent != &descriptor.intent
+         {
+             return Err(DurabilityError::Protocol {
+                 offset: frame.offset,
+-                reason: "transaction id already committed to another revision",
++                reason: "transaction id already committed to another exact intent",
+             });
+         }
+         if let Some(existing) = self.prepare_identity.get(&frame.revision) {
+@@ -731,16 +861,16 @@
+                 reason: "revision transition does not advance identity",
+             });
+         }
+-        if let Some(existing_target) = self.transactions.get(&descriptor.transaction_id) {
+-            if *existing_target != descriptor.target_revision {
++        if let Some(existing_intent) = self.transactions.get(&descriptor.transaction_id) {
++            if existing_intent != &descriptor.intent {
+                 return Err(DurabilityError::Protocol {
+                     offset: frame.offset,
+-                    reason: "transaction id conflicts with prior committed revision",
++                    reason: "transaction id conflicts with prior committed intent",
+                 });
+             }
+         } else {
+             self.transactions
+-                .insert(descriptor.transaction_id, descriptor.target_revision);
++                .insert(descriptor.transaction_id, descriptor.intent.clone());
+         }
+         self.commits.insert(frame.revision, record.clone());
+         self.committed.push(CommittedRevision {
+@@ -924,6 +1054,31 @@
+     push_u16(&mut out, MUTATION_CODEC_VERSION);
+     push_u128(&mut out, descriptor.transaction_id.raw());
+     push_u64(&mut out, descriptor.source_revision.raw());
++    match &descriptor.intent {
++        DurableTransactionIntent::Exact {
++            target_revision,
++            encoded_target_revision,
++            materializations,
++            semantic_modules,
++        } => {
++            if *target_revision != descriptor.target_revision {
++                return Err(CodecError::CollectionTooLarge);
++            }
++            out.push(1);
++            push_bytes(&mut out, encoded_target_revision)?;
++            match materializations {
++                None => out.push(0),
++                Some(specs) => {
++                    out.push(1);
++                    metadata::encode_materialization_specs(&mut out, specs)?;
++                }
++            }
++            metadata::encode_semantic_module_specs(&mut out, semantic_modules)?;
++        }
++        DurableTransactionIntent::LegacyTargetOnly { .. } => {
++            return Err(CodecError::CollectionTooLarge);
++        }
++    }
+     match &descriptor.change {
+         DurableRevisionChange::RelationData {
+             semantic_revision,
+@@ -945,10 +1100,15 @@
+             }
+         }
+         DurableRevisionChange::FullRevision {
+-            encoded_target_revision,
++            encoded_target_revision: _,
+         } => {
+             out.push(1);
+-            push_bytes(&mut out, encoded_target_revision)?;
++        }
++        DurableRevisionChange::FullRevisionAndMaterializations {
++            encoded_target_revision: _,
++            materializations: _,
++        } => {
++            out.push(2);
+         }
+     }
+     Ok(out)
+@@ -962,30 +1122,51 @@
+     let version = cursor.u16()?;
+     let transaction_id = ClientTransactionId::new(cursor.u128()?);
+     let source_revision = RevisionId::new(cursor.u64()?);
+-    let change = match version {
+-        2 => DurableRevisionChange::RelationData {
+-            semantic_revision: SemanticRevision::new(
+-                kernel_types::SchemaRevisionId::new(cursor.u64()?),
+-                kernel_types::SemanticEnvId::new(cursor.u64()?),
+-            ),
+-            relation_mutations: decode_relation_mutations(&mut cursor)?,
+-        },
+-        MUTATION_CODEC_VERSION => match cursor.u8()? {
+-            0 => DurableRevisionChange::RelationData {
++    let (intent, change) = match version {
++        2 => (
++            DurableTransactionIntent::LegacyTargetOnly { target_revision },
++            DurableRevisionChange::RelationData {
+                 semantic_revision: SemanticRevision::new(
+                     kernel_types::SchemaRevisionId::new(cursor.u64()?),
+                     kernel_types::SemanticEnvId::new(cursor.u64()?),
+                 ),
+                 relation_mutations: decode_relation_mutations(&mut cursor)?,
+             },
+-            1 => {
+-                let len = cursor.len()?;
++        ),
++        3 => {
++            let change = match cursor.u8()? {
++                0 => DurableRevisionChange::RelationData {
++                    semantic_revision: SemanticRevision::new(
++                        kernel_types::SchemaRevisionId::new(cursor.u64()?),
++                        kernel_types::SemanticEnvId::new(cursor.u64()?),
++                    ),
++                    relation_mutations: decode_relation_mutations(&mut cursor)?,
++                },
++                1 => {
++                    let len = cursor.len()?;
++                    DurableRevisionChange::FullRevision {
++                        encoded_target_revision: cursor.take(len)?.to_vec(),
++                    }
++                }
++                _ => return Err("unknown durable revision change tag"),
++            };
++            let intent = match &change {
+                 DurableRevisionChange::FullRevision {
+-                    encoded_target_revision: cursor.take(len)?.to_vec(),
++                    encoded_target_revision,
++                } => DurableTransactionIntent::Exact {
++                    target_revision,
++                    encoded_target_revision: encoded_target_revision.clone(),
++                    materializations: None,
++                    semantic_modules: Vec::new(),
++                },
++                DurableRevisionChange::RelationData { .. }
++                | DurableRevisionChange::FullRevisionAndMaterializations { .. } => {
++                    DurableTransactionIntent::LegacyTargetOnly { target_revision }
+                 }
+-            }
+-            _ => return Err("unknown durable revision change tag"),
+-        },
++            };
++            (intent, change)
++        }
++        MUTATION_CODEC_VERSION => decode_current_prepare_payload(&mut cursor, target_revision)?,
+         _ => return Err("unsupported mutation codec version"),
+     };
+     cursor.finish()?;
+@@ -993,10 +1174,60 @@
+         transaction_id,
+         source_revision,
+         target_revision,
++        intent,
+         change,
+     })
+ }
+ 
++fn decode_current_prepare_payload(
++    cursor: &mut Cursor<'_>,
++    target_revision: RevisionId,
++) -> Result<(DurableTransactionIntent, DurableRevisionChange), &'static str> {
++    if cursor.u8()? != 1 {
++        return Err("new durable transaction intent is not exact");
++    }
++    let encoded_target_revision = {
++        let len = cursor.len()?;
++        cursor.take(len)?.to_vec()
++    };
++    let materializations = match cursor.u8()? {
++        0 => None,
++        1 => Some(metadata::decode_materialization_specs(cursor)?),
++        _ => return Err("invalid durable transaction materialization tag"),
++    };
++    let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
++    let intent = DurableTransactionIntent::Exact {
++        target_revision,
++        encoded_target_revision: encoded_target_revision.clone(),
++        materializations: materializations.clone(),
++        semantic_modules,
++    };
++    let change = match cursor.u8()? {
++        0 => DurableRevisionChange::RelationData {
++            semantic_revision: SemanticRevision::new(
++                kernel_types::SchemaRevisionId::new(cursor.u64()?),
++                kernel_types::SemanticEnvId::new(cursor.u64()?),
++            ),
++            relation_mutations: decode_relation_mutations(cursor)?,
++        },
++        1 => {
++            if materializations.is_some() {
++                return Err("full revision record unexpectedly carries materializations");
++            }
++            DurableRevisionChange::FullRevision {
++                encoded_target_revision,
++            }
++        }
++        2 => DurableRevisionChange::FullRevisionAndMaterializations {
++            encoded_target_revision,
++            materializations: materializations
++                .ok_or("combined revision record is missing materialization registry")?,
++        },
++        _ => return Err("unknown durable revision change tag"),
++    };
++    Ok((intent, change))
++}
++
+ fn decode_relation_mutations(
+     cursor: &mut Cursor<'_>,
+ ) -> Result<Vec<DurableRelationMutation>, &'static str> {
+@@ -1403,17 +1634,31 @@
+     use kernel_types::{SchemaRevisionId, SemanticEnvId};
+ 
+     fn descriptor(source: u64, target: u64, value: Value) -> DurableRevisionDescriptor {
++        let registry = SemanticRegistry::default();
++        let context = SemanticContext {
++            schema: Schema::new(SchemaRevisionId::new(7)),
++            environment: SemanticEnvironment::new(SemanticEnvId::new(9)),
++        };
++        let target_revision = kernel_revision::Revision::build(
++            RevisionId::new(target),
++            &context,
++            &registry,
++            DatabaseState::default(),
++        )
++        .unwrap();
+         DurableRevisionDescriptor::relation_data(
+             ClientTransactionId::new(u128::from(target)),
+             RevisionId::new(source),
+-            RevisionId::new(target),
+-            SemanticRevision::new(SchemaRevisionId::new(7), SemanticEnvId::new(9)),
++            &target_revision,
++            target_revision.semantic_revision(),
+             vec![DurableRelationMutation {
+                 relation: SemanticId::new(11),
+                 inserted: vec![vec![value]],
+                 removed: Vec::new(),
+             }],
++            &registry,
+         )
++        .unwrap()
+     }
+ 
+     #[test]
+@@ -1486,6 +1731,7 @@
+             ClientTransactionId::new(900),
+             RevisionId::new(1),
+             &target,
++            &registry,
+         )
+         .unwrap();
+         let payload = encode_prepare_payload(&descriptor).unwrap();
+@@ -1519,9 +1765,16 @@
+             encode_rows(&mut payload, &mutation.inserted).unwrap();
+             encode_rows(&mut payload, &mutation.removed).unwrap();
+         }
++        let decoded = decode_prepare_payload(expected.target_revision, &payload).unwrap();
++        assert_eq!(decoded.transaction_id, expected.transaction_id);
++        assert_eq!(decoded.source_revision, expected.source_revision);
++        assert_eq!(decoded.target_revision, expected.target_revision);
++        assert_eq!(decoded.change, expected.change);
+         assert_eq!(
+-            decode_prepare_payload(expected.target_revision, &payload).unwrap(),
+-            expected
++            decoded.intent,
++            DurableTransactionIntent::LegacyTargetOnly {
++                target_revision: expected.target_revision,
++            }
+         );
+     }
+ 
+--- /mnt/data/cfmd_pass37_work/cfmd_workspace_pass37/crates/kernel-durability/src/metadata.rs	2026-09-19 23:59:45.949049977 +0000
++++ crates/kernel-durability/src/metadata.rs	2026-09-20 00:55:57.814751938 +0000
+@@ -1,61 +1,52 @@
+ use std::collections::BTreeMap;
+ 
+ use kernel_query::{AggregateSpec, OrderDirection, RelExpr};
++use kernel_semantics::{
++    BuiltinSemanticModuleSpec, EquivalenceModule, OrderingModule, TokenizerModule,
++};
+ use kernel_types::{ClientTransactionId, MaterializationId, RevisionId, SemanticId};
+ 
+ use super::{
+-    CodecError, Cursor, DurableMaterializationSpec, encode_value, push_len, push_u64, push_u128,
++    CodecError, Cursor, DurableMaterializationSpec, DurableTransactionIntent, encode_value,
++    push_bytes, push_len, push_u64, push_u128,
+ };
+ 
+-const METADATA_CODEC_VERSION: u16 = 1;
++const METADATA_CODEC_VERSION: u16 = 2;
+ const MAX_QUERY_DEPTH: usize = 128;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct DurableStoreMetadata {
+     pub materializations: Vec<DurableMaterializationSpec>,
+-    pub committed_transactions: BTreeMap<ClientTransactionId, RevisionId>,
++    pub committed_transactions: BTreeMap<ClientTransactionId, DurableTransactionIntent>,
++    pub semantic_modules: Vec<BuiltinSemanticModuleSpec>,
+ }
+ 
+ pub(crate) fn encode(metadata: &DurableStoreMetadata) -> Result<Vec<u8>, CodecError> {
+     let mut out = Vec::new();
+     out.extend_from_slice(&METADATA_CODEC_VERSION.to_le_bytes());
+-    push_len(&mut out, metadata.materializations.len())?;
+-    let mut previous = None;
+-    for spec in &metadata.materializations {
+-        if previous.is_some_and(|id: MaterializationId| id >= spec.id) {
+-            return Err(CodecError::CollectionTooLarge);
+-        }
+-        previous = Some(spec.id);
+-        push_u128(&mut out, spec.id.raw());
+-        encode_rel_expr(&mut out, &spec.query, 0)?;
+-    }
++    encode_materialization_specs(&mut out, &metadata.materializations)?;
+     push_len(&mut out, metadata.committed_transactions.len())?;
+-    for (transaction_id, target_revision) in &metadata.committed_transactions {
++    for (transaction_id, intent) in &metadata.committed_transactions {
+         push_u128(&mut out, transaction_id.raw());
+-        push_u64(&mut out, target_revision.raw());
++        encode_transaction_intent(&mut out, intent)?;
++    }
++    let mut modules = metadata.semantic_modules.clone();
++    modules.sort_by_key(|spec| spec.digest());
++    modules.dedup_by_key(|spec| spec.digest());
++    push_len(&mut out, modules.len())?;
++    for spec in modules {
++        encode_semantic_module_spec(&mut out, spec);
+     }
+     Ok(out)
+ }
+ 
+ pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str> {
+     let mut cursor = Cursor::new(bytes);
+-    if cursor.u16()? != METADATA_CODEC_VERSION {
++    let version = cursor.u16()?;
++    if version != 1 && version != METADATA_CODEC_VERSION {
+         return Err("unsupported durable metadata codec version");
+     }
+-    let materialization_count = cursor.len()?;
+-    let mut materializations = Vec::with_capacity(materialization_count);
+-    let mut previous = None;
+-    for _ in 0..materialization_count {
+-        let id = MaterializationId::new(cursor.u128()?);
+-        if previous.is_some_and(|prior: MaterializationId| prior >= id) {
+-            return Err("materialization ids are not strictly sorted and unique");
+-        }
+-        previous = Some(id);
+-        materializations.push(DurableMaterializationSpec {
+-            id,
+-            query: decode_rel_expr(&mut cursor, 0)?,
+-        });
+-    }
++    let materializations = decode_materialization_specs(&mut cursor)?;
+ 
+     let transaction_count = cursor.len()?;
+     let mut committed_transactions = BTreeMap::new();
+@@ -66,16 +57,274 @@
+             return Err("transaction ids are not strictly sorted and unique");
+         }
+         previous_transaction = Some(transaction_id);
+-        let target_revision = RevisionId::new(cursor.u64()?);
+-        committed_transactions.insert(transaction_id, target_revision);
++        let intent = if version == 1 {
++            DurableTransactionIntent::LegacyTargetOnly {
++                target_revision: RevisionId::new(cursor.u64()?),
++            }
++        } else {
++            decode_transaction_intent(&mut cursor)?
++        };
++        committed_transactions.insert(transaction_id, intent);
+     }
++    let semantic_modules = if version == 1 {
++        Vec::new()
++    } else {
++        let count = cursor.len()?;
++        let mut modules = Vec::with_capacity(count);
++        let mut previous = None;
++        for _ in 0..count {
++            let spec = decode_semantic_module_spec(&mut cursor)?;
++            let digest = spec.digest();
++            if previous.is_some_and(|prior| prior >= digest) {
++                return Err("semantic module digests are not strictly sorted and unique");
++            }
++            previous = Some(digest);
++            modules.push(spec);
++        }
++        modules
++    };
+     cursor.finish()?;
+     Ok(DurableStoreMetadata {
+         materializations,
+         committed_transactions,
++        semantic_modules,
+     })
+ }
+ 
++pub(crate) fn encode_materialization_specs(
++    out: &mut Vec<u8>,
++    specs: &[DurableMaterializationSpec],
++) -> Result<(), CodecError> {
++    push_len(out, specs.len())?;
++    let mut previous = None;
++    for spec in specs {
++        if previous.is_some_and(|id: MaterializationId| id >= spec.id) {
++            return Err(CodecError::CollectionTooLarge);
++        }
++        previous = Some(spec.id);
++        push_u128(out, spec.id.raw());
++        encode_rel_expr(out, &spec.query, 0)?;
++    }
++    Ok(())
++}
++
++pub(crate) fn decode_materialization_specs(
++    cursor: &mut Cursor<'_>,
++) -> Result<Vec<DurableMaterializationSpec>, &'static str> {
++    let materialization_count = cursor.len()?;
++    let mut materializations = Vec::with_capacity(materialization_count);
++    let mut previous = None;
++    for _ in 0..materialization_count {
++        let id = MaterializationId::new(cursor.u128()?);
++        if previous.is_some_and(|prior: MaterializationId| prior >= id) {
++            return Err("materialization ids are not strictly sorted and unique");
++        }
++        previous = Some(id);
++        materializations.push(DurableMaterializationSpec {
++            id,
++            query: decode_rel_expr(cursor, 0)?,
++        });
++    }
++    Ok(materializations)
++}
++
++fn encode_transaction_intent(
++    out: &mut Vec<u8>,
++    intent: &DurableTransactionIntent,
++) -> Result<(), CodecError> {
++    match intent {
++        DurableTransactionIntent::Exact {
++            target_revision,
++            encoded_target_revision,
++            materializations,
++            semantic_modules,
++        } => {
++            out.push(1);
++            push_u64(out, target_revision.raw());
++            push_bytes(out, encoded_target_revision)?;
++            match materializations {
++                None => out.push(0),
++                Some(specs) => {
++                    out.push(1);
++                    encode_materialization_specs(out, specs)?;
++                }
++            }
++            encode_semantic_module_specs(out, semantic_modules)?;
++        }
++        DurableTransactionIntent::LegacyTargetOnly { target_revision } => {
++            out.push(0);
++            push_u64(out, target_revision.raw());
++        }
++    }
++    Ok(())
++}
++
++fn decode_transaction_intent(
++    cursor: &mut Cursor<'_>,
++) -> Result<DurableTransactionIntent, &'static str> {
++    match cursor.u8()? {
++        0 => Ok(DurableTransactionIntent::LegacyTargetOnly {
++            target_revision: RevisionId::new(cursor.u64()?),
++        }),
++        1 => {
++            let target_revision = RevisionId::new(cursor.u64()?);
++            let len = cursor.len()?;
++            let encoded_target_revision = cursor.take(len)?.to_vec();
++            let materializations = match cursor.u8()? {
++                0 => None,
++                1 => Some(decode_materialization_specs(cursor)?),
++                _ => return Err("invalid transaction intent materialization tag"),
++            };
++            let semantic_modules = decode_semantic_module_specs(cursor)?;
++            Ok(DurableTransactionIntent::Exact {
++                target_revision,
++                encoded_target_revision,
++                materializations,
++                semantic_modules,
++            })
++        }
++        _ => Err("invalid transaction intent tag"),
++    }
++}
++
++pub(crate) fn encode_semantic_module_specs(
++    out: &mut Vec<u8>,
++    specs: &[BuiltinSemanticModuleSpec],
++) -> Result<(), CodecError> {
++    let mut specs = specs.to_vec();
++    specs.sort_by_key(|spec| spec.digest());
++    specs.dedup_by_key(|spec| spec.digest());
++    push_len(out, specs.len())?;
++    for spec in specs {
++        encode_semantic_module_spec(out, spec);
++    }
++    Ok(())
++}
++
++pub(crate) fn decode_semantic_module_specs(
++    cursor: &mut Cursor<'_>,
++) -> Result<Vec<BuiltinSemanticModuleSpec>, &'static str> {
++    let count = cursor.len()?;
++    let mut modules = Vec::with_capacity(count);
++    let mut previous = None;
++    for _ in 0..count {
++        let spec = decode_semantic_module_spec(cursor)?;
++        let digest = spec.digest();
++        if previous.is_some_and(|prior| prior >= digest) {
++            return Err("semantic module digests are not strictly sorted and unique");
++        }
++        previous = Some(digest);
++        modules.push(spec);
++    }
++    Ok(modules)
++}
++
++fn encode_semantic_module_spec(out: &mut Vec<u8>, spec: BuiltinSemanticModuleSpec) {
++    match spec {
++        BuiltinSemanticModuleSpec::Equivalence {
++            module,
++            implementation_revision,
++        } => {
++            out.push(0);
++            encode_equivalence_module(out, module);
++            push_u64(out, implementation_revision);
++        }
++        BuiltinSemanticModuleSpec::Tokenizer {
++            module,
++            implementation_revision,
++        } => {
++            out.push(1);
++            out.push(match module {
++                TokenizerModule::AsciiWhitespace => 0,
++                TokenizerModule::AsciiWhitespaceLowercase => 1,
++            });
++            push_u64(out, implementation_revision);
++        }
++        BuiltinSemanticModuleSpec::Ordering {
++            module,
++            implementation_revision,
++        } => {
++            out.push(2);
++            out.push(match module {
++                OrderingModule::I64Ascending => 0,
++                OrderingModule::F64Total => 1,
++                OrderingModule::TextBinary => 2,
++                OrderingModule::TextAsciiCaseInsensitive => 3,
++                OrderingModule::TextAsciiCaseInsensitiveThenBinary => 4,
++            });
++            push_u64(out, implementation_revision);
++        }
++    }
++}
++
++fn decode_semantic_module_spec(
++    cursor: &mut Cursor<'_>,
++) -> Result<BuiltinSemanticModuleSpec, &'static str> {
++    match cursor.u8()? {
++        0 => Ok(BuiltinSemanticModuleSpec::Equivalence {
++            module: decode_equivalence_module(cursor)?,
++            implementation_revision: cursor.u64()?,
++        }),
++        1 => Ok(BuiltinSemanticModuleSpec::Tokenizer {
++            module: match cursor.u8()? {
++                0 => TokenizerModule::AsciiWhitespace,
++                1 => TokenizerModule::AsciiWhitespaceLowercase,
++                _ => return Err("invalid builtin tokenizer module tag"),
++            },
++            implementation_revision: cursor.u64()?,
++        }),
++        2 => Ok(BuiltinSemanticModuleSpec::Ordering {
++            module: match cursor.u8()? {
++                0 => OrderingModule::I64Ascending,
++                1 => OrderingModule::F64Total,
++                2 => OrderingModule::TextBinary,
++                3 => OrderingModule::TextAsciiCaseInsensitive,
++                4 => OrderingModule::TextAsciiCaseInsensitiveThenBinary,
++                _ => return Err("invalid builtin ordering module tag"),
++            },
++            implementation_revision: cursor.u64()?,
++        }),
++        _ => Err("invalid builtin semantic module kind"),
++    }
++}
++
++fn encode_equivalence_module(out: &mut Vec<u8>, module: EquivalenceModule) {
++    match module {
++        EquivalenceModule::UnitExact => out.push(0),
++        EquivalenceModule::BoolExact => out.push(1),
++        EquivalenceModule::I64Exact => out.push(2),
++        EquivalenceModule::F64Bitwise => out.push(3),
++        EquivalenceModule::TextExact => out.push(4),
++        EquivalenceModule::TextAsciiCaseInsensitive => out.push(5),
++        EquivalenceModule::LiveEntityIdExact(entity_type) => {
++            out.push(6);
++            push_u128(out, entity_type.raw());
++        }
++        EquivalenceModule::HistoricalEntityIdExact(entity_type) => {
++            out.push(7);
++            push_u128(out, entity_type.raw());
++        }
++    }
++}
++
++fn decode_equivalence_module(cursor: &mut Cursor<'_>) -> Result<EquivalenceModule, &'static str> {
++    match cursor.u8()? {
++        0 => Ok(EquivalenceModule::UnitExact),
++        1 => Ok(EquivalenceModule::BoolExact),
++        2 => Ok(EquivalenceModule::I64Exact),
++        3 => Ok(EquivalenceModule::F64Bitwise),
++        4 => Ok(EquivalenceModule::TextExact),
++        5 => Ok(EquivalenceModule::TextAsciiCaseInsensitive),
++        6 => Ok(EquivalenceModule::LiveEntityIdExact(SemanticId::new(
++            cursor.u128()?,
++        ))),
++        7 => Ok(EquivalenceModule::HistoricalEntityIdExact(SemanticId::new(
++            cursor.u128()?,
++        ))),
++        _ => Err("invalid builtin equivalence module tag"),
++    }
++}
++
+ fn encode_rel_expr(out: &mut Vec<u8>, expr: &RelExpr, depth: usize) -> Result<(), CodecError> {
+     if depth > MAX_QUERY_DEPTH {
+         return Err(CodecError::ValueNestingTooDeep);
+@@ -349,7 +598,17 @@
+                 id: MaterializationId::new(7),
+                 query,
+             }],
+-            committed_transactions: [(ClientTransactionId::new(11), RevisionId::new(12))].into(),
++            committed_transactions: [(
++                ClientTransactionId::new(11),
++                DurableTransactionIntent::Exact {
++                    target_revision: RevisionId::new(12),
++                    encoded_target_revision: vec![1, 2, 3],
++                    materializations: None,
++                    semantic_modules: Vec::new(),
++                },
++            )]
++            .into(),
++            semantic_modules: Vec::new(),
+         };
+         let bytes = encode(&metadata).unwrap();
+         assert_eq!(decode(&bytes).unwrap(), metadata);
+--- /mnt/data/cfmd_pass37_work/cfmd_workspace_pass37/crates/kernel-durability/src/store.rs	2026-09-20 00:24:55.542440728 +0000
++++ crates/kernel-durability/src/store.rs	2026-09-20 01:18:25.900123040 +0000
+@@ -9,8 +9,9 @@
+ 
+ use super::{
+     DurabilityError, DurableCommitReceipt, DurableMaterializationSpec, DurablePrepareToken,
+-    DurableRevisionDescriptor, DurableTransactionOutcome, FileRevisionWal, RecoveryScan,
+-    RevisionDurability, checkpoint, crc32c, metadata, read_u16, read_u32, read_u64,
++    DurableRevisionDescriptor, DurableTransactionIntent, DurableTransactionOutcome,
++    FileRevisionWal, RecoveryScan, RevisionDurability, checkpoint, crc32c, metadata, read_u16,
++    read_u32, read_u64,
+ };
+ 
+ const CHECKPOINT_MAGIC: [u8; 4] = *b"CFCP";
+@@ -72,28 +73,88 @@
+     checkpoint: Revision,
+     durable_head: RevisionId,
+     wal: FileRevisionWal,
++    semantic_registry: SemanticRegistry,
+     materialization_specs: Vec<DurableMaterializationSpec>,
+-    committed_transactions: BTreeMap<ClientTransactionId, RevisionId>,
++    committed_transactions: BTreeMap<ClientTransactionId, DurableTransactionIntent>,
++    prepared_transactions: BTreeMap<u64, DurableRevisionDescriptor>,
+     poisoned: bool,
+ }
+ 
++fn install_intent_semantic_modules(
++    registry: &mut SemanticRegistry,
++    intent: &DurableTransactionIntent,
++) {
++    if let DurableTransactionIntent::Exact {
++        semantic_modules, ..
++    } = intent
++    {
++        for spec in semantic_modules {
++            registry.install_builtin_module_spec(*spec);
++        }
++    }
++}
++
++fn rebuild_semantic_registry(
++    metadata: &metadata::DurableStoreMetadata,
++    legacy_registry: Option<&SemanticRegistry>,
++) -> Result<SemanticRegistry, DurabilityError> {
++    let mut registry = if metadata.semantic_modules.is_empty() {
++        legacy_registry.cloned().ok_or(DurabilityError::Protocol {
++            offset: 0,
++            reason: "durable semantic deployment manifest is missing",
++        })?
++    } else {
++        let mut registry = SemanticRegistry::default();
++        for spec in &metadata.semantic_modules {
++            registry.install_builtin_module_spec(*spec);
++        }
++        registry
++    };
++    for intent in metadata.committed_transactions.values() {
++        install_intent_semantic_modules(&mut registry, intent);
++    }
++    Ok(registry)
++}
++
++fn merge_committed_transaction_intents(
++    mut committed_transactions: BTreeMap<ClientTransactionId, DurableTransactionIntent>,
++    scan: &RecoveryScan,
++    registry: &mut SemanticRegistry,
++) -> Result<BTreeMap<ClientTransactionId, DurableTransactionIntent>, DurabilityError> {
++    for (&transaction_id, intent) in scan.committed_transactions() {
++        install_intent_semantic_modules(registry, intent);
++        if let Some(existing) = committed_transactions.insert(transaction_id, intent.clone())
++            && existing != *intent
++        {
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: "checkpoint transaction intent ledger conflicts with WAL tail",
++            });
++        }
++    }
++    Ok(committed_transactions)
++}
++
+ impl DurableRevisionStore {
+     pub fn create(
+         directory: impl AsRef<Path>,
+         base_revision: &Revision,
++        registry: &SemanticRegistry,
+     ) -> Result<Self, DurabilityError> {
+-        Self::create_with_materializations(directory, base_revision, &[])
++        Self::create_with_materializations(directory, base_revision, &[], registry)
+     }
+ 
+     pub fn create_with_materializations(
+         directory: impl AsRef<Path>,
+         base_revision: &Revision,
+         materialization_specs: &[DurableMaterializationSpec],
++        registry: &SemanticRegistry,
+     ) -> Result<Self, DurabilityError> {
+         Self::create_with_hook(
+             directory.as_ref(),
+             base_revision,
+             materialization_specs,
++            registry,
+             &mut NoStoreFault,
+         )
+     }
+@@ -102,6 +163,7 @@
+         directory: &Path,
+         base_revision: &Revision,
+         materialization_specs: &[DurableMaterializationSpec],
++        registry: &SemanticRegistry,
+         hook: &mut impl StoreFaultHook,
+     ) -> Result<Self, DurabilityError> {
+         let directory = directory.to_path_buf();
+@@ -122,9 +184,16 @@
+         wal.barrier()?;
+         hook.hit(StoreFaultPoint::AfterWalSync);
+         let committed_transactions = BTreeMap::new();
++        let semantic_modules = registry
++            .builtin_modules_for_context(base_revision.semantic_context())
++            .map_err(|_| DurabilityError::Protocol {
++                offset: 0,
++                reason: "base revision requires unavailable semantic implementation",
++            })?;
+         let metadata_record = metadata::DurableStoreMetadata {
+             materializations: materialization_specs.to_vec(),
+             committed_transactions: committed_transactions.clone(),
++            semantic_modules,
+         };
+         let metadata_file = metadata_path(&directory, generation);
+         let metadata_crc32c = write_metadata_file(&metadata_file, &metadata_record)?;
+@@ -148,34 +217,32 @@
+             checkpoint: base_revision.clone(),
+             durable_head: base_revision.id(),
+             wal,
++            semantic_registry: registry.clone(),
+             materialization_specs: materialization_specs.to_vec(),
+             committed_transactions,
++            prepared_transactions: BTreeMap::new(),
+             poisoned: false,
+         })
+     }
+ 
+-    pub fn open(
++    pub fn open(directory: impl AsRef<Path>) -> Result<(Self, RecoveryScan), DurabilityError> {
++        Self::open_inner(directory.as_ref(), None)
++    }
++
++    pub fn open_with_legacy_registry(
+         directory: impl AsRef<Path>,
+-        registry: &SemanticRegistry,
++        legacy_registry: &SemanticRegistry,
+     ) -> Result<(Self, RecoveryScan), DurabilityError> {
+-        let directory = directory.as_ref().to_path_buf();
++        Self::open_inner(directory.as_ref(), Some(legacy_registry))
++    }
++
++    fn open_inner(
++        directory: &Path,
++        legacy_registry: Option<&SemanticRegistry>,
++    ) -> Result<(Self, RecoveryScan), DurabilityError> {
++        let directory = directory.to_path_buf();
+         let directory_lock = lock_directory(&directory)?;
+         let manifest = read_current_manifest(&directory)?;
+-        let checkpoint_file = checkpoint_path(&directory, manifest.generation);
+-        let checkpoint_bytes = fs::read(&checkpoint_file)?;
+-        if crc32c(&checkpoint_bytes) != manifest.checkpoint_crc32c {
+-            return Err(DurabilityError::Corruption {
+-                offset: 0,
+-                reason: "published checkpoint file checksum mismatch",
+-            });
+-        }
+-        let checkpoint = decode_checkpoint_file(&checkpoint_bytes, registry)?;
+-        if checkpoint.id() != manifest.base_revision {
+-            return Err(DurabilityError::Protocol {
+-                offset: 0,
+-                reason: "manifest base revision does not match checkpoint",
+-            });
+-        }
+         let metadata_file = metadata_path(&directory, manifest.generation);
+         let metadata_bytes = fs::read(&metadata_file).map_err(|error| {
+             if error.kind() == std::io::ErrorKind::NotFound {
+@@ -194,6 +261,22 @@
+             });
+         }
+         let metadata = decode_metadata_file(&metadata_bytes)?;
++        let mut registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
++        let checkpoint_file = checkpoint_path(&directory, manifest.generation);
++        let checkpoint_bytes = fs::read(&checkpoint_file)?;
++        if crc32c(&checkpoint_bytes) != manifest.checkpoint_crc32c {
++            return Err(DurabilityError::Corruption {
++                offset: 0,
++                reason: "published checkpoint file checksum mismatch",
++            });
++        }
++        let checkpoint = decode_checkpoint_file(&checkpoint_bytes, &registry)?;
++        if checkpoint.id() != manifest.base_revision {
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: "manifest base revision does not match checkpoint",
++            });
++        }
+         let wal_file = wal_path(&directory, manifest.generation);
+         if !wal_file.is_file() {
+             return Err(DurabilityError::Corruption {
+@@ -202,17 +285,11 @@
+             });
+         }
+         let (wal, scan) = FileRevisionWal::open_recovered(&wal_file, checkpoint.id())?;
+-        let mut committed_transactions = metadata.committed_transactions;
+-        for (&transaction_id, &target_revision) in scan.committed_transactions() {
+-            if let Some(existing) = committed_transactions.insert(transaction_id, target_revision)
+-                && existing != target_revision
+-            {
+-                return Err(DurabilityError::Protocol {
+-                    offset: 0,
+-                    reason: "checkpoint transaction ledger conflicts with WAL tail",
+-                });
+-            }
+-        }
++        let committed_transactions = merge_committed_transaction_intents(
++            metadata.committed_transactions,
++            &scan,
++            &mut registry,
++        )?;
+         Ok((
+             Self {
+                 directory,
+@@ -221,8 +298,10 @@
+                 checkpoint,
+                 durable_head: scan.durable_revision(),
+                 wal,
++                semantic_registry: registry,
+                 materialization_specs: metadata.materializations,
+                 committed_transactions,
++                prepared_transactions: BTreeMap::new(),
+                 poisoned: false,
+             },
+             scan,
+@@ -260,16 +339,29 @@
+     }
+ 
+     #[must_use]
++    pub const fn semantic_registry(&self) -> &SemanticRegistry {
++        &self.semantic_registry
++    }
++
++    #[must_use]
+     pub fn transaction_outcome(
+         &self,
+         transaction_id: ClientTransactionId,
+     ) -> DurableTransactionOutcome {
+-        self.committed_transactions
+-            .get(&transaction_id)
+-            .copied()
+-            .map_or(DurableTransactionOutcome::Unknown, |target_revision| {
+-                DurableTransactionOutcome::Committed { target_revision }
+-            })
++        self.committed_transactions.get(&transaction_id).map_or(
++            DurableTransactionOutcome::Unknown,
++            |intent| DurableTransactionOutcome::Committed {
++                target_revision: intent.target_revision(),
++            },
++        )
++    }
++
++    #[must_use]
++    pub fn transaction_intent(
++        &self,
++        transaction_id: ClientTransactionId,
++    ) -> Option<&DurableTransactionIntent> {
++        self.committed_transactions.get(&transaction_id)
+     }
+ 
+     pub fn rotate_checkpoint(
+@@ -319,6 +411,13 @@
+         let metadata_record = metadata::DurableStoreMetadata {
+             materializations: materialization_specs.to_vec(),
+             committed_transactions: self.committed_transactions.clone(),
++            semantic_modules: self
++                .semantic_registry
++                .builtin_modules_for_context(revision.semantic_context())
++                .map_err(|_| DurabilityError::Protocol {
++                    offset: 0,
++                    reason: "checkpoint revision requires unavailable semantic implementation",
++                })?,
+         };
+         let metadata_file = metadata_path(&self.directory, generation);
+         let metadata_crc32c = write_metadata_file(&metadata_file, &metadata_record)?;
+@@ -339,6 +438,7 @@
+         self.checkpoint = revision.clone();
+         self.wal = wal;
+         self.materialization_specs = materialization_specs.to_vec();
++        self.prepared_transactions.clear();
+         Ok(DurableGenerationReceipt {
+             generation,
+             base_revision: revision.id(),
+@@ -387,13 +487,13 @@
+         if self.poisoned {
+             return Err(DurabilityError::Poisoned);
+         }
+-        if let Some(existing_target) = self.committed_transactions.get(&descriptor.transaction_id) {
++        if let Some(existing_intent) = self.committed_transactions.get(&descriptor.transaction_id) {
+             return Err(DurabilityError::Protocol {
+                 offset: 0,
+-                reason: if *existing_target == descriptor.target_revision {
++                reason: if existing_intent == &descriptor.intent {
+                     "transaction is already committed"
+                 } else {
+-                    "transaction id already committed to another revision"
++                    "transaction id already committed to another exact intent"
+                 },
+             });
+         }
+@@ -403,7 +503,47 @@
+                 reason: "prepare source revision does not match durable store head",
+             });
+         }
+-        self.wal.durably_prepare(descriptor)
++        let DurableTransactionIntent::Exact {
++            target_revision,
++            encoded_target_revision,
++            semantic_modules,
++            ..
++        } = &descriptor.intent
++        else {
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: "new durable prepare does not carry exact transaction intent",
++            });
++        };
++        if *target_revision != descriptor.target_revision {
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: "transaction intent target does not match descriptor target",
++            });
++        }
++        for spec in semantic_modules {
++            self.semantic_registry.install_builtin_module_spec(*spec);
++        }
++        let target = checkpoint::decode_revision(encoded_target_revision, &self.semantic_registry)?;
++        if target.id() != descriptor.target_revision {
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: "transaction intent revision payload does not match target id",
++            });
++        }
++        let token = self.wal.durably_prepare(descriptor)?;
++        if let Some(existing) = self
++            .prepared_transactions
++            .insert(token.prepare_lsn(), descriptor.clone())
++            && existing != *descriptor
++        {
++            self.poisoned = true;
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: "prepare lsn was rebound to another descriptor",
++            });
++        }
++        Ok(token)
+     }
+ 
+     fn durably_commit(
+@@ -414,17 +554,33 @@
+             return Err(DurabilityError::Poisoned);
+         }
+         let transaction_id = prepared.transaction_id();
++        let descriptor = self
++            .prepared_transactions
++            .get(&prepared.prepare_lsn())
++            .cloned()
++            .ok_or(DurabilityError::Protocol {
++                offset: 0,
++                reason: "commit token has no prepared descriptor in this store",
++            })?;
++        if descriptor.transaction_id != transaction_id
++            || descriptor.target_revision != prepared.target_revision()
++        {
++            return Err(DurabilityError::Protocol {
++                offset: 0,
++                reason: "commit token identity does not match prepared descriptor",
++            });
++        }
+         let receipt = self.wal.durably_commit(prepared)?;
+         self.durable_head = receipt.target_revision();
+         if let Some(existing) = self
+             .committed_transactions
+-            .insert(transaction_id, receipt.target_revision())
+-            && existing != receipt.target_revision()
++            .insert(transaction_id, descriptor.intent.clone())
++            && existing != descriptor.intent
+         {
+             self.poisoned = true;
+             return Err(DurabilityError::Protocol {
+                 offset: 0,
+-                reason: "committed transaction id changed target revision",
++                reason: "committed transaction id changed exact intent",
+             });
+         }
+         Ok(receipt)
+@@ -898,45 +1054,65 @@
+ 
+     fn committed_descriptor(
+         base: &Revision,
++        registry: &SemanticRegistry,
+         relation: SemanticId,
+         target_revision: u64,
+         inserted: i64,
+     ) -> DurableRevisionDescriptor {
++        let mut state = base.state().clone();
++        state
++            .model
++            .relations
++            .entry(relation)
++            .or_default()
++            .push(vec![Value::I64(inserted)]);
++        let target = Revision::build(
++            RevisionId::new(target_revision),
++            base.semantic_context(),
++            registry,
++            state,
++        )
++        .unwrap();
+         DurableRevisionDescriptor::relation_data(
+             ClientTransactionId::new(u128::from(target_revision)),
+             base.id(),
+-            RevisionId::new(target_revision),
++            &target,
+             base.semantic_revision(),
+             vec![DurableRelationMutation {
+                 relation,
+                 inserted: vec![vec![Value::I64(inserted)]],
+                 removed: Vec::new(),
+             }],
++            registry,
+         )
++        .unwrap()
+     }
+ 
+     #[test]
+     fn store_reopens_exact_checkpoint_and_committed_wal_tail() {
+         let dir = test_dir("reopen");
+         let (base, registry, relation) = setup_revision(10, &[1]);
+-        let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
++        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
++        let (target, _, _) = setup_revision(11, &[1, 2]);
+         let descriptor = DurableRevisionDescriptor::relation_data(
+             ClientTransactionId::new(11),
+             RevisionId::new(10),
+-            RevisionId::new(11),
++            &target,
+             base.semantic_revision(),
+             vec![DurableRelationMutation {
+                 relation,
+                 inserted: vec![vec![Value::I64(2)]],
+                 removed: Vec::new(),
+             }],
+-        );
++            &registry,
++        )
++        .unwrap();
+         let prepared = store.durably_prepare(&descriptor).unwrap();
+         store.durably_commit(prepared).unwrap();
+         assert_eq!(store.durable_head(), RevisionId::new(11));
+         drop(store);
+ 
+-        let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+         assert_eq!(reopened.checkpoint_revision(), &base);
+         assert_eq!(reopened.durable_head(), RevisionId::new(11));
+         assert_eq!(scan.durable_revision(), RevisionId::new(11));
+@@ -948,18 +1124,20 @@
+         let dir = test_dir("rotate");
+         let (base, registry, relation) = setup_revision(20, &[1]);
+         let (next, _, _) = setup_revision(21, &[1, 2]);
+-        let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
++        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+         let descriptor = DurableRevisionDescriptor::relation_data(
+             ClientTransactionId::new(21),
+             RevisionId::new(20),
+-            RevisionId::new(21),
++            &next,
+             base.semantic_revision(),
+             vec![DurableRelationMutation {
+                 relation,
+                 inserted: vec![vec![Value::I64(2)]],
+                 removed: Vec::new(),
+             }],
+-        );
++            &registry,
++        )
++        .unwrap();
+         let prepared = store.durably_prepare(&descriptor).unwrap();
+         store.durably_commit(prepared).unwrap();
+         let receipt = store.rotate_checkpoint(&next).unwrap();
+@@ -967,7 +1145,7 @@
+         assert_eq!(store.checkpoint_revision(), &next);
+         drop(store);
+ 
+-        let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+         assert_eq!(reopened.generation(), 2);
+         assert_eq!(reopened.checkpoint_revision(), &next);
+         assert_eq!(scan.base_revision(), RevisionId::new(21));
+@@ -979,7 +1157,7 @@
+     fn unpublished_orphan_generation_is_ignored_and_next_rotation_skips_it() {
+         let dir = test_dir("orphan");
+         let (base, registry, _) = setup_revision(30, &[1]);
+-        let store = DurableRevisionStore::create(&dir, &base).unwrap();
++        let store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+         drop(store);
+         fs::copy(checkpoint_path(&dir, 1), checkpoint_path(&dir, 2)).unwrap();
+         File::create(wal_path(&dir, 2)).unwrap().sync_all().unwrap();
+@@ -989,7 +1167,7 @@
+         )
+         .unwrap();
+ 
+-        let (mut reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let (mut reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+         assert_eq!(reopened.generation(), 1);
+         assert_eq!(scan.durable_revision(), RevisionId::new(30));
+         let receipt = reopened.rotate_checkpoint(&base).unwrap();
+@@ -1001,7 +1179,7 @@
+     fn published_manifest_does_not_fallback_when_checkpoint_is_corrupt() {
+         let dir = test_dir("corrupt");
+         let (base, registry, _) = setup_revision(40, &[1]);
+-        let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
++        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+         store.rotate_checkpoint(&base).unwrap();
+         drop(store);
+         let checkpoint = checkpoint_path(&dir, 2);
+@@ -1011,7 +1189,7 @@
+         fs::write(checkpoint, bytes).unwrap();
+ 
+         assert!(matches!(
+-            DurableRevisionStore::open(&dir, &registry),
++            DurableRevisionStore::open(&dir),
+             Err(DurabilityError::Corruption { .. })
+         ));
+         fs::remove_dir_all(dir).unwrap();
+@@ -1020,8 +1198,8 @@
+     #[test]
+     fn compaction_keeps_only_active_generation_artifacts() {
+         let dir = test_dir("compact");
+-        let (base, _, _) = setup_revision(50, &[1]);
+-        let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
++        let (base, registry, _) = setup_revision(50, &[1]);
++        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+         store.rotate_checkpoint(&base).unwrap();
+         store.compact_obsolete_generations().unwrap();
+         assert!(!checkpoint_path(&dir, 1).exists());
+@@ -1040,13 +1218,13 @@
+     fn published_manifest_requires_exact_durable_metadata_sidecar() {
+         let dir = test_dir("metadata-authority");
+         let (base, registry, _) = setup_revision(59, &[1]);
+-        let store = DurableRevisionStore::create(&dir, &base).unwrap();
++        let store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+         drop(store);
+         let path = metadata_path(&dir, 1);
+         let original = fs::read(&path).unwrap();
+         fs::remove_file(&path).unwrap();
+         assert!(matches!(
+-            DurableRevisionStore::open(&dir, &registry),
++            DurableRevisionStore::open(&dir),
+             Err(DurabilityError::Corruption {
+                 reason: "published durable metadata file is missing",
+                 ..
+@@ -1058,7 +1236,7 @@
+         corrupt[last] ^= 0x40;
+         fs::write(&path, corrupt).unwrap();
+         assert!(matches!(
+-            DurableRevisionStore::open(&dir, &registry),
++            DurableRevisionStore::open(&dir),
+             Err(DurabilityError::Corruption { .. })
+         ));
+         fs::remove_dir_all(dir).unwrap();
+@@ -1068,11 +1246,11 @@
+     fn published_manifest_with_missing_wal_is_corruption_not_empty_segment() {
+         let dir = test_dir("missing-wal");
+         let (base, registry, _) = setup_revision(60, &[1]);
+-        let store = DurableRevisionStore::create(&dir, &base).unwrap();
++        let store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+         drop(store);
+         fs::remove_file(wal_path(&dir, 1)).unwrap();
+         assert!(matches!(
+-            DurableRevisionStore::open(&dir, &registry),
++            DurableRevisionStore::open(&dir),
+             Err(DurabilityError::Corruption {
+                 reason: "published WAL segment is missing",
+                 ..
+@@ -1085,7 +1263,7 @@
+     fn subprocess_kill_after_prepare_recovers_previous_committed_head() {
+         let dir = test_dir("kill-after-prepare");
+         let (base, registry, _) = setup_revision(80, &[1]);
+-        drop(DurableRevisionStore::create(&dir, &base).unwrap());
++        drop(DurableRevisionStore::create(&dir, &base, &registry).unwrap());
+ 
+         run_crash_worker(
+             "store::tests::crash_worker_wal_boundary",
+@@ -1093,7 +1271,7 @@
+             "after-prepare",
+         );
+ 
+-        let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+         assert_eq!(reopened.durable_head(), RevisionId::new(80));
+         assert!(scan.committed().is_empty());
+         fs::remove_dir_all(dir).unwrap();
+@@ -1103,7 +1281,7 @@
+     fn subprocess_kill_after_commit_recovers_committed_head_without_ack() {
+         let dir = test_dir("kill-after-commit");
+         let (base, registry, _) = setup_revision(80, &[1]);
+-        drop(DurableRevisionStore::create(&dir, &base).unwrap());
++        drop(DurableRevisionStore::create(&dir, &base, &registry).unwrap());
+ 
+         run_crash_worker(
+             "store::tests::crash_worker_wal_boundary",
+@@ -1111,7 +1289,7 @@
+             "after-commit",
+         );
+ 
+-        let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+         assert_eq!(reopened.durable_head(), RevisionId::new(81));
+         assert_eq!(scan.committed().len(), 1);
+         assert_eq!(
+@@ -1136,8 +1314,8 @@
+         for (point, expected_generation) in points {
+             let dir = test_dir(crash_point_name(point));
+             let (base, registry, relation) = setup_revision(90, &[1]);
+-            let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
+-            let descriptor = committed_descriptor(&base, relation, 91, 2);
++            let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
++            let descriptor = committed_descriptor(&base, &registry, relation, 91, 2);
+             let prepared = store.durably_prepare(&descriptor).unwrap();
+             store.durably_commit(prepared).unwrap();
+             drop(store);
+@@ -1148,7 +1326,7 @@
+                 crash_point_name(point),
+             );
+ 
+-            let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++            let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+             assert_eq!(reopened.generation(), expected_generation, "{point:?}");
+             assert_eq!(reopened.durable_head(), RevisionId::new(91), "{point:?}");
+             if expected_generation == 1 {
+@@ -1171,7 +1349,7 @@
+         ] {
+             let dir = test_dir(crash_point_name(point));
+             let (base, registry, _) = setup_revision(100, &[1]);
+-            let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
++            let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+             store.rotate_checkpoint(&base).unwrap();
+             drop(store);
+ 
+@@ -1181,7 +1359,7 @@
+                 crash_point_name(point),
+             );
+ 
+-            let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++            let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+             assert_eq!(reopened.generation(), 2, "{point:?}");
+             assert_eq!(reopened.durable_head(), RevisionId::new(100), "{point:?}");
+             assert!(scan.committed().is_empty());
+@@ -1197,8 +1375,8 @@
+         let dir = PathBuf::from(std::env::var_os(CRASH_DIR_ENV).unwrap());
+         let point = std::env::var(CRASH_POINT_ENV).unwrap();
+         let (base, registry, relation) = setup_revision(80, &[1]);
+-        let (mut store, _) = DurableRevisionStore::open(&dir, &registry).unwrap();
+-        let descriptor = committed_descriptor(&base, relation, 81, 2);
++        let (mut store, _) = DurableRevisionStore::open(&dir).unwrap();
++        let descriptor = committed_descriptor(&base, &registry, relation, 81, 2);
+         let prepared = store.durably_prepare(&descriptor).unwrap();
+         if point == "after-prepare" {
+             signal_crash_ready(&dir);
+@@ -1217,9 +1395,8 @@
+         }
+         let dir = PathBuf::from(std::env::var_os(CRASH_DIR_ENV).unwrap());
+         let point = parse_crash_point(&std::env::var(CRASH_POINT_ENV).unwrap());
+-        let (_, registry, _) = setup_revision(90, &[1]);
+         let (next, _, _) = setup_revision(91, &[1, 2]);
+-        let (mut store, _) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let (mut store, _) = DurableRevisionStore::open(&dir).unwrap();
+         let mut hook = BlockingKillFault {
+             target: point,
+             directory: dir.clone(),
+@@ -1238,8 +1415,7 @@
+         }
+         let dir = PathBuf::from(std::env::var_os(CRASH_DIR_ENV).unwrap());
+         let point = parse_crash_point(&std::env::var(CRASH_POINT_ENV).unwrap());
+-        let (_, registry, _) = setup_revision(100, &[1]);
+-        let (store, _) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let (store, _) = DurableRevisionStore::open(&dir).unwrap();
+         let mut hook = BlockingKillFault {
+             target: point,
+             directory: dir.clone(),
+--- /mnt/data/cfmd_pass37_work/cfmd_workspace_pass37/crates/kernel-plan/src/lib.rs	2026-09-20 00:28:01.856303045 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 01:18:48.721414070 +0000
+@@ -9,7 +9,8 @@
+ use kernel_durability::{
+     DurabilityError, DurableCommitReceipt, DurableGenerationReceipt, DurableMaterializationSpec,
+     DurableRelationMutation, DurableRevisionChange, DurableRevisionDescriptor,
+-    DurableRevisionStore, DurableTransactionOutcome, RecoveryScan, RevisionDurability,
++    DurableRevisionStore, DurableTransactionIntent, DurableTransactionOutcome, RecoveryScan,
++    RevisionDurability,
+ };
+ use kernel_model::Value;
+ use kernel_query::{
+@@ -514,7 +515,7 @@
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct RevisionCommitDescriptor {
+     source_revision: RevisionId,
+-    target_revision: RevisionId,
++    target: Box<kernel_revision::Revision>,
+     change: RevisionCommitChange,
+ }
+ 
+@@ -524,8 +525,9 @@
+         semantic_revision: kernel_types::SemanticRevision,
+         relation_deltas: BTreeMap<SemanticId, RelationDelta>,
+     },
+-    FullRevision {
+-        target: Box<kernel_revision::Revision>,
++    FullRevision,
++    FullRevisionAndMaterializations {
++        materializations: Vec<DurableMaterializationSpec>,
+     },
+ }
+ 
+@@ -536,8 +538,13 @@
+     }
+ 
+     #[must_use]
+-    pub const fn target_revision(&self) -> RevisionId {
+-        self.target_revision
++    pub fn target_revision(&self) -> RevisionId {
++        self.target.id()
++    }
++
++    #[must_use]
++    pub fn target(&self) -> &kernel_revision::Revision {
++        self.target.as_ref()
+     }
+ 
+     #[must_use]
+@@ -551,7 +558,8 @@
+             RevisionCommitChange::RelationData {
+                 semantic_revision, ..
+             } => Some(*semantic_revision),
+-            RevisionCommitChange::FullRevision { .. } => None,
++            RevisionCommitChange::FullRevision
++            | RevisionCommitChange::FullRevisionAndMaterializations { .. } => None,
+         }
+     }
+ 
+@@ -561,13 +569,15 @@
+             RevisionCommitChange::RelationData {
+                 relation_deltas, ..
+             } => Some(relation_deltas),
+-            RevisionCommitChange::FullRevision { .. } => None,
++            RevisionCommitChange::FullRevision
++            | RevisionCommitChange::FullRevisionAndMaterializations { .. } => None,
+         }
+     }
+ 
+     pub fn durable_descriptor(
+         &self,
+         transaction_id: ClientTransactionId,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<DurableRevisionDescriptor, DurabilityError> {
+         match &self.change {
+             RevisionCommitChange::RelationData {
+@@ -576,7 +586,7 @@
+             } => Ok(DurableRevisionDescriptor::relation_data(
+                 transaction_id,
+                 self.source_revision,
+-                self.target_revision,
++                self.target.as_ref(),
+                 *semantic_revision,
+                 relation_deltas
+                     .iter()
+@@ -586,12 +596,22 @@
+                         removed: delta.removed.clone(),
+                     })
+                     .collect(),
+-            )),
+-            RevisionCommitChange::FullRevision { target } => {
+-                DurableRevisionDescriptor::full_revision(
++                registry,
++            )?),
++            RevisionCommitChange::FullRevision => DurableRevisionDescriptor::full_revision(
++                transaction_id,
++                self.source_revision,
++                self.target.as_ref(),
++                registry,
++            )
++            .map_err(DurabilityError::Encode),
++            RevisionCommitChange::FullRevisionAndMaterializations { materializations } => {
++                DurableRevisionDescriptor::full_revision_and_materializations(
+                     transaction_id,
+                     self.source_revision,
+-                    target.as_ref(),
++                    self.target.as_ref(),
++                    materializations,
++                    registry,
+                 )
+                 .map_err(DurabilityError::Encode)
+             }
+@@ -610,10 +630,6 @@
+         committed_target: RevisionId,
+         requested_target: RevisionId,
+     },
+-    TransactionTargetMismatch {
+-        transaction_id: ClientTransactionId,
+-        target_revision: RevisionId,
+-    },
+ }
+ 
+ impl From<PhysicalExecutionError> for DurableRuntimeCommitError {
+@@ -699,6 +715,15 @@
+     pub registry: &'a kernel_semantics::SemanticRegistry,
+ }
+ 
++/// One atomic control-plane transition that replaces the complete semantic
++/// revision and the maintained materialization registry under the same durable
++/// client transaction identity.
++pub struct RevisionAndMaterializationsTransitionRequest<'a> {
++    pub target_revision: &'a kernel_revision::Revision,
++    pub materializations: &'a [RuntimeMaterializationSpec],
++    pub registry: &'a kernel_semantics::SemanticRegistry,
++}
++
+ /// Reader-visible owner for one coherent authoritative revision.
+ ///
+ /// The logical revision, authoritative physical relation layouts, and every
+@@ -748,6 +773,7 @@
+ pub struct DurableRuntime {
+     cell: RuntimeRevisionCell,
+     durability: Mutex<DurableRevisionStore>,
++    registry: kernel_semantics::SemanticRegistry,
+ }
+ 
+ /// Process-level owner that can discard a fail-stopped runtime, reopen the
+@@ -756,7 +782,6 @@
+ #[derive(Debug)]
+ pub struct DurableRuntimeSupervisor {
+     directory: std::path::PathBuf,
+-    registry: kernel_semantics::SemanticRegistry,
+     runtime: Mutex<Option<DurableRuntime>>,
+ }
+ 
+@@ -1088,7 +1113,7 @@
+         };
+         let descriptor = RevisionCommitDescriptor {
+             source_revision,
+-            target_revision,
++            target: Box::new(request.target_revision.clone()),
+             change: RevisionCommitChange::RelationData {
+                 semantic_revision: self.revision.semantic_revision(),
+                 relation_deltas,
+@@ -1172,10 +1197,80 @@
+         Ok(PreparedRuntimeRevisionTransition {
+             descriptor: RevisionCommitDescriptor {
+                 source_revision,
+-                target_revision,
+-                change: RevisionCommitChange::FullRevision {
+-                    target: Box::new(request.target_revision.clone()),
+-                },
++                target: Box::new(request.target_revision.clone()),
++                change: RevisionCommitChange::FullRevision,
++            },
++            source_identity: self.root_identity,
++            candidate: Box::new(candidate),
++            output_deltas: BTreeMap::new(),
++        })
++    }
++
++    fn prepare_revision_and_materializations(
++        &self,
++        request: &RevisionAndMaterializationsTransitionRequest<'_>,
++    ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
++        let source_revision = self.revision.id();
++        let target_revision = request.target_revision.id();
++        if target_revision == source_revision {
++            return Err(PhysicalExecutionError::InvalidRevisionTransition);
++        }
++        if self.physical.revision() != Some(source_revision)
++            || self
++                .materializations
++                .values()
++                .any(|state| state.revision() != Some(source_revision))
++        {
++            return Err(PhysicalExecutionError::RevisionBindingMismatch);
++        }
++
++        let candidate_version = self
++            .root_identity
++            .version
++            .0
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
++        let mut physical = PhysicalStore::default();
++        let mut relation_layouts = BTreeMap::new();
++        for relation in request
++            .target_revision
++            .semantic_context()
++            .schema
++            .relations()
++        {
++            let rows = request
++                .target_revision
++                .state()
++                .model
++                .relations
++                .get(&relation.id)
++                .cloned()
++                .unwrap_or_default();
++            physical.install(
++                relation.id,
++                LayoutBinding::RECOVERY_ROW_STORE,
++                NativeRelation::row_store(rows),
++            )?;
++            relation_layouts.insert(relation.id, LayoutBinding::RECOVERY_ROW_STORE);
++        }
++        let candidate = Self::build_with_identity(
++            request.target_revision.clone(),
++            physical,
++            relation_layouts,
++            request.materializations,
++            request.registry,
++            RuntimeRootIdentity {
++                root_id: self.root_identity.root_id,
++                version: RuntimeRootVersion(candidate_version),
++            },
++        )?;
++        let materializations = candidate.durable_materialization_specs();
++
++        Ok(PreparedRuntimeRevisionTransition {
++            descriptor: RevisionCommitDescriptor {
++                source_revision,
++                target: Box::new(request.target_revision.clone()),
++                change: RevisionCommitChange::FullRevisionAndMaterializations { materializations },
+             },
+             source_identity: self.root_identity,
+             candidate: Box::new(candidate),
+@@ -1320,6 +1415,14 @@
+         self.snapshot()?.prepare_full_revision(request)
+     }
+ 
++    pub fn prepare_revision_and_materializations(
++        &self,
++        request: &RevisionAndMaterializationsTransitionRequest<'_>,
++    ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
++        self.snapshot()?
++            .prepare_revision_and_materializations(request)
++    }
++
+     fn prepare_materialization_configuration(
+         &self,
+         specs: &[RuntimeMaterializationSpec],
+@@ -1350,7 +1453,7 @@
+         durability: &mut D,
+     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+         let prepared = self.prepare_revision(request)?;
+-        self.commit_prepared_durable(transaction_id, prepared, durability)
++        self.commit_prepared_durable(transaction_id, prepared, request.registry, durability)
+     }
+ 
+     pub(crate) fn commit_full_revision_durable<D: RevisionDurability>(
+@@ -1360,18 +1463,29 @@
+         durability: &mut D,
+     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+         let prepared = self.prepare_full_revision(request)?;
+-        self.commit_prepared_durable(transaction_id, prepared, durability)
++        self.commit_prepared_durable(transaction_id, prepared, request.registry, durability)
++    }
++
++    pub(crate) fn commit_revision_and_materializations_durable<D: RevisionDurability>(
++        &self,
++        transaction_id: ClientTransactionId,
++        request: &RevisionAndMaterializationsTransitionRequest<'_>,
++        durability: &mut D,
++    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
++        let prepared = self.prepare_revision_and_materializations(request)?;
++        self.commit_prepared_durable(transaction_id, prepared, request.registry, durability)
+     }
+ 
+     fn commit_prepared_durable<D: RevisionDurability>(
+         &self,
+         transaction_id: ClientTransactionId,
+         prepared: PreparedRuntimeRevisionTransition,
++        registry: &kernel_semantics::SemanticRegistry,
+         durability: &mut D,
+     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+         let durable_descriptor = prepared
+             .descriptor()
+-            .durable_descriptor(transaction_id)
++            .durable_descriptor(transaction_id, registry)
+             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+         let durable_prepare = durability
+             .durably_prepare(&durable_descriptor)
+@@ -1386,7 +1500,8 @@
+         };
+         let rebuilt = matches!(
+             sealed.descriptor().change(),
+-            RevisionCommitChange::FullRevision { .. }
++            RevisionCommitChange::FullRevision
++                | RevisionCommitChange::FullRevisionAndMaterializations { .. }
+         );
+         let output_deltas = sealed.publish();
+         Ok(DurableRuntimeCommitReceipt {
+@@ -1474,24 +1589,25 @@
+     pub fn create(
+         root: RuntimeRevisionBundle,
+         directory: impl AsRef<std::path::Path>,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, DurabilityError> {
+         let materialization_specs = root.durable_materialization_specs();
+         let durability = DurableRevisionStore::create_with_materializations(
+             directory,
+             root.revision(),
+             &materialization_specs,
++            registry,
+         )?;
+         Ok(Self {
+             cell: RuntimeRevisionCell::new(root),
+             durability: Mutex::new(durability),
++            registry: registry.clone(),
+         })
+     }
+ 
+-    pub fn open(
+-        directory: impl AsRef<std::path::Path>,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<Self, RuntimeRecoveryError> {
+-        let (durability, scan) = DurableRevisionStore::open(directory, registry)?;
++    pub fn open(directory: impl AsRef<std::path::Path>) -> Result<Self, RuntimeRecoveryError> {
++        let (durability, scan) = DurableRevisionStore::open(directory)?;
++        let registry = durability.semantic_registry().clone();
+         let materialization_specs = durability
+             .materialization_specs()
+             .iter()
+@@ -1504,7 +1620,7 @@
+             durability.checkpoint_revision(),
+             &scan,
+             &materialization_specs,
+-            registry,
++            &registry,
+         )?;
+         if root.revision().id() != durability.durable_head() {
+             return Err(RuntimeRecoveryError::DurableHeadMismatch);
+@@ -1512,9 +1628,15 @@
+         Ok(Self {
+             cell: RuntimeRevisionCell::new(root),
+             durability: Mutex::new(durability),
++            registry,
+         })
+     }
+ 
++    #[must_use]
++    pub const fn semantic_registry(&self) -> &kernel_semantics::SemanticRegistry {
++        &self.registry
++    }
++
+     pub fn snapshot(&self) -> Result<RuntimeRevisionSnapshot, PhysicalExecutionError> {
+         self.cell.snapshot()
+     }
+@@ -1524,33 +1646,33 @@
+         transaction_id: ClientTransactionId,
+         request: &RevisionTransitionRequest<'_>,
+     ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
++        let requested_intent =
++            DurableTransactionIntent::revision(request.target_revision, &self.registry)
++                .map_err(DurabilityError::Encode)
++                .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+         let mut durability = self.durability.lock().map_err(|_| {
+             let _ = self.cell.force_recovery_required();
+             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
+         })?;
+-        match durability.transaction_outcome(transaction_id) {
+-            DurableTransactionOutcome::Unknown => {}
+-            DurableTransactionOutcome::Committed { target_revision }
+-                if target_revision == request.target_revision.id() =>
+-            {
+-                if self.cell.snapshot()?.revision() != request.target_revision {
+-                    return Err(DurableRuntimeCommitError::TransactionTargetMismatch {
+-                        transaction_id,
+-                        target_revision,
+-                    });
+-                }
+-                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision });
+-            }
+-            DurableTransactionOutcome::Committed { target_revision } => {
+-                return Err(DurableRuntimeCommitError::TransactionIdConflict {
+-                    transaction_id,
+-                    committed_target: target_revision,
+-                    requested_target: request.target_revision.id(),
++        if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
++            if committed_intent == &requested_intent {
++                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
++                    target_revision: requested_intent.target_revision(),
+                 });
+             }
++            return Err(DurableRuntimeCommitError::TransactionIdConflict {
++                transaction_id,
++                committed_target: committed_intent.target_revision(),
++                requested_target: requested_intent.target_revision(),
++            });
+         }
++        let authorized_request = RevisionTransitionRequest {
++            target_revision: request.target_revision,
++            mutations: request.mutations,
++            registry: &self.registry,
++        };
+         self.cell
+-            .commit_revision_durable(transaction_id, request, &mut *durability)
++            .commit_revision_durable(transaction_id, &authorized_request, &mut *durability)
+             .map(DurableRuntimeCommitOutcome::Committed)
+     }
+ 
+@@ -1559,41 +1681,94 @@
+         transaction_id: ClientTransactionId,
+         request: &FullRevisionTransitionRequest<'_>,
+     ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
++        let requested_intent =
++            DurableTransactionIntent::revision(request.target_revision, &self.registry)
++                .map_err(DurabilityError::Encode)
++                .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+         let mut durability = self.durability.lock().map_err(|_| {
+             let _ = self.cell.force_recovery_required();
+             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
+         })?;
+-        match durability.transaction_outcome(transaction_id) {
+-            DurableTransactionOutcome::Unknown => {}
+-            DurableTransactionOutcome::Committed { target_revision }
+-                if target_revision == request.target_revision.id() =>
+-            {
+-                if self.cell.snapshot()?.revision() != request.target_revision {
+-                    return Err(DurableRuntimeCommitError::TransactionTargetMismatch {
+-                        transaction_id,
+-                        target_revision,
+-                    });
+-                }
+-                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision });
++        if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
++            if committed_intent == &requested_intent {
++                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
++                    target_revision: requested_intent.target_revision(),
++                });
+             }
+-            DurableTransactionOutcome::Committed { target_revision } => {
+-                return Err(DurableRuntimeCommitError::TransactionIdConflict {
+-                    transaction_id,
+-                    committed_target: target_revision,
+-                    requested_target: request.target_revision.id(),
++            return Err(DurableRuntimeCommitError::TransactionIdConflict {
++                transaction_id,
++                committed_target: committed_intent.target_revision(),
++                requested_target: requested_intent.target_revision(),
++            });
++        }
++        let authorized_request = FullRevisionTransitionRequest {
++            target_revision: request.target_revision,
++            registry: &self.registry,
++        };
++        self.cell
++            .commit_full_revision_durable(transaction_id, &authorized_request, &mut *durability)
++            .map(DurableRuntimeCommitOutcome::Committed)
++    }
++
++    pub fn replace_revision_and_materializations(
++        &self,
++        transaction_id: ClientTransactionId,
++        request: &RevisionAndMaterializationsTransitionRequest<'_>,
++    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
++        let mut desired = request
++            .materializations
++            .iter()
++            .map(|spec| DurableMaterializationSpec {
++                id: spec.id,
++                query: spec.query.clone(),
++            })
++            .collect::<Vec<_>>();
++        desired.sort_by_key(|spec| spec.id);
++        if let Some(duplicate) = desired.windows(2).find(|pair| pair[0].id == pair[1].id) {
++            return Err(PhysicalExecutionError::DuplicateMaterialization(duplicate[0].id).into());
++        }
++        let requested_intent = DurableTransactionIntent::revision_and_materializations(
++            request.target_revision,
++            &desired,
++            &self.registry,
++        )
++        .map_err(DurabilityError::Encode)
++        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
++        let mut durability = self.durability.lock().map_err(|_| {
++            let _ = self.cell.force_recovery_required();
++            DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
++        })?;
++        if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
++            if committed_intent == &requested_intent {
++                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
++                    target_revision: requested_intent.target_revision(),
+                 });
+             }
++            return Err(DurableRuntimeCommitError::TransactionIdConflict {
++                transaction_id,
++                committed_target: committed_intent.target_revision(),
++                requested_target: requested_intent.target_revision(),
++            });
+         }
++        let authorized_request = RevisionAndMaterializationsTransitionRequest {
++            target_revision: request.target_revision,
++            materializations: request.materializations,
++            registry: &self.registry,
++        };
+         self.cell
+-            .commit_full_revision_durable(transaction_id, request, &mut *durability)
++            .commit_revision_and_materializations_durable(
++                transaction_id,
++                &authorized_request,
++                &mut *durability,
++            )
+             .map(DurableRuntimeCommitOutcome::Committed)
+     }
+ 
+     pub fn reconfigure_materializations(
+         &self,
+         specs: &[RuntimeMaterializationSpec],
+-        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<DurableMaterializationConfigOutcome, DurableRuntimeCheckpointError> {
++        let registry = &self.registry;
+         let mut durability = self.durability.lock().map_err(|_| {
+             let _ = self.cell.force_recovery_required();
+             DurableRuntimeCheckpointError::DurabilityUncertain(DurabilityError::Poisoned)
+@@ -1678,30 +1853,25 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, DurabilityError> {
+         let directory = directory.as_ref().to_path_buf();
+-        let runtime = DurableRuntime::create(root, &directory)?;
++        let runtime = DurableRuntime::create(root, &directory, registry)?;
+         Ok(Self {
+             directory,
+-            registry: registry.clone(),
+             runtime: Mutex::new(Some(runtime)),
+         })
+     }
+ 
+-    pub fn open(
+-        directory: impl AsRef<std::path::Path>,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<Self, RuntimeRecoveryError> {
++    pub fn open(directory: impl AsRef<std::path::Path>) -> Result<Self, RuntimeRecoveryError> {
+         let directory = directory.as_ref().to_path_buf();
+-        let runtime = DurableRuntime::open(&directory, registry)?;
++        let runtime = DurableRuntime::open(&directory)?;
+         Ok(Self {
+             directory,
+-            registry: registry.clone(),
+             runtime: Mutex::new(Some(runtime)),
+         })
+     }
+ 
+     fn reopen_locked(&self, slot: &mut Option<DurableRuntime>) -> Result<(), RuntimeRecoveryError> {
+         drop(slot.take());
+-        let recovered = DurableRuntime::open(&self.directory, &self.registry)?;
++        let recovered = DurableRuntime::open(&self.directory)?;
+         *slot = Some(recovered);
+         Ok(())
+     }
+@@ -1775,24 +1945,7 @@
+         let runtime = slot
+             .as_ref()
+             .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?;
+-        match runtime
+-            .transaction_outcome(transaction_id)
+-            .map_err(DurableRuntimeCommitError::PrepareDurability)?
+-        {
+-            DurableTransactionOutcome::Committed { target_revision }
+-                if target_revision == request.target_revision.id() =>
+-            {
+-                runtime.commit_revision(transaction_id, request)
+-            }
+-            DurableTransactionOutcome::Committed { target_revision } => {
+-                Err(DurableRuntimeCommitError::TransactionIdConflict {
+-                    transaction_id,
+-                    committed_target: target_revision,
+-                    requested_target: request.target_revision.id(),
+-                })
+-            }
+-            DurableTransactionOutcome::Unknown => runtime.commit_revision(transaction_id, request),
+-        }
++        runtime.commit_revision(transaction_id, request)
+     }
+ 
+     pub fn replace_revision(
+@@ -1824,24 +1977,38 @@
+         let runtime = slot
+             .as_ref()
+             .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?;
+-        match runtime
+-            .transaction_outcome(transaction_id)
+-            .map_err(DurableRuntimeCommitError::PrepareDurability)?
+-        {
+-            DurableTransactionOutcome::Committed { target_revision }
+-                if target_revision == request.target_revision.id() =>
+-            {
+-                runtime.replace_revision(transaction_id, request)
+-            }
+-            DurableTransactionOutcome::Committed { target_revision } => {
+-                Err(DurableRuntimeCommitError::TransactionIdConflict {
+-                    transaction_id,
+-                    committed_target: target_revision,
+-                    requested_target: request.target_revision.id(),
+-                })
+-            }
+-            DurableTransactionOutcome::Unknown => runtime.replace_revision(transaction_id, request),
++        runtime.replace_revision(transaction_id, request)
++    }
++
++    pub fn replace_revision_and_materializations(
++        &self,
++        transaction_id: ClientTransactionId,
++        request: &RevisionAndMaterializationsTransitionRequest<'_>,
++    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
++        let mut slot = self
++            .runtime
++            .lock()
++            .map_err(|_| DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned))?;
++        let first = slot
++            .as_ref()
++            .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
++            .replace_revision_and_materializations(transaction_id, request);
++        let must_recover = matches!(
++            first,
++            Err(DurableRuntimeCommitError::CommitDurabilityUncertain(_)
++                | DurableRuntimeCommitError::Runtime(
++                    PhysicalExecutionError::RuntimeRecoveryRequired
++                ))
++        );
++        if !must_recover {
++            return first;
+         }
++
++        self.reopen_locked(&mut slot)
++            .map_err(DurableRuntimeCommitError::Recovery)?;
++        slot.as_ref()
++            .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
++            .replace_revision_and_materializations(transaction_id, request)
+     }
+ 
+     pub fn checkpoint(&self) -> Result<DurableGenerationReceipt, DurableRuntimeCheckpointError> {
+@@ -1877,7 +2044,7 @@
+         let first = slot
+             .as_ref()
+             .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
+-            .reconfigure_materializations(specs, &self.registry);
++            .reconfigure_materializations(specs);
+         if !matches!(
+             first,
+             Err(DurableRuntimeCheckpointError::Runtime(
+@@ -1890,7 +2057,7 @@
+             .map_err(DurableRuntimeCheckpointError::Recovery)?;
+         slot.as_ref()
+             .ok_or(PhysicalExecutionError::RuntimeRecoveryRequired)?
+-            .reconfigure_materializations(specs, &self.registry)
++            .reconfigure_materializations(specs)
+     }
+ }
+ 
+@@ -1948,8 +2115,8 @@
+     }
+ 
+     #[must_use]
+-    pub const fn target_revision(&self) -> RevisionId {
+-        self.descriptor.target_revision
++    pub fn target_revision(&self) -> RevisionId {
++        self.descriptor.target_revision()
+     }
+ 
+     #[must_use]
+@@ -1997,8 +2164,8 @@
+     }
+ 
+     #[must_use]
+-    pub const fn target_revision(&self) -> RevisionId {
+-        self.descriptor.target_revision
++    pub fn target_revision(&self) -> RevisionId {
++        self.descriptor.target_revision()
+     }
+ 
+     #[must_use]
+@@ -2078,7 +2245,8 @@
+                     next_state,
+                 )?;
+             }
+-            DurableRevisionChange::FullRevision { .. } => {
++            DurableRevisionChange::FullRevision { .. }
++            | DurableRevisionChange::FullRevisionAndMaterializations { .. } => {
+                 current = descriptor.decode_full_revision(registry)?.ok_or(
+                     RuntimeRecoveryError::Durability(DurabilityError::Protocol {
+                         offset: 0,
+@@ -2101,6 +2269,21 @@
+     registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<RuntimeRevisionBundle, RuntimeRecoveryError> {
+     let revision = replay_durable_revisions(base_revision, scan, registry)?;
++    let mut effective_materializations = materialization_specs.to_vec();
++    for committed in scan.committed() {
++        if let DurableRevisionChange::FullRevisionAndMaterializations {
++            materializations, ..
++        } = &committed.descriptor.change
++        {
++            effective_materializations = materializations
++                .iter()
++                .map(|spec| RuntimeMaterializationSpec {
++                    id: spec.id,
++                    query: spec.query.clone(),
++                })
++                .collect();
++        }
++    }
+     let mut physical = PhysicalStore::default();
+     let mut relation_layouts = BTreeMap::new();
+     for relation in revision.semantic_context().schema.relations() {
+@@ -2122,7 +2305,7 @@
+         revision,
+         physical,
+         relation_layouts,
+-        materialization_specs,
++        &effective_materializations,
+         registry,
+     )?)
+ }
+@@ -10069,7 +10252,7 @@
+     fn durable_runtime_owner_restarts_from_checkpoint_plus_wal_tail() {
+         let dir = durable_test_dir("restart-tail");
+         let (context, registry, relation, _, root) = scan_runtime_bundle(500, 1200, &[1, 2]);
+-        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+             relation,
+@@ -10090,7 +10273,7 @@
+             .unwrap();
+         drop(runtime);
+ 
+-        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(501));
+         assert_eq!(
+@@ -10113,7 +10296,7 @@
+     fn durable_runtime_checkpoint_rotates_base_then_replays_only_new_tail() {
+         let dir = durable_test_dir("checkpoint-tail");
+         let (context, registry, relation, _, root) = scan_runtime_bundle(510, 1201, &[1, 2]);
+-        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+ 
+         let delta_a = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations_a = [RevisionRelationMutation {
+@@ -10157,7 +10340,7 @@
+             .unwrap();
+         drop(runtime);
+ 
+-        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(512));
+         assert_eq!(
+@@ -10176,11 +10359,11 @@
+     fn durable_runtime_compaction_preserves_reopenability() {
+         let dir = durable_test_dir("compact");
+         let (_, registry, _relation, _, root) = scan_runtime_bundle(520, 1202, &[1, 2]);
+-        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+         runtime.checkpoint().unwrap();
+         runtime.compact_obsolete_generations().unwrap();
+         drop(runtime);
+-        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir).unwrap();
+         assert_eq!(
+             reopened.snapshot().unwrap().revision_id(),
+             RevisionId::new(520)
+@@ -10229,7 +10412,7 @@
+             delta: &retry_delta,
+         }];
+         let retry_target = target_revision_for(&root, 531, &retry_mutations, &registry);
+-        drop(DurableRuntime::create(root, &dir).unwrap());
++        drop(DurableRuntime::create(root, &dir, &registry).unwrap());
+         let marker = dir.join(".cfmd-plan-crash-ready");
+         let _ = std::fs::remove_file(&marker);
+ 
+@@ -10256,7 +10439,7 @@
+         let _ = child.wait().unwrap();
+         let _ = std::fs::remove_file(&marker);
+ 
+-        let reopened = DurableRuntimeSupervisor::open(&dir, &registry).unwrap();
++        let reopened = DurableRuntimeSupervisor::open(&dir).unwrap();
+         assert!(matches!(
+             reopened
+                 .commit_revision(
+@@ -10305,8 +10488,7 @@
+             delta: &delta,
+         }];
+         let target = target_revision_for(&root, 531, &mutations, &registry);
+-        let (durability, scan) =
+-            kernel_durability::DurableRevisionStore::open(&dir, &registry).unwrap();
++        let (durability, scan) = kernel_durability::DurableRevisionStore::open(&dir).unwrap();
+         assert!(scan.committed().is_empty());
+         let cell = RuntimeRevisionCell::new(root);
+         let mut durability = ExitAfterDurableCommit {
+@@ -10329,7 +10511,7 @@
+     fn client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent() {
+         let dir = durable_test_dir("transaction-idempotency");
+         let (context, registry, relation, _, root) = scan_runtime_bundle(540, 1204, &[1, 2]);
+-        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+         let transaction_id = ClientTransactionId::new(0xabc);
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+@@ -10363,7 +10545,7 @@
+         runtime.compact_obsolete_generations().unwrap();
+         drop(runtime);
+ 
+-        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir).unwrap();
+         assert_eq!(
+             reopened.transaction_outcome(transaction_id).unwrap(),
+             DurableTransactionOutcome::Committed {
+@@ -10546,11 +10728,11 @@
+ 
+     fn assert_reopened_full_revision(
+         dir: &std::path::Path,
+-        registry: &SemanticRegistry,
++        _registry: &SemanticRegistry,
+         target: &kernel_revision::Revision,
+         assertions: &FullRevisionReopenAssertions,
+     ) {
+-        let reopened = DurableRuntime::open(dir, registry).unwrap();
++        let reopened = DurableRuntime::open(dir).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision(), target);
+         assert_eq!(
+@@ -10580,6 +10762,35 @@
+         );
+     }
+ 
++    fn create_migration_runtime(
++        dir: &std::path::Path,
++        relation: SemanticId,
++        source: kernel_revision::Revision,
++        initial_text: &str,
++        registry: &SemanticRegistry,
++    ) -> DurableRuntime {
++        let mut physical = PhysicalStore::default();
++        physical
++            .install(
++                relation,
++                LayoutBinding::RECOVERY_ROW_STORE,
++                NativeRelation::row_store(vec![vec![Value::Text(initial_text.into())]]),
++            )
++            .unwrap();
++        let root = RuntimeRevisionBundle::build(
++            source,
++            physical,
++            BTreeMap::from([(relation, LayoutBinding::RECOVERY_ROW_STORE)]),
++            &[RuntimeMaterializationSpec {
++                id: test_materialization_id(),
++                query: RelExpr::Scan(relation),
++            }],
++            registry,
++        )
++        .unwrap();
++        DurableRuntime::create(root, dir, registry).unwrap()
++    }
++
+     #[test]
+     fn durable_full_revision_replacement_covers_schema_gamma_lifecycle_and_fields() {
+         let dir = durable_test_dir("full-revision-replacement");
+@@ -10590,8 +10801,9 @@
+         let first = EntityId::new(81);
+         let second = EntityId::new(82);
+         let mut registry = SemanticRegistry::default();
+-        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
+-        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let exact_digest = registry.install_equivalence_revision(EquivalenceModule::TextExact, 11);
++        let ci_digest =
++            registry.install_equivalence_revision(EquivalenceModule::TextAsciiCaseInsensitive, 17);
+         let source_context = migration_context(
+             801,
+             801,
+@@ -10608,26 +10820,7 @@
+             migration_state(entity_type, field, relation, &[(first, 1)], &["A"]),
+         )
+         .unwrap();
+-        let mut physical = PhysicalStore::default();
+-        physical
+-            .install(
+-                relation,
+-                LayoutBinding::RECOVERY_ROW_STORE,
+-                NativeRelation::row_store(vec![vec![Value::Text("A".into())]]),
+-            )
+-            .unwrap();
+-        let root = RuntimeRevisionBundle::build(
+-            source,
+-            physical,
+-            BTreeMap::from([(relation, LayoutBinding::RECOVERY_ROW_STORE)]),
+-            &[RuntimeMaterializationSpec {
+-                id: test_materialization_id(),
+-                query: RelExpr::Scan(relation),
+-            }],
+-            &registry,
+-        )
+-        .unwrap();
+-        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let runtime = create_migration_runtime(&dir, relation, source, "A", &registry);
+         let target_context = migration_context(
+             802,
+             802,
+@@ -10685,10 +10878,116 @@
+     }
+ 
+     #[test]
++    fn historical_semantic_implementation_manifest_survives_checkpoint_and_retry() {
++        let dir = durable_test_dir("historical-semantic-deployment");
++        let relation = sid(8_101);
++        let equivalence = sid(8_102);
++        let entity_type = sid(8_103);
++        let field = sid(8_104);
++        let entity = EntityId::new(811);
++        let mut registry = SemanticRegistry::default();
++        let exact_v11 = registry.install_equivalence_revision(EquivalenceModule::TextExact, 11);
++        let ci_v17 =
++            registry.install_equivalence_revision(EquivalenceModule::TextAsciiCaseInsensitive, 17);
++        let exact_v19 = registry.install_equivalence_revision(EquivalenceModule::TextExact, 19);
++
++        let source_context = migration_context(
++            811,
++            811,
++            relation,
++            equivalence,
++            entity_type,
++            field,
++            exact_v11,
++        );
++        let source = kernel_revision::Revision::build(
++            RevisionId::new(811),
++            &source_context,
++            &registry,
++            migration_state(entity_type, field, relation, &[(entity, 1)], &["A"]),
++        )
++        .unwrap();
++        let runtime = create_migration_runtime(&dir, relation, source, "A", &registry);
++
++        let first_target = kernel_revision::Revision::build(
++            RevisionId::new(812),
++            &migration_context(812, 812, relation, equivalence, entity_type, field, ci_v17),
++            &registry,
++            migration_state(entity_type, field, relation, &[(entity, 2)], &["a"]),
++        )
++        .unwrap();
++        let first_transaction = ClientTransactionId::new(0x812);
++        runtime
++            .replace_revision(
++                first_transaction,
++                &FullRevisionTransitionRequest {
++                    target_revision: &first_target,
++                    registry: &registry,
++                },
++            )
++            .unwrap();
++
++        let second_target = kernel_revision::Revision::build(
++            RevisionId::new(813),
++            &migration_context(
++                813,
++                813,
++                relation,
++                equivalence,
++                entity_type,
++                field,
++                exact_v19,
++            ),
++            &registry,
++            migration_state(entity_type, field, relation, &[(entity, 3)], &["B"]),
++        )
++        .unwrap();
++        runtime
++            .replace_revision(
++                ClientTransactionId::new(0x813),
++                &FullRevisionTransitionRequest {
++                    target_revision: &second_target,
++                    registry: &registry,
++                },
++            )
++            .unwrap();
++        runtime.checkpoint().unwrap();
++        runtime.compact_obsolete_generations().unwrap();
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        assert_eq!(reopened.snapshot().unwrap().revision(), &second_target);
++        assert_eq!(
++            reopened
++                .semantic_registry()
++                .builtin_module_spec(ci_v17)
++                .unwrap()
++                .digest(),
++            ci_v17
++        );
++        assert_eq!(
++            reopened
++                .replace_revision(
++                    first_transaction,
++                    &FullRevisionTransitionRequest {
++                        target_revision: &first_target,
++                        registry: &registry,
++                    },
++                )
++                .unwrap(),
++            DurableRuntimeCommitOutcome::AlreadyCommitted {
++                target_revision: RevisionId::new(812),
++            }
++        );
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
+     fn committed_transaction_id_rejects_same_revision_id_with_different_revision_content() {
+         let dir = durable_test_dir("same-revision-id-content-conflict");
+         let (context, registry, relation, _, root) = scan_runtime_bundle(860, 1280, &[1]);
+-        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+         let transaction_id = ClientTransactionId::new(0x860);
+         let delta = scan_delta(relation, &[2], &[], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+@@ -10731,8 +11030,9 @@
+                     registry: &registry,
+                 },
+             ),
+-            Err(DurableRuntimeCommitError::TransactionTargetMismatch {
+-                target_revision: RevisionId(861),
++            Err(DurableRuntimeCommitError::TransactionIdConflict {
++                committed_target: RevisionId(861),
++                requested_target: RevisionId(861),
+                 ..
+             })
+         ));
+@@ -10741,6 +11041,205 @@
+     }
+ 
+     #[test]
++    fn exact_transaction_intent_survives_later_heads_checkpoint_compaction_and_reopen() {
++        let dir = durable_test_dir("historical-exact-transaction-intent");
++        let (context, registry, relation, _, root) = scan_runtime_bundle(865, 1285, &[1]);
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
++
++        let first_transaction = ClientTransactionId::new(0x8651);
++        let first_delta = scan_delta(relation, &[2], &[], &context, &registry);
++        let first_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &first_delta,
++        }];
++        let snapshot = runtime.snapshot().unwrap();
++        let first_target = target_revision_for(snapshot.root(), 866, &first_mutations, &registry);
++        drop(snapshot);
++        runtime
++            .commit_revision(
++                first_transaction,
++                &RevisionTransitionRequest {
++                    target_revision: &first_target,
++                    mutations: &first_mutations,
++                    registry: &registry,
++                },
++            )
++            .unwrap();
++
++        let second_delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let second_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &second_delta,
++        }];
++        let snapshot = runtime.snapshot().unwrap();
++        let second_target = target_revision_for(snapshot.root(), 867, &second_mutations, &registry);
++        drop(snapshot);
++        runtime
++            .commit_revision(
++                ClientTransactionId::new(0x8652),
++                &RevisionTransitionRequest {
++                    target_revision: &second_target,
++                    mutations: &second_mutations,
++                    registry: &registry,
++                },
++            )
++            .unwrap();
++        runtime.checkpoint().unwrap();
++        runtime.compact_obsolete_generations().unwrap();
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        assert_eq!(
++            reopened
++                .commit_revision(
++                    first_transaction,
++                    &RevisionTransitionRequest {
++                        target_revision: &first_target,
++                        mutations: &first_mutations,
++                        registry: &registry,
++                    },
++                )
++                .unwrap(),
++            DurableRuntimeCommitOutcome::AlreadyCommitted {
++                target_revision: RevisionId::new(866),
++            }
++        );
++
++        let live = reopened.snapshot().unwrap();
++        let mut conflicting_state = first_target.state().clone();
++        conflicting_state
++            .model
++            .relations
++            .insert(relation, vec![vec![Value::I64(999)]]);
++        let conflicting_target = kernel_revision::Revision::build(
++            RevisionId::new(866),
++            live.revision().semantic_context(),
++            &registry,
++            conflicting_state,
++        )
++        .unwrap();
++        drop(live);
++        assert!(matches!(
++            reopened.replace_revision(
++                first_transaction,
++                &FullRevisionTransitionRequest {
++                    target_revision: &conflicting_target,
++                    registry: &registry,
++                },
++            ),
++            Err(DurableRuntimeCommitError::TransactionIdConflict {
++                committed_target: RevisionId(866),
++                requested_target: RevisionId(866),
++                ..
++            })
++        ));
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn revision_and_materialization_registry_commit_and_recover_atomically() {
++        let dir = durable_test_dir("revision-and-materializations-atomic");
++        let (context, registry, relation, _, root) = scan_runtime_bundle(868, 1286, &[1, 2, 3]);
++        let equivalence = match &context.schema.relation(relation).unwrap().semantics {
++            RelationSemantics::Bag {
++                column_equivalences,
++            }
++            | RelationSemantics::Set {
++                column_equivalences,
++            } => column_equivalences[0],
++        };
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
++        let delta = scan_delta(relation, &[4], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let snapshot = runtime.snapshot().unwrap();
++        let target = target_revision_for(snapshot.root(), 869, &mutations, &registry);
++        drop(snapshot);
++        let filtered_id = MaterializationId::new(2);
++        let desired = [RuntimeMaterializationSpec {
++            id: filtered_id,
++            query: RelExpr::FilterEqConst {
++                input: Box::new(RelExpr::Scan(relation)),
++                column: 0,
++                value: Value::I64(2),
++                equivalence,
++            },
++        }];
++        let transaction_id = ClientTransactionId::new(0x868);
++        assert!(matches!(
++            runtime
++                .replace_revision_and_materializations(
++                    transaction_id,
++                    &RevisionAndMaterializationsTransitionRequest {
++                        target_revision: &target,
++                        materializations: &desired,
++                        registry: &registry,
++                    },
++                )
++                .unwrap(),
++            DurableRuntimeCommitOutcome::Committed(_)
++        ));
++
++        let snapshot = runtime.snapshot().unwrap();
++        assert_eq!(snapshot.revision(), &target);
++        assert!(
++            snapshot
++                .materialization(test_materialization_id())
++                .is_none()
++        );
++        assert_eq!(
++            snapshot
++                .materialization(filtered_id)
++                .unwrap()
++                .output_value(&context, &registry)
++                .unwrap()
++                .rows(),
++            &[vec![Value::I64(2)]]
++        );
++        drop(snapshot);
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert_eq!(snapshot.revision(), &target);
++        assert!(
++            snapshot
++                .materialization(test_materialization_id())
++                .is_none()
++        );
++        assert_eq!(
++            snapshot
++                .materialization(filtered_id)
++                .unwrap()
++                .output_value(&context, reopened.semantic_registry())
++                .unwrap()
++                .rows(),
++            &[vec![Value::I64(2)]]
++        );
++        drop(snapshot);
++        assert_eq!(
++            reopened
++                .replace_revision_and_materializations(
++                    transaction_id,
++                    &RevisionAndMaterializationsTransitionRequest {
++                        target_revision: &target,
++                        materializations: &desired,
++                        registry: &registry,
++                    },
++                )
++                .unwrap(),
++            DurableRuntimeCommitOutcome::AlreadyCommitted {
++                target_revision: RevisionId::new(869),
++            }
++        );
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
+     fn materialization_configuration_evolves_durably_and_reopens_without_caller_specs() {
+         let dir = durable_test_dir("materialization-reconfigure");
+         let (context, registry, relation, _, root) = scan_runtime_bundle(870, 1281, &[1, 2, 3]);
+@@ -10752,7 +11251,7 @@
+                 column_equivalences,
+             } => column_equivalences[0],
+         };
+-        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+         let filtered_id = MaterializationId::new(2);
+         let desired = [RuntimeMaterializationSpec {
+             id: filtered_id,
+@@ -10765,9 +11264,7 @@
+         }];
+ 
+         assert!(matches!(
+-            runtime
+-                .reconfigure_materializations(&desired, &registry)
+-                .unwrap(),
++            runtime.reconfigure_materializations(&desired).unwrap(),
+             DurableMaterializationConfigOutcome::Applied(_)
+         ));
+         let snapshot = runtime.snapshot().unwrap();
+@@ -10779,14 +11276,12 @@
+         assert!(snapshot.materialization(filtered_id).is_some());
+         drop(snapshot);
+         assert_eq!(
+-            runtime
+-                .reconfigure_materializations(&desired, &registry)
+-                .unwrap(),
++            runtime.reconfigure_materializations(&desired).unwrap(),
+             DurableMaterializationConfigOutcome::AlreadyApplied
+         );
+         drop(runtime);
+ 
+-        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+         assert!(
+             snapshot
+@@ -10800,9 +11295,7 @@
+         );
+         drop(snapshot);
+         assert_eq!(
+-            reopened
+-                .reconfigure_materializations(&desired, &registry)
+-                .unwrap(),
++            reopened.reconfigure_materializations(&desired).unwrap(),
+             DurableMaterializationConfigOutcome::AlreadyApplied
+         );
+         drop(reopened);
+@@ -10813,14 +11306,14 @@
+     fn invalid_materialization_reconfiguration_is_rejected_before_durable_publication() {
+         let dir = durable_test_dir("invalid-materialization-reconfigure");
+         let (_context, registry, _relation, _, root) = scan_runtime_bundle(880, 1282, &[1, 2]);
+-        let runtime = DurableRuntime::create(root, &dir).unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+         let before = runtime.snapshot().unwrap();
+         let bad = [RuntimeMaterializationSpec {
+             id: MaterializationId::new(99),
+             query: RelExpr::Scan(sid(999_999)),
+         }];
+         assert!(matches!(
+-            runtime.reconfigure_materializations(&bad, &registry),
++            runtime.reconfigure_materializations(&bad),
+             Err(DurableRuntimeCheckpointError::Runtime(_))
+         ));
+         let after = runtime.snapshot().unwrap();
+@@ -10830,7 +11323,7 @@
+         drop(after);
+         drop(runtime);
+ 
+-        let reopened = DurableRuntime::open(&dir, &registry).unwrap();
++        let reopened = DurableRuntime::open(&dir).unwrap();
+         assert!(
+             reopened
+                 .snapshot()
+--- /mnt/data/cfmd_pass37_work/cfmd_workspace_pass37/crates/kernel-semantics/src/lib.rs	2026-09-19 11:54:57.000000000 +0000
++++ crates/kernel-semantics/src/lib.rs	2026-09-20 01:01:18.983389711 +0000
+@@ -428,6 +428,58 @@
+     ordering_compatibilities: Vec<OrderingCompatibilitySpec>,
+ }
+ 
++/// Durable description of one semantic implementation provided by the CFMD
++/// binary itself.  The descriptor is intentionally limited to the builtin
++/// implementation families currently present in `SemanticRegistry`; arbitrary
++/// executable code is not smuggled through durable storage.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum BuiltinSemanticModuleSpec {
++    Equivalence {
++        module: EquivalenceModule,
++        implementation_revision: u64,
++    },
++    Tokenizer {
++        module: TokenizerModule,
++        implementation_revision: u64,
++    },
++    Ordering {
++        module: OrderingModule,
++        implementation_revision: u64,
++    },
++}
++
++impl BuiltinSemanticModuleSpec {
++    #[must_use]
++    pub fn digest(self) -> ModuleDigest {
++        match self {
++            Self::Equivalence {
++                module,
++                implementation_revision,
++            } => EquivalenceImplementation {
++                contract: module,
++                implementation_revision,
++            }
++            .digest(),
++            Self::Tokenizer {
++                module,
++                implementation_revision,
++            } => TokenizerImplementation {
++                contract: module,
++                implementation_revision,
++            }
++            .digest(),
++            Self::Ordering {
++                module,
++                implementation_revision,
++            } => OrderingImplementation {
++                contract: module,
++                implementation_revision,
++            }
++            .digest(),
++        }
++    }
++}
++
+ impl Default for SemanticRegistry {
+     fn default() -> Self {
+         let mut registry = Self {
+@@ -448,6 +500,69 @@
+ }
+ 
+ impl SemanticRegistry {
++    /// Installs one builtin implementation from its durable descriptor and
++    /// returns the digest that callers must compare with the pinned semantic
++    /// environment.
++    pub fn install_builtin_module_spec(&mut self, spec: BuiltinSemanticModuleSpec) -> ModuleDigest {
++        match spec {
++            BuiltinSemanticModuleSpec::Equivalence {
++                module,
++                implementation_revision,
++            } => self.install_equivalence_revision(module, implementation_revision),
++            BuiltinSemanticModuleSpec::Tokenizer {
++                module,
++                implementation_revision,
++            } => self.install_tokenizer_revision(module, implementation_revision),
++            BuiltinSemanticModuleSpec::Ordering {
++                module,
++                implementation_revision,
++            } => self.install_ordering_revision(module, implementation_revision),
++        }
++    }
++
++    /// Returns the builtin descriptor for an installed digest.  At present all
++    /// executable semantic modules supported by CFMD are builtin contracts, so
++    /// a pinned digest without a descriptor is a deployment error.
++    #[must_use]
++    pub fn builtin_module_spec(&self, digest: ModuleDigest) -> Option<BuiltinSemanticModuleSpec> {
++        if let Some(implementation) = self.equivalences.get(&digest) {
++            return Some(BuiltinSemanticModuleSpec::Equivalence {
++                module: implementation.contract,
++                implementation_revision: implementation.implementation_revision,
++            });
++        }
++        if let Some(implementation) = self.tokenizers.get(&digest) {
++            return Some(BuiltinSemanticModuleSpec::Tokenizer {
++                module: implementation.contract,
++                implementation_revision: implementation.implementation_revision,
++            });
++        }
++        self.orderings
++            .get(&digest)
++            .map(|implementation| BuiltinSemanticModuleSpec::Ordering {
++                module: implementation.contract,
++                implementation_revision: implementation.implementation_revision,
++            })
++    }
++
++    /// Collects the exact builtin implementations pinned by one semantic
++    /// context, sorted by digest and deduplicated.  This is the deployment
++    /// manifest persisted by the durability layer.
++    pub fn builtin_modules_for_context(
++        &self,
++        context: &SemanticContext,
++    ) -> Result<Vec<BuiltinSemanticModuleSpec>, SemanticError> {
++        self.validate_context(context)?;
++        let mut by_digest = BTreeMap::new();
++        for (_, digest) in context.environment.modules() {
++            let spec = self
++                .builtin_module_spec(digest)
++                .ok_or(SemanticError::ModuleUnavailable(digest))?;
++            by_digest.insert(digest, spec);
++        }
++        Ok(by_digest.into_values().collect())
++    }
++
+     pub fn install_certified_ordering_compatibility(
+         &mut self,
+         checked: kernel_proof::CheckedCertificate<OrderingCompatibilityChecker>,
+@@ -2508,6 +2623,19 @@
+     }
+ 
+     #[test]
++    fn builtin_module_spec_roundtrips_exact_implementation_revision() {
++        let mut source = SemanticRegistry::default();
++        let digest =
++            source.install_equivalence_revision(EquivalenceModule::TextAsciiCaseInsensitive, 17);
++        let spec = source.builtin_module_spec(digest).unwrap();
++        assert_eq!(spec.digest(), digest);
++
++        let mut restored = SemanticRegistry::default();
++        assert_eq!(restored.install_builtin_module_spec(spec), digest);
++        assert_eq!(restored.builtin_module_spec(digest), Some(spec));
++    }
++
++    #[test]
+     fn registry_validates_every_pinned_environment_module_not_only_schema_dependencies() {
+         let extra = SemanticId::new(9900);
+         let mut environment = SemanticEnvironment::new(SemanticEnvId::new(1));

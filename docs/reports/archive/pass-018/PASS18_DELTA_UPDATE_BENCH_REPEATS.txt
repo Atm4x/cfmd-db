@@ -1,0 +1,12 @@
+--- run 1 ---
+rows=10000 first_no_index_ns=386 first_persisted_index_ns=2656 last_no_index_ns=496171 last_persisted_index_ns=2396
+rows=100000 first_no_index_ns=3281 first_persisted_index_ns=5250 last_no_index_ns=5284384 last_persisted_index_ns=6238
+rows=300000 first_no_index_ns=3123 first_persisted_index_ns=12223 last_no_index_ns=16920514 last_persisted_index_ns=12074
+--- run 2 ---
+rows=10000 first_no_index_ns=330 first_persisted_index_ns=2534 last_no_index_ns=453734 last_persisted_index_ns=1652
+rows=100000 first_no_index_ns=2967 first_persisted_index_ns=5756 last_no_index_ns=5339346 last_persisted_index_ns=5840
+rows=300000 first_no_index_ns=3474 first_persisted_index_ns=9594 last_no_index_ns=17059164 last_persisted_index_ns=9836
+--- run 3 ---
+rows=10000 first_no_index_ns=361 first_persisted_index_ns=1809 last_no_index_ns=490607 last_persisted_index_ns=3604
+rows=100000 first_no_index_ns=2745 first_persisted_index_ns=5187 last_no_index_ns=5095308 last_persisted_index_ns=5759
+rows=300000 first_no_index_ns=3624 first_persisted_index_ns=10591 last_no_index_ns=15310950 last_persisted_index_ns=10028

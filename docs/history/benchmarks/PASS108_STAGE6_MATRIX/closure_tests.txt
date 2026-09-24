@@ -1,0 +1,90 @@
+=== kernel-query optimized_delta_matches_oracle_over_small_hostile_bag_state_space ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+=== kernel-query materialized_support_state_matches_set_projection_oracle_over_all_small_transitions ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+=== kernel-query materialized_support_state_matches_distinct_oracle_over_all_small_transitions ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.01s
+
+=== kernel-query optimized_join_local_replay_matches_oracle_over_two_sided_state_space ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.02s
+
+=== kernel-query optimized_top_k_local_replay_matches_oracle_across_threshold_changes ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+=== kernel-query optimized_group_count_local_replay_matches_oracle_across_group_birth_and_death ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+=== kernel-query materialized_group_input_delta_rejects_malformed_or_underflowing_change_atomically ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+=== kernel-query recursive_antijoin_matches_recompute_and_invalid_blocker_is_atomic ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+=== kernel-query storage_resolved_removal_rejects_handle_payload_mismatch ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+=== kernel-plan revision_bound_states_reject_legacy_semantic_mutation_entrypoints ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.00s
+
+=== kernel-plan revision_prepare_is_invisible_until_sealed_publish ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.00s
+
+=== kernel-plan physical_index_change_after_prepare_makes_transition_stale ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.00s
+
+=== kernel-plan derived_relation_commit_matches_authoritative_target_and_rejects_stale_source ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.00s
+
+=== kernel-plan competing_prepared_transitions_from_same_revision_cannot_both_publish ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.00s
+
+=== kernel-plan target_revision_state_must_match_logical_mutation_descriptor ===
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.00s
+

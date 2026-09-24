@@ -1,0 +1,10 @@
+    Checking kernel-semantics v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-semantics)
+    Checking kernel-query v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-query)
+    Checking kernel-validation v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-validation)
+    Checking kernel-revision v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-revision)
+    Checking kernel-durability v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-durability)
+    Checking kernel-transport v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-transport)
+    Checking storage-memory v0.1.0 (/mnt/data/cfmd_pass77_work/crates/storage-memory)
+    Checking kernel-plan v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-plan)
+    Checking kernel-integration v0.1.0 (/mnt/data/cfmd_pass77_work/crates/kernel-integration)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.88s

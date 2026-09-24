@@ -1,0 +1,8 @@
+Cargo.lock
+crates/kernel-durability/Cargo.toml
+crates/kernel-durability/src/lib.rs
+crates/kernel-durability/src/metadata.rs
+crates/kernel-durability/src/store.rs
+PASS81_INTEGRATION_LEDGER.md
+PASS81_CHECKPOINT_J_DURABLE_COMPLEMENTS.md
+PASS81_CHECKPOINT_J_CHANGED_FILES.txt

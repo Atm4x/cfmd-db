@@ -1,0 +1,12 @@
+Pass65 Program5 hostile merge evidence
+Rust 1.98.1
+fmt PASS
+check PASS
+debug workspace PASS
+clippy -D warnings PASS
+release workspace PASS
+release build PASS
+rustdoc -D warnings PASS
+overflow-check release workspace PASS
+source freeze/post-gate SHA lists identical
+Program5 merged only after source-binding, pinned-Gamma validation, and local LiveRef-normalization corrections

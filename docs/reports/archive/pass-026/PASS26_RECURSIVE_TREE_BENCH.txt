@@ -1,0 +1,12 @@
+n=1000 compositional_build_ns=1233388
+n=1000 recursive_build_ns=1373184
+n=1000 maintained_tree_ns=4982
+n=1000 recursive_tree_ns=46760
+n=10000 compositional_build_ns=14422982
+n=10000 recursive_build_ns=14157904
+n=10000 maintained_tree_ns=8046
+n=10000 recursive_tree_ns=421114
+n=50000 compositional_build_ns=66036740
+n=50000 recursive_build_ns=75874626
+n=50000 maintained_tree_ns=9465
+n=50000 recursive_tree_ns=2322573

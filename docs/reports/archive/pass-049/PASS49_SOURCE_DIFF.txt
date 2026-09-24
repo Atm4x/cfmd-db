@@ -1,0 +1,939 @@
+--- /mnt/data/cfmd_workspace_pass48/crates/kernel-plan/src/lib.rs	2026-09-20 14:23:05.911866045 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 14:49:21.392039007 +0000
+@@ -3567,6 +3567,8 @@
+     pub typed_stateful_producer_hits: usize,
+     pub multiway_join_reorders: usize,
+     pub multiway_join_order_preserving_enumerations: usize,
++    pub multiway_join_semantic_quotient_constraints: usize,
++    pub multiway_join_semantic_quotient_pruned_rows: usize,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -4736,6 +4738,12 @@
+     target.multiway_join_order_preserving_enumerations = target
+         .multiway_join_order_preserving_enumerations
+         .saturating_add(source.multiway_join_order_preserving_enumerations);
++    target.multiway_join_semantic_quotient_constraints = target
++        .multiway_join_semantic_quotient_constraints
++        .saturating_add(source.multiway_join_semantic_quotient_constraints);
++    target.multiway_join_semantic_quotient_pruned_rows = target
++        .multiway_join_semantic_quotient_pruned_rows
++        .saturating_add(source.multiway_join_semantic_quotient_pruned_rows);
+ }
+ 
+ struct TypedBatchSelection<'a> {
+@@ -6576,7 +6584,7 @@
+     Ok(Some(rows))
+ }
+ 
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+ struct MultiwayJoinColumnRef {
+     leaf: usize,
+     column: usize,
+@@ -6620,14 +6628,22 @@
+ }
+ 
+ #[derive(Debug, Clone)]
+-struct JoinPredicateCompatibility {
+-    earlier_leaf: usize,
+-    later_leaf: usize,
+-    earlier_keys: Vec<kernel_semantics::CanonicalEqKey>,
+-    later_keys: Vec<kernel_semantics::CanonicalEqKey>,
+-    later_buckets: BTreeMap<kernel_semantics::CanonicalEqKey, Vec<u64>>,
++struct SemanticQuotientLeaf {
++    leaf: usize,
++    keys: Vec<Option<kernel_semantics::CanonicalEqKey>>,
++    buckets: BTreeMap<kernel_semantics::CanonicalEqKey, Vec<u64>>,
++}
++
++#[derive(Debug, Clone)]
++struct SemanticQuotientConstraint {
++    leaves: Vec<SemanticQuotientLeaf>,
++    common_keys: BTreeSet<kernel_semantics::CanonicalEqKey>,
+ }
+ 
++type SemanticQuotientKeySpec = (usize, usize, SemanticId);
++type SemanticQuotientKeyCache =
++    BTreeMap<SemanticQuotientKeySpec, Vec<kernel_semantics::CanonicalEqKey>>;
++
+ fn full_ordinal_mask(row_count: usize) -> Vec<u64> {
+     let words = row_count.div_ceil(64);
+     let mut mask = vec![u64::MAX; words];
+@@ -6645,10 +6661,14 @@
+         .is_some_and(|word| word & (1_u64 << (ordinal % 64)) != 0)
+ }
+ 
+-fn mask_clear(mask: &mut [u64], ordinal: usize) {
+-    if let Some(word) = mask.get_mut(ordinal / 64) {
+-        *word &= !(1_u64 << (ordinal % 64));
+-    }
++fn mask_clear(mask: &mut [u64], ordinal: usize) -> bool {
++    let Some(word) = mask.get_mut(ordinal / 64) else {
++        return false;
++    };
++    let bit = 1_u64 << (ordinal % 64);
++    let changed = *word & bit != 0;
++    *word &= !bit;
++    changed
+ }
+ 
+ fn mask_intersect_in_place(target: &mut [u64], other: &[u64]) {
+@@ -6675,112 +6695,291 @@
+     materialize_native_row(&installed.data, position)
+ }
+ 
+-fn build_join_compatibilities(
+-    leaves: &[MultiwayJoinLeaf],
++fn quotient_component_endpoints(
++    predicates: &[MultiwayJoinPredicate],
++    target: SemanticId,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Vec<Vec<MultiwayJoinColumnRef>>, PhysicalExecutionError> {
++    let mut vertices = BTreeSet::new();
++    let mut edges = Vec::new();
++    for predicate in predicates {
++        if registry.equivalence_refines(context, predicate.equivalence, target)? {
++            vertices.insert(predicate.left);
++            vertices.insert(predicate.right);
++            edges.push((predicate.left, predicate.right));
++        }
++    }
++    let mut unseen = vertices;
++    let mut components = Vec::new();
++    while let Some(start) = unseen.iter().next().copied() {
++        unseen.remove(&start);
++        let mut stack = vec![start];
++        let mut component = BTreeSet::from([start]);
++        while let Some(vertex) = stack.pop() {
++            for (left, right) in &edges {
++                let next = if *left == vertex {
++                    Some(*right)
++                } else if *right == vertex {
++                    Some(*left)
++                } else {
++                    None
++                };
++                if let Some(next) = next
++                    && component.insert(next)
++                {
++                    unseen.remove(&next);
++                    stack.push(next);
++                }
++            }
++        }
++        if component.len() > 1 {
++            components.push(component.into_iter().collect());
++        }
++    }
++    Ok(components)
++}
++
++fn semantic_quotient_specs(
+     predicates: &[MultiwayJoinPredicate],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Vec<(SemanticId, Vec<MultiwayJoinColumnRef>)>, PhysicalExecutionError> {
++    let equivalences = predicates
++        .iter()
++        .map(|predicate| predicate.equivalence)
++        .collect::<BTreeSet<_>>();
++    let mut candidates = Vec::new();
++    for equivalence in equivalences {
++        for endpoints in quotient_component_endpoints(predicates, equivalence, context, registry)? {
++            candidates.push((equivalence, endpoints));
++        }
++    }
++
++    let mut keep = vec![true; candidates.len()];
++    for i in 0..candidates.len() {
++        for j in 0..candidates.len() {
++            if i == j || candidates[i].1 != candidates[j].1 {
++                continue;
++            }
++            let j_refines_i =
++                registry.equivalence_refines(context, candidates[j].0, candidates[i].0)?;
++            let i_refines_j =
++                registry.equivalence_refines(context, candidates[i].0, candidates[j].0)?;
++            if j_refines_i && (!i_refines_j || j < i) {
++                keep[i] = false;
++                break;
++            }
++        }
++    }
++    Ok(candidates
++        .into_iter()
++        .zip(keep)
++        .filter_map(|(candidate, keep)| keep.then_some(candidate))
++        .collect())
++}
++
++fn quotient_key_cache(
++    specs: &[(SemanticId, Vec<MultiwayJoinColumnRef>)],
++    leaves: &[MultiwayJoinLeaf],
+     handles: &[Vec<PhysicalRowId>],
+     store: &PhysicalStore,
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+     stats: &mut ExecutionStats,
+-) -> Result<Option<Vec<JoinPredicateCompatibility>>, PhysicalExecutionError> {
+-    let mut key_cache =
+-        BTreeMap::<(usize, usize, SemanticId), Vec<kernel_semantics::CanonicalEqKey>>::new();
+-    for predicate in predicates {
+-        for endpoint in [predicate.left, predicate.right] {
+-            let spec = (endpoint.leaf, endpoint.column, predicate.equivalence);
+-            if key_cache.contains_key(&spec) {
++) -> Result<Option<SemanticQuotientKeyCache>, PhysicalExecutionError> {
++    let mut cache = BTreeMap::new();
++    for (equivalence, endpoints) in specs {
++        let Some(module) = registry.resolve_primitive_equivalence(context, *equivalence)? else {
++            return Ok(None);
++        };
++        for endpoint in endpoints {
++            let cache_key = (endpoint.leaf, endpoint.column, *equivalence);
++            if cache.contains_key(&cache_key) {
+                 continue;
+             }
+-            let Some(module) =
+-                registry.resolve_primitive_equivalence(context, predicate.equivalence)?
+-            else {
+-                return Ok(None);
+-            };
+-            let leaf = leaves
+-                .get(endpoint.leaf)
+-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+             let mut keys = Vec::with_capacity(handles[endpoint.leaf].len());
+             for row_id in &handles[endpoint.leaf] {
+-                let row = leaf_row_by_handle(store, leaf, *row_id)?;
++                let row = leaf_row_by_handle(store, &leaves[endpoint.leaf], *row_id)?;
+                 let value = row
+                     .get(endpoint.column)
+                     .ok_or(RelQueryError::ColumnOutOfBounds)?;
+                 keys.push(module.canonical_key(value)?);
+                 stats.values_read = stats.values_read.saturating_add(1);
+             }
+-            key_cache.insert(spec, keys);
++            cache.insert(cache_key, keys);
+         }
+     }
++    Ok(Some(cache))
++}
+ 
+-    let mut compatibilities = Vec::with_capacity(predicates.len());
+-    for predicate in predicates {
+-        let (earlier, later) = if predicate.left.leaf < predicate.right.leaf {
+-            (predicate.left, predicate.right)
+-        } else {
+-            (predicate.right, predicate.left)
+-        };
+-        let earlier_keys = key_cache
+-            .get(&(earlier.leaf, earlier.column, predicate.equivalence))
+-            .ok_or(RelQueryError::InconsistentIncrementalDelta)?
+-            .clone();
+-        let later_keys = key_cache
+-            .get(&(later.leaf, later.column, predicate.equivalence))
+-            .ok_or(RelQueryError::InconsistentIncrementalDelta)?
+-            .clone();
+-        let mut later_buckets = BTreeMap::new();
+-        for (ordinal, key) in later_keys.iter().enumerate() {
+-            let mask = later_buckets
+-                .entry(key.clone())
+-                .or_insert_with(|| vec![0_u64; later_keys.len().div_ceil(64)]);
+-            mask[ordinal / 64] |= 1_u64 << (ordinal % 64);
+-        }
+-        compatibilities.push(JoinPredicateCompatibility {
+-            earlier_leaf: earlier.leaf,
+-            later_leaf: later.leaf,
+-            earlier_keys,
+-            later_keys,
+-            later_buckets,
++fn quotient_leaf_keys(
++    leaf_index: usize,
++    columns: &[usize],
++    equivalence: SemanticId,
++    row_count: usize,
++    key_cache: &BTreeMap<(usize, usize, SemanticId), Vec<kernel_semantics::CanonicalEqKey>>,
++) -> Result<SemanticQuotientLeaf, PhysicalExecutionError> {
++    let mut keys = Vec::with_capacity(row_count);
++    for ordinal in 0..row_count {
++        let mut row_key = None;
++        let mut consistent = true;
++        for column in columns {
++            let key = key_cache
++                .get(&(leaf_index, *column, equivalence))
++                .and_then(|keys| keys.get(ordinal))
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            if row_key.as_ref().is_some_and(|current| current != key) {
++                consistent = false;
++                break;
++            }
++            row_key = Some(key.clone());
++        }
++        keys.push(consistent.then_some(row_key).flatten());
++    }
++    let mut buckets = BTreeMap::new();
++    for (ordinal, key) in keys.iter().enumerate() {
++        let Some(key) = key else { continue };
++        let mask = buckets
++            .entry(key.clone())
++            .or_insert_with(|| vec![0_u64; keys.len().div_ceil(64)]);
++        mask[ordinal / 64] |= 1_u64 << (ordinal % 64);
++    }
++    Ok(SemanticQuotientLeaf {
++        leaf: leaf_index,
++        keys,
++        buckets,
++    })
++}
++
++fn quotient_common_keys(
++    leaves: &[SemanticQuotientLeaf],
++) -> BTreeSet<kernel_semantics::CanonicalEqKey> {
++    let Some(first) = leaves.first() else {
++        return BTreeSet::new();
++    };
++    let mut common = first.buckets.keys().cloned().collect::<BTreeSet<_>>();
++    for leaf in &leaves[1..] {
++        common.retain(|key| leaf.buckets.contains_key(key));
++    }
++    common
++}
++
++fn build_semantic_quotient_constraints(
++    leaves: &[MultiwayJoinLeaf],
++    predicates: &[MultiwayJoinPredicate],
++    handles: &[Vec<PhysicalRowId>],
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<SemanticQuotientConstraint>>, PhysicalExecutionError> {
++    let specs = semantic_quotient_specs(predicates, context, registry)?;
++    let Some(key_cache) =
++        quotient_key_cache(&specs, leaves, handles, store, context, registry, stats)?
++    else {
++        return Ok(None);
++    };
++    let mut constraints = Vec::with_capacity(specs.len());
++    for (equivalence, endpoints) in specs {
++        let mut columns_by_leaf = BTreeMap::<usize, Vec<usize>>::new();
++        for endpoint in endpoints {
++            columns_by_leaf
++                .entry(endpoint.leaf)
++                .or_default()
++                .push(endpoint.column);
++        }
++        let mut quotient_leaves = Vec::with_capacity(columns_by_leaf.len());
++        for (leaf, columns) in columns_by_leaf {
++            quotient_leaves.push(quotient_leaf_keys(
++                leaf,
++                &columns,
++                equivalence,
++                handles[leaf].len(),
++                &key_cache,
++            )?);
++        }
++        let common_keys = quotient_common_keys(&quotient_leaves);
++        constraints.push(SemanticQuotientConstraint {
++            leaves: quotient_leaves,
++            common_keys,
+         });
+     }
+-    Ok(Some(compatibilities))
++    Ok(Some(constraints))
+ }
+ 
+-fn semijoin_support_masks(
++fn quotient_support_masks(
+     handles: &[Vec<PhysicalRowId>],
+-    compatibilities: &[JoinPredicateCompatibility],
++    constraints: &[SemanticQuotientConstraint],
+ ) -> Vec<Vec<u64>> {
+     let mut masks = handles
+         .iter()
+         .map(|rows| full_ordinal_mask(rows.len()))
+         .collect::<Vec<_>>();
+-    for compatibility in compatibilities {
+-        let earlier_key_set = compatibility.earlier_keys.iter().collect::<BTreeSet<_>>();
+-        for (ordinal, key) in compatibility.earlier_keys.iter().enumerate() {
+-            if !compatibility.later_buckets.contains_key(key) {
+-                mask_clear(&mut masks[compatibility.earlier_leaf], ordinal);
++    loop {
++        let mut changed = false;
++        for constraint in constraints {
++            let viable_keys = constraint
++                .common_keys
++                .iter()
++                .filter(|key| {
++                    constraint.leaves.iter().all(|leaf| {
++                        leaf.buckets
++                            .get(*key)
++                            .is_some_and(|bucket| masks_intersect(bucket, &masks[leaf.leaf]))
++                    })
++                })
++                .collect::<BTreeSet<_>>();
++            for quotient_leaf in &constraint.leaves {
++                for (ordinal, key) in quotient_leaf.keys.iter().enumerate() {
++                    let supported = key.as_ref().is_some_and(|key| viable_keys.contains(key));
++                    if !supported {
++                        changed |= mask_clear(&mut masks[quotient_leaf.leaf], ordinal);
++                    }
++                }
+             }
+         }
+-        for (ordinal, key) in compatibility.later_keys.iter().enumerate() {
+-            if !earlier_key_set.contains(key) {
+-                mask_clear(&mut masks[compatibility.later_leaf], ordinal);
+-            }
++        if !changed {
++            return masks;
+         }
+     }
+-    masks
++}
++
++fn quotient_leaf(
++    constraint: &SemanticQuotientConstraint,
++    leaf: usize,
++) -> Option<&SemanticQuotientLeaf> {
++    constraint
++        .leaves
++        .iter()
++        .find(|candidate| candidate.leaf == leaf)
+ }
+ 
+ struct OrderPreservingJoinEnumeration<'a> {
+     leaves: &'a [MultiwayJoinLeaf],
+     predicates: &'a [MultiwayJoinPredicate],
+     handles: &'a [Vec<PhysicalRowId>],
+-    compatibilities: &'a [JoinPredicateCompatibility],
++    constraints: &'a [SemanticQuotientConstraint],
+     base_masks: &'a [Vec<u64>],
+     store: &'a PhysicalStore,
+     context: &'a kernel_schema::SemanticContext,
+     registry: &'a kernel_semantics::SemanticRegistry,
+ }
+ 
++fn expected_quotient_key<'a>(
++    constraint: &'a SemanticQuotientConstraint,
++    leaf_index: usize,
++    assignment: &[Option<usize>],
++) -> Option<&'a kernel_semantics::CanonicalEqKey> {
++    constraint.leaves.iter().find_map(|quotient_leaf| {
++        if quotient_leaf.leaf >= leaf_index {
++            return None;
++        }
++        let ordinal = assignment[quotient_leaf.leaf]?;
++        quotient_leaf.keys[ordinal].as_ref()
++    })
++}
++
+ impl OrderPreservingJoinEnumeration<'_> {
+     fn enumerate(
+         &self,
+@@ -6822,15 +7021,14 @@
+         }
+ 
+         let mut candidates = self.base_masks[leaf_index].clone();
+-        for compatibility in self
+-            .compatibilities
+-            .iter()
+-            .filter(|compatibility| compatibility.later_leaf == leaf_index)
+-        {
+-            let earlier_ordinal = assignment[compatibility.earlier_leaf]
+-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-            let key = &compatibility.earlier_keys[earlier_ordinal];
+-            let Some(mask) = compatibility.later_buckets.get(key) else {
++        for constraint in self.constraints {
++            let Some(current_leaf) = quotient_leaf(constraint, leaf_index) else {
++                continue;
++            };
++            let Some(expected) = expected_quotient_key(constraint, leaf_index, assignment) else {
++                continue;
++            };
++            let Some(mask) = current_leaf.buckets.get(expected) else {
+                 return Ok(());
+             };
+             mask_intersect_in_place(&mut candidates, mask);
+@@ -6841,20 +7039,37 @@
+                 continue;
+             }
+             let mut viable = true;
+-            for compatibility in self
+-                .compatibilities
+-                .iter()
+-                .filter(|compatibility| compatibility.earlier_leaf == leaf_index)
+-            {
+-                let key = &compatibility.earlier_keys[ordinal];
+-                let Some(mask) = compatibility.later_buckets.get(key) else {
++            for constraint in self.constraints {
++                let Some(current_leaf) = quotient_leaf(constraint, leaf_index) else {
++                    continue;
++                };
++                let Some(key) = current_leaf.keys[ordinal].as_ref() else {
+                     viable = false;
+                     break;
+                 };
+-                if !masks_intersect(mask, &self.base_masks[compatibility.later_leaf]) {
++                if let Some(expected) = expected_quotient_key(constraint, leaf_index, assignment)
++                    && expected != key
++                {
+                     viable = false;
+                     break;
+                 }
++                for later in constraint
++                    .leaves
++                    .iter()
++                    .filter(|later| later.leaf > leaf_index)
++                {
++                    let Some(mask) = later.buckets.get(key) else {
++                        viable = false;
++                        break;
++                    };
++                    if !masks_intersect(mask, &self.base_masks[later.leaf]) {
++                        viable = false;
++                        break;
++                    }
++                }
++                if !viable {
++                    break;
++                }
+             }
+             if !viable {
+                 continue;
+@@ -6867,7 +7082,7 @@
+     }
+ }
+ 
+-fn execute_order_preserving_semijoin_join(
++fn execute_order_preserving_quotient_join(
+     leaves: &[MultiwayJoinLeaf],
+     predicates: &[MultiwayJoinPredicate],
+     store: &PhysicalStore,
+@@ -6882,13 +7097,33 @@
+     stats.scanned_rows = stats
+         .scanned_rows
+         .saturating_add(handles.iter().map(Vec::len).sum::<usize>());
+-    let Some(compatibilities) = build_join_compatibilities(
++    let Some(constraints) = build_semantic_quotient_constraints(
+         leaves, predicates, &handles, store, context, registry, stats,
+     )?
+     else {
+         return Ok(None);
+     };
+-    let base_masks = semijoin_support_masks(&handles, &compatibilities);
++    stats.multiway_join_semantic_quotient_constraints = stats
++        .multiway_join_semantic_quotient_constraints
++        .saturating_add(constraints.len());
++    let base_masks = quotient_support_masks(&handles, &constraints);
++    let supported_rows = base_masks
++        .iter()
++        .map(|mask| {
++            mask.iter()
++                .map(|word| word.count_ones() as usize)
++                .sum::<usize>()
++        })
++        .sum::<usize>();
++    stats.multiway_join_semantic_quotient_pruned_rows = stats
++        .multiway_join_semantic_quotient_pruned_rows
++        .saturating_add(
++            handles
++                .iter()
++                .map(Vec::len)
++                .sum::<usize>()
++                .saturating_sub(supported_rows),
++        );
+     if base_masks
+         .iter()
+         .any(|mask| mask.iter().all(|word| *word == 0))
+@@ -6899,7 +7134,7 @@
+         leaves,
+         predicates,
+         handles: &handles,
+-        compatibilities: &compatibilities,
++        constraints: &constraints,
+         base_masks: &base_masks,
+         store,
+         context,
+@@ -6944,26 +7179,21 @@
+     )))
+ }
+ 
+-fn estimated_compatibility_build_work(
++fn estimated_quotient_build_work(
+     leaves: &[MultiwayJoinLeaf],
+     predicates: &[MultiwayJoinPredicate],
+-) -> u128 {
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<u128, PhysicalExecutionError> {
+     let mut specs = BTreeSet::new();
+-    for predicate in predicates {
+-        specs.insert((
+-            predicate.left.leaf,
+-            predicate.left.column,
+-            predicate.equivalence,
+-        ));
+-        specs.insert((
+-            predicate.right.leaf,
+-            predicate.right.column,
+-            predicate.equivalence,
+-        ));
++    for (equivalence, endpoints) in semantic_quotient_specs(predicates, context, registry)? {
++        for endpoint in endpoints {
++            specs.insert((endpoint.leaf, endpoint.column, equivalence));
++        }
+     }
+-    specs.into_iter().fold(0_u128, |work, (leaf, _, _)| {
++    Ok(specs.into_iter().fold(0_u128, |work, (leaf, _, _)| {
+         work.saturating_add(leaves[leaf].rows as u128)
+-    })
++    }))
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -7172,12 +7402,17 @@
+     };
+     let estimated_work = candidate
+         .cost
+-        .saturating_add(estimated_compatibility_build_work(&leaves, &predicates))
++        .saturating_add(estimated_quotient_build_work(
++            &leaves,
++            &predicates,
++            context,
++            registry,
++        )?)
+         .saturating_add(candidate.estimated_rows as u128);
+     if estimated_work >= contiguous.cost {
+         return Ok(None);
+     }
+-    execute_order_preserving_semijoin_join(&leaves, &predicates, store, context, registry, stats)
++    execute_order_preserving_quotient_join(&leaves, &predicates, store, context, registry, stats)
+ }
+ 
+ fn try_execute_multiway_join(
+@@ -14170,7 +14405,7 @@
+     }
+ 
+     #[test]
+-    fn non_contiguous_three_way_join_uses_order_preserving_semijoin_enumeration() {
++    fn non_contiguous_three_way_join_uses_order_preserving_gamma_quotients() {
+         let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();
+         let bindings = [
+             LayoutBinding {
+@@ -14354,7 +14589,313 @@
+     }
+ 
+     #[test]
+-    fn four_way_subset_join_uses_order_preserving_semijoin_masks() {
++    fn gamma_quotient_specs_use_certified_refinement_closure() {
++        let exact = sid(720);
++        let ascii_ci = sid(721);
++        let mut registry = SemanticRegistry::default();
++        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(72));
++        environment.pin_module(exact, exact_digest);
++        environment.pin_module(ascii_ci, ci_digest);
++        let context = SemanticContext {
++            schema: Schema::new(SchemaRevisionId::new(72)),
++            environment,
++        };
++        let a = MultiwayJoinColumnRef { leaf: 0, column: 0 };
++        let b = MultiwayJoinColumnRef { leaf: 1, column: 0 };
++        let c = MultiwayJoinColumnRef { leaf: 2, column: 0 };
++        let predicates = [
++            MultiwayJoinPredicate {
++                left: a,
++                right: b,
++                equivalence: exact,
++            },
++            MultiwayJoinPredicate {
++                left: b,
++                right: c,
++                equivalence: ascii_ci,
++            },
++        ];
++        let specs = semantic_quotient_specs(&predicates, &context, &registry).unwrap();
++        assert!(specs.contains(&(exact, vec![a, b])));
++        assert!(specs.contains(&(ascii_ci, vec![a, b, c])));
++        assert_eq!(specs.len(), 2);
++    }
++
++    #[test]
++    fn gamma_quotient_execution_uses_nested_exact_and_coarser_semantic_coordinates() {
++        let relations = [sid(730), sid(731), sid(732)];
++        let exact = sid(733);
++        let ascii_ci = sid(734);
++        let mut registry = SemanticRegistry::default();
++        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(74));
++        environment.pin_module(exact, exact_digest);
++        environment.pin_module(ascii_ci, ci_digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(74));
++        for (relation, equivalence) in relations.into_iter().zip([exact, exact, ascii_ci]) {
++            schema
++                .define_relation(RelationDef {
++                    id: relation,
++                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
++                    semantics: RelationSemantics::Bag {
++                        column_equivalences: vec![equivalence],
++                    },
++                })
++                .unwrap();
++        }
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let layouts = [1_091_u128, 1_092, 1_093].map(|id| LayoutBinding {
++            id: LayoutId(id),
++            family: LayoutFamily::Columnar,
++        });
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, layout) in relations.into_iter().zip(layouts) {
++            catalog.bind_relation(relation, layout);
++        }
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(relations[0])),
++                right: Box::new(RelExpr::Scan(relations[1])),
++                left_column: 0,
++                right_column: 0,
++                equivalence: exact,
++            }),
++            right: Box::new(RelExpr::Scan(relations[2])),
++            left_column: 1,
++            right_column: 0,
++            equivalence: ascii_ci,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let values = [vec!["X", "x"], vec!["X", "Y"], vec!["x", "y"]];
++        let mut store = PhysicalStore::default();
++        let mut model = kernel_model::FiniteModel::default();
++        for ((relation, layout), values) in relations.into_iter().zip(layouts).zip(values) {
++            let owned = values.into_iter().map(str::to_owned).collect::<Vec<_>>();
++            store
++                .install(
++                    relation,
++                    layout,
++                    NativeRelation::typed_columnar(vec![NativeColumn::Text(owned.clone())])
++                        .unwrap(),
++                )
++                .unwrap();
++            model.relations.insert(
++                relation,
++                owned
++                    .into_iter()
++                    .map(|value| vec![Value::Text(value)])
++                    .collect(),
++            );
++        }
++        let mut leaves = Vec::new();
++        let mut predicates = Vec::new();
++        flatten_multiway_join_tree(prepared.physical(), &store, &mut leaves, &mut predicates)
++            .unwrap()
++            .unwrap();
++        let mut stats = ExecutionStats::default();
++        let native = execute_order_preserving_quotient_join(
++            &leaves,
++            &predicates,
++            &store,
++            &context,
++            &registry,
++            &mut stats,
++        )
++        .unwrap()
++        .unwrap();
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(kernel_query::RelationValue::Bag(native), reference);
++        assert_eq!(stats.multiway_join_semantic_quotient_constraints, 2);
++    }
++
++    #[test]
++    fn gamma_quotient_basis_changes_with_pinned_semantic_contract() {
++        let first = sid(738);
++        let second = sid(739);
++        let mut registry = SemanticRegistry::default();
++        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let context = |second_digest| {
++            let mut environment = SemanticEnvironment::new(SemanticEnvId::new(76));
++            environment.pin_module(first, exact_digest);
++            environment.pin_module(second, second_digest);
++            SemanticContext {
++                schema: Schema::new(SchemaRevisionId::new(76)),
++                environment,
++            }
++        };
++        let a = MultiwayJoinColumnRef { leaf: 0, column: 0 };
++        let b = MultiwayJoinColumnRef { leaf: 1, column: 0 };
++        let c = MultiwayJoinColumnRef { leaf: 2, column: 0 };
++        let predicates = [
++            MultiwayJoinPredicate {
++                left: a,
++                right: b,
++                equivalence: first,
++            },
++            MultiwayJoinPredicate {
++                left: b,
++                right: c,
++                equivalence: second,
++            },
++        ];
++        let mixed = semantic_quotient_specs(&predicates, &context(ci_digest), &registry).unwrap();
++        assert_eq!(mixed.len(), 2);
++        let both_exact =
++            semantic_quotient_specs(&predicates, &context(exact_digest), &registry).unwrap();
++        assert_eq!(both_exact, vec![(first, vec![a, b, c])]);
++    }
++
++    #[test]
++    fn gamma_quotient_specs_drop_same_component_coarser_duplicate() {
++        let exact = sid(735);
++        let ascii_ci = sid(736);
++        let mut registry = SemanticRegistry::default();
++        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(75));
++        environment.pin_module(exact, exact_digest);
++        environment.pin_module(ascii_ci, ci_digest);
++        let context = SemanticContext {
++            schema: Schema::new(SchemaRevisionId::new(75)),
++            environment,
++        };
++        let left = MultiwayJoinColumnRef { leaf: 0, column: 0 };
++        let right = MultiwayJoinColumnRef { leaf: 1, column: 0 };
++        let predicates = [
++            MultiwayJoinPredicate {
++                left,
++                right,
++                equivalence: ascii_ci,
++            },
++            MultiwayJoinPredicate {
++                left,
++                right,
++                equivalence: exact,
++            },
++        ];
++        let specs = semantic_quotient_specs(&predicates, &context, &registry).unwrap();
++        assert_eq!(specs, vec![(exact, vec![left, right])]);
++    }
++
++    #[test]
++    fn gamma_quotient_leaf_factor_prunes_intra_row_coordinate_conflict() {
++        let equivalence = sid(737);
++        let mut cache = SemanticQuotientKeyCache::new();
++        cache.insert(
++            (0, 0, equivalence),
++            vec![
++                kernel_semantics::CanonicalEqKey::I64(1),
++                kernel_semantics::CanonicalEqKey::I64(1),
++            ],
++        );
++        cache.insert(
++            (0, 1, equivalence),
++            vec![
++                kernel_semantics::CanonicalEqKey::I64(1),
++                kernel_semantics::CanonicalEqKey::I64(2),
++            ],
++        );
++        let leaf = quotient_leaf_keys(0, &[0, 1], equivalence, 2, &cache).unwrap();
++        assert_eq!(
++            leaf.keys,
++            vec![Some(kernel_semantics::CanonicalEqKey::I64(1)), None]
++        );
++    }
++
++    #[test]
++    fn gamma_quotient_support_fixpoint_propagates_across_coordinates() {
++        let q1 = sid(740);
++        let q2 = sid(741);
++        let a = kernel_semantics::CanonicalEqKey::TextExact("a".into());
++        let b = kernel_semantics::CanonicalEqKey::TextExact("b".into());
++        let x = kernel_semantics::CanonicalEqKey::TextExact("x".into());
++        let y = kernel_semantics::CanonicalEqKey::TextExact("y".into());
++        let mut cache = SemanticQuotientKeyCache::new();
++        cache.insert((0, 0, q1), vec![a.clone()]);
++        cache.insert((1, 0, q1), vec![a, b]);
++        cache.insert((1, 1, q2), vec![x, y.clone()]);
++        cache.insert((2, 0, q2), vec![y]);
++        let q1_leaves = vec![
++            quotient_leaf_keys(0, &[0], q1, 1, &cache).unwrap(),
++            quotient_leaf_keys(1, &[0], q1, 2, &cache).unwrap(),
++        ];
++        let q2_leaves = vec![
++            quotient_leaf_keys(1, &[1], q2, 2, &cache).unwrap(),
++            quotient_leaf_keys(2, &[0], q2, 1, &cache).unwrap(),
++        ];
++        let constraints = vec![
++            SemanticQuotientConstraint {
++                common_keys: quotient_common_keys(&q1_leaves),
++                leaves: q1_leaves,
++            },
++            SemanticQuotientConstraint {
++                common_keys: quotient_common_keys(&q2_leaves),
++                leaves: q2_leaves,
++            },
++        ];
++        let handles = vec![
++            vec![PhysicalRowId {
++                slot: 0,
++                generation: 0,
++            }],
++            vec![
++                PhysicalRowId {
++                    slot: 1,
++                    generation: 0,
++                },
++                PhysicalRowId {
++                    slot: 2,
++                    generation: 0,
++                },
++            ],
++            vec![PhysicalRowId {
++                slot: 3,
++                generation: 0,
++            }],
++        ];
++        let masks = quotient_support_masks(&handles, &constraints);
++        assert!(masks[2].iter().all(|word| *word == 0));
++    }
++
++    #[test]
++    fn gamma_quotient_specs_collapse_redundant_equality_clique() {
++        let equivalence = sid(722);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(73));
++        environment.pin_module(equivalence, digest);
++        let context = SemanticContext {
++            schema: Schema::new(SchemaRevisionId::new(73)),
++            environment,
++        };
++        let vertices = (0..4)
++            .map(|leaf| MultiwayJoinColumnRef { leaf, column: 0 })
++            .collect::<Vec<_>>();
++        let mut predicates = Vec::new();
++        for left in 0..vertices.len() {
++            for right in (left + 1)..vertices.len() {
++                predicates.push(MultiwayJoinPredicate {
++                    left: vertices[left],
++                    right: vertices[right],
++                    equivalence,
++                });
++            }
++        }
++        assert_eq!(predicates.len(), 6);
++        let specs = semantic_quotient_specs(&predicates, &context, &registry).unwrap();
++        assert_eq!(specs, vec![(equivalence, vertices)]);
++    }
++
++    #[test]
++    fn four_way_subset_join_uses_order_preserving_gamma_quotients() {
+         let FourWaySubsetFixture {
+             context,
+             registry,

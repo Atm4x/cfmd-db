@@ -1,0 +1,14 @@
+Production source changed relative to Pass30:
+- crates/kernel-plan/src/lib.rs
+- crates/kernel-query/src/lib.rs
+- crates/kernel-plan/examples/storage_plan_bridge_bench.rs
+
+Pass31 documentation/evidence added or updated:
+- PASS31_REPORT.md
+- IMPLEMENTATION_REPORT_pass31.md
+- CFMD_IDEAL_DB_SPEC.md
+- ARCHITECTURE.md
+- PASS31_CHANGED_FILES.txt
+- evidence/pass31/*
+
+Generated manifests are rebuilt after finalization and are not production source changes.

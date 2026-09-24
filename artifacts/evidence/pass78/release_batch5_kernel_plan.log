@@ -1,0 +1,256 @@
+   Compiling kernel-plan v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-plan)
+    Finished `release` profile [optimized] target(s) in 19.51s
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_plan-78fbe96aee665d1e)
+
+running 198 tests
+test algebraic_native::tests::benchmark_product_field_filter_against_logical_btree_rows ... ignored, diagnostic release benchmark
+test algebraic_native::tests::benchmark_sum_tag_filter_against_boxed_logical_variants ... ignored, diagnostic release benchmark
+test algebraic_native::tests::all_non_recursive_algebraic_constructors_round_trip ... ok
+test algebraic_native::tests::guarded_recursive_sum_round_trips ... ok
+test algebraic_native::tests::hostile_rejects_wrong_semantic_tags_and_empty_recursive_is_finite ... ok
+test algebraic_native::tests::native_structural_canonical_key_matches_registry_for_composed_algebra ... ok
+test algebraic_native::tests::selection_push_and_swap_remove_preserve_exact_values ... ok
+test algebraic_native::tests::option_sum_and_seq_mutation_stay_column_native ... ok
+test algebraic_native::tests::set_bag_and_map_mutation_stay_column_native ... ok
+test algebraic_native::tests::typed_relation_compiler_keeps_scalars_native_and_structures_algebraic ... ok
+test tests::adaptive_indexed_join_falls_back_for_non_i64_columnar_keys ... ok
+test tests::algebraic_structural_filter_composes_with_dense_live_entity_projection ... ok
+test tests::algebraic_structural_filter_feeds_typed_group_without_row_materialization ... ok
+test tests::algebraic_typed_filter_uses_structural_canonical_keys_without_row_materialization ... ok
+test tests::artifact_memory_report_deduplicates_shared_dense_identity_backing ... ok
+test tests::baseline_choices_are_explicit_and_contain_no_opaque_operator_variant ... ok
+test tests::benchmark_persistent_physical_store_clone_tax_with_and_without_index ... ignored, diagnostic clone benchmark; run explicitly in release mode
+test tests::baseline_lowering_is_exact_round_trip_for_every_operator_shape ... ok
+test tests::atomic_relation_delta_updates_relation_and_persisted_index_together ... ok
+test tests::bootstrap_rejects_logical_physical_divergence ... ok
+test tests::bounded_cyclic_work_certificate_uses_sparse_masks_and_rejects_bad_order ... ok
+test tests::bounded_recovery_schedules_cheaper_advisor_rebuild_before_semantic_id_order ... ok
+test tests::bounded_physical_recovery_prioritizes_manual_pin_over_advisor_recipe ... ok
+test tests::commit_durability_failure_after_seal_fail_stops_runtime_until_recovery ... ok
+test tests::columnar_join_selects_indexed_i64_path_and_preserves_bag_multiplicity ... ok
+test tests::competing_prepared_transitions_from_same_revision_cannot_both_publish ... ok
+test tests::composite_mixed_key_semantic_index_fuses_column_filtered_join ... ok
+test tests::client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent ... ok
+test tests::composite_mixed_type_semantic_index_drives_filter_chain_and_maintains_delta ... ok
+test tests::committed_transaction_id_rejects_same_revision_id_with_different_revision_content ... ok
+test tests::composite_semantic_statistics_use_the_same_canonical_key_contract_as_indexes ... ok
+test tests::compositional_typed_batch_chain_handles_nested_filters_projects_and_bag_promotion ... ok
+test tests::cost_model_rejects_unprofitable_persisted_i64_index_without_ephemeral_fallback ... ok
+test tests::cost_model_rejects_unprofitable_i64_index_before_join_batch_fast_path ... ok
+test tests::cost_model_rejects_unprofitable_tiny_text_semantic_index ... ok
+test tests::crash_worker_commit_durable_before_publish ... ok
+test tests::cost_model_uses_selective_persisted_text_semantic_index ... ok
+test tests::conflicting_durable_layout_recipes_fall_back_deterministically ... ok
+test tests::deferred_recovery_never_replays_manual_or_incompatible_recipes ... ok
+test tests::dense_live_entity_column_round_trips_and_filters_with_revision_local_ids ... ok
+test tests::dense_slot_delete_repairs_only_the_swapped_row_position ... ok
+test tests::deferred_advisor_recovery_can_resume_after_runtime_starts_serving ... ok
+test tests::derived_relation_commit_is_compact_exact_and_survives_compaction_retry ... ok
+test tests::duplicate_heavy_join_project_does_not_rebuild_rejected_transient_index ... ok
+test tests::derived_relation_commit_matches_authoritative_target_and_rejects_stale_source ... ok
+test tests::duplicate_materialization_id_is_rejected_at_bootstrap ... ok
+test tests::duplicate_relation_in_revision_batch_is_rejected_before_prepare ... ok
+test tests::durable_commit_linearizes_before_runtime_publication_and_recovers_from_logical_wal ... ok
+test tests::durable_checkpoint_rebuilds_physical_index_recipes_on_reopen ... ok
+test tests::durable_initial_recipes_rebuild_statistics_and_quotient_factor_with_ownership ... ok
+test tests::durable_full_revision_replacement_covers_schema_gamma_lifecycle_and_fields ... ok
+test tests::durable_recovery_replays_multiple_nonconsecutive_revision_ids_idempotently ... ok
+test tests::bounded_cyclic_prefix_index_tightens_joint_constraint_domain ... ok
+test tests::durable_runtime_compaction_preserves_reopenability ... ok
+test tests::durable_runtime_checkpoint_rotates_base_then_replays_only_new_tail ... ok
+test tests::durable_layout_recipe_round_trips_supported_native_representations ... ok
+test tests::durable_structural_semantic_index_rebuilds_and_serves_after_reopen ... ok
+test tests::durable_runtime_owner_restarts_from_checkpoint_plus_wal_tail ... ok
+test tests::execution_stats_merge_preserves_cyclic_qcn_telemetry ... ok
+test tests::failure_in_second_relation_of_batch_leaves_live_bundle_unchanged ... ok
+test tests::durable_typed_live_ref_layout_rebinds_fresh_revision_local_dense_ids ... ok
+test tests::gamma_quotient_basis_changes_with_pinned_semantic_contract ... ok
+test tests::exact_transaction_intent_survives_later_heads_checkpoint_compaction_and_reopen ... ok
+test tests::durable_typed_layout_and_i64_index_rebuild_and_serve_after_compaction ... ok
+test tests::gamma_quotient_leaf_factor_prunes_intra_row_coordinate_conflict ... ok
+test tests::gamma_quotient_execution_uses_nested_exact_and_coarser_semantic_coordinates ... ok
+test tests::gamma_quotient_revision_batch_coalesces_support_refresh ... ok
+test tests::gamma_quotient_specs_collapse_redundant_equality_clique ... ok
+test tests::gamma_quotient_specs_drop_same_component_coarser_duplicate ... ok
+test tests::gamma_quotient_specs_use_certified_refinement_closure ... ok
+test tests::gamma_quotient_local_insertion_resurrects_greatest_fixed_point ... ok
+test tests::gamma_quotient_support_fixpoint_propagates_across_coordinates ... ok
+test tests::generation_exhaustion_is_rejected_before_any_relation_mutation ... ok
+test tests::generational_slots_reuse_metadata_without_reviving_stale_handles ... ok
+test tests::gamma_quotient_mixed_delta_refreshes_only_affected_component ... ok
+test tests::high_churn_slot_metadata_is_bounded_by_peak_live_rows ... ok
+test tests::gamma_quotient_support_uses_local_dq_for_arbitrary_deletions ... ok
+test tests::i64_index_advisor_amortizes_build_consumes_and_evicts_owned_index ... ok
+test tests::historical_semantic_implementation_manifest_survives_checkpoint_and_retry ... ok
+test tests::i64_index_advisor_rejects_one_shot_budget_and_respects_manual_pin ... ok
+test tests::inconsistent_statistics_are_ignored_as_non_authoritative_physical_state ... ok
+test tests::indexed_i64_join_project_fuses_without_materializing_full_join_rows ... ok
+test tests::invalid_relation_delta_is_rejected_before_relation_or_index_mutation ... ok
+test tests::intermediate_transient_join_rechecks_actual_distinctness_before_committing_to_index ... ok
+test tests::join_access_decision_can_choose_transient_generic_semantic_family ... ok
+test tests::join_access_decision_unifies_persisted_and_ephemeral_i64_families ... ok
+test tests::invalid_materialization_reconfiguration_is_rejected_before_durable_publication ... ok
+test tests::logical_transition_validation_reconstructs_only_affected_relation ... ok
+test tests::lowering_checker_rejects_a_plan_that_changes_logical_meaning ... ok
+test tests::lowering_crosses_the_generic_checked_certificate_boundary ... ok
+test tests::lowering_preserves_native_relation_layout_without_forced_conversion_node ... ok
+test tests::maintained_i64_index_matches_fresh_rebuild_across_bag_delta_sequence ... ok
+test tests::join_project_reuses_persisted_semantic_index_before_building_ephemeral_i64 ... ok
+test tests::manual_quotient_factor_materialization_pins_advisor_owned_factors ... ok
+test tests::materialization_registry_advances_all_registered_plans_atomically ... ok
+test tests::mixed_typed_columnar_covers_all_scalar_carriers_and_matches_logical_reference ... ok
+test tests::mixed_typed_columnar_rejects_shape_and_schema_mismatch ... ok
+test tests::mixed_typed_predicate_kernels_cover_every_scalar_carrier ... ok
+test tests::large_text_join_builds_profitable_ephemeral_semantic_index ... ok
+test tests::multi_relation_revision_publishes_one_coherent_join_snapshot ... ok
+test tests::multiway_and_direct_join_planning_share_the_same_right_access_decision ... ok
+test tests::materialization_configuration_evolves_durably_and_reopens_without_caller_specs ... ok
+test tests::multiway_costing_does_not_credit_unbuilt_transient_distinctness ... ok
+test tests::multiway_join_executes_transient_access_after_intermediate_join ... ok
+test tests::native_columnar_filter_project_matches_logical_reference_without_full_row_materialization ... ok
+test tests::native_distinct_matches_logical_reference ... ok
+test tests::native_group_count_matches_logical_reference_including_empty_global_group ... ok
+test tests::native_group_exact_f64_sum_matches_logical_reference ... ok
+test tests::native_nested_loop_join_matches_logical_reference ... ok
+test tests::native_row_store_filter_project_matches_logical_reference ... ok
+test tests::native_runtime_refuses_layout_family_mismatch ... ok
+test tests::native_top_k_with_ties_matches_logical_reference ... ok
+test tests::nine_way_acyclic_quotient_join_preserves_bag_order_and_multiplicity ... ok
+test tests::nine_way_bushy_quotient_join_preserves_logical_bag_order ... ok
+test tests::nine_way_raw_cycle_collapses_to_certified_common_quotient_without_semantic_drift ... ok
+test tests::non_contiguous_three_way_join_uses_order_preserving_gamma_quotients ... ok
+test tests::pass44_multiway_join_reassociation_benchmark ... ignored, diagnostic release benchmark
+test tests::persisted_i64_index_is_reused_and_maintained_by_relation_delta ... ok
+test tests::persisted_structural_semantic_index_is_consumed_and_delta_maintained ... ok
+test tests::persisted_text_semantic_index_maintains_delta_and_pins_gamma ... ok
+test tests::physical_index_change_after_prepare_makes_transition_stale ... ok
+test tests::physical_recovery_byte_budget_drops_optional_artifact_but_keeps_revision ... ok
+test tests::physical_store_clone_cow_isolates_relation_mutation ... ok
+test tests::prepared_gamma_quotient_factors_reuse_delta_maintained_canonical_keys ... ok
+test tests::prepared_plan_preserves_catalog_layout_after_typecheck ... ok
+test tests::prepared_plan_reference_execution_rejects_semantic_context_drift ... ok
+test tests::prepared_plan_requires_logical_typecheck_before_lowering ... ok
+test tests::prepared_transition_cannot_cross_identical_runtime_root_lineages ... ok
+test tests::prepared_transition_rejects_different_same_revision_bundle ... ok
+test tests::quotient_factor_advisor_amortizes_build_and_evicts_only_owned_factors ... ok
+test tests::quotient_factor_advisor_does_not_materialize_unused_qcn_path ... ok
+test tests::quotient_factor_advisor_rejects_one_shot_and_respects_global_memory_budget ... ok
+test tests::quotient_factor_advisor_rejects_over_budget_non_gyo_cyclic_path ... ok
+test tests::quotient_hypergraph_gyo_accepts_chain_and_rejects_cycle ... ok
+test tests::quotient_key_support_counts_leaves_not_duplicate_rows ... ok
+test tests::reader_snapshot_remains_on_old_root_after_atomic_publication ... ok
+test tests::recovery_semantic_work_budget_distinguishes_same_cell_count_by_payload_size ... ok
+test tests::reinstalling_physical_relation_invalidates_persisted_i64_index ... ok
+test tests::resolved_leaf_delete_preserves_authoritative_scan_order ... ok
+test tests::retained_statistics_avoid_duplicate_heavy_transient_build ... ok
+test tests::retained_statistics_enable_safe_multiway_transient_costing ... ok
+test tests::revision_and_materialization_registry_commit_and_recover_atomically ... ok
+test tests::revision_bound_states_reject_legacy_semantic_mutation_entrypoints ... ok
+test tests::revision_prepare_is_invisible_until_sealed_publish ... ok
+test tests::revision_prepare_rejects_same_source_and_target_without_mutation ... ok
+test tests::runtime_bootstrap_rejects_semantically_equal_bag_reordering ... ok
+test tests::sealed_transition_drop_aborts_without_publication ... ok
+test tests::semantic_context_change_is_rejected_without_publication ... ok
+test tests::semantic_index_advisor_amortizes_build_and_reuses_one_shared_index ... ok
+test tests::semantic_index_advisor_budget_credits_replaced_manual_stale_index ... ok
+test tests::semantic_index_advisor_budget_evicts_only_its_own_lower_value_index ... ok
+test tests::semantic_index_advisor_builds_profitable_composite_join_index ... ok
+test tests::semantic_index_advisor_discovers_access_path_below_project_boundary ... ok
+test tests::semantic_index_advisor_enforces_estimated_byte_budget ... ok
+test tests::semantic_index_advisor_global_budget_counts_other_physical_families ... ok
+test tests::semantic_index_advisor_publishes_one_runtime_root_and_noop_does_not_republish ... ok
+test tests::semantic_index_advisor_rebuilds_stale_gamma_bound_index_before_reuse ... ok
+test tests::semantic_index_advisor_rejects_one_shot_build_that_does_not_amortize ... ok
+test tests::semantic_statistics_advisor_does_not_duplicate_exact_persisted_join_cardinality ... ok
+test tests::semantic_statistics_advisor_prevents_duplicate_heavy_transient_build_and_evicts_owned ... ok
+test tests::semantic_statistics_advisor_publishes_one_runtime_root_and_noop_does_not_republish ... ok
+test tests::semantic_statistics_advisor_respects_budget_and_manual_pin ... ok
+test tests::semantic_statistics_are_invalidated_by_gamma_change ... ok
+test tests::semantic_statistics_are_maintained_with_relation_delta ... ok
+test tests::semantic_statistics_publish_as_reconstructible_runtime_state ... ok
+test tests::sequential_transitions_carry_revision_and_stable_handles_forward ... ok
+test tests::sparse_non_gyo_cycle_visits_only_supported_ordinals ... ok
+test tests::multiway_join_planner_preserves_cross_relation_filter_predicates_and_bag_order ... ok
+test tests::stable_row_handles_survive_position_shifts_without_payload_aliasing ... ok
+test tests::stale_after_durable_prepare_leaves_only_uncommitted_wal_prepare ... ok
+test tests::stale_durable_layout_recipe_falls_back_without_blocking_logical_recovery ... ok
+test tests::stale_durable_physical_recipe_never_blocks_logical_recovery ... ok
+test tests::storage_resolved_delta_updates_recursive_scan_without_semantic_relookup ... ok
+test tests::structural_gamma_quotient_factors_are_materialized_and_delta_maintained ... ok
+
+running 1 test
+test tests::supervisor_can_resume_deferred_recovery_without_reopen ... ok
+test tests::supervisor_recovers_fail_stopped_runtime_and_retries_same_transaction ... ok
+test tests::supervisor_reuses_bounded_physical_recovery_policy_on_reopen ... ok
+test tests::target_revision_state_must_match_logical_mutation_descriptor ... ok
+test tests::ten_way_non_gyo_cycle_rejects_uncertified_large_enumeration_before_dfs ... ok
+test tests::ten_way_non_gyo_cycle_uses_bounded_cyclic_quotient_search ... ok
+test tests::typed_algebraic_work_estimate_matches_logical_value_shape_without_row_materialization ... ok
+test tests::typed_batch_chain_preserves_logical_order_after_physical_swap_remove ... ok
+test tests::typed_batch_dag_keeps_join_filter_project_unmaterialized_until_output ... ok
+test tests::typed_f64_top_k_producer_stays_columnar_until_project_boundary ... ok
+test tests::typed_group_top_k_producer_chain_stays_columnar_until_final_output ... ok
+test tests::typed_i64_columnar_matches_generic_columnar_and_logical_reference ... ok
+test tests::typed_i64_columnar_rejects_non_i64_schema ... ok
+test tests::typed_i64_top_k_descending_selects_high_threshold_with_ties ... ok
+test tests::typed_stateful_distinct_and_group_preserve_text_ci_semantics ... ok
+test tests::typed_stateful_distinct_consumes_batch_selection_without_full_input_rows ... ok
+test tests::typed_stateful_group_count_consumes_filtered_projected_batch_selection ... ok
+test tests::typed_stateful_group_exact_f64_sum_reads_only_group_key_and_aggregate_column ... ok
+test tests::typed_stateful_top_k_with_ties_sorts_positions_before_materializing_rows ... ok
+test tests::typed_text_group_producer_uses_primitive_canonical_keys ... ok
+test tests::typed_top_k_can_feed_group_without_row_materialization ... ok
+test tests::subprocess_commit_durable_before_publish_recovers_target_revision ... ok
+test tests::multiway_join_planner_reassociates_contiguous_tree_and_reuses_indexes_after_intermediate ... ok
+test tests::four_way_subset_join_uses_order_preserving_gamma_quotients ... ok
+
+test result: ok. 194 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests examples/delta_update_bench.rs (/mnt/data/cfmd_pass78_target/release/examples/delta_update_bench-f8aad47beeb6ac48)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/indexed_join_bench.rs (/mnt/data/cfmd_pass78_target/release/examples/indexed_join_bench-253703fc677e4e1e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/lowering_bench.rs (/mnt/data/cfmd_pass78_target/release/examples/lowering_bench-743e2343c2f52ca5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/persisted_index_bench.rs (/mnt/data/cfmd_pass78_target/release/examples/persisted_index_bench-83472701c3fb3df4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/physical_exec_bench.rs (/mnt/data/cfmd_pass78_target/release/examples/physical_exec_bench-e48fbeed5f0368a1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/stateful_batch_bench.rs (/mnt/data/cfmd_pass78_target/release/examples/stateful_batch_bench-5193e749b97b614b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/storage_plan_bridge_bench.rs (/mnt/data/cfmd_pass78_target/release/examples/storage_plan_bridge_bench-9bfb32d3db942a4a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/typed_batch_chain_bench.rs (/mnt/data/cfmd_pass78_target/release/examples/typed_batch_chain_bench-290ddf87a0f54f4a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

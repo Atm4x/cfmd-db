@@ -1,0 +1,2693 @@
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/ARCHITECTURE.md /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/ARCHITECTURE.md
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/ARCHITECTURE.md	2026-09-20 01:23:52.832883994 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/ARCHITECTURE.md	2026-09-20 01:51:54.616844022 +0000
+@@ -63,3 +63,13 @@
+ - published generation metadata and exact historical intents carry `BuiltinSemanticModuleSpec` descriptors for equality/tokenizer/ordering implementation revisions. Normal reopen reconstructs the builtin registry before validating durable Revision bytes;
+ - legacy target-only transaction records remain explicitly weaker and are never silently promoted to exact request identity;
+ - this deployment model is intentionally limited to builtin semantic implementation families. Arbitrary external executable/module artifact packaging, authentication and lifecycle remain outside current durable authority.
++
++Pass39 semantic-index note:
++
++- `kernel-semantics` is the sole authority for canonical primitive equality/order keys. A planner/operator may use a key only after resolving the exact pinned Γ module; ordinary host `Eq`/`Hash`/`Ord` is not semantic authority.
++- `kernel-semantic-index` is reconstructible derivative infrastructure. `SemanticIndexBinding` pins semantic revision, exact module digests and canonical-key encoding revision; `SemanticBucketIndex<Key, Identity>` is generic over derivative identity and is not tied to `StableRowHandle`.
++- maintained Join uses the existing I64 specialization first, exact semantic buckets for other current builtin primitive equivalences, and an exact semantic-scan fallback for structural/custom equivalences;
++- maintained Group uses composite canonical equality keys when every grouping equivalence is currently primitive/canonicalizable; structural/custom grouping remains scan fallback;
++- maintained TopK uses the I64 specialization or an ordered canonical semantic-key/tie-bucket index for current builtin non-I64 orderings;
++- these indexes are in-memory reconstructible maintained-query state. Pass39 does not turn them into persisted `PhysicalStore` indexes or durable authority.
++- benchmark evidence shows the indexed Join fixes asymptotic scaling but can lose on tiny relations, so future planner work must include an explicit cost/threshold policy rather than assuming every index is always faster.
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/CFMD_IDEAL_DB_SPEC.md /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/CFMD_IDEAL_DB_SPEC.md
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/CFMD_IDEAL_DB_SPEC.md	2026-09-20 01:50:31.519475166 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/CFMD_IDEAL_DB_SPEC.md	2026-09-20 01:51:54.616844022 +0000
+@@ -1122,3 +1122,19 @@
+ - **OPEN:** durable revision DAG/merge ancestry, universal format migration, arbitrary semantic executable artifact packaging/signing, intent-ledger GC, streaming codecs, machine-power-loss/cross-filesystem assurance, COW runtime roots, distributed durability and authenticated durable storage.
+ 
+ Practical next direction: the single-head durable control plane is now functionally complete enough that the highest-value mainline returns to the historical data-plane backlog, beginning with production integration of the already-verified Agent-2 semantic canonical-key/index design unless hostile review produces a new correctness counterexample.
++
++## Pass39 implementation correction — production semantic canonical indexes
++
++Status after Pass39: **VERIFIED**.
++
++- **VERIFIED:** every currently supported builtin primitive equality module has an exact production canonical equality key satisfying key equality iff pinned Γ equivalence.
++- **VERIFIED:** every currently supported builtin ordering module has an exact production canonical order key whose key comparison matches pinned Γ comparison, including hostile F64 Total values.
++- **VERIFIED:** new `kernel-semantic-index` provides Γ-bound, key-encoding-versioned derivative bucket indexes generic over row identity. Internal query indexes use local derivative identity and do not reuse storage handles as semantic authority.
++- **VERIFIED:** maintained non-I64 primitive Join probes semantic buckets instead of scanning the complete opposite relation for every changed row. Structural/custom equivalences deliberately retain the exact scan fallback.
++- **VERIFIED:** Group maintains composite canonical lookup for keys composed of current builtin primitive equivalences; structural/custom equivalence groups remain fallback.
++- **VERIFIED:** generic Text/F64/current non-I64 builtin TopK uses ordered canonical-key tie buckets with exact WITH-TIES behavior.
++- **HOSTILE CORRECTION:** release benchmarking exposed mutating index operations accidentally placed inside `debug_assert!`; release builds therefore dropped those side effects. Pass39 moved all mutations outside assertions, added release regression coverage, and completed the full release/overflow gate.
++- **PERFORMANCE:** TextAsciiCI Join benchmark from 1k to 50k right rows leaves indexed update approximately flat (~1.36-1.40 us) while a deliberately minimal full scan grows ~50.8x. At 1k the minimal scan is still faster, so cost-based index selection remains required.
++- **OPEN:** persisted Text/F64/Bool/entity storage indexes and planner integration, structural/custom canonical keys, shared index reuse, memory budgeting, key-encoding migration, typed-batch Group/TopK, I64 Group/TopK constant-factor gaps, and multiway/mixed-key join planning.
++
++Practical next direction: extend the now-proven semantic-index abstraction into persisted `PhysicalStore`/planner paths or use it as the base for typed-batch Group/TopK optimization. No change to semantic authority is required for either route.
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/Cargo.lock /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/Cargo.lock
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/Cargo.lock	2026-09-19 23:54:10.934109445 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/Cargo.lock	2026-09-20 01:32:19.651020382 +0000
+@@ -106,6 +106,7 @@
+  "kernel-change",
+  "kernel-model",
+  "kernel-schema",
++ "kernel-semantic-index",
+  "kernel-semantics",
+  "kernel-types",
+ ]
+@@ -135,6 +136,14 @@
+  "kernel-types",
+ ]
+ 
++[[package]]
++name = "kernel-semantic-index"
++version = "0.1.0"
++dependencies = [
++ "kernel-schema",
++ "kernel-types",
++]
++
+ [[package]]
+ name = "kernel-semantics"
+ version = "0.1.0"
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/Cargo.toml /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/Cargo.toml
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/Cargo.toml	2026-09-19 22:19:41.725143686 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/Cargo.toml	2026-09-20 01:30:01.577113825 +0000
+@@ -13,6 +13,7 @@
+   "crates/kernel-retention",
+   "crates/kernel-model",
+   "crates/kernel-semantics",
++  "crates/kernel-semantic-index",
+   "crates/kernel-validation",
+   "crates/kernel-revision",
+   "crates/kernel-transport",
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/IMPLEMENTATION_REPORT.md /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/IMPLEMENTATION_REPORT.md
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/IMPLEMENTATION_REPORT.md	2026-09-20 01:23:52.832883994 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/IMPLEMENTATION_REPORT.md	2026-09-20 01:54:06.097395573 +0000
+@@ -1,79 +1,98 @@
+-# IMPLEMENTATION REPORT — Pass38
++# IMPLEMENTATION REPORT — Pass39
+ 
+ ## problem
+ 
+-Pass37 left three connected durable-control-plane gaps: retained transaction outcomes did not encode exact historical request intent strongly enough, a semantic Revision migration and its required maintained-materialization registry could not publish as one transaction, and restart still depended on externally supplied implementations for builtin semantic-module digests.
++Pass38 completed the single-head durable control plane, leaving the historical maintained-query performance backlog. Agent-2 had already proved exact primitive canonical-key laws in an isolated prototype, but production generic Join/Group/TopK still lacked a shared Γ-bound semantic index layer.
+ 
+ ## hypotheses
+ 
+-1. Exact idempotency should retain canonical semantic target content rather than rely on nominal `RevisionId`.
+-2. Materialization registry is part of the client-visible migration intent when it changes together with a Revision, so both must share one PREPARE/COMMIT/publication boundary.
+-3. Current builtin semantic implementations are deterministic from `(builtin contract, implementation_revision)` and can therefore be durably described without serializing arbitrary executable code.
+-4. Legacy target-only records must remain explicitly weaker; compatibility code must not silently promote them to exact authority.
++1. Canonical equality/order encoders must be resolved from pinned semantic modules, never chosen ad hoc by the planner.
++2. A reusable index must be generic over derivative identity so storage `StableRowHandle` does not leak into internal query semantics.
++3. Current builtin primitive equivalences/orderings can be indexed exactly; structural/custom semantics should remain on the known-correct fallback until an exact canonical law exists.
++4. Join, Group and TopK can share the same key/index foundation while retaining their existing I64 specializations.
+ 
+ ## implementation
+ 
+-### `kernel-durability`
++### `kernel-semantics`
+ 
+-Added `DurableTransactionIntent::{Exact, LegacyTargetOnly}`. Exact intents retain canonical target Revision bytes, optional materialization specs and exact `BuiltinSemanticModuleSpec` descriptors.
++Added `CanonicalEqKey`, `CanonicalOrderKey`, `ResolvedPrimitiveOrdering`, `SemanticRegistry::resolve_primitive_ordering`, and canonical-key encoding on resolved primitive equality/ordering modules.
+ 
+-Added `DurableRevisionChange::FullRevisionAndMaterializations` and mutation codec v4. PREPARE encoding carries exact intent plus typed change; v2/v3 decoding remains explicit.
++F64 equality remains bitwise. F64 ordering key matches `total_cmp`, including signed zero, infinities, subnormals and NaN sign/payload ordering.
+ 
+-Recovery transaction ledger now stores durable intents rather than only target Revision IDs. Generation metadata codec v2 persists the exact committed-intent ledger plus builtin semantic deployment descriptors. Metadata v1 remains readable as `LegacyTargetOnly` with no invented exact identity.
++### `kernel-semantic-index`
+ 
+-`DurableRevisionStore::open` reconstructs current/historical builtin semantic implementation descriptors before checkpoint/WAL Revision decoding. `open_with_legacy_registry` remains the explicit compatibility route for generations that predate the durable semantic deployment manifest.
++Added a new zero-dependency crate with:
+ 
+-The final cleanup refactored semantic-registry reconstruction, recovered-intent merge and current PREPARE decoding into focused helpers to satisfy strict Clippy without suppression.
++- `SemanticModuleBinding`;
++- `SemanticIndexBinding` pinned to semantic revision, module digests and `KEY_ENCODING_REVISION`;
++- generic `SemanticBucketIndex<Key, Identity>` with ordered buckets and a reverse identity map.
+ 
+-### `kernel-semantics`
++The identity parameter is deliberately not `StableRowHandle`.
++
++### `kernel-query` Join
++
++Added local monotone `IndexedRowId` and indexed side state. Current primitive non-I64 equality modules now use canonical semantic buckets for removal verification and opposite-side delta probing. I64 keeps its specialized path. Structural/custom equality stays on `GenericScan`.
+ 
+-Added `BuiltinSemanticModuleSpec` for equivalence, tokenizer and ordering implementations. Each descriptor carries the builtin contract and exact implementation revision, deterministically reproduces the expected `ModuleDigest`, can be installed into `SemanticRegistry`, and can be enumerated for a pinned `SemanticContext`.
++### `kernel-query` Group
+ 
+-### `kernel-plan`
++Added composite `Vec<CanonicalEqKey>` lookup for all-primitive grouping keys. Existing I64 lookup remains. Structural/custom group equality retains semantic scan fallback.
+ 
+-Added `RevisionAndMaterializationsTransitionRequest`, prepared/sealed combined transition support and durable commit/retry paths.
++### `kernel-query` TopK
+ 
+-`DurableRuntime::{commit_revision,replace_revision,replace_revision_and_materializations}` now constructs exact requested intent and compares it with the retained committed intent before returning `AlreadyCommitted`. Same client ID with different exact target content/configuration is an explicit conflict.
++Added `IndexedOrderedRows` using `CanonicalOrderKey -> tie bucket`. Current non-I64 builtin ordering modules no longer use a generic sorted-row mutation path. Output traverses ordered buckets and includes the entire threshold tie bucket.
+ 
+-Recovery supports `FullRevisionAndMaterializations` by rebuilding the authoritative physical representation and the exact desired maintained registry from durable semantic authority.
++### release-only repair discovered during benchmark
++
++The first benchmark run exposed that some new `insert/remove` side effects were embedded in `debug_assert!`, so release optimized the mutations away. Side effects were moved into unconditional statements and assertions now inspect already-produced results. A release regression covers remove+insert replacement, and a static grep audit confirms the new paths have no mutating operations hidden in debug assertions.
+ 
+ ## hostile falsification
+ 
+-Production tests cover:
++Verified:
+ 
+-- historical exact intent surviving later heads, checkpoint rotation, compaction and restart;
+-- conflicting same client ID + same nominal RevisionId + different Revision contents;
+-- one atomic Revision + materialization-registry transition and restart;
+-- exact retry of the combined transition;
+-- historical semantic implementation manifest surviving checkpoint/compaction/reopen;
+-- legacy mutation decoding without silent authority promotion;
+-- exact builtin descriptor digest/installation roundtrip.
++- equality-key iff equivalence for every current builtin primitive equality contract;
++- ordering-key comparator equivalence for every current builtin ordering contract;
++- 100,000 deterministic F64 bit-pair order checks;
++- Text ASCII-CI and Unicode-boundary hostile cases;
++- entity namespace separation;
++- duplicate buckets/rebinding/invalidation;
++- Join replacement/removal semantics;
++- composite primitive Group;
++- hostile F64 TopK;
++- structural Join fallback rather than unsound canonicalization;
++- debug and release behavior match after the release-only repair.
+ 
+-Static authority audit confirms that physical row handles/layouts/indexes/materialized results remain absent from durable transaction intent and semantic deployment metadata.
++## benchmark
+ 
+-## verification
++`semantic_index_join_bench` compares the integrated TextAsciiCaseInsensitive Join update to a deliberately minimal full key scan.
+ 
+-Rust 1.98.1 final gate:
++Median across three release runs:
+ 
+ ```text
+-cargo fmt --all -- --check                                  PASS
+-cargo check --workspace --all-targets                       PASS
+-cargo test --workspace --all-targets                        PASS
+-cargo clippy --workspace --all-targets -- -D warnings       PASS
+-cargo test --workspace --all-targets --release              PASS
+-cargo build --workspace --release                           PASS
+-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps  PASS
+-RUSTFLAGS='-C overflow-checks=yes' cargo test ... --release PASS
++right rows   indexed ns   minimal scan ns   scan/indexed
++1,000        1,631        374               0.23x
++10,000       1,439        4,620             3.21x
++50,000       1,438        18,800            13.07x
+ ```
+ 
+-297 declared tests; 81 kernel-plan; 65 kernel-query; 32 kernel-durability; 20 crates; 38,065 Rust LOC; zero external Cargo sources; zero `unsafe`.
++The indexed path is effectively flat across 1k to 50k in this rerun (1,631 ns -> 1,438 ns; timing noise dominates), while the minimal scan scales ~50.27x. This closes the asymptotic scan gap but exposes a planner-threshold optimization for small relations.
+ 
+-## result
++## verification
++
++Rust 1.98.1:
++
++```text
++fmt                         PASS
++check --workspace           PASS
++debug all-target tests      PASS
++strict Clippy               PASS
++release all-target tests    PASS
++release build               PASS
++strict rustdoc              PASS
++overflow-checked release    PASS
++```
+ 
+-Pass38 closes three actual problems:
++308 declared tests; 69 kernel-query; 30 kernel-semantics; 3 kernel-semantic-index; 21 crates; 39,584 Rust LOC; zero external Cargo sources; zero `unsafe`.
+ 
+-1. new-format client transaction identity is exact and remains exact through later heads/checkpoint/compaction/restart;
+-2. semantic Revision plus materialization registry can migrate atomically as one durable transaction;
+-3. current builtin semantic implementation families have a durable self-describing deployment manifest, so normal reopen no longer relies on caller-supplied registry authority.
++## result
+ 
+-It does **not** claim arbitrary plugin executable persistence, universal historical-format migration, revision-DAG durability, distributed durability, authenticated storage, or machine-power-loss proof.
++Pass39 closes four actual production gaps: exact primitive canonical/index infrastructure, primitive generic Join full-scan maintenance, primitive/composite Group lookup, and generic Text/F64 maintained TopK ordering. It does not claim persisted storage semantic indexes, structural/custom canonical keys, cost-based index selection, typed-batch Group/TopK output, multiway join planning, or the existing I64 constant-factor gaps.
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/IMPLEMENTATION_REPORT_pass39.md /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/IMPLEMENTATION_REPORT_pass39.md
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/IMPLEMENTATION_REPORT_pass39.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/IMPLEMENTATION_REPORT_pass39.md	2026-09-20 01:54:06.096948939 +0000
+@@ -0,0 +1,98 @@
++# IMPLEMENTATION REPORT — Pass39
++
++## problem
++
++Pass38 completed the single-head durable control plane, leaving the historical maintained-query performance backlog. Agent-2 had already proved exact primitive canonical-key laws in an isolated prototype, but production generic Join/Group/TopK still lacked a shared Γ-bound semantic index layer.
++
++## hypotheses
++
++1. Canonical equality/order encoders must be resolved from pinned semantic modules, never chosen ad hoc by the planner.
++2. A reusable index must be generic over derivative identity so storage `StableRowHandle` does not leak into internal query semantics.
++3. Current builtin primitive equivalences/orderings can be indexed exactly; structural/custom semantics should remain on the known-correct fallback until an exact canonical law exists.
++4. Join, Group and TopK can share the same key/index foundation while retaining their existing I64 specializations.
++
++## implementation
++
++### `kernel-semantics`
++
++Added `CanonicalEqKey`, `CanonicalOrderKey`, `ResolvedPrimitiveOrdering`, `SemanticRegistry::resolve_primitive_ordering`, and canonical-key encoding on resolved primitive equality/ordering modules.
++
++F64 equality remains bitwise. F64 ordering key matches `total_cmp`, including signed zero, infinities, subnormals and NaN sign/payload ordering.
++
++### `kernel-semantic-index`
++
++Added a new zero-dependency crate with:
++
++- `SemanticModuleBinding`;
++- `SemanticIndexBinding` pinned to semantic revision, module digests and `KEY_ENCODING_REVISION`;
++- generic `SemanticBucketIndex<Key, Identity>` with ordered buckets and a reverse identity map.
++
++The identity parameter is deliberately not `StableRowHandle`.
++
++### `kernel-query` Join
++
++Added local monotone `IndexedRowId` and indexed side state. Current primitive non-I64 equality modules now use canonical semantic buckets for removal verification and opposite-side delta probing. I64 keeps its specialized path. Structural/custom equality stays on `GenericScan`.
++
++### `kernel-query` Group
++
++Added composite `Vec<CanonicalEqKey>` lookup for all-primitive grouping keys. Existing I64 lookup remains. Structural/custom group equality retains semantic scan fallback.
++
++### `kernel-query` TopK
++
++Added `IndexedOrderedRows` using `CanonicalOrderKey -> tie bucket`. Current non-I64 builtin ordering modules no longer use a generic sorted-row mutation path. Output traverses ordered buckets and includes the entire threshold tie bucket.
++
++### release-only repair discovered during benchmark
++
++The first benchmark run exposed that some new `insert/remove` side effects were embedded in `debug_assert!`, so release optimized the mutations away. Side effects were moved into unconditional statements and assertions now inspect already-produced results. A release regression covers remove+insert replacement, and a static grep audit confirms the new paths have no mutating operations hidden in debug assertions.
++
++## hostile falsification
++
++Verified:
++
++- equality-key iff equivalence for every current builtin primitive equality contract;
++- ordering-key comparator equivalence for every current builtin ordering contract;
++- 100,000 deterministic F64 bit-pair order checks;
++- Text ASCII-CI and Unicode-boundary hostile cases;
++- entity namespace separation;
++- duplicate buckets/rebinding/invalidation;
++- Join replacement/removal semantics;
++- composite primitive Group;
++- hostile F64 TopK;
++- structural Join fallback rather than unsound canonicalization;
++- debug and release behavior match after the release-only repair.
++
++## benchmark
++
++`semantic_index_join_bench` compares the integrated TextAsciiCaseInsensitive Join update to a deliberately minimal full key scan.
++
++Median across three release runs:
++
++```text
++right rows   indexed ns   minimal scan ns   scan/indexed
++1,000        1,631        374               0.23x
++10,000       1,439        4,620             3.21x
++50,000       1,438        18,800            13.07x
++```
++
++The indexed path is effectively flat across 1k to 50k in this rerun (1,631 ns -> 1,438 ns; timing noise dominates), while the minimal scan scales ~50.27x. This closes the asymptotic scan gap but exposes a planner-threshold optimization for small relations.
++
++## verification
++
++Rust 1.98.1:
++
++```text
++fmt                         PASS
++check --workspace           PASS
++debug all-target tests      PASS
++strict Clippy               PASS
++release all-target tests    PASS
++release build               PASS
++strict rustdoc              PASS
++overflow-checked release    PASS
++```
++
++308 declared tests; 69 kernel-query; 30 kernel-semantics; 3 kernel-semantic-index; 21 crates; 39,584 Rust LOC; zero external Cargo sources; zero `unsafe`.
++
++## result
++
++Pass39 closes four actual production gaps: exact primitive canonical/index infrastructure, primitive generic Join full-scan maintenance, primitive/composite Group lookup, and generic Text/F64 maintained TopK ordering. It does not claim persisted storage semantic indexes, structural/custom canonical keys, cost-based index selection, typed-batch Group/TopK output, multiway join planning, or the existing I64 constant-factor gaps.
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/PASS39_REPORT.md /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/PASS39_REPORT.md
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/PASS39_REPORT.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/PASS39_REPORT.md	2026-09-20 01:54:06.096780047 +0000
+@@ -0,0 +1,213 @@
++# PASS39 REPORT — production semantic canonical keys + maintained Join/Group/TopK indexes
++
++Status: **VERIFIED** on Rust **1.98.1**.
++
++Pass39 integrates the previously verified Agent-2 canonical-key/index research into the production maintained-query path. CLOSED items below are actual eliminated architecture/performance problems; individual tests are evidence and are not counted as separate problems.
++
++## 1. Problem
++
++After Pass38 the durable control plane was sufficiently complete to return to the historical data-plane backlog. Three closely related maintained-query gaps shared one root cause:
++
++1. primitive non-I64 Join still needed a semantic full scan on the opposite side for each changed row;
++2. non-I64/composite primitive Group lookup could fall back to a vector scan over existing groups;
++3. generic Text/F64 TopK maintained state lacked a semantic order-key index and relied on a generic ordered-row path with linear update costs.
++
++The correctness constraint is stronger than ordinary Rust `Eq`/`Hash`/`Ord`: every physical/derived lookup must implement the exact equality/ordering pinned by Γ.
++
++## 2. Design
++
++### 2.1 Exact canonical keys are resolved from pinned Γ
++
++`kernel-semantics` now exposes exact production representations for every currently supported builtin primitive equivalence:
++
++- UnitExact;
++- BoolExact;
++- I64Exact;
++- F64Bitwise;
++- TextExact;
++- TextAsciiCaseInsensitive;
++- LiveEntityIdExact(entity_type);
++- HistoricalEntityIdExact(entity_type).
++
++`ResolvedPrimitiveEquivalence::canonical_key` satisfies the required law:
++
++```text
++canonical_eq_key(a) == canonical_eq_key(b)
++IFF
++Γ.equivalent(a,b)
++```
++
++Ordering keys are provided for:
++
++- I64Ascending;
++- F64Total;
++- TextBinary;
++- TextAsciiCaseInsensitive;
++- TextAsciiCaseInsensitiveThenBinary.
++
++`ResolvedPrimitiveOrdering::canonical_key` preserves the exact pinned comparator. The F64Total encoding is checked against Rust `total_cmp` over hostile values and 100,000 deterministic bit-pattern pairs.
++
++### 2.2 Reusable `kernel-semantic-index`
++
++A new zero-external-dependency crate, `kernel-semantic-index`, contains:
++
++```text
++SemanticIndexBinding
++  semantic_revision
++  exact SemanticId -> ModuleDigest dependencies
++  key_encoding_revision
++
++SemanticBucketIndex<Key, Identity>
++  ordered key -> identity bucket
++  identity -> key reverse map
++```
++
++Identity is deliberately generic. Internal derived query rows use local `IndexedRowId`; the abstraction is not coupled to `StableRowHandle` and therefore does not turn storage identity into semantic authority.
++
++The binding explicitly invalidates an index when Γ revision, module digest dependencies, or canonical-key encoding revision changes. Maintained query states additionally pin the complete `SemanticContext`, so an operation under a different Γ is rejected before index use.
++
++### 2.3 Maintained Join
++
++Join selection is now:
++
++```text
++exact I64 specialized fast path
++    else current builtin primitive equivalence -> SemanticIndexed
++    else structural/custom equivalence -> exact GenericScan fallback
++```
++
++For `SemanticIndexed`, both sides maintain canonical-key buckets and monotone local derivative row IDs. Removal planning probes only the corresponding semantic bucket and then performs exact full-row semantic verification. Changed-row join propagation probes only the opposite canonical bucket.
++
++No hash-only equality shortcut is used.
++
++### 2.4 Maintained Group
++
++For group keys whose equivalence modules are all currently canonicalizable primitive modules, Group maintains:
++
++```text
++Vec<CanonicalEqKey> -> group slot
++```
++
++This supports composite primitive keys as well as TextAsciiCaseInsensitive. The existing single-I64 specialization remains intact. Structural/custom equivalence groups preserve the old exact semantic-scan fallback rather than pretending to have a canonical representation that has not been proved.
++
++### 2.5 Maintained TopK
++
++The I64 specialized path remains unchanged. Other current builtin primitive ordering modules use `SemanticOrdered`:
++
++```text
++CanonicalOrderKey -> ordered tie bucket of IndexedRowId
++IndexedRowId -> exact row
++```
++
++Updates are planned against the relevant tie bucket and then committed. Output traverses the ordered buckets in the requested direction and retains the complete threshold tie bucket, preserving `TopKWithTies` semantics.
++
++## 3. Hostile falsification
++
++The pass includes/retains hostile coverage for:
++
++- ASCII-CI case variants including ASCII changes inside Unicode strings;
++- TextExact vs TextAsciiCaseInsensitive distinction;
++- F64 `+0.0/-0.0`, infinities, subnormals and distinct positive/negative NaN payloads;
++- entity type/liveness namespaces;
++- duplicate semantic-key buckets;
++- remove+insert in one Join delta;
++- composite primitive Group keys;
++- hostile F64 Total ordering through maintained TopK;
++- structural Join equivalence remaining on exact semantic-scan fallback;
++- semantic binding invalidation on Γ/digest changes.
++
++A release-only falsifier found during Pass39 is worth recording. Initial index build/commit code performed mutating `insert` operations inside `debug_assert!`. Debug tests passed, but release compiled the side effects away and produced empty indexes. All side effects were moved outside assertions, a release regression was added, and a static audit found no remaining mutating expressions hidden inside `debug_assert!` in the new semantic-index paths.
++
++## 4. Benchmark
++
++Integrated release benchmark: `TextAsciiCaseInsensitive`, one changed left row, one-row output bucket, right side of 1k/10k/50k rows. The comparison baseline is intentionally conservative: a minimal direct `eq_ignore_ascii_case` full scan, which does less work than the old complete generic Join maintenance path.
++
++Median across three benchmark runs:
++
++| right rows | integrated semantic index | minimal full scan | scan / indexed |
++|---:|---:|---:|---:|
++| 1,000 | 1,631 ns | 374 ns | 0.23x |
++| 10,000 | 1,439 ns | 4,620 ns | 3.21x |
++| 50,000 | 1,438 ns | 18,800 ns | 13.07x |
++
++Scaling from 1k -> 50k:
++
++```text
++semantic-index update: 0.88x (noise-level / effectively flat)
++minimal full scan:     50.27x
++```
++
++Therefore Pass39 closes the asymptotic full-scan problem, not the small-relation constant factor. Around 1k rows the index is slower than a minimal scan, so planner/index-selection thresholds remain an explicit OPEN optimization problem.
++
++Raw benchmark evidence: `evidence/pass39/SEMANTIC_INDEX_JOIN_BENCH.log`.
++
++## 5. Verification
++
++Final Rust 1.98.1 gate:
++
++```text
++cargo fmt --all -- --check                                  PASS
++cargo check --workspace --all-targets                       PASS
++cargo test --workspace --all-targets                        PASS
++cargo clippy --workspace --all-targets -- -D warnings       PASS
++cargo test --workspace --all-targets --release              PASS
++cargo build --workspace --release                           PASS
++RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps  PASS
++RUSTFLAGS='-C overflow-checks=yes' cargo test ... --release PASS
++```
++
++Metrics:
++
++```text
++308 declared tests
++69 kernel-query tests
++30 kernel-semantics tests
++3 kernel-semantic-index tests
++21 crates
++39,584 Rust LOC
++0 external Cargo sources
++0 unsafe
++```
++
++## 6. Problem ledger
++
++### Closed exactly in Pass39
++
++1. ✅ **Production exact canonical-key/index foundation for current builtin primitive semantic modules was missing.** Canonical equality/order laws now live in `kernel-semantics`; the reusable identity-generic `kernel-semantic-index` is bound to pinned Γ dependencies and key-encoding revision.
++2. ✅ **Generic maintained Join for current builtin primitive equivalences performed `O(|Δ| * n)` opposite-side semantic scans.** It now uses exact semantic buckets; structural/custom equivalence remains an explicit fallback rather than an unproved fast path.
++3. ✅ **Maintained Group lookup for canonicalizable non-I64/composite primitive keys used semantic vector fallback.** Composite canonical group keys now maintain direct lookup; structural/custom group equivalence remains fallback.
++4. ✅ **Generic Text/F64 maintained TopK lacked a performance-grade semantic ordering structure.** Current non-I64 builtin orderings now use maintained ordered semantic-key/tie buckets with exact WITH-TIES semantics.
++
++### Closed from the historical Pass26 backlog
++
++1. ✅ Generic Text/F64 maintained TopK order-statistics for the currently supported builtin orderings.
++2. ✅ Agent-2 canonical-key strategy and production semantic-index integration for generic maintained Join over the currently supported builtin primitive equivalences.
++
++### Partially advanced, still OPEN
++
++1. 🟨 **Indexed generic/Text Group.** Text and every composite key composed only from current builtin primitive equivalences are indexed. Structural/custom equivalence keys still require exact semantic scan until a canonical structural-key law is designed and proved.
++2. 🟨 **Planner use of semantic indexes.** Maintained query state selects the index structurally, but there is no cost model/threshold. The benchmark shows that a 1k-row minimal scan can beat the index on constant factor.
++
++### Historical Pass26 OPEN backlog still active
++
++1. ⬜ I64 TopK constant-factor gap.
++2. ⬜ Group/TopK as typed-batch producers.
++3. ⬜ Maintained I64 Group constant-factor gap.
++4. ⬜ Structural/custom-equivalence Group canonical indexing; primitive/Text portion is closed in Pass39.
++5. ⬜ Persisted Text/F64/Bool/entity indexes in `PhysicalStore` + physical planner integration. Pass39 indexes are reconstructible maintained-query state, not persisted storage indexes.
++6. ⬜ Nested/multiway/mixed-key joins and broader join planning.
++7. ⬜ Remaining physical layouts + OrderedView/pagination.
++8. ⬜ Remaining durability assurance/history work: durable DAG history, general migration, arbitrary semantic artifacts, power-loss/cross-filesystem validation, scalability/distributed/authenticated durability.
++9. ⬜ Transaction repair runtime, distribution and formal mechanization.
++
++### Newly clarified OPEN after Pass39
++
++1. ⬜ Cost-based semantic-index selection / small-relation threshold; current maintained primitive path always indexes even where a tiny scan may be cheaper.
++2. ⬜ Canonical structural keys for Product/Option/Sum/Collection/recursive/custom equivalences. Current exact scan fallback is correct but not indexed.
++3. ⬜ Persist/rebuild policy for semantic indexes at storage level; current maintained indexes are intentionally reconstructible in-memory derivative state.
++4. ⬜ Shared index reuse across multiple materializations/operators. Each maintained operator currently owns its own derivative index.
++5. ⬜ Index memory accounting/budgeting and eviction policy.
++6. ⬜ Canonical-key encoding migration policy if `KEY_ENCODING_REVISION` changes; current binding correctly invalidates but does not migrate.
++7. ⬜ Benchmarks/constant-factor tuning for primitive Group and Text/F64 TopK beyond the functional/asymptotic structure established here.
++
++Practical next direction: Pass39 removes the main Agent-2 research-to-production gap. The next highest-value mainline is either (a) extend semantic indexing down into persisted `PhysicalStore` plus planner/cost model, closing historical Pass26 item 5, or (b) attack typed-batch Group/TopK and I64 constant-factor gaps before broader multiway joins. The architecture now supports either without changing semantic authority.
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-query/Cargo.toml /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-query/Cargo.toml
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-query/Cargo.toml	2026-09-19 01:49:44.000000000 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-query/Cargo.toml	2026-09-20 01:30:48.177258160 +0000
+@@ -9,6 +9,7 @@
+ kernel-change = { path = "../kernel-change" }
+ kernel-model = { path = "../kernel-model" }
+ kernel-schema = { path = "../kernel-schema" }
++kernel-semantic-index = { path = "../kernel-semantic-index" }
+ kernel-semantics = { path = "../kernel-semantics" }
+ kernel-types = { path = "../kernel-types" }
+ 
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-query/examples/semantic_index_join_bench.rs /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-query/examples/semantic_index_join_bench.rs
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-query/examples/semantic_index_join_bench.rs	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-query/examples/semantic_index_join_bench.rs	2026-09-20 01:45:16.046221003 +0000
+@@ -0,0 +1,181 @@
++use std::{hint::black_box, time::Instant};
++
++use kernel_model::{FiniteModel, Value};
++use kernel_query::{MaterializedJoinDeltaState, RelExpr, RelationDelta};
++use kernel_schema::{
++    RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext, SemanticEnvironment,
++    TypeExpr,
++};
++use kernel_semantics::{EquivalenceModule, SemanticRegistry};
++use kernel_types::{SchemaRevisionId, SemanticEnvId, SemanticId};
++
++struct Fixture {
++    context: SemanticContext,
++    registry: SemanticRegistry,
++    state: MaterializedJoinDeltaState,
++    left_type: kernel_query::RelType,
++    right_keys: Vec<String>,
++}
++
++fn fixture(rows: usize) -> Fixture {
++    let left = SemanticId::new(39_100);
++    let right = SemanticId::new(39_101);
++    let text_eq = SemanticId::new(39_102);
++    let i64_eq = SemanticId::new(39_103);
++
++    let mut registry = SemanticRegistry::default();
++    let text_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++    let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++    let mut environment = SemanticEnvironment::new(SemanticEnvId::new(39_100));
++    environment.pin_module(text_eq, text_digest);
++    environment.pin_module(i64_eq, i64_digest);
++
++    let mut schema = Schema::new(SchemaRevisionId::new(39_100));
++    for relation in [left, right] {
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![
++                    TypeExpr::Scalar(ScalarType::Text),
++                    TypeExpr::Scalar(ScalarType::I64),
++                ],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![text_eq, i64_eq],
++                },
++            })
++            .unwrap();
++    }
++    let context = SemanticContext {
++        schema,
++        environment,
++    };
++    let query = RelExpr::JoinEq {
++        left: Box::new(RelExpr::Scan(left)),
++        right: Box::new(RelExpr::Scan(right)),
++        left_column: 0,
++        right_column: 0,
++        equivalence: text_eq,
++    };
++
++    let right_keys: Vec<String> = (0..rows).map(|i| format!("KEY-{i}")).collect();
++    let mut model = FiniteModel::default();
++    model
++        .relations
++        .insert(left, vec![vec![Value::Text("key-0".into()), Value::I64(0)]]);
++    model.relations.insert(
++        right,
++        right_keys
++            .iter()
++            .enumerate()
++            .map(|(i, key)| {
++                vec![
++                    Value::Text(key.clone()),
++                    Value::I64(i64::try_from(i).expect("benchmark row count fits i64")),
++                ]
++            })
++            .collect(),
++    );
++    let state = MaterializedJoinDeltaState::build(&query, &model, &context, &registry)
++        .unwrap()
++        .unwrap();
++    let left_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
++
++    Fixture {
++        context,
++        registry,
++        state,
++        left_type,
++        right_keys,
++    }
++}
++
++fn delta(from_payload: i64, to_payload: i64, left_type: &kernel_query::RelType) -> RelationDelta {
++    RelationDelta {
++        removed: vec![vec![Value::Text("key-0".into()), Value::I64(from_payload)]],
++        inserted: vec![vec![Value::Text("KEY-0".into()), Value::I64(to_payload)]],
++        result_type: left_type.clone(),
++    }
++}
++
++fn empty_delta(
++    right: SemanticId,
++    context: &SemanticContext,
++    registry: &SemanticRegistry,
++) -> RelationDelta {
++    RelationDelta {
++        inserted: Vec::new(),
++        removed: Vec::new(),
++        result_type: RelExpr::Scan(right).typecheck(context, registry).unwrap(),
++    }
++}
++
++fn scan_probe(right_keys: &[String], needle: &str) -> usize {
++    let mut matches = 0;
++    for key in right_keys {
++        if key.eq_ignore_ascii_case(needle) {
++            matches += 1;
++        }
++    }
++    black_box(matches)
++}
++
++fn run(rows: usize, rounds: usize, iterations: usize) {
++    let right = SemanticId::new(39_101);
++    let mut fixture = fixture(rows);
++    let forward = delta(0, 1, &fixture.left_type);
++    let backward = RelationDelta {
++        removed: forward.inserted.clone(),
++        inserted: forward.removed.clone(),
++        result_type: fixture.left_type.clone(),
++    };
++    let empty_right = empty_delta(right, &fixture.context, &fixture.registry);
++
++    let mut indexed_samples = Vec::with_capacity(rounds);
++    let mut scan_samples = Vec::with_capacity(rounds);
++    for _ in 0..rounds {
++        let started = Instant::now();
++        for _ in 0..iterations {
++            black_box(
++                fixture
++                    .state
++                    .apply_input_deltas(&forward, &empty_right, &fixture.context, &fixture.registry)
++                    .unwrap(),
++            );
++            black_box(
++                fixture
++                    .state
++                    .apply_input_deltas(
++                        &backward,
++                        &empty_right,
++                        &fixture.context,
++                        &fixture.registry,
++                    )
++                    .unwrap(),
++            );
++        }
++        indexed_samples.push(started.elapsed().as_nanos() / (iterations as u128 * 2));
++
++        let started = Instant::now();
++        for _ in 0..iterations {
++            black_box(scan_probe(&fixture.right_keys, "KEY-0"));
++            black_box(scan_probe(&fixture.right_keys, "key-0"));
++        }
++        scan_samples.push(started.elapsed().as_nanos() / (iterations as u128 * 2));
++    }
++
++    indexed_samples.sort_unstable();
++    scan_samples.sort_unstable();
++    let indexed = indexed_samples[rounds / 2];
++    let scan = scan_samples[rounds / 2];
++    println!(
++        "rows={rows},indexed_median_ns={indexed},legacy_scan_median_ns={scan},scan_over_indexed_x1000={}",
++        scan.saturating_mul(1000) / indexed.max(1)
++    );
++}
++
++fn main() {
++    println!("workload=TextAsciiCaseInsensitive,left_rows=1,delta_rows=1,rounds=7");
++    run(1_000, 7, 300);
++    run(10_000, 7, 100);
++    run(50_000, 7, 30);
++}
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-query/src/lib.rs /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-query/src/lib.rs
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-query/src/lib.rs	2026-09-19 22:59:32.345089858 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-query/src/lib.rs	2026-09-20 01:45:16.134216718 +0000
+@@ -726,13 +726,39 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++struct IndexedRowId(u64);
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct IndexedJoinSide {
++    rows: BTreeMap<IndexedRowId, Row>,
++    index:
++        kernel_semantic_index::SemanticBucketIndex<kernel_semantics::CanonicalEqKey, IndexedRowId>,
++    next_id: u64,
++}
++
++#[derive(Debug)]
++struct IndexedRelationMutationPlan {
++    remove_ids: Vec<IndexedRowId>,
++    inserted: Vec<(IndexedRowId, kernel_semantics::CanonicalEqKey, Row)>,
++    next_id: u64,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct SemanticIndexedJoinStorage {
++    encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
++    left: IndexedJoinSide,
++    right: IndexedJoinSide,
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ enum MaintainedJoinStorage {
+     I64 {
+         left: BTreeMap<i64, Vec<Row>>,
+         right: BTreeMap<i64, Vec<Row>>,
+     },
+-    Generic {
++    SemanticIndexed(Box<SemanticIndexedJoinStorage>),
++    GenericScan {
+         left: RelationValue,
+         right: RelationValue,
+     },
+@@ -776,6 +802,152 @@
+     registry: &'a kernel_semantics::SemanticRegistry,
+ }
+ 
++impl IndexedJoinSide {
++    fn build(
++        rows: &[Row],
++        column: usize,
++        encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
++        context: &kernel_schema::SemanticContext,
++    ) -> Result<Self, RelQueryError> {
++        let dependency = kernel_semantic_index::SemanticModuleBinding {
++            semantic_id: encoder.equivalence(),
++            module_digest: encoder.module_digest(),
++        };
++        let mut index = kernel_semantic_index::SemanticBucketIndex::new(
++            kernel_semantic_index::SemanticIndexBinding::new(context, vec![dependency]),
++        );
++        let mut stored = BTreeMap::new();
++        let mut next_id = 0_u64;
++        for row in rows {
++            let value = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
++            let key = encoder.canonical_key(value)?;
++            let id = IndexedRowId(next_id);
++            next_id = next_id
++                .checked_add(1)
++                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
++            let previous_key = index.insert(id, key);
++            let previous_row = stored.insert(id, row.clone());
++            debug_assert!(previous_key.is_none());
++            debug_assert!(previous_row.is_none());
++        }
++        Ok(Self {
++            rows: stored,
++            index,
++            next_id,
++        })
++    }
++
++    fn plan_mutation(
++        &self,
++        delta: &RelationDelta,
++        join_column: usize,
++        encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
++        ty: &RelType,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<IndexedRelationMutationPlan, RelQueryError> {
++        let equivalences = relation_column_equivalences(ty);
++        let mut used = BTreeSet::new();
++        let mut remove_ids = Vec::with_capacity(delta.removed.len());
++        for removed in &delta.removed {
++            let key = encoder.canonical_key(
++                removed
++                    .get(join_column)
++                    .ok_or(RelQueryError::ColumnOutOfBounds)?,
++            )?;
++            let bucket = self
++                .index
++                .bucket(&key)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            let mut found = None;
++            for id in bucket {
++                if used.contains(id) {
++                    continue;
++                }
++                let candidate = self
++                    .rows
++                    .get(id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                if rows_semantically_equal(candidate, removed, equivalences, context, registry)? {
++                    found = Some(*id);
++                    break;
++                }
++            }
++            let Some(id) = found else {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
++            };
++            used.insert(id);
++            remove_ids.push(id);
++        }
++
++        let is_set = matches!(ty.semantics, kernel_schema::RelationSemantics::Set { .. });
++        let mut inserted = Vec::with_capacity(delta.inserted.len());
++        let mut next_id = self.next_id;
++        for row in &delta.inserted {
++            let key = encoder.canonical_key(
++                row.get(join_column)
++                    .ok_or(RelQueryError::ColumnOutOfBounds)?,
++            )?;
++            if is_set {
++                if let Some(bucket) = self.index.bucket(&key) {
++                    for id in bucket {
++                        if used.contains(id) {
++                            continue;
++                        }
++                        let candidate = self
++                            .rows
++                            .get(id)
++                            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                        if rows_semantically_equal(candidate, row, equivalences, context, registry)?
++                        {
++                            return Err(RelQueryError::InconsistentIncrementalDelta);
++                        }
++                    }
++                }
++                for (_, previous_key, previous_row) in &inserted {
++                    if previous_key == &key
++                        && rows_semantically_equal(
++                            previous_row,
++                            row,
++                            equivalences,
++                            context,
++                            registry,
++                        )?
++                    {
++                        return Err(RelQueryError::InconsistentIncrementalDelta);
++                    }
++                }
++            }
++            let id = IndexedRowId(next_id);
++            next_id = next_id
++                .checked_add(1)
++                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
++            inserted.push((id, key, row.clone()));
++        }
++        Ok(IndexedRelationMutationPlan {
++            remove_ids,
++            inserted,
++            next_id,
++        })
++    }
++
++    fn commit_plan(&mut self, plan: IndexedRelationMutationPlan) {
++        for id in plan.remove_ids {
++            let removed_key = self.index.remove(&id);
++            let removed_row = self.rows.remove(&id);
++            debug_assert!(removed_key.is_some());
++            debug_assert!(removed_row.is_some());
++        }
++        for (id, key, row) in plan.inserted {
++            let previous_key = self.index.insert(id, key);
++            let previous_row = self.rows.insert(id, row);
++            debug_assert!(previous_key.is_none());
++            debug_assert!(previous_row.is_none());
++        }
++        self.next_id = plan.next_id;
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct MaterializedJoinDeltaState {
+     query: RelExpr,
+@@ -838,6 +1010,8 @@
+             context,
+             registry,
+         )?;
++        let primitive_equivalence =
++            registry.resolve_primitive_equivalence(context, *equivalence)?;
+         let exact_i64 = matches!(
+             left_type.columns.get(*left_column),
+             Some(kernel_schema::TypeExpr::Scalar(
+@@ -849,9 +1023,7 @@
+                 kernel_schema::ScalarType::I64
+             ))
+         ) && matches!(
+-            registry
+-                .resolve_primitive_equivalence(context, *equivalence)?
+-                .map(|resolved| resolved.bind_right(&Value::I64(0))),
++            primitive_equivalence.map(|resolved| resolved.bind_right(&Value::I64(0))),
+             Some(Ok(kernel_semantics::BoundPrimitivePredicate::I64(0)))
+         );
+         let storage = if exact_i64 {
+@@ -859,8 +1031,14 @@
+                 left: Self::build_i64_buckets(left_value.rows(), *left_column)?,
+                 right: Self::build_i64_buckets(right_value.rows(), *right_column)?,
+             }
++        } else if let Some(encoder) = primitive_equivalence {
++            MaintainedJoinStorage::SemanticIndexed(Box::new(SemanticIndexedJoinStorage {
++                encoder,
++                left: IndexedJoinSide::build(left_value.rows(), *left_column, encoder, context)?,
++                right: IndexedJoinSide::build(right_value.rows(), *right_column, encoder, context)?,
++            }))
+         } else {
+-            MaintainedJoinStorage::Generic {
++            MaintainedJoinStorage::GenericScan {
+                 left: left_value,
+                 right: right_value,
+             }
+@@ -898,7 +1076,29 @@
+                 }
+                 Ok(relation_value_from_rows(rows, &self.result_type))
+             }
+-            MaintainedJoinStorage::Generic { left, right } => join_relation_values(
++            MaintainedJoinStorage::SemanticIndexed(storage) => {
++                let mut rows = Vec::new();
++                for (left_id, left_row) in &storage.left.rows {
++                    let key = storage
++                        .left
++                        .index
++                        .key_for(left_id)
++                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                    let Some(right_ids) = storage.right.index.bucket(key) else {
++                        continue;
++                    };
++                    for right_id in right_ids {
++                        let right_row = storage
++                            .right
++                            .rows
++                            .get(right_id)
++                            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                        rows.push(Self::join_pair(left_row, right_row));
++                    }
++                }
++                Ok(relation_value_from_rows(rows, &self.result_type))
++            }
++            MaintainedJoinStorage::GenericScan { left, right } => join_relation_values(
+                 left.clone(),
+                 right.clone(),
+                 self.left_column,
+@@ -968,7 +1168,24 @@
+                     registry,
+                 },
+             ),
+-            MaintainedJoinStorage::Generic { left, right } => Self::apply_generic_deltas(
++            MaintainedJoinStorage::SemanticIndexed(storage) => Self::apply_semantic_indexed_deltas(
++                storage.encoder,
++                &mut storage.left,
++                &mut storage.right,
++                left_delta,
++                right_delta,
++                GenericJoinMaintenanceSpec {
++                    left_column: self.left_column,
++                    right_column: self.right_column,
++                    equivalence: self.equivalence,
++                    left_type: &self.left_type,
++                    right_type: &self.right_type,
++                    result_type: &self.result_type,
++                    context,
++                    registry,
++                },
++            ),
++            MaintainedJoinStorage::GenericScan { left, right } => Self::apply_generic_deltas(
+                 left,
+                 right,
+                 left_delta,
+@@ -987,6 +1204,144 @@
+         }
+     }
+ 
++    fn apply_semantic_indexed_deltas(
++        encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
++        left: &mut IndexedJoinSide,
++        right: &mut IndexedJoinSide,
++        left_delta: &RelationDelta,
++        right_delta: &RelationDelta,
++        spec: GenericJoinMaintenanceSpec<'_>,
++    ) -> Result<RelationDelta, RelQueryError> {
++        let left_plan = left.plan_mutation(
++            left_delta,
++            spec.left_column,
++            encoder,
++            spec.left_type,
++            spec.context,
++            spec.registry,
++        )?;
++        let right_plan = right.plan_mutation(
++            right_delta,
++            spec.right_column,
++            encoder,
++            spec.right_type,
++            spec.context,
++            spec.registry,
++        )?;
++        let mut inserted = Vec::new();
++        let mut removed = Vec::new();
++
++        for left_row in &left_delta.removed {
++            Self::join_left_change_against_index(
++                left_row,
++                right,
++                spec.left_column,
++                encoder,
++                &mut removed,
++            )?;
++        }
++        for left_row in &left_delta.inserted {
++            Self::join_left_change_against_index(
++                left_row,
++                right,
++                spec.left_column,
++                encoder,
++                &mut inserted,
++            )?;
++        }
++        for right_row in &right_delta.removed {
++            Self::join_right_change_against_planned_left_index(
++                right_row,
++                left,
++                &left_plan,
++                spec.right_column,
++                encoder,
++                &mut removed,
++            )?;
++        }
++        for right_row in &right_delta.inserted {
++            Self::join_right_change_against_planned_left_index(
++                right_row,
++                left,
++                &left_plan,
++                spec.right_column,
++                encoder,
++                &mut inserted,
++            )?;
++        }
++
++        left.commit_plan(left_plan);
++        right.commit_plan(right_plan);
++        Ok(RelationDelta {
++            inserted,
++            removed,
++            result_type: spec.result_type.clone(),
++        })
++    }
++
++    fn join_left_change_against_index(
++        left_row: &Row,
++        right: &IndexedJoinSide,
++        left_column: usize,
++        encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
++        out: &mut Vec<Row>,
++    ) -> Result<(), RelQueryError> {
++        let key = encoder.canonical_key(
++            left_row
++                .get(left_column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?,
++        )?;
++        let Some(right_ids) = right.index.bucket(&key) else {
++            return Ok(());
++        };
++        for right_id in right_ids {
++            let right_row = right
++                .rows
++                .get(right_id)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            out.push(Self::join_pair(left_row, right_row));
++        }
++        Ok(())
++    }
++
++    fn join_right_change_against_planned_left_index(
++        right_row: &Row,
++        left: &IndexedJoinSide,
++        left_plan: &IndexedRelationMutationPlan,
++        right_column: usize,
++        encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
++        out: &mut Vec<Row>,
++    ) -> Result<(), RelQueryError> {
++        let key = encoder.canonical_key(
++            right_row
++                .get(right_column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?,
++        )?;
++        let removed = left_plan
++            .remove_ids
++            .iter()
++            .copied()
++            .collect::<BTreeSet<_>>();
++        if let Some(left_ids) = left.index.bucket(&key) {
++            for left_id in left_ids {
++                if removed.contains(left_id) {
++                    continue;
++                }
++                let left_row = left
++                    .rows
++                    .get(left_id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                out.push(Self::join_pair(left_row, right_row));
++            }
++        }
++        for (_, inserted_key, left_row) in &left_plan.inserted {
++            if inserted_key == &key {
++                out.push(Self::join_pair(left_row, right_row));
++            }
++        }
++        Ok(())
++    }
++
+     fn apply_generic_deltas(
+         left: &mut RelationValue,
+         right: &mut RelationValue,
+@@ -1988,7 +2343,7 @@
+             )),
+             MaintainedRelPlanNode::Join { state, .. } => state.output_value(context, registry),
+             MaintainedRelPlanNode::Group { state, .. } => state.output_value(),
+-            MaintainedRelPlanNode::TopK { state, .. } => state.output_value(context, registry),
++            MaintainedRelPlanNode::TopK { state, .. } => Ok(state.output_value()),
+         }
+     }
+ 
+@@ -2593,6 +2948,8 @@
+     result_type: RelType,
+     groups: Vec<MaintainedGroupBucket>,
+     i64_lookup: Option<BTreeMap<i64, usize>>,
++    semantic_lookup: Option<BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, usize>>,
++    group_encoders: Option<Vec<kernel_semantics::ResolvedPrimitiveEquivalence>>,
+     fast_i64_count: bool,
+ }
+ 
+@@ -2652,6 +3009,23 @@
+         } else {
+             None
+         };
++        let group_encoders = if i64_lookup.is_none() && !group_columns.is_empty() {
++            let mut encoders = Vec::with_capacity(group_equivalences.len());
++            let mut supported = true;
++            for equivalence in group_equivalences {
++                let Some(encoder) =
++                    registry.resolve_primitive_equivalence(context, *equivalence)?
++                else {
++                    supported = false;
++                    break;
++                };
++                encoders.push(encoder);
++            }
++            supported.then_some(encoders)
++        } else {
++            None
++        };
++        let semantic_lookup = group_encoders.as_ref().map(|_| BTreeMap::new());
+         let fast_i64_count = i64_lookup.is_some()
+             && matches!(aggregate, AggregateSpec::Count { .. })
+             && matches!(
+@@ -2675,6 +3049,8 @@
+             result_type,
+             groups: Vec::new(),
+             i64_lookup,
++            semantic_lookup,
++            group_encoders,
+             fast_i64_count,
+         };
+         for row in input_value.into_rows() {
+@@ -2957,6 +3333,24 @@
+         rows_semantically_equal(left, right, &self.group_equivalences, context, registry)
+     }
+ 
++    fn canonical_group_key(
++        &self,
++        key: &Row,
++    ) -> Result<Option<Vec<kernel_semantics::CanonicalEqKey>>, RelQueryError> {
++        let Some(encoders) = &self.group_encoders else {
++            return Ok(None);
++        };
++        if encoders.len() != key.len() {
++            return Err(RelQueryError::EquivalenceArityMismatch);
++        }
++        encoders
++            .iter()
++            .zip(key)
++            .map(|(encoder, value)| encoder.canonical_key(value).map_err(RelQueryError::from))
++            .collect::<Result<Vec<_>, _>>()
++            .map(Some)
++    }
++
+     fn find_group(
+         &self,
+         key: &Row,
+@@ -2969,6 +3363,12 @@
+             };
+             return Ok(lookup.get(key).copied());
+         }
++        if let Some(lookup) = &self.semantic_lookup {
++            let canonical = self
++                .canonical_group_key(key)?
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            return Ok(lookup.get(&canonical).copied());
++        }
+         for (index, group) in self.groups.iter().enumerate() {
+             if self.keys_equal(&group.key, key, context, registry)? {
+                 return Ok(Some(index));
+@@ -3069,6 +3469,13 @@
+                 return Err(RelQueryError::TypeMismatch);
+             };
+             lookup.insert(*key, index);
++        } else if self.semantic_lookup.is_some() {
++            let canonical = self
++                .canonical_group_key(&bucket.key)?
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            if let Some(lookup) = &mut self.semantic_lookup {
++                lookup.insert(canonical, index);
++            }
+         }
+         self.groups.push(bucket);
+         Ok(())
+@@ -3080,15 +3487,29 @@
+                 return Err(RelQueryError::TypeMismatch);
+             };
+             lookup.remove(removed_key);
++        } else if self.semantic_lookup.is_some() {
++            let canonical = self
++                .canonical_group_key(&self.groups[index].key)?
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            if let Some(lookup) = &mut self.semantic_lookup {
++                lookup.remove(&canonical);
++            }
+         }
+         self.groups.swap_remove(index);
+-        if index < self.groups.len()
+-            && let Some(lookup) = &mut self.i64_lookup
+-        {
+-            let [Value::I64(moved_key)] = self.groups[index].key.as_slice() else {
+-                return Err(RelQueryError::TypeMismatch);
+-            };
+-            lookup.insert(*moved_key, index);
++        if index < self.groups.len() {
++            if let Some(lookup) = &mut self.i64_lookup {
++                let [Value::I64(moved_key)] = self.groups[index].key.as_slice() else {
++                    return Err(RelQueryError::TypeMismatch);
++                };
++                lookup.insert(*moved_key, index);
++            } else if self.semantic_lookup.is_some() {
++                let canonical = self
++                    .canonical_group_key(&self.groups[index].key)?
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                if let Some(lookup) = &mut self.semantic_lookup {
++                    lookup.insert(canonical, index);
++                }
++            }
+         }
+         Ok(())
+     }
+@@ -3277,19 +3698,206 @@
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
++struct IndexedOrderedRows {
++    rows: BTreeMap<IndexedRowId, Row>,
++    index: kernel_semantic_index::SemanticBucketIndex<
++        kernel_semantics::CanonicalOrderKey,
++        IndexedRowId,
++    >,
++    next_id: u64,
++}
++
++#[derive(Debug)]
++struct IndexedOrderedMutationPlan {
++    remove_ids: Vec<IndexedRowId>,
++    inserted: Vec<(IndexedRowId, kernel_semantics::CanonicalOrderKey, Row)>,
++    next_id: u64,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
+ enum MaintainedTopKStorage {
+     I64(BTreeMap<i64, Vec<Row>>),
+-    Generic(Vec<Row>),
++    SemanticOrdered {
++        encoder: kernel_semantics::ResolvedPrimitiveOrdering,
++        rows: IndexedOrderedRows,
++    },
+ }
+ 
+-#[derive(Clone, Copy)]
+-struct TopKMaintenanceSpec<'a> {
+-    column: usize,
+-    ordering: kernel_types::SemanticId,
+-    direction: OrderDirection,
+-    input_type: &'a RelType,
+-    context: &'a kernel_schema::SemanticContext,
+-    registry: &'a kernel_semantics::SemanticRegistry,
++impl IndexedOrderedRows {
++    fn build(
++        rows: Vec<Row>,
++        column: usize,
++        encoder: kernel_semantics::ResolvedPrimitiveOrdering,
++        context: &kernel_schema::SemanticContext,
++    ) -> Result<Self, RelQueryError> {
++        let dependency = kernel_semantic_index::SemanticModuleBinding {
++            semantic_id: encoder.ordering(),
++            module_digest: encoder.module_digest(),
++        };
++        let mut index = kernel_semantic_index::SemanticBucketIndex::new(
++            kernel_semantic_index::SemanticIndexBinding::new(context, vec![dependency]),
++        );
++        let mut stored = BTreeMap::new();
++        let mut next_id = 0_u64;
++        for row in rows {
++            let key =
++                encoder.canonical_key(row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?)?;
++            let id = IndexedRowId(next_id);
++            next_id = next_id
++                .checked_add(1)
++                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
++            let previous_key = index.insert(id, key);
++            let previous_row = stored.insert(id, row);
++            debug_assert!(previous_key.is_none());
++            debug_assert!(previous_row.is_none());
++        }
++        Ok(Self {
++            rows: stored,
++            index,
++            next_id,
++        })
++    }
++
++    fn plan_mutation(
++        &self,
++        input_delta: &RelationDelta,
++        column: usize,
++        encoder: kernel_semantics::ResolvedPrimitiveOrdering,
++        input_type: &RelType,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<IndexedOrderedMutationPlan, RelQueryError> {
++        let equivalences = relation_column_equivalences(input_type);
++        let mut used = BTreeSet::new();
++        let mut remove_ids = Vec::with_capacity(input_delta.removed.len());
++        for removed in &input_delta.removed {
++            let key = encoder.canonical_key(
++                removed
++                    .get(column)
++                    .ok_or(RelQueryError::ColumnOutOfBounds)?,
++            )?;
++            let bucket = self
++                .index
++                .bucket(&key)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            let mut found = None;
++            for id in bucket {
++                if used.contains(id) {
++                    continue;
++                }
++                let candidate = self
++                    .rows
++                    .get(id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                if rows_semantically_equal(candidate, removed, equivalences, context, registry)? {
++                    found = Some(*id);
++                    break;
++                }
++            }
++            let Some(id) = found else {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
++            };
++            used.insert(id);
++            remove_ids.push(id);
++        }
++
++        let is_set = matches!(
++            input_type.semantics,
++            kernel_schema::RelationSemantics::Set { .. }
++        );
++        let mut inserted = Vec::with_capacity(input_delta.inserted.len());
++        let mut next_id = self.next_id;
++        for row in &input_delta.inserted {
++            let key =
++                encoder.canonical_key(row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?)?;
++            if is_set {
++                if let Some(bucket) = self.index.bucket(&key) {
++                    for id in bucket {
++                        if used.contains(id) {
++                            continue;
++                        }
++                        let candidate = self
++                            .rows
++                            .get(id)
++                            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                        if rows_semantically_equal(candidate, row, equivalences, context, registry)?
++                        {
++                            return Err(RelQueryError::InconsistentIncrementalDelta);
++                        }
++                    }
++                }
++                for (_, previous_key, previous_row) in &inserted {
++                    if previous_key == &key
++                        && rows_semantically_equal(
++                            previous_row,
++                            row,
++                            equivalences,
++                            context,
++                            registry,
++                        )?
++                    {
++                        return Err(RelQueryError::InconsistentIncrementalDelta);
++                    }
++                }
++            }
++            let id = IndexedRowId(next_id);
++            next_id = next_id
++                .checked_add(1)
++                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
++            inserted.push((id, key, row.clone()));
++        }
++        Ok(IndexedOrderedMutationPlan {
++            remove_ids,
++            inserted,
++            next_id,
++        })
++    }
++
++    fn commit_plan(&mut self, plan: IndexedOrderedMutationPlan) {
++        for id in plan.remove_ids {
++            let removed_key = self.index.remove(&id);
++            let removed_row = self.rows.remove(&id);
++            debug_assert!(removed_key.is_some());
++            debug_assert!(removed_row.is_some());
++        }
++        for (id, key, row) in plan.inserted {
++            let previous_key = self.index.insert(id, key);
++            let previous_row = self.rows.insert(id, row);
++            debug_assert!(previous_key.is_none());
++            debug_assert!(previous_row.is_none());
++        }
++        self.next_id = plan.next_id;
++    }
++
++    fn output_rows(&self, direction: OrderDirection, k: usize) -> Vec<Row> {
++        if k == 0 {
++            return Vec::new();
++        }
++        let mut out = Vec::new();
++        match direction {
++            OrderDirection::Ascending => {
++                for (_, ids) in self.index.buckets() {
++                    for id in ids {
++                        out.push(self.rows[id].clone());
++                    }
++                    if out.len() >= k {
++                        break;
++                    }
++                }
++            }
++            OrderDirection::Descending => {
++                for (_, ids) in self.index.buckets().rev() {
++                    for id in ids {
++                        out.push(self.rows[id].clone());
++                    }
++                    if out.len() >= k {
++                        break;
++                    }
++                }
++            }
++        }
++        out
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -3367,19 +3975,11 @@
+             }
+             MaintainedTopKStorage::I64(buckets)
+         } else {
+-            let mut sorted = Vec::with_capacity(rows.len());
+-            for row in rows {
+-                Self::insert_generic_sorted(
+-                    &mut sorted,
+-                    row,
+-                    *column,
+-                    *ordering,
+-                    *direction,
+-                    context,
+-                    registry,
+-                )?;
++            let encoder = registry.resolve_primitive_ordering(context, *ordering)?;
++            MaintainedTopKStorage::SemanticOrdered {
++                encoder,
++                rows: IndexedOrderedRows::build(rows, *column, encoder, context)?,
+             }
+-            MaintainedTopKStorage::Generic(sorted)
+         };
+         Ok(Some(Self {
+             query: query.clone(),
+@@ -3404,7 +4004,7 @@
+     pub fn row_count(&self) -> usize {
+         match &self.storage {
+             MaintainedTopKStorage::I64(buckets) => buckets.values().map(Vec::len).sum(),
+-            MaintainedTopKStorage::Generic(rows) => rows.len(),
++            MaintainedTopKStorage::SemanticOrdered { rows, .. } => rows.index.len(),
+         }
+     }
+ 
+@@ -3437,7 +4037,7 @@
+         }
+         MaterializedSetSupportState::validate_row_shapes(&input_delta.removed, &self.input_type)?;
+         MaterializedSetSupportState::validate_row_shapes(&input_delta.inserted, &self.input_type)?;
+-        let before = self.output_value(context, registry)?;
++        let before = self.output_value();
+         match &mut self.storage {
+             MaintainedTopKStorage::I64(buckets) => Self::apply_i64_delta(
+                 buckets,
+@@ -3447,20 +4047,19 @@
+                 context,
+                 registry,
+             )?,
+-            MaintainedTopKStorage::Generic(rows) => Self::apply_generic_delta(
+-                rows,
+-                input_delta,
+-                TopKMaintenanceSpec {
+-                    column: self.column,
+-                    ordering: self.ordering,
+-                    direction: self.direction,
+-                    input_type: &self.input_type,
++            MaintainedTopKStorage::SemanticOrdered { encoder, rows } => {
++                let plan = rows.plan_mutation(
++                    input_delta,
++                    self.column,
++                    *encoder,
++                    &self.input_type,
+                     context,
+                     registry,
+-                },
+-            )?,
++                )?;
++                rows.commit_plan(plan);
++            }
+         }
+-        let after = self.output_value(context, registry)?;
++        let after = self.output_value();
+         relation_delta_between_values(&before, &after, self.result_type.clone(), context, registry)
+     }
+ 
+@@ -3516,46 +4115,6 @@
+         Ok(())
+     }
+ 
+-    fn apply_generic_delta(
+-        rows: &mut Vec<Row>,
+-        input_delta: &RelationDelta,
+-        spec: TopKMaintenanceSpec<'_>,
+-    ) -> Result<(), RelQueryError> {
+-        let equivalences = relation_column_equivalences(spec.input_type);
+-        let is_set = matches!(
+-            spec.input_type.semantics,
+-            kernel_schema::RelationSemantics::Set { .. }
+-        );
+-        let mut next = rows.clone();
+-        for row in &input_delta.removed {
+-            Self::remove_semantic_row(&mut next, row, equivalences, spec.context, spec.registry)?;
+-        }
+-        for row in &input_delta.inserted {
+-            if is_set
+-                && Self::contains_semantic_row(
+-                    &next,
+-                    row,
+-                    equivalences,
+-                    spec.context,
+-                    spec.registry,
+-                )?
+-            {
+-                return Err(RelQueryError::InconsistentIncrementalDelta);
+-            }
+-            Self::insert_generic_sorted(
+-                &mut next,
+-                row.clone(),
+-                spec.column,
+-                spec.ordering,
+-                spec.direction,
+-                spec.context,
+-                spec.registry,
+-            )?;
+-        }
+-        *rows = next;
+-        Ok(())
+-    }
+-
+     fn remove_semantic_row(
+         rows: &mut Vec<Row>,
+         row: &Row,
+@@ -3592,44 +4151,14 @@
+         Ok(false)
+     }
+ 
+-    fn insert_generic_sorted(
+-        rows: &mut Vec<Row>,
+-        row: Row,
+-        column: usize,
+-        ordering: kernel_types::SemanticId,
+-        direction: OrderDirection,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<(), RelQueryError> {
+-        let key = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
+-        let mut position = rows.len();
+-        for (index, candidate) in rows.iter().enumerate() {
+-            let candidate_key = candidate
+-                .get(column)
+-                .ok_or(RelQueryError::ColumnOutOfBounds)?;
+-            if compare_with_direction(context, registry, ordering, candidate_key, key, direction)?
+-                == std::cmp::Ordering::Greater
+-            {
+-                position = index;
+-                break;
+-            }
+-        }
+-        rows.insert(position, row);
+-        Ok(())
+-    }
+-
+-    fn output_value(
+-        &self,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<RelationValue, RelQueryError> {
++    fn output_value(&self) -> RelationValue {
+         let rows = match &self.storage {
+             MaintainedTopKStorage::I64(buckets) => self.i64_output_rows(buckets),
+-            MaintainedTopKStorage::Generic(rows) => {
+-                self.generic_output_rows(rows, context, registry)?
++            MaintainedTopKStorage::SemanticOrdered { rows, .. } => {
++                rows.output_rows(self.direction, self.k)
+             }
+         };
+-        Ok(match &self.result_type.semantics {
++        match &self.result_type.semantics {
+             kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
+             kernel_schema::RelationSemantics::Set {
+                 column_equivalences,
+@@ -3637,7 +4166,7 @@
+                 rows,
+                 column_equivalences: column_equivalences.clone(),
+             },
+-        })
++        }
+     }
+ 
+     fn i64_output_rows(&self, buckets: &BTreeMap<i64, Vec<Row>>) -> Vec<Row> {
+@@ -3665,41 +4194,6 @@
+         }
+         out
+     }
+-
+-    fn generic_output_rows(
+-        &self,
+-        rows: &[Row],
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<Vec<Row>, RelQueryError> {
+-        if self.k == 0 || rows.is_empty() {
+-            return Ok(Vec::new());
+-        }
+-        let mut keep = self.k.min(rows.len());
+-        if keep < rows.len() {
+-            let threshold = rows[keep - 1]
+-                .get(self.column)
+-                .ok_or(RelQueryError::ColumnOutOfBounds)?;
+-            while keep < rows.len() {
+-                let candidate = rows[keep]
+-                    .get(self.column)
+-                    .ok_or(RelQueryError::ColumnOutOfBounds)?;
+-                if compare_with_direction(
+-                    context,
+-                    registry,
+-                    self.ordering,
+-                    candidate,
+-                    threshold,
+-                    self.direction,
+-                )? != std::cmp::Ordering::Equal
+-                {
+-                    break;
+-                }
+-                keep += 1;
+-            }
+-        }
+-        Ok(rows[..keep].to_vec())
+-    }
+ }
+ 
+ fn rel_delta_group_optimized(
+@@ -4709,6 +5203,7 @@
+     RevisionBoundMutationRequiresPreparedTransition,
+     StalePreparedTransition,
+     TransitionEpochExhausted,
++    DerivedIdentityExhausted,
+     Semantic(kernel_semantics::SemanticError),
+     Aggregate(kernel_aggregate::AggregateError),
+ }
+@@ -6611,6 +7106,8 @@
+         let mut state = MaterializedGroupDeltaState::build(&query, &old, &context, &registry)
+             .unwrap()
+             .expect("group state is supported");
++        assert!(state.semantic_lookup.is_some());
++        assert!(state.group_encoders.is_some());
+         for &mask in &sequence[1..] {
+             let next = model_for(mask);
+             let change = Change::Replace(next.clone());
+@@ -8652,6 +9149,10 @@
+         let mut state = MaterializedTopKDeltaState::build(&query, &old, &context, &registry)
+             .unwrap()
+             .unwrap();
++        assert!(matches!(
++            state.storage,
++            MaintainedTopKStorage::SemanticOrdered { .. }
++        ));
+         for values in &states[1..] {
+             let next = model_for(values);
+             let change = Change::Replace(next.clone());
+@@ -8850,6 +9351,10 @@
+         let mut state = MaterializedJoinDeltaState::build(&query, &old, &context, &registry)
+             .unwrap()
+             .unwrap();
++        assert!(matches!(
++            state.storage,
++            MaintainedJoinStorage::SemanticIndexed(_)
++        ));
+         let left_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
+         let right_type = RelExpr::Scan(right).typecheck(&context, &registry).unwrap();
+         let left_delta = RelationDelta {
+@@ -9489,4 +9994,266 @@
+             Err(RelQueryError::InconsistentIncrementalDelta)
+         );
+     }
++
++    #[test]
++    fn composite_primitive_group_uses_semantic_index_and_matches_recompute() {
++        let (context, registry, text_eq, relation, _) = setup();
++        let i64_eq = SemanticId::new(101);
++        let query = RelExpr::Group {
++            input: Box::new(RelExpr::Scan(relation)),
++            group_columns: vec![0, 1],
++            group_equivalences: vec![text_eq, i64_eq],
++            aggregate: AggregateSpec::Count {
++                result_equivalence: i64_eq,
++            },
++        };
++        let mut old = FiniteModel::default();
++        old.relations.insert(
++            relation,
++            vec![
++                vec![Value::Text("A".into()), Value::I64(1)],
++                vec![Value::Text("a".into()), Value::I64(1)],
++                vec![Value::Text("B".into()), Value::I64(2)],
++            ],
++        );
++        let mut state = MaterializedGroupDeltaState::build(&query, &old, &context, &registry)
++            .unwrap()
++            .unwrap();
++        assert!(state.semantic_lookup.is_some());
++        assert_eq!(state.group_encoders.as_ref().map(Vec::len), Some(2));
++        assert_eq!(state.group_count(), 2);
++
++        let mut next = old.clone();
++        next.relations.insert(
++            relation,
++            vec![
++                vec![Value::Text("A".into()), Value::I64(1)],
++                vec![Value::Text("b".into()), Value::I64(2)],
++                vec![Value::Text("C".into()), Value::I64(3)],
++            ],
++        );
++        let change = Change::Replace(next.clone());
++        let oracle = rel_delta_by_recompute(&query, &old, &change, &context, &registry).unwrap();
++        let maintained = state
++            .apply_model_change(&old, &change, &context, &registry)
++            .unwrap();
++        assert!(
++            relation_deltas_semantically_equivalent(&maintained, &oracle, &context, &registry)
++                .unwrap()
++        );
++        assert_eq!(state.group_count(), 3);
++    }
++
++    #[test]
++    fn materialized_f64_total_top_k_uses_order_index_across_hostile_values() {
++        let relation = SemanticId::new(98_100);
++        let f64_eq = SemanticId::new(98_101);
++        let f64_order = SemanticId::new(98_102);
++        let mut registry = SemanticRegistry::default();
++        let eq_digest = registry.install_equivalence(EquivalenceModule::F64Bitwise);
++        let order_digest = registry.install_ordering(OrderingModule::F64Total);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(98_100));
++        environment.pin_module(f64_eq, eq_digest);
++        environment.pin_module(f64_order, order_digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(98_100));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::F64)],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![f64_eq],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let query = RelExpr::TopKWithTies {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            ordering: f64_order,
++            direction: OrderDirection::Ascending,
++            k: 3,
++        };
++        let model_for = |bits: &[u64]| {
++            let mut model = FiniteModel::default();
++            model.relations.insert(
++                relation,
++                bits.iter()
++                    .copied()
++                    .map(|bits| vec![Value::F64Bits(bits)])
++                    .collect(),
++            );
++            model
++        };
++        let states = [
++            vec![
++                f64::NEG_INFINITY.to_bits(),
++                (-0.0_f64).to_bits(),
++                0.0_f64.to_bits(),
++                1.0_f64.to_bits(),
++                0x7ff8_0000_0000_0001,
++                0xfff8_0000_0000_0001,
++            ],
++            vec![
++                0xfff8_0000_0000_0002,
++                (-1.0_f64).to_bits(),
++                (-0.0_f64).to_bits(),
++                0.0_f64.to_bits(),
++                f64::INFINITY.to_bits(),
++                0x7ff8_0000_0000_0002,
++            ],
++            vec![
++                f64::NEG_INFINITY.to_bits(),
++                f64::INFINITY.to_bits(),
++                5e-324_f64.to_bits(),
++                (-5e-324_f64).to_bits(),
++            ],
++        ];
++        let mut old = model_for(&states[0]);
++        let mut state = MaterializedTopKDeltaState::build(&query, &old, &context, &registry)
++            .unwrap()
++            .unwrap();
++        assert!(matches!(
++            state.storage,
++            MaintainedTopKStorage::SemanticOrdered { .. }
++        ));
++        for values in &states[1..] {
++            let next = model_for(values);
++            let change = Change::Replace(next.clone());
++            let oracle =
++                rel_delta_by_recompute(&query, &old, &change, &context, &registry).unwrap();
++            let maintained = state
++                .apply_model_change(&old, &change, &context, &registry)
++                .unwrap();
++            assert!(
++                relation_deltas_semantically_equivalent(&maintained, &oracle, &context, &registry)
++                    .unwrap()
++            );
++            old = next;
++        }
++    }
++
++    #[test]
++    fn semantic_indexed_join_accepts_same_call_remove_insert_replacement() {
++        let (context, registry, text_eq, left_relation, right_relation) = setup();
++        let query = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(left_relation)),
++            right: Box::new(RelExpr::Scan(right_relation)),
++            left_column: 0,
++            right_column: 0,
++            equivalence: text_eq,
++        };
++        let mut model = FiniteModel::default();
++        model.relations.insert(
++            left_relation,
++            vec![vec![Value::Text("key-0".into()), Value::I64(0)]],
++        );
++        model.relations.insert(
++            right_relation,
++            (0..1000)
++                .map(|i| vec![Value::Text(format!("KEY-{i}")), Value::I64(i)])
++                .collect(),
++        );
++        let mut state = MaterializedJoinDeltaState::build(&query, &model, &context, &registry)
++            .unwrap()
++            .unwrap();
++        let left_type = RelExpr::Scan(left_relation)
++            .typecheck(&context, &registry)
++            .unwrap();
++        let right_type = RelExpr::Scan(right_relation)
++            .typecheck(&context, &registry)
++            .unwrap();
++        let left_delta = RelationDelta {
++            removed: vec![vec![Value::Text("key-0".into()), Value::I64(0)]],
++            inserted: vec![vec![Value::Text("KEY-0".into()), Value::I64(1)]],
++            result_type: left_type,
++        };
++        let right_delta = RelationDelta {
++            removed: Vec::new(),
++            inserted: Vec::new(),
++            result_type: right_type,
++        };
++        assert!(
++            state
++                .apply_input_deltas(&left_delta, &right_delta, &context, &registry)
++                .is_ok()
++        );
++    }
++
++    #[test]
++    fn structural_join_equivalence_remains_on_exact_semantic_scan_fallback() {
++        let left = SemanticId::new(98_200);
++        let right = SemanticId::new(98_201);
++        let product_eq = SemanticId::new(98_202);
++        let text_eq = SemanticId::new(98_203);
++        let i64_eq = SemanticId::new(98_204);
++        let field = SemanticId::new(98_205);
++        let mut registry = SemanticRegistry::default();
++        let text_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(98_200));
++        environment.pin_module(text_eq, text_digest);
++        environment.pin_module(i64_eq, i64_digest);
++        let product_type = TypeExpr::Product(BTreeMap::from([(
++            field,
++            TypeExpr::Scalar(ScalarType::Text),
++        )]));
++        let mut schema = Schema::new(SchemaRevisionId::new(98_200));
++        schema
++            .define_structural_equivalence(
++                product_eq,
++                kernel_schema::StructuralEquivalenceDef::Product {
++                    fields: BTreeMap::from([(field, text_eq)]),
++                },
++            )
++            .unwrap();
++        for relation in [left, right] {
++            schema
++                .define_relation(RelationDef {
++                    id: relation,
++                    columns: vec![product_type.clone(), TypeExpr::Scalar(ScalarType::I64)],
++                    semantics: RelationSemantics::Bag {
++                        column_equivalences: vec![product_eq, i64_eq],
++                    },
++                })
++                .unwrap();
++        }
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let product =
++            |label: &str| Value::Product(BTreeMap::from([(field, Value::Text(label.into()))]));
++        let mut model = FiniteModel::default();
++        model
++            .relations
++            .insert(left, vec![vec![product("Alpha"), Value::I64(1)]]);
++        model
++            .relations
++            .insert(right, vec![vec![product("alpha"), Value::I64(2)]]);
++        let query = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(left)),
++            right: Box::new(RelExpr::Scan(right)),
++            left_column: 0,
++            right_column: 0,
++            equivalence: product_eq,
++        };
++        let state = MaterializedJoinDeltaState::build(&query, &model, &context, &registry)
++            .unwrap()
++            .unwrap();
++        assert!(matches!(
++            state.storage,
++            MaintainedJoinStorage::GenericScan { .. }
++        ));
++        assert_eq!(
++            state
++                .output_value(&context, &registry)
++                .unwrap()
++                .rows()
++                .len(),
++            1
++        );
++    }
+ }
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-semantic-index/Cargo.toml /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-semantic-index/Cargo.toml
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-semantic-index/Cargo.toml	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-semantic-index/Cargo.toml	2026-09-20 01:30:00.917766332 +0000
+@@ -0,0 +1,12 @@
++[package]
++name = "kernel-semantic-index"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++
++[dependencies]
++kernel-schema = { path = "../kernel-schema" }
++kernel-types = { path = "../kernel-types" }
++
++[lints]
++workspace = true
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-semantic-index/src/lib.rs /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-semantic-index/src/lib.rs
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-semantic-index/src/lib.rs	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-semantic-index/src/lib.rs	2026-09-20 01:43:31.588883254 +0000
+@@ -0,0 +1,209 @@
++use std::collections::{BTreeMap, BTreeSet};
++
++use kernel_schema::{ModuleDigest, SemanticContext};
++use kernel_types::{SemanticId, SemanticRevision};
++
++pub const KEY_ENCODING_REVISION: u64 = 1;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct SemanticModuleBinding {
++    pub semantic_id: SemanticId,
++    pub module_digest: ModuleDigest,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SemanticIndexBinding {
++    semantic_revision: SemanticRevision,
++    dependencies: Vec<SemanticModuleBinding>,
++    key_encoding_revision: u64,
++}
++
++impl SemanticIndexBinding {
++    #[must_use]
++    pub fn new(context: &SemanticContext, mut dependencies: Vec<SemanticModuleBinding>) -> Self {
++        dependencies.sort_unstable();
++        dependencies.dedup();
++        Self {
++            semantic_revision: context.revision(),
++            dependencies,
++            key_encoding_revision: KEY_ENCODING_REVISION,
++        }
++    }
++
++    #[must_use]
++    pub const fn semantic_revision(&self) -> SemanticRevision {
++        self.semantic_revision
++    }
++
++    #[must_use]
++    pub fn dependencies(&self) -> &[SemanticModuleBinding] {
++        &self.dependencies
++    }
++
++    #[must_use]
++    pub const fn key_encoding_revision(&self) -> u64 {
++        self.key_encoding_revision
++    }
++
++    #[must_use]
++    pub fn is_valid_for(
++        &self,
++        context: &SemanticContext,
++        dependencies: &[SemanticModuleBinding],
++    ) -> bool {
++        if self.semantic_revision != context.revision()
++            || self.key_encoding_revision != KEY_ENCODING_REVISION
++        {
++            return false;
++        }
++        let mut dependencies = dependencies.to_vec();
++        dependencies.sort_unstable();
++        dependencies.dedup();
++        self.dependencies == dependencies
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SemanticBucketIndex<K, I> {
++    binding: SemanticIndexBinding,
++    buckets: BTreeMap<K, BTreeSet<I>>,
++    reverse: BTreeMap<I, K>,
++}
++
++impl<K, I> SemanticBucketIndex<K, I>
++where
++    K: Ord + Clone,
++    I: Ord + Clone,
++{
++    #[must_use]
++    pub fn new(binding: SemanticIndexBinding) -> Self {
++        Self {
++            binding,
++            buckets: BTreeMap::new(),
++            reverse: BTreeMap::new(),
++        }
++    }
++
++    #[must_use]
++    pub const fn binding(&self) -> &SemanticIndexBinding {
++        &self.binding
++    }
++
++    #[must_use]
++    pub fn len(&self) -> usize {
++        self.reverse.len()
++    }
++
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.reverse.is_empty()
++    }
++
++    #[must_use]
++    pub fn bucket(&self, key: &K) -> Option<&BTreeSet<I>> {
++        self.buckets.get(key)
++    }
++
++    #[must_use]
++    pub fn buckets(&self) -> impl DoubleEndedIterator<Item = (&K, &BTreeSet<I>)> {
++        self.buckets.iter()
++    }
++
++    #[must_use]
++    pub fn key_for(&self, identity: &I) -> Option<&K> {
++        self.reverse.get(identity)
++    }
++
++    /// Inserts or rebinds one derivative identity, returning its previous key if present.
++    pub fn insert(&mut self, identity: I, key: K) -> Option<K> {
++        let previous = self.reverse.insert(identity.clone(), key.clone());
++        if let Some(previous_key) = &previous {
++            let mut remove_bucket = false;
++            if let Some(bucket) = self.buckets.get_mut(previous_key) {
++                bucket.remove(&identity);
++                remove_bucket = bucket.is_empty();
++            }
++            if remove_bucket {
++                self.buckets.remove(previous_key);
++            }
++        }
++        self.buckets.entry(key).or_default().insert(identity);
++        previous
++    }
++
++    pub fn remove(&mut self, identity: &I) -> Option<K> {
++        let key = self.reverse.remove(identity)?;
++        let mut remove_bucket = false;
++        if let Some(bucket) = self.buckets.get_mut(&key) {
++            bucket.remove(identity);
++            remove_bucket = bucket.is_empty();
++        }
++        if remove_bucket {
++            self.buckets.remove(&key);
++        }
++        Some(key)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use kernel_schema::{Schema, SemanticEnvironment};
++    use kernel_types::{SchemaRevisionId, SemanticEnvId};
++
++    fn context() -> SemanticContext {
++        SemanticContext {
++            schema: Schema::new(SchemaRevisionId::new(7)),
++            environment: SemanticEnvironment::new(SemanticEnvId::new(11)),
++        }
++    }
++
++    #[test]
++    fn duplicate_bucket_membership_and_reverse_map_are_exact() {
++        let context = context();
++        let dependency = SemanticModuleBinding {
++            semantic_id: SemanticId::new(3),
++            module_digest: ModuleDigest([9; 32]),
++        };
++        let mut index =
++            SemanticBucketIndex::new(SemanticIndexBinding::new(&context, vec![dependency]));
++        assert_eq!(index.insert(10_u64, "a"), None);
++        assert_eq!(index.insert(11_u64, "a"), None);
++        assert_eq!(index.bucket(&"a").map(BTreeSet::len), Some(2));
++        assert_eq!(index.key_for(&10), Some(&"a"));
++        assert_eq!(index.remove(&10), Some("a"));
++        assert_eq!(index.bucket(&"a").map(BTreeSet::len), Some(1));
++        assert_eq!(index.remove(&11), Some("a"));
++        assert!(index.bucket(&"a").is_none());
++    }
++
++    #[test]
++    fn rebinding_identity_removes_dead_bucket() {
++        let context = context();
++        let mut index = SemanticBucketIndex::new(SemanticIndexBinding::new(&context, Vec::new()));
++        assert_eq!(index.insert(1_u64, 10_i64), None);
++        assert_eq!(index.insert(1_u64, 20_i64), Some(10));
++        assert!(index.bucket(&10).is_none());
++        assert_eq!(index.bucket(&20).map(BTreeSet::len), Some(1));
++    }
++
++    #[test]
++    fn binding_rejects_revision_digest_and_encoding_mismatch() {
++        let mut context = context();
++        let dependency = SemanticModuleBinding {
++            semantic_id: SemanticId::new(3),
++            module_digest: ModuleDigest([9; 32]),
++        };
++        let binding = SemanticIndexBinding::new(&context, vec![dependency]);
++        assert!(binding.is_valid_for(&context, &[dependency]));
++        assert!(!binding.is_valid_for(
++            &context,
++            &[SemanticModuleBinding {
++                semantic_id: dependency.semantic_id,
++                module_digest: ModuleDigest([8; 32]),
++            }]
++        ));
++        context.environment.revision = SemanticEnvId::new(12);
++        assert!(!binding.is_valid_for(&context, &[dependency]));
++    }
++}
+diff -ruN '--exclude=target' '--exclude=evidence' '--exclude=MANIFEST.sha256' '--exclude=SHA256_MANIFEST.txt' '--exclude=SOURCE_SHA256SUMS.txt' '--exclude=PASS39_CHANGED_FILES.txt' '--exclude=PASS39_SOURCE_DIFF.txt' /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-semantics/src/lib.rs /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-semantics/src/lib.rs
+--- /mnt/data/cfmd_pass38_work/cfmd_workspace_pass38/crates/kernel-semantics/src/lib.rs	2026-09-20 01:01:18.983389711 +0000
++++ /mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-semantics/src/lib.rs	2026-09-20 01:44:46.306871164 +0000
+@@ -115,9 +115,28 @@
+     HistoricalEntityIdExact(SemanticId),
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum CanonicalEqKey {
++    Unit,
++    Bool(bool),
++    I64(i64),
++    F64Bits(u64),
++    TextExact(String),
++    TextAsciiCaseInsensitive(String),
++    LiveEntityId {
++        entity_type: SemanticId,
++        id: kernel_types::EntityId,
++    },
++    HistoricalEntityId {
++        entity_type: SemanticId,
++        id: kernel_types::EntityId,
++    },
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct ResolvedPrimitiveEquivalence {
+     equivalence: SemanticId,
++    module_digest: ModuleDigest,
+     contract: EquivalenceModule,
+ }
+ 
+@@ -127,10 +146,54 @@
+         self.equivalence
+     }
+ 
++    #[must_use]
++    pub const fn module_digest(&self) -> ModuleDigest {
++        self.module_digest
++    }
++
+     pub fn equivalent(&self, left: &Value, right: &Value) -> Result<bool, SemanticError> {
+         self.contract.equivalent(left, right, self.equivalence)
+     }
+ 
++    pub fn canonical_key(&self, value: &Value) -> Result<CanonicalEqKey, SemanticError> {
++        let key = match (self.contract, value) {
++            (EquivalenceModule::UnitExact, Value::Unit) => CanonicalEqKey::Unit,
++            (EquivalenceModule::BoolExact, Value::Bool(value)) => CanonicalEqKey::Bool(*value),
++            (EquivalenceModule::I64Exact, Value::I64(value)) => CanonicalEqKey::I64(*value),
++            (EquivalenceModule::F64Bitwise, Value::F64Bits(value)) => {
++                CanonicalEqKey::F64Bits(*value)
++            }
++            (EquivalenceModule::TextExact, Value::Text(value)) => {
++                CanonicalEqKey::TextExact(value.clone())
++            }
++            (EquivalenceModule::TextAsciiCaseInsensitive, Value::Text(value)) => {
++                CanonicalEqKey::TextAsciiCaseInsensitive(value.to_ascii_lowercase())
++            }
++            (
++                EquivalenceModule::LiveEntityIdExact(entity_type),
++                Value::LiveEntityRef {
++                    entity_type: actual,
++                    id,
++                },
++            ) if actual == &entity_type => CanonicalEqKey::LiveEntityId {
++                entity_type,
++                id: *id,
++            },
++            (
++                EquivalenceModule::HistoricalEntityIdExact(entity_type),
++                Value::HistoricalEntityId {
++                    entity_type: actual,
++                    id,
++                },
++            ) if actual == &entity_type => CanonicalEqKey::HistoricalEntityId {
++                entity_type,
++                id: *id,
++            },
++            _ => return Err(SemanticError::TypeMismatch(self.equivalence)),
++        };
++        Ok(key)
++    }
++
+     pub fn bind_right(&self, right: &Value) -> Result<BoundPrimitivePredicate, SemanticError> {
+         let predicate = match (self.contract, right) {
+             (EquivalenceModule::UnitExact, Value::Unit) => BoundPrimitivePredicate::Unit,
+@@ -257,6 +320,63 @@
+     TextAsciiCaseInsensitiveThenBinary,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum CanonicalOrderKey {
++    I64(i64),
++    F64Total(i64),
++    TextBinary(String),
++    TextAsciiCaseInsensitive(String),
++    TextAsciiCaseInsensitiveThenBinary(String, String),
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ResolvedPrimitiveOrdering {
++    ordering: SemanticId,
++    module_digest: ModuleDigest,
++    contract: OrderingModule,
++}
++
++impl ResolvedPrimitiveOrdering {
++    #[must_use]
++    pub const fn ordering(&self) -> SemanticId {
++        self.ordering
++    }
++
++    #[must_use]
++    pub const fn module_digest(&self) -> ModuleDigest {
++        self.module_digest
++    }
++
++    pub fn compare(&self, left: &Value, right: &Value) -> Result<CmpOrdering, SemanticError> {
++        self.contract.compare(left, right, self.ordering)
++    }
++
++    pub fn canonical_key(&self, value: &Value) -> Result<CanonicalOrderKey, SemanticError> {
++        let key = match (self.contract, value) {
++            (OrderingModule::I64Ascending, Value::I64(value)) => CanonicalOrderKey::I64(*value),
++            (OrderingModule::F64Total, Value::F64Bits(bits)) => {
++                let signed = bits.cast_signed();
++                let sortable = signed ^ ((signed >> 63).cast_unsigned() >> 1).cast_signed();
++                CanonicalOrderKey::F64Total(sortable)
++            }
++            (OrderingModule::TextBinary, Value::Text(value)) => {
++                CanonicalOrderKey::TextBinary(value.clone())
++            }
++            (OrderingModule::TextAsciiCaseInsensitive, Value::Text(value)) => {
++                CanonicalOrderKey::TextAsciiCaseInsensitive(value.to_ascii_lowercase())
++            }
++            (OrderingModule::TextAsciiCaseInsensitiveThenBinary, Value::Text(value)) => {
++                CanonicalOrderKey::TextAsciiCaseInsensitiveThenBinary(
++                    value.to_ascii_lowercase(),
++                    value.clone(),
++                )
++            }
++            _ => return Err(SemanticError::TypeMismatch(self.ordering)),
++        };
++        Ok(key)
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum OrderingDomain {
+     I64,
+@@ -905,10 +1025,34 @@
+         };
+         Ok(Some(ResolvedPrimitiveEquivalence {
+             equivalence,
++            module_digest: digest,
+             contract: implementation.contract,
+         }))
+     }
+ 
++    pub fn resolve_primitive_ordering(
++        &self,
++        context: &SemanticContext,
++        ordering: SemanticId,
++    ) -> Result<ResolvedPrimitiveOrdering, SemanticError> {
++        let digest = context
++            .environment
++            .module(ordering)
++            .ok_or(SemanticError::WrongModuleKind(ordering))?;
++        let implementation = match self.orderings.get(&digest).copied() {
++            Some(implementation) => implementation,
++            None if self.module_available(digest) => {
++                return Err(SemanticError::WrongModuleKind(ordering));
++            }
++            None => return Err(SemanticError::ModuleUnavailable(digest)),
++        };
++        Ok(ResolvedPrimitiveOrdering {
++            ordering,
++            module_digest: digest,
++            contract: implementation.contract,
++        })
++    }
++
+     pub fn equivalence_domain(
+         &self,
+         context: &SemanticContext,
+@@ -2706,4 +2850,222 @@
+             Err(SemanticError::WrongModuleKind(symbol))
+         );
+     }
++
++    #[test]
++    fn canonical_equality_keys_match_every_builtin_primitive_contract() {
++        let modules = [
++            (
++                EquivalenceModule::UnitExact,
++                vec![(Value::Unit, Value::Unit)],
++            ),
++            (
++                EquivalenceModule::BoolExact,
++                vec![
++                    (Value::Bool(false), Value::Bool(false)),
++                    (Value::Bool(false), Value::Bool(true)),
++                ],
++            ),
++            (
++                EquivalenceModule::I64Exact,
++                vec![
++                    (Value::I64(-7), Value::I64(-7)),
++                    (Value::I64(-7), Value::I64(7)),
++                ],
++            ),
++            (
++                EquivalenceModule::F64Bitwise,
++                vec![
++                    (
++                        Value::F64Bits(0.0_f64.to_bits()),
++                        Value::F64Bits((-0.0_f64).to_bits()),
++                    ),
++                    (
++                        Value::F64Bits(0x7ff8_0000_0000_0001),
++                        Value::F64Bits(0x7ff8_0000_0000_0001),
++                    ),
++                    (
++                        Value::F64Bits(0x7ff8_0000_0000_0001),
++                        Value::F64Bits(0x7ff8_0000_0000_0002),
++                    ),
++                ],
++            ),
++            (
++                EquivalenceModule::TextExact,
++                vec![
++                    (Value::Text("A".into()), Value::Text("A".into())),
++                    (Value::Text("A".into()), Value::Text("a".into())),
++                ],
++            ),
++            (
++                EquivalenceModule::TextAsciiCaseInsensitive,
++                vec![
++                    (Value::Text("AΩz".into()), Value::Text("aΩZ".into())),
++                    (Value::Text("Ω".into()), Value::Text("ω".into())),
++                ],
++            ),
++        ];
++
++        for (offset, (module, pairs)) in modules.into_iter().enumerate() {
++            let semantic = SemanticId::new(71_000 + offset as u128);
++            let mut registry = SemanticRegistry::default();
++            let digest = registry.install_equivalence(module);
++            let context = context(semantic, digest);
++            let resolved = registry
++                .resolve_primitive_equivalence(&context, semantic)
++                .unwrap()
++                .unwrap();
++            assert_eq!(resolved.module_digest(), digest);
++            for (left, right) in pairs {
++                assert_eq!(
++                    resolved.canonical_key(&left).unwrap()
++                        == resolved.canonical_key(&right).unwrap(),
++                    resolved.equivalent(&left, &right).unwrap(),
++                    "module={module:?}, left={left:?}, right={right:?}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn canonical_entity_equality_keys_match_builtin_contracts() {
++        let person = SemanticId::new(70_001);
++        let modules = [
++            EquivalenceModule::LiveEntityIdExact(person),
++            EquivalenceModule::HistoricalEntityIdExact(person),
++        ];
++        for (offset, module) in modules.into_iter().enumerate() {
++            let semantic = SemanticId::new(71_100 + offset as u128);
++            let mut registry = SemanticRegistry::default();
++            let digest = registry.install_equivalence(module);
++            let context = context(semantic, digest);
++            let resolved = registry
++                .resolve_primitive_equivalence(&context, semantic)
++                .unwrap()
++                .unwrap();
++            let values = match module {
++                EquivalenceModule::LiveEntityIdExact(entity_type) => vec![
++                    Value::LiveEntityRef {
++                        entity_type,
++                        id: EntityId::new(5),
++                    },
++                    Value::LiveEntityRef {
++                        entity_type,
++                        id: EntityId::new(6),
++                    },
++                ],
++                EquivalenceModule::HistoricalEntityIdExact(entity_type) => vec![
++                    Value::HistoricalEntityId {
++                        entity_type,
++                        id: EntityId::new(5),
++                    },
++                    Value::HistoricalEntityId {
++                        entity_type,
++                        id: EntityId::new(6),
++                    },
++                ],
++                _ => unreachable!(),
++            };
++            for left in &values {
++                for right in &values {
++                    assert_eq!(
++                        resolved.canonical_key(left).unwrap()
++                            == resolved.canonical_key(right).unwrap(),
++                        resolved.equivalent(left, right).unwrap(),
++                        "module={module:?}, left={left:?}, right={right:?}"
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn canonical_order_keys_match_every_builtin_ordering_contract() {
++        let modules = [
++            OrderingModule::I64Ascending,
++            OrderingModule::F64Total,
++            OrderingModule::TextBinary,
++            OrderingModule::TextAsciiCaseInsensitive,
++            OrderingModule::TextAsciiCaseInsensitiveThenBinary,
++        ];
++        for (offset, module) in modules.into_iter().enumerate() {
++            let ordering = SemanticId::new(72_000 + offset as u128);
++            let mut registry = SemanticRegistry::default();
++            let digest = registry.install_ordering(module);
++            let context = context(ordering, digest);
++            let resolved = registry
++                .resolve_primitive_ordering(&context, ordering)
++                .unwrap();
++            assert_eq!(resolved.module_digest(), digest);
++            let values = match module {
++                OrderingModule::I64Ascending => {
++                    vec![
++                        Value::I64(i64::MIN),
++                        Value::I64(-1),
++                        Value::I64(0),
++                        Value::I64(i64::MAX),
++                    ]
++                }
++                OrderingModule::F64Total => vec![
++                    Value::F64Bits(f64::NEG_INFINITY.to_bits()),
++                    Value::F64Bits(0xfff8_0000_0000_0002),
++                    Value::F64Bits((-0.0_f64).to_bits()),
++                    Value::F64Bits(0.0_f64.to_bits()),
++                    Value::F64Bits(f64::INFINITY.to_bits()),
++                    Value::F64Bits(0x7ff8_0000_0000_0001),
++                    Value::F64Bits(0x7ff8_0000_0000_0002),
++                ],
++                OrderingModule::TextBinary
++                | OrderingModule::TextAsciiCaseInsensitive
++                | OrderingModule::TextAsciiCaseInsensitiveThenBinary => vec![
++                    Value::Text("A".into()),
++                    Value::Text("a".into()),
++                    Value::Text("B".into()),
++                    Value::Text("aΩZ".into()),
++                    Value::Text("AΩz".into()),
++                    Value::Text("ω".into()),
++                ],
++            };
++            for left in &values {
++                for right in &values {
++                    assert_eq!(
++                        resolved
++                            .canonical_key(left)
++                            .unwrap()
++                            .cmp(&resolved.canonical_key(right).unwrap()),
++                        resolved.compare(left, right).unwrap(),
++                        "module={module:?}, left={left:?}, right={right:?}"
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn f64_total_canonical_key_matches_total_cmp_on_many_bit_patterns() {
++        let ordering = SemanticId::new(73_000);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_ordering(OrderingModule::F64Total);
++        let context = context(ordering, digest);
++        let resolved = registry
++            .resolve_primitive_ordering(&context, ordering)
++            .unwrap();
++        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
++        for _ in 0..100_000 {
++            state = state
++                .wrapping_mul(6_364_136_223_846_793_005)
++                .wrapping_add(1_442_695_040_888_963_407);
++            let left = Value::F64Bits(state);
++            state = state
++                .wrapping_mul(6_364_136_223_846_793_005)
++                .wrapping_add(1_442_695_040_888_963_407);
++            let right = Value::F64Bits(state);
++            assert_eq!(
++                resolved
++                    .canonical_key(&left)
++                    .unwrap()
++                    .cmp(&resolved.canonical_key(&right).unwrap()),
++                resolved.compare(&left, &right).unwrap()
++            );
++        }
++    }
+ }

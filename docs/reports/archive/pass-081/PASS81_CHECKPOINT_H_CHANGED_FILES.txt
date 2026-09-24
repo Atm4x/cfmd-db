@@ -1,0 +1,8 @@
+Cargo.lock
+crates/kernel-change/src/lib.rs
+crates/kernel-plan/Cargo.toml
+crates/kernel-plan/src/lib.rs
+crates/kernel-query/src/lib.rs
+PASS81_INTEGRATION_LEDGER.md
+PASS81_CHECKPOINT_H_WRITE_PUBLICATION.md
+PASS81_CHECKPOINT_H_CHANGED_FILES.txt

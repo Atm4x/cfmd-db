@@ -1,0 +1,2123 @@
+diff -ruN a/crates/kernel-plan/src/algebraic_native.rs b/crates/kernel-plan/src/algebraic_native.rs
+--- a/crates/kernel-plan/src/algebraic_native.rs	2026-09-21 13:57:06.966053698 +0000
++++ b/crates/kernel-plan/src/algebraic_native.rs	2026-09-21 14:58:16.459489798 +0000
+@@ -188,6 +188,78 @@
+         }
+     }
+ 
++    pub(crate) fn semantic_work_units_at(
++        &self,
++        index: usize,
++    ) -> Result<usize, PhysicalExecutionError> {
++        match &self.storage {
++            AlgebraicStorage::Empty => Err(PhysicalExecutionError::ColumnShapeMismatch),
++            AlgebraicStorage::Scalar(column) => column.semantic_work_units_at(index),
++            AlgebraicStorage::Product { fields, row_count } => {
++                if index >= *row_count {
++                    return Err(PhysicalExecutionError::ColumnShapeMismatch);
++                }
++                fields.values().try_fold(1_usize, |work, child| {
++                    Ok(work.saturating_add(child.semantic_work_units_at(index)?))
++                })
++            }
++            AlgebraicStorage::Sum {
++                tags,
++                payload_index,
++                variants,
++            } => {
++                let tag = *tags
++                    .get(index)
++                    .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
++                let payload_index = *payload_index
++                    .get(index)
++                    .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
++                let payload = variants
++                    .get(&tag)
++                    .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
++                Ok(1_usize.saturating_add(payload.semantic_work_units_at(payload_index as usize)?))
++            }
++            AlgebraicStorage::Option {
++                payload_index,
++                payload,
++            } => {
++                let payload_index = payload_index
++                    .get(index)
++                    .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
++                payload_index.map_or(Ok(1), |payload_index| {
++                    Ok(1_usize
++                        .saturating_add(payload.semantic_work_units_at(payload_index as usize)?))
++                })
++            }
++            AlgebraicStorage::Seq { offsets, payload }
++            | AlgebraicStorage::Set {
++                offsets, payload, ..
++            }
++            | AlgebraicStorage::Bag {
++                offsets, payload, ..
++            } => {
++                let (start, end) = range(offsets, index)?;
++                (start..end).try_fold(1_usize, |work, child_index| {
++                    Ok(work.saturating_add(payload.semantic_work_units_at(child_index)?))
++                })
++            }
++            AlgebraicStorage::Map {
++                offsets,
++                keys,
++                values,
++                ..
++            } => {
++                let (start, end) = range(offsets, index)?;
++                (start..end).try_fold(1_usize, |work, child_index| {
++                    Ok(work
++                        .saturating_add(keys.semantic_work_units_at(child_index)?)
++                        .saturating_add(values.semantic_work_units_at(child_index)?))
++                })
++            }
++            AlgebraicStorage::Recursive(child) => child.semantic_work_units_at(index),
++        }
++    }
++
+     pub fn value_at(&self, index: usize) -> Result<Value, PhysicalExecutionError> {
+         match &self.storage {
+             AlgebraicStorage::Empty => Err(PhysicalExecutionError::ColumnShapeMismatch),
+diff -ruN a/crates/kernel-plan/src/lib.rs b/crates/kernel-plan/src/lib.rs
+--- a/crates/kernel-plan/src/lib.rs	2026-09-21 13:59:35.947689578 +0000
++++ b/crates/kernel-plan/src/lib.rs	2026-09-21 15:43:04.054275596 +0000
+@@ -214,6 +214,23 @@
+         }
+     }
+ 
++    fn semantic_work_units_at(&self, index: usize) -> Result<usize, PhysicalExecutionError> {
++        if index >= self.len() {
++            return Err(PhysicalExecutionError::ColumnShapeMismatch);
++        }
++        match self {
++            Self::Unit(_)
++            | Self::Bool(_)
++            | Self::I64(_)
++            | Self::F64Bits(_)
++            | Self::LiveEntityIds { .. }
++            | Self::DenseLiveEntityIds { .. }
++            | Self::HistoricalEntityIds { .. } => Ok(1),
++            Self::Text(values) => Ok(1_usize.saturating_add(values[index].len())),
++            Self::Algebraic(column) => column.semantic_work_units_at(index),
++        }
++    }
++
+     fn value_at(&self, index: usize) -> Value {
+         match self {
+             Self::Unit(_) => Value::Unit,
+@@ -986,6 +1003,8 @@
+     >,
+     semantic_statistics:
+         Arc<BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticStatisticsState>>>,
++    observable_atom_states:
++        Arc<BTreeMap<SemanticIndexBinding, Arc<MaterializedObservableAtomState>>>,
+     advisor_managed_artifacts: Arc<BTreeSet<ManagedPhysicalArtifact>>,
+     semantic_quotient_support_local_delta_updates: u64,
+     transition_epoch: u64,
+@@ -1227,6 +1246,11 @@
+     /// Maximum row/key-part evaluations attempted for advisor-owned artifacts.
+     /// Manual durable pins are fixed intent and are not evicted by this policy.
+     pub max_advisor_rebuild_key_evaluations: usize,
++    /// Maximum deterministic structural semantic-work units attempted for
++    /// advisor-owned rebuilds. One unit is one logical value node or one byte
++    /// of stable text payload. This is a size-aware planning metric, not CPU
++    /// time; manual durable pins remain fixed intent.
++    pub max_advisor_rebuild_semantic_work_units: usize,
+     /// Admission ceiling for advisor-owned rebuilds after relation layouts and
+     /// manual durable pins have been reconstructed. Fixed state may itself
+     /// exceed this ceiling; in that case no advisor-owned artifact is admitted.
+@@ -1239,6 +1263,7 @@
+     fn default() -> Self {
+         Self {
+             max_advisor_rebuild_key_evaluations: usize::MAX,
++            max_advisor_rebuild_semantic_work_units: usize::MAX,
+             max_total_estimated_bytes: usize::MAX,
+             max_advisor_estimated_bytes: usize::MAX,
+         }
+@@ -1254,10 +1279,13 @@
+ pub struct PhysicalRecoveryReport {
+     pub rebuilt: Vec<DurablePhysicalArtifactSpec>,
+     pub skipped_key_evaluation_budget: Vec<DurablePhysicalArtifactSpec>,
++    pub skipped_semantic_work_budget: Vec<DurablePhysicalArtifactSpec>,
+     pub skipped_estimated_byte_budget: Vec<DurablePhysicalArtifactSpec>,
+     pub dropped_incompatible: Vec<DurablePhysicalArtifactSpec>,
+     pub attempted_rebuild_key_evaluations: usize,
+     pub advisor_rebuild_key_evaluations: usize,
++    pub attempted_rebuild_semantic_work_units: usize,
++    pub advisor_rebuild_semantic_work_units: usize,
+     pub advisor_estimated_bytes: usize,
+     pub total_estimated_bytes_after: usize,
+ }
+@@ -1272,6 +1300,7 @@
+         let mut deferred = self
+             .skipped_key_evaluation_budget
+             .iter()
++            .chain(self.skipped_semantic_work_budget.iter())
+             .chain(self.skipped_estimated_byte_budget.iter())
+             .filter(|spec| durable_physical_artifact_is_advisor_managed(spec))
+             .cloned()
+@@ -1282,6 +1311,12 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++struct PhysicalRebuildWorkEstimate {
++    key_evaluations: usize,
++    semantic_work_units: usize,
++}
++
+ impl From<kernel_revision::RevisionError> for RuntimeRecoveryError {
+     fn from(value: kernel_revision::RevisionError) -> Self {
+         Self::Revision(value)
+@@ -2394,6 +2429,45 @@
+         Ok(())
+     }
+ 
++    pub fn install_observable_atom_state(
++        &self,
++        binding: SemanticIndexBinding,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        let mut state = self
++            .root
++            .write()
++            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
++        let RuntimeRevisionCellState::Serving(live) = &*state else {
++            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
++        };
++        let next_version = live
++            .root_identity
++            .version
++            .0
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
++        let mut physical = live.physical.clone();
++        physical.install_observable_atom_state(
++            binding,
++            live.revision.semantic_context(),
++            registry,
++        )?;
++        let candidate = RuntimeRevisionBundle {
++            root_identity: RuntimeRootIdentity {
++                root_id: live.root_identity.root_id,
++                version: RuntimeRootVersion(next_version),
++            },
++            revision: live.revision.clone(),
++            physical,
++            relation_layouts: live.relation_layouts.clone(),
++            materialization_specs: live.materialization_specs.clone(),
++            materializations: live.materializations.clone(),
++        };
++        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
++        Ok(())
++    }
++
+     pub fn advise_semantic_indexes(
+         &self,
+         workload: &[SemanticIndexWorkloadSample],
+@@ -3019,6 +3093,14 @@
+         self.cell.install_semantic_index(index, registry)
+     }
+ 
++    pub fn install_observable_atom_state(
++        &self,
++        binding: SemanticIndexBinding,
++    ) -> Result<(), PhysicalExecutionError> {
++        self.cell
++            .install_observable_atom_state(binding, &self.registry)
++    }
++
+     pub fn advise_semantic_indexes(
+         &self,
+         workload: &[SemanticIndexWorkloadSample],
+@@ -3857,6 +3939,12 @@
+         Arc::make_mut(&mut self.semantic_statistics)
+     }
+ 
++    fn observable_atom_states_mut(
++        &mut self,
++    ) -> &mut BTreeMap<SemanticIndexBinding, Arc<MaterializedObservableAtomState>> {
++        Arc::make_mut(&mut self.observable_atom_states)
++    }
++
+     fn advisor_managed_artifacts_mut(&mut self) -> &mut BTreeSet<ManagedPhysicalArtifact> {
+         Arc::make_mut(&mut self.advisor_managed_artifacts)
+     }
+@@ -3901,6 +3989,8 @@
+             .retain(|_, state| !state.supports_relation(relation, binding));
+         self.semantic_statistics_mut()
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
++        self.observable_atom_states_mut()
++            .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+         self.advisor_managed_artifacts_mut()
+             .retain(|artifact| !artifact.touches_relation_layout(relation, binding));
+         self.transition_epoch = next_epoch;
+@@ -4170,54 +4260,47 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> PhysicalRecoveryReport {
+         let mut report = PhysicalRecoveryReport::default();
+-        let mut optional_specs = specs
+-            .iter()
+-            .filter(|spec| !matches!(spec, DurablePhysicalArtifactSpec::RelationLayout { .. }))
+-            .cloned()
+-            .collect::<Vec<_>>();
+-        optional_specs.sort();
+-        let mut scheduled_specs = Vec::with_capacity(optional_specs.len());
+-        for spec in optional_specs {
+-            // Recipes describe reconstructible optimization state, never logical
+-            // authority. Manual pins get deterministic priority over advisor-owned
+-            // state and remain fixed durable intent; recovery budgets can skip only
+-            // advisor-owned derivatives without weakening authoritative recovery.
+-            let Ok(key_evaluations) =
+-                self.durable_physical_artifact_rebuild_key_evaluations(&spec, relation_layouts)
+-            else {
+-                report.dropped_incompatible.push(spec);
+-                continue;
+-            };
+-            scheduled_specs.push((spec, key_evaluations));
+-        }
+-        scheduled_specs.sort_by(|(left, left_work), (right, right_work)| {
+-            let left_advisor = durable_physical_artifact_is_advisor_managed(left);
+-            let right_advisor = durable_physical_artifact_is_advisor_managed(right);
+-            left_advisor.cmp(&right_advisor).then_with(|| {
+-                if left_advisor {
+-                    left_work.cmp(right_work).then_with(|| left.cmp(right))
+-                } else {
+-                    left.cmp(right)
+-                }
+-            })
+-        });
++        let scheduled_specs =
++            self.schedule_durable_physical_artifact_rebuilds(specs, relation_layouts, &mut report);
+ 
+-        for (spec, key_evaluations) in scheduled_specs {
++        for (spec, work) in scheduled_specs {
+             let advisor_managed = durable_physical_artifact_is_advisor_managed(&spec);
+             let next_total_key_evaluations = report
+                 .attempted_rebuild_key_evaluations
+-                .saturating_add(key_evaluations);
++                .saturating_add(work.key_evaluations);
+             let next_advisor_key_evaluations = report
+                 .advisor_rebuild_key_evaluations
+-                .saturating_add(if advisor_managed { key_evaluations } else { 0 });
++                .saturating_add(if advisor_managed {
++                    work.key_evaluations
++                } else {
++                    0
++                });
+             if advisor_managed
+                 && next_advisor_key_evaluations > policy.max_advisor_rebuild_key_evaluations
+             {
+                 report.skipped_key_evaluation_budget.push(spec);
+                 continue;
+             }
++            let next_total_semantic_work = report
++                .attempted_rebuild_semantic_work_units
++                .saturating_add(work.semantic_work_units);
++            let next_advisor_semantic_work = report
++                .advisor_rebuild_semantic_work_units
++                .saturating_add(if advisor_managed {
++                    work.semantic_work_units
++                } else {
++                    0
++                });
++            if advisor_managed
++                && next_advisor_semantic_work > policy.max_advisor_rebuild_semantic_work_units
++            {
++                report.skipped_semantic_work_budget.push(spec);
++                continue;
++            }
+             report.attempted_rebuild_key_evaluations = next_total_key_evaluations;
+             report.advisor_rebuild_key_evaluations = next_advisor_key_evaluations;
++            report.attempted_rebuild_semantic_work_units = next_total_semantic_work;
++            report.advisor_rebuild_semantic_work_units = next_advisor_semantic_work;
+ 
+             let current_estimated_bytes =
+                 self.artifact_memory_report().total_estimated_retained_bytes;
+@@ -4260,14 +4343,80 @@
+         report
+     }
+ 
+-    fn durable_physical_artifact_rebuild_key_evaluations(
++    fn schedule_durable_physical_artifact_rebuilds(
++        &self,
++        specs: &[DurablePhysicalArtifactSpec],
++        relation_layouts: &BTreeMap<SemanticId, LayoutBinding>,
++        report: &mut PhysicalRecoveryReport,
++    ) -> Vec<(DurablePhysicalArtifactSpec, PhysicalRebuildWorkEstimate)> {
++        let mut semantic_column_work_cache = BTreeMap::<(SemanticId, usize), usize>::new();
++        let mut optional_specs = specs
++            .iter()
++            .filter(|spec| !matches!(spec, DurablePhysicalArtifactSpec::RelationLayout { .. }))
++            .cloned()
++            .collect::<Vec<_>>();
++        optional_specs.sort();
++        let mut scheduled = Vec::with_capacity(optional_specs.len());
++        for spec in optional_specs {
++            let Ok(work) = self.durable_physical_artifact_rebuild_work(
++                &spec,
++                relation_layouts,
++                &mut semantic_column_work_cache,
++            ) else {
++                report.dropped_incompatible.push(spec);
++                continue;
++            };
++            scheduled.push((spec, work));
++        }
++        scheduled.sort_by(|(left, left_work), (right, right_work)| {
++            let left_advisor = durable_physical_artifact_is_advisor_managed(left);
++            let right_advisor = durable_physical_artifact_is_advisor_managed(right);
++            left_advisor.cmp(&right_advisor).then_with(|| {
++                if left_advisor {
++                    left_work
++                        .semantic_work_units
++                        .cmp(&right_work.semantic_work_units)
++                        .then_with(|| left_work.key_evaluations.cmp(&right_work.key_evaluations))
++                        .then_with(|| left.cmp(right))
++                } else {
++                    left.cmp(right)
++                }
++            })
++        });
++        scheduled
++    }
++
++    fn durable_physical_artifact_rebuild_work(
+         &self,
+         spec: &DurablePhysicalArtifactSpec,
+         relation_layouts: &BTreeMap<SemanticId, LayoutBinding>,
+-    ) -> Result<usize, PhysicalExecutionError> {
++        semantic_column_work_cache: &mut BTreeMap<(SemanticId, usize), usize>,
++    ) -> Result<PhysicalRebuildWorkEstimate, PhysicalExecutionError> {
+         let (relation, key_parts) = match spec {
+-            DurablePhysicalArtifactSpec::RelationLayout { .. } => return Ok(0),
+-            DurablePhysicalArtifactSpec::I64Index { relation, .. } => (*relation, 1),
++            DurablePhysicalArtifactSpec::RelationLayout { .. } => {
++                return Ok(PhysicalRebuildWorkEstimate::default());
++            }
++            DurablePhysicalArtifactSpec::I64Index {
++                relation,
++                key_column,
++                ..
++            } => {
++                let layout = relation_layouts.get(relation).copied().ok_or(
++                    PhysicalExecutionError::MissingRuntimeRelationBinding(*relation),
++                )?;
++                let installed = self.installed(*relation, layout)?;
++                let row_count = native_row_count(&installed.data);
++                let semantic_work_units = *semantic_column_work_cache
++                    .entry((*relation, *key_column))
++                    .or_insert(native_semantic_column_work_units(
++                        &installed.data,
++                        *key_column,
++                    )?);
++                return Ok(PhysicalRebuildWorkEstimate {
++                    key_evaluations: row_count,
++                    semantic_work_units,
++                });
++            }
+             DurablePhysicalArtifactSpec::SemanticIndex {
+                 relation,
+                 key_parts,
+@@ -4282,13 +4431,28 @@
+                 relation,
+                 key_parts,
+                 ..
+-            } => (*relation, key_parts.len().max(1)),
++            } => (*relation, key_parts),
+         };
+         let layout = relation_layouts.get(&relation).copied().ok_or(
+             PhysicalExecutionError::MissingRuntimeRelationBinding(relation),
+         )?;
+-        let relation = self.installed(relation, layout)?;
+-        Ok(native_row_count(&relation.data).saturating_mul(key_parts))
++        let installed = self.installed(relation, layout)?;
++        let row_count = native_row_count(&installed.data);
++        let semantic_work_units = key_parts.iter().try_fold(0_usize, |work, part| {
++            let column_work =
++                if let Some(work) = semantic_column_work_cache.get(&(relation, part.column)) {
++                    *work
++                } else {
++                    let work = native_semantic_column_work_units(&installed.data, part.column)?;
++                    semantic_column_work_cache.insert((relation, part.column), work);
++                    work
++                };
++            Ok::<_, PhysicalExecutionError>(work.saturating_add(column_work))
++        })?;
++        Ok(PhysicalRebuildWorkEstimate {
++            key_evaluations: row_count.saturating_mul(key_parts.len().max(1)),
++            semantic_work_units,
++        })
+     }
+ 
+     fn try_restore_durable_physical_artifact(
+@@ -4429,6 +4593,13 @@
+                     .contains(&ManagedPhysicalArtifact::SemanticIndex(binding.clone())),
+             );
+         }
++        for state in self.observable_atom_states.values() {
++            add(
++                PhysicalArtifactFamily::ObservableAtom,
++                observable_atom_estimated_retained_bytes(state),
++                false,
++            );
++        }
+         for (binding, state) in self.semantic_quotient_factors.iter() {
+             add(
+                 PhysicalArtifactFamily::SemanticQuotientFactor,
+@@ -4480,6 +4651,78 @@
+         Ok(())
+     }
+ 
++    pub fn install_observable_atom_state(
++        &mut self,
++        binding: SemanticIndexBinding,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        let relation = self.installed(binding.relation, binding.layout)?;
++        let state =
++            MaterializedObservableAtomState::build(binding.clone(), relation, context, registry)?;
++        let next_epoch = self
++            .transition_epoch
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
++        self.observable_atom_states_mut()
++            .insert(binding, Arc::new(state));
++        self.transition_epoch = next_epoch;
++        self.state_identity = Arc::new(());
++        Ok(())
++    }
++
++    pub fn observable_atom_probe_values(
++        &self,
++        binding: &SemanticIndexBinding,
++        values: &[&Value],
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Option<Vec<PhysicalRowId>>, PhysicalExecutionError> {
++        let state = self
++            .observable_atom_states
++            .get(binding)
++            .ok_or(PhysicalExecutionError::MissingPhysicalIndex)?;
++        state.probe_values(values, context, registry)
++    }
++
++    pub fn observable_atom_probe_value(
++        &self,
++        binding: &SemanticIndexBinding,
++        slot: usize,
++        value: &Value,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Vec<PhysicalRowId>, PhysicalExecutionError> {
++        let state = self
++            .observable_atom_states
++            .get(binding)
++            .ok_or(PhysicalExecutionError::MissingPhysicalIndex)?;
++        state.probe_slot_value(slot, value, context, registry)
++    }
++
++    pub fn observable_atom_count_value(
++        &self,
++        binding: &SemanticIndexBinding,
++        slot: usize,
++        value: &Value,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<usize, PhysicalExecutionError> {
++        let state = self
++            .observable_atom_states
++            .get(binding)
++            .ok_or(PhysicalExecutionError::MissingPhysicalIndex)?;
++        state.count_slot_value(slot, value, context, registry)
++    }
++
++    #[must_use]
++    pub fn observable_atom_state(
++        &self,
++        binding: &SemanticIndexBinding,
++    ) -> Option<&MaterializedObservableAtomState> {
++        self.observable_atom_states.get(binding).map(Arc::as_ref)
++    }
++
+     pub fn advise_semantic_indexes(
+         &mut self,
+         workload: &[SemanticIndexWorkloadSample],
+@@ -4694,6 +4937,14 @@
+                 return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+             }
+         }
++        for (binding, state) in self.observable_atom_states.iter() {
++            if binding.relation == relation
++                && binding.layout.id == layout.id
++                && !state.compatible_with(context, registry)?
++            {
++                return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
++            }
++        }
+         Ok(())
+     }
+ 
+@@ -4728,6 +4979,11 @@
+                 state.validate_physical_delta(delta)?;
+             }
+         }
++        for (binding, state) in self.observable_atom_states.iter() {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.validate_physical_delta(delta, context, registry)?;
++            }
++        }
+         Ok(())
+     }
+ 
+@@ -4786,6 +5042,17 @@
+                 }
+             }
+         }
++        if self
++            .observable_atom_states
++            .keys()
++            .any(|binding| binding.relation == relation && binding.layout.id == layout.id)
++        {
++            for (binding, state) in self.observable_atom_states_mut().iter_mut() {
++                if binding.relation == relation && binding.layout.id == layout.id {
++                    Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
++                }
++            }
++        }
+         Ok(())
+     }
+ 
+@@ -5606,6 +5873,352 @@
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
++pub struct MaterializedObservableAtomState {
++    binding: SemanticIndexBinding,
++    catalog: kernel_semantics::observable::RevisionObservableCatalog,
++    observables: Vec<kernel_types::RevisionObservableId>,
++    product_observable: kernel_types::RevisionObservableId,
++    projection: kernel_semantics::observable::CertifiedSemanticMorphism,
++    fabric: kernel_semantics::support_atom::SupportAtomFabric<PhysicalRowId>,
++}
++
++impl MaterializedObservableAtomState {
++    fn build(
++        binding: SemanticIndexBinding,
++        relation: &InstalledRelation,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, PhysicalExecutionError> {
++        if binding.key_parts.is_empty() {
++            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++        }
++        let mut catalog = kernel_semantics::observable::RevisionObservableCatalog::new(context)
++            .map_err(observable_error_to_physical)?;
++        let observables = binding
++            .key_parts
++            .iter()
++            .map(|part| {
++                catalog
++                    .register_equivalence(registry, context, part.equivalence)
++                    .map_err(observable_error_to_physical)
++            })
++            .collect::<Result<Vec<_>, _>>()?;
++        let product_observable = catalog
++            .register_product(observables.clone())
++            .map_err(observable_error_to_physical)?;
++        let mut fabric = kernel_semantics::support_atom::SupportAtomFabric::new(
++            &catalog,
++            product_observable,
++            observables.clone(),
++        )
++        .map_err(support_atom_error_to_physical)?;
++
++        for row_index in relation.scan_positions() {
++            let row = materialize_native_row(&relation.data, row_index)?;
++            let classes = observe_atom_row_classes(
++                &binding,
++                &observables,
++                &mut catalog,
++                context,
++                registry,
++                &row,
++            )?;
++            let atom_class = catalog
++                .intern_product_class(product_observable, classes.clone())
++                .map_err(observable_error_to_physical)?;
++            fabric
++                .insert(
++                    &catalog,
++                    relation.row_id_at(row_index)?,
++                    atom_class,
++                    &classes,
++                )
++                .map_err(support_atom_error_to_physical)?;
++        }
++        let projection =
++            kernel_semantics::observable::CertifiedSemanticMorphism::product_projection(
++                &catalog,
++                product_observable,
++                (0..observables.len()).collect(),
++            )
++            .map_err(observable_error_to_physical)?;
++        Ok(Self {
++            binding,
++            catalog,
++            observables,
++            product_observable,
++            projection,
++            fabric,
++        })
++    }
++
++    fn compatible_with(
++        &self,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<bool, PhysicalExecutionError> {
++        if self.catalog.revision() != context.revision() {
++            return Ok(false);
++        }
++        for part in &self.binding.key_parts {
++            let _ = registry.equivalence_domain(context, part.equivalence)?;
++        }
++        Ok(true)
++    }
++
++    #[must_use]
++    pub fn row_count(&self) -> usize {
++        self.fabric.row_count()
++    }
++
++    #[must_use]
++    pub fn atom_count(&self) -> usize {
++        self.fabric.atom_count()
++    }
++
++    #[must_use]
++    pub const fn product_observable(&self) -> kernel_types::RevisionObservableId {
++        self.product_observable
++    }
++
++    #[must_use]
++    pub const fn product_projection(
++        &self,
++    ) -> &kernel_semantics::observable::CertifiedSemanticMorphism {
++        &self.projection
++    }
++
++    fn probe_values(
++        &self,
++        values: &[&Value],
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Option<Vec<PhysicalRowId>>, PhysicalExecutionError> {
++        if values.len() != self.observables.len() {
++            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++        }
++        let mut classes = Vec::with_capacity(values.len());
++        for (&observable, value) in self.observables.iter().zip(values) {
++            let Some(class) = self
++                .catalog
++                .lookup_value_class(registry, context, observable, value)
++                .map_err(observable_error_to_physical)?
++            else {
++                return Ok(None);
++            };
++            classes.push(class);
++        }
++        Ok(self
++            .fabric
++            .joint_fiber(&classes)
++            .map(|rows| rows.iter().copied().collect()))
++    }
++
++    fn probe_slot_value(
++        &self,
++        slot: usize,
++        value: &Value,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Vec<PhysicalRowId>, PhysicalExecutionError> {
++        let observable = self
++            .observables
++            .get(slot)
++            .copied()
++            .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
++        let Some(class) = self
++            .catalog
++            .lookup_value_class(registry, context, observable, value)
++            .map_err(observable_error_to_physical)?
++        else {
++            return Ok(Vec::new());
++        };
++        self.fabric
++            .projected_fiber(slot, class)
++            .map(|rows| rows.into_iter().collect())
++            .map_err(support_atom_error_to_physical)
++    }
++
++    fn count_slot_value(
++        &self,
++        slot: usize,
++        value: &Value,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<usize, PhysicalExecutionError> {
++        let observable = self
++            .observables
++            .get(slot)
++            .copied()
++            .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
++        let Some(class) = self
++            .catalog
++            .lookup_value_class(registry, context, observable, value)
++            .map_err(observable_error_to_physical)?
++        else {
++            return Ok(0);
++        };
++        self.fabric
++            .projected_count(slot, class)
++            .map_err(support_atom_error_to_physical)
++    }
++
++    fn validate_physical_delta(
++        &self,
++        delta: &PhysicalRelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        for (row_id, row) in &delta.removed {
++            let classes = lookup_atom_row_classes(
++                &self.binding,
++                &self.observables,
++                &self.catalog,
++                context,
++                registry,
++                row,
++            )?
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            if self.fabric.row_signature(row_id) != Some(classes.as_slice()) {
++                return Err(RelQueryError::InconsistentIncrementalDelta.into());
++            }
++        }
++
++        let mut catalog = self.catalog.clone();
++        for (_, row) in &delta.inserted {
++            let classes = observe_atom_row_classes(
++                &self.binding,
++                &self.observables,
++                &mut catalog,
++                context,
++                registry,
++                row,
++            )?;
++            let _ = catalog
++                .intern_product_class(self.product_observable, classes)
++                .map_err(observable_error_to_physical)?;
++        }
++        Ok(())
++    }
++
++    fn apply_physical_delta(
++        &mut self,
++        delta: &PhysicalRelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        let mut candidate = self.clone();
++        for (row_id, _) in &delta.removed {
++            candidate
++                .fabric
++                .remove(row_id)
++                .map_err(support_atom_error_to_physical)?;
++        }
++        for (row_id, row) in &delta.inserted {
++            let classes = observe_atom_row_classes(
++                &candidate.binding,
++                &candidate.observables,
++                &mut candidate.catalog,
++                context,
++                registry,
++                row,
++            )?;
++            let atom_class = candidate
++                .catalog
++                .intern_product_class(candidate.product_observable, classes.clone())
++                .map_err(observable_error_to_physical)?;
++            candidate
++                .fabric
++                .insert(&candidate.catalog, *row_id, atom_class, &classes)
++                .map_err(support_atom_error_to_physical)?;
++        }
++        candidate.projection =
++            kernel_semantics::observable::CertifiedSemanticMorphism::product_projection(
++                &candidate.catalog,
++                candidate.product_observable,
++                (0..candidate.observables.len()).collect(),
++            )
++            .map_err(observable_error_to_physical)?;
++        *self = candidate;
++        Ok(())
++    }
++}
++
++fn observe_atom_row_classes(
++    binding: &SemanticIndexBinding,
++    observables: &[kernel_types::RevisionObservableId],
++    catalog: &mut kernel_semantics::observable::RevisionObservableCatalog,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    row: &kernel_query::Row,
++) -> Result<Vec<kernel_types::EqClassId>, PhysicalExecutionError> {
++    binding
++        .key_parts
++        .iter()
++        .zip(observables)
++        .map(|(part, &observable)| {
++            let value = row
++                .get(part.column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            catalog
++                .observe_value(registry, context, observable, value)
++                .map_err(observable_error_to_physical)
++        })
++        .collect()
++}
++
++fn lookup_atom_row_classes(
++    binding: &SemanticIndexBinding,
++    observables: &[kernel_types::RevisionObservableId],
++    catalog: &kernel_semantics::observable::RevisionObservableCatalog,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    row: &kernel_query::Row,
++) -> Result<Option<Vec<kernel_types::EqClassId>>, PhysicalExecutionError> {
++    let mut classes = Vec::with_capacity(observables.len());
++    for (part, &observable) in binding.key_parts.iter().zip(observables) {
++        let value = row
++            .get(part.column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        let Some(class) = catalog
++            .lookup_value_class(registry, context, observable, value)
++            .map_err(observable_error_to_physical)?
++        else {
++            return Ok(None);
++        };
++        classes.push(class);
++    }
++    Ok(Some(classes))
++}
++
++fn observable_error_to_physical(
++    error: kernel_semantics::observable::ObservableError,
++) -> PhysicalExecutionError {
++    match error {
++        kernel_semantics::observable::ObservableError::Semantic(error) => error.into(),
++        kernel_semantics::observable::ObservableError::RevisionMismatch { .. }
++        | kernel_semantics::observable::ObservableError::ObservableCatalogMismatch => {
++            PhysicalExecutionError::SemanticContextTransitionRequiresRebuild
++        }
++        _ => PhysicalExecutionError::PhysicalTypeMismatch,
++    }
++}
++
++fn support_atom_error_to_physical<RowId>(
++    error: kernel_semantics::support_atom::SupportAtomError<RowId>,
++) -> PhysicalExecutionError {
++    match error {
++        kernel_semantics::support_atom::SupportAtomError::Observable(error) => {
++            observable_error_to_physical(error)
++        }
++        kernel_semantics::support_atom::SupportAtomError::CatalogMismatch => {
++            PhysicalExecutionError::SemanticContextTransitionRequiresRebuild
++        }
++        _ => PhysicalExecutionError::PhysicalTypeMismatch,
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
+ struct MaterializedSemanticQuotientFactorState {
+     binding: SemanticIndexBinding,
+     key_binding: kernel_semantic_index::SemanticIndexBinding,
+@@ -6295,6 +6908,7 @@
+     SharedDenseIdentityMap,
+     I64Index,
+     SemanticIndex,
++    ObservableAtom,
+     SemanticQuotientFactor,
+     SemanticQuotientSupport,
+     SemanticStatistics,
+@@ -14552,6 +15166,46 @@
+         )
+ }
+ 
++fn observable_atom_estimated_retained_bytes(state: &MaterializedObservableAtomState) -> usize {
++    let class_bytes = std::mem::size_of::<kernel_types::EqClassId>();
++    let row_bytes = std::mem::size_of::<PhysicalRowId>();
++    let atom_rows = state.fabric.row_count();
++    let atoms = state.fabric.atom_count();
++    let coordinates = state.observables.len();
++    let projection_refs = state.fabric.projection_atom_reference_count();
++    let projected_classes = state.fabric.projected_class_count();
++    let projection_mapping_bytes =
++        state
++            .projection
++            .materialized_mapping()
++            .iter()
++            .fold(0_usize, |bytes, (source, target)| {
++                bytes
++                    .saturating_add(std::mem::size_of::<Vec<kernel_types::EqClassId>>() * 2)
++                    .saturating_add(source.capacity().saturating_mul(class_bytes))
++                    .saturating_add(target.capacity().saturating_mul(class_bytes))
++            });
++
++    std::mem::size_of::<MaterializedObservableAtomState>()
++        .saturating_add(semantic_index_binding_heap_bytes(&state.binding))
++        .saturating_add(
++            state
++                .observables
++                .capacity()
++                .saturating_mul(std::mem::size_of::<kernel_types::RevisionObservableId>()),
++        )
++        .saturating_add(atom_rows.saturating_mul(row_bytes.saturating_mul(2)))
++        .saturating_add(atom_rows.saturating_mul(class_bytes))
++        .saturating_add(
++            atoms
++                .saturating_mul(coordinates)
++                .saturating_mul(class_bytes),
++        )
++        .saturating_add(projection_refs.saturating_mul(class_bytes))
++        .saturating_add(projected_classes.saturating_mul(class_bytes))
++        .saturating_add(projection_mapping_bytes)
++}
++
+ fn i64_index_estimated_retained_bytes(state: &MaterializedI64IndexState) -> usize {
+     state.buckets.iter().fold(
+         std::mem::size_of::<MaterializedI64IndexState>(),
+@@ -16074,6 +16728,46 @@
+     }
+ }
+ 
++fn native_semantic_column_work_units(
++    data: &NativeRelation,
++    column: usize,
++) -> Result<usize, PhysicalExecutionError> {
++    match data {
++        NativeRelation::RowStore(rows) => rows.iter().try_fold(0_usize, |work, row| {
++            let value = row
++                .get(column)
++                .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
++            Ok(work.saturating_add(
++                kernel_semantics::semantic_value_work_estimate(value).total_units(),
++            ))
++        }),
++        NativeRelation::Columnar { columns, .. } => {
++            let values = columns
++                .get(column)
++                .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
++            Ok(values.iter().fold(0_usize, |work, value| {
++                work.saturating_add(
++                    kernel_semantics::semantic_value_work_estimate(value).total_units(),
++                )
++            }))
++        }
++        NativeRelation::I64Columnar { columns, row_count } => {
++            columns
++                .get(column)
++                .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
++            Ok(*row_count)
++        }
++        NativeRelation::TypedColumnar { columns, row_count } => {
++            let column = columns
++                .get(column)
++                .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
++            (0..*row_count).try_fold(0_usize, |work, row_index| {
++                Ok(work.saturating_add(column.semantic_work_units_at(row_index)?))
++            })
++        }
++    }
++}
++
+ fn materialize_native_row(
+     data: &NativeRelation,
+     row_index: usize,
+@@ -18572,6 +19266,102 @@
+         (context, registry, relation, binding, runtime)
+     }
+ 
++    fn two_text_recovery_bundle(
++        revision_id: u64,
++        short_values: &[&str],
++        long_values: &[&str],
++    ) -> (
++        SemanticContext,
++        SemanticRegistry,
++        SemanticIndexBinding,
++        SemanticIndexBinding,
++        RuntimeRevisionBundle,
++    ) {
++        assert_eq!(short_values.len(), long_values.len());
++        let relation = sid(9_930_000 + revision_id);
++        let equivalence = sid(9_940_000 + revision_id);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(revision_id));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(revision_id));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![
++                    TypeExpr::Scalar(ScalarType::Text),
++                    TypeExpr::Scalar(ScalarType::Text),
++                ],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence, equivalence],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let rows = short_values
++            .iter()
++            .zip(long_values)
++            .map(|(short, long)| vec![Value::Text((*short).into()), Value::Text((*long).into())])
++            .collect::<Vec<_>>();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(relation, rows.clone());
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(revision_id),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let layout = LayoutBinding {
++            id: LayoutId(u128::from(9_950_000 + revision_id)),
++            family: LayoutFamily::Columnar,
++        };
++        let mut physical = PhysicalStore::default();
++        physical
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_from_rows(
++                    &rows,
++                    &[
++                        TypeExpr::Scalar(ScalarType::Text),
++                        TypeExpr::Scalar(ScalarType::Text),
++                    ],
++                )
++                .unwrap(),
++            )
++            .unwrap();
++        let short = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        let long = SemanticIndexBinding::single(relation, layout, 1, equivalence);
++        physical
++            .install_semantic_index(short.clone(), &context, &registry)
++            .unwrap();
++        physical
++            .install_semantic_index(long.clone(), &context, &registry)
++            .unwrap();
++        physical
++            .advisor_managed_artifacts_mut()
++            .insert(ManagedPhysicalArtifact::SemanticIndex(short.clone()));
++        physical
++            .advisor_managed_artifacts_mut()
++            .insert(ManagedPhysicalArtifact::SemanticIndex(long.clone()));
++        let root = RuntimeRevisionBundle::build(
++            revision,
++            physical,
++            BTreeMap::from([(relation, layout)]),
++            &[],
++            &registry,
++        )
++        .unwrap();
++        (context, registry, short, long, root)
++    }
++
+     fn scan_delta(
+         relation: SemanticId,
+         inserted: &[i64],
+@@ -18894,6 +19684,36 @@
+     }
+ 
+     #[test]
++    fn observable_atom_state_publishes_as_reconstructible_runtime_state() {
++        let values = (0_i64..32).collect::<Vec<_>>();
++        let (context, registry, relation, layout, runtime) =
++            scan_runtime_bundle(9_978_200, 9_978_201, &values);
++        let binding = SemanticIndexBinding::single(relation, layout, 0, sid(101));
++        let cell = RuntimeRevisionCell::new(runtime);
++        let old_reader = cell.snapshot().unwrap();
++
++        cell.install_observable_atom_state(binding.clone(), &registry)
++            .unwrap();
++        let new_reader = cell.snapshot().unwrap();
++        assert_eq!(old_reader.revision_id(), new_reader.revision_id());
++        assert_eq!(old_reader.root_version().raw(), 0);
++        assert_eq!(new_reader.root_version().raw(), 1);
++        assert!(
++            old_reader
++                .physical_store()
++                .observable_atom_state(&binding)
++                .is_none()
++        );
++        let state = new_reader
++            .physical_store()
++            .observable_atom_state(&binding)
++            .unwrap();
++        assert_eq!(state.row_count(), 32);
++        assert_eq!(state.atom_count(), 32);
++        assert_eq!(state.catalog.revision(), context.revision());
++    }
++
++    #[test]
+     fn semantic_index_advisor_publishes_one_runtime_root_and_noop_does_not_republish() {
+         let values = (0_i64..64).collect::<Vec<_>>();
+         let (context, registry, relation, binding, runtime) = scan_runtime_bundle(72, 965, &values);
+@@ -20342,6 +21162,221 @@
+     }
+ 
+     #[test]
++    fn observable_atom_state_matches_legacy_semantic_index_and_statistics_views() {
++        let (context, registry, relation, equivalence, layout, mut store) =
++            text_semantic_index_fixture();
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        store
++            .install_semantic_statistics(binding.clone(), &context, &registry)
++            .unwrap();
++        store
++            .install_observable_atom_state(binding.clone(), &context, &registry)
++            .unwrap();
++
++        let value = Value::Text("a".into());
++        let mut legacy = store
++            .semantic_index(&binding)
++            .unwrap()
++            .probe_value(&value, &context, &registry)
++            .unwrap()
++            .unwrap()
++            .to_vec();
++        let mut atom_rows = store
++            .observable_atom_probe_value(&binding, 0, &value, &context, &registry)
++            .unwrap();
++        legacy.sort_unstable();
++        atom_rows.sort_unstable();
++        assert_eq!(atom_rows, legacy);
++        assert_eq!(
++            store
++                .observable_atom_count_value(&binding, 0, &value, &context, &registry)
++                .unwrap(),
++            2
++        );
++        let state = store.observable_atom_state(&binding).unwrap();
++        assert_eq!(state.row_count(), 3);
++        assert_eq!(state.atom_count(), 2);
++    }
++
++    #[test]
++    fn observable_atom_state_maintains_exact_fibers_through_relation_delta() {
++        let (context, registry, relation, equivalence, layout, mut store) =
++            text_semantic_index_fixture();
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        store
++            .install_observable_atom_state(binding.clone(), &context, &registry)
++            .unwrap();
++        let result_type = RelExpr::Scan(relation)
++            .typecheck(&context, &registry)
++            .unwrap();
++        store
++            .apply_relation_delta(
++                relation,
++                layout,
++                &RelationDelta {
++                    inserted: vec![vec![Value::Text("C".into())]],
++                    removed: vec![vec![Value::Text("A".into())]],
++                    result_type,
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++
++        assert_eq!(
++            store
++                .observable_atom_count_value(
++                    &binding,
++                    0,
++                    &Value::Text("a".into()),
++                    &context,
++                    &registry,
++                )
++                .unwrap(),
++            1
++        );
++        assert_eq!(
++            store
++                .observable_atom_count_value(
++                    &binding,
++                    0,
++                    &Value::Text("c".into()),
++                    &context,
++                    &registry,
++                )
++                .unwrap(),
++            1
++        );
++        assert_eq!(
++            store.observable_atom_state(&binding).unwrap().row_count(),
++            3
++        );
++    }
++
++    #[test]
++    fn observable_atom_state_is_invalidated_on_layout_replacement() {
++        let (context, registry, relation, equivalence, layout, mut store) =
++            text_semantic_index_fixture();
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        store
++            .install_observable_atom_state(binding.clone(), &context, &registry)
++            .unwrap();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::Text(vec!["z".into()])]).unwrap(),
++            )
++            .unwrap();
++        assert!(store.observable_atom_state(&binding).is_none());
++    }
++
++    #[test]
++    fn observable_atom_state_rejects_gamma_drift_before_relation_mutation() {
++        let (context, mut registry, relation, equivalence, layout, mut store) =
++            text_semantic_index_fixture();
++        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
++        store
++            .install_observable_atom_state(binding.clone(), &context, &registry)
++            .unwrap();
++        let before = store.clone();
++
++        let mut changed = context.clone();
++        let exact = registry.install_equivalence(EquivalenceModule::TextExact);
++        changed.environment.pin_module(equivalence, exact);
++        let result_type = RelExpr::Scan(relation)
++            .typecheck(&changed, &registry)
++            .unwrap();
++        assert!(matches!(
++            store.apply_relation_delta(
++                relation,
++                layout,
++                &RelationDelta {
++                    inserted: vec![vec![Value::Text("C".into())]],
++                    removed: Vec::new(),
++                    result_type,
++                },
++                &changed,
++                &registry,
++            ),
++            Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild)
++        ));
++        assert_eq!(store, before);
++    }
++
++    #[test]
++    fn observable_atom_state_factors_multi_column_joint_and_projected_fibers() {
++        let relation = sid(9_978_100);
++        let equivalence = sid(9_978_101);
++        let (context, registry) = two_i64_column_context(relation, equivalence, 9_978_100);
++        let layout = LayoutBinding {
++            id: LayoutId(9_978_100),
++            family: LayoutFamily::Columnar,
++        };
++        let binding = SemanticIndexBinding {
++            relation,
++            layout,
++            key_parts: vec![
++                SemanticIndexKeyPart {
++                    column: 0,
++                    equivalence,
++                },
++                SemanticIndexKeyPart {
++                    column: 1,
++                    equivalence,
++                },
++            ],
++        };
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![
++                    NativeColumn::I64(vec![1, 1, 2]),
++                    NativeColumn::I64(vec![10, 20, 10]),
++                ])
++                .unwrap(),
++            )
++            .unwrap();
++        store
++            .install_observable_atom_state(binding.clone(), &context, &registry)
++            .unwrap();
++
++        let joint = store
++            .observable_atom_probe_values(
++                &binding,
++                &[&Value::I64(1), &Value::I64(10)],
++                &context,
++                &registry,
++            )
++            .unwrap()
++            .unwrap();
++        assert_eq!(joint.len(), 1);
++        assert_eq!(
++            store
++                .observable_atom_probe_value(&binding, 0, &Value::I64(1), &context, &registry)
++                .unwrap()
++                .len(),
++            2
++        );
++        assert_eq!(
++            store
++                .observable_atom_probe_value(&binding, 1, &Value::I64(10), &context, &registry)
++                .unwrap()
++                .len(),
++            2
++        );
++        let state = store.observable_atom_state(&binding).unwrap();
++        assert_eq!(state.atom_count(), 3);
++        assert_eq!(
++            state.product_projection().source(),
++            &[state.product_observable()]
++        );
++        assert_eq!(state.product_projection().target().len(), 2);
++    }
++
++    #[test]
+     fn semantic_statistics_are_invalidated_by_gamma_change() {
+         let (context, mut registry, relation, equivalence, layout, mut store) =
+             text_semantic_index_fixture();
+@@ -27797,6 +28832,60 @@
+     }
+ 
+     #[test]
++    fn recovery_semantic_work_budget_distinguishes_same_cell_count_by_payload_size() {
++        let dir = durable_test_dir("bounded-physical-recovery-semantic-work");
++        let (_context, registry, short, long, root) = two_text_recovery_bundle(
++            5_182,
++            &["a", "b"],
++            &[
++                "this-is-a-deliberately-long-semantic-key-payload",
++                "this-is-another-deliberately-long-semantic-key-payload",
++            ],
++        );
++        drop(DurableRuntime::create(root, &dir, &registry).unwrap());
++
++        let (reopened, report) = DurableRuntime::open_with_recovery_policy(
++            &dir,
++            PhysicalRecoveryPolicy {
++                max_advisor_rebuild_semantic_work_units: 4,
++                ..PhysicalRecoveryPolicy::default()
++            },
++        )
++        .unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert!(snapshot.physical_store().semantic_index(&short).is_some());
++        assert!(snapshot.physical_store().semantic_index(&long).is_none());
++        assert_eq!(report.advisor_rebuild_key_evaluations, 2);
++        assert_eq!(report.advisor_rebuild_semantic_work_units, 4);
++        assert_eq!(report.skipped_semantic_work_budget.len(), 1);
++        assert!(matches!(
++            report.skipped_semantic_work_budget.as_slice(),
++            [DurablePhysicalArtifactSpec::SemanticIndex { key_parts, .. }]
++                if key_parts.as_slice() == [DurableSemanticKeyPart {
++                    column: 1,
++                    equivalence: long.key_parts[0].equivalence,
++                }]
++        ));
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn typed_algebraic_work_estimate_matches_logical_value_shape_without_row_materialization() {
++        let value = Value::Seq(vec![Value::Text("abc".into()), Value::Text("d".into())]);
++        let data = NativeRelation::typed_from_rows(
++            &[vec![value.clone()]],
++            &[TypeExpr::Seq(Box::new(TypeExpr::Scalar(ScalarType::Text)))],
++        )
++        .unwrap();
++        assert_eq!(
++            native_semantic_column_work_units(&data, 0).unwrap(),
++            kernel_semantics::semantic_value_work_estimate(&value).total_units()
++        );
++    }
++
++    #[test]
+     fn deferred_recovery_never_replays_manual_or_incompatible_recipes() {
+         let dir = durable_test_dir("deferred-physical-recovery-safety");
+         let (context, registry, relation, layout, mut root) =
+diff -ruN a/crates/kernel-semantics/src/lib.rs b/crates/kernel-semantics/src/lib.rs
+--- a/crates/kernel-semantics/src/lib.rs	2026-09-21 14:26:32.689039382 +0000
++++ b/crates/kernel-semantics/src/lib.rs	2026-09-21 15:28:46.773065287 +0000
+@@ -9,6 +9,7 @@
+ 
+ pub mod anchor_pullback;
+ pub mod observable;
++pub mod support_atom;
+ 
+ fn structural_equivalence_children(definition: &StructuralEquivalenceDef) -> Vec<SemanticId> {
+     match definition {
+@@ -174,6 +175,128 @@
+     Map(FiniteMeasure<CanonicalMapAtom>),
+ }
+ 
++/// Allocator-independent structural estimate for semantic key work.
++///
++/// This is intentionally not a CPU-time claim. `value_nodes` counts logical
++/// constructor/scalar visits and `payload_bytes` counts stable user payload
++/// bytes (currently text). The estimate is deterministic across physical
++/// layouts and is suitable for admission/scheduling heuristics that must not
++/// treat a deeply nested or very large text value as equivalent to one scalar.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
++pub struct SemanticWorkEstimate {
++    pub value_nodes: usize,
++    pub payload_bytes: usize,
++}
++
++impl SemanticWorkEstimate {
++    #[must_use]
++    pub const fn scalar() -> Self {
++        Self {
++            value_nodes: 1,
++            payload_bytes: 0,
++        }
++    }
++
++    #[must_use]
++    pub const fn saturating_add(self, other: Self) -> Self {
++        Self {
++            value_nodes: self.value_nodes.saturating_add(other.value_nodes),
++            payload_bytes: self.payload_bytes.saturating_add(other.payload_bytes),
++        }
++    }
++
++    #[must_use]
++    pub const fn total_units(self) -> usize {
++        self.value_nodes.saturating_add(self.payload_bytes)
++    }
++}
++
++/// Estimates the structural work required to inspect a logical value while
++/// producing an exact semantic key. The metric is independent of Rust heap
++/// capacity and therefore stable across row/column/algebraic layouts.
++#[must_use]
++pub fn semantic_value_work_estimate(value: &Value) -> SemanticWorkEstimate {
++    fn add_children<'a>(children: impl IntoIterator<Item = &'a Value>) -> SemanticWorkEstimate {
++        children
++            .into_iter()
++            .fold(SemanticWorkEstimate::scalar(), |work, child| {
++                work.saturating_add(semantic_value_work_estimate(child))
++            })
++    }
++
++    match value {
++        Value::Unit
++        | Value::Bool(_)
++        | Value::I64(_)
++        | Value::F64Bits(_)
++        | Value::LiveEntityRef { .. }
++        | Value::HistoricalEntityId { .. }
++        | Value::Option(None) => SemanticWorkEstimate::scalar(),
++        Value::Text(text) => SemanticWorkEstimate {
++            value_nodes: 1,
++            payload_bytes: text.len(),
++        },
++        Value::Product(fields) => add_children(fields.values()),
++        Value::Option(Some(value)) | Value::Variant { value, .. } => {
++            SemanticWorkEstimate::scalar().saturating_add(semantic_value_work_estimate(value))
++        }
++        Value::Seq(values) => add_children(values),
++        Value::Set { elements, .. } => add_children(elements),
++        Value::Bag { entries, .. } => add_children(entries.iter().map(|(value, _)| value)),
++        Value::Map { entries, .. } => {
++            entries
++                .iter()
++                .fold(SemanticWorkEstimate::scalar(), |work, (key, value)| {
++                    work.saturating_add(semantic_value_work_estimate(key))
++                        .saturating_add(semantic_value_work_estimate(value))
++                })
++        }
++    }
++}
++
++/// Same deterministic metric after canonicalization. This is useful for
++/// materialization/resource accounting without encoding or allocating bytes.
++#[must_use]
++pub fn canonical_eq_key_work_estimate(key: &CanonicalEqKey) -> SemanticWorkEstimate {
++    fn add_keys<'a>(keys: impl IntoIterator<Item = &'a CanonicalEqKey>) -> SemanticWorkEstimate {
++        keys.into_iter()
++            .fold(SemanticWorkEstimate::scalar(), |work, key| {
++                work.saturating_add(canonical_eq_key_work_estimate(key))
++            })
++    }
++
++    match key {
++        CanonicalEqKey::Unit
++        | CanonicalEqKey::Bool(_)
++        | CanonicalEqKey::I64(_)
++        | CanonicalEqKey::F64Bits(_)
++        | CanonicalEqKey::LiveEntityId { .. }
++        | CanonicalEqKey::HistoricalEntityId { .. }
++        | CanonicalEqKey::OptionNone => SemanticWorkEstimate::scalar(),
++        CanonicalEqKey::TextExact(text) | CanonicalEqKey::TextAsciiCaseInsensitive(text) => {
++            SemanticWorkEstimate {
++                value_nodes: 1,
++                payload_bytes: text.len(),
++            }
++        }
++        CanonicalEqKey::Product(fields) => add_keys(fields.iter().map(|(_, value)| value)),
++        CanonicalEqKey::OptionSome(value) | CanonicalEqKey::Variant { value, .. } => {
++            SemanticWorkEstimate::scalar().saturating_add(canonical_eq_key_work_estimate(value))
++        }
++        CanonicalEqKey::Seq(values) => add_keys(values),
++        CanonicalEqKey::Set(entries) => add_keys(entries.iter().map(|entry| &entry.atom)),
++        CanonicalEqKey::Bag(entries) => add_keys(entries.iter().map(|entry| &entry.atom.value)),
++        CanonicalEqKey::Map(entries) => {
++            entries
++                .iter()
++                .fold(SemanticWorkEstimate::scalar(), |work, entry| {
++                    work.saturating_add(canonical_eq_key_work_estimate(&entry.atom.key))
++                        .saturating_add(canonical_eq_key_work_estimate(&entry.atom.value))
++                })
++        }
++    }
++}
++
+ /// Canonical finite counting measure over an ordered atom domain.
+ #[must_use]
+ pub fn finite_measure_from_atoms<T: Ord>(atoms: impl IntoIterator<Item = T>) -> FiniteMeasure<T> {
+@@ -4619,6 +4742,25 @@
+     }
+ 
+     #[test]
++    fn semantic_work_estimate_distinguishes_payload_and_nested_structure() {
++        let scalar = semantic_value_work_estimate(&Value::I64(1));
++        let text = semantic_value_work_estimate(&Value::Text("abcdefghij".into()));
++        let nested = semantic_value_work_estimate(&Value::Seq(vec![
++            Value::I64(1),
++            Value::Seq(vec![Value::I64(2), Value::I64(3)]),
++        ]));
++        assert_eq!(scalar.total_units(), 1);
++        assert_eq!(text.total_units(), 11);
++        assert!(nested.total_units() > scalar.total_units());
++
++        let key = CanonicalEqKey::Seq(vec![
++            CanonicalEqKey::TextExact("abcd".into()),
++            CanonicalEqKey::I64(1),
++        ]);
++        assert_eq!(canonical_eq_key_work_estimate(&key).total_units(), 7);
++    }
++
++    #[test]
+     fn structural_canonical_dependency_closure_tracks_only_primitive_leaf_digests() {
+         let ci = SemanticId::new(82_000);
+         let exact = SemanticId::new(82_001);
+diff -ruN a/crates/kernel-semantics/src/observable.rs b/crates/kernel-semantics/src/observable.rs
+--- a/crates/kernel-semantics/src/observable.rs	2026-09-21 14:27:51.929778301 +0000
++++ b/crates/kernel-semantics/src/observable.rs	2026-09-21 15:28:47.687920837 +0000
+@@ -184,6 +184,29 @@
+         self.intern_equivalence_key(observable, key)
+     }
+ 
++    pub fn lookup_value_class(
++        &self,
++        registry: &SemanticRegistry,
++        context: &SemanticContext,
++        observable: RevisionObservableId,
++        value: &Value,
++    ) -> Result<Option<EqClassId>, ObservableError> {
++        self.ensure_revision(context.revision())?;
++        let equivalence = match self.definition(observable)? {
++            SemanticObservableDefinition::PinnedEquivalence(equivalence) => *equivalence,
++            SemanticObservableDefinition::Product(_) => {
++                return Err(ObservableError::ObservableKindMismatch(observable));
++            }
++        };
++        let key = registry
++            .canonical_equivalence_key(context, equivalence, value)
++            .map_err(ObservableError::Semantic)?;
++        Ok(self
++            .classes
++            .get(&(observable, ObservableClassSignature::Canonical(key)))
++            .copied())
++    }
++
+     pub fn intern_product_class(
+         &mut self,
+         observable: RevisionObservableId,
+diff -ruN a/crates/kernel-semantics/src/support_atom.rs b/crates/kernel-semantics/src/support_atom.rs
+--- a/crates/kernel-semantics/src/support_atom.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/kernel-semantics/src/support_atom.rs	2026-09-21 15:38:09.338462858 +0000
+@@ -0,0 +1,449 @@
++use std::collections::{BTreeMap, BTreeSet};
++
++use kernel_types::{EqClassId, RevisionObservableId, SemanticRevision};
++
++use crate::observable::{
++    ObservableClassSignature, ObservableError, RevisionObservableCatalog,
++    SemanticObservableDefinition,
++};
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum SupportAtomError<RowId> {
++    Observable(ObservableError),
++    CatalogMismatch,
++    ProductObservableMismatch,
++    ArityMismatch {
++        expected: usize,
++        actual: usize,
++    },
++    ForeignEqClass {
++        class: EqClassId,
++        expected: RevisionObservableId,
++        actual: RevisionObservableId,
++    },
++    InvalidProductClass(EqClassId),
++    DuplicateRow(RowId),
++    UnknownRow(RowId),
++}
++
++impl<RowId> From<ObservableError> for SupportAtomError<RowId> {
++    fn from(value: ObservableError) -> Self {
++        Self::Observable(value)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct SupportAtom<RowId> {
++    signature: Vec<EqClassId>,
++    rows: BTreeSet<RowId>,
++}
++
++/// Finite partition of physical support by one revision-local product observable.
++///
++/// `EqClassId` of the product observable is the atom identity. No atom identifier
++/// is durable semantic authority: the whole structure is reconstructible from the
++/// pinned revision, observable recipe, and authoritative relation rows.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SupportAtomFabric<RowId> {
++    revision: SemanticRevision,
++    catalog_instance: u64,
++    product: RevisionObservableId,
++    coordinates: Vec<RevisionObservableId>,
++    signature_to_atom: BTreeMap<Vec<EqClassId>, EqClassId>,
++    atoms: BTreeMap<EqClassId, SupportAtom<RowId>>,
++    row_to_atom: BTreeMap<RowId, EqClassId>,
++    inverse: Vec<BTreeMap<EqClassId, BTreeSet<EqClassId>>>,
++}
++
++impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
++    pub fn new(
++        catalog: &RevisionObservableCatalog,
++        product: RevisionObservableId,
++        coordinates: Vec<RevisionObservableId>,
++    ) -> Result<Self, SupportAtomError<RowId>> {
++        for coordinate in &coordinates {
++            catalog.definition(*coordinate)?;
++        }
++        match catalog.definition(product)? {
++            SemanticObservableDefinition::Product(components) if components == &coordinates => {}
++            _ => return Err(SupportAtomError::ProductObservableMismatch),
++        }
++        Ok(Self {
++            revision: catalog.revision(),
++            catalog_instance: catalog.catalog_instance(),
++            product,
++            inverse: vec![BTreeMap::new(); coordinates.len()],
++            coordinates,
++            signature_to_atom: BTreeMap::new(),
++            atoms: BTreeMap::new(),
++            row_to_atom: BTreeMap::new(),
++        })
++    }
++
++    #[must_use]
++    pub const fn revision(&self) -> SemanticRevision {
++        self.revision
++    }
++
++    #[must_use]
++    pub const fn product(&self) -> RevisionObservableId {
++        self.product
++    }
++
++    #[must_use]
++    pub fn coordinates(&self) -> &[RevisionObservableId] {
++        &self.coordinates
++    }
++
++    #[must_use]
++    pub fn row_count(&self) -> usize {
++        self.row_to_atom.len()
++    }
++
++    #[must_use]
++    pub fn atom_count(&self) -> usize {
++        self.atoms.len()
++    }
++
++    #[must_use]
++    pub fn projection_atom_reference_count(&self) -> usize {
++        self.inverse
++            .iter()
++            .map(|classes| classes.values().map(BTreeSet::len).sum::<usize>())
++            .sum()
++    }
++
++    #[must_use]
++    pub fn projected_class_count(&self) -> usize {
++        self.inverse.iter().map(BTreeMap::len).sum()
++    }
++
++    pub fn insert(
++        &mut self,
++        catalog: &RevisionObservableCatalog,
++        row: RowId,
++        atom_class: EqClassId,
++        signature: &[EqClassId],
++    ) -> Result<(), SupportAtomError<RowId>> {
++        self.ensure_catalog(catalog)?;
++        self.validate_signature(catalog, signature)?;
++        self.validate_product_class(catalog, atom_class, signature)?;
++        if self.row_to_atom.contains_key(&row) {
++            return Err(SupportAtomError::DuplicateRow(row));
++        }
++
++        if let Some(atom) = self.atoms.get_mut(&atom_class) {
++            if atom.signature != signature {
++                return Err(SupportAtomError::InvalidProductClass(atom_class));
++            }
++            atom.rows.insert(row.clone());
++        } else {
++            if let Some(existing) = self
++                .signature_to_atom
++                .insert(signature.to_owned(), atom_class)
++                && existing != atom_class
++            {
++                return Err(SupportAtomError::InvalidProductClass(atom_class));
++            }
++            for (slot, class) in signature.iter().copied().enumerate() {
++                self.inverse[slot]
++                    .entry(class)
++                    .or_default()
++                    .insert(atom_class);
++            }
++            self.atoms.insert(
++                atom_class,
++                SupportAtom {
++                    signature: signature.to_owned(),
++                    rows: BTreeSet::from([row.clone()]),
++                },
++            );
++        }
++        self.row_to_atom.insert(row, atom_class);
++        Ok(())
++    }
++
++    pub fn remove(&mut self, row: &RowId) -> Result<Vec<EqClassId>, SupportAtomError<RowId>> {
++        let atom_class = self
++            .row_to_atom
++            .remove(row)
++            .ok_or_else(|| SupportAtomError::UnknownRow(row.clone()))?;
++        let atom = self
++            .atoms
++            .get_mut(&atom_class)
++            .expect("row-to-atom map references an existing atom");
++        atom.rows.remove(row);
++        let signature = atom.signature.clone();
++        if atom.rows.is_empty() {
++            self.atoms.remove(&atom_class);
++            self.signature_to_atom.remove(&signature);
++            for (slot, class) in signature.iter().copied().enumerate() {
++                let atom_classes = self.inverse[slot]
++                    .get_mut(&class)
++                    .expect("inverse projection contains every live atom");
++                atom_classes.remove(&atom_class);
++                if atom_classes.is_empty() {
++                    self.inverse[slot].remove(&class);
++                }
++            }
++        }
++        Ok(signature)
++    }
++
++    #[must_use]
++    pub fn row_signature(&self, row: &RowId) -> Option<&[EqClassId]> {
++        let atom_class = self.row_to_atom.get(row)?;
++        self.atoms
++            .get(atom_class)
++            .map(|atom| atom.signature.as_slice())
++    }
++
++    #[must_use]
++    pub fn joint_fiber(&self, signature: &[EqClassId]) -> Option<&BTreeSet<RowId>> {
++        let atom_class = self.signature_to_atom.get(signature)?;
++        self.atoms.get(atom_class).map(|atom| &atom.rows)
++    }
++
++    pub fn projected_fiber(
++        &self,
++        slot: usize,
++        class: EqClassId,
++    ) -> Result<BTreeSet<RowId>, SupportAtomError<RowId>> {
++        if slot >= self.coordinates.len() {
++            return Err(SupportAtomError::ArityMismatch {
++                expected: self.coordinates.len(),
++                actual: slot.saturating_add(1),
++            });
++        }
++        let mut rows = BTreeSet::new();
++        if let Some(atom_classes) = self.inverse[slot].get(&class) {
++            for atom_class in atom_classes {
++                rows.extend(
++                    self.atoms
++                        .get(atom_class)
++                        .expect("inverse projection references an existing atom")
++                        .rows
++                        .iter()
++                        .cloned(),
++                );
++            }
++        }
++        Ok(rows)
++    }
++
++    pub fn projected_count(
++        &self,
++        slot: usize,
++        class: EqClassId,
++    ) -> Result<usize, SupportAtomError<RowId>> {
++        if slot >= self.coordinates.len() {
++            return Err(SupportAtomError::ArityMismatch {
++                expected: self.coordinates.len(),
++                actual: slot.saturating_add(1),
++            });
++        }
++        Ok(self.inverse[slot]
++            .get(&class)
++            .into_iter()
++            .flatten()
++            .map(|atom_class| {
++                self.atoms
++                    .get(atom_class)
++                    .expect("inverse projection references an existing atom")
++                    .rows
++                    .len()
++            })
++            .sum())
++    }
++
++    pub fn distinct_classes(
++        &self,
++        slot: usize,
++    ) -> Result<BTreeSet<EqClassId>, SupportAtomError<RowId>> {
++        if slot >= self.coordinates.len() {
++            return Err(SupportAtomError::ArityMismatch {
++                expected: self.coordinates.len(),
++                actual: slot.saturating_add(1),
++            });
++        }
++        Ok(self.inverse[slot].keys().copied().collect())
++    }
++
++    fn ensure_catalog(
++        &self,
++        catalog: &RevisionObservableCatalog,
++    ) -> Result<(), SupportAtomError<RowId>> {
++        if self.revision != catalog.revision()
++            || self.catalog_instance != catalog.catalog_instance()
++        {
++            return Err(SupportAtomError::CatalogMismatch);
++        }
++        Ok(())
++    }
++
++    fn validate_signature(
++        &self,
++        catalog: &RevisionObservableCatalog,
++        signature: &[EqClassId],
++    ) -> Result<(), SupportAtomError<RowId>> {
++        if signature.len() != self.coordinates.len() {
++            return Err(SupportAtomError::ArityMismatch {
++                expected: self.coordinates.len(),
++                actual: signature.len(),
++            });
++        }
++        for (&expected, &class) in self.coordinates.iter().zip(signature) {
++            let actual = catalog.class_record(class)?.observable;
++            if expected != actual {
++                return Err(SupportAtomError::ForeignEqClass {
++                    class,
++                    expected,
++                    actual,
++                });
++            }
++        }
++        Ok(())
++    }
++
++    fn validate_product_class(
++        &self,
++        catalog: &RevisionObservableCatalog,
++        atom_class: EqClassId,
++        signature: &[EqClassId],
++    ) -> Result<(), SupportAtomError<RowId>> {
++        let record = catalog.class_record(atom_class)?;
++        if record.observable != self.product
++            || record.signature != ObservableClassSignature::Product(signature.to_owned())
++        {
++            return Err(SupportAtomError::InvalidProductClass(atom_class));
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use kernel_model::Value;
++    use kernel_schema::{Schema, SemanticContext, SemanticEnvironment};
++    use kernel_types::{SchemaRevisionId, SemanticEnvId, SemanticId};
++
++    use super::*;
++    use crate::{EquivalenceModule, SemanticRegistry};
++
++    fn fixture() -> (SemanticContext, SemanticRegistry, SemanticId, SemanticId) {
++        let left = SemanticId::new(10);
++        let right = SemanticId::new(11);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(9));
++        environment.pin_module(left, digest);
++        environment.pin_module(right, digest);
++        (
++            SemanticContext {
++                schema: Schema::new(SchemaRevisionId::new(7)),
++                environment,
++            },
++            registry,
++            left,
++            right,
++        )
++    }
++
++    #[test]
++    fn support_atoms_are_product_classes_and_factor_projected_fibers() {
++        let (context, registry, left_eq, right_eq) = fixture();
++        let mut catalog = RevisionObservableCatalog::new(&context).unwrap();
++        let left = catalog
++            .register_equivalence(&registry, &context, left_eq)
++            .unwrap();
++        let right = catalog
++            .register_equivalence(&registry, &context, right_eq)
++            .unwrap();
++        let product = catalog.register_product(vec![left, right]).unwrap();
++        let mut fabric = SupportAtomFabric::new(&catalog, product, vec![left, right]).unwrap();
++
++        let l1 = catalog
++            .observe_value(&registry, &context, left, &Value::I64(1))
++            .unwrap();
++        let l2 = catalog
++            .observe_value(&registry, &context, left, &Value::I64(2))
++            .unwrap();
++        let r7 = catalog
++            .observe_value(&registry, &context, right, &Value::I64(7))
++            .unwrap();
++        let a17 = catalog.intern_product_class(product, vec![l1, r7]).unwrap();
++        let a27 = catalog.intern_product_class(product, vec![l2, r7]).unwrap();
++        fabric.insert(&catalog, 1_u64, a17, &[l1, r7]).unwrap();
++        fabric.insert(&catalog, 2_u64, a17, &[l1, r7]).unwrap();
++        fabric.insert(&catalog, 3_u64, a27, &[l2, r7]).unwrap();
++
++        assert_eq!(fabric.row_count(), 3);
++        assert_eq!(fabric.atom_count(), 2);
++        assert_eq!(fabric.joint_fiber(&[l1, r7]).unwrap().len(), 2);
++        assert_eq!(fabric.projected_count(0, l1).unwrap(), 2);
++        assert_eq!(fabric.projected_count(1, r7).unwrap(), 3);
++        assert_eq!(fabric.projected_fiber(0, l2).unwrap(), BTreeSet::from([3]));
++    }
++
++    #[test]
++    fn deletion_removes_empty_atoms_but_preserves_other_projection_members() {
++        let (context, registry, left_eq, right_eq) = fixture();
++        let mut catalog = RevisionObservableCatalog::new(&context).unwrap();
++        let left = catalog
++            .register_equivalence(&registry, &context, left_eq)
++            .unwrap();
++        let right = catalog
++            .register_equivalence(&registry, &context, right_eq)
++            .unwrap();
++        let product = catalog.register_product(vec![left, right]).unwrap();
++        let mut fabric = SupportAtomFabric::new(&catalog, product, vec![left, right]).unwrap();
++        let l1 = catalog
++            .observe_value(&registry, &context, left, &Value::I64(1))
++            .unwrap();
++        let l2 = catalog
++            .observe_value(&registry, &context, left, &Value::I64(2))
++            .unwrap();
++        let r7 = catalog
++            .observe_value(&registry, &context, right, &Value::I64(7))
++            .unwrap();
++        let a17 = catalog.intern_product_class(product, vec![l1, r7]).unwrap();
++        let a27 = catalog.intern_product_class(product, vec![l2, r7]).unwrap();
++        fabric.insert(&catalog, 1_u64, a17, &[l1, r7]).unwrap();
++        fabric.insert(&catalog, 2_u64, a27, &[l2, r7]).unwrap();
++
++        fabric.remove(&1).unwrap();
++        assert_eq!(fabric.atom_count(), 1);
++        assert!(fabric.joint_fiber(&[l1, r7]).is_none());
++        assert_eq!(fabric.projected_count(1, r7).unwrap(), 1);
++    }
++
++    #[test]
++    fn foreign_catalog_product_class_is_rejected_even_for_same_revision() {
++        let (context, registry, left_eq, _) = fixture();
++        let mut first = RevisionObservableCatalog::new(&context).unwrap();
++        let mut second = RevisionObservableCatalog::new(&context).unwrap();
++        let first_observable = first
++            .register_equivalence(&registry, &context, left_eq)
++            .unwrap();
++        let first_product = first.register_product(vec![first_observable]).unwrap();
++        let second_observable = second
++            .register_equivalence(&registry, &context, left_eq)
++            .unwrap();
++        let second_product = second.register_product(vec![second_observable]).unwrap();
++        let foreign_component = second
++            .observe_value(&registry, &context, second_observable, &Value::I64(1))
++            .unwrap();
++        let foreign_atom = second
++            .intern_product_class(second_product, vec![foreign_component])
++            .unwrap();
++        let mut fabric =
++            SupportAtomFabric::new(&first, first_product, vec![first_observable]).unwrap();
++
++        assert!(matches!(
++            fabric.insert(&first, 1_u64, foreign_atom, &[foreign_component]),
++            Err(SupportAtomError::Observable(
++                ObservableError::UnknownEqClass(_)
++            ))
++        ));
++    }
++}

@@ -1,0 +1,2087 @@
+--- /mnt/data/pass73_work/crates/kernel-durability/src/lib.rs	2026-09-21 09:27:35.238008148 +0000
++++ crates/kernel-durability/src/lib.rs	2026-09-21 11:45:02.363887715 +0000
+@@ -18,7 +18,7 @@
+ pub const MAGIC: [u8; 4] = *b"CFMW";
+ pub const FORMAT_VERSION: u16 = 1;
+ pub const MUTATION_CODEC_VERSION: u16 = 5;
+-pub const PHYSICAL_ARTIFACT_RECIPE_VERSION: u16 = 1;
++pub const PHYSICAL_ARTIFACT_RECIPE_VERSION: u16 = 2;
+ pub const HEADER_LEN: usize = 36;
+ pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+ const MAX_COLLECTION_LEN: usize = 1_000_000;
+@@ -288,8 +288,32 @@
+     pub equivalence: SemanticId,
+ }
+ 
++/// Reconstructible native representation for one active relation layout.
++///
++/// This is intentionally a logical lowering recipe, not a serialized physical
++/// payload: row handles, dense local ids and allocator representation are rebuilt
++/// against the recovered authoritative Revision.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub enum DurableRelationLayoutKind {
++    RowStore,
++    ValueColumnar,
++    I64Columnar,
++    TypedColumnar,
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+ pub enum DurablePhysicalArtifactSpec {
++    RelationLayout {
++        relation: SemanticId,
++        layout_id: u128,
++        kind: DurableRelationLayoutKind,
++    },
++    I64Index {
++        relation: SemanticId,
++        key_column: usize,
++        equivalence: SemanticId,
++        advisor_managed: bool,
++    },
+     SemanticIndex {
+         relation: SemanticId,
+         key_parts: Vec<DurableSemanticKeyPart>,
+@@ -309,6 +333,16 @@
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+ enum DurablePhysicalArtifactKey {
++    RelationLayout {
++        relation: SemanticId,
++        layout_id: u128,
++        kind: DurableRelationLayoutKind,
++    },
++    I64Index {
++        relation: SemanticId,
++        key_column: usize,
++        equivalence: SemanticId,
++    },
+     Index {
+         relation: SemanticId,
+         key_parts: Vec<DurableSemanticKeyPart>,
+@@ -323,46 +357,126 @@
+     },
+ }
+ 
++fn physical_artifact_key(spec: &DurablePhysicalArtifactSpec) -> (DurablePhysicalArtifactKey, bool) {
++    match spec {
++        DurablePhysicalArtifactSpec::RelationLayout {
++            relation,
++            layout_id,
++            kind,
++        } => (
++            DurablePhysicalArtifactKey::RelationLayout {
++                relation: *relation,
++                layout_id: *layout_id,
++                kind: *kind,
++            },
++            false,
++        ),
++        DurablePhysicalArtifactSpec::I64Index {
++            relation,
++            key_column,
++            equivalence,
++            advisor_managed,
++        } => (
++            DurablePhysicalArtifactKey::I64Index {
++                relation: *relation,
++                key_column: *key_column,
++                equivalence: *equivalence,
++            },
++            *advisor_managed,
++        ),
++        DurablePhysicalArtifactSpec::SemanticIndex {
++            relation,
++            key_parts,
++            advisor_managed,
++        } => (
++            DurablePhysicalArtifactKey::Index {
++                relation: *relation,
++                key_parts: key_parts.clone(),
++            },
++            *advisor_managed,
++        ),
++        DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++            relation,
++            key_parts,
++            advisor_managed,
++        } => (
++            DurablePhysicalArtifactKey::QuotientFactor {
++                relation: *relation,
++                key_parts: key_parts.clone(),
++            },
++            *advisor_managed,
++        ),
++        DurablePhysicalArtifactSpec::SemanticStatistics {
++            relation,
++            key_parts,
++            advisor_managed,
++        } => (
++            DurablePhysicalArtifactKey::Statistics {
++                relation: *relation,
++                key_parts: key_parts.clone(),
++            },
++            *advisor_managed,
++        ),
++    }
++}
++
++fn physical_artifact_spec_from_key(
++    key: DurablePhysicalArtifactKey,
++    advisor_managed: bool,
++) -> DurablePhysicalArtifactSpec {
++    match key {
++        DurablePhysicalArtifactKey::RelationLayout {
++            relation,
++            layout_id,
++            kind,
++        } => DurablePhysicalArtifactSpec::RelationLayout {
++            relation,
++            layout_id,
++            kind,
++        },
++        DurablePhysicalArtifactKey::I64Index {
++            relation,
++            key_column,
++            equivalence,
++        } => DurablePhysicalArtifactSpec::I64Index {
++            relation,
++            key_column,
++            equivalence,
++            advisor_managed,
++        },
++        DurablePhysicalArtifactKey::Index {
++            relation,
++            key_parts,
++        } => DurablePhysicalArtifactSpec::SemanticIndex {
++            relation,
++            key_parts,
++            advisor_managed,
++        },
++        DurablePhysicalArtifactKey::QuotientFactor {
++            relation,
++            key_parts,
++        } => DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++            relation,
++            key_parts,
++            advisor_managed,
++        },
++        DurablePhysicalArtifactKey::Statistics {
++            relation,
++            key_parts,
++        } => DurablePhysicalArtifactSpec::SemanticStatistics {
++            relation,
++            key_parts,
++            advisor_managed,
++        },
++    }
++}
++
+ fn canonical_physical_artifact_specs(
+     specs: &[DurablePhysicalArtifactSpec],
+ ) -> Vec<DurablePhysicalArtifactSpec> {
+     let mut ownership = BTreeMap::<DurablePhysicalArtifactKey, bool>::new();
+     for spec in specs {
+-        let (key, advisor_managed) = match spec {
+-            DurablePhysicalArtifactSpec::SemanticIndex {
+-                relation,
+-                key_parts,
+-                advisor_managed,
+-            } => (
+-                DurablePhysicalArtifactKey::Index {
+-                    relation: *relation,
+-                    key_parts: key_parts.clone(),
+-                },
+-                *advisor_managed,
+-            ),
+-            DurablePhysicalArtifactSpec::SemanticQuotientFactor {
+-                relation,
+-                key_parts,
+-                advisor_managed,
+-            } => (
+-                DurablePhysicalArtifactKey::QuotientFactor {
+-                    relation: *relation,
+-                    key_parts: key_parts.clone(),
+-                },
+-                *advisor_managed,
+-            ),
+-            DurablePhysicalArtifactSpec::SemanticStatistics {
+-                relation,
+-                key_parts,
+-                advisor_managed,
+-            } => (
+-                DurablePhysicalArtifactKey::Statistics {
+-                    relation: *relation,
+-                    key_parts: key_parts.clone(),
+-                },
+-                *advisor_managed,
+-            ),
+-        };
++        let (key, advisor_managed) = physical_artifact_key(spec);
+         ownership
+             .entry(key)
+             .and_modify(|managed| *managed &= advisor_managed)
+@@ -370,32 +484,7 @@
+     }
+     ownership
+         .into_iter()
+-        .map(|(key, advisor_managed)| match key {
+-            DurablePhysicalArtifactKey::Index {
+-                relation,
+-                key_parts,
+-            } => DurablePhysicalArtifactSpec::SemanticIndex {
+-                relation,
+-                key_parts,
+-                advisor_managed,
+-            },
+-            DurablePhysicalArtifactKey::QuotientFactor {
+-                relation,
+-                key_parts,
+-            } => DurablePhysicalArtifactSpec::SemanticQuotientFactor {
+-                relation,
+-                key_parts,
+-                advisor_managed,
+-            },
+-            DurablePhysicalArtifactKey::Statistics {
+-                relation,
+-                key_parts,
+-            } => DurablePhysicalArtifactSpec::SemanticStatistics {
+-                relation,
+-                key_parts,
+-                advisor_managed,
+-            },
+-        })
++        .map(|(key, advisor_managed)| physical_artifact_spec_from_key(key, advisor_managed))
+         .collect()
+ }
+ 
+--- /mnt/data/pass73_work/crates/kernel-durability/src/metadata.rs	2026-09-21 09:31:18.939265237 +0000
++++ crates/kernel-durability/src/metadata.rs	2026-09-21 11:45:02.364200156 +0000
+@@ -10,8 +10,9 @@
+ 
+ use super::{
+     CodecError, Cursor, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
+-    DurableSemanticKeyPart, DurableTransactionIntent, PHYSICAL_ARTIFACT_RECIPE_VERSION,
+-    canonical_physical_artifact_specs, encode_value, push_bytes, push_len, push_u64, push_u128,
++    DurableRelationLayoutKind, DurableSemanticKeyPart, DurableTransactionIntent,
++    PHYSICAL_ARTIFACT_RECIPE_VERSION, canonical_physical_artifact_specs, encode_value, push_bytes,
++    push_len, push_u64, push_u128,
+ };
+ 
+ const METADATA_CODEC_VERSION: u16 = 5;
+@@ -153,6 +154,36 @@
+     push_len(out, specs.len())?;
+     for spec in specs {
+         match spec {
++            DurablePhysicalArtifactSpec::RelationLayout {
++                relation,
++                layout_id,
++                kind,
++            } => {
++                out.push(3);
++                push_u128(out, relation.raw());
++                push_u128(out, layout_id);
++                out.push(match kind {
++                    DurableRelationLayoutKind::RowStore => 0,
++                    DurableRelationLayoutKind::ValueColumnar => 1,
++                    DurableRelationLayoutKind::I64Columnar => 2,
++                    DurableRelationLayoutKind::TypedColumnar => 3,
++                });
++            }
++            DurablePhysicalArtifactSpec::I64Index {
++                relation,
++                key_column,
++                equivalence,
++                advisor_managed,
++            } => {
++                out.push(4);
++                push_u128(out, relation.raw());
++                push_u64(
++                    out,
++                    u64::try_from(key_column).map_err(|_| CodecError::CollectionTooLarge)?,
++                );
++                push_u128(out, equivalence.raw());
++                out.push(u8::from(advisor_managed));
++            }
+             DurablePhysicalArtifactSpec::SemanticIndex {
+                 relation,
+                 key_parts,
+@@ -204,7 +235,8 @@
+ fn decode_physical_artifact_specs(
+     cursor: &mut Cursor<'_>,
+ ) -> Result<Vec<DurablePhysicalArtifactSpec>, &'static str> {
+-    if cursor.u16()? != PHYSICAL_ARTIFACT_RECIPE_VERSION {
++    let recipe_version = cursor.u16()?;
++    if recipe_version != 1 && recipe_version != PHYSICAL_ARTIFACT_RECIPE_VERSION {
+         return Err("unsupported physical artifact recipe version");
+     }
+     let count = cursor.len()?;
+@@ -236,6 +268,39 @@
+                     advisor_managed,
+                 }
+             }
++            3 if recipe_version >= 2 => {
++                let relation = SemanticId::new(cursor.u128()?);
++                let layout_id = cursor.u128()?;
++                let kind = match cursor.u8()? {
++                    0 => DurableRelationLayoutKind::RowStore,
++                    1 => DurableRelationLayoutKind::ValueColumnar,
++                    2 => DurableRelationLayoutKind::I64Columnar,
++                    3 => DurableRelationLayoutKind::TypedColumnar,
++                    _ => return Err("invalid durable relation layout kind"),
++                };
++                DurablePhysicalArtifactSpec::RelationLayout {
++                    relation,
++                    layout_id,
++                    kind,
++                }
++            }
++            4 if recipe_version >= 2 => {
++                let relation = SemanticId::new(cursor.u128()?);
++                let key_column = usize::try_from(cursor.u64()?)
++                    .map_err(|_| "physical artifact column overflow")?;
++                let equivalence = SemanticId::new(cursor.u128()?);
++                let advisor_managed = match cursor.u8()? {
++                    0 => false,
++                    1 => true,
++                    _ => return Err("invalid physical artifact ownership tag"),
++                };
++                DurablePhysicalArtifactSpec::I64Index {
++                    relation,
++                    key_column,
++                    equivalence,
++                    advisor_managed,
++                }
++            }
+             _ => return Err("invalid physical artifact spec tag"),
+         };
+         specs.push(spec);
+@@ -827,6 +892,17 @@
+     }
+     fn current_physical_artifact_specs(eq: SemanticId) -> Vec<DurablePhysicalArtifactSpec> {
+         vec![
++            DurablePhysicalArtifactSpec::RelationLayout {
++                relation: SemanticId::new(1),
++                layout_id: 0x1234,
++                kind: DurableRelationLayoutKind::TypedColumnar,
++            },
++            DurablePhysicalArtifactSpec::I64Index {
++                relation: SemanticId::new(1),
++                key_column: 0,
++                equivalence: eq,
++                advisor_managed: false,
++            },
+             DurablePhysicalArtifactSpec::SemanticIndex {
+                 relation: SemanticId::new(1),
+                 key_parts: vec![DurableSemanticKeyPart {
+@@ -855,6 +931,39 @@
+     }
+ 
+     #[test]
++    fn physical_artifact_recipe_v1_remains_decodable() {
++        let relation = SemanticId::new(41);
++        let equivalence = SemanticId::new(42);
++        let mut bytes = Vec::new();
++        bytes.extend_from_slice(&1_u16.to_le_bytes());
++        push_len(&mut bytes, 1).unwrap();
++        bytes.push(0);
++        encode_semantic_artifact_key(
++            &mut bytes,
++            relation,
++            &[DurableSemanticKeyPart {
++                column: 3,
++                equivalence,
++            }],
++            true,
++        )
++        .unwrap();
++
++        let decoded = decode_physical_artifact_specs(&mut Cursor::new(&bytes)).unwrap();
++        assert_eq!(
++            decoded,
++            vec![DurablePhysicalArtifactSpec::SemanticIndex {
++                relation,
++                key_parts: vec![DurableSemanticKeyPart {
++                    column: 3,
++                    equivalence,
++                }],
++                advisor_managed: true,
++            }]
++        );
++    }
++
++    #[test]
+     fn physical_artifact_recipe_collapse_preserves_manual_pin() {
+         let eq = SemanticId::new(78);
+         let mut bytes = Vec::new();
+@@ -894,6 +1003,41 @@
+                 advisor_managed: false,
+             }]
+         );
++    }
++
++    #[test]
++    fn i64_recipe_collapse_preserves_manual_pin() {
++        let relation = SemanticId::new(79);
++        let equivalence = SemanticId::new(80);
++        let mut bytes = Vec::new();
++        encode_physical_artifact_specs(
++            &mut bytes,
++            &[
++                DurablePhysicalArtifactSpec::I64Index {
++                    relation,
++                    key_column: 2,
++                    equivalence,
++                    advisor_managed: true,
++                },
++                DurablePhysicalArtifactSpec::I64Index {
++                    relation,
++                    key_column: 2,
++                    equivalence,
++                    advisor_managed: false,
++                },
++            ],
++        )
++        .unwrap();
++        let decoded = decode_physical_artifact_specs(&mut Cursor::new(&bytes)).unwrap();
++        assert_eq!(
++            decoded,
++            vec![DurablePhysicalArtifactSpec::I64Index {
++                relation,
++                key_column: 2,
++                equivalence,
++                advisor_managed: false,
++            }]
++        );
+     }
+ 
+     #[test]
+--- /mnt/data/pass73_work/crates/kernel-plan/src/lib.rs	2026-09-21 10:32:26.589397224 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-21 11:45:02.365590631 +0000
+@@ -8,8 +8,8 @@
+ 
+ use kernel_durability::{
+     DurabilityError, DurableCommitReceipt, DurableGenerationReceipt, DurableMaterializationSpec,
+-    DurablePhysicalArtifactSpec, DurableRelationMutation, DurableRevisionChange,
+-    DurableRevisionDescriptor, DurableRevisionStore, DurableSemanticKeyPart,
++    DurablePhysicalArtifactSpec, DurableRelationLayoutKind, DurableRelationMutation,
++    DurableRevisionChange, DurableRevisionDescriptor, DurableRevisionStore, DurableSemanticKeyPart,
+     DurableTransactionIntent, DurableTransactionOutcome, RecoveryScan, RevisionDurability,
+ };
+ use kernel_identity::{DenseEntityIds, LocalEntityId};
+@@ -1543,7 +1543,26 @@
+ 
+     #[must_use]
+     pub fn durable_physical_artifact_specs(&self) -> Vec<DurablePhysicalArtifactSpec> {
+-        self.physical.durable_physical_artifact_specs()
++        let mut specs = self.physical.durable_physical_artifact_specs();
++        for (&relation, &layout) in &self.relation_layouts {
++            let Ok(installed) = self.physical.installed(relation, layout) else {
++                continue;
++            };
++            let kind = match installed.data {
++                NativeRelation::RowStore(_) => DurableRelationLayoutKind::RowStore,
++                NativeRelation::Columnar { .. } => DurableRelationLayoutKind::ValueColumnar,
++                NativeRelation::I64Columnar { .. } => DurableRelationLayoutKind::I64Columnar,
++                NativeRelation::TypedColumnar { .. } => DurableRelationLayoutKind::TypedColumnar,
++            };
++            specs.push(DurablePhysicalArtifactSpec::RelationLayout {
++                relation,
++                layout_id: layout.id.0,
++                kind,
++            });
++        }
++        specs.sort();
++        specs.dedup();
++        specs
+     }
+ 
+     #[cfg(test)]
+@@ -3319,15 +3338,24 @@
+             .get(&relation.id)
+             .cloned()
+             .unwrap_or_default();
+-        physical.install(
+-            relation.id,
+-            LayoutBinding::RECOVERY_ROW_STORE,
+-            NativeRelation::row_store(rows),
+-        )?;
+-        relation_layouts.insert(relation.id, LayoutBinding::RECOVERY_ROW_STORE);
++        let recovered = recovered_relation_layout_recipe(relation.id, physical_artifact_specs)
++            .and_then(|(layout, kind)| {
++                recovered_native_relation(&revision, relation, &rows, kind)
++                    .ok()
++                    .map(|native| (layout, native))
++            });
++        let (layout, native) = recovered.unwrap_or_else(|| {
++            (
++                LayoutBinding::RECOVERY_ROW_STORE,
++                NativeRelation::row_store(rows),
++            )
++        });
++        physical.install(relation.id, layout, native)?;
++        relation_layouts.insert(relation.id, layout);
+     }
+     physical.restore_durable_physical_artifacts(
+         physical_artifact_specs,
++        &relation_layouts,
+         revision.semantic_context(),
+         registry,
+     );
+@@ -3403,6 +3431,7 @@
+ 
+ fn recovered_semantic_index_binding(
+     relation: SemanticId,
++    layout: LayoutBinding,
+     key_parts: &[DurableSemanticKeyPart],
+ ) -> Result<SemanticIndexBinding, PhysicalExecutionError> {
+     if key_parts.is_empty() {
+@@ -3410,7 +3439,7 @@
+     }
+     Ok(SemanticIndexBinding {
+         relation,
+-        layout: LayoutBinding::RECOVERY_ROW_STORE,
++        layout,
+         key_parts: key_parts
+             .iter()
+             .map(|part| SemanticIndexKeyPart {
+@@ -3421,6 +3450,128 @@
+     })
+ }
+ 
++fn recovered_relation_layout_recipe(
++    relation: SemanticId,
++    specs: &[DurablePhysicalArtifactSpec],
++) -> Option<(LayoutBinding, DurableRelationLayoutKind)> {
++    let mut recovered = None;
++    for spec in specs {
++        let DurablePhysicalArtifactSpec::RelationLayout {
++            relation: candidate,
++            layout_id,
++            kind,
++        } = spec
++        else {
++            continue;
++        };
++        if *candidate != relation {
++            continue;
++        }
++        let family = match kind {
++            DurableRelationLayoutKind::RowStore => LayoutFamily::RowStore,
++            DurableRelationLayoutKind::ValueColumnar
++            | DurableRelationLayoutKind::I64Columnar
++            | DurableRelationLayoutKind::TypedColumnar => LayoutFamily::Columnar,
++        };
++        let candidate = (
++            LayoutBinding {
++                id: LayoutId(*layout_id),
++                family,
++            },
++            *kind,
++        );
++        if recovered.is_some_and(|prior| prior != candidate) {
++            return None;
++        }
++        recovered = Some(candidate);
++    }
++    recovered
++}
++
++fn transpose_value_rows(
++    rows: &[kernel_query::Row],
++    column_count: usize,
++) -> Result<Vec<Vec<Value>>, PhysicalExecutionError> {
++    let mut columns = (0..column_count)
++        .map(|_| Vec::with_capacity(rows.len()))
++        .collect::<Vec<_>>();
++    for row in rows {
++        if row.len() != column_count {
++            return Err(PhysicalExecutionError::ColumnShapeMismatch);
++        }
++        for (column, value) in columns.iter_mut().zip(row) {
++            column.push(value.clone());
++        }
++    }
++    Ok(columns)
++}
++
++fn recovered_native_relation(
++    revision: &kernel_revision::Revision,
++    relation: &kernel_schema::RelationDef,
++    rows: &[kernel_query::Row],
++    kind: DurableRelationLayoutKind,
++) -> Result<NativeRelation, PhysicalExecutionError> {
++    match kind {
++        DurableRelationLayoutKind::RowStore => Ok(NativeRelation::row_store(rows.to_vec())),
++        DurableRelationLayoutKind::ValueColumnar => {
++            NativeRelation::columnar(transpose_value_rows(rows, relation.columns.len())?)
++        }
++        DurableRelationLayoutKind::I64Columnar => {
++            let values = transpose_value_rows(rows, relation.columns.len())?;
++            let columns = values
++                .into_iter()
++                .map(|column| {
++                    column
++                        .into_iter()
++                        .map(|value| match value {
++                            Value::I64(value) => Ok(value),
++                            _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                        })
++                        .collect::<Result<Vec<_>, _>>()
++                })
++                .collect::<Result<Vec<_>, _>>()?;
++            NativeRelation::i64_columnar(columns)
++        }
++        DurableRelationLayoutKind::TypedColumnar => {
++            use kernel_schema::{ScalarType, TypeExpr};
++            if rows.iter().any(|row| row.len() != relation.columns.len()) {
++                return Err(PhysicalExecutionError::ColumnShapeMismatch);
++            }
++            let dense = revision.dense_entity_ids();
++            let mut columns = Vec::with_capacity(relation.columns.len());
++            for (column_index, ty) in relation.columns.iter().enumerate() {
++                let values = rows
++                    .iter()
++                    .map(|row| row[column_index].clone())
++                    .collect::<Vec<_>>();
++                let column = match ty {
++                    TypeExpr::Scalar(ScalarType::LiveEntityRef(entity_type)) => {
++                        let external = values
++                            .into_iter()
++                            .map(|value| match value {
++                                Value::LiveEntityRef {
++                                    entity_type: value_type,
++                                    id,
++                                } if value_type == *entity_type => Ok(id),
++                                _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                            })
++                            .collect::<Result<Vec<_>, _>>()?;
++                        NativeColumn::dense_live_entity_ids(
++                            *entity_type,
++                            Arc::clone(&dense),
++                            external,
++                        )?
++                    }
++                    _ => NativeColumn::from_typed_values(&values, ty)?,
++                };
++                columns.push(column);
++            }
++            NativeRelation::typed_columnar(columns)
++        }
++    }
++}
++
+ impl PhysicalStore {
+     fn relations_mut(&mut self) -> &mut BTreeMap<(SemanticId, LayoutId), Arc<InstalledRelation>> {
+         Arc::make_mut(&mut self.relations)
+@@ -3719,6 +3870,16 @@
+     #[must_use]
+     pub fn durable_physical_artifact_specs(&self) -> Vec<DurablePhysicalArtifactSpec> {
+         let mut specs = Vec::new();
++        for binding in self.i64_indexes.keys() {
++            specs.push(DurablePhysicalArtifactSpec::I64Index {
++                relation: binding.relation,
++                key_column: binding.key_column,
++                equivalence: binding.equivalence,
++                advisor_managed: self
++                    .advisor_managed_artifacts
++                    .contains(&ManagedPhysicalArtifact::I64Index(*binding)),
++            });
++        }
+         for binding in self.semantic_indexes.keys() {
+             specs.push(DurablePhysicalArtifactSpec::SemanticIndex {
+                 relation: binding.relation,
+@@ -3754,6 +3915,7 @@
+     fn restore_durable_physical_artifacts(
+         &mut self,
+         specs: &[DurablePhysicalArtifactSpec],
++        relation_layouts: &BTreeMap<SemanticId, LayoutBinding>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) {
+@@ -3762,7 +3924,12 @@
+             // authority. A syntactically valid recipe may become stale after a
+             // checkpoint's WAL tail performs a schema/Γ migration. In that case
+             // recovery drops only the optimization and continues from Revision.
+-            let _ = self.try_restore_durable_physical_artifact(spec, context, registry);
++            let _ = self.try_restore_durable_physical_artifact(
++                spec,
++                relation_layouts,
++                context,
++                registry,
++            );
+         }
+         self.state_identity = Arc::new(());
+     }
+@@ -3770,16 +3937,42 @@
+     fn try_restore_durable_physical_artifact(
+         &mut self,
+         spec: &DurablePhysicalArtifactSpec,
++        relation_layouts: &BTreeMap<SemanticId, LayoutBinding>,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+         match spec {
++            DurablePhysicalArtifactSpec::RelationLayout { .. } => {}
++            DurablePhysicalArtifactSpec::I64Index {
++                relation,
++                key_column,
++                equivalence,
++                advisor_managed,
++            } => {
++                let layout = relation_layouts.get(relation).copied().ok_or(
++                    PhysicalExecutionError::MissingRuntimeRelationBinding(*relation),
++                )?;
++                let binding = I64IndexBinding {
++                    relation: *relation,
++                    layout,
++                    key_column: *key_column,
++                    equivalence: *equivalence,
++                };
++                self.install_i64_index(binding, context, registry)?;
++                if *advisor_managed {
++                    self.advisor_managed_artifacts_mut()
++                        .insert(ManagedPhysicalArtifact::I64Index(binding));
++                }
++            }
+             DurablePhysicalArtifactSpec::SemanticIndex {
+                 relation,
+                 key_parts,
+                 advisor_managed,
+             } => {
+-                let binding = recovered_semantic_index_binding(*relation, key_parts)?;
++                let layout = relation_layouts.get(relation).copied().ok_or(
++                    PhysicalExecutionError::MissingRuntimeRelationBinding(*relation),
++                )?;
++                let binding = recovered_semantic_index_binding(*relation, layout, key_parts)?;
+                 self.install_semantic_index(binding.clone(), context, registry)?;
+                 if *advisor_managed {
+                     self.advisor_managed_artifacts_mut()
+@@ -3791,7 +3984,10 @@
+                 key_parts,
+                 advisor_managed,
+             } => {
+-                let binding = recovered_semantic_index_binding(*relation, key_parts)?;
++                let layout = relation_layouts.get(relation).copied().ok_or(
++                    PhysicalExecutionError::MissingRuntimeRelationBinding(*relation),
++                )?;
++                let binding = recovered_semantic_index_binding(*relation, layout, key_parts)?;
+                 let relation_state = self.installed(binding.relation, binding.layout)?;
+                 let state = MaterializedSemanticQuotientFactorState::build(
+                     binding.clone(),
+@@ -3811,7 +4007,10 @@
+                 key_parts,
+                 advisor_managed,
+             } => {
+-                let binding = recovered_semantic_index_binding(*relation, key_parts)?;
++                let layout = relation_layouts.get(relation).copied().ok_or(
++                    PhysicalExecutionError::MissingRuntimeRelationBinding(*relation),
++                )?;
++                let binding = recovered_semantic_index_binding(*relation, layout, key_parts)?;
+                 self.install_semantic_statistics(binding.clone(), context, registry)?;
+                 if *advisor_managed {
+                     self.advisor_managed_artifacts_mut()
+@@ -5385,6 +5584,8 @@
+     pub multiway_join_maintained_quotient_key_hits: usize,
+     pub multiway_join_maintained_quotient_support_hits: usize,
+     pub multiway_join_cyclic_budget_rejections: usize,
++    pub multiway_join_cyclic_prefix_index_lookups: usize,
++    pub multiway_join_semantic_quotient_candidate_visits: usize,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -6708,6 +6909,15 @@
+     target.multiway_join_maintained_quotient_support_hits = target
+         .multiway_join_maintained_quotient_support_hits
+         .saturating_add(source.multiway_join_maintained_quotient_support_hits);
++    target.multiway_join_cyclic_budget_rejections = target
++        .multiway_join_cyclic_budget_rejections
++        .saturating_add(source.multiway_join_cyclic_budget_rejections);
++    target.multiway_join_cyclic_prefix_index_lookups = target
++        .multiway_join_cyclic_prefix_index_lookups
++        .saturating_add(source.multiway_join_cyclic_prefix_index_lookups);
++    target.multiway_join_semantic_quotient_candidate_visits = target
++        .multiway_join_semantic_quotient_candidate_visits
++        .saturating_add(source.multiway_join_semantic_quotient_candidate_visits);
+ }
+ 
+ struct TypedBatchSelection<'a> {
+@@ -9971,11 +10181,39 @@
+         .find(|candidate| candidate.leaf == leaf)
+ }
+ 
++#[derive(Debug, Clone)]
++struct CyclicPrefixCandidateIndex {
++    constraint_indices: Vec<usize>,
++    buckets: BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, Vec<usize>>,
++    max_bucket_len: usize,
++}
++
++#[derive(Debug, Clone)]
++struct CyclicPrefixCandidateIndexes {
++    by_leaf: Vec<Option<CyclicPrefixCandidateIndex>>,
++    build_work_upper_bound: u128,
++}
++
+ struct OrderPreservingJoinEnumeration<'a> {
+     handles: &'a [Vec<PhysicalRowId>],
+     constraints: &'a [SemanticQuotientConstraint],
+     base_masks: &'a [Vec<u64>],
+     search_order: &'a [usize],
++    cyclic_prefix_indexes: Option<&'a CyclicPrefixCandidateIndexes>,
++}
++
++fn mask_ordinals(mask: &[u64]) -> impl Iterator<Item = usize> + '_ {
++    mask.iter().enumerate().flat_map(|(word_index, word)| {
++        let mut remaining = *word;
++        std::iter::from_fn(move || {
++            if remaining == 0 {
++                return None;
++            }
++            let bit = remaining.trailing_zeros() as usize;
++            remaining &= remaining - 1;
++            Some(word_index * 64 + bit)
++        })
++    })
+ }
+ 
+ fn assigned_quotient_key<'a>(
+@@ -9992,12 +10230,158 @@
+     })
+ }
+ 
++fn cyclic_prefix_candidate_indexes(
++    constraints: &[SemanticQuotientConstraint],
++    base_masks: &[Vec<u64>],
++    search_order: &[usize],
++) -> Option<CyclicPrefixCandidateIndexes> {
++    if search_order.len() != base_masks.len() {
++        return None;
++    }
++    let mut seen = vec![false; base_masks.len()];
++    for leaf in search_order.iter().copied() {
++        if leaf >= base_masks.len() || seen[leaf] {
++            return None;
++        }
++        seen[leaf] = true;
++    }
++
++    let mut assigned = vec![false; base_masks.len()];
++    let mut by_leaf = vec![None; base_masks.len()];
++    let mut build_work_upper_bound = 0_u128;
++    for leaf in search_order.iter().copied() {
++        let constraint_indices = constraints
++            .iter()
++            .enumerate()
++            .filter_map(|(index, constraint)| {
++                quotient_leaf(constraint, leaf)?;
++                constraint
++                    .leaves
++                    .iter()
++                    .any(|other| other.leaf != leaf && assigned[other.leaf])
++                    .then_some(index)
++            })
++            .collect::<Vec<_>>();
++        if !constraint_indices.is_empty() {
++            let active_rows = mask_population(&base_masks[leaf]);
++            let tree_height = u128::from(
++                usize::BITS
++                    .saturating_sub(active_rows.max(1).leading_zeros())
++                    .saturating_add(1),
++            );
++            build_work_upper_bound = build_work_upper_bound
++                .saturating_add(base_masks[leaf].len() as u128)
++                .saturating_add(
++                    (active_rows as u128)
++                        .saturating_mul(constraint_indices.len().saturating_add(1) as u128)
++                        .saturating_mul(tree_height),
++                );
++            if build_work_upper_bound > MAX_BOUNDED_CYCLIC_ENUMERATION_WORK {
++                return None;
++            }
++            let mut buckets = BTreeMap::<Vec<kernel_semantics::CanonicalEqKey>, Vec<usize>>::new();
++            for ordinal in mask_ordinals(&base_masks[leaf]) {
++                let mut signature = Vec::with_capacity(constraint_indices.len());
++                for constraint_index in &constraint_indices {
++                    let current = quotient_leaf(&constraints[*constraint_index], leaf)?;
++                    signature.push(current.keys.get(ordinal)?.as_ref()?.clone());
++                }
++                buckets.entry(signature).or_default().push(ordinal);
++            }
++            let max_bucket_len = buckets.values().map(Vec::len).max().unwrap_or(0);
++            by_leaf[leaf] = Some(CyclicPrefixCandidateIndex {
++                constraint_indices,
++                buckets,
++                max_bucket_len,
++            });
++        }
++        assigned[leaf] = true;
++    }
++    Some(CyclicPrefixCandidateIndexes {
++        by_leaf,
++        build_work_upper_bound,
++    })
++}
++
++fn cyclic_prefix_signature(
++    index: &CyclicPrefixCandidateIndex,
++    constraints: &[SemanticQuotientConstraint],
++    leaf: usize,
++    assignment: &[Option<usize>],
++) -> Option<Vec<kernel_semantics::CanonicalEqKey>> {
++    index
++        .constraint_indices
++        .iter()
++        .map(|constraint_index| {
++            assigned_quotient_key(&constraints[*constraint_index], leaf, assignment).cloned()
++        })
++        .collect()
++}
++
+ impl OrderPreservingJoinEnumeration<'_> {
++    fn enumerate_candidate(
++        &self,
++        depth: usize,
++        leaf_index: usize,
++        ordinal: usize,
++        assignment: &mut [Option<usize>],
++        output: &mut Vec<Vec<usize>>,
++        stats: &mut ExecutionStats,
++    ) -> Result<(), PhysicalExecutionError> {
++        if ordinal >= self.handles[leaf_index].len() {
++            return Err(RelQueryError::InconsistentIncrementalDelta.into());
++        }
++        stats.multiway_join_semantic_quotient_candidate_visits = stats
++            .multiway_join_semantic_quotient_candidate_visits
++            .saturating_add(1);
++        let mut viable = true;
++        for constraint in self.constraints {
++            let Some(current_leaf) = quotient_leaf(constraint, leaf_index) else {
++                continue;
++            };
++            let Some(key) = current_leaf.keys[ordinal].as_ref() else {
++                viable = false;
++                break;
++            };
++            if let Some(expected) = assigned_quotient_key(constraint, leaf_index, assignment)
++                && expected != key
++            {
++                viable = false;
++                break;
++            }
++            for later in constraint
++                .leaves
++                .iter()
++                .filter(|later| later.leaf != leaf_index && assignment[later.leaf].is_none())
++            {
++                let Some(mask) = later.buckets.get(key) else {
++                    viable = false;
++                    break;
++                };
++                if !masks_intersect(mask, &self.base_masks[later.leaf]) {
++                    viable = false;
++                    break;
++                }
++            }
++            if !viable {
++                break;
++            }
++        }
++        if !viable {
++            return Ok(());
++        }
++        assignment[leaf_index] = Some(ordinal);
++        self.enumerate(depth + 1, assignment, output, stats)?;
++        assignment[leaf_index] = None;
++        Ok(())
++    }
++
+     fn enumerate(
+         &self,
+         depth: usize,
+         assignment: &mut [Option<usize>],
+         output: &mut Vec<Vec<usize>>,
++        stats: &mut ExecutionStats,
+     ) -> Result<(), PhysicalExecutionError> {
+         if depth == self.search_order.len() {
+             output.push(
+@@ -10015,6 +10399,27 @@
+             .get(depth)
+             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+ 
++        if let Some(index) = self
++            .cyclic_prefix_indexes
++            .and_then(|indexes| indexes.by_leaf.get(leaf_index))
++            .and_then(Option::as_ref)
++        {
++            let signature =
++                cyclic_prefix_signature(index, self.constraints, leaf_index, assignment)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            stats.multiway_join_cyclic_prefix_index_lookups = stats
++                .multiway_join_cyclic_prefix_index_lookups
++                .saturating_add(1);
++            if let Some(ordinals) = index.buckets.get(&signature) {
++                for ordinal in ordinals.iter().copied() {
++                    self.enumerate_candidate(
++                        depth, leaf_index, ordinal, assignment, output, stats,
++                    )?;
++                }
++            }
++            return Ok(());
++        }
++
+         let mut candidates = self.base_masks[leaf_index].clone();
+         for constraint in self.constraints {
+             let Some(current_leaf) = quotient_leaf(constraint, leaf_index) else {
+@@ -10029,49 +10434,8 @@
+             mask_intersect_in_place(&mut candidates, mask);
+         }
+ 
+-        for ordinal in 0..self.handles[leaf_index].len() {
+-            if !mask_contains(&candidates, ordinal) {
+-                continue;
+-            }
+-            let mut viable = true;
+-            for constraint in self.constraints {
+-                let Some(current_leaf) = quotient_leaf(constraint, leaf_index) else {
+-                    continue;
+-                };
+-                let Some(key) = current_leaf.keys[ordinal].as_ref() else {
+-                    viable = false;
+-                    break;
+-                };
+-                if let Some(expected) = assigned_quotient_key(constraint, leaf_index, assignment)
+-                    && expected != key
+-                {
+-                    viable = false;
+-                    break;
+-                }
+-                for later in constraint
+-                    .leaves
+-                    .iter()
+-                    .filter(|later| assignment[later.leaf].is_none())
+-                {
+-                    let Some(mask) = later.buckets.get(key) else {
+-                        viable = false;
+-                        break;
+-                    };
+-                    if !masks_intersect(mask, &self.base_masks[later.leaf]) {
+-                        viable = false;
+-                        break;
+-                    }
+-                }
+-                if !viable {
+-                    break;
+-                }
+-            }
+-            if !viable {
+-                continue;
+-            }
+-            assignment[leaf_index] = Some(ordinal);
+-            self.enumerate(depth + 1, assignment, output)?;
+-            assignment[leaf_index] = None;
++        for ordinal in mask_ordinals(&candidates) {
++            self.enumerate_candidate(depth, leaf_index, ordinal, assignment, output, stats)?;
+         }
+         Ok(())
+     }
+@@ -10131,42 +10495,73 @@
+         .sum()
+ }
+ 
+-fn quotient_enumeration_work_upper_bound(
++fn quotient_enumeration_inputs_valid(
+     constraints: &[SemanticQuotientConstraint],
+     base_masks: &[Vec<u64>],
+     row_counts: &[usize],
+     search_order: &[usize],
+-) -> Option<u128> {
++) -> bool {
+     if search_order.len() != base_masks.len() || row_counts.len() != base_masks.len() {
+-        return None;
++        return false;
+     }
+-    let mut assigned = vec![false; base_masks.len()];
+-    for leaf in search_order.iter().copied() {
+-        if leaf >= base_masks.len() || assigned[leaf] {
+-            return None;
++    for (leaf, (mask, row_count)) in base_masks.iter().zip(row_counts).enumerate() {
++        if mask.len() != row_count.div_ceil(64) {
++            return false;
+         }
+-        assigned[leaf] = true;
+-    }
+-    assigned.fill(false);
+-    let mut parent_prefix = 1_u128;
+-    let mut work = 0_u128;
+-    for leaf in search_order.iter().copied() {
+-        work = work.saturating_add(parent_prefix.saturating_mul(row_counts[leaf] as u128));
+-        if work > MAX_BOUNDED_CYCLIC_ENUMERATION_WORK {
+-            return Some(work);
++        if let Some(last) = mask.last() {
++            let used = row_count % 64;
++            if used != 0 && *last >> used != 0 {
++                return false;
++            }
+         }
+-        let mut domain = mask_population(&base_masks[leaf]);
+         for constraint in constraints {
+             let Some(current) = quotient_leaf(constraint, leaf) else {
+                 continue;
+             };
+-            if !constraint
+-                .leaves
+-                .iter()
+-                .any(|other| other.leaf != leaf && assigned[other.leaf])
++            if current.keys.len() != *row_count
++                || current
++                    .buckets
++                    .values()
++                    .any(|bucket| bucket.len() != mask.len())
+             {
+-                continue;
++                return false;
+             }
++        }
++    }
++    let mut seen = vec![false; base_masks.len()];
++    for leaf in search_order.iter().copied() {
++        if leaf >= base_masks.len() || seen[leaf] {
++            return false;
++        }
++        seen[leaf] = true;
++    }
++    true
++}
++
++fn quotient_depth_work_upper_bound(
++    constraints: &[SemanticQuotientConstraint],
++    base_masks: &[Vec<u64>],
++    assigned: &[bool],
++    leaf: usize,
++    prefix_index: Option<&CyclicPrefixCandidateIndex>,
++) -> (usize, usize) {
++    let mut domain = prefix_index.map_or_else(
++        || mask_population(&base_masks[leaf]),
++        |index| index.max_bucket_len,
++    );
++    let mut assigned_bucket_intersections = 0_usize;
++    let mut candidate_check_units = 1_usize;
++    for constraint in constraints {
++        let Some(current) = quotient_leaf(constraint, leaf) else {
++            continue;
++        };
++        candidate_check_units = candidate_check_units.saturating_add(1);
++        if constraint
++            .leaves
++            .iter()
++            .any(|other| other.leaf != leaf && assigned[other.leaf])
++        {
++            assigned_bucket_intersections = assigned_bucket_intersections.saturating_add(1);
+             let max_bucket = current
+                 .buckets
+                 .values()
+@@ -10175,6 +10570,60 @@
+                 .unwrap_or(0);
+             domain = domain.min(max_bucket);
+         }
++        for later in constraint
++            .leaves
++            .iter()
++            .filter(|later| later.leaf != leaf && !assigned[later.leaf])
++        {
++            candidate_check_units = candidate_check_units
++                .saturating_add(1)
++                .saturating_add(base_masks[later.leaf].len());
++        }
++    }
++    let per_parent_work = if let Some(index) = prefix_index {
++        let lookup_height = usize::BITS
++            .saturating_sub(index.buckets.len().max(1).leading_zeros())
++            .saturating_add(1) as usize;
++        index
++            .constraint_indices
++            .len()
++            .saturating_add(1)
++            .saturating_mul(lookup_height)
++            .saturating_add(domain.saturating_mul(candidate_check_units))
++    } else {
++        let mask_word_units = base_masks[leaf]
++            .len()
++            .saturating_mul(1_usize.saturating_add(assigned_bucket_intersections));
++        mask_word_units.saturating_add(domain.saturating_mul(candidate_check_units))
++    };
++    (per_parent_work, domain)
++}
++fn quotient_enumeration_work_upper_bound(
++    constraints: &[SemanticQuotientConstraint],
++    base_masks: &[Vec<u64>],
++    row_counts: &[usize],
++    search_order: &[usize],
++    cyclic_prefix_indexes: Option<&CyclicPrefixCandidateIndexes>,
++) -> Option<u128> {
++    if !quotient_enumeration_inputs_valid(constraints, base_masks, row_counts, search_order) {
++        return None;
++    }
++    let mut assigned = vec![false; base_masks.len()];
++    let mut parent_prefix = 1_u128;
++    let mut work = cyclic_prefix_indexes.map_or(0, |indexes| indexes.build_work_upper_bound);
++    if work > MAX_BOUNDED_CYCLIC_ENUMERATION_WORK {
++        return Some(work);
++    }
++    for leaf in search_order.iter().copied() {
++        let prefix_index = cyclic_prefix_indexes
++            .and_then(|indexes| indexes.by_leaf.get(leaf))
++            .and_then(Option::as_ref);
++        let (per_parent_work, domain) =
++            quotient_depth_work_upper_bound(constraints, base_masks, &assigned, leaf, prefix_index);
++        work = work.saturating_add(parent_prefix.saturating_mul(per_parent_work as u128));
++        if work > MAX_BOUNDED_CYCLIC_ENUMERATION_WORK {
++            return Some(work);
++        }
+         assigned[leaf] = true;
+         parent_prefix = parent_prefix.saturating_mul(domain as u128);
+     }
+@@ -10182,20 +10631,33 @@
+     Some(work)
+ }
+ 
+-fn bounded_cyclic_program_within_budget(
++enum CyclicExecutionAdmission {
++    NotCyclic,
++    Bounded(CyclicPrefixCandidateIndexes),
++}
++
++fn bounded_cyclic_execution_certificate(
+     prepared_program: Option<&PreparedSemanticQuotientProgram>,
+     constraints: &[SemanticQuotientConstraint],
+     base_masks: &[Vec<u64>],
+     row_counts: &[usize],
+     search_order: &[usize],
+-) -> bool {
++) -> Option<CyclicExecutionAdmission> {
+     if !prepared_program.is_some_and(|program| {
+         program.search_certificate == Some(SemanticQuotientSearchCertificate::BoundedCyclic)
+     }) {
+-        return true;
++        return Some(CyclicExecutionAdmission::NotCyclic);
+     }
+-    quotient_enumeration_work_upper_bound(constraints, base_masks, row_counts, search_order)
+-        .is_some_and(|bound| bound <= MAX_BOUNDED_CYCLIC_ENUMERATION_WORK)
++    let indexes = cyclic_prefix_candidate_indexes(constraints, base_masks, search_order)?;
++    let bound = quotient_enumeration_work_upper_bound(
++        constraints,
++        base_masks,
++        row_counts,
++        search_order,
++        Some(&indexes),
++    )?;
++    (bound <= MAX_BOUNDED_CYCLIC_ENUMERATION_WORK)
++        .then_some(CyclicExecutionAdmission::Bounded(indexes))
+ }
+ 
+ fn record_quotient_support_stats(
+@@ -10301,27 +10763,31 @@
+         return Ok(Some(Vec::new()));
+     }
+     let row_counts = handles.iter().map(Vec::len).collect::<Vec<_>>();
+-    if !bounded_cyclic_program_within_budget(
++    let Some(cyclic_admission) = bounded_cyclic_execution_certificate(
+         prepared_program,
+         constraints,
+         base_masks,
+         &row_counts,
+         search_order,
+-    ) {
++    ) else {
+         stats.multiway_join_cyclic_budget_rejections = stats
+             .multiway_join_cyclic_budget_rejections
+             .saturating_add(1);
+         return Ok(None);
+-    }
++    };
+     let execution = OrderPreservingJoinEnumeration {
+         handles: &handles,
+         constraints,
+         base_masks,
+         search_order,
++        cyclic_prefix_indexes: match &cyclic_admission {
++            CyclicExecutionAdmission::NotCyclic => None,
++            CyclicExecutionAdmission::Bounded(indexes) => Some(indexes),
++        },
+     };
+     let mut assignment = vec![None; leaves.len()];
+     let mut assignments = Vec::new();
+-    execution.enumerate(0, &mut assignment, &mut assignments)?;
++    execution.enumerate(0, &mut assignment, &mut assignments, stats)?;
+     materialize_join_assignments(
+         &mut assignments,
+         leaves,
+@@ -10618,13 +11084,14 @@
+         return Ok(true);
+     }
+     let row_counts = handles.iter().map(Vec::len).collect::<Vec<_>>();
+-    Ok(bounded_cyclic_program_within_budget(
++    Ok(bounded_cyclic_execution_certificate(
+         Some(program),
+         &constraints,
+         &base_masks,
+         &row_counts,
+         program.hypergraph_order.as_deref().unwrap_or(&[]),
+-    ))
++    )
++    .is_some())
+ }
+ 
+ fn preferred_nway_order_preserving_join_inputs(
+@@ -20343,17 +20810,136 @@
+     }
+ 
+     #[test]
+-    fn bounded_cyclic_work_certificate_counts_ordinal_scans_and_rejects_bad_order() {
+-        let masks = (0..10).map(|_| vec![1_u64]).collect::<Vec<_>>();
++    fn bounded_cyclic_work_certificate_uses_sparse_masks_and_rejects_bad_order() {
+         let row_counts = vec![200_000_usize; 10];
++        let masks = row_counts
++            .iter()
++            .map(|rows| {
++                let mut mask = vec![0_u64; rows.div_ceil(64)];
++                mask[0] = 1;
++                mask
++            })
++            .collect::<Vec<_>>();
+         let order = (0..10).collect::<Vec<_>>();
+-        let work = quotient_enumeration_work_upper_bound(&[], &masks, &row_counts, &order).unwrap();
+-        assert!(work > MAX_BOUNDED_CYCLIC_ENUMERATION_WORK);
++        let work =
++            quotient_enumeration_work_upper_bound(&[], &masks, &row_counts, &order, None).unwrap();
++        assert!(work < MAX_BOUNDED_CYCLIC_ENUMERATION_WORK);
++
++        let dense_masks = (0..10).map(|_| vec![u64::MAX; 4]).collect::<Vec<_>>();
++        let dense_rows = vec![256_usize; 10];
++        let dense_work =
++            quotient_enumeration_work_upper_bound(&[], &dense_masks, &dense_rows, &order, None)
++                .unwrap();
++        assert!(dense_work > MAX_BOUNDED_CYCLIC_ENUMERATION_WORK);
++
++        let malformed_masks = (0..10).map(|_| vec![1_u64]).collect::<Vec<_>>();
++        assert!(
++            quotient_enumeration_work_upper_bound(&[], &malformed_masks, &row_counts, &order, None)
++                .is_none()
++        );
+ 
+         let mut invalid = order;
+         invalid[9] = 0;
+         assert!(
+-            quotient_enumeration_work_upper_bound(&[], &masks, &row_counts, &invalid).is_none()
++            quotient_enumeration_work_upper_bound(&[], &masks, &row_counts, &invalid, None)
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn execution_stats_merge_preserves_cyclic_qcn_telemetry() {
++        let mut target = ExecutionStats {
++            multiway_join_cyclic_budget_rejections: 2,
++            multiway_join_semantic_quotient_candidate_visits: 3,
++            ..ExecutionStats::default()
++        };
++        merge_execution_stats(
++            &mut target,
++            ExecutionStats {
++                multiway_join_cyclic_budget_rejections: 5,
++                multiway_join_semantic_quotient_candidate_visits: 7,
++                ..ExecutionStats::default()
++            },
++        );
++        assert_eq!(target.multiway_join_cyclic_budget_rejections, 7);
++        assert_eq!(target.multiway_join_semantic_quotient_candidate_visits, 10);
++    }
++
++    #[test]
++    fn bounded_cyclic_prefix_index_tightens_joint_constraint_domain() {
++        let q1 = sid(1_720);
++        let q2 = sid(1_721);
++        let a = (0..64)
++            .map(kernel_semantics::CanonicalEqKey::I64)
++            .collect::<Vec<_>>();
++        let b = (100..164)
++            .map(kernel_semantics::CanonicalEqKey::I64)
++            .collect::<Vec<_>>();
++        let mut cache = SemanticQuotientKeyCache::new();
++        cache.insert((0, 0, q1), a.clone());
++        cache.insert(
++            (2, 0, q1),
++            (0..4_096).map(|row| a[row / 64].clone()).collect(),
++        );
++        cache.insert((1, 0, q2), b.clone());
++        cache.insert(
++            (2, 1, q2),
++            (0..4_096).map(|row| b[row % 64].clone()).collect(),
++        );
++        let q1_leaves = vec![
++            quotient_leaf_keys(0, &[0], q1, 64, &cache).unwrap(),
++            quotient_leaf_keys(2, &[0], q1, 4_096, &cache).unwrap(),
++        ];
++        let q2_leaves = vec![
++            quotient_leaf_keys(1, &[0], q2, 64, &cache).unwrap(),
++            quotient_leaf_keys(2, &[1], q2, 4_096, &cache).unwrap(),
++        ];
++        let q1_support = quotient_key_leaf_support(&q1_leaves);
++        let q2_support = quotient_key_leaf_support(&q2_leaves);
++        let constraints = vec![
++            SemanticQuotientConstraint {
++                leaves: q1_leaves,
++                key_leaf_support: q1_support.clone(),
++                live_key_leaf_support: q1_support,
++            },
++            SemanticQuotientConstraint {
++                leaves: q2_leaves,
++                key_leaf_support: q2_support.clone(),
++                live_key_leaf_support: q2_support,
++            },
++        ];
++        let masks = vec![
++            full_ordinal_mask(64),
++            full_ordinal_mask(64),
++            full_ordinal_mask(4_096),
++        ];
++        let rows = vec![64, 64, 4_096];
++        let order = vec![0, 1, 2];
++        let indexes = cyclic_prefix_candidate_indexes(&constraints, &masks, &order).unwrap();
++        let leaf_two = indexes.by_leaf[2].as_ref().unwrap();
++        assert_eq!(leaf_two.constraint_indices, vec![0, 1]);
++        assert_eq!(leaf_two.max_bucket_len, 1);
++        assert_eq!(leaf_two.buckets.len(), 4_096);
++
++        let coarse =
++            quotient_enumeration_work_upper_bound(&constraints, &masks, &rows, &order, None)
++                .unwrap();
++        let joint = quotient_enumeration_work_upper_bound(
++            &constraints,
++            &masks,
++            &rows,
++            &order,
++            Some(&indexes),
++        )
++        .unwrap();
++        assert!(joint < coarse, "joint={joint}, coarse={coarse}");
++        assert!(
++            coarse > MAX_BOUNDED_CYCLIC_ENUMERATION_WORK,
++            "coarse={coarse}"
++        );
++        assert!(
++            joint <= MAX_BOUNDED_CYCLIC_ENUMERATION_WORK,
++            "joint={joint}"
+         );
+     }
+ 
+@@ -20818,6 +21404,51 @@
+         (store, model)
+     }
+ 
++    fn install_sparse_cyclic_text_rows(
++        fixture: &CyclicTextFixture,
++        rows_per_leaf: usize,
++    ) -> (PhysicalStore, kernel_model::FiniteModel) {
++        let mut store = PhysicalStore::default();
++        let mut model = kernel_model::FiniteModel::default();
++        for (leaf, (relation, binding)) in fixture
++            .relations
++            .iter()
++            .copied()
++            .zip(fixture.bindings.iter().copied())
++            .enumerate()
++        {
++            let mut first = Vec::with_capacity(rows_per_leaf);
++            let mut second = Vec::with_capacity(rows_per_leaf);
++            first.push("A".to_owned());
++            second.push("A".to_owned());
++            for ordinal in 1..rows_per_leaf {
++                let noise = format!("noise-{leaf}-{ordinal}");
++                first.push(noise.clone());
++                second.push(noise);
++            }
++            store
++                .install(
++                    relation,
++                    binding,
++                    NativeRelation::typed_columnar(vec![
++                        NativeColumn::Text(first.clone()),
++                        NativeColumn::Text(second.clone()),
++                    ])
++                    .unwrap(),
++                )
++                .unwrap();
++            model.relations.insert(
++                relation,
++                first
++                    .into_iter()
++                    .zip(second)
++                    .map(|(first, second)| vec![Value::Text(first), Value::Text(second)])
++                    .collect(),
++            );
++        }
++        (store, model)
++    }
++
+     #[test]
+     fn ten_way_non_gyo_cycle_uses_bounded_cyclic_quotient_search() {
+         let fixture = ten_way_non_gyo_text_cycle_fixture();
+@@ -20846,6 +21477,7 @@
+         assert_eq!(native.rows().len(), 2);
+         assert_eq!(stats.multiway_join_order_preserving_enumerations, 1);
+         assert_eq!(stats.multiway_join_prepared_quotient_hits, 1);
++        assert!(stats.multiway_join_cyclic_prefix_index_lookups > 0);
+ 
+         let mut cached_store = store.clone();
+         assert!(
+@@ -20906,6 +21538,26 @@
+     }
+ 
+     #[test]
++    fn sparse_non_gyo_cycle_visits_only_supported_ordinals() {
++        let fixture = ten_way_non_gyo_text_cycle_fixture();
++        let rows_per_leaf = 128;
++        let (store, model) = install_sparse_cyclic_text_rows(&fixture, rows_per_leaf);
++        let (native, stats) = fixture
++            .prepared
++            .execute_native_pinned(&store, &fixture.registry)
++            .unwrap();
++        let reference = fixture
++            .logical
++            .evaluate(&model, &fixture.context, &fixture.registry)
++            .unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(native.rows().len(), 1);
++        assert_eq!(stats.scanned_rows, rows_per_leaf * fixture.relations.len());
++        assert_eq!(stats.multiway_join_semantic_quotient_candidate_visits, 10);
++        assert!(stats.multiway_join_semantic_quotient_candidate_visits * 100 < stats.scanned_rows);
++    }
++
++    #[test]
+     fn ten_way_non_gyo_cycle_rejects_uncertified_large_enumeration_before_dfs() {
+         let fixture = ten_way_non_gyo_text_cycle_fixture();
+         let program = fixture.prepared.semantic_quotient_program.as_ref().unwrap();
+@@ -25937,7 +26589,7 @@
+     #[test]
+     fn durable_runtime_owner_restarts_from_checkpoint_plus_wal_tail() {
+         let dir = durable_test_dir("restart-tail");
+-        let (context, registry, relation, _, root) = scan_runtime_bundle(500, 1200, &[1, 2]);
++        let (context, registry, relation, layout, root) = scan_runtime_bundle(500, 1200, &[1, 2]);
+         let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+         let delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let mutations = [RevisionRelationMutation {
+@@ -25963,11 +26615,7 @@
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(501));
+         assert_eq!(
+-            runtime_physical_i64_values(
+-                snapshot.root(),
+-                relation,
+-                LayoutBinding::RECOVERY_ROW_STORE,
+-            ),
++            runtime_physical_i64_values(snapshot.root(), relation, layout),
+             vec![2, 3]
+         );
+         assert_eq!(
+@@ -25981,7 +26629,7 @@
+     #[test]
+     fn durable_runtime_checkpoint_rotates_base_then_replays_only_new_tail() {
+         let dir = durable_test_dir("checkpoint-tail");
+-        let (context, registry, relation, _, root) = scan_runtime_bundle(510, 1201, &[1, 2]);
++        let (context, registry, relation, layout, root) = scan_runtime_bundle(510, 1201, &[1, 2]);
+         let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+ 
+         let delta_a = scan_delta(relation, &[3], &[1], &context, &registry);
+@@ -26030,11 +26678,7 @@
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(512));
+         assert_eq!(
+-            runtime_physical_i64_values(
+-                snapshot.root(),
+-                relation,
+-                LayoutBinding::RECOVERY_ROW_STORE,
+-            ),
++            runtime_physical_i64_values(snapshot.root(), relation, layout),
+             vec![3, 4]
+         );
+         drop(reopened);
+@@ -26071,7 +26715,7 @@
+ 
+         {
+             let durability = runtime.durability.lock().unwrap();
+-            assert_eq!(durability.physical_artifact_specs().len(), 1);
++            assert_eq!(durability.physical_artifact_specs().len(), 2);
+         }
+ 
+         let delta = scan_delta(relation, &[4], &[1], &context, &registry);
+@@ -26097,8 +26741,7 @@
+         let reopened = DurableRuntime::open(&dir).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(516));
+-        let recovered_binding =
+-            SemanticIndexBinding::single(relation, LayoutBinding::RECOVERY_ROW_STORE, 0, sid(101));
++        let recovered_binding = SemanticIndexBinding::single(relation, layout, 0, sid(101));
+         assert_eq!(
+             snapshot
+                 .physical_store()
+@@ -26117,7 +26760,7 @@
+         );
+ 
+         let mut catalog = PhysicalCatalog::default();
+-        catalog.bind_relation(relation, LayoutBinding::RECOVERY_ROW_STORE);
++        catalog.bind_relation(relation, layout);
+         let query = RelExpr::FilterEqConst {
+             input: Box::new(RelExpr::Scan(relation)),
+             column: 0,
+@@ -26136,6 +26779,257 @@
+     }
+ 
+     #[test]
++    fn durable_typed_layout_and_i64_index_rebuild_and_serve_after_compaction() {
++        let dir = durable_test_dir("typed-layout-i64-recovery");
++        let values = (1_i64..=64).collect::<Vec<_>>();
++        let (context, registry, relation, layout, root) =
++            scan_runtime_bundle(5_180, 9_180, &values);
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
++        let index = I64IndexBinding {
++            relation,
++            layout,
++            key_column: 0,
++            equivalence: sid(101),
++        };
++        runtime.install_i64_index(index, &registry).unwrap();
++        runtime.checkpoint().unwrap();
++        runtime.compact_obsolete_generations().unwrap();
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert_eq!(snapshot.root().relation_layout(relation), Some(layout));
++        assert!(matches!(
++            &snapshot
++                .physical_store()
++                .installed(relation, layout)
++                .unwrap()
++                .data,
++            NativeRelation::TypedColumnar { columns, row_count }
++                if *row_count == 64 && matches!(columns.as_slice(), [NativeColumn::I64(values)] if values.len() == 64)
++        ));
++        let recovered_index = snapshot.physical_store().i64_index(index).unwrap();
++        assert_eq!(recovered_index.row_count(), 64);
++        assert_eq!(recovered_index.probe(32).unwrap().len(), 1);
++
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, layout);
++        let query = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(relation)),
++            right: Box::new(RelExpr::Scan(relation)),
++            left_column: 0,
++            right_column: 0,
++            equivalence: sid(101),
++        };
++        let prepared = prepare_with_catalog(query, &context, &registry, &catalog).unwrap();
++        let (result, stats) = prepared
++            .execute_native_pinned(snapshot.physical_store(), &registry)
++            .unwrap();
++        assert_eq!(result.rows().len(), 64);
++        assert_eq!(stats.persisted_index_hits, 1);
++        assert_eq!(stats.ephemeral_index_builds, 0);
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn durable_layout_recipe_round_trips_supported_native_representations() {
++        let (context, registry, relation) = planning_context();
++        let rows = vec![vec![Value::I64(1)], vec![Value::I64(2)]];
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(relation, rows.clone());
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(5_179),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let cases = [
++            (
++                "row",
++                LayoutBinding {
++                    id: LayoutId(9_179),
++                    family: LayoutFamily::RowStore,
++                },
++                NativeRelation::row_store(rows.clone()),
++            ),
++            (
++                "value-columnar",
++                LayoutBinding {
++                    id: LayoutId(9_180),
++                    family: LayoutFamily::Columnar,
++                },
++                NativeRelation::columnar(vec![vec![Value::I64(1), Value::I64(2)]]).unwrap(),
++            ),
++            (
++                "i64-columnar",
++                LayoutBinding {
++                    id: LayoutId(9_181),
++                    family: LayoutFamily::Columnar,
++                },
++                NativeRelation::i64_columnar(vec![vec![1, 2]]).unwrap(),
++            ),
++        ];
++        for (name, layout, native) in cases {
++            let dir = durable_test_dir(name);
++            let mut physical = PhysicalStore::default();
++            physical.install(relation, layout, native.clone()).unwrap();
++            let root = RuntimeRevisionBundle::build(
++                revision.clone(),
++                physical,
++                BTreeMap::from([(relation, layout)]),
++                &[],
++                &registry,
++            )
++            .unwrap();
++            drop(DurableRuntime::create(root, &dir, &registry).unwrap());
++            let reopened = DurableRuntime::open(&dir).unwrap();
++            let snapshot = reopened.snapshot().unwrap();
++            assert_eq!(snapshot.root().relation_layout(relation), Some(layout));
++            assert_eq!(
++                snapshot
++                    .physical_store()
++                    .installed(relation, layout)
++                    .unwrap()
++                    .data,
++                native
++            );
++            drop(snapshot);
++            drop(reopened);
++            std::fs::remove_dir_all(dir).unwrap();
++        }
++    }
++
++    fn assert_recovered_dense_live_ref_layout(
++        snapshot: &RuntimeRevisionSnapshot,
++        relation: SemanticId,
++        layout: LayoutBinding,
++        source_dense: &Arc<DenseEntityIds>,
++        first: EntityId,
++        second: EntityId,
++    ) {
++        let recovered_dense = snapshot.revision().dense_entity_ids();
++        assert!(!Arc::ptr_eq(source_dense, &recovered_dense));
++        let installed = snapshot
++            .physical_store()
++            .installed(relation, layout)
++            .unwrap();
++        let NativeRelation::TypedColumnar { columns, row_count } = &installed.data else {
++            panic!("typed relation layout was not recovered");
++        };
++        assert_eq!(*row_count, 2);
++        let [NativeColumn::DenseLiveEntityIds { ids, values, .. }] = columns.as_slice() else {
++            panic!("recovered live-ref column was not rebound to dense local ids");
++        };
++        assert!(Arc::ptr_eq(ids, &recovered_dense));
++        assert_eq!(
++            values
++                .iter()
++                .map(|&local| recovered_dense.external(local).unwrap())
++                .collect::<Vec<_>>(),
++            vec![first, second]
++        );
++    }
++
++    #[test]
++    fn durable_typed_live_ref_layout_rebinds_fresh_revision_local_dense_ids() {
++        let dir = durable_test_dir("typed-live-ref-recovery");
++        let relation = sid(5_181);
++        let entity_type = sid(5_182);
++        let equivalence = sid(5_183);
++        let mut registry = SemanticRegistry::default();
++        let digest =
++            registry.install_equivalence(EquivalenceModule::LiveEntityIdExact(entity_type));
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(5_181));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(5_181));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::LiveEntityRef(entity_type))],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let first = EntityId::new(5_181);
++        let second = EntityId::new(5_182);
++        let rows = [first, second]
++            .into_iter()
++            .map(|id| vec![Value::LiveEntityRef { entity_type, id }])
++            .collect::<Vec<_>>();
++        let mut state = kernel_model::DatabaseState::default();
++        for entity in [first, second] {
++            state.lifecycle.entities.insert(entity);
++            state.lifecycle.roots.insert(entity);
++            state
++                .model
++                .carriers
++                .entry(entity_type)
++                .or_default()
++                .insert(entity);
++        }
++        state.model.relations.insert(relation, rows);
++        let revision =
++            kernel_revision::Revision::build(RevisionId::new(5_181), &context, &registry, state)
++                .unwrap();
++        let source_dense = revision.dense_entity_ids();
++        let layout = LayoutBinding {
++            id: LayoutId(9_181),
++            family: LayoutFamily::Columnar,
++        };
++        let dense_column = NativeColumn::dense_live_entity_ids(
++            entity_type,
++            Arc::clone(&source_dense),
++            vec![first, second],
++        )
++        .unwrap();
++        let mut physical = PhysicalStore::default();
++        physical
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![dense_column]).unwrap(),
++            )
++            .unwrap();
++        let root = RuntimeRevisionBundle::build(
++            revision,
++            physical,
++            BTreeMap::from([(relation, layout)]),
++            &[],
++            &registry,
++        )
++        .unwrap();
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
++        runtime.checkpoint().unwrap();
++        runtime.compact_obsolete_generations().unwrap();
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert_recovered_dense_live_ref_layout(
++            &snapshot,
++            relation,
++            layout,
++            &source_dense,
++            first,
++            second,
++        );
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
+     fn durable_initial_recipes_rebuild_statistics_and_quotient_factor_with_ownership() {
+         let dir = durable_test_dir("physical-recipes-initial");
+         let (context, registry, relation, layout, mut root) =
+@@ -26159,12 +27053,11 @@
+             ManagedPhysicalArtifact::SemanticQuotientFactor(binding.clone()),
+         );
+ 
+-        assert_eq!(root.durable_physical_artifact_specs().len(), 2);
++        assert_eq!(root.durable_physical_artifact_specs().len(), 3);
+         drop(DurableRuntime::create(root, &dir, &registry).unwrap());
+         let reopened = DurableRuntime::open(&dir).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+-        let recovered =
+-            SemanticIndexBinding::single(relation, LayoutBinding::RECOVERY_ROW_STORE, 0, sid(101));
++        let recovered = SemanticIndexBinding::single(relation, layout, 0, sid(101));
+         assert!(
+             snapshot
+                 .physical_store()
+@@ -26229,6 +27122,126 @@
+         std::fs::remove_dir_all(dir).unwrap();
+     }
+ 
++    #[test]
++    fn stale_durable_layout_recipe_falls_back_without_blocking_logical_recovery() {
++        let dir = durable_test_dir("stale-layout-recipe");
++        let relation = sid(5_190);
++        let equivalence = sid(5_191);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(5_190));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(5_190));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            vec![
++                vec![Value::Text("alpha".into())],
++                vec![Value::Text("beta".into())],
++            ],
++        );
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(5_190),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        drop(
++            DurableRevisionStore::create_with_materializations_and_physical_artifacts(
++                &dir,
++                &revision,
++                &[],
++                &[DurablePhysicalArtifactSpec::RelationLayout {
++                    relation,
++                    layout_id: 9_190,
++                    kind: DurableRelationLayoutKind::I64Columnar,
++                }],
++                &registry,
++            )
++            .unwrap(),
++        );
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert_eq!(snapshot.revision(), &revision);
++        assert_eq!(
++            snapshot.root().relation_layout(relation),
++            Some(LayoutBinding::RECOVERY_ROW_STORE)
++        );
++        assert_eq!(
++            snapshot
++                .physical_store()
++                .installed(relation, LayoutBinding::RECOVERY_ROW_STORE)
++                .unwrap()
++                .data
++                .clone(),
++            NativeRelation::row_store(vec![
++                vec![Value::Text("alpha".into())],
++                vec![Value::Text("beta".into())]
++            ])
++        );
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn conflicting_durable_layout_recipes_fall_back_deterministically() {
++        let dir = durable_test_dir("conflicting-layout-recipes");
++        let (_, registry, relation, _, root) = scan_runtime_bundle(5_191, 9_191, &[1, 2]);
++        let revision = root.revision().clone();
++        let materializations = root.durable_materialization_specs();
++        let specs = [
++            DurablePhysicalArtifactSpec::RelationLayout {
++                relation,
++                layout_id: 9_191,
++                kind: DurableRelationLayoutKind::TypedColumnar,
++            },
++            DurablePhysicalArtifactSpec::RelationLayout {
++                relation,
++                layout_id: 9_192,
++                kind: DurableRelationLayoutKind::I64Columnar,
++            },
++        ];
++        drop(
++            DurableRevisionStore::create_with_materializations_and_physical_artifacts(
++                &dir,
++                &revision,
++                &materializations,
++                &specs,
++                &registry,
++            )
++            .unwrap(),
++        );
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert_eq!(
++            snapshot.root().relation_layout(relation),
++            Some(LayoutBinding::RECOVERY_ROW_STORE)
++        );
++        assert_eq!(snapshot.revision(), &revision);
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
+     fn structural_durable_index_fixture() -> (
+         SemanticRegistry,
+         SemanticContext,
+@@ -26312,16 +27325,12 @@
+     fn durable_structural_semantic_index_rebuilds_and_serves_after_reopen() {
+         let dir = durable_test_dir("structural-physical-recipe");
+         let (registry, context, root, relation, structural) = structural_durable_index_fixture();
++        let layout = root.relation_layout(relation).unwrap();
+         drop(DurableRuntime::create(root, &dir, &registry).unwrap());
+ 
+         let reopened = DurableRuntime::open(&dir).unwrap();
+         let snapshot = reopened.snapshot().unwrap();
+-        let recovered_binding = SemanticIndexBinding::single(
+-            relation,
+-            LayoutBinding::RECOVERY_ROW_STORE,
+-            0,
+-            structural,
+-        );
++        let recovered_binding = SemanticIndexBinding::single(relation, layout, 0, structural);
+         assert!(
+             snapshot
+                 .physical_store()
+@@ -26329,7 +27338,7 @@
+                 .contains_key(&recovered_binding)
+         );
+         let mut catalog = PhysicalCatalog::default();
+-        catalog.bind_relation(relation, LayoutBinding::RECOVERY_ROW_STORE);
++        catalog.bind_relation(relation, layout);
+         let query = RelExpr::FilterEqConst {
+             input: Box::new(RelExpr::Scan(relation)),
+             column: 0,
+@@ -26380,7 +27389,7 @@
+         const WORKER_ENV: &str = "CFMD_PLAN_COMMIT_CRASH_WORKER";
+         const DIR_ENV: &str = "CFMD_PLAN_COMMIT_CRASH_DIR";
+         let dir = durable_test_dir("commit-before-publish");
+-        let (context, registry, relation, _, root) = scan_runtime_bundle(530, 1203, &[1, 2]);
++        let (context, registry, relation, layout, root) = scan_runtime_bundle(530, 1203, &[1, 2]);
+         let retry_delta = scan_delta(relation, &[3], &[1], &context, &registry);
+         let retry_mutations = [RevisionRelationMutation {
+             relation,
+@@ -26433,11 +27442,7 @@
+         let snapshot = reopened.snapshot().unwrap();
+         assert_eq!(snapshot.revision_id(), RevisionId::new(531));
+         assert_eq!(
+-            runtime_physical_i64_values(
+-                snapshot.root(),
+-                relation,
+-                LayoutBinding::RECOVERY_ROW_STORE,
+-            ),
++            runtime_physical_i64_values(snapshot.root(), relation, layout),
+             vec![2, 3]
+         );
+         assert_eq!(

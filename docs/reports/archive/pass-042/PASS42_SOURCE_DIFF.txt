@@ -1,0 +1,1847 @@
+diff -ruN /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-durability/src/metadata.rs /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-durability/src/metadata.rs
+--- /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-durability/src/metadata.rs	2026-09-20 00:55:57.000000000 +0000
++++ /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-durability/src/metadata.rs	2026-09-20 10:35:37.819064304 +0000
+@@ -11,7 +11,7 @@
+     push_bytes, push_len, push_u64, push_u128,
+ };
+ 
+-const METADATA_CODEC_VERSION: u16 = 2;
++const METADATA_CODEC_VERSION: u16 = 3;
+ const MAX_QUERY_DEPTH: usize = 128;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -43,7 +43,7 @@
+ pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str> {
+     let mut cursor = Cursor::new(bytes);
+     let version = cursor.u16()?;
+-    if version != 1 && version != METADATA_CODEC_VERSION {
++    if version != 1 && version != 2 && version != METADATA_CODEC_VERSION {
+         return Err("unsupported durable metadata codec version");
+     }
+     let materializations = decode_materialization_specs(&mut cursor)?;
+@@ -346,6 +346,18 @@
+             encode_value(out, value, 0)?;
+             push_u128(out, equivalence.raw());
+         }
++        RelExpr::FilterEqColumns {
++            input,
++            left_column,
++            right_column,
++            equivalence,
++        } => {
++            out.push(8);
++            encode_rel_expr(out, input, depth + 1)?;
++            push_usize(out, *left_column)?;
++            push_usize(out, *right_column)?;
++            push_u128(out, equivalence.raw());
++        }
+         RelExpr::Project { input, columns } => {
+             out.push(2);
+             encode_rel_expr(out, input, depth + 1)?;
+@@ -484,6 +496,12 @@
+             cursor,
+             depth + 1,
+         )?))),
++        8 => Ok(RelExpr::FilterEqColumns {
++            input: Box::new(decode_rel_expr(cursor, depth + 1)?),
++            left_column: decode_usize(cursor)?,
++            right_column: decode_usize(cursor)?,
++            equivalence: SemanticId::new(cursor.u128()?),
++        }),
+         _ => Err("unknown durable relation expression tag"),
+     }
+ }
+@@ -567,16 +585,21 @@
+         let query = RelExpr::TopKWithTies {
+             input: Box::new(RelExpr::Group {
+                 input: Box::new(RelExpr::Distinct {
+-                    input: Box::new(RelExpr::JoinEq {
+-                        left: Box::new(RelExpr::Project {
+-                            input: Box::new(left),
+-                            columns: vec![0, 1],
++                    input: Box::new(RelExpr::FilterEqColumns {
++                        input: Box::new(RelExpr::JoinEq {
++                            left: Box::new(RelExpr::Project {
++                                input: Box::new(left),
++                                columns: vec![0, 1],
++                            }),
++                            right: Box::new(RelExpr::PromoteToBag(Box::new(RelExpr::Scan(
++                                SemanticId::new(2),
++                            )))),
++                            left_column: 0,
++                            right_column: 0,
++                            equivalence: eq,
+                         }),
+-                        right: Box::new(RelExpr::PromoteToBag(Box::new(RelExpr::Scan(
+-                            SemanticId::new(2),
+-                        )))),
+-                        left_column: 0,
+-                        right_column: 0,
++                        left_column: 1,
++                        right_column: 3,
+                         equivalence: eq,
+                     }),
+                     column_equivalences: vec![eq, eq],
+diff -ruN /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-plan/src/lib.rs /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-plan/src/lib.rs
+--- /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-plan/src/lib.rs	2026-09-20 02:58:08.000000000 +0000
++++ /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-plan/src/lib.rs	2026-09-20 10:36:28.789734813 +0000
+@@ -90,11 +90,35 @@
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub struct SemanticIndexKeyPart {
++    pub column: usize,
++    pub equivalence: SemanticId,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+ pub struct SemanticIndexBinding {
+     pub relation: SemanticId,
+     pub layout: LayoutBinding,
+-    pub key_column: usize,
+-    pub equivalence: SemanticId,
++    pub key_parts: Vec<SemanticIndexKeyPart>,
++}
++
++impl SemanticIndexBinding {
++    #[must_use]
++    pub fn single(
++        relation: SemanticId,
++        layout: LayoutBinding,
++        column: usize,
++        equivalence: SemanticId,
++    ) -> Self {
++        Self {
++            relation,
++            layout,
++            key_parts: vec![SemanticIndexKeyPart {
++                column,
++                equivalence,
++            }],
++        }
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -2578,7 +2602,8 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+         let relation = self.installed(index.relation, index.layout)?;
+-        let state = MaterializedSemanticIndexState::build(index, relation, context, registry)?;
++        let state =
++            MaterializedSemanticIndexState::build(index.clone(), relation, context, registry)?;
+         let next_epoch = self
+             .transition_epoch
+             .checked_add(1)
+@@ -2814,9 +2839,9 @@
+ 
+     fn semantic_index(
+         &self,
+-        index: SemanticIndexBinding,
++        index: &SemanticIndexBinding,
+     ) -> Option<&MaterializedSemanticIndexState> {
+-        self.semantic_indexes.get(&index)
++        self.semantic_indexes.get(index)
+     }
+ 
+     fn installed(
+@@ -2960,9 +2985,11 @@
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct MaterializedSemanticIndexState {
+     binding: SemanticIndexBinding,
+-    resolved: kernel_semantics::ResolvedPrimitiveEquivalence,
+-    index:
+-        kernel_semantic_index::SemanticBucketIndex<kernel_semantics::CanonicalEqKey, PhysicalRowId>,
++    resolved: Vec<kernel_semantics::ResolvedPrimitiveEquivalence>,
++    index: kernel_semantic_index::SemanticBucketIndex<
++        Vec<kernel_semantics::CanonicalEqKey>,
++        PhysicalRowId,
++    >,
+ }
+ 
+ impl MaterializedSemanticIndexState {
+@@ -2972,31 +2999,35 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, PhysicalExecutionError> {
+-        let Some(resolved) =
+-            registry.resolve_primitive_equivalence(context, binding.equivalence)?
+-        else {
++        if binding.key_parts.is_empty() {
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+-        };
++        }
+         let definition = context
+             .schema
+             .relation(binding.relation)
+             .ok_or(RelQueryError::UnknownRelation(binding.relation))?;
+-        if binding.key_column >= definition.columns.len() {
+-            return Err(RelQueryError::ColumnOutOfBounds.into());
++        let mut resolved = Vec::with_capacity(binding.key_parts.len());
++        let mut dependencies = Vec::with_capacity(binding.key_parts.len());
++        for part in &binding.key_parts {
++            if part.column >= definition.columns.len() {
++                return Err(RelQueryError::ColumnOutOfBounds.into());
++            }
++            let Some(module) = registry.resolve_primitive_equivalence(context, part.equivalence)?
++            else {
++                return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++            };
++            dependencies.push(kernel_semantic_index::SemanticModuleBinding {
++                semantic_id: part.equivalence,
++                module_digest: module.module_digest(),
++            });
++            resolved.push(module);
+         }
+-        let dependency = kernel_semantic_index::SemanticModuleBinding {
+-            semantic_id: binding.equivalence,
+-            module_digest: resolved.module_digest(),
+-        };
+         let mut index = kernel_semantic_index::SemanticBucketIndex::new(
+-            kernel_semantic_index::SemanticIndexBinding::new(context, vec![dependency]),
++            kernel_semantic_index::SemanticIndexBinding::new(context, dependencies),
+         );
+         for row_index in relation.scan_positions() {
+             let row = materialize_native_row(&relation.data, row_index)?;
+-            let value = row
+-                .get(binding.key_column)
+-                .ok_or(RelQueryError::ColumnOutOfBounds)?;
+-            let key = resolved.canonical_key(value)?;
++            let key = semantic_index_row_key(&binding, &resolved, &row)?;
+             let previous = index.insert(relation.row_id_at(row_index)?, key);
+             debug_assert!(previous.is_none());
+         }
+@@ -3012,9 +3043,19 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<bool, PhysicalExecutionError> {
+-        Ok(registry
+-            .resolve_primitive_equivalence(context, self.binding.equivalence)?
+-            .is_some_and(|resolved| resolved == self.resolved))
++        if self.binding.key_parts.len() != self.resolved.len() {
++            return Ok(false);
++        }
++        for (part, expected) in self.binding.key_parts.iter().zip(&self.resolved) {
++            let Some(actual) = registry.resolve_primitive_equivalence(context, part.equivalence)?
++            else {
++                return Ok(false);
++            };
++            if &actual != expected {
++                return Ok(false);
++            }
++        }
++        Ok(true)
+     }
+ 
+     #[must_use]
+@@ -3022,22 +3063,39 @@
+         self.index.len()
+     }
+ 
++    #[must_use]
++    pub fn distinct_key_count(&self) -> usize {
++        self.index.distinct_key_count()
++    }
++
++    fn probe_values(
++        &self,
++        values: &[&Value],
++    ) -> Result<Option<&[PhysicalRowId]>, PhysicalExecutionError> {
++        if values.len() != self.resolved.len() {
++            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++        }
++        let key = self
++            .resolved
++            .iter()
++            .zip(values)
++            .map(|(resolved, value)| resolved.canonical_key(value))
++            .collect::<Result<Vec<_>, _>>()?;
++        Ok(self.index.bucket(&key))
++    }
++
+     fn probe_value(
+         &self,
+         value: &Value,
+     ) -> Result<Option<&[PhysicalRowId]>, PhysicalExecutionError> {
+-        let key = self.resolved.canonical_key(value)?;
+-        Ok(self.index.bucket(&key))
++        self.probe_values(&[value])
+     }
+ 
+     fn row_key(
+         &self,
+         row: &kernel_query::Row,
+-    ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+-        let value = row
+-            .get(self.binding.key_column)
+-            .ok_or(RelQueryError::ColumnOutOfBounds)?;
+-        self.resolved.canonical_key(value).map_err(Into::into)
++    ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
++        semantic_index_row_key(&self.binding, &self.resolved, row)
+     }
+ 
+     fn validate_physical_delta(
+@@ -3076,12 +3134,31 @@
+     }
+ }
+ 
++fn semantic_index_row_key(
++    binding: &SemanticIndexBinding,
++    resolved: &[kernel_semantics::ResolvedPrimitiveEquivalence],
++    row: &kernel_query::Row,
++) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
++    binding
++        .key_parts
++        .iter()
++        .zip(resolved)
++        .map(|(part, module)| {
++            let value = row
++                .get(part.column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            module.canonical_key(value).map_err(Into::into)
++        })
++        .collect()
++}
++
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+ pub struct ExecutionStats {
+     pub scanned_rows: usize,
+     pub values_read: usize,
+     pub output_rows: usize,
+     pub persisted_index_hits: usize,
++    pub persisted_index_cost_rejections: usize,
+     pub ephemeral_index_builds: usize,
+     pub fused_join_project_hits: usize,
+     pub typed_batch_chain_hits: usize,
+@@ -3173,6 +3250,47 @@
+     FullSort,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SemanticAccessPath {
++    FullScan,
++    PersistedIndex,
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct SemanticAccessCostModel;
++
++impl SemanticAccessCostModel {
++    #[must_use]
++    pub const fn choose_filter(row_count: usize, matching_rows: usize) -> SemanticAccessPath {
++        let scan_work = row_count;
++        let index_work = 1_usize.saturating_add(matching_rows);
++        if index_work < scan_work {
++            SemanticAccessPath::PersistedIndex
++        } else {
++            SemanticAccessPath::FullScan
++        }
++    }
++
++    #[must_use]
++    pub const fn choose_join(
++        left_rows: usize,
++        right_rows: usize,
++        right_distinct_keys: usize,
++    ) -> SemanticAccessPath {
++        if left_rows == 0 || right_rows == 0 || right_distinct_keys == 0 {
++            return SemanticAccessPath::PersistedIndex;
++        }
++        let nested_work = left_rows.saturating_mul(right_rows);
++        let average_bucket = right_rows.div_ceil(right_distinct_keys);
++        let indexed_work = left_rows.saturating_mul(1_usize.saturating_add(average_bucket));
++        if indexed_work < nested_work {
++            SemanticAccessPath::PersistedIndex
++        } else {
++            SemanticAccessPath::FullScan
++        }
++    }
++}
++
+ /// Minimal physical-plan vocabulary for the correctness-first baseline.
+ ///
+ /// This is deliberately closed and contains no host callbacks, opaque expression
+@@ -3192,6 +3310,12 @@
+         value: Value,
+         equivalence: SemanticId,
+     },
++    FilterEqColumns {
++        input: Box<Self>,
++        left_column: usize,
++        right_column: usize,
++        equivalence: SemanticId,
++    },
+     Project {
+         input: Box<Self>,
+         columns: Vec<usize>,
+@@ -3271,6 +3395,17 @@
+                 value: value.clone(),
+                 equivalence: *equivalence,
+             },
++            RelExpr::FilterEqColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => Self::FilterEqColumns {
++                input: Box::new(Self::lower_with_catalog(input, catalog)),
++                left_column: *left_column,
++                right_column: *right_column,
++                equivalence: *equivalence,
++            },
+             RelExpr::Project { input, columns } => Self::Project {
+                 input: Box::new(Self::lower_with_catalog(input, catalog)),
+                 columns: columns.clone(),
+@@ -3352,6 +3487,17 @@
+                 value: value.clone(),
+                 equivalence: *equivalence,
+             },
++            Self::FilterEqColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => RelExpr::FilterEqColumns {
++                input: Box::new(input.to_logical_expr()),
++                left_column: *left_column,
++                right_column: *right_column,
++                equivalence: *equivalence,
++            },
+             Self::Project { input, columns } => RelExpr::Project {
+                 input: Box::new(input.to_logical_expr()),
+                 columns: columns.clone(),
+@@ -3418,7 +3564,7 @@
+         shape.nodes += 1;
+         match self {
+             Self::Scan { .. } => shape.scans += 1,
+-            Self::FilterEqConst { input, .. } => {
++            Self::FilterEqConst { input, .. } | Self::FilterEqColumns { input, .. } => {
+                 shape.filters += 1;
+                 input.accumulate_shape(shape);
+             }
+@@ -3466,9 +3612,9 @@
+     fn guarantees_set_uniqueness(&self) -> bool {
+         match self {
+             Self::Distinct { .. } | Self::Group { .. } => true,
+-            Self::FilterEqConst { input, .. } | Self::TopKWithTies { input, .. } => {
+-                input.guarantees_set_uniqueness()
+-            }
++            Self::FilterEqConst { input, .. }
++            | Self::FilterEqColumns { input, .. }
++            | Self::TopKWithTies { input, .. } => input.guarantees_set_uniqueness(),
+             Self::Scan { .. }
+             | Self::Project { .. }
+             | Self::JoinEq { .. }
+@@ -3529,6 +3675,23 @@
+                     stats,
+                 )
+             }
++            Self::FilterEqColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => {
++                let input_rows = input.execute_native_rows(store, context, registry, stats)?;
++                filter_rows_columns(
++                    input_rows,
++                    *left_column,
++                    *right_column,
++                    *equivalence,
++                    context,
++                    registry,
++                    stats,
++                )
++            }
+             Self::Scan {
+                 relation,
+                 layout,
+@@ -3599,6 +3762,11 @@
+     stats: &mut ExecutionStats,
+ ) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
+     if let Some(rows) =
++        try_execute_persisted_semantic_multi_key_join_plan(plan, store, context, registry, stats)?
++    {
++        return Ok(Some(rows));
++    }
++    if let Some(rows) =
+         try_execute_persisted_semantic_filter_plan(plan, store, context, registry, stats)?
+     {
+         return Ok(Some(rows));
+@@ -3876,6 +4044,7 @@
+             registry,
+         ),
+         Plan::Scan { .. }
++        | Plan::FilterEqColumns { .. }
+         | Plan::JoinEq { .. }
+         | Plan::Distinct { .. }
+         | Plan::Group { .. }
+@@ -3962,6 +4131,9 @@
+     target.persisted_index_hits = target
+         .persisted_index_hits
+         .saturating_add(source.persisted_index_hits);
++    target.persisted_index_cost_rejections = target
++        .persisted_index_cost_rejections
++        .saturating_add(source.persisted_index_cost_rejections);
+     target.ephemeral_index_builds = target
+         .ephemeral_index_builds
+         .saturating_add(source.ephemeral_index_builds);
+@@ -4239,7 +4411,10 @@
+             store,
+             env,
+         ),
+-        Plan::Scan { .. } | Plan::Distinct { .. } | Plan::JoinEq { .. } => Ok(None),
++        Plan::Scan { .. }
++        | Plan::FilterEqColumns { .. }
++        | Plan::Distinct { .. }
++        | Plan::JoinEq { .. } => Ok(None),
+     }
+ }
+ 
+@@ -4799,6 +4974,7 @@
+         ),
+         Plan::Scan { .. }
+         | Plan::FilterEqConst { .. }
++        | Plan::FilterEqColumns { .. }
+         | Plan::Project { .. }
+         | Plan::JoinEq { .. }
+         | Plan::PromoteToBag(_) => Ok(None),
+@@ -5584,7 +5760,8 @@
+             Ok(Some(program))
+         }
+         Plan::PromoteToBag(input) => build_typed_batch_program(input, store, context, registry),
+-        Plan::JoinEq { .. }
++        Plan::FilterEqColumns { .. }
++        | Plan::JoinEq { .. }
+         | Plan::Distinct { .. }
+         | Plan::Group { .. }
+         | Plan::TopKWithTies { .. } => Ok(None),
+@@ -5678,64 +5855,110 @@
+     Ok(matched)
+ }
+ 
+-fn try_execute_persisted_semantic_filter_plan(
++#[derive(Debug, Clone, Copy)]
++struct SemanticFilterPredicate<'a> {
++    column: usize,
++    value: &'a Value,
++    equivalence: SemanticId,
++}
++
++fn collect_direct_filter_chain(
+     plan: &Plan,
+-    store: &PhysicalStore,
+-    context: &kernel_schema::SemanticContext,
+-    registry: &kernel_semantics::SemanticRegistry,
+-    stats: &mut ExecutionStats,
+-) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
+-    let Plan::FilterEqConst {
+-        input,
+-        column,
+-        value,
+-        equivalence,
+-    } = plan
+-    else {
+-        return Ok(None);
+-    };
+-    try_execute_persisted_semantic_filter(
+-        input,
+-        *column,
+-        value,
+-        *equivalence,
+-        store,
+-        context,
+-        registry,
+-        stats,
+-    )
++) -> Option<(SemanticId, LayoutBinding, Vec<SemanticFilterPredicate<'_>>)> {
++    let mut predicates = Vec::new();
++    let mut current = plan;
++    loop {
++        match current {
++            Plan::FilterEqConst {
++                input,
++                column,
++                value,
++                equivalence,
++            } => {
++                predicates.push(SemanticFilterPredicate {
++                    column: *column,
++                    value,
++                    equivalence: *equivalence,
++                });
++                current = input;
++            }
++            Plan::Scan {
++                relation,
++                layout,
++                algorithm: ScanAlgorithm::FullScan,
++            } => return Some((*relation, *layout, predicates)),
++            _ => return None,
++        }
++    }
+ }
+ 
+-#[allow(clippy::too_many_arguments)]
+-fn try_execute_persisted_semantic_filter(
+-    input: &Plan,
+-    column: usize,
+-    value: &Value,
+-    equivalence: SemanticId,
++fn try_execute_persisted_semantic_filter_plan(
++    plan: &Plan,
+     store: &PhysicalStore,
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+     stats: &mut ExecutionStats,
+ ) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
+-    let Some((relation, layout)) = direct_scan_relation(input) else {
++    let Some((relation, layout, predicates)) = collect_direct_filter_chain(plan) else {
+         return Ok(None);
+     };
+-    let Some(resolved) = registry.resolve_primitive_equivalence(context, equivalence)? else {
+-        return Ok(None);
+-    };
+-    let Some(index) = store.semantic_index(SemanticIndexBinding {
+-        relation,
+-        layout,
+-        key_column: column,
+-        equivalence,
+-    }) else {
+-        return Ok(None);
+-    };
+-    if !index.compatible_with(context, registry)? {
++    if predicates.is_empty() {
+         return Ok(None);
+     }
+     let installed = store.installed(relation, layout)?;
+-    let Some(row_ids) = index.probe_value(value)? else {
++    let row_count = native_row_count(&installed.data);
++    let mut rejected_by_cost = false;
++    let mut best: Option<(&MaterializedSemanticIndexState, Vec<&Value>, usize, usize)> = None;
++
++    for (binding, index) in &store.semantic_indexes {
++        if binding.relation != relation || binding.layout != layout {
++            continue;
++        }
++        if !index.compatible_with(context, registry)? {
++            continue;
++        }
++        let mut values = Vec::with_capacity(binding.key_parts.len());
++        let mut complete = true;
++        for part in &binding.key_parts {
++            let Some(predicate) = predicates.iter().find(|predicate| {
++                predicate.column == part.column && predicate.equivalence == part.equivalence
++            }) else {
++                complete = false;
++                break;
++            };
++            values.push(predicate.value);
++        }
++        if !complete {
++            continue;
++        }
++        let matching_rows = index
++            .probe_values(&values)?
++            .map_or(0, <[PhysicalRowId]>::len);
++        if SemanticAccessCostModel::choose_filter(row_count, matching_rows)
++            == SemanticAccessPath::FullScan
++        {
++            rejected_by_cost = true;
++            continue;
++        }
++        let candidate = (index, values, matching_rows, binding.key_parts.len());
++        let replace = best.as_ref().is_none_or(|(_, _, best_rows, best_parts)| {
++            matching_rows < *best_rows
++                || (matching_rows == *best_rows && binding.key_parts.len() > *best_parts)
++        });
++        if replace {
++            best = Some(candidate);
++        }
++    }
++
++    let Some((index, values, _, _)) = best else {
++        if rejected_by_cost {
++            stats.persisted_index_cost_rejections =
++                stats.persisted_index_cost_rejections.saturating_add(1);
++        }
++        return Ok(None);
++    };
++
++    let Some(row_ids) = index.probe_values(&values)? else {
+         stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+         return Ok(Some(Vec::new()));
+     };
+@@ -5745,13 +5968,22 @@
+             .position(*row_id)
+             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+         let row = materialize_native_row(&installed.data, position)?;
+-        let candidate = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
+-        if !resolved.equivalent(candidate, value)? {
+-            return Err(RelQueryError::InconsistentIncrementalDelta.into());
++        let mut matched = true;
++        for predicate in &predicates {
++            let candidate = row
++                .get(predicate.column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            stats.values_read = stats.values_read.saturating_add(1);
++            if !registry.equivalent(context, predicate.equivalence, candidate, predicate.value)? {
++                matched = false;
++                break;
++            }
+         }
+         stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+-        stats.values_read = stats.values_read.saturating_add(row.len());
+-        rows.push(row);
++        if matched {
++            stats.values_read = stats.values_read.saturating_add(row.len());
++            rows.push(row);
++        }
+     }
+     stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+     Ok(Some(rows))
+@@ -5832,6 +6064,11 @@
+     registry: &kernel_semantics::SemanticRegistry,
+     stats: &mut ExecutionStats,
+ ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
++    if let Some(rows) =
++        try_execute_persisted_semantic_multi_key_join_plan(input, store, context, registry, stats)?
++    {
++        return project_rows(rows, columns, stats);
++    }
+     if let Plan::JoinEq {
+         left,
+         right,
+@@ -5877,22 +6114,8 @@
+     {
+         return Ok(rows);
+     }
+-    if let Plan::FilterEqConst {
+-        input: filter_input,
+-        column,
+-        value,
+-        equivalence,
+-    } = input
+-        && let Some(rows) = try_execute_persisted_semantic_filter(
+-            filter_input,
+-            *column,
+-            value,
+-            *equivalence,
+-            store,
+-            context,
+-            registry,
+-            stats,
+-        )?
++    if let Some(rows) =
++        try_execute_persisted_semantic_filter_plan(input, store, context, registry, stats)?
+     {
+         return project_rows(rows, columns, stats);
+     }
+@@ -6729,6 +6952,37 @@
+     Ok(out)
+ }
+ 
++fn filter_rows_columns(
++    rows: Vec<kernel_query::Row>,
++    left_column: usize,
++    right_column: usize,
++    equivalence: SemanticId,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
++    let resolved = registry.resolve_primitive_equivalence(context, equivalence)?;
++    let mut out = Vec::new();
++    for row in rows {
++        let left = row
++            .get(left_column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        let right = row
++            .get(right_column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        stats.values_read = stats.values_read.saturating_add(2);
++        let matched = if let Some(resolved) = &resolved {
++            resolved.equivalent(left, right)?
++        } else {
++            registry.equivalent(context, equivalence, left, right)?
++        };
++        if matched {
++            out.push(row);
++        }
++    }
++    Ok(out)
++}
++
+ fn project_rows(
+     rows: Vec<kernel_query::Row>,
+     columns: &[usize],
+@@ -6806,6 +7060,224 @@
+     Ok(out)
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct CompositeJoinKey {
++    left_column: usize,
++    right_column: usize,
++    equivalence: SemanticId,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct JoinedColumnPredicate {
++    first_column: usize,
++    second_column: usize,
++    equivalence: SemanticId,
++}
++
++struct DirectMultiKeyJoin<'a> {
++    left: &'a Plan,
++    right: &'a Plan,
++    base_key: CompositeJoinKey,
++    extra_predicates: Vec<JoinedColumnPredicate>,
++}
++
++fn collect_direct_multi_key_join(plan: &Plan) -> Option<DirectMultiKeyJoin<'_>> {
++    let mut cursor = plan;
++    let mut extra_predicates = Vec::new();
++    while let Plan::FilterEqColumns {
++        input,
++        left_column,
++        right_column,
++        equivalence,
++    } = cursor
++    {
++        extra_predicates.push(JoinedColumnPredicate {
++            first_column: *left_column,
++            second_column: *right_column,
++            equivalence: *equivalence,
++        });
++        cursor = input;
++    }
++    let Plan::JoinEq {
++        left,
++        right,
++        left_column,
++        right_column,
++        equivalence,
++        algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
++    } = cursor
++    else {
++        return None;
++    };
++    if extra_predicates.is_empty() {
++        return None;
++    }
++    Some(DirectMultiKeyJoin {
++        left,
++        right,
++        base_key: CompositeJoinKey {
++            left_column: *left_column,
++            right_column: *right_column,
++            equivalence: *equivalence,
++        },
++        extra_predicates,
++    })
++}
++
++fn normalize_join_column_predicates(
++    join: &DirectMultiKeyJoin<'_>,
++    left_width: usize,
++    right_width: usize,
++) -> Option<Vec<CompositeJoinKey>> {
++    let total_width = left_width.checked_add(right_width)?;
++    let mut keys = Vec::with_capacity(join.extra_predicates.len().saturating_add(1));
++    keys.push(join.base_key);
++    for predicate in &join.extra_predicates {
++        if predicate.first_column >= total_width || predicate.second_column >= total_width {
++            return None;
++        }
++        let key = match (
++            predicate.first_column < left_width,
++            predicate.second_column < left_width,
++        ) {
++            (true, false) => CompositeJoinKey {
++                left_column: predicate.first_column,
++                right_column: predicate.second_column - left_width,
++                equivalence: predicate.equivalence,
++            },
++            (false, true) => CompositeJoinKey {
++                left_column: predicate.second_column,
++                right_column: predicate.first_column - left_width,
++                equivalence: predicate.equivalence,
++            },
++            (true, true) | (false, false) => return None,
++        };
++        if key.right_column >= right_width {
++            return None;
++        }
++        keys.push(key);
++    }
++    Some(keys)
++}
++
++fn binding_join_key_order(
++    binding: &SemanticIndexBinding,
++    keys: &[CompositeJoinKey],
++) -> Option<Vec<usize>> {
++    if binding.key_parts.len() != keys.len() {
++        return None;
++    }
++    let mut used = vec![false; keys.len()];
++    let mut order = Vec::with_capacity(keys.len());
++    for part in &binding.key_parts {
++        let (index, _) = keys.iter().enumerate().find(|(index, key)| {
++            !used[*index] && key.right_column == part.column && key.equivalence == part.equivalence
++        })?;
++        used[index] = true;
++        order.push(index);
++    }
++    Some(order)
++}
++
++fn try_execute_persisted_semantic_multi_key_join_plan(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let Some(join) = collect_direct_multi_key_join(plan) else {
++        return Ok(None);
++    };
++    let Some((left_relation, left_layout)) = direct_scan_relation(join.left) else {
++        return Ok(None);
++    };
++    let Some((right_relation, right_layout)) = direct_scan_relation(join.right) else {
++        return Ok(None);
++    };
++    let left_installed = store.installed(left_relation, left_layout)?;
++    let right_installed = store.installed(right_relation, right_layout)?;
++    let left_width = native_column_count(&left_installed.data);
++    let right_width = native_column_count(&right_installed.data);
++    let Some(keys) = normalize_join_column_predicates(&join, left_width, right_width) else {
++        return Ok(None);
++    };
++    if keys.len() < 2 {
++        return Ok(None);
++    }
++
++    let mut candidate = None;
++    for (binding, index) in &store.semantic_indexes {
++        if binding.relation != right_relation || binding.layout != right_layout {
++            continue;
++        }
++        let Some(order) = binding_join_key_order(binding, &keys) else {
++            continue;
++        };
++        if !index.compatible_with(context, registry)? {
++            continue;
++        }
++        candidate = Some((index, order));
++        break;
++    }
++    let Some((index, key_order)) = candidate else {
++        return Ok(None);
++    };
++
++    if SemanticAccessCostModel::choose_join(
++        native_row_count(&left_installed.data),
++        native_row_count(&right_installed.data),
++        index.distinct_key_count(),
++    ) == SemanticAccessPath::FullScan
++    {
++        stats.persisted_index_cost_rejections =
++            stats.persisted_index_cost_rejections.saturating_add(1);
++        return Ok(None);
++    }
++
++    let mut out = Vec::new();
++    for left_position in left_installed.scan_positions() {
++        let left_row = materialize_native_row(&left_installed.data, left_position)?;
++        let mut values = Vec::with_capacity(key_order.len());
++        for &key_index in &key_order {
++            let key = keys[key_index];
++            values.push(
++                left_row
++                    .get(key.left_column)
++                    .ok_or(RelQueryError::ColumnOutOfBounds)?,
++            );
++        }
++        stats.scanned_rows = stats.scanned_rows.saturating_add(1);
++        stats.values_read = stats.values_read.saturating_add(values.len());
++        if let Some(right_ids) = index.probe_values(&values)? {
++            for right_id in right_ids {
++                let right_position = right_installed
++                    .position(*right_id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let right_row = materialize_native_row(&right_installed.data, right_position)?;
++                for key in &keys {
++                    let left_value = left_row
++                        .get(key.left_column)
++                        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++                    let right_value = right_row
++                        .get(key.right_column)
++                        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++                    stats.values_read = stats.values_read.saturating_add(2);
++                    if !registry.equivalent(context, key.equivalence, left_value, right_value)? {
++                        return Err(RelQueryError::InconsistentIncrementalDelta.into());
++                    }
++                }
++                let mut row = left_row.clone();
++                row.extend(right_row);
++                stats.values_read = stats.values_read.saturating_add(row.len());
++                out.push(row);
++            }
++        }
++    }
++    stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
++    Ok(Some(out))
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn try_execute_persisted_semantic_join(
+     left: &Plan,
+@@ -6827,12 +7299,12 @@
+     let Some(resolved) = registry.resolve_primitive_equivalence(context, equivalence)? else {
+         return Ok(None);
+     };
+-    let Some(index) = store.semantic_index(SemanticIndexBinding {
+-        relation: right_relation,
+-        layout: right_layout,
+-        key_column: right_column,
++    let Some(index) = store.semantic_index(&SemanticIndexBinding::single(
++        right_relation,
++        right_layout,
++        right_column,
+         equivalence,
+-    }) else {
++    )) else {
+         return Ok(None);
+     };
+     if !index.compatible_with(context, registry)? {
+@@ -6840,6 +7312,16 @@
+     }
+     let left_installed = store.installed(left_relation, left_layout)?;
+     let right_installed = store.installed(right_relation, right_layout)?;
++    if SemanticAccessCostModel::choose_join(
++        native_row_count(&left_installed.data),
++        native_row_count(&right_installed.data),
++        index.distinct_key_count(),
++    ) == SemanticAccessPath::FullScan
++    {
++        stats.persisted_index_cost_rejections =
++            stats.persisted_index_cost_rejections.saturating_add(1);
++        return Ok(None);
++    }
+     let mut out = Vec::new();
+     for left_position in left_installed.scan_positions() {
+         let left_row = materialize_native_row(&left_installed.data, left_position)?;
+@@ -7615,6 +8097,7 @@
+     match expr {
+         RelExpr::Scan(_) => 1,
+         RelExpr::FilterEqConst { input, .. }
++        | RelExpr::FilterEqColumns { input, .. }
+         | RelExpr::Project { input, .. }
+         | RelExpr::Distinct { input, .. }
+         | RelExpr::Group { input, .. }
+@@ -8260,16 +8743,11 @@
+         assert_eq!(stats.output_rows, 2);
+ 
+         for (key_column, equivalence) in equivalences.into_iter().enumerate() {
+-            let index = SemanticIndexBinding {
+-                relation,
+-                layout: binding,
+-                key_column,
+-                equivalence,
+-            };
++            let index = SemanticIndexBinding::single(relation, binding, key_column, equivalence);
+             store
+-                .install_semantic_index(index, &context, &registry)
++                .install_semantic_index(index.clone(), &context, &registry)
+                 .unwrap();
+-            assert_eq!(store.semantic_index(index).unwrap().row_count(), 3);
++            assert_eq!(store.semantic_index(&index).unwrap().row_count(), 3);
+         }
+     }
+ 
+@@ -10401,12 +10879,7 @@
+             .unwrap();
+         store
+             .install_semantic_index(
+-                SemanticIndexBinding {
+-                    relation,
+-                    layout: binding,
+-                    key_column: 0,
+-                    equivalence,
+-                },
++                SemanticIndexBinding::single(relation, binding, 0, equivalence),
+                 &context,
+                 &registry,
+             )
+@@ -10415,7 +10888,7 @@
+     }
+ 
+     #[test]
+-    fn persisted_text_semantic_index_drives_join_and_filter_plans() {
++    fn cost_model_rejects_unprofitable_tiny_text_semantic_index() {
+         let (context, registry, relation, equivalence, binding, store) =
+             text_semantic_index_fixture();
+         let mut catalog = PhysicalCatalog::default();
+@@ -10439,26 +10912,324 @@
+             .execute_native_pinned(&store, &registry)
+             .unwrap();
+         assert_eq!(join_value.rows().len(), 5);
+-        assert_eq!(join_stats.persisted_index_hits, 1);
++        assert_eq!(join_stats.persisted_index_hits, 0);
++        assert_eq!(join_stats.persisted_index_cost_rejections, 1);
+         assert_eq!(join_stats.ephemeral_index_builds, 0);
+         let (filter_value, filter_stats) = prepared_filter
+             .execute_native_pinned(&store, &registry)
+             .unwrap();
+         assert_eq!(filter_value.rows().len(), 2);
+-        assert_eq!(filter_stats.persisted_index_hits, 1);
+-        assert_eq!(filter_stats.scanned_rows, 2);
++        assert_eq!(filter_stats.persisted_index_hits, 0);
++        assert_eq!(filter_stats.persisted_index_cost_rejections, 1);
++        assert_eq!(filter_stats.scanned_rows, 3);
+     }
+ 
+     #[test]
+-    fn persisted_text_semantic_index_maintains_delta_and_pins_gamma() {
+-        let (context, mut registry, relation, equivalence, binding, mut store) =
+-            text_semantic_index_fixture();
++    fn cost_model_uses_selective_persisted_text_semantic_index() {
++        let relation = sid(344);
++        let equivalence = sid(345);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(36));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(36));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let binding = LayoutBinding {
++            id: LayoutId(938),
++            family: LayoutFamily::Columnar,
++        };
++        let values = (0..64)
++            .map(|index| {
++                if index == 37 {
++                    "Needle".to_owned()
++                } else {
++                    format!("row-{index}")
++                }
++            })
++            .collect::<Vec<_>>();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::Text(values)]).unwrap(),
++            )
++            .unwrap();
++        store
++            .install_semantic_index(
++                SemanticIndexBinding::single(relation, binding, 0, equivalence),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let filter = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            value: Value::Text("needle".into()),
++            equivalence,
++        };
++        let prepared = prepare_with_catalog(filter, &context, &registry, &catalog).unwrap();
++        let (value, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(value.rows(), &[vec![Value::Text("Needle".into())]]);
++        assert_eq!(stats.persisted_index_hits, 1);
++        assert_eq!(stats.persisted_index_cost_rejections, 0);
++        assert_eq!(stats.scanned_rows, 1);
++    }
++
++    fn text_i64_semantic_fixture(
++        relations: &[SemanticId],
++        text_equivalence: SemanticId,
++        i64_equivalence: SemanticId,
++        revision: u64,
++    ) -> (SemanticContext, SemanticRegistry) {
++        let mut registry = SemanticRegistry::default();
++        let text_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(revision));
++        environment.pin_module(text_equivalence, text_digest);
++        environment.pin_module(i64_equivalence, i64_digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(revision));
++        for &relation in relations {
++            schema
++                .define_relation(RelationDef {
++                    id: relation,
++                    columns: vec![
++                        TypeExpr::Scalar(ScalarType::Text),
++                        TypeExpr::Scalar(ScalarType::I64),
++                    ],
++                    semantics: RelationSemantics::Bag {
++                        column_equivalences: vec![text_equivalence, i64_equivalence],
++                    },
++                })
++                .unwrap();
++        }
++        (
++            SemanticContext {
++                schema,
++                environment,
++            },
++            registry,
++        )
++    }
++
++    fn text_i64_rows(values: &[(&str, i64)]) -> Vec<kernel_query::Row> {
++        values
++            .iter()
++            .map(|(text, number)| vec![Value::Text((*text).into()), Value::I64(*number)])
++            .collect()
++    }
++
++    fn text_i64_native(values: &[(&str, i64)]) -> NativeRelation {
++        NativeRelation::typed_columnar(vec![
++            NativeColumn::Text(values.iter().map(|(text, _)| (*text).into()).collect()),
++            NativeColumn::I64(values.iter().map(|(_, number)| *number).collect()),
++        ])
++        .unwrap()
++    }
++
++    #[test]
++    fn composite_mixed_type_semantic_index_drives_filter_chain_and_maintains_delta() {
++        let relation = sid(346);
++        let text_equivalence = sid(347);
++        let i64_equivalence = sid(348);
++        let (context, registry) =
++            text_i64_semantic_fixture(&[relation], text_equivalence, i64_equivalence, 37);
++        let binding = LayoutBinding {
++            id: LayoutId(939),
++            family: LayoutFamily::Columnar,
++        };
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                text_i64_native(&[("A", 1), ("a", 2), ("A", 2), ("B", 2), ("C", 3), ("D", 4)]),
++            )
++            .unwrap();
+         let index_binding = SemanticIndexBinding {
+             relation,
+             layout: binding,
+-            key_column: 0,
+-            equivalence,
++            key_parts: vec![
++                SemanticIndexKeyPart {
++                    column: 0,
++                    equivalence: text_equivalence,
++                },
++                SemanticIndexKeyPart {
++                    column: 1,
++                    equivalence: i64_equivalence,
++                },
++            ],
+         };
++        store
++            .install_semantic_index(index_binding.clone(), &context, &registry)
++            .unwrap();
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let filter = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::FilterEqConst {
++                input: Box::new(RelExpr::Scan(relation)),
++                column: 0,
++                value: Value::Text("a".into()),
++                equivalence: text_equivalence,
++            }),
++            column: 1,
++            value: Value::I64(2),
++            equivalence: i64_equivalence,
++        };
++        let prepared = prepare_with_catalog(filter.clone(), &context, &registry, &catalog).unwrap();
++        let (value, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            value.rows(),
++            &[
++                vec![Value::Text("a".into()), Value::I64(2)],
++                vec![Value::Text("A".into()), Value::I64(2)],
++            ]
++        );
++        assert_eq!(stats.persisted_index_hits, 1);
++        assert_eq!(stats.scanned_rows, 2);
++
++        let result_type = RelExpr::Scan(relation)
++            .typecheck(&context, &registry)
++            .unwrap();
++        store
++            .apply_relation_delta(
++                relation,
++                binding,
++                &RelationDelta {
++                    inserted: vec![vec![Value::Text("a".into()), Value::I64(3)]],
++                    removed: vec![vec![Value::Text("A".into()), Value::I64(2)]],
++                    result_type,
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(store.semantic_index(&index_binding).unwrap().row_count(), 6);
++        let (value, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            value.rows(),
++            &[vec![Value::Text("A".into()), Value::I64(2)]]
++        );
++        assert_eq!(stats.persisted_index_hits, 1);
++        assert_eq!(stats.scanned_rows, 1);
++    }
++
++    #[test]
++    fn composite_mixed_key_semantic_index_fuses_column_filtered_join() {
++        let left_relation = sid(349);
++        let right_relation = sid(350);
++        let text_equivalence = sid(351);
++        let i64_equivalence = sid(352);
++        let (context, registry) = text_i64_semantic_fixture(
++            &[left_relation, right_relation],
++            text_equivalence,
++            i64_equivalence,
++            38,
++        );
++        let left_layout = LayoutBinding {
++            id: LayoutId(940),
++            family: LayoutFamily::Columnar,
++        };
++        let right_layout = LayoutBinding {
++            id: LayoutId(941),
++            family: LayoutFamily::Columnar,
++        };
++        let left_values = [("A", 1), ("A", 2), ("B", 2)];
++        let right_values = [("a", 1), ("a", 3), ("B", 2), ("b", 3), ("C", 9), ("D", 10)];
++        let left_rows = text_i64_rows(&left_values);
++        let right_rows = text_i64_rows(&right_values);
++        let mut store = PhysicalStore::default();
++        store
++            .install(left_relation, left_layout, text_i64_native(&left_values))
++            .unwrap();
++        store
++            .install(right_relation, right_layout, text_i64_native(&right_values))
++            .unwrap();
++        store
++            .install_semantic_index(
++                SemanticIndexBinding {
++                    relation: right_relation,
++                    layout: right_layout,
++                    key_parts: vec![
++                        SemanticIndexKeyPart {
++                            column: 1,
++                            equivalence: i64_equivalence,
++                        },
++                        SemanticIndexKeyPart {
++                            column: 0,
++                            equivalence: text_equivalence,
++                        },
++                    ],
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++
++        let query = RelExpr::FilterEqColumns {
++            input: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(left_relation)),
++                right: Box::new(RelExpr::Scan(right_relation)),
++                left_column: 0,
++                right_column: 0,
++                equivalence: text_equivalence,
++            }),
++            left_column: 1,
++            right_column: 3,
++            equivalence: i64_equivalence,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(left_relation, left_layout);
++        catalog.bind_relation(right_relation, right_layout);
++        let prepared = prepare_with_catalog(query.clone(), &context, &registry, &catalog).unwrap();
++        let (value, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            value.rows(),
++            &[
++                vec![
++                    Value::Text("A".into()),
++                    Value::I64(1),
++                    Value::Text("a".into()),
++                    Value::I64(1),
++                ],
++                vec![
++                    Value::Text("B".into()),
++                    Value::I64(2),
++                    Value::Text("B".into()),
++                    Value::I64(2),
++                ],
++            ]
++        );
++        assert_eq!(stats.persisted_index_hits, 1);
++        assert_eq!(stats.persisted_index_cost_rejections, 0);
++        assert_eq!(stats.scanned_rows, left_rows.len());
++
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(left_relation, left_rows);
++        model.relations.insert(right_relation, right_rows);
++        let reference = query.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(value, reference);
++    }
++
++    #[test]
++    fn persisted_text_semantic_index_maintains_delta_and_pins_gamma() {
++        let (context, mut registry, relation, equivalence, binding, mut store) =
++            text_semantic_index_fixture();
++        let index_binding = SemanticIndexBinding::single(relation, binding, 0, equivalence);
+         let result_type = RelExpr::Scan(relation)
+             .typecheck(&context, &registry)
+             .unwrap();
+@@ -10475,7 +11246,7 @@
+                 &registry,
+             )
+             .unwrap();
+-        let index = store.semantic_index(index_binding).unwrap();
++        let index = store.semantic_index(&index_binding).unwrap();
+         assert_eq!(index.row_count(), 3);
+         assert_eq!(
+             index
+diff -ruN /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-query/src/lib.rs /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-query/src/lib.rs
+--- /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-query/src/lib.rs	2026-09-20 02:48:16.000000000 +0000
++++ /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-query/src/lib.rs	2026-09-20 10:25:56.517183141 +0000
+@@ -1839,6 +1839,12 @@
+         value: Value,
+         equivalence: kernel_types::SemanticId,
+     },
++    FilterColumns {
++        input: Box<MaterializedRelPlanState>,
++        left_column: usize,
++        right_column: usize,
++        equivalence: kernel_types::SemanticId,
++    },
+     ProjectBag {
+         input: Box<MaterializedRelPlanState>,
+         columns: Vec<usize>,
+@@ -2116,6 +2122,17 @@
+                 value: value.clone(),
+                 equivalence: *equivalence,
+             },
++            RelExpr::FilterEqColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => MaintainedRelPlanNode::FilterColumns {
++                input: Box::new(Self::build(input, old, context, registry)?),
++                left_column: *left_column,
++                right_column: *right_column,
++                equivalence: *equivalence,
++            },
+             RelExpr::Project { input, columns } => {
+                 Self::build_project_node(input, columns, old, result_type, context, registry)?
+             }
+@@ -2284,6 +2301,7 @@
+                 relations.insert(*relation);
+             }
+             MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::FilterColumns { input, .. }
+             | MaintainedRelPlanNode::ProjectBag { input, .. }
+             | MaintainedRelPlanNode::ProjectSet { input, .. }
+             | MaintainedRelPlanNode::Distinct { input, .. }
+@@ -2334,6 +2352,31 @@
+                     &self.result_type,
+                 ))
+             }
++            MaintainedRelPlanNode::FilterColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => {
++                let input_value = input.output_value(context, registry)?;
++                let input_delta = RelationDelta {
++                    inserted: input_value.into_rows(),
++                    removed: Vec::new(),
++                    result_type: input.result_type.clone(),
++                };
++                let filtered = rel_delta_filter_columns(
++                    input_delta,
++                    *left_column,
++                    *right_column,
++                    *equivalence,
++                    context,
++                    registry,
++                )?;
++                Ok(relation_value_from_rows(
++                    filtered.inserted,
++                    &self.result_type,
++                ))
++            }
+             MaintainedRelPlanNode::ProjectBag { input, columns } => {
+                 let rows =
+                     project_rows(input.output_value(context, registry)?.into_rows(), columns)?;
+@@ -2438,6 +2481,7 @@
+                 Ok(())
+             }
+             MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::FilterColumns { input, .. }
+             | MaintainedRelPlanNode::ProjectBag { input, .. }
+             | MaintainedRelPlanNode::ProjectSet { input, .. }
+             | MaintainedRelPlanNode::Distinct { input, .. }
+@@ -2637,6 +2681,7 @@
+                 Ok(())
+             }
+             MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::FilterColumns { input, .. }
+             | MaintainedRelPlanNode::ProjectBag { input, .. }
+             | MaintainedRelPlanNode::ProjectSet { input, .. }
+             | MaintainedRelPlanNode::Distinct { input, .. }
+@@ -2682,6 +2727,7 @@
+                 Ok(())
+             }
+             MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::FilterColumns { input, .. }
+             | MaintainedRelPlanNode::ProjectBag { input, .. }
+             | MaintainedRelPlanNode::ProjectSet { input, .. }
+             | MaintainedRelPlanNode::Distinct { input, .. }
+@@ -2723,6 +2769,19 @@
+                 context,
+                 registry,
+             ),
++            MaintainedRelPlanNode::FilterColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => rel_delta_filter_columns(
++                input.propagate_resolved_deltas_inner(deltas, context, registry)?,
++                *left_column,
++                *right_column,
++                *equivalence,
++                context,
++                registry,
++            ),
+             MaintainedRelPlanNode::ProjectBag { input, columns } => rel_delta_project_bag(
+                 input.propagate_resolved_deltas_inner(deltas, context, registry)?,
+                 columns,
+@@ -2780,6 +2839,7 @@
+                 relation: current, ..
+             } => *current == relation,
+             MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::FilterColumns { input, .. }
+             | MaintainedRelPlanNode::ProjectBag { input, .. }
+             | MaintainedRelPlanNode::ProjectSet { input, .. }
+             | MaintainedRelPlanNode::Distinct { input, .. }
+@@ -2830,6 +2890,7 @@
+                 Ok(())
+             }
+             MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::FilterColumns { input, .. }
+             | MaintainedRelPlanNode::ProjectBag { input, .. }
+             | MaintainedRelPlanNode::ProjectSet { input, .. }
+             | MaintainedRelPlanNode::Distinct { input, .. }
+@@ -2881,6 +2942,22 @@
+                 let input_delta = input.apply_relation_deltas_inner(deltas, context, registry)?;
+                 rel_delta_filter(input_delta, *column, value, *equivalence, context, registry)
+             }
++            MaintainedRelPlanNode::FilterColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => {
++                let input_delta = input.apply_relation_deltas_inner(deltas, context, registry)?;
++                rel_delta_filter_columns(
++                    input_delta,
++                    *left_column,
++                    *right_column,
++                    *equivalence,
++                    context,
++                    registry,
++                )
++            }
+             MaintainedRelPlanNode::ProjectBag { input, columns } => {
+                 let input_delta = input.apply_relation_deltas_inner(deltas, context, registry)?;
+                 rel_delta_project_bag(input_delta, columns, &self.query, context, registry)
+@@ -3752,6 +3829,27 @@
+             };
+             rel_delta_filter(input_delta, *column, value, *equivalence, context, registry).map(Some)
+         }
++        RelExpr::FilterEqColumns {
++            input,
++            left_column,
++            right_column,
++            equivalence,
++        } => {
++            let Some(input_delta) =
++                rel_delta_optimized_inner(input, old, change, context, registry)?
++            else {
++                return Ok(None);
++            };
++            rel_delta_filter_columns(
++                input_delta,
++                *left_column,
++                *right_column,
++                *equivalence,
++                context,
++                registry,
++            )
++            .map(Some)
++        }
+         RelExpr::Project { input, columns } => {
+             let Some(input_delta) =
+                 rel_delta_optimized_inner(input, old, change, context, registry)?
+@@ -4727,6 +4825,64 @@
+     })
+ }
+ 
++fn rel_delta_filter_columns(
++    input_delta: RelationDelta,
++    left_column: usize,
++    right_column: usize,
++    equivalence: kernel_types::SemanticId,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<RelationDelta, RelQueryError> {
++    let left_type = input_delta
++        .result_type
++        .columns
++        .get(left_column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    let right_type = input_delta
++        .result_type
++        .columns
++        .get(right_column)
++        .ok_or(RelQueryError::ColumnOutOfBounds)?;
++    if !query_types_compatible(left_type, right_type, &context.schema) {
++        return Err(RelQueryError::TypeMismatch);
++    }
++    validate_query_equivalence(equivalence, left_type, context, registry)?;
++    validate_query_equivalence(equivalence, right_type, context, registry)?;
++    let left_input_equivalence =
++        relation_column_equivalence(&input_delta.result_type, left_column)?;
++    let right_input_equivalence =
++        relation_column_equivalence(&input_delta.result_type, right_column)?;
++    if !registry.equivalence_refines(context, left_input_equivalence, equivalence)?
++        || !registry.equivalence_refines(context, right_input_equivalence, equivalence)?
++    {
++        return Err(RelQueryError::EquivalenceNotCongruentWithInputEquality);
++    }
++
++    let filter_rows = |rows: Vec<Row>| -> Result<Vec<Row>, RelQueryError> {
++        rows.into_iter()
++            .filter_map(|row| {
++                let Some(left) = row.get(left_column) else {
++                    return Some(Err(RelQueryError::ColumnOutOfBounds));
++                };
++                let Some(right) = row.get(right_column) else {
++                    return Some(Err(RelQueryError::ColumnOutOfBounds));
++                };
++                match registry.equivalent(context, equivalence, left, right) {
++                    Ok(true) => Some(Ok(row)),
++                    Ok(false) => None,
++                    Err(error) => Some(Err(error.into())),
++                }
++            })
++            .collect()
++    };
++
++    Ok(RelationDelta {
++        inserted: filter_rows(input_delta.inserted)?,
++        removed: filter_rows(input_delta.removed)?,
++        result_type: input_delta.result_type,
++    })
++}
++
+ fn rel_delta_project_bag(
+     input_delta: RelationDelta,
+     columns: &[usize],
+@@ -5622,6 +5778,12 @@
+         value: Value,
+         equivalence: kernel_types::SemanticId,
+     },
++    FilterEqColumns {
++        input: Box<Self>,
++        left_column: usize,
++        right_column: usize,
++        equivalence: kernel_types::SemanticId,
++    },
+     Project {
+         input: Box<Self>,
+         columns: Vec<usize>,
+@@ -5685,6 +5847,19 @@
+                 value,
+                 equivalence,
+             } => Self::typecheck_filter(input, *column, value, *equivalence, context, registry),
++            Self::FilterEqColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => Self::typecheck_filter_columns(
++                input,
++                *left_column,
++                *right_column,
++                *equivalence,
++                context,
++                registry,
++            ),
+             Self::Project { input, columns } => {
+                 Self::typecheck_project(input, columns, context, registry)
+             }
+@@ -5784,6 +5959,38 @@
+         Ok(input_type)
+     }
+ 
++    fn typecheck_filter_columns(
++        input: &Self,
++        left_column: usize,
++        right_column: usize,
++        equivalence: kernel_types::SemanticId,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelType, RelQueryError> {
++        let input_type = input.typecheck(context, registry)?;
++        let left_type = input_type
++            .columns
++            .get(left_column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        let right_type = input_type
++            .columns
++            .get(right_column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        if !query_types_compatible(left_type, right_type, &context.schema) {
++            return Err(RelQueryError::TypeMismatch);
++        }
++        validate_query_equivalence(equivalence, left_type, context, registry)?;
++        validate_query_equivalence(equivalence, right_type, context, registry)?;
++        let left_input_equivalence = relation_column_equivalence(&input_type, left_column)?;
++        let right_input_equivalence = relation_column_equivalence(&input_type, right_column)?;
++        if !registry.equivalence_refines(context, left_input_equivalence, equivalence)?
++            || !registry.equivalence_refines(context, right_input_equivalence, equivalence)?
++        {
++            return Err(RelQueryError::EquivalenceNotCongruentWithInputEquality);
++        }
++        Ok(input_type)
++    }
++
+     fn typecheck_project(
+         input: &Self,
+         columns: &[usize],
+@@ -6062,6 +6269,12 @@
+                 value,
+                 equivalence,
+             } => Self::eval_filter(input, *column, value, *equivalence, eval),
++            Self::FilterEqColumns {
++                input,
++                left_column,
++                right_column,
++                equivalence,
++            } => Self::eval_filter_columns(input, *left_column, *right_column, *equivalence, eval),
+             Self::Project { input, columns } => Self::eval_project(input, columns, eval),
+             Self::JoinEq {
+                 left,
+@@ -6165,6 +6378,45 @@
+             {
+                 out.push(row);
+             }
++        }
++        Ok(match set_equivalences {
++            Some(column_equivalences) => RelationValue::Set {
++                rows: out,
++                column_equivalences,
++            },
++            None => RelationValue::Bag(out),
++        })
++    }
++
++    fn eval_filter_columns(
++        input: &Self,
++        left_column: usize,
++        right_column: usize,
++        equivalence: kernel_types::SemanticId,
++        eval: &RelEvalContext<'_>,
++    ) -> Result<RelationValue, RelQueryError> {
++        let input_value = input.evaluate_unchecked(eval)?;
++        let set_equivalences = match &input_value {
++            RelationValue::Set {
++                column_equivalences,
++                ..
++            } => Some(column_equivalences.clone()),
++            RelationValue::Bag(_) => None,
++        };
++        let mut out = Vec::new();
++        for row in input_value.into_rows() {
++            let left = row
++                .get(left_column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            let right = row
++                .get(right_column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            if eval
++                .registry
++                .equivalent(eval.semantic, equivalence, left, right)?
++            {
++                out.push(row);
++            }
+         }
+         Ok(match set_equivalences {
+             Some(column_equivalences) => RelationValue::Set {
+diff -ruN /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-semantic-index/src/lib.rs /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-semantic-index/src/lib.rs
+--- /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-semantic-index/src/lib.rs	2026-09-20 02:27:26.000000000 +0000
++++ /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-semantic-index/src/lib.rs	2026-09-20 10:18:10.613682413 +0000
+@@ -100,6 +100,11 @@
+     }
+ 
+     #[must_use]
++    pub fn distinct_key_count(&self) -> usize {
++        self.buckets.len()
++    }
++
++    #[must_use]
+     pub fn bucket(&self, key: &K) -> Option<&[I]> {
+         self.buckets.get(key).map(Vec::as_slice)
+     }
+diff -ruN /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-transport/src/lib.rs /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-transport/src/lib.rs
+--- /mnt/data/pass41_ref/cfmd_workspace_pass41/crates/kernel-transport/src/lib.rs	2026-09-19 09:12:28.000000000 +0000
++++ /mnt/data/cfmd_pass42_work/cfmd_workspace_pass42/crates/kernel-transport/src/lib.rs	2026-09-20 10:26:31.847869663 +0000
+@@ -257,6 +257,17 @@
+             value: transport_value(identity, value)?,
+             equivalence: *equivalence,
+         },
++        RelExpr::FilterEqColumns {
++            input,
++            left_column,
++            right_column,
++            equivalence,
++        } => RelExpr::FilterEqColumns {
++            input: Box::new(transport_rel_expr(identity, input)?),
++            left_column: *left_column,
++            right_column: *right_column,
++            equivalence: *equivalence,
++        },
+         RelExpr::Project { input, columns } => RelExpr::Project {
+             input: Box::new(transport_rel_expr(identity, input)?),
+             columns: columns.clone(),

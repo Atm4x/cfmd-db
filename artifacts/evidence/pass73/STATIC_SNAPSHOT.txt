@@ -1,0 +1,13 @@
+declared_tests=448
+kernel_plan_declared_tests=181
+kernel_plan_runtime_passed=177
+kernel_plan_runtime_ignored=4
+workspace_overflow_passed=440
+workspace_overflow_failed=0
+workspace_overflow_ignored=8
+crates=21
+rust_loc=63463
+unsafe_hits=0
+allow_attrs=19
+todo_fixme_hits=0
+external_registry_git_sources=0

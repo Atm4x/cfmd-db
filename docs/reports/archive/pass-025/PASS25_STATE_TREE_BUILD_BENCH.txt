@@ -1,0 +1,6 @@
+n=1000 compositional_build_ns=1519557
+n=1000 maintained_tree_ns=5830
+n=10000 compositional_build_ns=14012535
+n=10000 maintained_tree_ns=17491
+n=50000 compositional_build_ns=74919600
+n=50000 maintained_tree_ns=7416

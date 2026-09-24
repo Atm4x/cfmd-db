@@ -1,0 +1,9 @@
+rows=100000
+matches=1562
+typed_batch_chain_hits=1
+typed_values_read=107812
+typed_batch_ns_median=808629
+row_materialized_ns_median=1951107
+handwritten_ns_median=115473
+typed_over_row_milli=414
+typed_over_handwritten_milli=7002

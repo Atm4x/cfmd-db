@@ -1,0 +1,1441 @@
+--- /mnt/data/pass68_work/crates/kernel-plan/src/algebraic_native.rs	2026-09-20 21:45:25.000000000 +0000
++++ /mnt/data/pass70_work/crates/kernel-plan/src/algebraic_native.rs	2026-09-21 01:44:00.332945973 +0000
+@@ -558,113 +558,104 @@
+         Some(payload)
+     }
+ 
+-    pub(crate) fn canonical_key_at(
++    pub(crate) fn canonical_key_at_compiled(
+         &self,
+         index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        equivalence: SemanticId,
+-        registry: &kernel_semantics::SemanticRegistry,
++        compiled: &kernel_semantics::CompiledEquivalence,
+     ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+         if index >= self.len() {
+             return Err(PhysicalExecutionError::ColumnShapeMismatch);
+         }
+-        let Some(definition) = context.schema.structural_equivalence(equivalence) else {
+-            let AlgebraicStorage::Scalar(column) = &self.storage else {
+-                return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+-            };
+-            return registry
+-                .canonical_equivalence_key(context, equivalence, &column.value_at(index))
+-                .map_err(Into::into);
+-        };
+-        self.canonical_structural_key_at(index, context, definition, registry)
++        self.canonical_compiled_node_at(index, compiled, compiled.root_node())
+     }
+ 
+-    fn canonical_structural_key_at(
++    fn canonical_compiled_node_at(
+         &self,
+         index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        definition: &kernel_schema::StructuralEquivalenceDef,
+-        registry: &kernel_semantics::SemanticRegistry,
++        compiled: &kernel_semantics::CompiledEquivalence,
++        node_index: usize,
+     ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+-        use kernel_schema::StructuralEquivalenceDef;
+-        match definition {
+-            StructuralEquivalenceDef::Mu { body } => {
+-                self.canonical_recursive_key_at(index, context, *body, registry)
++        use kernel_semantics::{CanonicalEqKey, CompiledEquivalenceNodeRef};
++        let (_, node) = compiled
++            .node(node_index)
++            .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
++        match node {
++            CompiledEquivalenceNodeRef::Primitive(resolved) => {
++                let AlgebraicStorage::Scalar(column) = &self.storage else {
++                    return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++                };
++                resolved
++                    .canonical_key(&column.value_at(index))
++                    .map_err(Into::into)
+             }
+-            StructuralEquivalenceDef::Var { binder } => {
+-                self.canonical_recursive_key_at(index, context, *binder, registry)
++            CompiledEquivalenceNodeRef::Mu { body } => {
++                let AlgebraicStorage::Recursive(child) = &self.storage else {
++                    return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++                };
++                child.canonical_compiled_node_at(index, compiled, body)
+             }
+-            StructuralEquivalenceDef::Product { fields } => {
+-                self.canonical_product_key_at(index, context, fields, registry)
++            CompiledEquivalenceNodeRef::Var { binder } => {
++                let AlgebraicStorage::Recursive(child) = &self.storage else {
++                    return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++                };
++                child.canonical_compiled_node_at(index, compiled, binder)
+             }
+-            StructuralEquivalenceDef::Option { inner } => {
+-                self.canonical_option_key_at(index, context, *inner, registry)
++            CompiledEquivalenceNodeRef::Product(fields) => {
++                self.canonical_compiled_product_at(index, compiled, fields)
+             }
+-            StructuralEquivalenceDef::Sum { variants } => {
+-                self.canonical_sum_key_at(index, context, variants, registry)
++            CompiledEquivalenceNodeRef::Option { inner } => {
++                self.canonical_compiled_option_at(index, compiled, inner)
+             }
+-            StructuralEquivalenceDef::Seq { element } => self
+-                .canonical_range_key_at(index, context, *element, registry, false)
+-                .map(kernel_semantics::CanonicalEqKey::Seq),
+-            StructuralEquivalenceDef::Set { element } => self
+-                .canonical_range_key_at(index, context, *element, registry, true)
+-                .map(kernel_semantics::CanonicalEqKey::Set),
+-            StructuralEquivalenceDef::Bag { element } => {
+-                self.canonical_bag_key_at(index, context, *element, registry)
++            CompiledEquivalenceNodeRef::Sum(variants) => {
++                self.canonical_compiled_sum_at(index, compiled, variants)
+             }
+-            StructuralEquivalenceDef::Map { key, value } => {
+-                self.canonical_map_key_at(index, context, *key, *value, registry)
++            CompiledEquivalenceNodeRef::Seq { element } => self
++                .canonical_compiled_range_at(index, compiled, element, false)
++                .map(CanonicalEqKey::Seq),
++            CompiledEquivalenceNodeRef::Set { element } => self
++                .canonical_compiled_range_at(index, compiled, element, true)
++                .map(CanonicalEqKey::Set),
++            CompiledEquivalenceNodeRef::Bag { element } => {
++                self.canonical_compiled_bag_at(index, compiled, element)
++            }
++            CompiledEquivalenceNodeRef::Map { key, value } => {
++                self.canonical_compiled_map_at(index, compiled, key, value)
+             }
+         }
+     }
+ 
+-    fn canonical_recursive_key_at(
+-        &self,
+-        index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        equivalence: SemanticId,
+-        registry: &kernel_semantics::SemanticRegistry,
+-    ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+-        let AlgebraicStorage::Recursive(child) = &self.storage else {
+-            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+-        };
+-        child.canonical_key_at(index, context, equivalence, registry)
+-    }
+-
+-    fn canonical_product_key_at(
++    fn canonical_compiled_product_at(
+         &self,
+         index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        equivalences: &BTreeMap<SemanticId, SemanticId>,
+-        registry: &kernel_semantics::SemanticRegistry,
++        compiled: &kernel_semantics::CompiledEquivalence,
++        compiled_fields: &[(SemanticId, usize)],
+     ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+         let AlgebraicStorage::Product { fields, row_count } = &self.storage else {
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+         };
+-        if index >= *row_count || fields.len() != equivalences.len() {
++        if index >= *row_count || fields.len() != compiled_fields.len() {
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+         }
+-        equivalences
++        compiled_fields
+             .iter()
+-            .map(|(&field, &child_equivalence)| {
++            .map(|(field, child_node)| {
+                 let child = fields
+-                    .get(&field)
++                    .get(field)
+                     .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
+                 Ok((
+-                    field,
+-                    child.canonical_key_at(index, context, child_equivalence, registry)?,
++                    *field,
++                    child.canonical_compiled_node_at(index, compiled, *child_node)?,
+                 ))
+             })
+             .collect::<Result<Vec<_>, PhysicalExecutionError>>()
+             .map(kernel_semantics::CanonicalEqKey::Product)
+     }
+ 
+-    fn canonical_option_key_at(
++    fn canonical_compiled_option_at(
+         &self,
+         index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        inner: SemanticId,
+-        registry: &kernel_semantics::SemanticRegistry,
++        compiled: &kernel_semantics::CompiledEquivalence,
++        inner: usize,
+     ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+         use kernel_semantics::CanonicalEqKey;
+         let AlgebraicStorage::Option {
+@@ -680,23 +671,22 @@
+         {
+             None => Ok(CanonicalEqKey::OptionNone),
+             Some(payload_index) => payload
+-                .canonical_key_at(*payload_index as usize, context, inner, registry)
++                .canonical_compiled_node_at(*payload_index as usize, compiled, inner)
+                 .map(Box::new)
+                 .map(CanonicalEqKey::OptionSome),
+         }
+     }
+ 
+-    fn canonical_sum_key_at(
++    fn canonical_compiled_sum_at(
+         &self,
+         index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        equivalences: &BTreeMap<SemanticId, SemanticId>,
+-        registry: &kernel_semantics::SemanticRegistry,
++        compiled: &kernel_semantics::CompiledEquivalence,
++        variants: &BTreeMap<SemanticId, usize>,
+     ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+         let AlgebraicStorage::Sum {
+             tags,
+             payload_index,
+-            variants,
++            variants: columns,
+         } = &self.storage
+         else {
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+@@ -707,51 +697,27 @@
+         let payload_index = *payload_index
+             .get(index)
+             .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
+-        let equivalence = *equivalences
++        let child_node = *variants
+             .get(&tag)
+             .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
+-        let child = variants
++        let child = columns
+             .get(&tag)
+             .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
+         Ok(kernel_semantics::CanonicalEqKey::Variant {
+             tag,
+-            value: Box::new(child.canonical_key_at(
++            value: Box::new(child.canonical_compiled_node_at(
+                 payload_index as usize,
+-                context,
+-                equivalence,
+-                registry,
++                compiled,
++                child_node,
+             )?),
+         })
+     }
+ 
+-    fn canonical_range_key_at(
++    fn canonical_compiled_bag_at(
+         &self,
+         index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        element: SemanticId,
+-        registry: &kernel_semantics::SemanticRegistry,
+-        sort: bool,
+-    ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
+-        let (offsets, payload) = match &self.storage {
+-            AlgebraicStorage::Seq { offsets, payload }
+-            | AlgebraicStorage::Set {
+-                offsets, payload, ..
+-            } => (offsets, payload.as_ref()),
+-            _ => return Err(PhysicalExecutionError::PhysicalTypeMismatch),
+-        };
+-        let mut keys = canonical_range_keys(offsets, payload, index, context, element, registry)?;
+-        if sort {
+-            keys.sort_unstable();
+-        }
+-        Ok(keys)
+-    }
+-
+-    fn canonical_bag_key_at(
+-        &self,
+-        index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        element: SemanticId,
+-        registry: &kernel_semantics::SemanticRegistry,
++        compiled: &kernel_semantics::CompiledEquivalence,
++        element: usize,
+     ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+         let AlgebraicStorage::Bag {
+             offsets,
+@@ -766,7 +732,7 @@
+         let mut entries = Vec::with_capacity(end.saturating_sub(start));
+         for position in start..end {
+             entries.push((
+-                payload.canonical_key_at(position, context, element, registry)?,
++                payload.canonical_compiled_node_at(position, compiled, element)?,
+                 *counts
+                     .get(position)
+                     .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?,
+@@ -776,13 +742,12 @@
+         Ok(kernel_semantics::CanonicalEqKey::Bag(entries))
+     }
+ 
+-    fn canonical_map_key_at(
++    fn canonical_compiled_map_at(
+         &self,
+         index: usize,
+-        context: &kernel_schema::SemanticContext,
+-        key_equivalence: SemanticId,
+-        value_equivalence: SemanticId,
+-        registry: &kernel_semantics::SemanticRegistry,
++        compiled: &kernel_semantics::CompiledEquivalence,
++        key: usize,
++        value: usize,
+     ) -> Result<kernel_semantics::CanonicalEqKey, PhysicalExecutionError> {
+         let AlgebraicStorage::Map {
+             offsets,
+@@ -797,27 +762,37 @@
+         let mut entries = Vec::with_capacity(end.saturating_sub(start));
+         for position in start..end {
+             entries.push((
+-                keys.canonical_key_at(position, context, key_equivalence, registry)?,
+-                values.canonical_key_at(position, context, value_equivalence, registry)?,
++                keys.canonical_compiled_node_at(position, compiled, key)?,
++                values.canonical_compiled_node_at(position, compiled, value)?,
+             ));
+         }
+         entries.sort_unstable();
+         Ok(kernel_semantics::CanonicalEqKey::Map(entries))
+     }
+-}
+ 
+-fn canonical_range_keys(
+-    offsets: &[u32],
+-    payload: &AlgebraicNativeColumn,
+-    index: usize,
+-    context: &kernel_schema::SemanticContext,
+-    equivalence: SemanticId,
+-    registry: &kernel_semantics::SemanticRegistry,
+-) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
+-    let (start, end) = range(offsets, index)?;
+-    (start..end)
+-        .map(|position| payload.canonical_key_at(position, context, equivalence, registry))
+-        .collect()
++    fn canonical_compiled_range_at(
++        &self,
++        index: usize,
++        compiled: &kernel_semantics::CompiledEquivalence,
++        element: usize,
++        sort: bool,
++    ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
++        let (offsets, payload) = match &self.storage {
++            AlgebraicStorage::Seq { offsets, payload }
++            | AlgebraicStorage::Set {
++                offsets, payload, ..
++            } => (offsets, payload.as_ref()),
++            _ => return Err(PhysicalExecutionError::PhysicalTypeMismatch),
++        };
++        let (start, end) = range(offsets, index)?;
++        let mut keys = (start..end)
++            .map(|position| payload.canonical_compiled_node_at(position, compiled, element))
++            .collect::<Result<Vec<_>, _>>()?;
++        if sort {
++            keys.sort_unstable();
++        }
++        Ok(keys)
++    }
+ }
+ 
+ fn select_sum(
+@@ -1758,16 +1733,13 @@
+         ];
+         let native =
+             AlgebraicNativeColumn::from_values(&rows, &composed_algebra_type(&fixture)).unwrap();
++        let compiled = fixture
++            .registry
++            .compile_equivalence(&fixture.context, fixture.product_equivalence)
++            .unwrap();
+         let mut keys = Vec::new();
+         for (index, row) in rows.iter().enumerate() {
+-            let native_key = native
+-                .canonical_key_at(
+-                    index,
+-                    &fixture.context,
+-                    fixture.product_equivalence,
+-                    &fixture.registry,
+-                )
+-                .unwrap();
++            let native_key = native.canonical_key_at_compiled(index, &compiled).unwrap();
+             let registry_key = fixture
+                 .registry
+                 .canonical_equivalence_key(&fixture.context, fixture.product_equivalence, row)
+--- /mnt/data/pass68_work/crates/kernel-plan/src/lib.rs	2026-09-21 01:22:37.577825129 +0000
++++ /mnt/data/pass70_work/crates/kernel-plan/src/lib.rs	2026-09-21 01:53:53.708828876 +0000
+@@ -4602,8 +4602,9 @@
+         if let Some(module) = registry.resolve_primitive_equivalence(context, part.equivalence)? {
+             resolved.push(ResolvedSemanticIndexKeyPart::Primitive(module));
+         } else {
+-            registry.equivalence_domain(context, part.equivalence)?;
+-            resolved.push(ResolvedSemanticIndexKeyPart::Structural(part.equivalence));
++            resolved.push(ResolvedSemanticIndexKeyPart::Structural(
++                registry.compile_equivalence(context, part.equivalence)?,
++            ));
+         }
+         dependencies.extend(
+             registry
+@@ -4659,10 +4660,10 @@
+     Ok((resolved, dependencies))
+ }
+ 
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ enum ResolvedSemanticIndexKeyPart {
+     Primitive(kernel_semantics::ResolvedPrimitiveEquivalence),
+-    Structural(SemanticId),
++    Structural(kernel_semantics::CompiledEquivalence),
+ }
+ 
+ fn semantic_key_dependencies_for_equivalences(
+@@ -4685,6 +4686,30 @@
+     Ok(dependencies.into_iter().collect())
+ }
+ 
++fn semantic_key_structural_definitions_for_equivalences(
++    equivalences: impl IntoIterator<Item = SemanticId>,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Vec<kernel_semantic_index::StructuralEquivalenceBinding>, PhysicalExecutionError> {
++    let mut definitions = BTreeMap::new();
++    for equivalence in equivalences {
++        for dependency in
++            registry.canonical_structural_equivalence_dependencies(context, equivalence)?
++        {
++            definitions.insert(dependency.semantic_id, dependency.definition);
++        }
++    }
++    Ok(definitions
++        .into_iter()
++        .map(
++            |(semantic_id, definition)| kernel_semantic_index::StructuralEquivalenceBinding {
++                semantic_id,
++                definition,
++            },
++        )
++        .collect())
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct MaterializedSemanticIndexState {
+     binding: SemanticIndexBinding,
+@@ -4704,8 +4729,17 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, PhysicalExecutionError> {
+         let (resolved, dependencies) = resolve_semantic_key_binding(&binding, context, registry)?;
++        let structural_definitions = semantic_key_structural_definitions_for_equivalences(
++            binding.key_parts.iter().map(|part| part.equivalence),
++            context,
++            registry,
++        )?;
+         let key_binding =
+-            kernel_semantic_index::SemanticIndexBinding::new(context, dependencies.clone());
++            kernel_semantic_index::SemanticIndexBinding::new_with_structural_definitions(
++                context,
++                dependencies.clone(),
++                structural_definitions,
++            );
+         let mut index = kernel_semantic_index::SemanticBucketIndex::new(key_binding.clone());
+         for row_index in relation.scan_positions() {
+             let row = materialize_native_row(&relation.data, row_index)?;
+@@ -4744,8 +4778,8 @@
+     fn probe_values(
+         &self,
+         values: &[&Value],
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
++        _context: &kernel_schema::SemanticContext,
++        _registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Option<&[PhysicalRowId]>, PhysicalExecutionError> {
+         if values.len() != self.resolved.len() {
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+@@ -4760,9 +4794,9 @@
+                 ResolvedSemanticIndexKeyPart::Primitive(module) => {
+                     module.canonical_key(value).map_err(Into::into)
+                 }
+-                ResolvedSemanticIndexKeyPart::Structural(equivalence) => registry
+-                    .canonical_equivalence_key(context, *equivalence, value)
+-                    .map_err(Into::into),
++                ResolvedSemanticIndexKeyPart::Structural(compiled) => {
++                    compiled.canonical_key(value).map_err(Into::into)
++                }
+             })
+             .collect::<Result<Vec<_>, PhysicalExecutionError>>()?;
+         Ok(self.index.bucket(&key))
+@@ -4829,8 +4863,8 @@
+ fn semantic_index_state_row_key(
+     binding: &SemanticIndexBinding,
+     resolved: &[ResolvedSemanticIndexKeyPart],
+-    context: &kernel_schema::SemanticContext,
+-    registry: &kernel_semantics::SemanticRegistry,
++    _context: &kernel_schema::SemanticContext,
++    _registry: &kernel_semantics::SemanticRegistry,
+     row: &kernel_query::Row,
+ ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
+     binding
+@@ -4845,9 +4879,9 @@
+                 ResolvedSemanticIndexKeyPart::Primitive(module) => {
+                     module.canonical_key(value).map_err(Into::into)
+                 }
+-                ResolvedSemanticIndexKeyPart::Structural(equivalence) => registry
+-                    .canonical_equivalence_key(context, *equivalence, value)
+-                    .map_err(Into::into),
++                ResolvedSemanticIndexKeyPart::Structural(compiled) => {
++                    compiled.canonical_key(value).map_err(Into::into)
++                }
+             }
+         })
+         .collect()
+@@ -4857,6 +4891,7 @@
+ struct MaterializedSemanticQuotientFactorState {
+     binding: SemanticIndexBinding,
+     key_binding: kernel_semantic_index::SemanticIndexBinding,
++    compiled: Vec<kernel_semantics::CompiledEquivalence>,
+     buckets: BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, Vec<PhysicalRowId>>,
+     reverse: BTreeMap<PhysicalRowId, Vec<kernel_semantics::CanonicalEqKey>>,
+ }
+@@ -4872,12 +4907,26 @@
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+         }
+         let (_, dependencies) = resolve_semantic_key_binding(&binding, context, registry)?;
+-        let key_binding = kernel_semantic_index::SemanticIndexBinding::new(context, dependencies);
++        let structural_definitions = semantic_key_structural_definitions_for_equivalences(
++            binding.key_parts.iter().map(|part| part.equivalence),
++            context,
++            registry,
++        )?;
++        let key_binding =
++            kernel_semantic_index::SemanticIndexBinding::new_with_structural_definitions(
++                context,
++                dependencies,
++                structural_definitions,
++            );
++        let mut compiled = Vec::with_capacity(binding.key_parts.len());
++        for part in &binding.key_parts {
++            compiled.push(registry.compile_equivalence(context, part.equivalence)?);
++        }
+         let mut buckets = BTreeMap::new();
+         let mut reverse = BTreeMap::new();
+         for row_index in relation.scan_positions() {
+             let row = materialize_native_row(&relation.data, row_index)?;
+-            let key = semantic_quotient_factor_row_key(&binding, context, registry, &row)?;
++            let key = semantic_quotient_factor_row_key(&binding, &compiled, &row)?;
+             let row_id = relation.row_id_at(row_index)?;
+             buckets
+                 .entry(key.clone())
+@@ -4890,6 +4939,7 @@
+         Ok(Self {
+             binding,
+             key_binding,
++            compiled,
+             buckets,
+             reverse,
+         })
+@@ -4901,7 +4951,18 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<bool, PhysicalExecutionError> {
+         let (_, dependencies) = resolve_semantic_key_binding(&self.binding, context, registry)?;
+-        Ok(self.key_binding.is_valid_for(context, &dependencies))
++        if !self.key_binding.is_valid_for(context, &dependencies)
++            || self.binding.key_parts.len() != self.compiled.len()
++        {
++            return Ok(false);
++        }
++        for (part, compiled) in self.binding.key_parts.iter().zip(&self.compiled) {
++            let actual = registry.compile_equivalence(context, part.equivalence)?;
++            if actual != *compiled {
++                return Ok(false);
++            }
++        }
++        Ok(true)
+     }
+ 
+     #[must_use]
+@@ -4919,10 +4980,8 @@
+     fn row_key(
+         &self,
+         row: &kernel_query::Row,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
+-        semantic_quotient_factor_row_key(&self.binding, context, registry, row)
++        semantic_quotient_factor_row_key(&self.binding, &self.compiled, row)
+     }
+ 
+     fn validate_physical_delta(
+@@ -4935,13 +4994,13 @@
+             return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+         }
+         for (row_id, row) in &delta.removed {
+-            let key = self.row_key(row, context, registry)?;
++            let key = self.row_key(row)?;
+             if self.reverse.get(row_id) != Some(&key) {
+                 return Err(RelQueryError::InconsistentIncrementalDelta.into());
+             }
+         }
+         for (_, row) in &delta.inserted {
+-            let _ = self.row_key(row, context, registry)?;
++            let _ = self.row_key(row)?;
+         }
+         Ok(())
+     }
+@@ -4949,11 +5008,11 @@
+     fn apply_physical_delta(
+         &mut self,
+         delta: &PhysicalRelationDelta,
+-        context: &kernel_schema::SemanticContext,
+-        registry: &kernel_semantics::SemanticRegistry,
++        _context: &kernel_schema::SemanticContext,
++        _registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+         for (row_id, row) in &delta.removed {
+-            let key = self.row_key(row, context, registry)?;
++            let key = self.row_key(row)?;
+             if self.reverse.get(row_id) != Some(&key) {
+                 return Err(RelQueryError::InconsistentIncrementalDelta.into());
+             }
+@@ -4974,7 +5033,7 @@
+                 .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+         }
+         for (row_id, row) in &delta.inserted {
+-            let key = self.row_key(row, context, registry)?;
++            let key = self.row_key(row)?;
+             if self.reverse.insert(*row_id, key.clone()).is_some() {
+                 return Err(RelQueryError::InconsistentIncrementalDelta.into());
+             }
+@@ -4986,20 +5045,18 @@
+ 
+ fn semantic_quotient_factor_row_key(
+     binding: &SemanticIndexBinding,
+-    context: &kernel_schema::SemanticContext,
+-    registry: &kernel_semantics::SemanticRegistry,
++    compiled: &[kernel_semantics::CompiledEquivalence],
+     row: &kernel_query::Row,
+ ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
+     binding
+         .key_parts
+         .iter()
+-        .map(|part| {
++        .zip(compiled)
++        .map(|(part, compiled)| {
+             let value = row
+                 .get(part.column)
+                 .ok_or(RelQueryError::ColumnOutOfBounds)?;
+-            registry
+-                .canonical_equivalence_key(context, part.equivalence, value)
+-                .map_err(Into::into)
++            compiled.canonical_key(value).map_err(Into::into)
+         })
+         .collect()
+ }
+@@ -6438,7 +6495,7 @@
+ enum TypedBatchPredicateKind {
+     Primitive(kernel_semantics::BoundPrimitivePredicate),
+     Algebraic {
+-        equivalence: SemanticId,
++        compiled: kernel_semantics::CompiledEquivalence,
+         expected: kernel_semantics::CanonicalEqKey,
+     },
+ }
+@@ -6533,8 +6590,6 @@
+                         .ok_or(RelQueryError::ColumnOutOfBounds)?,
+                     position,
+                     predicate,
+-                    context,
+-                    registry,
+                 )? {
+                     matched = false;
+                     break;
+@@ -7859,15 +7914,11 @@
+     let mut rows = Vec::new();
+     if program.installed.scan_order_is_physical {
+         for position in 0..native_row_count(&program.installed.data) {
+-            execute_typed_batch_position(
+-                position, &program, columns, context, registry, &mut rows, &mut stats,
+-            )?;
++            execute_typed_batch_position(position, &program, columns, &mut rows, &mut stats)?;
+         }
+     } else {
+         for position in program.installed.scan_positions() {
+-            execute_typed_batch_position(
+-                position, &program, columns, context, registry, &mut rows, &mut stats,
+-            )?;
++            execute_typed_batch_position(position, &program, columns, &mut rows, &mut stats)?;
+         }
+     }
+     stats.typed_batch_chain_hits = stats.typed_batch_chain_hits.saturating_add(1);
+@@ -7879,8 +7930,6 @@
+     position: usize,
+     program: &TypedBatchProgram<'_>,
+     columns: &[NativeColumn],
+-    context: &kernel_schema::SemanticContext,
+-    registry: &kernel_semantics::SemanticRegistry,
+     rows: &mut Vec<kernel_query::Row>,
+     stats: &mut ExecutionStats,
+ ) -> Result<(), PhysicalExecutionError> {
+@@ -7893,8 +7942,6 @@
+                 .ok_or(RelQueryError::ColumnOutOfBounds)?,
+             position,
+             predicate,
+-            context,
+-            registry,
+         )? {
+             return Ok(());
+         }
+@@ -8111,14 +8158,12 @@
+                     .structural_equivalence(*equivalence)
+                     .is_some()
+             {
+-                let expected = registry.canonical_equivalence_key(context, *equivalence, value)?;
++                let compiled = registry.compile_equivalence(context, *equivalence)?;
++                let expected = compiled.canonical_key(value)?;
+                 if let Some(position) = program.installed.scan_positions().next() {
+-                    let _ = column.canonical_key_at(position, context, *equivalence, registry)?;
+-                }
+-                TypedBatchPredicateKind::Algebraic {
+-                    equivalence: *equivalence,
+-                    expected,
++                    let _ = column.canonical_key_at_compiled(position, &compiled)?;
+                 }
++                TypedBatchPredicateKind::Algebraic { compiled, expected }
+             } else {
+                 return Ok(None);
+             };
+@@ -8243,21 +8288,16 @@
+     column: &NativeColumn,
+     index: usize,
+     predicate: &TypedBatchPredicate,
+-    context: &kernel_schema::SemanticContext,
+-    registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<bool, PhysicalExecutionError> {
+     match &predicate.kind {
+         TypedBatchPredicateKind::Primitive(bound) => {
+             typed_column_matches_bound(column, index, bound)
+         }
+-        TypedBatchPredicateKind::Algebraic {
+-            equivalence,
+-            expected,
+-        } => {
++        TypedBatchPredicateKind::Algebraic { compiled, expected } => {
+             let NativeColumn::Algebraic(column) = column else {
+                 return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+             };
+-            Ok(column.canonical_key_at(index, context, *equivalence, registry)? == *expected)
++            Ok(column.canonical_key_at_compiled(index, compiled)? == *expected)
+         }
+     }
+ }
+@@ -9408,7 +9448,16 @@
+         context,
+         registry,
+     )?;
+-    let key_binding = kernel_semantic_index::SemanticIndexBinding::new(context, dependencies);
++    let structural_definitions = semantic_key_structural_definitions_for_equivalences(
++        binding.specs.iter().map(|(equivalence, _)| *equivalence),
++        context,
++        registry,
++    )?;
++    let key_binding = kernel_semantic_index::SemanticIndexBinding::new_with_structural_definitions(
++        context,
++        dependencies,
++        structural_definitions,
++    );
+     let leaves = semantic_quotient_support_leaves(&binding, store)?;
+     let handles = leaves
+         .iter()
+@@ -11639,20 +11688,13 @@
+     row_count: usize,
+     request: &AlgebraicFilterRequest<'_>,
+ ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
+-    let expected = request.registry.canonical_equivalence_key(
+-        request.context,
+-        request.equivalence,
+-        request.predicate_value,
+-    )?;
++    let compiled = request
++        .registry
++        .compile_equivalence(request.context, request.equivalence)?;
++    let expected = compiled.canonical_key(request.predicate_value)?;
+     let mut matching = Vec::new();
+     for row_index in 0..row_count {
+-        if predicate.canonical_key_at(
+-            row_index,
+-            request.context,
+-            request.equivalence,
+-            request.registry,
+-        )? == expected
+-        {
++        if predicate.canonical_key_at_compiled(row_index, &compiled)? == expected {
+             matching.push(row_index);
+         }
+     }
+--- /mnt/data/pass68_work/crates/kernel-semantic-index/src/lib.rs	2026-09-21 01:23:02.653521227 +0000
++++ /mnt/data/pass70_work/crates/kernel-semantic-index/src/lib.rs	2026-09-21 01:51:12.540571852 +0000
+@@ -1,6 +1,6 @@
+ use std::collections::BTreeMap;
+ 
+-use kernel_schema::{ModuleDigest, SemanticContext};
++use kernel_schema::{ModuleDigest, SemanticContext, StructuralEquivalenceDef};
+ use kernel_types::{SemanticId, SemanticRevision};
+ 
+ pub const KEY_ENCODING_REVISION: u64 = 1;
+@@ -9,6 +9,7 @@
+ pub enum SemanticIndexCompatibility {
+     Compatible,
+     RebuildSemanticRevision,
++    RebuildStructuralDefinitions,
+     RebuildDependencies,
+     RebuildKeyEncoding,
+ }
+@@ -20,19 +21,37 @@
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
++pub struct StructuralEquivalenceBinding {
++    pub semantic_id: SemanticId,
++    pub definition: StructuralEquivalenceDef,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct SemanticIndexBinding {
+     semantic_revision: SemanticRevision,
++    structural_definitions: Vec<StructuralEquivalenceBinding>,
+     dependencies: Vec<SemanticModuleBinding>,
+     key_encoding_revision: u64,
+ }
+ 
+ impl SemanticIndexBinding {
+     #[must_use]
+-    pub fn new(context: &SemanticContext, mut dependencies: Vec<SemanticModuleBinding>) -> Self {
++    pub fn new(context: &SemanticContext, dependencies: Vec<SemanticModuleBinding>) -> Self {
++        Self::new_with_structural_definitions(context, dependencies, Vec::new())
++    }
++
++    #[must_use]
++    pub fn new_with_structural_definitions(
++        context: &SemanticContext,
++        mut dependencies: Vec<SemanticModuleBinding>,
++        mut structural_definitions: Vec<StructuralEquivalenceBinding>,
++    ) -> Self {
+         dependencies.sort_unstable();
+         dependencies.dedup();
++        structural_definitions.sort_by_key(|binding| binding.semantic_id);
+         Self {
+             semantic_revision: context.revision(),
++            structural_definitions,
+             dependencies,
+             key_encoding_revision: KEY_ENCODING_REVISION,
+         }
+@@ -53,6 +72,27 @@
+         dependencies.dedup();
+         Self {
+             semantic_revision,
++            structural_definitions: Vec::new(),
++            dependencies,
++            key_encoding_revision,
++        }
++    }
++
++    /// Reconstructs cache metadata that contains the exact structural law
++    /// closure used by the persisted canonical keys.
++    #[must_use]
++    pub fn from_persisted_with_structural_definitions(
++        semantic_revision: SemanticRevision,
++        mut dependencies: Vec<SemanticModuleBinding>,
++        mut structural_definitions: Vec<StructuralEquivalenceBinding>,
++        key_encoding_revision: u64,
++    ) -> Self {
++        dependencies.sort_unstable();
++        dependencies.dedup();
++        structural_definitions.sort_by_key(|binding| binding.semantic_id);
++        Self {
++            semantic_revision,
++            structural_definitions,
+             dependencies,
+             key_encoding_revision,
+         }
+@@ -69,6 +109,11 @@
+     }
+ 
+     #[must_use]
++    pub fn structural_definitions(&self) -> &[StructuralEquivalenceBinding] {
++        &self.structural_definitions
++    }
++
++    #[must_use]
+     pub const fn key_encoding_revision(&self) -> u64 {
+         self.key_encoding_revision
+     }
+@@ -94,6 +139,11 @@
+         if self.semantic_revision != context.revision() {
+             return SemanticIndexCompatibility::RebuildSemanticRevision;
+         }
++        if self.structural_definitions.iter().any(|binding| {
++            context.schema.structural_equivalence(binding.semantic_id) != Some(&binding.definition)
++        }) {
++            return SemanticIndexCompatibility::RebuildStructuralDefinitions;
++        }
+         let mut dependencies = dependencies.to_vec();
+         dependencies.sort_unstable();
+         dependencies.dedup();
+@@ -175,6 +225,28 @@
+                 .capacity()
+                 .saturating_mul(std::mem::size_of::<SemanticModuleBinding>()),
+         );
++        bytes = bytes.saturating_add(
++            self.binding
++                .structural_definitions
++                .capacity()
++                .saturating_mul(std::mem::size_of::<StructuralEquivalenceBinding>()),
++        );
++        for binding in &self.binding.structural_definitions {
++            let entries = match &binding.definition {
++                StructuralEquivalenceDef::Product { fields } => fields.len(),
++                StructuralEquivalenceDef::Sum { variants } => variants.len(),
++                StructuralEquivalenceDef::Mu { .. }
++                | StructuralEquivalenceDef::Var { .. }
++                | StructuralEquivalenceDef::Option { .. }
++                | StructuralEquivalenceDef::Set { .. }
++                | StructuralEquivalenceDef::Bag { .. }
++                | StructuralEquivalenceDef::Seq { .. }
++                | StructuralEquivalenceDef::Map { .. } => 0,
++            };
++            bytes = bytes.saturating_add(
++                entries.saturating_mul(std::mem::size_of::<(SemanticId, SemanticId)>()),
++            );
++        }
+         for (key, identities) in &self.buckets {
+             bytes = bytes
+                 .saturating_add(std::mem::size_of::<K>())
+@@ -362,4 +434,52 @@
+             SemanticIndexCompatibility::RebuildKeyEncoding
+         );
+     }
++
++    #[test]
++    fn binding_rejects_same_nominal_revision_with_changed_structural_definition() {
++        let root = SemanticId::new(100);
++        let field_a = SemanticId::new(101);
++        let field_b = SemanticId::new(102);
++        let eq_a = SemanticId::new(103);
++        let eq_b = SemanticId::new(104);
++        let original = StructuralEquivalenceDef::Product {
++            fields: [(field_a, eq_a), (field_b, eq_b)].into_iter().collect(),
++        };
++        let mut context = context();
++        context
++            .schema
++            .define_structural_equivalence(root, original.clone())
++            .unwrap();
++        let binding = SemanticIndexBinding::new_with_structural_definitions(
++            &context,
++            Vec::new(),
++            vec![StructuralEquivalenceBinding {
++                semantic_id: root,
++                definition: original,
++            }],
++        );
++        assert_eq!(
++            binding.compatibility(&context, &[]),
++            SemanticIndexCompatibility::Compatible
++        );
++
++        let mut drifted = SemanticContext {
++            schema: Schema::new(context.schema.revision),
++            environment: context.environment.clone(),
++        };
++        drifted
++            .schema
++            .define_structural_equivalence(
++                root,
++                StructuralEquivalenceDef::Product {
++                    fields: [(field_a, eq_b), (field_b, eq_a)].into_iter().collect(),
++                },
++            )
++            .unwrap();
++        assert_eq!(context.revision(), drifted.revision());
++        assert_eq!(
++            binding.compatibility(&drifted, &[]),
++            SemanticIndexCompatibility::RebuildStructuralDefinitions
++        );
++    }
+ }
+--- /mnt/data/pass68_work/crates/kernel-semantics/src/lib.rs	2026-09-21 01:26:35.100199772 +0000
++++ /mnt/data/pass70_work/crates/kernel-semantics/src/lib.rs	2026-09-21 01:50:24.204668073 +0000
+@@ -571,6 +571,198 @@
+     pub module_digest: ModuleDigest,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct CanonicalStructuralEquivalenceDependency {
++    pub semantic_id: SemanticId,
++    pub definition: StructuralEquivalenceDef,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct CompiledEquivalence {
++    equivalence: SemanticId,
++    domain: EquivalenceDomain,
++    root: usize,
++    nodes: Vec<CompiledEquivalenceNode>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct CompiledEquivalenceNode {
++    equivalence: SemanticId,
++    kind: CompiledEquivalenceKind,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum CompiledEquivalenceKind {
++    Primitive(ResolvedPrimitiveEquivalence),
++    Mu { body: usize },
++    Var { binder: usize },
++    Product(Vec<(SemanticId, usize)>),
++    Option { inner: usize },
++    Sum(BTreeMap<SemanticId, usize>),
++    Set { element: usize },
++    Bag { element: usize },
++    Seq { element: usize },
++    Map { key: usize, value: usize },
++}
++
++#[derive(Debug, Clone, Copy)]
++pub enum CompiledEquivalenceNodeRef<'a> {
++    Primitive(ResolvedPrimitiveEquivalence),
++    Mu { body: usize },
++    Var { binder: usize },
++    Product(&'a [(SemanticId, usize)]),
++    Option { inner: usize },
++    Sum(&'a BTreeMap<SemanticId, usize>),
++    Set { element: usize },
++    Bag { element: usize },
++    Seq { element: usize },
++    Map { key: usize, value: usize },
++}
++
++struct EquivalenceCompileState<'a> {
++    context: &'a SemanticContext,
++    nodes: &'a mut Vec<CompiledEquivalenceNode>,
++    stack: &'a mut BTreeSet<SemanticId>,
++    binders: &'a mut Vec<(SemanticId, usize, usize)>,
++}
++
++impl CompiledEquivalence {
++    #[must_use]
++    pub const fn equivalence(&self) -> SemanticId {
++        self.equivalence
++    }
++
++    #[must_use]
++    pub const fn domain(&self) -> &EquivalenceDomain {
++        &self.domain
++    }
++
++    #[must_use]
++    pub const fn root_node(&self) -> usize {
++        self.root
++    }
++
++    #[must_use]
++    pub fn node(&self, index: usize) -> Option<(SemanticId, CompiledEquivalenceNodeRef<'_>)> {
++        let node = self.nodes.get(index)?;
++        let kind = match &node.kind {
++            CompiledEquivalenceKind::Primitive(resolved) => {
++                CompiledEquivalenceNodeRef::Primitive(*resolved)
++            }
++            CompiledEquivalenceKind::Mu { body } => CompiledEquivalenceNodeRef::Mu { body: *body },
++            CompiledEquivalenceKind::Var { binder } => {
++                CompiledEquivalenceNodeRef::Var { binder: *binder }
++            }
++            CompiledEquivalenceKind::Product(fields) => CompiledEquivalenceNodeRef::Product(fields),
++            CompiledEquivalenceKind::Option { inner } => {
++                CompiledEquivalenceNodeRef::Option { inner: *inner }
++            }
++            CompiledEquivalenceKind::Sum(variants) => CompiledEquivalenceNodeRef::Sum(variants),
++            CompiledEquivalenceKind::Set { element } => {
++                CompiledEquivalenceNodeRef::Set { element: *element }
++            }
++            CompiledEquivalenceKind::Bag { element } => {
++                CompiledEquivalenceNodeRef::Bag { element: *element }
++            }
++            CompiledEquivalenceKind::Seq { element } => {
++                CompiledEquivalenceNodeRef::Seq { element: *element }
++            }
++            CompiledEquivalenceKind::Map { key, value } => CompiledEquivalenceNodeRef::Map {
++                key: *key,
++                value: *value,
++            },
++        };
++        Some((node.equivalence, kind))
++    }
++
++    pub fn canonical_key(&self, value: &Value) -> Result<CanonicalEqKey, SemanticError> {
++        self.canonical_key_at(self.root, value)
++    }
++
++    pub fn equivalent(&self, left: &Value, right: &Value) -> Result<bool, SemanticError> {
++        Ok(self.canonical_key(left)? == self.canonical_key(right)?)
++    }
++
++    fn canonical_key_at(
++        &self,
++        node_index: usize,
++        value: &Value,
++    ) -> Result<CanonicalEqKey, SemanticError> {
++        let node = &self.nodes[node_index];
++        match (&node.kind, value) {
++            (CompiledEquivalenceKind::Primitive(resolved), _) => resolved.canonical_key(value),
++            (CompiledEquivalenceKind::Mu { body }, _) => self.canonical_key_at(*body, value),
++            (CompiledEquivalenceKind::Var { binder }, _) => self.canonical_key_at(*binder, value),
++            (CompiledEquivalenceKind::Product(fields), Value::Product(values)) => {
++                if fields.len() != values.len() {
++                    return Err(SemanticError::TypeMismatch(node.equivalence));
++                }
++                fields
++                    .iter()
++                    .map(|(field, child)| {
++                        let value = values
++                            .get(field)
++                            .ok_or(SemanticError::TypeMismatch(node.equivalence))?;
++                        Ok((*field, self.canonical_key_at(*child, value)?))
++                    })
++                    .collect::<Result<Vec<_>, _>>()
++                    .map(CanonicalEqKey::Product)
++            }
++            (CompiledEquivalenceKind::Option { inner }, Value::Option(value)) => value
++                .as_deref()
++                .map_or(Ok(CanonicalEqKey::OptionNone), |value| {
++                    self.canonical_key_at(*inner, value)
++                        .map(Box::new)
++                        .map(CanonicalEqKey::OptionSome)
++                }),
++            (CompiledEquivalenceKind::Sum(variants), Value::Variant { tag, value }) => {
++                let child = variants
++                    .get(tag)
++                    .ok_or(SemanticError::TypeMismatch(node.equivalence))?;
++                Ok(CanonicalEqKey::Variant {
++                    tag: *tag,
++                    value: Box::new(self.canonical_key_at(*child, value)?),
++                })
++            }
++            (CompiledEquivalenceKind::Seq { element }, Value::Seq(values)) => values
++                .iter()
++                .map(|value| self.canonical_key_at(*element, value))
++                .collect::<Result<Vec<_>, _>>()
++                .map(CanonicalEqKey::Seq),
++            (CompiledEquivalenceKind::Set { element }, Value::Set { elements, .. }) => {
++                let mut key = elements
++                    .iter()
++                    .map(|value| self.canonical_key_at(*element, value))
++                    .collect::<Result<Vec<_>, _>>()?;
++                key.sort_unstable();
++                Ok(CanonicalEqKey::Set(key))
++            }
++            (CompiledEquivalenceKind::Bag { element }, Value::Bag { entries, .. }) => {
++                let mut key = entries
++                    .iter()
++                    .map(|(value, count)| Ok((self.canonical_key_at(*element, value)?, *count)))
++                    .collect::<Result<Vec<_>, SemanticError>>()?;
++                key.sort_unstable();
++                Ok(CanonicalEqKey::Bag(key))
++            }
++            (CompiledEquivalenceKind::Map { key, value }, Value::Map { entries, .. }) => {
++                let mut canonical = entries
++                    .iter()
++                    .map(|(entry_key, entry_value)| {
++                        Ok((
++                            self.canonical_key_at(*key, entry_key)?,
++                            self.canonical_key_at(*value, entry_value)?,
++                        ))
++                    })
++                    .collect::<Result<Vec<_>, SemanticError>>()?;
++                canonical.sort_unstable();
++                Ok(CanonicalEqKey::Map(canonical))
++            }
++            _ => Err(SemanticError::TypeMismatch(node.equivalence)),
++        }
++    }
++}
++
+ impl ResolvedPrimitiveEquivalence {
+     #[must_use]
+     pub const fn equivalence(&self) -> SemanticId {
+@@ -1461,6 +1653,185 @@
+         }))
+     }
+ 
++    pub fn compile_equivalence(
++        &self,
++        context: &SemanticContext,
++        equivalence: SemanticId,
++    ) -> Result<CompiledEquivalence, SemanticError> {
++        let domain = self.equivalence_domain(context, equivalence)?;
++        let mut nodes = Vec::new();
++        let mut stack = BTreeSet::new();
++        let mut binders = Vec::new();
++        let root = self.compile_equivalence_node(
++            equivalence,
++            &mut EquivalenceCompileState {
++                context,
++                nodes: &mut nodes,
++                stack: &mut stack,
++                binders: &mut binders,
++            },
++            0,
++        )?;
++        Ok(CompiledEquivalence {
++            equivalence,
++            domain,
++            root,
++            nodes,
++        })
++    }
++
++    fn compile_equivalence_node(
++        &self,
++        equivalence: SemanticId,
++        state: &mut EquivalenceCompileState<'_>,
++        constructor_depth: usize,
++    ) -> Result<usize, SemanticError> {
++        let Some(definition) = state.context.schema.structural_equivalence(equivalence) else {
++            return self.compile_primitive_equivalence_node(equivalence, state);
++        };
++        if let StructuralEquivalenceDef::Var { binder } = definition {
++            return Self::compile_variable_equivalence_node(
++                equivalence,
++                *binder,
++                state,
++                constructor_depth,
++            );
++        }
++        if !state.stack.insert(equivalence) {
++            return Err(SemanticError::CyclicStructuralEquivalence(equivalence));
++        }
++        let index = state.nodes.len();
++        state.nodes.push(CompiledEquivalenceNode {
++            equivalence,
++            kind: CompiledEquivalenceKind::Mu { body: usize::MAX },
++        });
++        let kind = self.compile_structural_equivalence_kind(
++            equivalence,
++            definition,
++            index,
++            state,
++            constructor_depth,
++        )?;
++        state.nodes[index].kind = kind;
++        state.stack.remove(&equivalence);
++        Ok(index)
++    }
++
++    fn compile_primitive_equivalence_node(
++        &self,
++        equivalence: SemanticId,
++        state: &mut EquivalenceCompileState<'_>,
++    ) -> Result<usize, SemanticError> {
++        let resolved = self
++            .resolve_primitive_equivalence(state.context, equivalence)?
++            .ok_or(SemanticError::WrongModuleKind(equivalence))?;
++        let index = state.nodes.len();
++        state.nodes.push(CompiledEquivalenceNode {
++            equivalence,
++            kind: CompiledEquivalenceKind::Primitive(resolved),
++        });
++        Ok(index)
++    }
++
++    fn compile_variable_equivalence_node(
++        equivalence: SemanticId,
++        binder: SemanticId,
++        state: &mut EquivalenceCompileState<'_>,
++        constructor_depth: usize,
++    ) -> Result<usize, SemanticError> {
++        let Some((_, binder_node, binder_depth)) = state
++            .binders
++            .iter()
++            .rev()
++            .find(|(candidate, _, _)| candidate == &binder)
++        else {
++            return Err(SemanticError::FreeStructuralRecursion(binder));
++        };
++        if constructor_depth <= *binder_depth {
++            return Err(SemanticError::UnguardedStructuralRecursion(binder));
++        }
++        let index = state.nodes.len();
++        state.nodes.push(CompiledEquivalenceNode {
++            equivalence,
++            kind: CompiledEquivalenceKind::Var {
++                binder: *binder_node,
++            },
++        });
++        Ok(index)
++    }
++
++    fn compile_structural_equivalence_kind(
++        &self,
++        equivalence: SemanticId,
++        definition: &StructuralEquivalenceDef,
++        index: usize,
++        state: &mut EquivalenceCompileState<'_>,
++        constructor_depth: usize,
++    ) -> Result<CompiledEquivalenceKind, SemanticError> {
++        match definition {
++            StructuralEquivalenceDef::Mu { body } => {
++                state.binders.push((equivalence, index, constructor_depth));
++                let body = self.compile_equivalence_node(*body, state, constructor_depth)?;
++                state.binders.pop();
++                Ok(CompiledEquivalenceKind::Mu { body })
++            }
++            StructuralEquivalenceDef::Var { .. } => unreachable!(),
++            StructuralEquivalenceDef::Product { fields } => self
++                .compile_named_children(fields, state, constructor_depth)
++                .map(CompiledEquivalenceKind::Product),
++            StructuralEquivalenceDef::Option { inner } => self
++                .compile_equivalence_node(*inner, state, constructor_depth + 1)
++                .map(|inner| CompiledEquivalenceKind::Option { inner }),
++            StructuralEquivalenceDef::Sum { variants } => self
++                .compile_tagged_children(variants, state, constructor_depth)
++                .map(CompiledEquivalenceKind::Sum),
++            StructuralEquivalenceDef::Set { element } => self
++                .compile_equivalence_node(*element, state, constructor_depth + 1)
++                .map(|element| CompiledEquivalenceKind::Set { element }),
++            StructuralEquivalenceDef::Bag { element } => self
++                .compile_equivalence_node(*element, state, constructor_depth + 1)
++                .map(|element| CompiledEquivalenceKind::Bag { element }),
++            StructuralEquivalenceDef::Seq { element } => self
++                .compile_equivalence_node(*element, state, constructor_depth + 1)
++                .map(|element| CompiledEquivalenceKind::Seq { element }),
++            StructuralEquivalenceDef::Map { key, value } => {
++                let key = self.compile_equivalence_node(*key, state, constructor_depth + 1)?;
++                let value = self.compile_equivalence_node(*value, state, constructor_depth + 1)?;
++                Ok(CompiledEquivalenceKind::Map { key, value })
++            }
++        }
++    }
++
++    fn compile_named_children(
++        &self,
++        children: &BTreeMap<SemanticId, SemanticId>,
++        state: &mut EquivalenceCompileState<'_>,
++        constructor_depth: usize,
++    ) -> Result<Vec<(SemanticId, usize)>, SemanticError> {
++        children
++            .iter()
++            .map(|(name, child)| {
++                self.compile_equivalence_node(*child, state, constructor_depth + 1)
++                    .map(|node| (*name, node))
++            })
++            .collect()
++    }
++
++    fn compile_tagged_children(
++        &self,
++        children: &BTreeMap<SemanticId, SemanticId>,
++        state: &mut EquivalenceCompileState<'_>,
++        constructor_depth: usize,
++    ) -> Result<BTreeMap<SemanticId, usize>, SemanticError> {
++        children
++            .iter()
++            .map(|(tag, child)| {
++                self.compile_equivalence_node(*child, state, constructor_depth + 1)
++                    .map(|node| (*tag, node))
++            })
++            .collect()
++    }
++
+     pub fn canonical_equivalence_key(
+         &self,
+         context: &SemanticContext,
+@@ -1507,6 +1878,44 @@
+         Ok(dependencies.into_iter().collect())
+     }
+ 
++    /// Returns the exact structural-definition closure that participates in
++    /// one canonical key law. This complements primitive module digests: two
++    /// contexts may reuse the same nominal revision identifiers while carrying
++    /// different structural definitions, so long-lived caches must bind to
++    /// the definitions themselves rather than trusting the nominal revision.
++    pub fn canonical_structural_equivalence_dependencies(
++        &self,
++        context: &SemanticContext,
++        equivalence: SemanticId,
++    ) -> Result<Vec<CanonicalStructuralEquivalenceDependency>, SemanticError> {
++        self.equivalence_domain(context, equivalence)?;
++        let mut pending = vec![equivalence];
++        let mut visited = BTreeSet::new();
++        let mut dependencies = BTreeMap::new();
++        while let Some(current) = pending.pop() {
++            if !visited.insert(current) {
++                continue;
++            }
++            let Some(definition) = context.schema.structural_equivalence(current) else {
++                let _ = self
++                    .resolve_primitive_equivalence(context, current)?
++                    .ok_or(SemanticError::WrongModuleKind(current))?;
++                continue;
++            };
++            dependencies.insert(current, definition.clone());
++            pending.extend(canonical_dependency_children(definition));
++        }
++        Ok(dependencies
++            .into_iter()
++            .map(
++                |(semantic_id, definition)| CanonicalStructuralEquivalenceDependency {
++                    semantic_id,
++                    definition,
++                },
++            )
++            .collect())
++    }
++
+     fn canonical_equivalence_key_unchecked(
+         &self,
+         context: &SemanticContext,
+@@ -2835,15 +3244,22 @@
+         let left = cons("A", cons("B", nil()));
+         let right = cons("a", cons("b", nil()));
+         let different = cons("a", nil());
++        let compiled = registry.compile_equivalence(&context, root).unwrap();
+         assert_eq!(registry.equivalent(&context, root, &left, &right), Ok(true));
+         assert_eq!(
+             registry.canonical_equivalence_key(&context, root, &left),
+             registry.canonical_equivalence_key(&context, root, &right)
+         );
++        assert_eq!(compiled.equivalent(&left, &right), Ok(true));
++        assert_eq!(
++            compiled.canonical_key(&left),
++            registry.canonical_equivalence_key(&context, root, &left)
++        );
+         assert_eq!(
+             registry.equivalent(&context, root, &left, &different),
+             Ok(false)
+         );
++        assert_eq!(compiled.equivalent(&left, &different), Ok(false));
+         assert_ne!(
+             registry.canonical_equivalence_key(&context, root, &left),
+             registry.canonical_equivalence_key(&context, root, &different)
+@@ -3711,6 +4127,12 @@
+         equivalence: SemanticId,
+         values: &[Value],
+     ) {
++        let compiled = registry.compile_equivalence(context, equivalence).unwrap();
++        assert_eq!(compiled.equivalence(), equivalence);
++        assert_eq!(
++            compiled.domain(),
++            &registry.equivalence_domain(context, equivalence).unwrap()
++        );
+         for left in values {
+             for right in values {
+                 let oracle = registry
+@@ -3723,6 +4145,9 @@
+                     .canonical_equivalence_key(context, equivalence, right)
+                     .unwrap();
+                 assert_eq!(left_key == right_key, oracle);
++                assert_eq!(compiled.canonical_key(left).unwrap(), left_key);
++                assert_eq!(compiled.canonical_key(right).unwrap(), right_key);
++                assert_eq!(compiled.equivalent(left, right).unwrap(), oracle);
+             }
+         }
+     }

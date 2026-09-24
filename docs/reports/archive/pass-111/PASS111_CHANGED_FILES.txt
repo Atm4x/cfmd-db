@@ -1,0 +1,13 @@
+Production source delta vs Pass110:
+crates/kernel-query/src/execgraph.rs
+crates/kernel-query/src/lib.rs
+crates/kernel-query/src/linear_island.rs
+
+Reports/checkpoint metadata:
+PASS111_REPORT.md
+PASS111_HISTORICAL_LEDGER.md
+IMPLEMENTATION_REPORT_pass111.md
+IMPLEMENTATION_REPORT.md
+PASS111_CHANGED_FILES.txt
+PASS111_FREEZE.txt
+MANIFEST.sha256

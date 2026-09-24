@@ -1,0 +1,32 @@
+=== cost_model_rejects_unprofitable_tiny_text_semantic_index ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_plan-177b99e53f78f745)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 0.00s
+
+=== cost_model_uses_selective_persisted_text_semantic_index ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_plan-177b99e53f78f745)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 0.00s
+
+=== composite_mixed_type_semantic_index_drives_filter_chain_and_maintains_delta ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_plan-177b99e53f78f745)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 0.00s
+
+=== composite_mixed_key_semantic_index_fuses_column_filtered_join ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_plan-177b99e53f78f745)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 0.00s
+

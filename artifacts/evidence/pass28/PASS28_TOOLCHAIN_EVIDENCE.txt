@@ -1,0 +1,20 @@
+# Pass28 toolchain evidence
+captured_utc=2026-09-19T20:15:14Z
+
+$ cargo --version
+cargo: command not found
+
+$ rustc --version
+rustc: command not found
+
+$ rustfmt --version
+rustfmt: command not found
+
+$ clippy-driver --version
+clippy-driver: command not found
+
+$ cargo fmt --all -- --check
+bash: line 14: cargo: command not found
+
+$ cargo test --workspace
+bash: line 17: cargo: command not found

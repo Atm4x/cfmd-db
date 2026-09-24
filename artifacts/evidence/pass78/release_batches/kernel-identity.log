@@ -1,0 +1,13 @@
+   Compiling kernel-identity v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-identity)
+    Finished `release` profile [optimized] target(s) in 0.56s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_identity-806ad34189ee0e11)
+
+running 5 tests
+test tests::dense_entity_ids_round_trip_external_identity_without_reusing_semantics ... ok
+test tests::bijective_transports_form_a_groupoid_under_composition ... ok
+test tests::dense_entity_set_is_a_compact_exact_local_id_extent ... ok
+test tests::merge_is_not_identity_transport ... ok
+test tests::split_is_not_identity_transport ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

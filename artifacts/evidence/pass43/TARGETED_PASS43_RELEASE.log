@@ -1,0 +1,15 @@
+$ cargo test -p kernel-plan semantic_index_advisor --release -- --nocapture
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_plan-177b99e53f78f745)
+
+running 7 tests
+test tests::semantic_index_advisor_discovers_access_path_below_project_boundary ... ok
+test tests::semantic_index_advisor_amortizes_build_and_reuses_one_shared_index ... ok
+test tests::semantic_index_advisor_budget_evicts_only_its_own_lower_value_index ... ok
+test tests::semantic_index_advisor_builds_profitable_composite_join_index ... ok
+test tests::semantic_index_advisor_rejects_one_shot_build_that_does_not_amortize ... ok
+test tests::semantic_index_advisor_rebuilds_stale_gamma_bound_index_before_reuse ... ok
+test tests::semantic_index_advisor_publishes_one_runtime_root_and_noop_does_not_republish ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 0.00s
+

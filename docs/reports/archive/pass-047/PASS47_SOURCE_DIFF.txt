@@ -1,0 +1,537 @@
+# Pass47 production source diff vs Pass46
+
+--- /mnt/data/cfmd_workspace_pass46/cfmd_workspace_pass46/crates/kernel-plan/src/lib.rs	2026-09-20 12:53:51.030739042 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 13:24:36.332427635 +0000
+@@ -3566,6 +3566,7 @@
+     pub typed_stateful_batch_hits: usize,
+     pub typed_stateful_producer_hits: usize,
+     pub multiway_join_reorders: usize,
++    pub multiway_join_order_restorations: usize,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -4732,6 +4733,9 @@
+     target.multiway_join_reorders = target
+         .multiway_join_reorders
+         .saturating_add(source.multiway_join_reorders);
++    target.multiway_join_order_restorations = target
++        .multiway_join_order_restorations
++        .saturating_add(source.multiway_join_order_restorations);
+ }
+ 
+ struct TypedBatchSelection<'a> {
+@@ -6615,6 +6619,316 @@
+     registry: &'a kernel_semantics::SemanticRegistry,
+ }
+ 
++#[derive(Debug, Clone)]
++struct ProvenanceJoinRow {
++    fragments: Vec<Option<kernel_query::Row>>,
++    scan_ordinals: Vec<Option<usize>>,
++}
++
++impl ProvenanceJoinRow {
++    fn leaf(leaf_count: usize, leaf: usize, ordinal: usize, row: kernel_query::Row) -> Self {
++        let mut fragments = vec![None; leaf_count];
++        fragments[leaf] = Some(row);
++        let mut scan_ordinals = vec![None; leaf_count];
++        scan_ordinals[leaf] = Some(ordinal);
++        Self {
++            fragments,
++            scan_ordinals,
++        }
++    }
++
++    fn merge(&self, other: &Self) -> Option<Self> {
++        if self
++            .fragments
++            .iter()
++            .zip(&other.fragments)
++            .any(|(left, right)| left.is_some() && right.is_some())
++        {
++            return None;
++        }
++        Some(Self {
++            fragments: self
++                .fragments
++                .iter()
++                .zip(&other.fragments)
++                .map(|(left, right)| left.clone().or_else(|| right.clone()))
++                .collect(),
++            scan_ordinals: self
++                .scan_ordinals
++                .iter()
++                .zip(&other.scan_ordinals)
++                .map(|(left, right)| left.or(*right))
++                .collect(),
++        })
++    }
++}
++
++fn provenance_row_satisfies_predicates(
++    row: &ProvenanceJoinRow,
++    predicates: &[MultiwayJoinPredicate],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<bool, PhysicalExecutionError> {
++    for predicate in predicates {
++        let (Some(left), Some(right)) = (
++            row.fragments[predicate.left.leaf].as_ref(),
++            row.fragments[predicate.right.leaf].as_ref(),
++        ) else {
++            continue;
++        };
++        let left = left
++            .get(predicate.left.column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        let right = right
++            .get(predicate.right.column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        if !registry.equivalent(context, predicate.equivalence, left, right)? {
++            return Ok(false);
++        }
++    }
++    Ok(true)
++}
++
++fn join_provenance_rows(
++    left: &[ProvenanceJoinRow],
++    right: &[ProvenanceJoinRow],
++    predicates: &[MultiwayJoinPredicate],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Vec<ProvenanceJoinRow>, PhysicalExecutionError> {
++    let mut output = Vec::new();
++    for left_row in left {
++        for right_row in right {
++            let Some(merged) = left_row.merge(right_row) else {
++                continue;
++            };
++            if provenance_row_satisfies_predicates(&merged, predicates, context, registry)? {
++                output.push(merged);
++            }
++        }
++    }
++    Ok(output)
++}
++
++fn restore_provenance_join_order(
++    mut rows: Vec<ProvenanceJoinRow>,
++) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
++    rows.sort_by(|left, right| left.scan_ordinals.cmp(&right.scan_ordinals));
++    rows.into_iter()
++        .map(|row| {
++            let mut output = Vec::new();
++            for fragment in row.fragments {
++                let Some(fragment) = fragment else {
++                    return Err(RelQueryError::InconsistentIncrementalDelta.into());
++                };
++                output.extend(fragment);
++            }
++            Ok(output)
++        })
++        .collect()
++}
++
++fn leaf_provenance_rows(
++    store: &PhysicalStore,
++    leaves: &[MultiwayJoinLeaf],
++    leaf: usize,
++    stats: &mut ExecutionStats,
++) -> Result<Vec<ProvenanceJoinRow>, PhysicalExecutionError> {
++    let rows = store.logical_rows_with_handles(leaves[leaf].relation, leaves[leaf].layout)?;
++    stats.scanned_rows = stats.scanned_rows.saturating_add(rows.len());
++    stats.values_read = stats
++        .values_read
++        .saturating_add(rows.len().saturating_mul(leaves[leaf].width));
++    Ok(rows
++        .into_iter()
++        .enumerate()
++        .map(|(ordinal, (_, row))| ProvenanceJoinRow::leaf(leaves.len(), leaf, ordinal, row))
++        .collect())
++}
++
++fn leaf_pair_distinct_estimate(
++    store: &PhysicalStore,
++    leaves: &[MultiwayJoinLeaf],
++    predicate: MultiwayJoinPredicate,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<(usize, usize)>, PhysicalExecutionError> {
++    let left_leaf = &leaves[predicate.left.leaf];
++    let right_leaf = &leaves[predicate.right.leaf];
++    let left_binding = SemanticIndexBinding::single(
++        left_leaf.relation,
++        left_leaf.layout,
++        predicate.left.column,
++        predicate.equivalence,
++    );
++    let right_binding = SemanticIndexBinding::single(
++        right_leaf.relation,
++        right_leaf.layout,
++        predicate.right.column,
++        predicate.equivalence,
++    );
++    let Some(left) = store.semantic_statistics(&left_binding, context, registry)? else {
++        return Ok(None);
++    };
++    let Some(right) = store.semantic_statistics(&right_binding, context, registry)? else {
++        return Ok(None);
++    };
++    Ok(Some((
++        left.distinct_key_count.max(1),
++        right.distinct_key_count.max(1),
++    )))
++}
++
++fn estimated_leaf_pair_rows(
++    store: &PhysicalStore,
++    leaves: &[MultiwayJoinLeaf],
++    predicates: &[MultiwayJoinPredicate],
++    left: usize,
++    right: usize,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<usize>, PhysicalExecutionError> {
++    let mut estimate = None;
++    for predicate in predicates.iter().copied().filter(|predicate| {
++        (predicate.left.leaf == left && predicate.right.leaf == right)
++            || (predicate.left.leaf == right && predicate.right.leaf == left)
++    }) {
++        let Some((left_distinct, right_distinct)) =
++            leaf_pair_distinct_estimate(store, leaves, predicate, context, registry)?
++        else {
++            continue;
++        };
++        let rows = leaves[left]
++            .rows
++            .saturating_mul(leaves[right].rows)
++            .div_ceil(left_distinct.max(right_distinct));
++        estimate = Some(estimate.map_or(rows, |current: usize| current.min(rows)));
++    }
++    Ok(estimate)
++}
++
++fn estimated_third_join_rows(
++    planner: &MultiwayPlannerContext<'_>,
++    predicates: &[MultiwayJoinPredicate],
++    pair: [usize; 2],
++    pair_rows: usize,
++    third: usize,
++) -> Result<Option<usize>, PhysicalExecutionError> {
++    let leaves = planner.leaves;
++    let mut estimate = None;
++    for predicate in predicates.iter().copied().filter(|predicate| {
++        (predicate.left.leaf == third && pair.contains(&predicate.right.leaf))
++            || (predicate.right.leaf == third && pair.contains(&predicate.left.leaf))
++    }) {
++        let Some((left_distinct, right_distinct)) = leaf_pair_distinct_estimate(
++            planner.store,
++            leaves,
++            predicate,
++            planner.context,
++            planner.registry,
++        )?
++        else {
++            continue;
++        };
++        let rows = pair_rows
++            .saturating_mul(leaves[third].rows)
++            .div_ceil(left_distinct.max(right_distinct));
++        estimate = Some(estimate.map_or(rows, |current: usize| current.min(rows)));
++    }
++    Ok(estimate)
++}
++
++fn estimated_order_restoration_work(rows: usize) -> u128 {
++    if rows <= 1 {
++        return 0;
++    }
++    let log2 = usize::BITS - (rows - 1).leading_zeros();
++    (rows as u128).saturating_mul(u128::from(log2))
++}
++
++fn try_execute_three_way_order_restored_join(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let mut leaves = Vec::new();
++    let mut predicates = Vec::new();
++    let Some(_) = flatten_multiway_join_tree(plan, store, &mut leaves, &mut predicates)? else {
++        return Ok(None);
++    };
++    if leaves.len() != 3 {
++        return Ok(None);
++    }
++    for predicate in &predicates {
++        for endpoint in [predicate.left, predicate.right] {
++            let leaf = &leaves[endpoint.leaf];
++            let binding = SemanticIndexBinding::single(
++                leaf.relation,
++                leaf.layout,
++                endpoint.column,
++                predicate.equivalence,
++            );
++            if store.semantic_index(&binding).is_some()
++                || store
++                    .i64_index(I64IndexBinding {
++                        relation: leaf.relation,
++                        layout: leaf.layout,
++                        key_column: endpoint.column,
++                        equivalence: predicate.equivalence,
++                    })
++                    .is_some()
++            {
++                return Ok(None);
++            }
++        }
++    }
++
++    let adjacent_pairs = [(0_usize, 1_usize, 2_usize), (1, 2, 0)];
++    let mut adjacent_best = u128::MAX;
++    for (left, right, third) in adjacent_pairs {
++        if let Some(rows) =
++            estimated_leaf_pair_rows(store, &leaves, &predicates, left, right, context, registry)?
++        {
++            let work = (leaves[left].rows as u128)
++                .saturating_mul(leaves[right].rows as u128)
++                .saturating_add((rows as u128).saturating_mul(leaves[third].rows as u128));
++            adjacent_best = adjacent_best.min(work);
++        }
++    }
++    let Some(non_contiguous_rows) =
++        estimated_leaf_pair_rows(store, &leaves, &predicates, 0, 2, context, registry)?
++    else {
++        return Ok(None);
++    };
++    let planner = MultiwayPlannerContext {
++        store,
++        leaves: &leaves,
++        context,
++        registry,
++    };
++    let Some(final_rows) =
++        estimated_third_join_rows(&planner, &predicates, [0, 2], non_contiguous_rows, 1)?
++    else {
++        return Ok(None);
++    };
++    let non_contiguous_work = (leaves[0].rows as u128)
++        .saturating_mul(leaves[2].rows as u128)
++        .saturating_add((non_contiguous_rows as u128).saturating_mul(leaves[1].rows as u128))
++        .saturating_add(estimated_order_restoration_work(final_rows));
++    if adjacent_best == u128::MAX || non_contiguous_work >= adjacent_best {
++        return Ok(None);
++    }
++
++    let left = leaf_provenance_rows(store, &leaves, 0, stats)?;
++    let right = leaf_provenance_rows(store, &leaves, 2, stats)?;
++    let first = join_provenance_rows(&left, &right, &predicates, context, registry)?;
++    let third = leaf_provenance_rows(store, &leaves, 1, stats)?;
++    let final_rows = join_provenance_rows(&first, &third, &predicates, context, registry)?;
++    restore_provenance_join_order(final_rows).map(Some)
++}
++
+ fn try_execute_multiway_join(
+     plan: &Plan,
+     store: &PhysicalStore,
+@@ -6625,6 +6939,14 @@
+     if !matches!(plan, Plan::JoinEq { .. } | Plan::FilterEqColumns { .. }) {
+         return Ok(None);
+     }
++    if let Some(rows) =
++        try_execute_three_way_order_restored_join(plan, store, context, registry, stats)?
++    {
++        stats.multiway_join_reorders = stats.multiway_join_reorders.saturating_add(1);
++        stats.multiway_join_order_restorations =
++            stats.multiway_join_order_restorations.saturating_add(1);
++        return Ok(Some(rows));
++    }
+     let Some(optimized) = optimize_contiguous_multiway_join(plan, store, context, registry)? else {
+         return Ok(None);
+     };
+@@ -6632,7 +6954,7 @@
+     execute_multiway_join_candidate(&optimized, store, context, registry, stats).map(Some)
+ }
+ 
+-fn flatten_contiguous_join_tree(
++fn flatten_multiway_join_tree(
+     plan: &Plan,
+     store: &PhysicalStore,
+     leaves: &mut Vec<MultiwayJoinLeaf>,
+@@ -6669,12 +6991,11 @@
+             ..
+         } => {
+             let Some(mut left_columns) =
+-                flatten_contiguous_join_tree(left, store, leaves, predicates)?
++                flatten_multiway_join_tree(left, store, leaves, predicates)?
+             else {
+                 return Ok(None);
+             };
+-            let Some(right_columns) =
+-                flatten_contiguous_join_tree(right, store, leaves, predicates)?
++            let Some(right_columns) = flatten_multiway_join_tree(right, store, leaves, predicates)?
+             else {
+                 return Ok(None);
+             };
+@@ -6698,7 +7019,7 @@
+             right_column,
+             equivalence,
+         } => {
+-            let Some(columns) = flatten_contiguous_join_tree(input, store, leaves, predicates)?
++            let Some(columns) = flatten_multiway_join_tree(input, store, leaves, predicates)?
+             else {
+                 return Ok(None);
+             };
+@@ -6926,7 +7247,7 @@
+ ) -> Result<Option<Plan>, PhysicalExecutionError> {
+     let mut leaves = Vec::new();
+     let mut predicates = Vec::new();
+-    let Some(_) = flatten_contiguous_join_tree(plan, store, &mut leaves, &mut predicates)? else {
++    let Some(_) = flatten_multiway_join_tree(plan, store, &mut leaves, &mut predicates)? else {
+         return Ok(None);
+     };
+     if leaves.len() < 3 || leaves.len() > 32 {
+@@ -13587,6 +13908,124 @@
+     }
+ 
+     #[test]
++    fn order_restoration_uses_original_leaf_scan_ordinals_not_physical_join_order() {
++        let rows = vec![
++            ProvenanceJoinRow {
++                fragments: vec![
++                    Some(vec![Value::I64(2)]),
++                    Some(vec![Value::I64(20)]),
++                    Some(vec![Value::I64(200)]),
++                ],
++                scan_ordinals: vec![Some(1), Some(0), Some(0)],
++            },
++            ProvenanceJoinRow {
++                fragments: vec![
++                    Some(vec![Value::I64(1)]),
++                    Some(vec![Value::I64(11)]),
++                    Some(vec![Value::I64(101)]),
++                ],
++                scan_ordinals: vec![Some(0), Some(1), Some(0)],
++            },
++            ProvenanceJoinRow {
++                fragments: vec![
++                    Some(vec![Value::I64(1)]),
++                    Some(vec![Value::I64(10)]),
++                    Some(vec![Value::I64(100)]),
++                ],
++                scan_ordinals: vec![Some(0), Some(0), Some(0)],
++            },
++        ];
++        let restored = restore_provenance_join_order(rows).unwrap();
++        assert_eq!(
++            restored,
++            vec![
++                vec![Value::I64(1), Value::I64(10), Value::I64(100)],
++                vec![Value::I64(1), Value::I64(11), Value::I64(101)],
++                vec![Value::I64(2), Value::I64(20), Value::I64(200)],
++            ]
++        );
++    }
++
++    #[test]
++    fn non_contiguous_three_way_join_permutation_restores_reference_bag_order() {
++        let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();
++        let bindings = [
++            LayoutBinding {
++                id: LayoutId(1_061),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1_062),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1_063),
++                family: LayoutFamily::Columnar,
++            },
++        ];
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, binding) in [a, b, c].into_iter().zip(bindings) {
++            catalog.bind_relation(relation, binding);
++        }
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(a)),
++                right: Box::new(RelExpr::Scan(b)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            right: Box::new(RelExpr::Scan(c)),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let values = [
++            (1_i64..=20).collect::<Vec<_>>(),
++            vec![1_i64; 100],
++            (1_i64..=20).collect::<Vec<_>>(),
++        ];
++        let mut store = PhysicalStore::default();
++        let mut model = kernel_model::FiniteModel::default();
++        for ((relation, layout), relation_values) in [a, b, c].into_iter().zip(bindings).zip(values)
++        {
++            store
++                .install(
++                    relation,
++                    layout,
++                    NativeRelation::typed_columnar(vec![NativeColumn::I64(
++                        relation_values.clone(),
++                    )])
++                    .unwrap(),
++                )
++                .unwrap();
++            store
++                .install_semantic_statistics(
++                    SemanticIndexBinding::single(relation, layout, 0, equivalence),
++                    &context,
++                    &registry,
++                )
++                .unwrap();
++            model.relations.insert(
++                relation,
++                relation_values
++                    .into_iter()
++                    .map(|value| vec![Value::I64(value)])
++                    .collect(),
++            );
++        }
++
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(stats.multiway_join_order_restorations, 1);
++        assert_eq!(stats.multiway_join_reorders, 1);
++        assert_eq!(stats.scanned_rows, 140);
++    }
++
++    #[test]
+     fn multiway_join_planner_reassociates_contiguous_tree_and_reuses_indexes_after_intermediate() {
+         let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();
+         let bindings = [
+@@ -13675,6 +14114,7 @@
+         let reference = logical.evaluate(&model, &context, &registry).unwrap();
+         assert_eq!(native, reference);
+         assert_eq!(stats.multiway_join_reorders, 1);
++        assert_eq!(stats.multiway_join_order_restorations, 0);
+         assert_eq!(stats.persisted_index_hits, 2);
+         assert_eq!(native.rows().len(), 2);
+     }
+@@ -14365,6 +14805,7 @@
+         let reference = logical.evaluate(&model, &context, &registry).unwrap();
+         assert_eq!(native, reference);
+         assert_eq!(stats.multiway_join_reorders, 1);
++        assert_eq!(stats.multiway_join_order_restorations, 0);
+         assert_eq!(stats.ephemeral_index_builds, 2);
+         assert_eq!(stats.persisted_index_hits, 0);
+     }

@@ -1,0 +1,14 @@
+[package]
+name = "pass103-stage6-alloc-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+kernel-model = { path = "../../crates/kernel-model" }
+kernel-query = { path = "../../crates/kernel-query" }
+kernel-schema = { path = "../../crates/kernel-schema" }
+kernel-semantics = { path = "../../crates/kernel-semantics" }
+kernel-types = { path = "../../crates/kernel-types" }
+
+[workspace]

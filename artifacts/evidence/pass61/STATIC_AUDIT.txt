@@ -1,0 +1,9 @@
+declared_tests=388
+kernel_plan_tests=138
+crates=21
+rust_loc=53085
+allow_attrs=19
+unsafe_hits=0
+todo_fixme=0
+generic_scan=0
+external_registry_git_sources=0

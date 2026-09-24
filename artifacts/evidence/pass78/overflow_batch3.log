@@ -1,0 +1,150 @@
+   Compiling kernel-validation v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-validation)
+   Compiling kernel-semantics v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-semantics)
+   Compiling kernel-revision v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-revision)
+   Compiling kernel-semantic-index v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-semantic-index)
+   Compiling kernel-transport v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-transport)
+   Compiling kernel-types v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-types)
+   Compiling storage-memory v0.1.0 (/mnt/data/cfmd_pass78_work/crates/storage-memory)
+    Finished `release` profile [optimized] target(s) in 10.44s
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_semantic_index-4d0212b4f4e4cdd9)
+
+running 7 tests
+test tests::binding_rejects_revision_digest_and_encoding_mismatch ... ok
+test tests::bucket_preserves_identity_insertion_order_and_same_key_reinsert_is_stable ... ok
+test tests::binding_rejects_same_nominal_revision_with_changed_structural_definition ... ok
+test tests::compatibility_reports_exact_rebuild_reason ... ok
+test tests::duplicate_bucket_membership_and_reverse_map_are_exact ... ok
+test tests::rebinding_identity_removes_dead_bucket ... ok
+test tests::retained_size_estimate_accounts_for_bucket_and_reverse_payloads ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_semantics-bd63c7856eeb4c2d)
+
+running 51 tests
+test anchor_pullback::tests::apnf_is_bound_to_one_observable_catalog_realization ... ok
+test anchor_pullback::tests::apnf_keeps_redundant_direct_morphism_and_can_prove_branch_free_anchor ... ok
+test anchor_pullback::tests::determinant_closure_handles_true_hypercycle_without_unary_scc_assumption ... ok
+test anchor_pullback::tests::finite_factor_derives_ordered_hyper_determinant_morphism_without_unary_special_case ... ok
+test anchor_pullback::tests::finite_factor_rejects_non_functional_projection_and_preserves_duplicate_weight ... ok
+test anchor_pullback::tests::value_saturation_is_confluent_and_rejects_conflicting_exact_images ... ok
+test anchor_pullback::tests::weighted_anchor_factorization_is_lossless_and_inclusion_minimal ... ok
+test observable::tests::independent_catalogs_cannot_alias_revision_local_observable_or_class_ids ... ok
+test observable::tests::materialized_morphisms_compose_without_changing_semantic_revision ... ok
+test observable::tests::morphism_ir_is_nary_to_mary_and_rejects_non_functions ... ok
+test observable::tests::product_observable_is_revision_local_exact_meet_coordinate ... ok
+test observable::tests::observable_registration_is_pinned_to_one_semantic_revision ... ok
+test tests::bound_primitive_predicate_preserves_resolved_equivalence_contract ... ok
+test tests::builtin_equivalence_modules_satisfy_equivalence_laws_on_hostile_samples ... ok
+test tests::builtin_module_spec_roundtrips_exact_implementation_revision ... ok
+test tests::canonical_entity_equality_keys_match_builtin_contracts ... ok
+test tests::canonical_eq_key_codec_roundtrips_recursive_structures_and_rejects_version_drift ... ok
+test tests::canonical_eq_key_codec_rejects_noncanonical_and_hostile_lengths ... ok
+test tests::canonical_eq_key_v2_has_golden_bytes_independent_of_rust_layout ... ok
+test anchor_pullback::tests::closure_worklist_scales_with_incidence_not_rule_scan_rounds ... ok
+test tests::canonical_order_keys_match_every_builtin_ordering_contract ... ok
+test tests::canonical_equality_keys_match_every_builtin_primitive_contract ... ok
+test tests::coarse_unordered_structural_keys_use_canonical_finite_measures ... ok
+test tests::equality_is_resolved_through_pinned_digest_not_host_ord ... ok
+test tests::f64_key_equality_is_total_bitwise_not_ieee_partial_equality ... ok
+test tests::f64_total_order_is_defined_for_signed_zero_and_nan ... ok
+test tests::implementation_revision_changes_digest_without_changing_semantic_contract ... ok
+test tests::nominal_entity_equivalence_rejects_wrong_runtime_type ... ok
+test tests::guarded_recursive_equivalence_has_canonical_mu_domain_and_terminates_on_values ... ok
+test tests::ordering_congruence_is_explicit_and_not_inferred_from_matching_scalar_type ... ok
+test tests::ordering_compatibility_requires_a_checked_law_certificate ... ok
+test tests::ordering_implementation_upgrade_preserves_contract_but_contract_change_does_not ... ok
+test tests::ordering_is_versioned_semantics_not_host_iteration_order ... ok
+test tests::recursive_equivalence_rejects_unguarded_and_free_variables ... ok
+test tests::recursive_equivalence_refinement_is_checked_coinductively_through_mu_binders ... ok
+test tests::registry_validates_every_pinned_environment_module_not_only_schema_dependencies ... ok
+test tests::semantic_implementation_install_requires_contract_bound_checked_certificate ... ok
+test tests::semantic_work_estimate_distinguishes_payload_and_nested_structure ... ok
+test tests::structural_canonical_dependency_closure_tracks_only_primitive_leaf_digests ... ok
+test tests::structural_collection_equivalences_are_compositional ... ok
+test tests::set_rejects_semantic_duplicates_even_when_rust_values_differ ... ok
+test tests::structural_equivalence_cycle_is_rejected_before_data_exists ... ok
+test tests::structural_equivalence_refinement_is_compositional_and_directional ... ok
+test tests::structural_collection_keys_match_equivalence_oracle ... ok
+test tests::structural_option_and_sum_equivalence_are_compositional ... ok
+test tests::structural_product_equivalence_is_schema_derived_and_compositional ... ok
+test tests::tokenizer_digest_cannot_masquerade_as_equality_module ... ok
+test tests::structural_product_option_and_sum_keys_match_equivalence_oracle ... ok
+test tests::tokenizer_implementation_revision_preserves_contract_but_contract_change_does_not ... ok
+test tests::tokenizer_is_versioned_semantics_not_ambient_library_behavior ... ok
+test tests::f64_total_canonical_key_matches_total_cmp_on_many_bit_patterns ... ok
+
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_transport-1c59b04e18af6736)
+
+running 21 tests
+test tests::adding_query_visible_module_is_conservative_but_removing_it_is_not ... ok
+test tests::environment_transport_compares_query_visible_modules_even_when_schema_does_not_use_them ... ok
+test tests::changed_law_is_not_misclassified_as_implementation_upgrade ... ok
+test tests::field_transport_cannot_silently_reinterpret_semantic_environment ... ok
+test tests::bijective_identity_transport_rewrites_lifecycle_carriers_and_nested_references_coherently ... ok
+test tests::historical_ids_must_be_covered_by_identity_retention_domain ... ok
+test tests::genuine_semantic_law_migration_has_no_generic_relational_impact_invariance ... ok
+test tests::impact_commutes_with_bijective_identity_transport ... ok
+test tests::implementation_upgrade_with_same_contract_is_identity_transport ... ok
+test tests::law_migration_revalidates_target_instead_of_silently_collapsing_set_rows ... ok
+test tests::relational_impact_commutes_with_bijective_identity_transport ... ok
+test tests::rename_and_revision_bump_transport_without_data_migration ... ok
+test tests::retention_domain_mapping_does_not_resurrect_non_live_ids ... ok
+test tests::relational_impact_is_preserved_by_identity_like_semantic_context_transports ... ok
+test tests::semantic_environment_transport_is_generic_across_ordering_modules ... ok
+test tests::semantic_environment_transport_is_generic_across_tokenizer_modules ... ok
+test tests::semantic_type_change_is_not_definitional_transport ... ok
+test tests::typed_field_transport_reuses_exact_query_ir_and_rebuilds_trusted_revision ... ok
+test tests::typed_relation_transport_checks_full_set_bag_semantics ... ok
+test tests::typed_transport_rejects_transform_whose_output_type_disagrees_with_target ... ok
+test tests::typed_relation_transport_reuses_relational_query_ir ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_types-0e5d97c15e95c140)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/kernel_validation-9b563e8ec1f7551d)
+
+running 11 tests
+test tests::benchmark_dense_type_extent_membership_against_carrier_scan ... ignored, diagnostic release benchmark
+test tests::empty_set_relation_still_rejects_wrong_column_equivalence_domain ... ok
+test tests::dense_type_extents_match_subtype_membership_and_overlap ... ok
+test tests::product_shape_is_keyed_by_semantic_field_id ... ok
+test tests::equality_domain_is_checked_even_for_singleton_collection ... ok
+test tests::set_relation_rejects_semantically_duplicate_rows ... ok
+test tests::unit_is_a_real_schema_type_not_an_untyped_runtime_sentinel ... ok
+test tests::structural_product_equivalence_validates_composite_set_keys ... ok
+test tests::validation_accepts_subtype_owner_through_dense_extent ... ok
+test tests::wrong_field_type_is_rejected ... ok
+test tests::well_typed_model_validates ... ok
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/mnt/data/cfmd_pass78_target/release/deps/storage_memory-b5b9c42787deeb44)
+
+running 16 tests
+test tests::commit_rejects_pinned_but_uninstalled_semantic_module_even_when_empty ... ok
+test tests::commit_normalizes_lifecycle_and_pins_semantics ... ok
+test tests::conservative_environment_extension_is_transparent_only_toward_extended_context ... ok
+test tests::bijective_identity_edge_becomes_mergeable_after_intent_conjugation ... ok
+test tests::definitional_transport_is_an_identity_data_rewrite_inside_lca_merge ... ok
+test tests::criss_cross_history_exposes_ambiguous_merge_base_instead_of_guessing ... ok
+test tests::diamond_has_unique_merge_base ... ok
+test tests::equivalent_semantic_implementation_transport_is_transparent_to_lifecycle_merge ... ok
+test tests::genuine_semantic_law_migration_is_not_transparent_to_lifecycle_history ... ok
+test tests::identical_revision_numbers_cannot_alias_different_schema_contents ... ok
+test tests::lifecycle_merge_uses_semantic_intents_from_lca_not_pruned_snapshots ... ok
+test tests::lifecycle_rewrite_cannot_silently_cross_semantic_revision ... ok
+test tests::identity_retention_domain_preserves_gc_pruned_atom_for_cross_branch_rescue ... ok
+test tests::snapshot_commit_also_requires_explicit_semantic_transport ... ok
+test tests::same_semantic_context_requires_explicit_identity_coordinate_choice ... ok
+test tests::typed_field_transport_commits_as_first_class_revision_edge ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

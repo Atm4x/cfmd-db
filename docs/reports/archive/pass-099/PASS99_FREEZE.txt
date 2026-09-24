@@ -1,0 +1,4 @@
+PASS99 source frozen before nominal 20-minute boundary.
+Baseline: cfmd_workspace_pass98_topk_scalar_orderedboundary.zip
+Production source fingerprint: 9e7645c1001bf32e04ad03717ac556923aa145396249127270ed9f699889434a
+No Stage 4.4 source integration is claimed in this checkpoint.

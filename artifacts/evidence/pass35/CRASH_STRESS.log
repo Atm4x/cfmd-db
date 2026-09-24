@@ -1,0 +1,642 @@
+PASS35 subprocess crash matrix repeated stress
+2026-09-19T23:43:19Z
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 1 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 2 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 3 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 4 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 5 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 6 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 7 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 8 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 9 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 10 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 11 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 12 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 13 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 14 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 15 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 16 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 17 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 18 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 19 PASS
+
+running 4 tests
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+.
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.04s
+
+durability crash iteration 20 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 1 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 2 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 3 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 4 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 5 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 6 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 7 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 8 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 9 PASS
+
+running 1 test
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+plan commit-before-publish iteration 10 PASS

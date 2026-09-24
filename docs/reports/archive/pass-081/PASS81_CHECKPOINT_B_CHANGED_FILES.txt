@@ -1,0 +1,10 @@
+crates/kernel-durability/src/checkpoint.rs
+crates/kernel-durability/src/metadata.rs
+crates/kernel-plan/src/lib.rs
+crates/kernel-query/src/lib.rs
+crates/kernel-schema/src/lib.rs
+crates/kernel-semantics/src/lib.rs
+crates/kernel-transport/src/lib.rs
+PASS81_INTEGRATION_LEDGER.md
+PASS81_CHECKPOINT_B_READ_GAPS.md
+PASS81_CHECKPOINT_B_CHANGED_FILES.txt

@@ -1,0 +1,21 @@
+[package]
+name = "kernel-durability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
+kernel-auth = { path = "../kernel-auth" }
+kernel-change = { path = "../kernel-change" }
+kernel-model = { path = "../kernel-model" }
+kernel-lens = { path = "../kernel-lens" }
+kernel-query = { path = "../kernel-query" }
+kernel-revision = { path = "../kernel-revision" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true
+

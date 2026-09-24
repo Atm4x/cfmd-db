@@ -1,0 +1,8 @@
+$ cargo run --release -p kernel-query --example maintained_group_bench
+   Compiling kernel-query v0.1.0 (/mnt/data/cfmd_workspace_pass43/crates/kernel-query)
+    Finished `release` profile [optimized] target(s) in 0.64s
+     Running `target/release/examples/maintained_group_bench`
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=275
+baseline_median_ns=137
+ratio_milli=2007

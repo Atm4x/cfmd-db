@@ -1,0 +1,5 @@
+relations=40 rows_per_relation=5000
+state_clone_median_ns=30
+clone_plus_one_relation_replace_median_ns=190
+clone_runs=[150, 30, 30, 30, 40, 30, 30]
+mutate_runs=[3686, 230, 190, 190, 190, 200, 181]

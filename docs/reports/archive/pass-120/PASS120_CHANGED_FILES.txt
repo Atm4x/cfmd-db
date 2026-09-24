@@ -1,0 +1,18 @@
+MODIFIED production:
+crates/kernel-durability/src/lib.rs
+crates/kernel-durability/src/store.rs
+
+ADDED production/tooling:
+crates/kernel-durability/src/platform_assurance.rs
+crates/kernel-durability/src/bin/cfmd-durability-campaign.rs
+
+ADDED evidence/reports:
+PASS120_PLATFORM_CURRENT_ENV_EVIDENCE.txt
+PASS120_FULL_WORKSPACE_TEST.log
+PASS120_HIST13_PLATFORM_ASSURANCE.md
+PASS120_REPORT.md
+IMPLEMENTATION_REPORT_pass120.md
+HISTORICAL_PROBLEMS_LEDGER_PASS120.md
+PASS120_CHANGED_FILES.txt
+PASS120_SOURCE_DIFF.txt
+PASS120_SOURCE_SHA256.txt

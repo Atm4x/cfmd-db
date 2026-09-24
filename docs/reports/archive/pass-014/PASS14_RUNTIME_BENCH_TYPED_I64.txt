@@ -1,0 +1,12 @@
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=273035
+native_ns_per_iter_median=284503
+native_ns_per_iter_max=436349
+baseline_ns_per_iter_min=244202
+baseline_ns_per_iter_median=270930
+baseline_ns_per_iter_max=302533
+native_over_baseline_milli=1050

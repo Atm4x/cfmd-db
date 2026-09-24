@@ -1,0 +1,1360 @@
+--- /mnt/data/pass66_work/crates/kernel-plan/src/lib.rs	2026-09-20 23:47:39.356908651 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-21 00:10:19.104170595 +0000
+@@ -971,15 +971,17 @@
+ 
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+ pub struct PhysicalStore {
+-    relations: BTreeMap<(SemanticId, LayoutId), Arc<InstalledRelation>>,
+-    i64_indexes: BTreeMap<I64IndexBinding, Arc<MaterializedI64IndexState>>,
+-    semantic_indexes: BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>>,
++    relations: Arc<BTreeMap<(SemanticId, LayoutId), Arc<InstalledRelation>>>,
++    i64_indexes: Arc<BTreeMap<I64IndexBinding, Arc<MaterializedI64IndexState>>>,
++    semantic_indexes: Arc<BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>>>,
+     semantic_quotient_factors:
+-        BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticQuotientFactorState>>,
+-    semantic_quotient_supports:
++        Arc<BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticQuotientFactorState>>>,
++    semantic_quotient_supports: Arc<
+         BTreeMap<SemanticQuotientSupportBinding, Arc<MaterializedSemanticQuotientSupportState>>,
+-    semantic_statistics: BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticStatisticsState>>,
+-    advisor_managed_artifacts: BTreeSet<ManagedPhysicalArtifact>,
++    >,
++    semantic_statistics:
++        Arc<BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticStatisticsState>>>,
++    advisor_managed_artifacts: Arc<BTreeSet<ManagedPhysicalArtifact>>,
+     semantic_quotient_support_local_delta_updates: u64,
+     transition_epoch: u64,
+     revision: Option<RevisionId>,
+@@ -2330,6 +2332,51 @@
+         *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
+         Ok(report)
+     }
++
++    pub fn advise_semantic_statistics(
++        &self,
++        workload: &[SemanticIndexWorkloadSample],
++        policy: PhysicalArtifactAdvisorPolicy,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<SemanticStatisticsAdvisorReport, PhysicalExecutionError> {
++        let mut state = self
++            .root
++            .write()
++            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
++        let RuntimeRevisionCellState::Serving(live) = &*state else {
++            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
++        };
++        let mut physical = live.physical.clone();
++        let source_epoch = physical.transition_epoch();
++        let report = physical.advise_semantic_statistics(
++            workload,
++            policy,
++            live.revision.semantic_context(),
++            registry,
++        )?;
++        if physical.transition_epoch() == source_epoch {
++            return Ok(report);
++        }
++        let next_version = live
++            .root_identity
++            .version
++            .0
++            .checked_add(1)
++            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
++        let candidate = RuntimeRevisionBundle {
++            root_identity: RuntimeRootIdentity {
++                root_id: live.root_identity.root_id,
++                version: RuntimeRootVersion(next_version),
++            },
++            revision: live.revision.clone(),
++            physical,
++            relation_layouts: live.relation_layouts.clone(),
++            materialization_specs: live.materialization_specs.clone(),
++            materializations: live.materializations.clone(),
++        };
++        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
++        Ok(report)
++    }
+ }
+ 
+ impl DurableRuntime {
+@@ -2617,6 +2664,15 @@
+         self.cell
+             .advise_i64_indexes(workload, policy, &self.registry)
+     }
++
++    pub fn advise_semantic_statistics(
++        &self,
++        workload: &[SemanticIndexWorkloadSample],
++        policy: PhysicalArtifactAdvisorPolicy,
++    ) -> Result<SemanticStatisticsAdvisorReport, PhysicalExecutionError> {
++        self.cell
++            .advise_semantic_statistics(workload, policy, &self.registry)
++    }
+ }
+ 
+ impl DurableRuntimeSupervisor {
+@@ -3126,6 +3182,45 @@
+ }
+ 
+ impl PhysicalStore {
++    fn relations_mut(&mut self) -> &mut BTreeMap<(SemanticId, LayoutId), Arc<InstalledRelation>> {
++        Arc::make_mut(&mut self.relations)
++    }
++
++    fn i64_indexes_mut(
++        &mut self,
++    ) -> &mut BTreeMap<I64IndexBinding, Arc<MaterializedI64IndexState>> {
++        Arc::make_mut(&mut self.i64_indexes)
++    }
++
++    fn semantic_indexes_mut(
++        &mut self,
++    ) -> &mut BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>> {
++        Arc::make_mut(&mut self.semantic_indexes)
++    }
++
++    fn semantic_quotient_factors_mut(
++        &mut self,
++    ) -> &mut BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticQuotientFactorState>> {
++        Arc::make_mut(&mut self.semantic_quotient_factors)
++    }
++
++    fn semantic_quotient_supports_mut(
++        &mut self,
++    ) -> &mut BTreeMap<SemanticQuotientSupportBinding, Arc<MaterializedSemanticQuotientSupportState>>
++    {
++        Arc::make_mut(&mut self.semantic_quotient_supports)
++    }
++
++    fn semantic_statistics_mut(
++        &mut self,
++    ) -> &mut BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticStatisticsState>> {
++        Arc::make_mut(&mut self.semantic_statistics)
++    }
++
++    fn advisor_managed_artifacts_mut(&mut self) -> &mut BTreeSet<ManagedPhysicalArtifact> {
++        Arc::make_mut(&mut self.advisor_managed_artifacts)
++    }
++
+     pub fn install(
+         &mut self,
+         relation: SemanticId,
+@@ -3152,21 +3247,21 @@
+             .transition_epoch
+             .checked_add(1)
+             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
+-        self.relations.insert(
++        self.relations_mut().insert(
+             (relation, binding.id),
+             Arc::new(InstalledRelation::new(data)),
+         );
+-        self.i64_indexes
++        self.i64_indexes_mut()
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+-        self.semantic_indexes
++        self.semantic_indexes_mut()
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+-        self.semantic_quotient_factors
++        self.semantic_quotient_factors_mut()
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+-        self.semantic_quotient_supports
++        self.semantic_quotient_supports_mut()
+             .retain(|_, state| !state.supports_relation(relation, binding));
+-        self.semantic_statistics
++        self.semantic_statistics_mut()
+             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
+-        self.advisor_managed_artifacts
++        self.advisor_managed_artifacts_mut()
+             .retain(|artifact| !artifact.touches_relation_layout(relation, binding));
+         self.transition_epoch = next_epoch;
+         self.state_identity = Arc::new(());
+@@ -3185,9 +3280,9 @@
+             .transition_epoch
+             .checked_add(1)
+             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
+-        self.advisor_managed_artifacts
++        self.advisor_managed_artifacts_mut()
+             .remove(&ManagedPhysicalArtifact::I64Index(index));
+-        self.i64_indexes.insert(index, Arc::new(state));
++        self.i64_indexes_mut().insert(index, Arc::new(state));
+         self.transition_epoch = next_epoch;
+         self.state_identity = Arc::new(());
+         Ok(())
+@@ -3227,14 +3322,14 @@
+             None
+         };
+         for binding in evicted {
+-            self.i64_indexes.remove(&binding);
+-            self.advisor_managed_artifacts
++            self.i64_indexes_mut().remove(&binding);
++            self.advisor_managed_artifacts_mut()
+                 .remove(&ManagedPhysicalArtifact::I64Index(binding));
+             report.evicted.push(binding);
+         }
+         for (binding, state) in prepared_states {
+-            self.i64_indexes.insert(binding, Arc::new(state));
+-            self.advisor_managed_artifacts
++            self.i64_indexes_mut().insert(binding, Arc::new(state));
++            self.advisor_managed_artifacts_mut()
+                 .insert(ManagedPhysicalArtifact::I64Index(binding));
+             report.created.push(binding);
+         }
+@@ -3277,12 +3372,91 @@
+             .transition_epoch
+             .checked_add(1)
+             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
+-        self.semantic_statistics.insert(binding, Arc::new(state));
++        self.advisor_managed_artifacts_mut()
++            .remove(&ManagedPhysicalArtifact::SemanticStatistics(
++                binding.clone(),
++            ));
++        self.semantic_statistics_mut()
++            .insert(binding, Arc::new(state));
+         self.transition_epoch = next_epoch;
+         self.state_identity = Arc::new(());
+         Ok(snapshot)
+     }
+ 
++    pub fn advise_semantic_statistics(
++        &mut self,
++        workload: &[SemanticIndexWorkloadSample],
++        policy: PhysicalArtifactAdvisorPolicy,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<SemanticStatisticsAdvisorReport, PhysicalExecutionError> {
++        let SemanticStatisticsAdvisorSelection {
++            selected,
++            prepared_states,
++            managed_estimated_bytes,
++            mut report,
++        } = semantic_statistics_advisor_selection(self, workload, policy, context, registry)?;
++        let evicted = self
++            .advisor_managed_artifacts
++            .iter()
++            .filter_map(|artifact| match artifact {
++                ManagedPhysicalArtifact::SemanticStatistics(binding)
++                    if !selected.contains(binding) =>
++                {
++                    Some(binding.clone())
++                }
++                _ => None,
++            })
++            .collect::<Vec<_>>();
++        let changed = !evicted.is_empty() || !prepared_states.is_empty();
++        let next_epoch = if changed {
++            Some(
++                self.transition_epoch
++                    .checked_add(1)
++                    .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?,
++            )
++        } else {
++            None
++        };
++        for binding in &evicted {
++            self.semantic_statistics_mut().remove(binding);
++            self.advisor_managed_artifacts_mut().remove(
++                &ManagedPhysicalArtifact::SemanticStatistics(binding.clone()),
++            );
++            report.evicted.push(binding.clone());
++        }
++        for (binding, state) in prepared_states {
++            let existed = self.semantic_statistics.contains_key(&binding);
++            self.semantic_statistics_mut()
++                .insert(binding.clone(), Arc::new(state));
++            self.advisor_managed_artifacts_mut()
++                .insert(ManagedPhysicalArtifact::SemanticStatistics(binding.clone()));
++            if existed {
++                report.rebuilt.push(binding);
++            } else {
++                report.created.push(binding);
++            }
++        }
++        for binding in selected {
++            if report.created.contains(&binding) || report.rebuilt.contains(&binding) {
++                continue;
++            }
++            if self.advisor_managed_artifacts.contains(
++                &ManagedPhysicalArtifact::SemanticStatistics(binding.clone()),
++            ) {
++                report.retained.push(binding);
++            } else {
++                report.reused_existing.push(binding);
++            }
++        }
++        if let Some(next_epoch) = next_epoch {
++            self.transition_epoch = next_epoch;
++            self.state_identity = Arc::new(());
++        }
++        report.managed_estimated_bytes = managed_estimated_bytes;
++        Ok(report)
++    }
++
+     pub fn semantic_statistics(
+         &self,
+         binding: &SemanticIndexBinding,
+@@ -3337,7 +3511,7 @@
+                 }
+             }
+         }
+-        for (binding, state) in &self.i64_indexes {
++        for (binding, state) in self.i64_indexes.iter() {
+             add(
+                 PhysicalArtifactFamily::I64Index,
+                 i64_index_estimated_retained_bytes(state),
+@@ -3345,7 +3519,7 @@
+                     .contains(&ManagedPhysicalArtifact::I64Index(*binding)),
+             );
+         }
+-        for (binding, state) in &self.semantic_indexes {
++        for (binding, state) in self.semantic_indexes.iter() {
+             add(
+                 PhysicalArtifactFamily::SemanticIndex,
+                 semantic_index_estimated_retained_bytes(state),
+@@ -3353,7 +3527,7 @@
+                     .contains(&ManagedPhysicalArtifact::SemanticIndex(binding.clone())),
+             );
+         }
+-        for (binding, state) in &self.semantic_quotient_factors {
++        for (binding, state) in self.semantic_quotient_factors.iter() {
+             add(
+                 PhysicalArtifactFamily::SemanticQuotientFactor,
+                 quotient_factor_estimated_retained_bytes(state),
+@@ -3362,7 +3536,7 @@
+                 ),
+             );
+         }
+-        for (binding, state) in &self.semantic_quotient_supports {
++        for (binding, state) in self.semantic_quotient_supports.iter() {
+             add(
+                 PhysicalArtifactFamily::SemanticQuotientSupport,
+                 quotient_support_estimated_retained_bytes(state),
+@@ -3371,7 +3545,7 @@
+                 ),
+             );
+         }
+-        for (binding, state) in &self.semantic_statistics {
++        for (binding, state) in self.semantic_statistics.iter() {
+             add(
+                 PhysicalArtifactFamily::SemanticStatistics,
+                 semantic_statistics_estimated_retained_bytes(state),
+@@ -3396,9 +3570,9 @@
+             .transition_epoch
+             .checked_add(1)
+             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
+-        self.advisor_managed_artifacts
++        self.advisor_managed_artifacts_mut()
+             .remove(&ManagedPhysicalArtifact::SemanticIndex(index.clone()));
+-        self.semantic_indexes.insert(index, Arc::new(state));
++        self.semantic_indexes_mut().insert(index, Arc::new(state));
+         self.transition_epoch = next_epoch;
+         self.state_identity = Arc::new(());
+         Ok(())
+@@ -3437,16 +3611,16 @@
+         };
+ 
+         for binding in &evicted {
+-            self.semantic_indexes.remove(binding);
+-            self.advisor_managed_artifacts
++            self.semantic_indexes_mut().remove(binding);
++            self.advisor_managed_artifacts_mut()
+                 .remove(&ManagedPhysicalArtifact::SemanticIndex(binding.clone()));
+             report.evicted.push(binding.clone());
+         }
+         for (binding, state) in prepared_states {
+             let existed = self.semantic_indexes.contains_key(&binding);
+-            self.semantic_indexes
++            self.semantic_indexes_mut()
+                 .insert(binding.clone(), Arc::new(state));
+-            self.advisor_managed_artifacts
++            self.advisor_managed_artifacts_mut()
+                 .insert(ManagedPhysicalArtifact::SemanticIndex(binding.clone()));
+             if existed {
+                 report.rebuilt.push(binding);
+@@ -3519,20 +3693,19 @@
+         };
+ 
+         for binding in &evicted {
+-            self.semantic_quotient_factors.remove(binding);
+-            self.advisor_managed_artifacts.remove(
++            self.semantic_quotient_factors_mut().remove(binding);
++            self.advisor_managed_artifacts_mut().remove(
+                 &ManagedPhysicalArtifact::SemanticQuotientFactor(binding.clone()),
+             );
+             report.evicted.push(binding.clone());
+         }
+         for (binding, state) in prepared_states {
+             let existed = self.semantic_quotient_factors.contains_key(&binding);
+-            self.semantic_quotient_factors
++            self.semantic_quotient_factors_mut()
+                 .insert(binding.clone(), Arc::new(state));
+-            self.advisor_managed_artifacts
+-                .insert(ManagedPhysicalArtifact::SemanticQuotientFactor(
+-                    binding.clone(),
+-                ));
++            self.advisor_managed_artifacts_mut().insert(
++                ManagedPhysicalArtifact::SemanticQuotientFactor(binding.clone()),
++            );
+             if existed {
+                 report.rebuilt.push(binding);
+             } else {
+@@ -3603,7 +3776,7 @@
+             context,
+             registry,
+         )?;
+-        for (binding, state) in &self.semantic_quotient_factors {
++        for (binding, state) in self.semantic_quotient_factors.iter() {
+             if binding.relation == relation
+                 && binding.layout.id == layout.id
+                 && !state.compatible_with(context, registry)?
+@@ -3611,7 +3784,7 @@
+                 return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+             }
+         }
+-        for (binding, state) in &self.semantic_statistics {
++        for (binding, state) in self.semantic_statistics.iter() {
+             if binding.relation == relation
+                 && binding.layout.id == layout.id
+                 && !state.compatible_with(context, registry)?
+@@ -3630,18 +3803,18 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+-        for (binding, state) in &self.i64_indexes {
++        for (binding, state) in self.i64_indexes.iter() {
+             if binding.relation == relation && binding.layout.id == layout.id {
+                 state.validate_physical_delta(delta)?;
+             }
+         }
+         validate_semantic_index_family_delta(&self.semantic_indexes, relation, layout, delta)?;
+-        for (binding, state) in &self.semantic_quotient_factors {
++        for (binding, state) in self.semantic_quotient_factors.iter() {
+             if binding.relation == relation && binding.layout.id == layout.id {
+                 state.validate_physical_delta(delta, context, registry)?;
+             }
+         }
+-        for (binding, state) in &self.semantic_statistics {
++        for (binding, state) in self.semantic_statistics.iter() {
+             if binding.relation == relation && binding.layout.id == layout.id {
+                 state.validate_physical_delta(delta)?;
+             }
+@@ -3657,20 +3830,49 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+-        for (binding, state) in &mut self.i64_indexes {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                Arc::make_mut(state).apply_physical_delta(delta)?;
++        if self
++            .i64_indexes
++            .keys()
++            .any(|binding| binding.relation == relation && binding.layout.id == layout.id)
++        {
++            for (binding, state) in self.i64_indexes_mut().iter_mut() {
++                if binding.relation == relation && binding.layout.id == layout.id {
++                    Arc::make_mut(state).apply_physical_delta(delta)?;
++                }
+             }
+         }
+-        apply_semantic_index_family_delta(&mut self.semantic_indexes, relation, layout, delta)?;
+-        for (binding, state) in &mut self.semantic_quotient_factors {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
++        if self
++            .semantic_indexes
++            .keys()
++            .any(|binding| binding.relation == relation && binding.layout.id == layout.id)
++        {
++            apply_semantic_index_family_delta(
++                self.semantic_indexes_mut(),
++                relation,
++                layout,
++                delta,
++            )?;
++        }
++        if self
++            .semantic_quotient_factors
++            .keys()
++            .any(|binding| binding.relation == relation && binding.layout.id == layout.id)
++        {
++            for (binding, state) in self.semantic_quotient_factors_mut().iter_mut() {
++                if binding.relation == relation && binding.layout.id == layout.id {
++                    Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
++                }
+             }
+         }
+-        for (binding, state) in &mut self.semantic_statistics {
+-            if binding.relation == relation && binding.layout.id == layout.id {
+-                Arc::make_mut(state).apply_physical_delta(delta)?;
++        if self
++            .semantic_statistics
++            .keys()
++            .any(|binding| binding.relation == relation && binding.layout.id == layout.id)
++        {
++            for (binding, state) in self.semantic_statistics_mut().iter_mut() {
++                if binding.relation == relation && binding.layout.id == layout.id {
++                    Arc::make_mut(state).apply_physical_delta(delta)?;
++                }
+             }
+         }
+         Ok(())
+@@ -3839,7 +4041,7 @@
+             .checked_add(1)
+             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
+ 
+-        let installed = self.relations.get_mut(&key).ok_or(
++        let installed = self.relations_mut().get_mut(&key).ok_or(
+             PhysicalExecutionError::MissingPhysicalRelation {
+                 relation,
+                 layout: layout.id,
+@@ -4006,12 +4208,12 @@
+             };
+             let locally_maintained = if has_insertions {
+                 component_refresh_patches.is_some_and(|patches| {
+-                    self.semantic_quotient_supports
++                    self.semantic_quotient_supports_mut()
+                         .get_mut(&binding)
+                         .is_some_and(|state| Arc::make_mut(state).apply_component_refresh(patches))
+                 })
+             } else {
+-                self.semantic_quotient_supports
++                self.semantic_quotient_supports_mut()
+                     .get_mut(&binding)
+                     .is_some_and(|state| {
+                         Arc::make_mut(state).try_apply_monotone_deletion(&leaf_updates, context)
+@@ -4026,7 +4228,7 @@
+             let state =
+                 build_semantic_quotient_support_state(binding.clone(), self, context, registry)?
+                     .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-            self.semantic_quotient_supports
++            self.semantic_quotient_supports_mut()
+                 .insert(binding, Arc::new(state));
+         }
+         Ok(())
+@@ -4977,6 +5179,20 @@
+     pub total_estimated_bytes_after: usize,
+ }
+ 
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct SemanticStatisticsAdvisorReport {
++    pub created: Vec<SemanticIndexBinding>,
++    pub rebuilt: Vec<SemanticIndexBinding>,
++    pub retained: Vec<SemanticIndexBinding>,
++    pub evicted: Vec<SemanticIndexBinding>,
++    pub reused_existing: Vec<SemanticIndexBinding>,
++    pub rejected_unprofitable: Vec<SemanticIndexBinding>,
++    pub rejected_budget: Vec<SemanticIndexBinding>,
++    pub managed_estimated_bytes: usize,
++    pub fixed_estimated_bytes: usize,
++    pub total_estimated_bytes_after: usize,
++}
++
+ impl Default for PhysicalArtifactAdvisorPolicy {
+     fn default() -> Self {
+         Self {
+@@ -7812,7 +8028,7 @@
+     let mut rejected_by_cost = false;
+     let mut best: Option<(&MaterializedSemanticIndexState, Vec<&Value>, usize, usize)> = None;
+ 
+-    for (binding, index) in &store.semantic_indexes {
++    for (binding, index) in store.semantic_indexes.iter() {
+         if binding.relation != relation || binding.layout != layout {
+             continue;
+         }
+@@ -11795,7 +12011,7 @@
+     }
+ 
+     let mut candidate = None;
+-    for (binding, index) in &store.semantic_indexes {
++    for (binding, index) in store.semantic_indexes.iter() {
+         if binding.relation != right_relation || binding.layout != right_layout {
+             continue;
+         }
+@@ -12325,6 +12541,32 @@
+     report: I64IndexAdvisorReport,
+ }
+ 
++#[derive(Debug, Clone, Copy)]
++struct SemanticStatisticsAdviceUse {
++    left_rows: usize,
++    right_rows: usize,
++    expected_executions: usize,
++}
++
++#[derive(Debug)]
++struct SemanticStatisticsAdviceChoice {
++    binding: SemanticIndexBinding,
++    net_savings: u128,
++    row_count: usize,
++    estimated_bytes: usize,
++    compatible_existing: bool,
++    advisor_managed: bool,
++    replaced_fixed_bytes: usize,
++    prepared_state: Option<MaterializedSemanticStatisticsState>,
++}
++
++struct SemanticStatisticsAdvisorSelection {
++    selected: BTreeSet<SemanticIndexBinding>,
++    prepared_states: Vec<(SemanticIndexBinding, MaterializedSemanticStatisticsState)>,
++    managed_estimated_bytes: usize,
++    report: SemanticStatisticsAdvisorReport,
++}
++
+ fn canonical_eq_key_heap_bytes(key: &kernel_semantics::CanonicalEqKey) -> usize {
+     use kernel_semantics::CanonicalEqKey;
+     match key {
+@@ -12959,6 +13201,315 @@
+     }
+ }
+ 
++fn collect_semantic_statistics_advice_uses(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    expected_executions: usize,
++    uses: &mut BTreeMap<SemanticIndexBinding, Vec<SemanticStatisticsAdviceUse>>,
++) -> Result<(), PhysicalExecutionError> {
++    if expected_executions == 0 {
++        return Ok(());
++    }
++    if let Plan::JoinEq {
++        left,
++        right,
++        right_column,
++        equivalence,
++        algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
++        ..
++    } = plan
++        && let (Some((left_relation, left_layout)), Some((right_relation, right_layout))) =
++            (direct_scan_relation(left), direct_scan_relation(right))
++    {
++        let binding =
++            SemanticIndexBinding::single(right_relation, right_layout, *right_column, *equivalence);
++        if primitive_binding_supported(&binding, context, registry)? {
++            let i64_binding = semantic_binding_as_i64(&binding, context, registry)?;
++            let has_i64 = i64_binding.is_some_and(|binding| store.i64_index(binding).is_some());
++            let has_semantic = match store.semantic_indexes.get(&binding) {
++                Some(state) => state.compatible_with(context, registry)?,
++                None => false,
++            };
++            if !has_i64 && !has_semantic {
++                let left_rows =
++                    native_row_count(&store.installed(left_relation, left_layout)?.data);
++                let right_rows =
++                    native_row_count(&store.installed(right_relation, right_layout)?.data);
++                if left_rows != 0 && right_rows != 0 {
++                    let scan_work = SemanticAccessCostModel::join_scan_work(left_rows, right_rows);
++                    let optimistic_ephemeral = SemanticAccessCostModel::ephemeral_join_work(
++                        left_rows,
++                        right_rows,
++                        right_rows,
++                        binding.key_parts.len(),
++                    );
++                    if optimistic_ephemeral < scan_work {
++                        uses.entry(binding)
++                            .or_default()
++                            .push(SemanticStatisticsAdviceUse {
++                                left_rows,
++                                right_rows,
++                                expected_executions,
++                            });
++                    }
++                }
++            }
++        }
++        return Ok(());
++    }
++    match plan {
++        Plan::FilterEqConst { input, .. }
++        | Plan::FilterEqColumns { input, .. }
++        | Plan::Project { input, .. }
++        | Plan::Distinct { input, .. }
++        | Plan::Group { input, .. }
++        | Plan::TopKWithTies { input, .. }
++        | Plan::PromoteToBag(input) => collect_semantic_statistics_advice_uses(
++            input,
++            store,
++            context,
++            registry,
++            expected_executions,
++            uses,
++        ),
++        Plan::JoinEq { left, right, .. } => {
++            collect_semantic_statistics_advice_uses(
++                left,
++                store,
++                context,
++                registry,
++                expected_executions,
++                uses,
++            )?;
++            collect_semantic_statistics_advice_uses(
++                right,
++                store,
++                context,
++                registry,
++                expected_executions,
++                uses,
++            )
++        }
++        Plan::Scan { .. } => Ok(()),
++    }
++}
++
++fn semantic_statistics_savings(
++    uses: &[SemanticStatisticsAdviceUse],
++    distinct_key_count: usize,
++    key_parts: usize,
++) -> u128 {
++    uses.iter().fold(0_u128, |total, use_| {
++        let scan_work = SemanticAccessCostModel::join_scan_work(use_.left_rows, use_.right_rows);
++        let actual_ephemeral = SemanticAccessCostModel::ephemeral_join_work(
++            use_.left_rows,
++            use_.right_rows,
++            distinct_key_count.max(1),
++            key_parts,
++        );
++        let savings = actual_ephemeral.saturating_sub(scan_work) as u128;
++        total.saturating_add(savings.saturating_mul(use_.expected_executions as u128))
++    })
++}
++
++fn semantic_statistics_advice_choice(
++    store: &PhysicalStore,
++    binding: SemanticIndexBinding,
++    uses: &[SemanticStatisticsAdviceUse],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    report: &mut SemanticStatisticsAdvisorReport,
++) -> Result<Option<SemanticStatisticsAdviceChoice>, PhysicalExecutionError> {
++    let relation = store.installed(binding.relation, binding.layout)?;
++    let row_count = native_row_count(&relation.data);
++    let existing = store.semantic_statistics.get(&binding);
++    let compatible_existing = match existing {
++        Some(state) => state.compatible_with(context, registry)? && state.row_count == row_count,
++        None => false,
++    };
++    let build_work = if compatible_existing {
++        0
++    } else {
++        row_count.saturating_mul(binding.key_parts.len().max(1)) as u128
++    };
++    if !compatible_existing {
++        let upper_bound = semantic_statistics_savings(uses, 1, binding.key_parts.len());
++        if upper_bound <= build_work {
++            report.rejected_unprofitable.push(binding);
++            return Ok(None);
++        }
++    }
++    let (distinct_key_count, estimated_bytes, prepared_state) = if compatible_existing {
++        let state = existing.expect("compatible statistics must exist");
++        (
++            state.counts.len(),
++            semantic_statistics_estimated_retained_bytes(state),
++            None,
++        )
++    } else {
++        let candidate = MaterializedSemanticStatisticsState::build(
++            binding.clone(),
++            relation,
++            context,
++            registry,
++        )?;
++        let estimated_bytes = semantic_statistics_estimated_retained_bytes(&candidate);
++        (candidate.counts.len(), estimated_bytes, Some(candidate))
++    };
++    let gross_savings =
++        semantic_statistics_savings(uses, distinct_key_count, binding.key_parts.len());
++    if gross_savings <= build_work {
++        report.rejected_unprofitable.push(binding);
++        return Ok(None);
++    }
++    let advisor_managed =
++        store
++            .advisor_managed_artifacts
++            .contains(&ManagedPhysicalArtifact::SemanticStatistics(
++                binding.clone(),
++            ));
++    let replaced_fixed_bytes = if !compatible_existing && !advisor_managed {
++        existing.map_or(0, |state| {
++            semantic_statistics_estimated_retained_bytes(state)
++        })
++    } else {
++        0
++    };
++    Ok(Some(SemanticStatisticsAdviceChoice {
++        binding,
++        net_savings: gross_savings.saturating_sub(build_work),
++        row_count,
++        estimated_bytes,
++        compatible_existing,
++        advisor_managed,
++        replaced_fixed_bytes,
++        prepared_state,
++    }))
++}
++
++fn semantic_statistics_advice_choices(
++    store: &PhysicalStore,
++    workload: &[SemanticIndexWorkloadSample],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    report: &mut SemanticStatisticsAdvisorReport,
++) -> Result<Vec<SemanticStatisticsAdviceChoice>, PhysicalExecutionError> {
++    let mut uses = BTreeMap::<SemanticIndexBinding, Vec<SemanticStatisticsAdviceUse>>::new();
++    for sample in workload {
++        collect_semantic_statistics_advice_uses(
++            &sample.plan,
++            store,
++            context,
++            registry,
++            sample.expected_executions,
++            &mut uses,
++        )?;
++    }
++    let mut choices = Vec::new();
++    for (binding, uses) in uses {
++        if let Some(choice) =
++            semantic_statistics_advice_choice(store, binding, &uses, context, registry, report)?
++        {
++            choices.push(choice);
++        }
++    }
++    choices.sort_by(|left, right| {
++        let left_cost = if left.compatible_existing && !left.advisor_managed {
++            0
++        } else {
++            left.estimated_bytes
++        };
++        let right_cost = if right.compatible_existing && !right.advisor_managed {
++            0
++        } else {
++            right.estimated_bytes
++        };
++        match (left_cost, right_cost) {
++            (0, 0) => right
++                .net_savings
++                .cmp(&left.net_savings)
++                .then_with(|| left.binding.cmp(&right.binding)),
++            (0, _) => std::cmp::Ordering::Less,
++            (_, 0) => std::cmp::Ordering::Greater,
++            _ => {
++                let left_density = left.net_savings.saturating_mul(right_cost as u128);
++                let right_density = right.net_savings.saturating_mul(left_cost as u128);
++                right_density
++                    .cmp(&left_density)
++                    .then_with(|| right.net_savings.cmp(&left.net_savings))
++                    .then_with(|| right.row_count.cmp(&left.row_count))
++                    .then_with(|| left.binding.cmp(&right.binding))
++            }
++        }
++    });
++    Ok(choices)
++}
++
++fn semantic_statistics_advisor_selection(
++    store: &PhysicalStore,
++    workload: &[SemanticIndexWorkloadSample],
++    policy: PhysicalArtifactAdvisorPolicy,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<SemanticStatisticsAdvisorSelection, PhysicalExecutionError> {
++    let mut report = SemanticStatisticsAdvisorReport::default();
++    let choices =
++        semantic_statistics_advice_choices(store, workload, context, registry, &mut report)?;
++    let current_memory = store
++        .artifact_memory_report()
++        .total_estimated_retained_bytes;
++    let replaceable_managed_bytes = saturating_usize_sum(
++        store
++            .semantic_statistics
++            .iter()
++            .filter(|(binding, _)| {
++                store.advisor_managed_artifacts.contains(
++                    &ManagedPhysicalArtifact::SemanticStatistics((*binding).clone()),
++                )
++            })
++            .map(|(_, state)| semantic_statistics_estimated_retained_bytes(state)),
++    );
++    let mut fixed_estimated_bytes = current_memory.saturating_sub(replaceable_managed_bytes);
++    let mut selected = BTreeSet::new();
++    let mut prepared_states = Vec::new();
++    let mut managed_estimated_bytes = 0_usize;
++    for mut choice in choices {
++        let managed_cost = if choice.compatible_existing && !choice.advisor_managed {
++            0
++        } else {
++            choice.estimated_bytes
++        };
++        let projected_fixed_estimated_bytes =
++            fixed_estimated_bytes.saturating_sub(choice.replaced_fixed_bytes);
++        if managed_estimated_bytes.saturating_add(managed_cost) > policy.max_managed_estimated_bytes
++            || projected_fixed_estimated_bytes
++                .saturating_add(managed_estimated_bytes)
++                .saturating_add(managed_cost)
++                > policy.max_total_estimated_bytes
++        {
++            report.rejected_budget.push(choice.binding);
++            continue;
++        }
++        managed_estimated_bytes = managed_estimated_bytes.saturating_add(managed_cost);
++        fixed_estimated_bytes = projected_fixed_estimated_bytes;
++        if let Some(state) = choice.prepared_state.take() {
++            prepared_states.push((choice.binding.clone(), state));
++        }
++        selected.insert(choice.binding);
++    }
++    report.fixed_estimated_bytes = fixed_estimated_bytes;
++    report.total_estimated_bytes_after =
++        fixed_estimated_bytes.saturating_add(managed_estimated_bytes);
++    Ok(SemanticStatisticsAdvisorSelection {
++        selected,
++        prepared_states,
++        managed_estimated_bytes,
++        report,
++    })
++}
++
+ fn semantic_quotient_factor_advice_scores(
+     store: &PhysicalStore,
+     workload: &[SemanticQuotientFactorWorkloadSample<'_>],
+@@ -14233,12 +14784,12 @@
+         let count = prepared.len();
+         for (binding, state) in prepared {
+             store
+-                .semantic_quotient_factors
++                .semantic_quotient_factors_mut()
+                 .insert(binding, Arc::new(state));
+         }
+         for binding in bindings {
+             store
+-                .advisor_managed_artifacts
++                .advisor_managed_artifacts_mut()
+                 .remove(&ManagedPhysicalArtifact::SemanticQuotientFactor(binding));
+         }
+         store.transition_epoch = next_epoch;
+@@ -14287,7 +14838,7 @@
+             .checked_add(1)
+             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
+         store
+-            .semantic_quotient_supports
++            .semantic_quotient_supports_mut()
+             .insert(binding, Arc::new(state));
+         store.transition_epoch = next_epoch;
+         store.state_identity = Arc::new(());
+@@ -14583,6 +15134,39 @@
+         assert_eq!(stats.typed_stateful_batch_hits, 1);
+     }
+ 
++    fn assert_physical_store_catalog_root_sharing(
++        left: &PhysicalStore,
++        right: &PhysicalStore,
++        relations_shared: bool,
++        i64_indexes_shared: bool,
++    ) {
++        assert_eq!(
++            Arc::ptr_eq(&left.relations, &right.relations),
++            relations_shared
++        );
++        assert_eq!(
++            Arc::ptr_eq(&left.i64_indexes, &right.i64_indexes),
++            i64_indexes_shared
++        );
++        assert!(Arc::ptr_eq(&left.semantic_indexes, &right.semantic_indexes));
++        assert!(Arc::ptr_eq(
++            &left.semantic_quotient_factors,
++            &right.semantic_quotient_factors
++        ));
++        assert!(Arc::ptr_eq(
++            &left.semantic_quotient_supports,
++            &right.semantic_quotient_supports
++        ));
++        assert!(Arc::ptr_eq(
++            &left.semantic_statistics,
++            &right.semantic_statistics
++        ));
++        assert!(Arc::ptr_eq(
++            &left.advisor_managed_artifacts,
++            &right.advisor_managed_artifacts
++        ));
++    }
++
+     #[test]
+     fn physical_store_clone_cow_isolates_relation_mutation() {
+         let (context, registry, relation) = planning_context();
+@@ -14609,6 +15193,7 @@
+             .unwrap();
+ 
+         let mut candidate = original.clone();
++        assert_physical_store_catalog_root_sharing(&original, &candidate, true, true);
+         let original_root = original.relations.get(&(relation, layout.id)).unwrap();
+         let candidate_root = candidate.relations.get(&(relation, layout.id)).unwrap();
+         assert!(Arc::ptr_eq(original_root, candidate_root));
+@@ -14627,6 +15212,8 @@
+             )
+             .unwrap();
+ 
++        assert_physical_store_catalog_root_sharing(&original, &candidate, false, false);
++
+         assert!(!Arc::ptr_eq(
+             original.relations.get(&(relation, layout.id)).unwrap(),
+             candidate.relations.get(&(relation, layout.id)).unwrap(),
+@@ -16439,6 +17026,67 @@
+     }
+ 
+     #[test]
++    fn semantic_statistics_advisor_publishes_one_runtime_root_and_noop_does_not_republish() {
++        let values = vec![1_i64; 128];
++        let (context, registry, relation, binding, runtime) = scan_runtime_bundle(73, 966, &values);
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let query = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(relation)),
++            right: Box::new(RelExpr::Scan(relation)),
++            left_column: 0,
++            right_column: 0,
++            equivalence: sid(101),
++        };
++        let prepared = prepare_with_catalog(query, &context, &registry, &catalog).unwrap();
++        let workload = [SemanticIndexWorkloadSample {
++            plan: prepared.physical().clone(),
++            expected_executions: 1,
++        }];
++        let statistics = SemanticIndexBinding::single(relation, binding, 0, sid(101));
++        let cell = RuntimeRevisionCell::new(runtime);
++        let old_reader = cell.snapshot().unwrap();
++
++        let first = cell
++            .advise_semantic_statistics(
++                &workload,
++                PhysicalArtifactAdvisorPolicy::default(),
++                &registry,
++            )
++            .unwrap();
++        let new_reader = cell.snapshot().unwrap();
++        assert_eq!(first.created, vec![statistics.clone()]);
++        assert_eq!(old_reader.root_version().raw(), 0);
++        assert_eq!(new_reader.root_version().raw(), 1);
++        assert!(
++            old_reader
++                .physical_store()
++                .semantic_statistics(&statistics, &context, &registry)
++                .unwrap()
++                .is_none()
++        );
++        assert_eq!(
++            new_reader
++                .physical_store()
++                .semantic_statistics(&statistics, &context, &registry)
++                .unwrap()
++                .unwrap()
++                .distinct_key_count,
++            1
++        );
++
++        let second = cell
++            .advise_semantic_statistics(
++                &workload,
++                PhysicalArtifactAdvisorPolicy::default(),
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(second.retained, vec![statistics]);
++        assert_eq!(cell.snapshot().unwrap().root_version().raw(), 1);
++    }
++
++    #[test]
+     fn competing_prepared_transitions_from_same_revision_cannot_both_publish() {
+         let (context, registry, relation, _, runtime) = scan_runtime_bundle(100, 967, &[1, 2]);
+         let delta_a = scan_delta(relation, &[3], &[1], &context, &registry);
+@@ -17706,7 +18354,7 @@
+         let (context, mut registry, relation, equivalence, layout, mut store) =
+             text_semantic_index_fixture();
+         let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
+-        store.semantic_indexes.remove(&binding);
++        store.semantic_indexes_mut().remove(&binding);
+         let statistics = store
+             .install_semantic_statistics(binding.clone(), &context, &registry)
+             .unwrap();
+@@ -19775,7 +20423,7 @@
+         assert_eq!(both.family, JoinAccessFamily::PersistedI64);
+         assert!(!both.persisted_rejected);
+ 
+-        store.i64_indexes.remove(&i64_binding);
++        store.i64_indexes_mut().remove(&i64_binding);
+         let semantic_only = right_scan_join_access_decision(
+             RightJoinAccessRequest {
+                 left_rows: 100,
+@@ -19792,7 +20440,7 @@
+         .unwrap();
+         assert_eq!(semantic_only.family, JoinAccessFamily::PersistedSemantic);
+ 
+-        store.semantic_indexes.remove(&semantic_binding);
++        store.semantic_indexes_mut().remove(&semantic_binding);
+         let transient = right_scan_join_access_decision(
+             RightJoinAccessRequest {
+                 left_rows: 100,
+@@ -20029,7 +20677,7 @@
+         store
+             .install_semantic_statistics(binding.clone(), &context, &registry)
+             .unwrap();
+-        Arc::make_mut(store.semantic_statistics.get_mut(&binding).unwrap()).row_count = 99;
++        Arc::make_mut(store.semantic_statistics_mut().get_mut(&binding).unwrap()).row_count = 99;
+         assert_eq!(
+             store
+                 .semantic_statistics(&binding, &context, &registry)
+@@ -20219,7 +20867,7 @@
+         let (context, registry, relation, equivalence, layout, mut store) =
+             text_semantic_index_fixture();
+         let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
+-        store.semantic_indexes.remove(&binding);
++        store.semantic_indexes_mut().remove(&binding);
+         let decision = right_scan_join_access_decision(
+             RightJoinAccessRequest {
+                 left_rows: 100,
+@@ -20703,6 +21351,233 @@
+     }
+ 
+     #[test]
++    fn semantic_statistics_advisor_prevents_duplicate_heavy_transient_build_and_evicts_owned() {
++        let (context, registry, [left_relation, right_relation, _], equivalence) =
++            three_relation_i64_context();
++        let left_layout = LayoutBinding {
++            id: LayoutId(9_958),
++            family: LayoutFamily::Columnar,
++        };
++        let right_layout = LayoutBinding {
++            id: LayoutId(9_959),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(left_relation, left_layout);
++        catalog.bind_relation(right_relation, right_layout);
++        let query = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(left_relation)),
++            right: Box::new(RelExpr::Scan(right_relation)),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared = prepare_with_catalog(query, &context, &registry, &catalog).unwrap();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                left_relation,
++                left_layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64((1_i64..=64).collect())])
++                    .unwrap(),
++            )
++            .unwrap();
++        store
++            .install(
++                right_relation,
++                right_layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1; 128])]).unwrap(),
++            )
++            .unwrap();
++        let (_, before) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(before.ephemeral_index_builds, 1);
++
++        let workload = [SemanticIndexWorkloadSample {
++            plan: prepared.physical().clone(),
++            expected_executions: 2,
++        }];
++        let binding = SemanticIndexBinding::single(right_relation, right_layout, 0, equivalence);
++        let report = store
++            .advise_semantic_statistics(
++                &workload,
++                PhysicalArtifactAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(report.created, vec![binding.clone()]);
++        assert!(report.managed_estimated_bytes > 0);
++        assert!(store.advisor_managed_artifacts.contains(
++            &ManagedPhysicalArtifact::SemanticStatistics(binding.clone())
++        ));
++        let statistics = store
++            .semantic_statistics(&binding, &context, &registry)
++            .unwrap()
++            .unwrap();
++        assert_eq!(statistics.distinct_key_count, 1);
++        let (_, after) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(after.ephemeral_index_builds, 0);
++
++        let report = store
++            .advise_semantic_statistics(
++                &[],
++                PhysicalArtifactAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(report.evicted, vec![binding.clone()]);
++        assert_eq!(
++            store
++                .semantic_statistics(&binding, &context, &registry)
++                .unwrap(),
++            None
++        );
++    }
++
++    #[test]
++    fn semantic_statistics_advisor_respects_budget_and_manual_pin() {
++        let (context, registry, [left_relation, right_relation, _], equivalence) =
++            three_relation_i64_context();
++        let left_layout = LayoutBinding {
++            id: LayoutId(9_956),
++            family: LayoutFamily::Columnar,
++        };
++        let right_layout = LayoutBinding {
++            id: LayoutId(9_957),
++            family: LayoutFamily::Columnar,
++        };
++        let scan = |relation, layout| Plan::Scan {
++            relation,
++            layout,
++            algorithm: ScanAlgorithm::FullScan,
++        };
++        let plan = Plan::JoinEq {
++            left: Box::new(scan(left_relation, left_layout)),
++            right: Box::new(scan(right_relation, right_layout)),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++            algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
++        };
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                left_relation,
++                left_layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64((1_i64..=64).collect())])
++                    .unwrap(),
++            )
++            .unwrap();
++        store
++            .install(
++                right_relation,
++                right_layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1; 128])]).unwrap(),
++            )
++            .unwrap();
++        let workload = [SemanticIndexWorkloadSample {
++            plan,
++            expected_executions: 2,
++        }];
++        let binding = SemanticIndexBinding::single(right_relation, right_layout, 0, equivalence);
++        let report = store
++            .advise_semantic_statistics(
++                &workload,
++                PhysicalArtifactAdvisorPolicy {
++                    max_managed_estimated_bytes: 0,
++                    max_total_estimated_bytes: usize::MAX,
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert_eq!(report.rejected_budget, vec![binding.clone()]);
++        assert!(!store.semantic_statistics.contains_key(&binding));
++
++        store
++            .advise_semantic_statistics(
++                &workload,
++                PhysicalArtifactAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert!(store.advisor_managed_artifacts.contains(
++            &ManagedPhysicalArtifact::SemanticStatistics(binding.clone())
++        ));
++        store
++            .install_semantic_statistics(binding.clone(), &context, &registry)
++            .unwrap();
++        assert!(!store.advisor_managed_artifacts.contains(
++            &ManagedPhysicalArtifact::SemanticStatistics(binding.clone())
++        ));
++        let report = store
++            .advise_semantic_statistics(
++                &[],
++                PhysicalArtifactAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert!(report.evicted.is_empty());
++        assert!(store.semantic_statistics.contains_key(&binding));
++    }
++
++    #[test]
++    fn semantic_statistics_advisor_does_not_duplicate_exact_persisted_join_cardinality() {
++        let (context, registry, relation) = planning_context();
++        let layout = LayoutBinding {
++            id: LayoutId(9_955),
++            family: LayoutFamily::Columnar,
++        };
++        let plan = Plan::JoinEq {
++            left: Box::new(Plan::Scan {
++                relation,
++                layout,
++                algorithm: ScanAlgorithm::FullScan,
++            }),
++            right: Box::new(Plan::Scan {
++                relation,
++                layout,
++                algorithm: ScanAlgorithm::FullScan,
++            }),
++            left_column: 0,
++            right_column: 0,
++            equivalence: sid(101),
++            algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
++        };
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                layout,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1; 128])]).unwrap(),
++            )
++            .unwrap();
++        let index = I64IndexBinding {
++            relation,
++            layout,
++            key_column: 0,
++            equivalence: sid(101),
++        };
++        store.install_i64_index(index, &context, &registry).unwrap();
++        let report = store
++            .advise_semantic_statistics(
++                &[SemanticIndexWorkloadSample {
++                    plan,
++                    expected_executions: 100,
++                }],
++                PhysicalArtifactAdvisorPolicy::default(),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        assert!(report.created.is_empty());
++        assert!(store.semantic_statistics.is_empty());
++    }
++
++    #[test]
+     fn i64_index_advisor_amortizes_build_consumes_and_evicts_owned_index() {
+         let (context, registry, relation) = planning_context();
+         let layout = LayoutBinding {
+@@ -22767,7 +23642,10 @@
+             )
+             .unwrap();
+         {
+-            let installed = store.relations.get_mut(&(relation, binding.id)).unwrap();
++            let installed = store
++                .relations_mut()
++                .get_mut(&(relation, binding.id))
++                .unwrap();
+             let installed = Arc::make_mut(installed);
+             installed.row_ids[0].generation = u64::MAX;
+             installed.slots[0].generation = u64::MAX;

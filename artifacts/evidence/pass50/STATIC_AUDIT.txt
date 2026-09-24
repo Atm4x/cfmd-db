@@ -1,0 +1,14 @@
+CFMD Pass50 static audit
+source freeze: 2026-09-20 18:19:04 +03:00
+source window: 15m39s
+rustc: rustc 1.98.1 (48a229cea 2026-09-01)
+declared_rust_tests: 357
+kernel_plan_tests: 129
+rust_loc: 48758
+crates: 21
+allow_sites: 19
+unsafe_sites: 0
+todo_fixme_unimplemented: 0
+external_cargo_sources: 0
+production_source_changed_vs_pass49: crates/kernel-plan/src/lib.rs
+full_gate: PASS

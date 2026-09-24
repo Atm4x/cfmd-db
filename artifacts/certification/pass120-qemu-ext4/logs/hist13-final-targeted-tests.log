@@ -1,0 +1,99 @@
+## destructive_campaign_requires_complete_matching_evidence
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/kernel_durability-957ac0e734015229)
+
+running 1 test
+test platform_assurance::tests::destructive_campaign_requires_complete_matching_evidence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 0.00s
+
+     Running unittests src/bin/cfmd-durability-campaign.rs (target/debug/deps/cfmd_durability_campaign-d0370598f5366170)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/cfmd-hist13-certify.rs (target/debug/deps/cfmd_hist13_certify-a2f0716de675789c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/external_freshness_multiprocess.rs (target/debug/deps/external_freshness_multiprocess-79324f12a41a1c17)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/replication_transport_multiprocess.rs (target/debug/deps/replication_transport_multiprocess-7dcaf5145d500d93)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+## destructive_campaign_certificate_is_strictly_authenticated
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/kernel_durability-957ac0e734015229)
+
+running 1 test
+test platform_assurance::tests::destructive_campaign_certificate_is_strictly_authenticated ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 0.05s
+
+     Running unittests src/bin/cfmd-durability-campaign.rs (target/debug/deps/cfmd_durability_campaign-d0370598f5366170)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/cfmd-hist13-certify.rs (target/debug/deps/cfmd_hist13_certify-a2f0716de675789c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/external_freshness_multiprocess.rs (target/debug/deps/external_freshness_multiprocess-79324f12a41a1c17)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/replication_transport_multiprocess.rs (target/debug/deps/replication_transport_multiprocess-7dcaf5145d500d93)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+## current_mount_evidence_is_resolvable_and_supported_profiles_fail_closed
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/kernel_durability-957ac0e734015229)
+
+running 1 test
+test platform_assurance::tests::current_mount_evidence_is_resolvable_and_supported_profiles_fail_closed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 0.00s
+
+     Running unittests src/bin/cfmd-durability-campaign.rs (target/debug/deps/cfmd_durability_campaign-d0370598f5366170)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/cfmd-hist13-certify.rs (target/debug/deps/cfmd_hist13_certify-a2f0716de675789c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/external_freshness_multiprocess.rs (target/debug/deps/external_freshness_multiprocess-79324f12a41a1c17)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/replication_transport_multiprocess.rs (target/debug/deps/replication_transport_multiprocess-7dcaf5145d500d93)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+

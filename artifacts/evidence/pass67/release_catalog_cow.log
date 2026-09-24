@@ -1,0 +1,8 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_plan-78fbe96aee665d1e)
+
+running 1 test
+test tests::physical_store_clone_cow_isolates_relation_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 164 filtered out; finished in 0.00s
+

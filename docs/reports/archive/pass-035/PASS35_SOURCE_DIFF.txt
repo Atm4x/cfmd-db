@@ -1,0 +1,598 @@
+--- /mnt/data/cfmd_pass34_work/cfmd_workspace_pass34/crates/kernel-durability/src/store.rs	2026-09-19 23:25:52.302345705 +0000
++++ crates/kernel-durability/src/store.rs	2026-09-19 23:39:46.271719938 +0000
+@@ -22,6 +22,29 @@
+ const LOCK_FILE_NAME: &str = ".cfmd-durability.lock";
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum StoreFaultPoint {
++    AfterCheckpointSync,
++    AfterWalSync,
++    AfterPrerequisiteDirectorySync,
++    AfterPendingManifestSync,
++    AfterManifestRename,
++    AfterManifestDirectorySync,
++    BeforeCompactionRemove,
++    AfterCompactionRemove,
++    AfterCompactionDirectorySync,
++}
++
++trait StoreFaultHook {
++    fn hit(&mut self, point: StoreFaultPoint);
++}
++
++struct NoStoreFault;
++
++impl StoreFaultHook for NoStoreFault {
++    fn hit(&mut self, _point: StoreFaultPoint) {}
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct DurableGenerationReceipt {
+     pub generation: u64,
+     pub base_revision: RevisionId,
+@@ -50,7 +73,15 @@
+         directory: impl AsRef<Path>,
+         base_revision: &Revision,
+     ) -> Result<Self, DurabilityError> {
+-        let directory = directory.as_ref().to_path_buf();
++        Self::create_with_hook(directory.as_ref(), base_revision, &mut NoStoreFault)
++    }
++
++    fn create_with_hook(
++        directory: &Path,
++        base_revision: &Revision,
++        hook: &mut impl StoreFaultHook,
++    ) -> Result<Self, DurabilityError> {
++        let directory = directory.to_path_buf();
+         fs::create_dir_all(&directory)?;
+         let directory_lock = lock_directory(&directory)?;
+         if highest_manifest_generation(&directory)?.is_some() {
+@@ -62,17 +93,21 @@
+         let generation = 1;
+         let checkpoint_path = checkpoint_path(&directory, generation);
+         let checkpoint_crc32c = write_checkpoint_file(&checkpoint_path, base_revision)?;
++        hook.hit(StoreFaultPoint::AfterCheckpointSync);
+         let wal_path = wal_path(&directory, generation);
+         let mut wal = FileRevisionWal::create(&wal_path)?;
+         wal.barrier()?;
++        hook.hit(StoreFaultPoint::AfterWalSync);
+         sync_directory(&directory)?;
+-        publish_manifest(
++        hook.hit(StoreFaultPoint::AfterPrerequisiteDirectorySync);
++        publish_manifest_with_hook(
+             &directory,
+             ManifestRecord {
+                 generation,
+                 base_revision: base_revision.id(),
+                 checkpoint_crc32c,
+             },
++            hook,
+         )?;
+         Ok(Self {
+             directory,
+@@ -167,31 +202,36 @@
+                 reason: "checkpoint revision does not match durable WAL head",
+             });
+         }
+-        let result = self.rotate_checkpoint_inner(revision);
++        let result = self.rotate_checkpoint_with_hook(revision, &mut NoStoreFault);
+         if result.is_err() {
+             self.poisoned = true;
+         }
+         result
+     }
+ 
+-    fn rotate_checkpoint_inner(
++    fn rotate_checkpoint_with_hook(
+         &mut self,
+         revision: &Revision,
++        hook: &mut impl StoreFaultHook,
+     ) -> Result<DurableGenerationReceipt, DurabilityError> {
+         let generation = next_generation(&self.directory)?;
+         let checkpoint_file = checkpoint_path(&self.directory, generation);
+         let checkpoint_crc32c = write_checkpoint_file(&checkpoint_file, revision)?;
++        hook.hit(StoreFaultPoint::AfterCheckpointSync);
+         let wal_file = wal_path(&self.directory, generation);
+         let mut wal = FileRevisionWal::create(&wal_file)?;
+         wal.barrier()?;
++        hook.hit(StoreFaultPoint::AfterWalSync);
+         sync_directory(&self.directory)?;
+-        publish_manifest(
++        hook.hit(StoreFaultPoint::AfterPrerequisiteDirectorySync);
++        publish_manifest_with_hook(
+             &self.directory,
+             ManifestRecord {
+                 generation,
+                 base_revision: revision.id(),
+                 checkpoint_crc32c,
+             },
++            hook,
+         )?;
+         self.generation = generation;
+         self.checkpoint = revision.clone();
+@@ -206,6 +246,13 @@
+         if self.poisoned {
+             return Err(DurabilityError::Poisoned);
+         }
++        self.compact_obsolete_generations_with_hook(&mut NoStoreFault)
++    }
++
++    fn compact_obsolete_generations_with_hook(
++        &self,
++        hook: &mut impl StoreFaultHook,
++    ) -> Result<(), DurabilityError> {
+         for entry in fs::read_dir(&self.directory)? {
+             let entry = entry?;
+             let name = entry.file_name();
+@@ -217,10 +264,14 @@
+                 .or_else(|| parse_generation_name(name, "wal-", ".cfmw"));
+             let is_pending = parse_generation_name(name, "pending-manifest-", ".tmp").is_some();
+             if is_pending || generation.is_some_and(|generation| generation != self.generation) {
++                hook.hit(StoreFaultPoint::BeforeCompactionRemove);
+                 fs::remove_file(entry.path())?;
++                hook.hit(StoreFaultPoint::AfterCompactionRemove);
+             }
+         }
+-        sync_directory(&self.directory)
++        sync_directory(&self.directory)?;
++        hook.hit(StoreFaultPoint::AfterCompactionDirectorySync);
++        Ok(())
+     }
+ }
+ 
+@@ -363,7 +414,11 @@
+     Ok(revision)
+ }
+ 
+-fn publish_manifest(directory: &Path, manifest: ManifestRecord) -> Result<(), DurabilityError> {
++fn publish_manifest_with_hook(
++    directory: &Path,
++    manifest: ManifestRecord,
++    hook: &mut impl StoreFaultHook,
++) -> Result<(), DurabilityError> {
+     let final_path = manifest_path(directory, manifest.generation);
+     let pending_path = directory.join(format!("pending-manifest-{:020}.tmp", manifest.generation));
+     if pending_path.exists() {
+@@ -376,8 +431,12 @@
+         .open(&pending_path)?;
+     file.write_all(&bytes)?;
+     file.sync_all()?;
++    hook.hit(StoreFaultPoint::AfterPendingManifestSync);
+     fs::rename(&pending_path, &final_path)?;
+-    sync_directory(directory)
++    hook.hit(StoreFaultPoint::AfterManifestRename);
++    sync_directory(directory)?;
++    hook.hit(StoreFaultPoint::AfterManifestDirectorySync);
++    Ok(())
+ }
+ 
+ fn encode_manifest(manifest: ManifestRecord) -> [u8; MANIFEST_LEN] {
+@@ -485,6 +544,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::process::Command;
+     use std::sync::atomic::{AtomicU64, Ordering};
+ 
+     use kernel_model::{DatabaseState, Value};
+@@ -500,6 +560,23 @@
+     use crate::{DurableRelationMutation, DurableRevisionDescriptor};
+ 
+     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
++    const CRASH_WORKER_ENV: &str = "CFMD_CRASH_WORKER";
++    const CRASH_DIR_ENV: &str = "CFMD_CRASH_DIR";
++    const CRASH_POINT_ENV: &str = "CFMD_CRASH_POINT";
++    const CRASH_READY_FILE: &str = ".cfmd-crash-ready";
++
++    struct BlockingKillFault {
++        target: StoreFaultPoint,
++        directory: PathBuf,
++    }
++
++    impl StoreFaultHook for BlockingKillFault {
++        fn hit(&mut self, point: StoreFaultPoint) {
++            if point == self.target {
++                signal_crash_ready(&self.directory);
++            }
++        }
++    }
+ 
+     fn test_dir(name: &str) -> PathBuf {
+         let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+@@ -550,6 +627,92 @@
+         )
+     }
+ 
++    fn crash_point_name(point: StoreFaultPoint) -> &'static str {
++        match point {
++            StoreFaultPoint::AfterCheckpointSync => "after-checkpoint-sync",
++            StoreFaultPoint::AfterWalSync => "after-wal-sync",
++            StoreFaultPoint::AfterPrerequisiteDirectorySync => "after-prerequisite-directory-sync",
++            StoreFaultPoint::AfterPendingManifestSync => "after-pending-manifest-sync",
++            StoreFaultPoint::AfterManifestRename => "after-manifest-rename",
++            StoreFaultPoint::AfterManifestDirectorySync => "after-manifest-directory-sync",
++            StoreFaultPoint::BeforeCompactionRemove => "before-compaction-remove",
++            StoreFaultPoint::AfterCompactionRemove => "after-compaction-remove",
++            StoreFaultPoint::AfterCompactionDirectorySync => "after-compaction-directory-sync",
++        }
++    }
++
++    fn parse_crash_point(raw: &str) -> StoreFaultPoint {
++        [
++            StoreFaultPoint::AfterCheckpointSync,
++            StoreFaultPoint::AfterWalSync,
++            StoreFaultPoint::AfterPrerequisiteDirectorySync,
++            StoreFaultPoint::AfterPendingManifestSync,
++            StoreFaultPoint::AfterManifestRename,
++            StoreFaultPoint::AfterManifestDirectorySync,
++            StoreFaultPoint::BeforeCompactionRemove,
++            StoreFaultPoint::AfterCompactionRemove,
++            StoreFaultPoint::AfterCompactionDirectorySync,
++        ]
++        .into_iter()
++        .find(|point| crash_point_name(*point) == raw)
++        .unwrap_or_else(|| panic!("unknown crash point {raw}"))
++    }
++
++    fn signal_crash_ready(dir: &Path) -> ! {
++        let marker = dir.join(CRASH_READY_FILE);
++        let file = File::create(marker).unwrap();
++        file.sync_all().unwrap();
++        loop {
++            std::thread::sleep(std::time::Duration::from_secs(60));
++        }
++    }
++
++    fn run_crash_worker(test_name: &str, dir: &Path, point: &str) {
++        let marker = dir.join(CRASH_READY_FILE);
++        let _ = fs::remove_file(&marker);
++        let mut child = Command::new(std::env::current_exe().unwrap())
++            .arg("--exact")
++            .arg(test_name)
++            .arg("--nocapture")
++            .env(CRASH_WORKER_ENV, "1")
++            .env(CRASH_DIR_ENV, dir)
++            .env(CRASH_POINT_ENV, point)
++            .spawn()
++            .unwrap();
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++        while !marker.is_file() {
++            if let Some(status) = child.try_wait().unwrap() {
++                panic!("crash worker exited before killpoint: {status}");
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "crash worker did not reach killpoint {point}"
++            );
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        }
++        child.kill().unwrap();
++        let _ = child.wait().unwrap();
++        let _ = fs::remove_file(marker);
++    }
++
++    fn committed_descriptor(
++        base: &Revision,
++        relation: SemanticId,
++        target_revision: u64,
++        inserted: i64,
++    ) -> DurableRevisionDescriptor {
++        DurableRevisionDescriptor {
++            source_revision: base.id(),
++            target_revision: RevisionId::new(target_revision),
++            semantic_revision: base.semantic_revision(),
++            relation_mutations: vec![DurableRelationMutation {
++                relation,
++                inserted: vec![vec![Value::I64(inserted)]],
++                removed: Vec::new(),
++            }],
++        }
++    }
++
+     #[test]
+     fn store_reopens_exact_checkpoint_and_committed_wal_tail() {
+         let dir = test_dir("reopen");
+@@ -683,4 +846,169 @@
+         ));
+         fs::remove_dir_all(dir).unwrap();
+     }
++
++    #[test]
++    fn subprocess_kill_after_prepare_recovers_previous_committed_head() {
++        let dir = test_dir("kill-after-prepare");
++        let (base, registry, _) = setup_revision(80, &[1]);
++        drop(DurableRevisionStore::create(&dir, &base).unwrap());
++
++        run_crash_worker(
++            "store::tests::crash_worker_wal_boundary",
++            &dir,
++            "after-prepare",
++        );
++
++        let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        assert_eq!(reopened.durable_head(), RevisionId::new(80));
++        assert!(scan.committed().is_empty());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn subprocess_kill_after_commit_recovers_committed_head_without_ack() {
++        let dir = test_dir("kill-after-commit");
++        let (base, registry, _) = setup_revision(80, &[1]);
++        drop(DurableRevisionStore::create(&dir, &base).unwrap());
++
++        run_crash_worker(
++            "store::tests::crash_worker_wal_boundary",
++            &dir,
++            "after-commit",
++        );
++
++        let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        assert_eq!(reopened.durable_head(), RevisionId::new(81));
++        assert_eq!(scan.committed().len(), 1);
++        assert_eq!(
++            scan.committed()[0].descriptor.target_revision,
++            RevisionId::new(81)
++        );
++        fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn subprocess_kill_checkpoint_manifest_matrix_preserves_authority_boundary() {
++        let points = [
++            (StoreFaultPoint::AfterCheckpointSync, 1),
++            (StoreFaultPoint::AfterWalSync, 1),
++            (StoreFaultPoint::AfterPrerequisiteDirectorySync, 1),
++            (StoreFaultPoint::AfterPendingManifestSync, 1),
++            (StoreFaultPoint::AfterManifestRename, 2),
++            (StoreFaultPoint::AfterManifestDirectorySync, 2),
++        ];
++
++        for (point, expected_generation) in points {
++            let dir = test_dir(crash_point_name(point));
++            let (base, registry, relation) = setup_revision(90, &[1]);
++            let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
++            let descriptor = committed_descriptor(&base, relation, 91, 2);
++            let prepared = store.durably_prepare(&descriptor).unwrap();
++            store.durably_commit(prepared).unwrap();
++            drop(store);
++
++            run_crash_worker(
++                "store::tests::crash_worker_checkpoint_rotation",
++                &dir,
++                crash_point_name(point),
++            );
++
++            let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++            assert_eq!(reopened.generation(), expected_generation, "{point:?}");
++            assert_eq!(reopened.durable_head(), RevisionId::new(91), "{point:?}");
++            if expected_generation == 1 {
++                assert_eq!(reopened.checkpoint_revision().id(), RevisionId::new(90));
++                assert_eq!(scan.committed().len(), 1);
++            } else {
++                assert_eq!(reopened.checkpoint_revision().id(), RevisionId::new(91));
++                assert!(scan.committed().is_empty());
++            }
++            fs::remove_dir_all(dir).unwrap();
++        }
++    }
++
++    #[test]
++    fn subprocess_kill_during_compaction_never_removes_active_generation() {
++        for point in [
++            StoreFaultPoint::BeforeCompactionRemove,
++            StoreFaultPoint::AfterCompactionRemove,
++            StoreFaultPoint::AfterCompactionDirectorySync,
++        ] {
++            let dir = test_dir(crash_point_name(point));
++            let (base, registry, _) = setup_revision(100, &[1]);
++            let mut store = DurableRevisionStore::create(&dir, &base).unwrap();
++            store.rotate_checkpoint(&base).unwrap();
++            drop(store);
++
++            run_crash_worker(
++                "store::tests::crash_worker_compaction",
++                &dir,
++                crash_point_name(point),
++            );
++
++            let (reopened, scan) = DurableRevisionStore::open(&dir, &registry).unwrap();
++            assert_eq!(reopened.generation(), 2, "{point:?}");
++            assert_eq!(reopened.durable_head(), RevisionId::new(100), "{point:?}");
++            assert!(scan.committed().is_empty());
++            fs::remove_dir_all(dir).unwrap();
++        }
++    }
++
++    #[test]
++    fn crash_worker_wal_boundary() {
++        if std::env::var_os(CRASH_WORKER_ENV).is_none() {
++            return;
++        }
++        let dir = PathBuf::from(std::env::var_os(CRASH_DIR_ENV).unwrap());
++        let point = std::env::var(CRASH_POINT_ENV).unwrap();
++        let (base, registry, relation) = setup_revision(80, &[1]);
++        let (mut store, _) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let descriptor = committed_descriptor(&base, relation, 81, 2);
++        let prepared = store.durably_prepare(&descriptor).unwrap();
++        if point == "after-prepare" {
++            signal_crash_ready(&dir);
++        }
++        store.durably_commit(prepared).unwrap();
++        if point == "after-commit" {
++            signal_crash_ready(&dir);
++        }
++        panic!("unknown WAL crash point {point}");
++    }
++
++    #[test]
++    fn crash_worker_checkpoint_rotation() {
++        if std::env::var_os(CRASH_WORKER_ENV).is_none() {
++            return;
++        }
++        let dir = PathBuf::from(std::env::var_os(CRASH_DIR_ENV).unwrap());
++        let point = parse_crash_point(&std::env::var(CRASH_POINT_ENV).unwrap());
++        let (_, registry, _) = setup_revision(90, &[1]);
++        let (next, _, _) = setup_revision(91, &[1, 2]);
++        let (mut store, _) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let mut hook = BlockingKillFault {
++            target: point,
++            directory: dir.clone(),
++        };
++        store.rotate_checkpoint_with_hook(&next, &mut hook).unwrap();
++        panic!("checkpoint crash point was not reached: {point:?}");
++    }
++
++    #[test]
++    fn crash_worker_compaction() {
++        if std::env::var_os(CRASH_WORKER_ENV).is_none() {
++            return;
++        }
++        let dir = PathBuf::from(std::env::var_os(CRASH_DIR_ENV).unwrap());
++        let point = parse_crash_point(&std::env::var(CRASH_POINT_ENV).unwrap());
++        let (_, registry, _) = setup_revision(100, &[1]);
++        let (store, _) = DurableRevisionStore::open(&dir, &registry).unwrap();
++        let mut hook = BlockingKillFault {
++            target: point,
++            directory: dir.clone(),
++        };
++        store
++            .compact_obsolete_generations_with_hook(&mut hook)
++            .unwrap();
++        panic!("compaction crash point was not reached: {point:?}");
++    }
+ }
+--- /mnt/data/cfmd_pass34_work/cfmd_workspace_pass34/crates/kernel-plan/src/lib.rs	2026-09-19 23:24:06.308192039 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-19 23:40:00.242784736 +0000
+@@ -5613,6 +5613,8 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::process::Command;
++
+     use kernel_schema::{
+         RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext, SemanticEnvironment,
+         TypeExpr,
+@@ -9452,4 +9454,122 @@
+         drop(reopened);
+         std::fs::remove_dir_all(dir).unwrap();
+     }
++
++    struct ExitAfterDurableCommit {
++        inner: kernel_durability::DurableRevisionStore,
++        crash_marker: std::path::PathBuf,
++    }
++
++    impl kernel_durability::RevisionDurability for ExitAfterDurableCommit {
++        fn durably_prepare(
++            &mut self,
++            descriptor: &kernel_durability::DurableRevisionDescriptor,
++        ) -> Result<kernel_durability::DurablePrepareToken, kernel_durability::DurabilityError>
++        {
++            self.inner.durably_prepare(descriptor)
++        }
++
++        fn durably_commit(
++            &mut self,
++            prepared: kernel_durability::DurablePrepareToken,
++        ) -> Result<kernel_durability::DurableCommitReceipt, kernel_durability::DurabilityError>
++        {
++            self.inner.durably_commit(prepared)?;
++            let marker = std::fs::File::create(&self.crash_marker)?;
++            marker.sync_all()?;
++            loop {
++                std::thread::sleep(std::time::Duration::from_secs(60));
++            }
++        }
++    }
++
++    #[test]
++    fn subprocess_commit_durable_before_publish_recovers_target_revision() {
++        const WORKER_ENV: &str = "CFMD_PLAN_COMMIT_CRASH_WORKER";
++        const DIR_ENV: &str = "CFMD_PLAN_COMMIT_CRASH_DIR";
++        let dir = durable_test_dir("commit-before-publish");
++        let (context, registry, relation, _, root) = scan_runtime_bundle(530, 1203, &[1, 2]);
++        let specs = [RuntimeMaterializationSpec {
++            id: test_materialization_id(),
++            query: RelExpr::Scan(relation),
++        }];
++        drop(DurableRuntime::create(root, &dir).unwrap());
++        let marker = dir.join(".cfmd-plan-crash-ready");
++        let _ = std::fs::remove_file(&marker);
++
++        let mut child = Command::new(std::env::current_exe().unwrap())
++            .arg("--exact")
++            .arg("tests::crash_worker_commit_durable_before_publish")
++            .arg("--nocapture")
++            .env(WORKER_ENV, "1")
++            .env(DIR_ENV, &dir)
++            .spawn()
++            .unwrap();
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++        while !marker.is_file() {
++            if let Some(status) = child.try_wait().unwrap() {
++                panic!("commit crash worker exited before killpoint: {status}");
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "commit crash worker did not reach durable-COMMIT killpoint"
++            );
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        }
++        child.kill().unwrap();
++        let _ = child.wait().unwrap();
++        let _ = std::fs::remove_file(&marker);
++
++        let reopened = DurableRuntime::open(&dir, &specs, &registry).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert_eq!(snapshot.revision_id(), RevisionId::new(531));
++        assert_eq!(
++            runtime_physical_i64_values(
++                snapshot.root(),
++                relation,
++                LayoutBinding::RECOVERY_ROW_STORE,
++            ),
++            vec![2, 3]
++        );
++        assert_eq!(
++            runtime_maintained_i64_values(snapshot.root(), &context, &registry),
++            vec![2, 3]
++        );
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn crash_worker_commit_durable_before_publish() {
++        const WORKER_ENV: &str = "CFMD_PLAN_COMMIT_CRASH_WORKER";
++        const DIR_ENV: &str = "CFMD_PLAN_COMMIT_CRASH_DIR";
++        if std::env::var_os(WORKER_ENV).is_none() {
++            return;
++        }
++        let dir = std::path::PathBuf::from(std::env::var_os(DIR_ENV).unwrap());
++        let (context, registry, relation, _, root) = scan_runtime_bundle(530, 1203, &[1, 2]);
++        let delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let target = target_revision_for(&root, 531, &mutations, &registry);
++        let (durability, scan) =
++            kernel_durability::DurableRevisionStore::open(&dir, &registry).unwrap();
++        assert!(scan.committed().is_empty());
++        let cell = RuntimeRevisionCell::new(root);
++        let mut durability = ExitAfterDurableCommit {
++            inner: durability,
++            crash_marker: dir.join(".cfmd-plan-crash-ready"),
++        };
++        let _ = cell.commit_revision_durable(
++            &RevisionTransitionRequest {
++                target_revision: &target,
++                mutations: &mutations,
++                registry: &registry,
++            },
++            &mut durability,
++        );
++        panic!("worker must exit after durable COMMIT and before publish");
++    }
+ }

@@ -1,0 +1,19 @@
+campaign_id=qemu-tcg-ext4-ordered-pass120-2026-09-23
+qemu=QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)
+accel=tcg
+machine=pc/i440FX
+memory_mib=192
+vcpus=1
+guest_kernel=6.18.52-0-virt
+data_device=/dev/vda
+qemu_drive=file=cfmd-data.img,format=raw,if=virtio,cache=none,aio=threads
+filesystem=ext4
+mount_options=rw,relatime
+super_options=rw,data=ordered
+filesystem_uuid=632c2322-b79e-11f1-80e3-d1c9cdf3a3a0
+host_note=virtualized-profile-only; host raw image resides on ChatGPT container storage
+kernel_sha256=40f620bc8c93d952e57dd8dfc0f94fca1759d192a4fc4a260705d50ca378559c
+initramfs_sha256=36b6626aa779e030d40dbfe1fa5a1ede98af3872eeed9739e7a78f188090cc68
+campaign_binary_sha256=4fd5ef9578f31ffd17c3d124b75ad8a949bb821a58102a17fc7ef787f0db0373
+completed_fault_cases=7
+expected_fault_cases=7

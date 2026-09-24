@@ -1,0 +1,704 @@
+===== crates/kernel-lens/Cargo.toml =====
+--- /mnt/data/kernel-lens.Cargo.before.toml	2026-09-22 01:51:12.981797631 +0000
++++ crates/kernel-lens/Cargo.toml	2026-09-22 01:58:00.548110263 +0000
+@@ -8,6 +8,8 @@
+ kernel-change = { path = "../kernel-change" }
+ kernel-model = { path = "../kernel-model" }
+ kernel-query = { path = "../kernel-query" }
++kernel-schema = { path = "../kernel-schema" }
++kernel-semantics = { path = "../kernel-semantics" }
+ kernel-types = { path = "../kernel-types" }
+ 
+ [lints]
+
+===== crates/kernel-lens/src/lib.rs =====
+--- /mnt/data/kernel-lens.before.rs	2026-09-22 01:51:12.980725949 +0000
++++ crates/kernel-lens/src/lib.rs	2026-09-22 01:58:16.360371425 +0000
+@@ -1,8 +1,8 @@
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, BTreeSet};
+ 
+ use kernel_change::{FineChange, FineChangeKind, PreparedRewrite, RewriteEffect};
+ use kernel_model::Value;
+-use kernel_types::SemanticId;
++use kernel_types::{RevisionObservableId, SemanticId};
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum LensError {
+@@ -363,6 +363,505 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub struct RelColumnOrigin {
++    pub relation: SemanticId,
++    pub column: usize,
++    pub observable: RevisionObservableId,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RelRewriteLiftStage {
++    Project {
++        columns: Vec<usize>,
++    },
++    FilterEqConst {
++        column: usize,
++        equivalence: SemanticId,
++    },
++    FilterEqColumns {
++        left_column: usize,
++        right_column: usize,
++        equivalence: SemanticId,
++    },
++    JoinOwnerSide {
++        owner_is_left: bool,
++        owner_column: usize,
++        lookup_column: usize,
++        equivalence: SemanticId,
++    },
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++pub enum RelWritableObligation {
++    PreserveHiddenColumnsComplement {
++        relation: SemanticId,
++        hidden: BTreeSet<RevisionObservableId>,
++    },
++    HiddenColumnConstructorForInsert {
++        relation: SemanticId,
++        hidden: BTreeSet<RevisionObservableId>,
++    },
++    ProjectionNoSemanticCollapse,
++    PredicateAdmissibility,
++    DtcGuardNoImpact,
++    VmfInvariantClosure,
++    JoinLookupDeterminant {
++        join_key: RevisionObservableId,
++        lookup_outputs: BTreeSet<RevisionObservableId>,
++    },
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RelWritabilityFailure {
++    OwnerRelationNotReferenced,
++    OwnerRelationReferencedOnBothJoinSides,
++    MissingObservableBinding { relation: SemanticId },
++    ColumnOutOfBounds { column: usize, arity: usize },
++    DuplicateProjectionColumn(usize),
++    UnsupportedOperator,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RelWritableBindingError {
++    UnknownRelation(SemanticId),
++    ArityMismatch {
++        relation: SemanticId,
++        expected: usize,
++        actual: usize,
++    },
++    UnknownObservable(RevisionObservableId),
++    ObservableEquivalenceMismatch {
++        relation: SemanticId,
++        column: usize,
++        expected: SemanticId,
++        actual: SemanticId,
++    },
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RelWritableColumnBindings {
++    columns: BTreeMap<SemanticId, Vec<RevisionObservableId>>,
++}
++
++impl RelWritableColumnBindings {
++    pub fn from_catalog(
++        semantic: &kernel_schema::SemanticContext,
++        catalog: &kernel_semantics::observable::RevisionObservableCatalog,
++        columns: BTreeMap<SemanticId, Vec<RevisionObservableId>>,
++    ) -> Result<Self, RelWritableBindingError> {
++        for (&relation, observables) in &columns {
++            let definition = semantic
++                .schema
++                .relation(relation)
++                .ok_or(RelWritableBindingError::UnknownRelation(relation))?;
++            let equivalences = match &definition.semantics {
++                kernel_schema::RelationSemantics::Set {
++                    column_equivalences,
++                }
++                | kernel_schema::RelationSemantics::Bag {
++                    column_equivalences,
++                } => column_equivalences,
++            };
++            if equivalences.len() != observables.len() {
++                return Err(RelWritableBindingError::ArityMismatch {
++                    relation,
++                    expected: equivalences.len(),
++                    actual: observables.len(),
++                });
++            }
++            for (column, (&expected, &observable)) in
++                equivalences.iter().zip(observables).enumerate()
++            {
++                let actual = match catalog.definition(observable) {
++                    Ok(
++                        kernel_semantics::observable::SemanticObservableDefinition::PinnedEquivalence(
++                            equivalence,
++                        )
++                        | kernel_semantics::observable::SemanticObservableDefinition::PinnedEquivalenceCoordinate {
++                            equivalence,
++                            ..
++                        },
++                    ) => *equivalence,
++                    Ok(kernel_semantics::observable::SemanticObservableDefinition::Product(_)) => {
++                        return Err(RelWritableBindingError::UnknownObservable(observable));
++                    }
++                    Err(_) => return Err(RelWritableBindingError::UnknownObservable(observable)),
++                };
++                if actual != expected {
++                    return Err(RelWritableBindingError::ObservableEquivalenceMismatch {
++                        relation,
++                        column,
++                        expected,
++                        actual,
++                    });
++                }
++            }
++        }
++        Ok(Self { columns })
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RelWritableViewPlan {
++    pub query: kernel_query::RelExpr,
++    pub owner_relation: SemanticId,
++    pub rewrite_spec: kernel_change::RewriteSpecId,
++    pub output_origins: Vec<RelColumnOrigin>,
++    pub stages: Vec<RelRewriteLiftStage>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RelWritableCompilation {
++    Writable(RelWritableViewPlan),
++    Conditional {
++        plan: RelWritableViewPlan,
++        obligations: BTreeSet<RelWritableObligation>,
++    },
++    ReadOnly(RelWritabilityFailure),
++}
++
++pub struct RelWritableCompileContext<'a> {
++    pub owner_relation: SemanticId,
++    pub rewrite_spec: kernel_change::RewriteSpecId,
++    pub relation_columns: &'a RelWritableColumnBindings,
++    pub determinant_theory: Option<&'a kernel_semantics::anchor_pullback::DeterminantTheory>,
++}
++
++#[derive(Debug, Clone)]
++struct RelWritableAnalysis {
++    owner_present: bool,
++    output_origins: Vec<RelColumnOrigin>,
++    stages: Vec<RelRewriteLiftStage>,
++    obligations: BTreeSet<RelWritableObligation>,
++}
++
++/// Compiles the exact relational write fragment with one explicit source owner.
++/// The compiler never guesses a preimage: information loss, predicate guards,
++/// invariant closure, and lookup-side determinant facts remain typed obligations.
++pub fn compile_rel_writable_query(
++    query: &kernel_query::RelExpr,
++    context: &RelWritableCompileContext<'_>,
++) -> Result<RelWritableCompilation, kernel_semantics::anchor_pullback::AnchorPullbackError> {
++    let analysis = match analyze_writable_rel(query, context) {
++        Ok(analysis) => analysis,
++        Err(reason) => return Ok(RelWritableCompilation::ReadOnly(reason)),
++    };
++    if !analysis.owner_present {
++        return Ok(RelWritableCompilation::ReadOnly(
++            RelWritabilityFailure::OwnerRelationNotReferenced,
++        ));
++    }
++    let plan = RelWritableViewPlan {
++        query: query.clone(),
++        owner_relation: context.owner_relation,
++        rewrite_spec: context.rewrite_spec,
++        output_origins: analysis.output_origins,
++        stages: analysis.stages,
++    };
++    if analysis.obligations.is_empty() {
++        Ok(RelWritableCompilation::Writable(plan))
++    } else {
++        Ok(RelWritableCompilation::Conditional {
++            plan,
++            obligations: analysis.obligations,
++        })
++    }
++}
++
++fn analyze_writable_rel(
++    query: &kernel_query::RelExpr,
++    context: &RelWritableCompileContext<'_>,
++) -> Result<RelWritableAnalysis, RelWritabilityFailure> {
++    use kernel_query::RelExpr;
++    match query {
++        RelExpr::Scan(relation) => analyze_rel_scan(*relation, context),
++        RelExpr::Project { input, columns } => analyze_rel_project(input, columns, context),
++        RelExpr::FilterEqConst {
++            input,
++            column,
++            equivalence,
++            ..
++        } => analyze_rel_filter_const(input, *column, *equivalence, context),
++        RelExpr::FilterEqColumns {
++            input,
++            left_column,
++            right_column,
++            equivalence,
++        } => analyze_rel_filter_columns(input, *left_column, *right_column, *equivalence, context),
++        RelExpr::JoinEq {
++            left,
++            right,
++            left_column,
++            right_column,
++            equivalence,
++        } => analyze_rel_join(
++            left,
++            right,
++            *left_column,
++            *right_column,
++            *equivalence,
++            context,
++        ),
++        RelExpr::Difference { .. }
++        | RelExpr::AntiJoin { .. }
++        | RelExpr::Distinct { .. }
++        | RelExpr::Group { .. }
++        | RelExpr::TopKWithTies { .. }
++        | RelExpr::PromoteToBag(_) => Err(RelWritabilityFailure::UnsupportedOperator),
++    }
++}
++
++fn analyze_rel_scan(
++    relation: SemanticId,
++    context: &RelWritableCompileContext<'_>,
++) -> Result<RelWritableAnalysis, RelWritabilityFailure> {
++    let Some(columns) = context.relation_columns.columns.get(&relation) else {
++        return Err(RelWritabilityFailure::MissingObservableBinding { relation });
++    };
++    Ok(RelWritableAnalysis {
++        owner_present: relation == context.owner_relation,
++        output_origins: columns
++            .iter()
++            .enumerate()
++            .map(|(column, &observable)| RelColumnOrigin {
++                relation,
++                column,
++                observable,
++            })
++            .collect(),
++        stages: Vec::new(),
++        obligations: BTreeSet::new(),
++    })
++}
++
++fn analyze_rel_project(
++    input: &kernel_query::RelExpr,
++    columns: &[usize],
++    context: &RelWritableCompileContext<'_>,
++) -> Result<RelWritableAnalysis, RelWritabilityFailure> {
++    let mut analysis = analyze_writable_rel(input, context)?;
++    let mut seen = BTreeSet::new();
++    for &column in columns {
++        ensure_column(column, analysis.output_origins.len())?;
++        if !seen.insert(column) {
++            return Err(RelWritabilityFailure::DuplicateProjectionColumn(column));
++        }
++    }
++    let previous = analysis.output_origins.clone();
++    let projected = columns
++        .iter()
++        .map(|&column| previous[column])
++        .collect::<Vec<_>>();
++    let visible_owner = projected
++        .iter()
++        .filter(|origin| origin.relation == context.owner_relation)
++        .map(|origin| origin.observable)
++        .collect::<BTreeSet<_>>();
++    let hidden_owner = previous
++        .iter()
++        .filter(|origin| origin.relation == context.owner_relation)
++        .map(|origin| origin.observable)
++        .filter(|observable| !visible_owner.contains(observable))
++        .collect::<BTreeSet<_>>();
++    add_projection_obligations(
++        &mut analysis.obligations,
++        context,
++        &visible_owner,
++        hidden_owner,
++    );
++    analysis
++        .obligations
++        .insert(RelWritableObligation::ProjectionNoSemanticCollapse);
++    analysis.output_origins = projected;
++    analysis.stages.push(RelRewriteLiftStage::Project {
++        columns: columns.to_vec(),
++    });
++    Ok(analysis)
++}
++
++fn add_projection_obligations(
++    obligations: &mut BTreeSet<RelWritableObligation>,
++    context: &RelWritableCompileContext<'_>,
++    visible_owner: &BTreeSet<RevisionObservableId>,
++    hidden_owner: BTreeSet<RevisionObservableId>,
++) {
++    if hidden_owner.is_empty()
++        || determinant_covers(context.determinant_theory, visible_owner, &hidden_owner)
++            .unwrap_or(false)
++    {
++        return;
++    }
++    obligations.insert(RelWritableObligation::PreserveHiddenColumnsComplement {
++        relation: context.owner_relation,
++        hidden: hidden_owner.clone(),
++    });
++    obligations.insert(RelWritableObligation::HiddenColumnConstructorForInsert {
++        relation: context.owner_relation,
++        hidden: hidden_owner,
++    });
++}
++
++fn analyze_rel_filter_const(
++    input: &kernel_query::RelExpr,
++    column: usize,
++    equivalence: SemanticId,
++    context: &RelWritableCompileContext<'_>,
++) -> Result<RelWritableAnalysis, RelWritabilityFailure> {
++    let mut analysis = analyze_writable_rel(input, context)?;
++    ensure_column(column, analysis.output_origins.len())?;
++    add_guard_obligations(&mut analysis.obligations);
++    analysis.stages.push(RelRewriteLiftStage::FilterEqConst {
++        column,
++        equivalence,
++    });
++    Ok(analysis)
++}
++
++fn analyze_rel_filter_columns(
++    input: &kernel_query::RelExpr,
++    left_column: usize,
++    right_column: usize,
++    equivalence: SemanticId,
++    context: &RelWritableCompileContext<'_>,
++) -> Result<RelWritableAnalysis, RelWritabilityFailure> {
++    let mut analysis = analyze_writable_rel(input, context)?;
++    ensure_column(left_column, analysis.output_origins.len())?;
++    ensure_column(right_column, analysis.output_origins.len())?;
++    add_guard_obligations(&mut analysis.obligations);
++    analysis.stages.push(RelRewriteLiftStage::FilterEqColumns {
++        left_column,
++        right_column,
++        equivalence,
++    });
++    Ok(analysis)
++}
++
++fn analyze_rel_join(
++    left: &kernel_query::RelExpr,
++    right: &kernel_query::RelExpr,
++    left_column: usize,
++    right_column: usize,
++    equivalence: SemanticId,
++    context: &RelWritableCompileContext<'_>,
++) -> Result<RelWritableAnalysis, RelWritabilityFailure> {
++    let left_analysis = analyze_writable_rel(left, context)?;
++    let right_analysis = analyze_writable_rel(right, context)?;
++    if left_analysis.owner_present && right_analysis.owner_present {
++        return Err(RelWritabilityFailure::OwnerRelationReferencedOnBothJoinSides);
++    }
++    if !left_analysis.owner_present && !right_analysis.owner_present {
++        return Err(RelWritabilityFailure::OwnerRelationNotReferenced);
++    }
++    let (mut owner, lookup, owner_column, lookup_column, owner_is_left) =
++        if left_analysis.owner_present {
++            (
++                left_analysis,
++                right_analysis,
++                left_column,
++                right_column,
++                true,
++            )
++        } else {
++            (
++                right_analysis,
++                left_analysis,
++                right_column,
++                left_column,
++                false,
++            )
++        };
++    ensure_column(owner_column, owner.output_origins.len())?;
++    ensure_column(lookup_column, lookup.output_origins.len())?;
++    add_join_obligations(&mut owner.obligations, &lookup, lookup_column, context);
++    let output_origins = join_output_origins(&owner, &lookup, owner_is_left);
++    owner.obligations.extend(lookup.obligations);
++    owner
++        .obligations
++        .insert(RelWritableObligation::DtcGuardNoImpact);
++    owner
++        .obligations
++        .insert(RelWritableObligation::VmfInvariantClosure);
++    owner.output_origins = output_origins;
++    owner.stages.push(RelRewriteLiftStage::JoinOwnerSide {
++        owner_is_left,
++        owner_column,
++        lookup_column,
++        equivalence,
++    });
++    Ok(owner)
++}
++
++fn add_join_obligations(
++    obligations: &mut BTreeSet<RelWritableObligation>,
++    lookup: &RelWritableAnalysis,
++    lookup_column: usize,
++    context: &RelWritableCompileContext<'_>,
++) {
++    let lookup_key = lookup.output_origins[lookup_column].observable;
++    let lookup_outputs = lookup
++        .output_origins
++        .iter()
++        .map(|origin| origin.observable)
++        .collect::<BTreeSet<_>>();
++    if determinant_covers(
++        context.determinant_theory,
++        &BTreeSet::from([lookup_key]),
++        &lookup_outputs,
++    )
++    .unwrap_or(false)
++    {
++        return;
++    }
++    obligations.insert(RelWritableObligation::JoinLookupDeterminant {
++        join_key: lookup_key,
++        lookup_outputs,
++    });
++}
++
++fn join_output_origins(
++    owner: &RelWritableAnalysis,
++    lookup: &RelWritableAnalysis,
++    owner_is_left: bool,
++) -> Vec<RelColumnOrigin> {
++    let mut outputs = if owner_is_left {
++        owner.output_origins.clone()
++    } else {
++        lookup.output_origins.clone()
++    };
++    if owner_is_left {
++        outputs.extend(lookup.output_origins.iter().copied());
++    } else {
++        outputs.extend(owner.output_origins.iter().copied());
++    }
++    outputs
++}
++
++fn add_guard_obligations(obligations: &mut BTreeSet<RelWritableObligation>) {
++    obligations.insert(RelWritableObligation::PredicateAdmissibility);
++    obligations.insert(RelWritableObligation::DtcGuardNoImpact);
++    obligations.insert(RelWritableObligation::VmfInvariantClosure);
++}
++
++fn ensure_column(column: usize, arity: usize) -> Result<(), RelWritabilityFailure> {
++    if column < arity {
++        Ok(())
++    } else {
++        Err(RelWritabilityFailure::ColumnOutOfBounds { column, arity })
++    }
++}
++
++fn determinant_covers(
++    theory: Option<&kernel_semantics::anchor_pullback::DeterminantTheory>,
++    seed: &BTreeSet<RevisionObservableId>,
++    targets: &BTreeSet<RevisionObservableId>,
++) -> Result<bool, kernel_semantics::anchor_pullback::AnchorPullbackError> {
++    let Some(theory) = theory else {
++        return Ok(false);
++    };
++    Ok(theory.closure(seed)?.is_superset(targets))
++}
++
+ #[cfg(test)]
+ mod writable_tests {
+     use super::*;
+@@ -431,6 +930,157 @@
+     }
+ }
+ 
++#[cfg(test)]
++mod relational_writable_tests {
++    use super::*;
++    use kernel_change::RewriteSpecId;
++    use kernel_query::RelExpr;
++
++    const OWNER: SemanticId = SemanticId(800);
++    const LOOKUP: SemanticId = SemanticId(801);
++    const EQ: SemanticId = SemanticId(802);
++
++    fn observable(id: u128) -> RevisionObservableId {
++        RevisionObservableId::new(id)
++    }
++
++    fn bindings() -> BTreeMap<SemanticId, Vec<RevisionObservableId>> {
++        BTreeMap::from([
++            (OWNER, vec![observable(1), observable(2), observable(3)]),
++            (LOOKUP, vec![observable(10), observable(11)]),
++        ])
++    }
++
++    fn context(bindings: &RelWritableColumnBindings) -> RelWritableCompileContext<'_> {
++        RelWritableCompileContext {
++            owner_relation: OWNER,
++            rewrite_spec: RewriteSpecId(SemanticId(900)),
++            relation_columns: bindings,
++            determinant_theory: None,
++        }
++    }
++
++    #[test]
++    fn scan_owner_is_unconditionally_writable() {
++        let bindings = RelWritableColumnBindings {
++            columns: bindings(),
++        };
++        let compiled =
++            compile_rel_writable_query(&RelExpr::Scan(OWNER), &context(&bindings)).unwrap();
++        let RelWritableCompilation::Writable(plan) = compiled else {
++            panic!("owner scan must preserve identity without extra obligations")
++        };
++        assert_eq!(plan.output_origins.len(), 3);
++        assert!(plan.stages.is_empty());
++    }
++
++    #[test]
++    fn projection_filter_exposes_hidden_and_dynamic_obligations() {
++        let bindings = RelWritableColumnBindings {
++            columns: bindings(),
++        };
++        let query = RelExpr::Project {
++            input: Box::new(RelExpr::FilterEqConst {
++                input: Box::new(RelExpr::Scan(OWNER)),
++                column: 0,
++                value: Value::I64(7),
++                equivalence: EQ,
++            }),
++            columns: vec![0, 1],
++        };
++        let RelWritableCompilation::Conditional { plan, obligations } =
++            compile_rel_writable_query(&query, &context(&bindings)).unwrap()
++        else {
++            panic!("lossy filtered projection must be conditional")
++        };
++        assert_eq!(plan.output_origins.len(), 2);
++        assert!(obligations.contains(&RelWritableObligation::PredicateAdmissibility));
++        assert!(obligations.contains(&RelWritableObligation::DtcGuardNoImpact));
++        assert!(obligations.contains(&RelWritableObligation::VmfInvariantClosure));
++        assert!(obligations.contains(&RelWritableObligation::ProjectionNoSemanticCollapse));
++        assert!(
++            obligations.contains(&RelWritableObligation::PreserveHiddenColumnsComplement {
++                relation: OWNER,
++                hidden: BTreeSet::from([observable(3)]),
++            })
++        );
++        assert!(
++            obligations.contains(&RelWritableObligation::HiddenColumnConstructorForInsert {
++                relation: OWNER,
++                hidden: BTreeSet::from([observable(3)]),
++            })
++        );
++    }
++
++    #[test]
++    fn owner_side_join_never_guesses_lookup_preimage() {
++        let bindings = RelWritableColumnBindings {
++            columns: bindings(),
++        };
++        let query = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(OWNER)),
++            right: Box::new(RelExpr::Scan(LOOKUP)),
++            left_column: 0,
++            right_column: 0,
++            equivalence: EQ,
++        };
++        let RelWritableCompilation::Conditional { plan, obligations } =
++            compile_rel_writable_query(&query, &context(&bindings)).unwrap()
++        else {
++            panic!("join without determinant certificate must be conditional")
++        };
++        assert_eq!(plan.output_origins.len(), 5);
++        assert!(
++            obligations.contains(&RelWritableObligation::JoinLookupDeterminant {
++                join_key: observable(10),
++                lookup_outputs: BTreeSet::from([observable(10), observable(11)]),
++            })
++        );
++        assert!(matches!(
++            plan.stages.last(),
++            Some(RelRewriteLiftStage::JoinOwnerSide {
++                owner_is_left: true,
++                ..
++            })
++        ));
++    }
++
++    #[test]
++    fn join_with_owner_on_both_sides_is_read_only() {
++        let bindings = RelWritableColumnBindings {
++            columns: bindings(),
++        };
++        let query = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(OWNER)),
++            right: Box::new(RelExpr::Scan(OWNER)),
++            left_column: 0,
++            right_column: 0,
++            equivalence: EQ,
++        };
++        assert_eq!(
++            compile_rel_writable_query(&query, &context(&bindings)).unwrap(),
++            RelWritableCompilation::ReadOnly(
++                RelWritabilityFailure::OwnerRelationReferencedOnBothJoinSides
++            )
++        );
++    }
++
++    #[test]
++    fn distinct_requires_explicit_action_policy() {
++        let bindings = RelWritableColumnBindings {
++            columns: bindings(),
++        };
++        let query = RelExpr::Distinct {
++            input: Box::new(RelExpr::Scan(OWNER)),
++            column_equivalences: vec![EQ, EQ, EQ],
++        };
++        assert_eq!(
++            compile_rel_writable_query(&query, &context(&bindings)).unwrap(),
++            RelWritableCompilation::ReadOnly(RelWritabilityFailure::UnsupportedOperator)
++        );
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct LensSpecId(pub SemanticId);
+ 
+
+===== Cargo.lock =====
+--- /tmp/pass81L_Cargo.lock	2026-09-22 02:05:07.300025762 +0000
++++ Cargo.lock	2026-09-22 01:58:02.036664481 +0000
+@@ -71,6 +71,8 @@
+  "kernel-change",
+  "kernel-model",
+  "kernel-query",
++ "kernel-schema",
++ "kernel-semantics",
+  "kernel-types",
+ ]
+ 

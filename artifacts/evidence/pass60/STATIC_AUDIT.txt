@@ -1,0 +1,9 @@
+declared_tests=387
+kernel_plan_tests=137
+kernel_lifecycle_tests=11
+kernel_validation_tests=11
+crates=21
+rust_loc=52819
+allow_attrs=19
+unsafe_hits=0
+todo_fixme=0

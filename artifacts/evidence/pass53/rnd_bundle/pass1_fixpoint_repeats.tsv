@@ -1,0 +1,10 @@
+baseline	1	n=8000 solve_us=276195 reachable=8000 rank_last=7999
+rnd	1	n=8000 solve_us=17931 reachable=8000 rank_last=7999
+baseline	2	n=8000 solve_us=257332 reachable=8000 rank_last=7999
+rnd	2	n=8000 solve_us=17234 reachable=8000 rank_last=7999
+baseline	3	n=8000 solve_us=286894 reachable=8000 rank_last=7999
+rnd	3	n=8000 solve_us=16328 reachable=8000 rank_last=7999
+baseline	4	n=8000 solve_us=270952 reachable=8000 rank_last=7999
+rnd	4	n=8000 solve_us=15852 reachable=8000 rank_last=7999
+baseline	5	n=8000 solve_us=273228 reachable=8000 rank_last=7999
+rnd	5	n=8000 solve_us=16029 reachable=8000 rank_last=7999

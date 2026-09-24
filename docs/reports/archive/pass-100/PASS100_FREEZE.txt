@@ -1,0 +1,5 @@
+PASS100 source frozen before nominal 20-minute boundary.
+Baseline: cfmd_workspace_pass99_topk_orderedboundary_complete.zip
+Production source fingerprint: d21904012350dd116225d73e3e1c587287504be2926b3396a1f7dff26b7cb03b
+V5 Stage 4.4 BilinearPullback / Join is complete.
+No Stage 4.5 source integration is claimed in this checkpoint.

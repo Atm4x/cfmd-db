@@ -1,0 +1,88 @@
+PASS42 STATIC AUDIT
+1. Legacy single key_column fields in SemanticIndexBinding:
+88:    pub key_column: usize,
+99:pub struct SemanticIndexBinding {
+105:impl SemanticIndexBinding {
+3819:    left_key_column: usize,
+3820:    right_key_column: usize,
+3854:        key_column: program.right_key_column,
+4103:        left_key_column: left_column,
+4104:        right_key_column: right_column,
+6220:        key_column: right_column,
+7398:        key_column: right_column,
+9051:            key_column: 0,
+9115:            key_column: 0,
+9195:                    key_column: 0,
+9223:                key_column: 0,
+9698:                key_column: 0,
+10377:            key_column: 0,
+10435:            key_column: 0,
+10491:            key_column: 0,
+10583:            key_column: 0,
+10740:                    key_column: 0,
+10752:                    key_column: 0,
+10769:                    key_column: 0,
+11063:        let index_binding = SemanticIndexBinding {
+11164:                SemanticIndexBinding {
+12668:                key_column: 0,
+
+2. Composite key_parts references:
+93:pub struct SemanticIndexKeyPart {
+102:    pub key_parts: Vec<SemanticIndexKeyPart>,
+116:            key_parts: vec![SemanticIndexKeyPart {
+3002:        if binding.key_parts.is_empty() {
+3009:        let mut resolved = Vec::with_capacity(binding.key_parts.len());
+3010:        let mut dependencies = Vec::with_capacity(binding.key_parts.len());
+3011:        for part in &binding.key_parts {
+3046:        if self.binding.key_parts.len() != self.resolved.len() {
+3049:        for (part, expected) in self.binding.key_parts.iter().zip(&self.resolved) {
+3143:        .key_parts
+5920:        let mut values = Vec::with_capacity(binding.key_parts.len());
+5922:        for part in &binding.key_parts {
+5943:        let candidate = (index, values, matching_rows, binding.key_parts.len());
+5946:                || (matching_rows == *best_rows && binding.key_parts.len() > *best_parts)
+7167:    if binding.key_parts.len() != keys.len() {
+7172:    for part in &binding.key_parts {
+11066:            key_parts: vec![
+11067:                SemanticIndexKeyPart {
+11071:                SemanticIndexKeyPart {
+11167:                    key_parts: vec![
+11168:                        SemanticIndexKeyPart {
+11172:                        SemanticIndexKeyPart {
+
+3. FilterEqColumns codec/transport coverage:
+crates/kernel-transport/src/lib.rs:260:        RelExpr::FilterEqColumns {
+crates/kernel-transport/src/lib.rs:265:        } => RelExpr::FilterEqColumns {
+crates/kernel-durability/src/metadata.rs:349:        RelExpr::FilterEqColumns {
+crates/kernel-durability/src/metadata.rs:499:        8 => Ok(RelExpr::FilterEqColumns {
+crates/kernel-durability/src/metadata.rs:588:                    input: Box::new(RelExpr::FilterEqColumns {
+crates/kernel-query/src/lib.rs:2125:            RelExpr::FilterEqColumns {
+crates/kernel-query/src/lib.rs:3832:        RelExpr::FilterEqColumns {
+crates/kernel-query/src/lib.rs:5781:    FilterEqColumns {
+crates/kernel-query/src/lib.rs:5850:            Self::FilterEqColumns {
+crates/kernel-query/src/lib.rs:6272:            Self::FilterEqColumns {
+
+4. Cost model and rejection stat:
+3161:    pub persisted_index_cost_rejections: usize,
+3260:pub struct SemanticAccessCostModel;
+3262:impl SemanticAccessCostModel {
+4134:    target.persisted_index_cost_rejections = target
+4135:        .persisted_index_cost_rejections
+4136:        .saturating_add(source.persisted_index_cost_rejections);
+5937:        if SemanticAccessCostModel::choose_filter(row_count, matching_rows)
+5955:            stats.persisted_index_cost_rejections =
+5956:                stats.persisted_index_cost_rejections.saturating_add(1);
+7227:    if SemanticAccessCostModel::choose_join(
+7233:        stats.persisted_index_cost_rejections =
+7234:            stats.persisted_index_cost_rejections.saturating_add(1);
+7315:    if SemanticAccessCostModel::choose_join(
+7321:        stats.persisted_index_cost_rejections =
+7322:            stats.persisted_index_cost_rejections.saturating_add(1);
+10916:        assert_eq!(join_stats.persisted_index_cost_rejections, 1);
+10923:        assert_eq!(filter_stats.persisted_index_cost_rejections, 1);
+10989:        assert_eq!(stats.persisted_index_cost_rejections, 0);
+11218:        assert_eq!(stats.persisted_index_cost_rejections, 0);
+
+5. unsafe:
+
+6. TODO/FIXME in changed production files:

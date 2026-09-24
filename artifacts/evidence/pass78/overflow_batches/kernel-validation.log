@@ -1,0 +1,19 @@
+   Compiling kernel-validation v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-validation)
+    Finished `release` profile [optimized] target(s) in 1.34s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_validation-9b563e8ec1f7551d)
+
+running 11 tests
+test tests::benchmark_dense_type_extent_membership_against_carrier_scan ... ignored, diagnostic release benchmark
+test tests::dense_type_extents_match_subtype_membership_and_overlap ... ok
+test tests::empty_set_relation_still_rejects_wrong_column_equivalence_domain ... ok
+test tests::product_shape_is_keyed_by_semantic_field_id ... ok
+test tests::equality_domain_is_checked_even_for_singleton_collection ... ok
+test tests::set_relation_rejects_semantically_duplicate_rows ... ok
+test tests::structural_product_equivalence_validates_composite_set_keys ... ok
+test tests::unit_is_a_real_schema_type_not_an_untyped_runtime_sentinel ... ok
+test tests::validation_accepts_subtype_owner_through_dense_extent ... ok
+test tests::well_typed_model_validates ... ok
+test tests::wrong_field_type_is_rejected ... ok
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

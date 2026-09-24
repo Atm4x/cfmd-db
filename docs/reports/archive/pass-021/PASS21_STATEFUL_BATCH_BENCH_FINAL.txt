@@ -1,0 +1,50 @@
+=== process 1 ===
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1
+group_typed_ns=2839104
+group_baseline_ns=2760034
+group_typed_over_baseline=1.028
+top_typed_ns=342147
+top_baseline_ns=754383
+top_typed_over_baseline=0.453
+=== process 2 ===
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1
+group_typed_ns=3063492
+group_baseline_ns=2847654
+group_typed_over_baseline=1.075
+top_typed_ns=319636
+top_baseline_ns=665575
+top_typed_over_baseline=0.480
+=== process 3 ===
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1
+group_typed_ns=3007391
+group_baseline_ns=2722196
+group_typed_over_baseline=1.104
+top_typed_ns=302852
+top_baseline_ns=657437
+top_typed_over_baseline=0.460
+=== process 4 ===
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1
+group_typed_ns=3113444
+group_baseline_ns=2846548
+group_typed_over_baseline=1.093
+top_typed_ns=405099
+top_baseline_ns=639723
+top_typed_over_baseline=0.633
+=== process 5 ===
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1
+group_typed_ns=3076410
+group_baseline_ns=2532977
+group_typed_over_baseline=1.214
+top_typed_ns=363593
+top_baseline_ns=673205
+top_typed_over_baseline=0.540

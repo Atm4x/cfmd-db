@@ -1,0 +1,11 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_plan-78fbe96aee665d1e)
+
+running 4 tests
+test tests::semantic_statistics_advisor_does_not_duplicate_exact_persisted_join_cardinality ... ok
+test tests::semantic_statistics_advisor_respects_budget_and_manual_pin ... ok
+test tests::semantic_statistics_advisor_prevents_duplicate_heavy_transient_build_and_evicts_owned ... ok
+test tests::semantic_statistics_advisor_publishes_one_runtime_root_and_noop_does_not_republish ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 161 filtered out; finished in 0.00s
+

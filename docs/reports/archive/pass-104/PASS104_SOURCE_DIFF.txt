@@ -1,0 +1,410 @@
+--- /mnt/data/pass103_cmp/lib.rs	2026-09-23 11:51:09.664720831 +0000
++++ crates/kernel-query/src/lib.rs	2026-09-23 11:48:30.666720311 +0000
+@@ -923,6 +923,19 @@
+ struct RelationMutationPlan {
+     remove_indices: Vec<usize>,
+     inserted: Vec<Row>,
++    canonical_keys: Option<CanonicalRelationMutationKeys>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct CanonicalRelationMutationKeys {
++    removed: Vec<CanonicalRowKey>,
++    inserted: Vec<CanonicalRowKey>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct CanonicalRowPositionIndex {
++    by_key: BTreeMap<CanonicalRowKey, Vec<usize>>,
++    by_position: Vec<CanonicalRowKey>,
+ }
+ 
+ #[derive(Debug)]
+@@ -1966,6 +1979,71 @@
+         value: &RelationValue,
+         delta: &RelationDelta,
+         ty: &RelType,
++        canonical_lookup: Option<&CanonicalRowPositionIndex>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelationMutationPlan, RelQueryError> {
++        if let Some(lookup) = canonical_lookup {
++            let equivalences = relation_column_equivalences(ty);
++            let mut removed_per_key = BTreeMap::<CanonicalRowKey, usize>::new();
++            let mut remove_indices = Vec::with_capacity(delta.removed.len());
++            let mut removed_keys = Vec::with_capacity(delta.removed.len());
++            for removed in &delta.removed {
++                let Some(key) = try_canonical_row_key(removed, equivalences, context, registry)?
++                else {
++                    return Self::plan_relation_mutation_linear(
++                        value, delta, ty, context, registry,
++                    );
++                };
++                let used = removed_per_key.entry(key.clone()).or_default();
++                let bucket = lookup
++                    .by_key
++                    .get(&key)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let index = bucket
++                    .len()
++                    .checked_sub(*used + 1)
++                    .and_then(|position| bucket.get(position).copied())
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                *used += 1;
++                remove_indices.push(index);
++                removed_keys.push(key);
++            }
++
++            let mut inserted_keys = Vec::with_capacity(delta.inserted.len());
++            for inserted in &delta.inserted {
++                let Some(key) = try_canonical_row_key(inserted, equivalences, context, registry)?
++                else {
++                    return Self::plan_relation_mutation_linear(
++                        value, delta, ty, context, registry,
++                    );
++                };
++                if matches!(ty.semantics, kernel_schema::RelationSemantics::Set { .. }) {
++                    let existing = lookup.by_key.get(&key).map_or(0, Vec::len);
++                    let removing = removed_per_key.get(&key).copied().unwrap_or(0);
++                    if existing > removing || inserted_keys.iter().any(|previous| previous == &key)
++                    {
++                        return Err(RelQueryError::InconsistentIncrementalDelta);
++                    }
++                }
++                inserted_keys.push(key);
++            }
++            return Ok(RelationMutationPlan {
++                remove_indices,
++                inserted: delta.inserted.clone(),
++                canonical_keys: Some(CanonicalRelationMutationKeys {
++                    removed: removed_keys,
++                    inserted: inserted_keys,
++                }),
++            });
++        }
++        Self::plan_relation_mutation_linear(value, delta, ty, context, registry)
++    }
++
++    fn plan_relation_mutation_linear(
++        value: &RelationValue,
++        delta: &RelationDelta,
++        ty: &RelType,
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<RelationMutationPlan, RelQueryError> {
+@@ -2014,10 +2092,64 @@
+         Ok(RelationMutationPlan {
+             remove_indices,
+             inserted: delta.inserted.clone(),
++            canonical_keys: None,
+         })
+     }
+ 
+-    fn commit_relation_mutation(value: &mut RelationValue, mut plan: RelationMutationPlan) {
++    fn commit_relation_mutation(
++        value: &mut RelationValue,
++        canonical_lookup: &mut Option<CanonicalRowPositionIndex>,
++        mut plan: RelationMutationPlan,
++    ) {
++        if let (Some(lookup), Some(keys)) = (canonical_lookup.as_mut(), plan.canonical_keys.take())
++        {
++            let mut removals = plan
++                .remove_indices
++                .into_iter()
++                .zip(keys.removed)
++                .collect::<Vec<_>>();
++            removals.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
++            let rows = value.rows_mut();
++            for (index, key) in removals {
++                let last_index = rows.len() - 1;
++                let bucket = lookup
++                    .by_key
++                    .get_mut(&key)
++                    .expect("planned canonical Scan removal key must exist");
++                let position = bucket
++                    .iter()
++                    .position(|candidate| *candidate == index)
++                    .expect("planned canonical Scan removal index must exist");
++                bucket.swap_remove(position);
++                if bucket.is_empty() {
++                    lookup.by_key.remove(&key);
++                }
++                if index != last_index {
++                    rows.swap(index, last_index);
++                    let moved_key = lookup.by_position[last_index].clone();
++                    let moved_bucket = lookup
++                        .by_key
++                        .get_mut(&moved_key)
++                        .expect("moved canonical Scan key must exist");
++                    let moved_position = moved_bucket
++                        .iter()
++                        .position(|candidate| *candidate == last_index)
++                        .expect("moved canonical Scan index must exist");
++                    moved_bucket[moved_position] = index;
++                    lookup.by_position.swap(index, last_index);
++                }
++                rows.pop();
++                lookup.by_position.pop();
++            }
++            for (row, key) in plan.inserted.into_iter().zip(keys.inserted) {
++                let index = rows.len();
++                rows.push(row);
++                lookup.by_position.push(key.clone());
++                lookup.by_key.entry(key).or_default().push(index);
++            }
++            return;
++        }
++
+         plan.remove_indices
+             .sort_unstable_by(|left, right| right.cmp(left));
+         let rows = value.rows_mut();
+@@ -2025,6 +2157,7 @@
+             rows.remove(index);
+         }
+         rows.extend(plan.inserted);
++        *canonical_lookup = None;
+     }
+ 
+     fn build_i64_buckets(
+@@ -2937,6 +3070,7 @@
+         relation: kernel_types::SemanticId,
+         value: RelationValue,
+         handles: Option<MaintainedLeafHandles>,
++        canonical_lookup: Option<CanonicalRowPositionIndex>,
+     },
+     Filter {
+         input: Box<MaterializedRelPlanState>,
+@@ -3314,11 +3448,21 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<MaintainedRelPlanNode, RelQueryError> {
+         Ok(match query {
+-            RelExpr::Scan(relation) => MaintainedRelPlanNode::Scan {
+-                relation: *relation,
+-                value: query.evaluate(old, context, registry)?,
+-                handles: None,
+-            },
++            RelExpr::Scan(relation) => {
++                let value = query.evaluate(old, context, registry)?;
++                let canonical_lookup = canonical_row_position_index(
++                    value.rows(),
++                    relation_column_equivalences(result_type),
++                    context,
++                    registry,
++                )?;
++                MaintainedRelPlanNode::Scan {
++                    relation: *relation,
++                    value,
++                    handles: None,
++                    canonical_lookup,
++                }
++            }
+             RelExpr::FilterEqConst {
+                 input,
+                 column,
+@@ -3729,6 +3873,7 @@
+                 relation: current,
+                 value,
+                 handles,
++                ..
+             } => {
+                 if *current != relation {
+                     return Ok(());
+@@ -3905,6 +4050,7 @@
+                 relation,
+                 value,
+                 handles,
++                ..
+             } => {
+                 let Some(resolved) = deltas.get(relation) else {
+                     return Ok(());
+@@ -3975,6 +4121,7 @@
+                 relation,
+                 value,
+                 handles,
++                ..
+             } => {
+                 let Some(resolved) = deltas.get(relation) else {
+                     return Ok(());
+@@ -4159,7 +4306,10 @@
+     ) -> Result<(), RelQueryError> {
+         match self.node.as_ref() {
+             MaintainedRelPlanNode::Scan {
+-                relation, value, ..
++                relation,
++                value,
++                canonical_lookup,
++                ..
+             } => {
+                 let edge = CompiledDeltaEdgeIdentity::new(*next_edge_ordinal, *relation);
+                 *next_edge_ordinal = next_edge_ordinal
+@@ -4187,6 +4337,7 @@
+                     value,
+                     delta,
+                     &self.result_type,
++                    canonical_lookup.as_ref(),
+                     context,
+                     registry,
+                 )?;
+@@ -4450,10 +4601,14 @@
+     fn commit_relation_plan(&mut self, patch: MaintainedRelPlanPatch) {
+         match (Arc::make_mut(&mut self.node), patch) {
+             (
+-                MaintainedRelPlanNode::Scan { value, .. },
++                MaintainedRelPlanNode::Scan {
++                    value,
++                    canonical_lookup,
++                    ..
++                },
+                 MaintainedRelPlanPatch::Scan(Some(plan)),
+             ) => {
+-                MaterializedJoinDeltaState::commit_relation_mutation(value, plan);
++                MaterializedJoinDeltaState::commit_relation_mutation(value, canonical_lookup, plan);
+             }
+             (MaintainedRelPlanNode::Scan { .. }, MaintainedRelPlanPatch::Scan(None)) => {}
+             (
+@@ -6567,15 +6722,7 @@
+             changes.push((key, (!bucket.is_empty()).then_some(bucket)));
+         }
+         let before = self.i64_output_rows(buckets);
+-        let mut candidate = buckets.clone();
+-        for (key, bucket) in &changes {
+-            if let Some(bucket) = bucket {
+-                candidate.insert(*key, bucket.clone());
+-            } else {
+-                candidate.remove(key);
+-            }
+-        }
+-        let after = self.i64_output_rows(&candidate);
++        let after = self.i64_output_rows_with_changes(buckets, &changes);
+         let effect =
+             adaptive_delta_between_rows(&before, &after, &self.result_type, context, registry)?;
+         Ok(PlannedDeltaEffect {
+@@ -6647,6 +6794,100 @@
+         }
+     }
+ 
++    fn i64_output_rows_with_changes(
++        &self,
++        buckets: &BTreeMap<i64, Vec<Row>>,
++        changes: &[(i64, Option<Vec<Row>>)],
++    ) -> Vec<Row> {
++        if self.k == 0 {
++            return Vec::new();
++        }
++        let mut out = Vec::new();
++        match self.direction {
++            OrderDirection::Ascending => {
++                let mut base = buckets.iter().peekable();
++                let mut overlay = changes.iter().peekable();
++                while out.len() < self.k {
++                    match (base.peek(), overlay.peek()) {
++                        (Some((base_key, base_bucket)), Some((changed_key, changed_bucket))) => {
++                            match (**base_key).cmp(changed_key) {
++                                std::cmp::Ordering::Less => {
++                                    out.extend(base_bucket.iter().cloned());
++                                    base.next();
++                                }
++                                std::cmp::Ordering::Greater => {
++                                    if let Some(bucket) = changed_bucket {
++                                        out.extend(bucket.iter().cloned());
++                                    }
++                                    overlay.next();
++                                }
++                                std::cmp::Ordering::Equal => {
++                                    if let Some(bucket) = changed_bucket {
++                                        out.extend(bucket.iter().cloned());
++                                    }
++                                    base.next();
++                                    overlay.next();
++                                }
++                            }
++                        }
++                        (Some((_, bucket)), None) => {
++                            out.extend(bucket.iter().cloned());
++                            base.next();
++                        }
++                        (None, Some((_, bucket))) => {
++                            if let Some(bucket) = bucket {
++                                out.extend(bucket.iter().cloned());
++                            }
++                            overlay.next();
++                        }
++                        (None, None) => break,
++                    }
++                }
++            }
++            OrderDirection::Descending => {
++                let mut base = buckets.iter().rev().peekable();
++                let mut overlay = changes.iter().rev().peekable();
++                while out.len() < self.k {
++                    match (base.peek(), overlay.peek()) {
++                        (Some((base_key, base_bucket)), Some((changed_key, changed_bucket))) => {
++                            match (**base_key).cmp(changed_key) {
++                                std::cmp::Ordering::Greater => {
++                                    out.extend(base_bucket.iter().cloned());
++                                    base.next();
++                                }
++                                std::cmp::Ordering::Less => {
++                                    if let Some(bucket) = changed_bucket {
++                                        out.extend(bucket.iter().cloned());
++                                    }
++                                    overlay.next();
++                                }
++                                std::cmp::Ordering::Equal => {
++                                    if let Some(bucket) = changed_bucket {
++                                        out.extend(bucket.iter().cloned());
++                                    }
++                                    base.next();
++                                    overlay.next();
++                                }
++                            }
++                        }
++                        (Some((_, bucket)), None) => {
++                            out.extend(bucket.iter().cloned());
++                            base.next();
++                        }
++                        (None, Some((_, bucket))) => {
++                            if let Some(bucket) = bucket {
++                                out.extend(bucket.iter().cloned());
++                            }
++                            overlay.next();
++                        }
++                        (None, None) => break,
++                    }
++                }
++            }
++        }
++        out
++    }
++
+     fn i64_output_rows(&self, buckets: &BTreeMap<i64, Vec<Row>>) -> Vec<Row> {
+         if self.k == 0 {
+             return Vec::new();
+@@ -7146,6 +7387,27 @@
+         .collect()
+ }
+ 
++fn canonical_row_position_index(
++    rows: &[Row],
++    column_equivalences: &[kernel_types::SemanticId],
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<CanonicalRowPositionIndex>, RelQueryError> {
++    let mut by_key = BTreeMap::<CanonicalRowKey, Vec<usize>>::new();
++    let mut by_position = Vec::with_capacity(rows.len());
++    for (index, row) in rows.iter().enumerate() {
++        let Some(key) = try_canonical_row_key(row, column_equivalences, context, registry)? else {
++            return Ok(None);
++        };
++        by_key.entry(key.clone()).or_default().push(index);
++        by_position.push(key);
++    }
++    Ok(Some(CanonicalRowPositionIndex {
++        by_key,
++        by_position,
++    }))
++}
++
+ fn canonical_row_supports(
+     rows: &[Row],
+     column_equivalences: &[kernel_types::SemanticId],

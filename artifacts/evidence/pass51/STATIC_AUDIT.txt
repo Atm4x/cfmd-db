@@ -1,0 +1,7 @@
+Rust: rustc 1.98.1 (48a229cea 2026-09-01)
+Declared tests: 357
+kernel-plan tests: 129
+Rust LOC: 49003
+unsafe matches: 0
+allow sites: 19
+TODO/FIXME/todo!/unimplemented!: 0

@@ -1,0 +1,23 @@
+[package]
+name = "kernel-integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-types = { path = "../kernel-types" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-model = { path = "../kernel-model" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-lifecycle = { path = "../kernel-lifecycle" }
+kernel-change = { path = "../kernel-change" }
+kernel-query = { path = "../kernel-query" }
+kernel-lens = { path = "../kernel-lens" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-retention = { path = "../kernel-retention" }
+kernel-proof = { path = "../kernel-proof" }
+kernel-plan = { path = "../kernel-plan" }
+storage-memory = { path = "../storage-memory" }
+
+[lints]
+workspace = true

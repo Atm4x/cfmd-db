@@ -1,0 +1,15 @@
+RUN 1
+stage6 label=linear_join_group_topk samples=400 median_ns=13100 p90_ns=13601
+stage6 label=blocker_group_topk samples=400 median_ns=10996 p90_ns=11387
+RUN 2
+stage6 label=linear_join_group_topk samples=400 median_ns=13200 p90_ns=19009
+stage6 label=blocker_group_topk samples=400 median_ns=11056 p90_ns=11878
+RUN 3
+stage6 label=linear_join_group_topk samples=400 median_ns=13170 p90_ns=14021
+stage6 label=blocker_group_topk samples=400 median_ns=10997 p90_ns=11528
+RUN 4
+stage6 label=linear_join_group_topk samples=400 median_ns=13270 p90_ns=13891
+stage6 label=blocker_group_topk samples=400 median_ns=11116 p90_ns=11527
+RUN 5
+stage6 label=linear_join_group_topk samples=400 median_ns=13020 p90_ns=13611
+stage6 label=blocker_group_topk samples=400 median_ns=10986 p90_ns=11587

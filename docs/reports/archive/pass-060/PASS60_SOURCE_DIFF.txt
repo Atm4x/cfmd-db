@@ -1,0 +1,1884 @@
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-identity/src/lib.rs /mnt/data/cfmd_workspace_pass60/crates/kernel-identity/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-identity/src/lib.rs	2026-09-20 18:42:26.157307595 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-identity/src/lib.rs	2026-09-20 19:34:50.606070474 +0000
+@@ -39,6 +39,18 @@
+         self.words[word] |= 1_u64 << bit;
+     }
+ 
++    pub fn remove(&mut self, entity: LocalEntityId) -> bool {
++        let word = entity.index() / 64;
++        let bit = entity.index() % 64;
++        let Some(bits) = self.words.get_mut(word) else {
++            return false;
++        };
++        let mask = 1_u64 << bit;
++        let existed = *bits & mask != 0;
++        *bits &= !mask;
++        existed
++    }
++
+     #[must_use]
+     pub fn contains(&self, entity: LocalEntityId) -> bool {
+         let word = entity.index() / 64;
+@@ -60,6 +72,23 @@
+     pub fn is_empty(&self) -> bool {
+         self.words.iter().all(|word| *word == 0)
+     }
++
++    pub fn iter(&self) -> impl Iterator<Item = LocalEntityId> + '_ {
++        self.words
++            .iter()
++            .enumerate()
++            .flat_map(|(word_index, word)| {
++                let word = *word;
++                (0_usize..64)
++                    .filter(move |&bit| word & (1_u64 << bit) != 0)
++                    .map(move |bit| {
++                        let index = word_index * 64 + bit;
++                        LocalEntityId(
++                            u32::try_from(index).expect("dense entity set index fits u32"),
++                        )
++                    })
++            })
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Default)]
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-lifecycle/src/lib.rs /mnt/data/cfmd_workspace_pass60/crates/kernel-lifecycle/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-lifecycle/src/lib.rs	2026-09-20 18:43:07.626813191 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-lifecycle/src/lib.rs	2026-09-20 19:33:56.286085516 +0000
+@@ -1,6 +1,6 @@
+ use std::collections::{BTreeMap, BTreeSet, VecDeque};
+ 
+-use kernel_identity::{DenseEntityIds, DenseIdentityError, LocalEntityId};
++use kernel_identity::{DenseEntityIds, DenseEntitySet, DenseIdentityError, LocalEntityId};
+ use kernel_types::EntityId;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+@@ -60,18 +60,209 @@
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct DenseLifecycleProjection {
+     ids: DenseEntityIds,
+-    roots: Vec<LocalEntityId>,
++    roots: DenseEntitySet,
+     keeps_alive: Vec<Vec<LocalEntityId>>,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct MaintainedDenseLifecycle {
++    ids: DenseEntityIds,
++    roots: DenseEntitySet,
++    keeps_alive: Vec<Vec<LocalEntityId>>,
++    kept_by: Vec<Vec<LocalEntityId>>,
++    live: DenseEntitySet,
++}
++
++impl MaintainedDenseLifecycle {
++    pub fn compile(graph: &LifecycleGraph) -> Result<Self, DenseIdentityError> {
++        let projection = DenseLifecycleProjection::compile(graph)?;
++        Ok(Self::from_projection(projection))
++    }
++
++    #[must_use]
++    pub fn compile_with_ids(graph: &LifecycleGraph, ids: &DenseEntityIds) -> Self {
++        Self::from_projection(DenseLifecycleProjection::compile_with_ids(graph, ids))
++    }
++
++    fn from_projection(projection: DenseLifecycleProjection) -> Self {
++        let mut kept_by = vec![Vec::new(); projection.ids.len()];
++        for (parent_index, children) in projection.keeps_alive.iter().enumerate() {
++            let Some(parent_external) = projection.ids.external_at(parent_index) else {
++                continue;
++            };
++            let Some(parent) = projection.ids.local(parent_external) else {
++                continue;
++            };
++            for &child in children {
++                kept_by[child.index()].push(parent);
++            }
++        }
++        for parents in &mut kept_by {
++            parents.sort_unstable();
++            parents.dedup();
++        }
++        let live = projection.live_set();
++        Self {
++            ids: projection.ids,
++            roots: projection.roots,
++            keeps_alive: projection.keeps_alive,
++            kept_by,
++            live,
++        }
++    }
++
++    #[must_use]
++    pub fn live_count(&self) -> usize {
++        self.live.len()
++    }
++
++    #[must_use]
++    pub fn live_entities(&self) -> BTreeSet<EntityId> {
++        self.live
++            .iter()
++            .filter_map(|local| self.ids.external(local))
++            .collect()
++    }
++
++    pub fn apply_intent(&mut self, intent: &LifecycleIntent) {
++        let mut decrease_starts = Vec::new();
++        let mut additions = Vec::new();
++
++        for (fact, &present) in intent.edits() {
++            match (fact, present) {
++                (LifecycleFact::Root(entity), false) => {
++                    if let Some(local) = self.ids.local(*entity)
++                        && self.roots.remove(local)
++                    {
++                        decrease_starts.push(local);
++                    }
++                }
++                (LifecycleFact::KeepsAlive { parent, child }, false) => {
++                    let (Some(parent), Some(child)) =
++                        (self.ids.local(*parent), self.ids.local(*child))
++                    else {
++                        continue;
++                    };
++                    if remove_sorted(&mut self.keeps_alive[parent.index()], child) {
++                        remove_sorted(&mut self.kept_by[child.index()], parent);
++                        decrease_starts.push(child);
++                    }
++                }
++                (_, true) => additions.push(fact.clone()),
++            }
++        }
++
++        if !decrease_starts.is_empty() {
++            self.recompute_decrease_region(&decrease_starts);
++        }
++
++        let mut increase_starts = Vec::new();
++        for fact in additions {
++            match fact {
++                LifecycleFact::Root(entity) => {
++                    if let Some(local) = self.ids.local(entity) {
++                        self.roots.insert(local);
++                        increase_starts.push(local);
++                    }
++                }
++                LifecycleFact::KeepsAlive { parent, child } => {
++                    let (Some(parent), Some(child)) =
++                        (self.ids.local(parent), self.ids.local(child))
++                    else {
++                        continue;
++                    };
++                    insert_sorted_unique(&mut self.keeps_alive[parent.index()], child);
++                    insert_sorted_unique(&mut self.kept_by[child.index()], parent);
++                    if self.live.contains(parent) {
++                        increase_starts.push(child);
++                    }
++                }
++            }
++        }
++        self.activate_from(&increase_starts);
++    }
++
++    fn recompute_decrease_region(&mut self, starts: &[LocalEntityId]) {
++        let mut candidate = DenseEntitySet::with_capacity(self.ids.len());
++        let mut queue = VecDeque::from(starts.to_vec());
++        while let Some(entity) = queue.pop_front() {
++            if candidate.contains(entity) {
++                continue;
++            }
++            candidate.insert(entity);
++            queue.extend(self.keeps_alive[entity.index()].iter().copied());
++        }
++
++        let mut surviving = DenseEntitySet::with_capacity(self.ids.len());
++        let mut queue = VecDeque::new();
++        for entity in candidate.iter() {
++            let externally_supported = self.roots.contains(entity)
++                || self.kept_by[entity.index()]
++                    .iter()
++                    .any(|&parent| self.live.contains(parent) && !candidate.contains(parent));
++            if externally_supported {
++                surviving.insert(entity);
++                queue.push_back(entity);
++            }
++        }
++        while let Some(parent) = queue.pop_front() {
++            for &child in &self.keeps_alive[parent.index()] {
++                if candidate.contains(child) && !surviving.contains(child) {
++                    surviving.insert(child);
++                    queue.push_back(child);
++                }
++            }
++        }
++        for entity in candidate.iter() {
++            self.live.remove(entity);
++        }
++        for entity in surviving.iter() {
++            self.live.insert(entity);
++        }
++    }
++
++    fn activate_from(&mut self, starts: &[LocalEntityId]) {
++        let mut queue = VecDeque::from(starts.to_vec());
++        while let Some(entity) = queue.pop_front() {
++            if self.live.contains(entity) {
++                continue;
++            }
++            self.live.insert(entity);
++            queue.extend(self.keeps_alive[entity.index()].iter().copied());
++        }
++    }
++}
++
++fn insert_sorted_unique(values: &mut Vec<LocalEntityId>, value: LocalEntityId) -> bool {
++    match values.binary_search(&value) {
++        Ok(_) => false,
++        Err(index) => {
++            values.insert(index, value);
++            true
++        }
++    }
++}
++
++fn remove_sorted(values: &mut Vec<LocalEntityId>, value: LocalEntityId) -> bool {
++    let Ok(index) = values.binary_search(&value) else {
++        return false;
++    };
++    values.remove(index);
++    true
++}
++
+ impl DenseLifecycleProjection {
+     pub fn compile(graph: &LifecycleGraph) -> Result<Self, DenseIdentityError> {
+         let ids = DenseEntityIds::compile(&graph.entities)?;
+-        let roots = graph
+-            .roots
+-            .iter()
+-            .filter_map(|entity| ids.local(*entity))
+-            .collect::<Vec<_>>();
++        Ok(Self::compile_with_ids(graph, &ids))
++    }
++
++    #[must_use]
++    pub fn compile_with_ids(graph: &LifecycleGraph, ids: &DenseEntityIds) -> Self {
++        let mut roots = DenseEntitySet::with_capacity(ids.len());
++        for root in graph.roots.iter().filter_map(|entity| ids.local(*entity)) {
++            roots.insert(root);
++        }
+         let mut keeps_alive = vec![Vec::new(); ids.len()];
+         for (parent, children) in &graph.keeps_alive {
+             let Some(parent) = ids.local(*parent) else {
+@@ -80,26 +271,26 @@
+             keeps_alive[parent.index()]
+                 .extend(children.iter().filter_map(|child| ids.local(*child)));
+         }
+-        Ok(Self {
+-            ids,
++        Self {
++            ids: ids.clone(),
+             roots,
+             keeps_alive,
+-        })
++        }
+     }
+ 
+-    fn live_mask(&self) -> Vec<bool> {
+-        let mut live = vec![false; self.ids.len()];
++    fn live_set(&self) -> DenseEntitySet {
++        let mut live = DenseEntitySet::with_capacity(self.ids.len());
+         let mut queue = VecDeque::new();
+-        for &root in &self.roots {
+-            if !live[root.index()] {
+-                live[root.index()] = true;
++        for root in self.roots.iter() {
++            if !live.contains(root) {
++                live.insert(root);
+                 queue.push_back(root);
+             }
+         }
+         while let Some(parent) = queue.pop_front() {
+             for &child in &self.keeps_alive[parent.index()] {
+-                if !live[child.index()] {
+-                    live[child.index()] = true;
++                if !live.contains(child) {
++                    live.insert(child);
+                     queue.push_back(child);
+                 }
+             }
+@@ -109,15 +300,14 @@
+ 
+     #[must_use]
+     pub fn live_count(&self) -> usize {
+-        self.live_mask().into_iter().filter(|live| *live).count()
++        self.live_set().len()
+     }
+ 
+     #[must_use]
+     pub fn live_entities(&self) -> BTreeSet<EntityId> {
+-        self.live_mask()
+-            .into_iter()
+-            .enumerate()
+-            .filter_map(|(index, live)| live.then(|| self.ids.external_at(index)).flatten())
++        self.live_set()
++            .iter()
++            .filter_map(|local| self.ids.external(local))
+             .collect()
+     }
+ }
+@@ -271,6 +461,180 @@
+     }
+ 
+     #[test]
++    fn maintained_dense_lifecycle_matches_exact_lfp_through_cycle_death_and_resurrection() {
++        let mut graph = LifecycleGraph::default();
++        graph.entities.extend((1..=6).map(id));
++        graph.roots.insert(id(1));
++        graph.keeps_alive.insert(id(1), BTreeSet::from([id(2)]));
++        graph.keeps_alive.insert(id(2), BTreeSet::from([id(3)]));
++        graph
++            .keeps_alive
++            .insert(id(3), BTreeSet::from([id(2), id(4)]));
++        graph.keeps_alive.insert(id(5), BTreeSet::from([id(6)]));
++        graph.keeps_alive.insert(id(6), BTreeSet::from([id(5)]));
++
++        let mut maintained = MaintainedDenseLifecycle::compile(&graph).unwrap();
++        assert_eq!(maintained.live_entities(), graph.live_entities());
++
++        let mut cut = LifecycleIntent::default();
++        cut.set(
++            LifecycleFact::KeepsAlive {
++                parent: id(1),
++                child: id(2),
++            },
++            false,
++        );
++        graph.apply_intent(&cut);
++        maintained.apply_intent(&cut);
++        assert_eq!(maintained.live_entities(), graph.live_entities());
++        assert_eq!(maintained.live_entities(), BTreeSet::from([id(1)]));
++
++        let mut root_cycle = LifecycleIntent::default();
++        root_cycle.set(LifecycleFact::Root(id(3)), true);
++        graph.apply_intent(&root_cycle);
++        maintained.apply_intent(&root_cycle);
++        assert_eq!(maintained.live_entities(), graph.live_entities());
++        assert_eq!(maintained.live_count(), 4);
++
++        let mut bridge = LifecycleIntent::default();
++        bridge.set(
++            LifecycleFact::KeepsAlive {
++                parent: id(4),
++                child: id(5),
++            },
++            true,
++        );
++        graph.apply_intent(&bridge);
++        maintained.apply_intent(&bridge);
++        assert_eq!(maintained.live_entities(), graph.live_entities());
++        assert_eq!(maintained.live_count(), 6);
++
++        let mut remove_root = LifecycleIntent::default();
++        remove_root.set(LifecycleFact::Root(id(3)), false);
++        graph.apply_intent(&remove_root);
++        maintained.apply_intent(&remove_root);
++        assert_eq!(maintained.live_entities(), graph.live_entities());
++        assert_eq!(maintained.live_entities(), BTreeSet::from([id(1)]));
++    }
++
++    #[test]
++    fn maintained_dense_lifecycle_matches_reference_for_all_single_fact_toggles_on_three_nodes() {
++        let nodes = [id(1), id(2), id(3)];
++        let directed_edges = [
++            (nodes[0], nodes[1]),
++            (nodes[0], nodes[2]),
++            (nodes[1], nodes[0]),
++            (nodes[1], nodes[2]),
++            (nodes[2], nodes[0]),
++            (nodes[2], nodes[1]),
++        ];
++
++        for root_mask in 0_u8..8 {
++            for edge_mask in 0_u8..64 {
++                let mut base = LifecycleGraph::default();
++                base.entities.extend(nodes);
++                for (index, node) in nodes.iter().enumerate() {
++                    if root_mask & (1 << index) != 0 {
++                        base.roots.insert(*node);
++                    }
++                }
++                for (index, (parent, child)) in directed_edges.iter().enumerate() {
++                    if edge_mask & (1 << index) != 0 {
++                        base.keeps_alive.entry(*parent).or_default().insert(*child);
++                    }
++                }
++
++                let facts = nodes.iter().copied().map(LifecycleFact::Root).chain(
++                    directed_edges
++                        .iter()
++                        .copied()
++                        .map(|(parent, child)| LifecycleFact::KeepsAlive { parent, child }),
++                );
++                for fact in facts {
++                    let currently_present = match &fact {
++                        LifecycleFact::Root(entity) => base.roots.contains(entity),
++                        LifecycleFact::KeepsAlive { parent, child } => base
++                            .keeps_alive
++                            .get(parent)
++                            .is_some_and(|children| children.contains(child)),
++                    };
++                    let mut intent = LifecycleIntent::default();
++                    intent.set(fact, !currently_present);
++
++                    let mut reference = base.clone();
++                    reference.apply_intent(&intent);
++                    let mut maintained = MaintainedDenseLifecycle::compile(&base).unwrap();
++                    maintained.apply_intent(&intent);
++                    assert_eq!(
++                        maintained.live_entities(),
++                        reference.live_entities(),
++                        "root_mask={root_mask}, edge_mask={edge_mask}"
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    #[ignore = "diagnostic release benchmark"]
++    fn benchmark_maintained_dense_lifecycle_local_cut_against_full_tree_recompute() {
++        use std::hint::black_box;
++        use std::time::Instant;
++
++        let n = 50_000_u128;
++        let cut_parent = 49_000_u128;
++        let mut graph = LifecycleGraph::default();
++        graph.entities.extend((1..=n).map(id));
++        graph.roots.insert(id(1));
++        for raw in 1..n {
++            graph
++                .keeps_alive
++                .entry(id(raw))
++                .or_default()
++                .insert(id(raw + 1));
++        }
++        let mut maintained = MaintainedDenseLifecycle::compile(&graph).unwrap();
++
++        let mut remove = LifecycleIntent::default();
++        remove.set(
++            LifecycleFact::KeepsAlive {
++                parent: id(cut_parent),
++                child: id(cut_parent + 1),
++            },
++            false,
++        );
++        let mut add = LifecycleIntent::default();
++        add.set(
++            LifecycleFact::KeepsAlive {
++                parent: id(cut_parent),
++                child: id(cut_parent + 1),
++            },
++            true,
++        );
++
++        let start = Instant::now();
++        for _ in 0..20 {
++            graph.apply_intent(&remove);
++            black_box(graph.live_entities());
++            graph.apply_intent(&add);
++            black_box(graph.live_entities());
++        }
++        let tree_ns = start.elapsed().as_nanos();
++
++        let start = Instant::now();
++        for _ in 0..20 {
++            maintained.apply_intent(&remove);
++            black_box(maintained.live_count());
++            maintained.apply_intent(&add);
++            black_box(maintained.live_count());
++        }
++        let maintained_ns = start.elapsed().as_nanos();
++        assert_eq!(maintained.live_entities(), graph.live_entities());
++        let ratio_milli = tree_ns.saturating_mul(1_000) / maintained_ns.max(1);
++        println!("tree_ns={tree_ns} maintained_ns={maintained_ns} ratio_milli={ratio_milli}");
++    }
++
++    #[test]
+     #[ignore = "diagnostic release benchmark"]
+     fn benchmark_dense_local_id_lifecycle_against_entity_tree_walk() {
+         use std::hint::black_box;
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-model/Cargo.toml /mnt/data/cfmd_workspace_pass60/crates/kernel-model/Cargo.toml
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-model/Cargo.toml	2026-09-19 00:48:16.000000000 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-model/Cargo.toml	2026-09-20 19:33:04.755927938 +0000
+@@ -5,6 +5,7 @@
+ license.workspace = true
+ 
+ [dependencies]
++kernel-identity = { path = "../kernel-identity" }
+ kernel-types = { path = "../kernel-types" }
+ kernel-schema = { path = "../kernel-schema" }
+ kernel-lifecycle = { path = "../kernel-lifecycle" }
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-model/src/lib.rs /mnt/data/cfmd_workspace_pass60/crates/kernel-model/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-model/src/lib.rs	2026-09-19 01:53:54.000000000 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-model/src/lib.rs	2026-09-20 19:33:04.756055346 +0000
+@@ -1,5 +1,6 @@
+ use std::collections::{BTreeMap, BTreeSet};
+ 
++use kernel_identity::{DenseEntityIds, DenseEntitySet, LocalEntityId};
+ use kernel_lifecycle::LifecycleGraph;
+ use kernel_schema::ContextError;
+ use kernel_types::{EntityId, SemanticId};
+@@ -73,6 +74,123 @@
+             }),
+         }
+     }
++
++    fn collect_live_refs(&self, output: &mut Vec<EntityId>) {
++        match self {
++            Self::LiveEntityRef { id, .. } => output.push(*id),
++            Self::HistoricalEntityId { .. }
++            | Self::Unit
++            | Self::Bool(_)
++            | Self::I64(_)
++            | Self::F64Bits(_)
++            | Self::Text(_) => {}
++            Self::Product(values) => {
++                for value in values.values() {
++                    value.collect_live_refs(output);
++                }
++            }
++            Self::Seq(values)
++            | Self::Set {
++                elements: values, ..
++            } => {
++                for value in values {
++                    value.collect_live_refs(output);
++                }
++            }
++            Self::Variant { value, .. } => value.collect_live_refs(output),
++            Self::Option(value) => {
++                if let Some(value) = value.as_deref() {
++                    value.collect_live_refs(output);
++                }
++            }
++            Self::Bag { entries, .. } => {
++                for (value, _) in entries {
++                    value.collect_live_refs(output);
++                }
++            }
++            Self::Map { entries, .. } => {
++                for (key, value) in entries {
++                    key.collect_live_refs(output);
++                    value.collect_live_refs(output);
++                }
++            }
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Default)]
++pub struct LiveRefConsumers {
++    fields: BTreeSet<(SemanticId, EntityId)>,
++    relation_rows: BTreeMap<SemanticId, BTreeSet<usize>>,
++}
++
++impl LiveRefConsumers {
++    #[must_use]
++    pub fn fields(&self) -> &BTreeSet<(SemanticId, EntityId)> {
++        &self.fields
++    }
++
++    #[must_use]
++    pub fn relation_rows(&self) -> &BTreeMap<SemanticId, BTreeSet<usize>> {
++        &self.relation_rows
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Default)]
++pub struct LiveRefSensitivityIndex {
++    by_target: BTreeMap<LocalEntityId, LiveRefConsumers>,
++    unresolved: BTreeMap<EntityId, LiveRefConsumers>,
++}
++
++impl LiveRefSensitivityIndex {
++    #[must_use]
++    pub fn compile(model: &FiniteModel, ids: &DenseEntityIds) -> Self {
++        let mut index = Self::default();
++        for (&field, value) in &model.fields {
++            let mut targets = Vec::new();
++            value.collect_live_refs(&mut targets);
++            for target in targets {
++                index.consumers_mut(ids, target).fields.insert(field);
++            }
++        }
++        for (&relation, rows) in &model.relations {
++            for (row_index, row) in rows.iter().enumerate() {
++                let mut targets = Vec::new();
++                for value in row {
++                    value.collect_live_refs(&mut targets);
++                }
++                targets.sort_unstable();
++                targets.dedup();
++                for target in targets {
++                    index
++                        .consumers_mut(ids, target)
++                        .relation_rows
++                        .entry(relation)
++                        .or_default()
++                        .insert(row_index);
++                }
++            }
++        }
++        index
++    }
++
++    fn consumers_mut(&mut self, ids: &DenseEntityIds, target: EntityId) -> &mut LiveRefConsumers {
++        if let Some(local) = ids.local(target) {
++            self.by_target.entry(local).or_default()
++        } else {
++            self.unresolved.entry(target).or_default()
++        }
++    }
++
++    #[must_use]
++    pub fn consumers(&self, target: LocalEntityId) -> Option<&LiveRefConsumers> {
++        self.by_target.get(&target)
++    }
++
++    #[must_use]
++    pub fn unresolved(&self, target: EntityId) -> Option<&LiveRefConsumers> {
++        self.unresolved.get(&target)
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Default)]
+@@ -90,33 +208,81 @@
+             .collect()
+     }
+ 
+-    fn restrict_to_live(&mut self, live: &BTreeSet<EntityId>) -> Result<(), ModelError> {
++    fn restrict_to_live_indexed(
++        &mut self,
++        live: &BTreeSet<EntityId>,
++        ids: &DenseEntityIds,
++        refs: &LiveRefSensitivityIndex,
++    ) -> Result<(), ModelError> {
+         for carrier in self.carriers.values_mut() {
+             carrier.retain(|entity| live.contains(entity));
+         }
+         self.fields.retain(|(_, owner), _| live.contains(owner));
+ 
+-        for value in self.fields.values() {
+-            if let Some(id) = value.first_dangling_live_ref(live) {
+-                return Err(ModelError::DanglingLiveReference(id));
++        let mut live_dense = DenseEntitySet::with_capacity(ids.len());
++        for entity in live {
++            if let Some(local) = ids.local(*entity) {
++                live_dense.insert(local);
+             }
+         }
+ 
+-        for tuples in self.relations.values_mut() {
+-            tuples.retain(|tuple| {
+-                !tuple
+-                    .iter()
+-                    .any(|value| value.first_dangling_live_ref(live).is_some())
++        let mut relation_rows_to_remove = BTreeMap::<SemanticId, BTreeSet<usize>>::new();
++        for (&target, consumers) in &refs.by_target {
++            if live_dense.contains(target) {
++                continue;
++            }
++            if consumers
++                .fields
++                .iter()
++                .any(|(_, owner)| live.contains(owner))
++            {
++                let external = ids
++                    .external(target)
++                    .expect("sensitivity target comes from dense identity map");
++                return Err(ModelError::DanglingLiveReference(external));
++            }
++            merge_relation_rows(&mut relation_rows_to_remove, &consumers.relation_rows);
++        }
++        for (&target, consumers) in &refs.unresolved {
++            if consumers
++                .fields
++                .iter()
++                .any(|(_, owner)| live.contains(owner))
++            {
++                return Err(ModelError::DanglingLiveReference(target));
++            }
++            merge_relation_rows(&mut relation_rows_to_remove, &consumers.relation_rows);
++        }
++
++        for (relation, rows_to_remove) in relation_rows_to_remove {
++            let Some(rows) = self.relations.get_mut(&relation) else {
++                continue;
++            };
++            let mut row_index = 0_usize;
++            rows.retain(|_| {
++                let keep = !rows_to_remove.contains(&row_index);
++                row_index += 1;
++                keep
+             });
+         }
+         Ok(())
+     }
+ }
+ 
++fn merge_relation_rows(
++    target: &mut BTreeMap<SemanticId, BTreeSet<usize>>,
++    source: &BTreeMap<SemanticId, BTreeSet<usize>>,
++) {
++    for (&relation, rows) in source {
++        target.entry(relation).or_default().extend(rows);
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum ModelError {
+     EntityMissingFromLifecycle(EntityId),
+     DanglingLiveReference(EntityId),
++    DenseIdentityCapacityExceeded,
+     InvalidSemanticContext(ContextError),
+ }
+ 
+@@ -134,8 +300,12 @@
+             }
+         }
+ 
++        let ids = DenseEntityIds::compile(&self.lifecycle.entities)
++            .map_err(|_| ModelError::DenseIdentityCapacityExceeded)?;
++        let refs = LiveRefSensitivityIndex::compile(&self.model, &ids);
+         self.lifecycle = self.lifecycle.normalize();
+-        self.model.restrict_to_live(&self.lifecycle.entities)?;
++        self.model
++            .restrict_to_live_indexed(&self.lifecycle.entities, &ids, &refs)?;
+         Ok(self)
+     }
+ }
+@@ -261,4 +431,74 @@
+             }
+         );
+     }
++
++    #[test]
++    fn reverse_live_ref_sensitivity_indexes_nested_fields_and_relation_rows() {
++        let owner = EntityId::new(1);
++        let target = EntityId::new(2);
++        let entity_type = SemanticId::new(10);
++        let field = SemanticId::new(11);
++        let relation = SemanticId::new(12);
++        let ids = DenseEntityIds::compile(&BTreeSet::from([owner, target])).unwrap();
++        let mut model = FiniteModel::default();
++        model.fields.insert(
++            (field, owner),
++            Value::Product(BTreeMap::from([(
++                SemanticId::new(99),
++                Value::Option(Some(Box::new(Value::LiveEntityRef {
++                    entity_type,
++                    id: target,
++                }))),
++            )])),
++        );
++        model.relations.insert(
++            relation,
++            vec![
++                vec![Value::I64(1)],
++                vec![Value::LiveEntityRef {
++                    entity_type,
++                    id: target,
++                }],
++            ],
++        );
++
++        let sensitivity = LiveRefSensitivityIndex::compile(&model, &ids);
++        let consumers = sensitivity.consumers(ids.local(target).unwrap()).unwrap();
++        assert!(consumers.fields().contains(&(field, owner)));
++        assert_eq!(
++            consumers.relation_rows().get(&relation),
++            Some(&BTreeSet::from([1]))
++        );
++    }
++
++    #[test]
++    fn indexed_lifecycle_restriction_preserves_previous_dangling_reference_semantics() {
++        let live = EntityId::new(1);
++        let dead = EntityId::new(2);
++        let entity_type = SemanticId::new(10);
++        let relation = SemanticId::new(12);
++        let mut state = DatabaseState::default();
++        state.lifecycle.entities.extend([live, dead]);
++        state.lifecycle.roots.insert(live);
++        state
++            .model
++            .carriers
++            .insert(entity_type, BTreeSet::from([live, dead]));
++        state.model.relations.insert(
++            relation,
++            vec![
++                vec![Value::I64(7)],
++                vec![Value::LiveEntityRef {
++                    entity_type,
++                    id: dead,
++                }],
++            ],
++        );
++
++        let normalized = state.normalize().unwrap();
++        assert_eq!(
++            normalized.model.relations[&relation],
++            vec![vec![Value::I64(7)]]
++        );
++    }
+ }
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-plan/Cargo.toml /mnt/data/cfmd_workspace_pass60/crates/kernel-plan/Cargo.toml
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-plan/Cargo.toml	2026-09-20 02:27:24.000000000 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-plan/Cargo.toml	2026-09-20 19:33:04.756150676 +0000
+@@ -5,6 +5,7 @@
+ license.workspace = true
+ 
+ [dependencies]
++kernel-identity = { path = "../kernel-identity" }
+ kernel-durability = { path = "../kernel-durability" }
+ kernel-aggregate = { path = "../kernel-aggregate" }
+ kernel-model = { path = "../kernel-model" }
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-plan/src/lib.rs /mnt/data/cfmd_workspace_pass60/crates/kernel-plan/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-plan/src/lib.rs	2026-09-20 19:23:02.448132686 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-plan/src/lib.rs	2026-09-20 19:34:39.958622898 +0000
+@@ -12,6 +12,7 @@
+     DurableRevisionStore, DurableTransactionIntent, DurableTransactionOutcome, RecoveryScan,
+     RevisionDurability,
+ };
++use kernel_identity::{DenseEntityIds, LocalEntityId};
+ use kernel_model::Value;
+ use kernel_query::{
+     AggregateSpec, MaterializedRelPlanState, OrderDirection, RelExpr, RelQueryError, RelType,
+@@ -132,6 +133,11 @@
+         entity_type: SemanticId,
+         values: Vec<kernel_types::EntityId>,
+     },
++    DenseLiveEntityIds {
++        entity_type: SemanticId,
++        ids: Arc<DenseEntityIds>,
++        values: Vec<LocalEntityId>,
++    },
+     HistoricalEntityIds {
+         entity_type: SemanticId,
+         values: Vec<kernel_types::EntityId>,
+@@ -139,6 +145,25 @@
+ }
+ 
+ impl NativeColumn {
++    pub fn dense_live_entity_ids(
++        entity_type: SemanticId,
++        ids: Arc<DenseEntityIds>,
++        values: Vec<kernel_types::EntityId>,
++    ) -> Result<Self, PhysicalExecutionError> {
++        let values = values
++            .into_iter()
++            .map(|id| {
++                ids.local(id)
++                    .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)
++            })
++            .collect::<Result<Vec<_>, _>>()?;
++        Ok(Self::DenseLiveEntityIds {
++            entity_type,
++            ids,
++            values,
++        })
++    }
++
+     fn len(&self) -> usize {
+         match self {
+             Self::Unit(len) => *len,
+@@ -149,6 +174,7 @@
+             Self::LiveEntityIds { values, .. } | Self::HistoricalEntityIds { values, .. } => {
+                 values.len()
+             }
++            Self::DenseLiveEntityIds { values, .. } => values.len(),
+         }
+     }
+ 
+@@ -166,6 +192,16 @@
+                 entity_type: *entity_type,
+                 id: values[index],
+             },
++            Self::DenseLiveEntityIds {
++                entity_type,
++                ids,
++                values,
++            } => Value::LiveEntityRef {
++                entity_type: *entity_type,
++                id: ids
++                    .external(values[index])
++                    .expect("dense live entity column shares its revision identity map"),
++            },
+             Self::HistoricalEntityIds {
+                 entity_type,
+                 values,
+@@ -234,6 +270,25 @@
+                     entity_type: *entity_type,
+                     values,
+                 }),
++            Self::DenseLiveEntityIds {
++                entity_type, ids, ..
++            } => values
++                .into_iter()
++                .map(|value| match value {
++                    Value::LiveEntityRef {
++                        entity_type: value_type,
++                        id,
++                    } if value_type == *entity_type => ids
++                        .local(id)
++                        .ok_or(PhysicalExecutionError::PhysicalTypeMismatch),
++                    _ => Err(PhysicalExecutionError::PhysicalTypeMismatch),
++                })
++                .collect::<Result<Vec<_>, _>>()
++                .map(|values| Self::DenseLiveEntityIds {
++                    entity_type: *entity_type,
++                    ids: Arc::clone(ids),
++                    values,
++                }),
+             Self::HistoricalEntityIds { entity_type, .. } => values
+                 .into_iter()
+                 .map(|value| match value {
+@@ -313,6 +368,23 @@
+                     })
+                     .collect::<Result<Vec<_>, _>>()?,
+             },
++            Self::DenseLiveEntityIds {
++                entity_type,
++                ids,
++                values,
++            } => Self::DenseLiveEntityIds {
++                entity_type: *entity_type,
++                ids: Arc::clone(ids),
++                values: positions
++                    .iter()
++                    .map(|&position| {
++                        values
++                            .get(position)
++                            .copied()
++                            .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
++                    })
++                    .collect::<Result<Vec<_>, _>>()?,
++            },
+             Self::HistoricalEntityIds {
+                 entity_type,
+                 values,
+@@ -349,6 +421,9 @@
+             Self::LiveEntityIds { values, .. } | Self::HistoricalEntityIds { values, .. } => {
+                 values.swap_remove(index);
+             }
++            Self::DenseLiveEntityIds { values, .. } => {
++                values.swap_remove(index);
++            }
+         }
+     }
+ 
+@@ -370,6 +445,20 @@
+                 },
+             ) if entity_type == value_type => values.push(*id),
+             (
++                Self::DenseLiveEntityIds {
++                    entity_type,
++                    ids,
++                    values,
++                },
++                Value::LiveEntityRef {
++                    entity_type: value_type,
++                    id,
++                },
++            ) if entity_type == value_type => values.push(
++                ids.local(*id)
++                    .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?,
++            ),
++            (
+                 Self::HistoricalEntityIds {
+                     entity_type,
+                     values,
+@@ -6770,6 +6859,15 @@
+     ) || matches!(
+         (column, bound),
+         (
++            NativeColumn::DenseLiveEntityIds { entity_type, .. },
++            kernel_semantics::BoundPrimitivePredicate::LiveEntityId {
++                entity_type: expected_type,
++                ..
++            }
++        ) if entity_type == expected_type
++    ) || matches!(
++        (column, bound),
++        (
+             NativeColumn::HistoricalEntityIds { entity_type, .. },
+             kernel_semantics::BoundPrimitivePredicate::HistoricalEntityId {
+                 entity_type: expected_type,
+@@ -6814,6 +6912,12 @@
+             kernel_semantics::BoundPrimitivePredicate::LiveEntityId { id: expected, .. },
+         ) => values.get(index).is_some_and(|value| value == expected),
+         (
++            NativeColumn::DenseLiveEntityIds { ids, values, .. },
++            kernel_semantics::BoundPrimitivePredicate::LiveEntityId { id: expected, .. },
++        ) => ids
++            .local(*expected)
++            .is_some_and(|expected| values.get(index).is_some_and(|value| *value == expected)),
++        (
+             NativeColumn::HistoricalEntityIds { values, .. },
+             kernel_semantics::BoundPrimitivePredicate::HistoricalEntityId { id: expected, .. },
+         ) => values.get(index).is_some_and(|value| value == expected),
+@@ -9939,6 +10043,10 @@
+             NativeColumn::LiveEntityIds {
+                 entity_type: physical_type,
+                 ..
++            }
++            | NativeColumn::DenseLiveEntityIds {
++                entity_type: physical_type,
++                ..
+             },
+         )
+         | (
+@@ -10147,6 +10255,26 @@
+             matching_indices(values, |candidate| candidate == expected),
+         ),
+         (
++            NativeColumn::DenseLiveEntityIds {
++                entity_type,
++                ids,
++                values,
++            },
++            kernel_semantics::BoundPrimitivePredicate::LiveEntityId {
++                entity_type: expected_type,
++                id: expected,
++            },
++        ) if entity_type == expected_type => {
++            if let Some(expected) = ids.local(*expected) {
++                push_typed_matches(
++                    &mut rows,
++                    columns,
++                    projection,
++                    matching_indices(values, |candidate| *candidate == expected),
++                );
++            }
++        }
++        (
+             NativeColumn::HistoricalEntityIds {
+                 entity_type,
+                 values,
+@@ -11778,6 +11906,13 @@
+             },
+         )
+         | (
++            NativeColumn::DenseLiveEntityIds { entity_type, .. },
++            Value::LiveEntityRef {
++                entity_type: value_type,
++                ..
++            },
++        )
++        | (
+             NativeColumn::HistoricalEntityIds { entity_type, .. },
+             Value::HistoricalEntityId {
+                 entity_type: value_type,
+@@ -13163,6 +13298,40 @@
+     }
+ 
+     #[test]
++    fn dense_live_entity_column_round_trips_and_filters_with_revision_local_ids() {
++        let entity_type = sid(340);
++        let external = [
++            kernel_types::EntityId::new(10),
++            kernel_types::EntityId::new(20),
++            kernel_types::EntityId::new(30),
++        ];
++        let dense = Arc::new(
++            DenseEntityIds::compile(&external.into_iter().collect::<BTreeSet<_>>()).unwrap(),
++        );
++        let column =
++            NativeColumn::dense_live_entity_ids(entity_type, Arc::clone(&dense), external.to_vec())
++                .unwrap();
++
++        assert!(matches!(
++            column.value_at(1),
++            Value::LiveEntityRef { entity_type: actual, id }
++                if actual == entity_type && id == external[1]
++        ));
++        let bound = kernel_semantics::BoundPrimitivePredicate::LiveEntityId {
++            entity_type,
++            id: external[2],
++        };
++        assert!(!typed_column_matches_bound(&column, 0, &bound).unwrap());
++        assert!(typed_column_matches_bound(&column, 2, &bound).unwrap());
++
++        let selected = column.select_positions(&[2, 0]).unwrap();
++        assert!(matches!(
++            selected.value_at(0),
++            Value::LiveEntityRef { id, .. } if id == external[2]
++        ));
++    }
++
++    #[test]
+     fn mixed_typed_predicate_kernels_cover_every_scalar_carrier() {
+         let entity_type = sid(350);
+         let ids = [
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-revision/Cargo.toml /mnt/data/cfmd_workspace_pass60/crates/kernel-revision/Cargo.toml
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-revision/Cargo.toml	2026-09-19 01:48:04.000000000 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-revision/Cargo.toml	2026-09-20 19:33:04.757955676 +0000
+@@ -5,6 +5,8 @@
+ license.workspace = true
+ 
+ [dependencies]
++kernel-identity = { path = "../kernel-identity" }
++kernel-lifecycle = { path = "../kernel-lifecycle" }
+ kernel-model = { path = "../kernel-model" }
+ kernel-schema = { path = "../kernel-schema" }
+ kernel-semantics = { path = "../kernel-semantics" }
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-revision/src/lib.rs /mnt/data/cfmd_workspace_pass60/crates/kernel-revision/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-revision/src/lib.rs	2026-09-19 01:52:58.000000000 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-revision/src/lib.rs	2026-09-20 19:33:04.758059309 +0000
+@@ -1,8 +1,12 @@
+-use kernel_model::{DatabaseState, ModelError};
++use std::sync::Arc;
++
++use kernel_identity::DenseEntityIds;
++use kernel_lifecycle::DenseLifecycleProjection;
++use kernel_model::{DatabaseState, LiveRefSensitivityIndex, ModelError};
+ use kernel_schema::SemanticContext;
+ use kernel_semantics::{SemanticError, SemanticRegistry};
+ use kernel_types::{RevisionId, SemanticRevision};
+-use kernel_validation::{ValidationError, validate_state};
++use kernel_validation::{ValidationError, validate_state_with_ids};
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum RevisionError {
+@@ -23,6 +27,9 @@
+     semantics: SemanticRevision,
+     semantic_context: SemanticContext,
+     state: DatabaseState,
++    dense_entities: Arc<DenseEntityIds>,
++    dense_lifecycle: DenseLifecycleProjection,
++    live_ref_sensitivity: LiveRefSensitivityIndex,
+ }
+ 
+ impl Revision {
+@@ -39,12 +46,24 @@
+             .validate_context(context)
+             .map_err(RevisionError::InvalidSemantics)?;
+         let state = state.normalize()?;
+-        validate_state(context, registry, &state).map_err(RevisionError::InvalidTypedModel)?;
++        let dense_entities = Arc::new(
++            DenseEntityIds::compile(&state.lifecycle.entities).map_err(|_| {
++                RevisionError::InvalidModel(ModelError::DenseIdentityCapacityExceeded)
++            })?,
++        );
++        validate_state_with_ids(context, registry, &state, &dense_entities)
++            .map_err(RevisionError::InvalidTypedModel)?;
++        let dense_lifecycle =
++            DenseLifecycleProjection::compile_with_ids(&state.lifecycle, &dense_entities);
++        let live_ref_sensitivity = LiveRefSensitivityIndex::compile(&state.model, &dense_entities);
+         Ok(Self {
+             id,
+             semantics: context.revision(),
+             semantic_context: context.clone(),
+             state,
++            dense_entities,
++            dense_lifecycle,
++            live_ref_sensitivity,
+         })
+     }
+ 
+@@ -67,6 +86,21 @@
+     pub const fn state(&self) -> &DatabaseState {
+         &self.state
+     }
++
++    #[must_use]
++    pub fn dense_entity_ids(&self) -> Arc<DenseEntityIds> {
++        Arc::clone(&self.dense_entities)
++    }
++
++    #[must_use]
++    pub const fn dense_lifecycle(&self) -> &DenseLifecycleProjection {
++        &self.dense_lifecycle
++    }
++
++    #[must_use]
++    pub const fn live_ref_sensitivity(&self) -> &LiveRefSensitivityIndex {
++        &self.live_ref_sensitivity
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -134,4 +168,34 @@
+         assert_eq!(revision.semantic_context(), &context);
+         assert_eq!(revision.semantic_revision(), context.revision());
+     }
++
++    #[test]
++    fn revision_owns_one_shared_dense_identity_projection_for_physical_derivatives() {
++        let context = empty_context();
++        let first = EntityId::new(10);
++        let second = EntityId::new(20);
++        let mut state = DatabaseState::default();
++        state.lifecycle.entities.extend([first, second]);
++        state.lifecycle.roots.insert(first);
++        state
++            .lifecycle
++            .keeps_alive
++            .entry(first)
++            .or_default()
++            .insert(second);
++        let revision = Revision::build(
++            RevisionId::new(1),
++            &context,
++            &SemanticRegistry::default(),
++            state,
++        )
++        .unwrap();
++
++        let left = revision.dense_entity_ids();
++        let right = revision.dense_entity_ids();
++        assert!(Arc::ptr_eq(&left, &right));
++        assert_eq!(left.local(first).unwrap().index(), 0);
++        assert_eq!(left.local(second).unwrap().index(), 1);
++        assert_eq!(revision.dense_lifecycle().live_count(), 2);
++    }
+ }
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-validation/Cargo.toml /mnt/data/cfmd_workspace_pass60/crates/kernel-validation/Cargo.toml
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-validation/Cargo.toml	2026-09-19 01:13:28.000000000 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-validation/Cargo.toml	2026-09-20 19:33:04.758134790 +0000
+@@ -5,6 +5,7 @@
+ license.workspace = true
+ 
+ [dependencies]
++kernel-identity = { path = "../kernel-identity" }
+ kernel-model = { path = "../kernel-model" }
+ kernel-schema = { path = "../kernel-schema" }
+ kernel-semantics = { path = "../kernel-semantics" }
+diff -ruN --exclude target --exclude evidence --exclude 'PASS60_*' --exclude IMPLEMENTATION_REPORT_pass60.md /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-validation/src/lib.rs /mnt/data/cfmd_workspace_pass60/crates/kernel-validation/src/lib.rs
+--- /mnt/data/cfmd_workspace_pass60_pre_rnd/crates/kernel-validation/src/lib.rs	2026-09-19 03:20:12.000000000 +0000
++++ /mnt/data/cfmd_workspace_pass60/crates/kernel-validation/src/lib.rs	2026-09-20 19:33:04.758283849 +0000
+@@ -1,5 +1,6 @@
+ use std::collections::{BTreeMap, BTreeSet};
+ 
++use kernel_identity::{DenseEntityIds, DenseEntitySet, DenseIdentityError};
+ use kernel_model::{DatabaseState, FiniteModel, Value};
+ use kernel_schema::{RelationSemantics, ScalarType, SemanticContext, TypeExpr, TypeVar};
+ use kernel_semantics::{SemanticError, SemanticRegistry};
+@@ -27,6 +28,7 @@
+     },
+     UnboundRecursiveVariable(TypeVar),
+     Semantic(SemanticError),
++    DenseIdentity(DenseIdentityError),
+ }
+ 
+ impl From<SemanticError> for ValidationError {
+@@ -35,17 +37,120 @@
+     }
+ }
+ 
++impl From<DenseIdentityError> for ValidationError {
++    fn from(value: DenseIdentityError) -> Self {
++        Self::DenseIdentity(value)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DenseTypeExtents {
++    ids: DenseEntityIds,
++    extents: BTreeMap<SemanticId, DenseEntitySet>,
++}
++
++impl DenseTypeExtents {
++    pub fn compile(
++        model: &FiniteModel,
++        schema: &kernel_schema::Schema,
++    ) -> Result<Self, DenseIdentityError> {
++        let entities = model
++            .carriers
++            .values()
++            .flat_map(|carrier| carrier.iter().copied())
++            .collect::<BTreeSet<_>>();
++        let ids = DenseEntityIds::compile(&entities)?;
++        Ok(Self::compile_with_ids(model, schema, &ids))
++    }
++
++    #[must_use]
++    pub fn compile_with_ids(
++        model: &FiniteModel,
++        schema: &kernel_schema::Schema,
++        ids: &DenseEntityIds,
++    ) -> Self {
++        let mut targets = model.carriers.keys().copied().collect::<BTreeSet<_>>();
++        targets.extend(schema.type_definitions().map(|(id, _)| id));
++        targets.extend(schema.capabilities().map(|capability| capability.id));
++        for (subtype, supertype) in schema.inclusions() {
++            targets.insert(subtype);
++            targets.insert(supertype);
++        }
++
++        let mut extents = targets
++            .iter()
++            .copied()
++            .map(|target| (target, DenseEntitySet::with_capacity(ids.len())))
++            .collect::<BTreeMap<_, _>>();
++
++        for (&actual, carrier) in &model.carriers {
++            let matching_targets = targets
++                .iter()
++                .copied()
++                .filter(|&target| schema.is_subtype(actual, target))
++                .collect::<Vec<_>>();
++            for &entity in carrier {
++                let Some(local) = ids.local(entity) else {
++                    continue;
++                };
++                for target in &matching_targets {
++                    extents
++                        .get_mut(target)
++                        .expect("target extent was initialized")
++                        .insert(local);
++                }
++            }
++        }
++
++        Self {
++            ids: ids.clone(),
++            extents,
++        }
++    }
++
++    #[must_use]
++    pub fn contains(&self, entity: EntityId, expected: SemanticId) -> bool {
++        self.ids.local(entity).is_some_and(|local| {
++            self.extents
++                .get(&expected)
++                .is_some_and(|extent| extent.contains(local))
++        })
++    }
++
++    #[must_use]
++    pub fn entity_count(&self) -> usize {
++        self.ids.len()
++    }
++}
++
+ pub fn validate_state(
+     context: &SemanticContext,
+     registry: &SemanticRegistry,
+     state: &DatabaseState,
+ ) -> Result<(), ValidationError> {
++    let entities = state
++        .model
++        .carriers
++        .values()
++        .flat_map(|carrier| carrier.iter().copied())
++        .collect::<BTreeSet<_>>();
++    let ids = DenseEntityIds::compile(&entities)?;
++    validate_state_with_ids(context, registry, state, &ids)
++}
++
++pub fn validate_state_with_ids(
++    context: &SemanticContext,
++    registry: &SemanticRegistry,
++    state: &DatabaseState,
++    ids: &DenseEntityIds,
++) -> Result<(), ValidationError> {
++    let entity_types = DenseTypeExtents::compile_with_ids(&state.model, &context.schema, ids);
+     for (&(field_id, owner), value) in &state.model.fields {
+         let field = context
+             .schema
+             .field(field_id)
+             .ok_or(ValidationError::UnknownField(field_id))?;
+-        if !entity_has_type(&state.model, &context.schema, owner, field.owner) {
++        if !entity_types.contains(owner, field.owner) {
+             return Err(ValidationError::FieldOwnerMismatch {
+                 field: field_id,
+                 entity: owner,
+@@ -57,6 +162,7 @@
+             &state.model,
+             context,
+             registry,
++            &entity_types,
+             &BTreeMap::new(),
+         )?;
+     }
+@@ -81,6 +187,7 @@
+                     &state.model,
+                     context,
+                     registry,
++                    &entity_types,
+                     &BTreeMap::new(),
+                 )?;
+             }
+@@ -127,30 +234,26 @@
+     Ok(())
+ }
+ 
+-fn entity_has_type(
+-    model: &FiniteModel,
+-    schema: &kernel_schema::Schema,
+-    entity: EntityId,
+-    expected: SemanticId,
+-) -> bool {
+-    model.carriers.iter().any(|(&actual, entities)| {
+-        entities.contains(&entity) && schema.is_subtype(actual, expected)
+-    })
+-}
+-
+ fn validate_value(
+     value: &Value,
+     expected: &TypeExpr,
+     model: &FiniteModel,
+     context: &SemanticContext,
+     registry: &SemanticRegistry,
++    entity_types: &DenseTypeExtents,
+     recursive: &BTreeMap<TypeVar, TypeExpr>,
+ ) -> Result<(), ValidationError> {
+     match expected {
+-        TypeExpr::Scalar(scalar) => validate_scalar(value, scalar, model, &context.schema),
+-        TypeExpr::Product(fields) => {
+-            validate_product(value, fields, model, context, registry, recursive)
+-        }
++        TypeExpr::Scalar(scalar) => validate_scalar(value, scalar, &context.schema, entity_types),
++        TypeExpr::Product(fields) => validate_product(
++            value,
++            fields,
++            model,
++            context,
++            registry,
++            entity_types,
++            recursive,
++        ),
+         TypeExpr::Sum(variants) => {
+             let Value::Variant { tag, value } = value else {
+                 return Err(ValidationError::TypeMismatch);
+@@ -158,102 +261,195 @@
+             let variant = variants
+                 .get(tag)
+                 .ok_or(ValidationError::UnknownVariant(*tag))?;
+-            validate_value(value, variant, model, context, registry, recursive)
++            validate_value(
++                value,
++                variant,
++                model,
++                context,
++                registry,
++                entity_types,
++                recursive,
++            )
+         }
+         TypeExpr::Option(inner) => {
+             let Value::Option(value) = value else {
+                 return Err(ValidationError::TypeMismatch);
+             };
+             if let Some(value) = value.as_deref() {
+-                validate_value(value, inner, model, context, registry, recursive)?;
+-            }
+-            Ok(())
+-        }
+-        TypeExpr::Set {
+-            element,
+-            equivalence,
+-        } => {
+-            let Value::Set {
+-                equivalence: actual,
+-                elements,
+-            } = value
+-            else {
+-                return Err(ValidationError::TypeMismatch);
+-            };
+-            ensure_equivalence(*equivalence, *actual)?;
+-            validate_equivalence_type(*equivalence, element, context, registry)?;
+-            for value in elements {
+-                validate_value(value, element, model, context, registry, recursive)?;
+-            }
+-            Ok(())
+-        }
+-        TypeExpr::Bag {
+-            element,
+-            equivalence,
+-        } => {
+-            let Value::Bag {
+-                equivalence: actual,
+-                entries,
+-            } = value
+-            else {
+-                return Err(ValidationError::TypeMismatch);
+-            };
+-            ensure_equivalence(*equivalence, *actual)?;
+-            validate_equivalence_type(*equivalence, element, context, registry)?;
+-            for (value, _) in entries {
+-                validate_value(value, element, model, context, registry, recursive)?;
++                validate_value(
++                    value,
++                    inner,
++                    model,
++                    context,
++                    registry,
++                    entity_types,
++                    recursive,
++                )?;
+             }
+             Ok(())
+         }
++        TypeExpr::Set { .. } | TypeExpr::Bag { .. } => validate_unary_collection(
++            value,
++            expected,
++            model,
++            context,
++            registry,
++            entity_types,
++            recursive,
++        ),
+         TypeExpr::Seq(element) => {
+             let Value::Seq(values) = value else {
+                 return Err(ValidationError::TypeMismatch);
+             };
+             for value in values {
+-                validate_value(value, element, model, context, registry, recursive)?;
+-            }
+-            Ok(())
+-        }
+-        TypeExpr::Map {
+-            key,
+-            value: mapped,
+-            key_equivalence,
+-        } => {
+-            let Value::Map {
+-                key_equivalence: actual,
+-                entries,
+-            } = value
+-            else {
+-                return Err(ValidationError::TypeMismatch);
+-            };
+-            ensure_equivalence(*key_equivalence, *actual)?;
+-            validate_equivalence_type(*key_equivalence, key, context, registry)?;
+-            for (entry_key, entry_value) in entries {
+-                validate_value(entry_key, key, model, context, registry, recursive)?;
+-                validate_value(entry_value, mapped, model, context, registry, recursive)?;
++                validate_value(
++                    value,
++                    element,
++                    model,
++                    context,
++                    registry,
++                    entity_types,
++                    recursive,
++                )?;
+             }
+             Ok(())
+         }
++        TypeExpr::Map { .. } => validate_map(
++            value,
++            expected,
++            model,
++            context,
++            registry,
++            entity_types,
++            recursive,
++        ),
+         TypeExpr::Var(var) => {
+             let ty = recursive
+                 .get(var)
+                 .ok_or(ValidationError::UnboundRecursiveVariable(*var))?;
+-            validate_value(value, ty, model, context, registry, recursive)
++            validate_value(value, ty, model, context, registry, entity_types, recursive)
+         }
+         TypeExpr::Mu { binder, body } => {
+             let mut next = recursive.clone();
+             next.insert(*binder, expected.clone());
+-            validate_value(value, body, model, context, registry, &next)
++            validate_value(value, body, model, context, registry, entity_types, &next)
+         }
+     }
+ }
+ 
++fn validate_unary_collection(
++    value: &Value,
++    expected: &TypeExpr,
++    model: &FiniteModel,
++    context: &SemanticContext,
++    registry: &SemanticRegistry,
++    entity_types: &DenseTypeExtents,
++    recursive: &BTreeMap<TypeVar, TypeExpr>,
++) -> Result<(), ValidationError> {
++    let (element, equivalence, values): (&TypeExpr, SemanticId, Vec<&Value>) =
++        match (value, expected) {
++            (
++                Value::Set {
++                    equivalence: actual,
++                    elements,
++                },
++                TypeExpr::Set {
++                    element,
++                    equivalence,
++                },
++            ) => {
++                ensure_equivalence(*equivalence, *actual)?;
++                (element, *equivalence, elements.iter().collect())
++            }
++            (
++                Value::Bag {
++                    equivalence: actual,
++                    entries,
++                },
++                TypeExpr::Bag {
++                    element,
++                    equivalence,
++                },
++            ) => {
++                ensure_equivalence(*equivalence, *actual)?;
++                (
++                    element,
++                    *equivalence,
++                    entries.iter().map(|(value, _)| value).collect(),
++                )
++            }
++            _ => return Err(ValidationError::TypeMismatch),
++        };
++    validate_equivalence_type(equivalence, element, context, registry)?;
++    for value in values {
++        validate_value(
++            value,
++            element,
++            model,
++            context,
++            registry,
++            entity_types,
++            recursive,
++        )?;
++    }
++    Ok(())
++}
++
++fn validate_map(
++    value: &Value,
++    expected: &TypeExpr,
++    model: &FiniteModel,
++    context: &SemanticContext,
++    registry: &SemanticRegistry,
++    entity_types: &DenseTypeExtents,
++    recursive: &BTreeMap<TypeVar, TypeExpr>,
++) -> Result<(), ValidationError> {
++    let (
++        Value::Map {
++            key_equivalence: actual,
++            entries,
++        },
++        TypeExpr::Map {
++            key,
++            value: mapped,
++            key_equivalence,
++        },
++    ) = (value, expected)
++    else {
++        return Err(ValidationError::TypeMismatch);
++    };
++    ensure_equivalence(*key_equivalence, *actual)?;
++    validate_equivalence_type(*key_equivalence, key, context, registry)?;
++    for (entry_key, entry_value) in entries {
++        validate_value(
++            entry_key,
++            key,
++            model,
++            context,
++            registry,
++            entity_types,
++            recursive,
++        )?;
++        validate_value(
++            entry_value,
++            mapped,
++            model,
++            context,
++            registry,
++            entity_types,
++            recursive,
++        )?;
++    }
++    Ok(())
++}
++
+ fn validate_product(
+     value: &Value,
+     fields: &BTreeMap<SemanticId, TypeExpr>,
+     model: &FiniteModel,
+     context: &SemanticContext,
+     registry: &SemanticRegistry,
++    entity_types: &DenseTypeExtents,
+     recursive: &BTreeMap<TypeVar, TypeExpr>,
+ ) -> Result<(), ValidationError> {
+     let Value::Product(values) = value else {
+@@ -265,7 +461,15 @@
+         return Err(ValidationError::ProductShapeMismatch);
+     }
+     for (field, ty) in fields {
+-        validate_value(&values[field], ty, model, context, registry, recursive)?;
++        validate_value(
++            &values[field],
++            ty,
++            model,
++            context,
++            registry,
++            entity_types,
++            recursive,
++        )?;
+     }
+     Ok(())
+ }
+@@ -273,8 +477,8 @@
+ fn validate_scalar(
+     value: &Value,
+     expected: &ScalarType,
+-    model: &FiniteModel,
+     schema: &kernel_schema::Schema,
++    entity_types: &DenseTypeExtents,
+ ) -> Result<(), ValidationError> {
+     let valid = match (value, expected) {
+         (Value::Unit, ScalarType::Unit)
+@@ -287,7 +491,7 @@
+         }
+         (Value::LiveEntityRef { entity_type, id }, ScalarType::LiveEntityRef(target)) => {
+             (entity_type == target || schema.is_subtype(*entity_type, *target))
+-                && entity_has_type(model, schema, *id, *target)
++                && entity_types.contains(*id, *target)
+         }
+         _ => false,
+     };
+@@ -445,6 +649,7 @@
+             (SemanticId::new(22), Value::Text("wrong field".into())),
+         ]));
+         let (context, registry, state) = fixture();
++        let entity_types = DenseTypeExtents::compile(&state.model, &context.schema).unwrap();
+         assert_eq!(
+             validate_value(
+                 &value,
+@@ -452,6 +657,7 @@
+                 &state.model,
+                 &context,
+                 &registry,
++                &entity_types,
+                 &BTreeMap::new()
+             ),
+             Err(ValidationError::ProductShapeMismatch)
+@@ -664,4 +870,118 @@
+             Err(SemanticError::EquivalenceDomainMismatch { .. })
+         ));
+     }
++
++    #[test]
++    fn dense_type_extents_match_subtype_membership_and_overlap() {
++        let concrete = SemanticId::new(980);
++        let secondary = SemanticId::new(981);
++        let parent = SemanticId::new(982);
++        let unrelated = SemanticId::new(983);
++        let mut schema = Schema::new(SchemaRevisionId::new(1));
++        schema.include(concrete, parent).unwrap();
++
++        let mut model = FiniteModel::default();
++        model
++            .carriers
++            .insert(concrete, BTreeSet::from([id(1), id(2)]));
++        model
++            .carriers
++            .insert(secondary, BTreeSet::from([id(2), id(3)]));
++        model.carriers.insert(unrelated, BTreeSet::from([id(4)]));
++
++        let extents = DenseTypeExtents::compile(&model, &schema).unwrap();
++        assert_eq!(extents.entity_count(), 4);
++        assert!(extents.contains(id(1), concrete));
++        assert!(extents.contains(id(1), parent));
++        assert!(extents.contains(id(2), concrete));
++        assert!(extents.contains(id(2), secondary));
++        assert!(extents.contains(id(3), secondary));
++        assert!(!extents.contains(id(3), parent));
++        assert!(extents.contains(id(4), unrelated));
++        assert!(!extents.contains(id(4), parent));
++    }
++
++    #[test]
++    fn validation_accepts_subtype_owner_through_dense_extent() {
++        let concrete = SemanticId::new(990);
++        let parent = SemanticId::new(991);
++        let field = SemanticId::new(992);
++        let mut schema = Schema::new(SchemaRevisionId::new(1));
++        schema.include(concrete, parent).unwrap();
++        schema
++            .define_field(FieldDef {
++                id: field,
++                owner: parent,
++                value: TypeExpr::Scalar(ScalarType::I64),
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment: SemanticEnvironment::new(SemanticEnvId::new(1)),
++        };
++        let registry = SemanticRegistry::default();
++        let mut state = DatabaseState::default();
++        state
++            .model
++            .carriers
++            .insert(concrete, BTreeSet::from([id(1)]));
++        state.model.fields.insert((field, id(1)), Value::I64(7));
++        state.lifecycle.entities.insert(id(1));
++        state.lifecycle.roots.insert(id(1));
++        assert_eq!(validate_state(&context, &registry, &state), Ok(()));
++    }
++
++    #[test]
++    #[ignore = "diagnostic release benchmark"]
++    fn benchmark_dense_type_extent_membership_against_carrier_scan() {
++        use std::hint::black_box;
++        use std::time::Instant;
++
++        let parent = SemanticId::new(10_000);
++        let carrier_count = 128_u128;
++        let per_carrier = 256_u128;
++        let mut schema = Schema::new(SchemaRevisionId::new(1));
++        let mut model = FiniteModel::default();
++        let mut probes = Vec::new();
++        for carrier_index in 0..carrier_count {
++            let actual = SemanticId::new(20_000 + carrier_index);
++            schema.include(actual, parent).unwrap();
++            let start = carrier_index * per_carrier + 1;
++            let entities = (start..start + per_carrier)
++                .map(id)
++                .collect::<BTreeSet<_>>();
++            probes.extend(entities.iter().copied());
++            model.carriers.insert(actual, entities);
++        }
++        let compile_start = Instant::now();
++        let dense = DenseTypeExtents::compile(&model, &schema).unwrap();
++        let compile_ns = compile_start.elapsed().as_nanos();
++
++        let start = Instant::now();
++        let mut baseline_hits = 0_usize;
++        for _ in 0..4 {
++            for &entity in &probes {
++                let hit = model.carriers.iter().any(|(&actual, entities)| {
++                    entities.contains(&entity) && schema.is_subtype(actual, parent)
++                });
++                baseline_hits += usize::from(black_box(hit));
++            }
++        }
++        let baseline_ns = start.elapsed().as_nanos();
++
++        let start = Instant::now();
++        let mut dense_hits = 0_usize;
++        for _ in 0..4 {
++            for &entity in &probes {
++                dense_hits += usize::from(black_box(dense.contains(entity, parent)));
++            }
++        }
++        let dense_ns = start.elapsed().as_nanos();
++        assert_eq!(baseline_hits, dense_hits);
++        let ratio_milli = baseline_ns.saturating_mul(1_000) / dense_ns.max(1);
++        println!(
++            "compile_ns={compile_ns} baseline_ns={baseline_ns} dense_ns={dense_ns} ratio_milli={ratio_milli} probes={}",
++            probes.len()
++        );
++    }
+ }

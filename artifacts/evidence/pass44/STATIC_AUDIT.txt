@@ -1,0 +1,4 @@
+declared_tests=332
+kernel_plan_tests=104
+unsafe_hits=0
+rust_loc=45361

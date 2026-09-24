@@ -1,0 +1,686 @@
+Only in crates/kernel-plan/examples: storage_plan_bridge_bench.rs
+diff -ru /mnt/data/p26src/crates/kernel-plan/src/lib.rs crates/kernel-plan/src/lib.rs
+--- /mnt/data/p26src/crates/kernel-plan/src/lib.rs	2026-09-19 16:15:38.000000000 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-19 18:54:25.131728346 +0000
+@@ -3,8 +3,10 @@
+ use kernel_model::Value;
+ use kernel_query::{
+     AggregateSpec, OrderDirection, RelExpr, RelQueryError, RelType, RelationDelta, RelationValue,
++    StorageCertifiedRelationDelta,
+ };
+ use kernel_types::SemanticId;
++pub use kernel_types::StableRowHandle as PhysicalRowId;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct LayoutId(pub u128);
+@@ -199,12 +201,6 @@
+     }
+ }
+ 
+-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+-pub struct PhysicalRowId {
+-    slot: usize,
+-    generation: u64,
+-}
+-
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct PhysicalRowSlot {
+     generation: u64,
+@@ -477,6 +473,22 @@
+         context: &kernel_schema::SemanticContext,
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
++        self.apply_relation_delta_certified(relation, layout, delta, context, registry)?;
++        Ok(())
++    }
++
++    /// Applies a semantic delta to authoritative storage and returns the exact
++    /// stable row identities selected/allocated by that transition. Maintained
++    /// query plans can consume this receipt without resolving the same semantic
++    /// rows a second time.
++    pub fn apply_relation_delta_certified(
++        &mut self,
++        relation: SemanticId,
++        layout: LayoutBinding,
++        delta: &RelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<StorageCertifiedRelationDelta, PhysicalExecutionError> {
+         let key = (relation, layout.id);
+         let installed =
+             self.relations
+@@ -516,7 +528,25 @@
+                 state.apply_physical_delta(&physical_delta)?;
+             }
+         }
+-        Ok(())
++        Ok(StorageCertifiedRelationDelta::new(
++            relation,
++            delta.clone(),
++            physical_delta.removed.iter().map(|(id, _)| *id).collect(),
++            physical_delta.inserted.iter().map(|(id, _)| *id).collect(),
++        ))
++    }
++
++    /// Returns live row handles in the relation's logical scan order.
++    pub fn logical_row_handles(
++        &self,
++        relation: SemanticId,
++        layout: LayoutBinding,
++    ) -> Result<Vec<PhysicalRowId>, PhysicalExecutionError> {
++        let installed = self.installed(relation, layout)?;
++        installed
++            .scan_positions()
++            .map(|position| installed.row_id_at(position))
++            .collect()
+     }
+ 
+     fn i64_index(&self, index: I64IndexBinding) -> Option<&MaterializedI64IndexState> {
+@@ -5398,6 +5428,76 @@
+     }
+ 
+     #[test]
++    fn storage_certified_delta_updates_recursive_scan_without_semantic_relookup() {
++        let (context, registry, relation) = planning_context();
++        let binding = LayoutBinding {
++            id: LayoutId(960),
++            family: LayoutFamily::Columnar,
++        };
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            vec![
++                vec![Value::I64(1)],
++                vec![Value::I64(2)],
++                vec![Value::I64(3)],
++            ],
++        );
++        let query = RelExpr::Scan(relation);
++        let mut maintained =
++            kernel_query::MaterializedRelPlanState::build(&query, &model, &context, &registry)
++                .unwrap();
++
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 2, 3])]).unwrap(),
++            )
++            .unwrap();
++        let handles = store.logical_row_handles(relation, binding).unwrap();
++        maintained
++            .attach_storage_handles(relation, &handles)
++            .unwrap();
++
++        let result_type = query.typecheck(&context, &registry).unwrap();
++        let delta = RelationDelta {
++            inserted: vec![vec![Value::I64(4)]],
++            removed: vec![vec![Value::I64(1)]],
++            result_type,
++        };
++        let certified = store
++            .apply_relation_delta_certified(relation, binding, &delta, &context, &registry)
++            .unwrap();
++        let mut certified_map = BTreeMap::new();
++        certified_map.insert(relation, certified.clone());
++        let emitted = maintained
++            .apply_storage_certified_deltas(&certified_map, &context, &registry)
++            .unwrap();
++        assert_eq!(emitted, delta);
++
++        let output = maintained.output_value(&context, &registry).unwrap();
++        let mut values = output
++            .rows()
++            .iter()
++            .map(|row| match row.as_slice() {
++                [Value::I64(value)] => *value,
++                _ => unreachable!(),
++            })
++            .collect::<Vec<_>>();
++        values.sort_unstable();
++        assert_eq!(values, vec![2, 3, 4]);
++
++        let before = maintained.clone();
++        assert_eq!(
++            maintained.apply_storage_certified_deltas(&certified_map, &context, &registry),
++            Err(RelQueryError::InconsistentIncrementalDelta)
++        );
++        assert_eq!(maintained, before);
++    }
++
++    #[test]
+     fn invalid_relation_delta_is_rejected_before_relation_or_index_mutation() {
+         let (context, registry, relation) = planning_context();
+         let binding = LayoutBinding {
+diff -ru /mnt/data/p26src/crates/kernel-query/src/lib.rs crates/kernel-query/src/lib.rs
+--- /mnt/data/p26src/crates/kernel-query/src/lib.rs	2026-09-19 18:20:29.000000000 +0000
++++ crates/kernel-query/src/lib.rs	2026-09-19 18:54:51.267134748 +0000
+@@ -1,4 +1,4 @@
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, BTreeSet};
+ 
+ use kernel_change::{Change, SeqChangeError, SeqSplice};
+ use kernel_model::Value;
+@@ -358,6 +358,47 @@
+     pub result_type: RelType,
+ }
+ 
++/// A relation delta whose row identities were resolved by the authoritative
++/// storage layer before the maintained query tree sees the change.
++///
++/// The row payload is still carried for operator semantics, while handles let
++/// `Scan` update its local snapshot without repeating semantic membership
++/// search over the whole base relation.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct StorageCertifiedRelationDelta {
++    relation: kernel_types::SemanticId,
++    delta: RelationDelta,
++    removed_handles: Vec<kernel_types::StableRowHandle>,
++    inserted_handles: Vec<kernel_types::StableRowHandle>,
++}
++
++impl StorageCertifiedRelationDelta {
++    #[must_use]
++    pub fn new(
++        relation: kernel_types::SemanticId,
++        delta: RelationDelta,
++        removed_handles: Vec<kernel_types::StableRowHandle>,
++        inserted_handles: Vec<kernel_types::StableRowHandle>,
++    ) -> Self {
++        Self {
++            relation,
++            delta,
++            removed_handles,
++            inserted_handles,
++        }
++    }
++
++    #[must_use]
++    pub fn relation(&self) -> kernel_types::SemanticId {
++        self.relation
++    }
++
++    #[must_use]
++    pub fn delta(&self) -> &RelationDelta {
++        &self.delta
++    }
++}
++
+ impl RelationDelta {
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+@@ -1408,6 +1449,7 @@
+     Scan {
+         relation: kernel_types::SemanticId,
+         value: RelationValue,
++        handles: Option<MaintainedLeafHandles>,
+     },
+     Filter {
+         input: Box<MaterializedRelPlanState>,
+@@ -1446,6 +1488,62 @@
+     },
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct MaintainedLeafHandles {
++    ids: Vec<kernel_types::StableRowHandle>,
++    positions: BTreeMap<kernel_types::StableRowHandle, usize>,
++}
++
++impl MaintainedLeafHandles {
++    fn new(ids: Vec<kernel_types::StableRowHandle>) -> Result<Self, RelQueryError> {
++        let mut positions = BTreeMap::new();
++        for (position, id) in ids.iter().copied().enumerate() {
++            if positions.insert(id, position).is_some() {
++                return Err(RelQueryError::InconsistentIncrementalDelta);
++            }
++        }
++        Ok(Self { ids, positions })
++    }
++
++    fn remove(
++        &mut self,
++        value: &mut RelationValue,
++        id: kernel_types::StableRowHandle,
++    ) -> Result<(), RelQueryError> {
++        let position = self
++            .positions
++            .remove(&id)
++            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        let rows = value.rows_mut();
++        rows.swap_remove(position);
++        let removed_id = self.ids.swap_remove(position);
++        if removed_id != id {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        if position < self.ids.len() {
++            self.positions.insert(self.ids[position], position);
++        }
++        Ok(())
++    }
++
++    fn insert(
++        &mut self,
++        value: &mut RelationValue,
++        id: kernel_types::StableRowHandle,
++        row: Row,
++    ) -> Result<(), RelQueryError> {
++        if self.positions.contains_key(&id) {
++            return Err(RelQueryError::InconsistentIncrementalDelta);
++        }
++        let rows = value.rows_mut();
++        let position = rows.len();
++        rows.push(row);
++        self.ids.push(id);
++        self.positions.insert(id, position);
++        Ok(())
++    }
++}
++
+ /// Recursive owner for a maintained relational expression tree.
+ ///
+ /// Construction is bottom-up from child snapshots. Maintenance is top-down only at
+@@ -1489,6 +1587,7 @@
+             RelExpr::Scan(relation) => MaintainedRelPlanNode::Scan {
+                 relation: *relation,
+                 value: query.evaluate(old, context, registry)?,
++                handles: None,
+             },
+             RelExpr::FilterEqConst {
+                 input,
+@@ -1719,6 +1818,256 @@
+         self.apply_relation_deltas_inner(deltas, context, registry)
+     }
+ 
++    /// Attaches authoritative storage row identities to every `Scan` of one
++    /// relation. The handle order must match the scan snapshot's current row
++    /// order. This is normally called by the physical-store bridge once, after
++    /// building the maintained plan from the same revision.
++    pub fn attach_storage_handles(
++        &mut self,
++        relation: kernel_types::SemanticId,
++        ids: &[kernel_types::StableRowHandle],
++    ) -> Result<(), RelQueryError> {
++        match &mut self.node {
++            MaintainedRelPlanNode::Scan {
++                relation: current,
++                value,
++                handles,
++            } => {
++                if *current != relation {
++                    return Ok(());
++                }
++                if value.rows().len() != ids.len() {
++                    return Err(RelQueryError::InconsistentIncrementalDelta);
++                }
++                *handles = Some(MaintainedLeafHandles::new(ids.to_vec())?);
++                Ok(())
++            }
++            MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::ProjectBag { input, .. }
++            | MaintainedRelPlanNode::ProjectSet { input, .. }
++            | MaintainedRelPlanNode::Distinct { input, .. }
++            | MaintainedRelPlanNode::PromoteToBag { input }
++            | MaintainedRelPlanNode::Group { input, .. }
++            | MaintainedRelPlanNode::TopK { input, .. } => {
++                input.attach_storage_handles(relation, ids)
++            }
++            MaintainedRelPlanNode::Join { left, right, .. } => {
++                left.attach_storage_handles(relation, ids)?;
++                right.attach_storage_handles(relation, ids)
++            }
++        }
++    }
++
++    /// Applies storage-certified base-table deltas without repeating semantic
++    /// membership search inside `Scan` nodes. Row identity is resolved once by
++    /// the authoritative storage layer and propagated here as stable handles.
++    pub fn apply_storage_certified_deltas(
++        &mut self,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelationDelta, RelQueryError> {
++        if context != &self.semantic_context {
++            return Err(RelQueryError::SemanticRevisionMismatch);
++        }
++        for (relation, certified) in deltas {
++            if *relation != certified.relation || !self.contains_scan_relation(*relation) {
++                return Err(RelQueryError::UnknownRelation(*relation));
++            }
++        }
++        self.validate_certified_leaf_deltas(deltas, context, registry)?;
++        self.apply_certified_leaf_deltas(deltas)?;
++        self.propagate_certified_deltas_inner(deltas, context, registry)
++    }
++
++    fn validate_certified_leaf_deltas(
++        &self,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), RelQueryError> {
++        match &self.node {
++            MaintainedRelPlanNode::Scan {
++                relation, handles, ..
++            } => {
++                let Some(certified) = deltas.get(relation) else {
++                    return Ok(());
++                };
++                if certified.delta.result_type != self.result_type
++                    || certified.removed_handles.len() != certified.delta.removed.len()
++                    || certified.inserted_handles.len() != certified.delta.inserted.len()
++                {
++                    return Err(RelQueryError::TypeMismatch);
++                }
++                MaterializedSetSupportState::validate_rows(
++                    &certified.delta.removed,
++                    &self.result_type,
++                    context,
++                    registry,
++                )?;
++                MaterializedSetSupportState::validate_rows(
++                    &certified.delta.inserted,
++                    &self.result_type,
++                    context,
++                    registry,
++                )?;
++                let handles = handles
++                    .as_ref()
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let mut seen = BTreeSet::new();
++                for id in &certified.removed_handles {
++                    if !handles.positions.contains_key(id) || !seen.insert(*id) {
++                        return Err(RelQueryError::InconsistentIncrementalDelta);
++                    }
++                }
++                for id in &certified.inserted_handles {
++                    if handles.positions.contains_key(id) || !seen.insert(*id) {
++                        return Err(RelQueryError::InconsistentIncrementalDelta);
++                    }
++                }
++                Ok(())
++            }
++            MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::ProjectBag { input, .. }
++            | MaintainedRelPlanNode::ProjectSet { input, .. }
++            | MaintainedRelPlanNode::Distinct { input, .. }
++            | MaintainedRelPlanNode::PromoteToBag { input }
++            | MaintainedRelPlanNode::Group { input, .. }
++            | MaintainedRelPlanNode::TopK { input, .. } => {
++                input.validate_certified_leaf_deltas(deltas, context, registry)
++            }
++            MaintainedRelPlanNode::Join { left, right, .. } => {
++                left.validate_certified_leaf_deltas(deltas, context, registry)?;
++                right.validate_certified_leaf_deltas(deltas, context, registry)
++            }
++        }
++    }
++
++    fn apply_certified_leaf_deltas(
++        &mut self,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++    ) -> Result<(), RelQueryError> {
++        match &mut self.node {
++            MaintainedRelPlanNode::Scan {
++                relation,
++                value,
++                handles,
++            } => {
++                let Some(certified) = deltas.get(relation) else {
++                    return Ok(());
++                };
++                let handles = handles
++                    .as_mut()
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                for id in &certified.removed_handles {
++                    handles.remove(value, *id)?;
++                }
++                for (id, row) in certified
++                    .inserted_handles
++                    .iter()
++                    .copied()
++                    .zip(certified.delta.inserted.iter().cloned())
++                {
++                    handles.insert(value, id, row)?;
++                }
++                Ok(())
++            }
++            MaintainedRelPlanNode::Filter { input, .. }
++            | MaintainedRelPlanNode::ProjectBag { input, .. }
++            | MaintainedRelPlanNode::ProjectSet { input, .. }
++            | MaintainedRelPlanNode::Distinct { input, .. }
++            | MaintainedRelPlanNode::PromoteToBag { input }
++            | MaintainedRelPlanNode::Group { input, .. }
++            | MaintainedRelPlanNode::TopK { input, .. } => {
++                input.apply_certified_leaf_deltas(deltas)
++            }
++            MaintainedRelPlanNode::Join { left, right, .. } => {
++                left.apply_certified_leaf_deltas(deltas)?;
++                right.apply_certified_leaf_deltas(deltas)
++            }
++        }
++    }
++
++    fn propagate_certified_deltas_inner(
++        &mut self,
++        deltas: &BTreeMap<kernel_types::SemanticId, StorageCertifiedRelationDelta>,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<RelationDelta, RelQueryError> {
++        match &mut self.node {
++            MaintainedRelPlanNode::Scan { relation, .. } => Ok(deltas.get(relation).map_or_else(
++                || RelationDelta {
++                    inserted: Vec::new(),
++                    removed: Vec::new(),
++                    result_type: self.result_type.clone(),
++                },
++                |certified| certified.delta.clone(),
++            )),
++            MaintainedRelPlanNode::Filter {
++                input,
++                column,
++                value,
++                equivalence,
++            } => rel_delta_filter(
++                input.propagate_certified_deltas_inner(deltas, context, registry)?,
++                *column,
++                value,
++                *equivalence,
++                context,
++                registry,
++            ),
++            MaintainedRelPlanNode::ProjectBag { input, columns } => rel_delta_project_bag(
++                input.propagate_certified_deltas_inner(deltas, context, registry)?,
++                columns,
++                &self.query,
++                context,
++                registry,
++            ),
++            MaintainedRelPlanNode::ProjectSet {
++                input,
++                columns,
++                supports,
++            } => {
++                let delta = input.propagate_certified_deltas_inner(deltas, context, registry)?;
++                supports.apply_rows_delta(
++                    project_rows(delta.inserted, columns)?,
++                    project_rows(delta.removed, columns)?,
++                    context,
++                    registry,
++                )
++            }
++            MaintainedRelPlanNode::Distinct { input, supports } => {
++                let delta = input.propagate_certified_deltas_inner(deltas, context, registry)?;
++                supports.apply_rows_delta(delta.inserted, delta.removed, context, registry)
++            }
++            MaintainedRelPlanNode::PromoteToBag { input } => {
++                let delta = input.propagate_certified_deltas_inner(deltas, context, registry)?;
++                Ok(RelationDelta {
++                    inserted: delta.inserted,
++                    removed: delta.removed,
++                    result_type: self.result_type.clone(),
++                })
++            }
++            MaintainedRelPlanNode::Join { left, right, state } => {
++                let left_delta =
++                    left.propagate_certified_deltas_inner(deltas, context, registry)?;
++                let right_delta =
++                    right.propagate_certified_deltas_inner(deltas, context, registry)?;
++                state.apply_input_deltas(&left_delta, &right_delta, context, registry)
++            }
++            MaintainedRelPlanNode::Group { input, state } => state.apply_input_delta(
++                &input.propagate_certified_deltas_inner(deltas, context, registry)?,
++                context,
++                registry,
++            ),
++            MaintainedRelPlanNode::TopK { input, state } => state.apply_input_delta(
++                &input.propagate_certified_deltas_inner(deltas, context, registry)?,
++                context,
++                registry,
++            ),
++        }
++    }
++
+     fn contains_scan_relation(&self, relation: kernel_types::SemanticId) -> bool {
+         match &self.node {
+             MaintainedRelPlanNode::Scan {
+@@ -1744,7 +2093,9 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), RelQueryError> {
+         match &self.node {
+-            MaintainedRelPlanNode::Scan { relation, value } => {
++            MaintainedRelPlanNode::Scan {
++                relation, value, ..
++            } => {
+                 let Some(delta) = deltas.get(relation) else {
+                     return Ok(());
+                 };
+@@ -1795,7 +2146,9 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<RelationDelta, RelQueryError> {
+         match &mut self.node {
+-            MaintainedRelPlanNode::Scan { relation, value } => {
++            MaintainedRelPlanNode::Scan {
++                relation, value, ..
++            } => {
+                 let Some(delta) = deltas.get(relation) else {
+                     return Ok(RelationDelta {
+                         inserted: Vec::new(),
+@@ -8467,6 +8820,95 @@
+         );
+         let left_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
+         let right_type = RelExpr::Scan(right).typecheck(&context, &registry).unwrap();
++
++        let mut certified_state = state.clone();
++        certified_state
++            .attach_storage_handles(
++                left,
++                &[
++                    kernel_types::StableRowHandle {
++                        slot: 0,
++                        generation: 0,
++                    },
++                    kernel_types::StableRowHandle {
++                        slot: 1,
++                        generation: 0,
++                    },
++                    kernel_types::StableRowHandle {
++                        slot: 2,
++                        generation: 0,
++                    },
++                ],
++            )
++            .unwrap();
++        certified_state
++            .attach_storage_handles(
++                right,
++                &[
++                    kernel_types::StableRowHandle {
++                        slot: 0,
++                        generation: 0,
++                    },
++                    kernel_types::StableRowHandle {
++                        slot: 1,
++                        generation: 0,
++                    },
++                ],
++            )
++            .unwrap();
++        let certified_delta = RelationDelta {
++            inserted: vec![vec![Value::I64(1), Value::I64(1)]],
++            removed: vec![vec![Value::I64(2), Value::I64(1)]],
++            result_type: left_type.clone(),
++        };
++        let certified = StorageCertifiedRelationDelta::new(
++            left,
++            certified_delta.clone(),
++            vec![kernel_types::StableRowHandle {
++                slot: 1,
++                generation: 0,
++            }],
++            vec![kernel_types::StableRowHandle {
++                slot: 1,
++                generation: 1,
++            }],
++        );
++        let mut certified_next = old.clone();
++        certified_next.relations.get_mut(&left).unwrap().remove(1);
++        certified_next
++            .relations
++            .get_mut(&left)
++            .unwrap()
++            .push(vec![Value::I64(1), Value::I64(1)]);
++        let certified_oracle = rel_delta_by_recompute(
++            &query,
++            &old,
++            &Change::Replace(certified_next.clone()),
++            &context,
++            &registry,
++        )
++        .unwrap();
++        let mut certified_map = BTreeMap::new();
++        certified_map.insert(left, certified);
++        let certified_output = certified_state
++            .apply_storage_certified_deltas(&certified_map, &context, &registry)
++            .unwrap();
++        assert!(
++            relation_deltas_semantically_equivalent(
++                &certified_output,
++                &certified_oracle,
++                &context,
++                &registry,
++            )
++            .unwrap()
++        );
++        assert_eq!(
++            certified_state.output_value(&context, &registry).unwrap(),
++            query
++                .evaluate(&certified_next, &context, &registry)
++                .unwrap()
++        );
++
+         let steps = [
+             (
+                 left,
+diff -ru /mnt/data/p26src/crates/kernel-types/src/lib.rs crates/kernel-types/src/lib.rs
+--- /mnt/data/p26src/crates/kernel-types/src/lib.rs	2026-09-19 00:48:04.000000000 +0000
++++ crates/kernel-types/src/lib.rs	2026-09-19 18:47:18.683491869 +0000
+@@ -31,6 +31,16 @@
+ semantic_id!(SemanticEnvId, u64);
+ semantic_id!(RevisionId, u64);
+ 
++/// Stable storage identity for one physical row slot.
++///
++/// The slot may be reused after deletion, while `generation` prevents stale
++/// handles from aliasing a later occupant of the same slot.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct StableRowHandle {
++    pub slot: usize,
++    pub generation: u64,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct SemanticRevision {
+     pub schema: SchemaRevisionId,

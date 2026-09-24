@@ -1,0 +1,20 @@
+[package]
+name = "kernel-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-change = { path = "../kernel-change" }
+kernel-model = { path = "../kernel-model" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-lifecycle = { path = "../kernel-lifecycle" }
+kernel-validation = { path = "../kernel-validation" }
+kernel-query = { path = "../kernel-query" }
+kernel-revision = { path = "../kernel-revision" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true

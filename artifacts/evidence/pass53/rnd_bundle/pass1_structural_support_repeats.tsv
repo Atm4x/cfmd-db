@@ -1,0 +1,10 @@
+baseline	1	n=3000 probes=1500 build_us=1736758 probe_us=918572 checksum=1500
+rnd	1	n=3000 probes=1500 build_us=23158 probe_us=3372 checksum=1500
+baseline	2	n=3000 probes=1500 build_us=1769998 probe_us=865781 checksum=1500
+rnd	2	n=3000 probes=1500 build_us=26378 probe_us=3554 checksum=1500
+baseline	3	n=3000 probes=1500 build_us=1827562 probe_us=967682 checksum=1500
+rnd	3	n=3000 probes=1500 build_us=27083 probe_us=5094 checksum=1500
+baseline	4	n=3000 probes=1500 build_us=1910576 probe_us=862757 checksum=1500
+rnd	4	n=3000 probes=1500 build_us=25576 probe_us=3633 checksum=1500
+baseline	5	n=3000 probes=1500 build_us=1723486 probe_us=874916 checksum=1500
+rnd	5	n=3000 probes=1500 build_us=25972 probe_us=5610 checksum=1500

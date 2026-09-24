@@ -1,0 +1,25 @@
+   Compiling kernel-transport v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-transport)
+   Compiling storage-memory v0.1.0 (/mnt/data/cfmd_pass78_work/crates/storage-memory)
+    Finished `release` profile [optimized] target(s) in 3.56s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/storage_memory-b5b9c42787deeb44)
+
+running 16 tests
+test tests::commit_normalizes_lifecycle_and_pins_semantics ... ok
+test tests::commit_rejects_pinned_but_uninstalled_semantic_module_even_when_empty ... ok
+test tests::bijective_identity_edge_becomes_mergeable_after_intent_conjugation ... ok
+test tests::conservative_environment_extension_is_transparent_only_toward_extended_context ... ok
+test tests::criss_cross_history_exposes_ambiguous_merge_base_instead_of_guessing ... ok
+test tests::diamond_has_unique_merge_base ... ok
+test tests::definitional_transport_is_an_identity_data_rewrite_inside_lca_merge ... ok
+test tests::genuine_semantic_law_migration_is_not_transparent_to_lifecycle_history ... ok
+test tests::identical_revision_numbers_cannot_alias_different_schema_contents ... ok
+test tests::equivalent_semantic_implementation_transport_is_transparent_to_lifecycle_merge ... ok
+test tests::lifecycle_merge_uses_semantic_intents_from_lca_not_pruned_snapshots ... ok
+test tests::identity_retention_domain_preserves_gc_pruned_atom_for_cross_branch_rescue ... ok
+test tests::lifecycle_rewrite_cannot_silently_cross_semantic_revision ... ok
+test tests::same_semantic_context_requires_explicit_identity_coordinate_choice ... ok
+test tests::snapshot_commit_also_requires_explicit_semantic_transport ... ok
+test tests::typed_field_transport_commits_as_first_class_revision_edge ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

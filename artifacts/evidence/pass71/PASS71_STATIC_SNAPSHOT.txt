@@ -1,0 +1,8 @@
+declared_tests=439
+kernel_plan_declared_tests=172
+crates=21
+rust_loc=62186
+external_cargo_sources=0
+unsafe_hits=0
+allow_attrs=19
+todo_fixme_unimplemented_hits=0

@@ -1,0 +1,14 @@
+# Production source changed from Pass27
+crates/kernel-plan/src/lib.rs
+crates/kernel-query/src/lib.rs
+
+# Post-freeze Pass28 reports/evidence added or regenerated
+PASS28_REPORT.md
+IMPLEMENTATION_REPORT_pass28.md
+PASS28_VERIFICATION_REPORT.md
+PASS28_STATIC_AUDIT.txt
+PASS28_CHANGED_FILES.txt
+MANIFEST.sha256
+evidence/pass28/PASS28_TOOLCHAIN_EVIDENCE.txt
+evidence/pass28/kernel-plan_pass27_to_pass28.patch
+evidence/pass28/kernel-query_pass27_to_pass28.patch

@@ -1,0 +1,4 @@
+RUN env RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
+   Generated /mnt/data/cfmd_pass29_work/cfmd_workspace_pass29/target/doc/kernel_aggregate/index.html and 18 other files
+EXIT 0

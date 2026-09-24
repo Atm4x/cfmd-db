@@ -1,0 +1,38 @@
+PASS31 FINAL STATIC AUDIT
+UTC 2026-09-19T22:09:57Z
+
+== old certificate terminology under crates ==
+PASS: none
+
+== public query prepared capability ==
+PASS: private/not exposed
+
+== runtime prepared source bundle field ==
+pub struct PreparedRuntimeRevisionTransition {
+    descriptor: RevisionCommitDescriptor,
+    source_identity: RuntimeRootIdentity,
+    candidate: Box<RuntimeRevisionBundle>,
+    output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
+
+PASS: source identity only
+
+== runtime cell/root publication ==
+4:        Arc, RwLock, RwLockWriteGuard,
+562:pub struct RuntimeRevisionSnapshot {
+572:pub struct RuntimeRevisionCell {
+573:    root: RwLock<Arc<RuntimeRevisionBundle>>,
+591:    live: RwLockWriteGuard<'a, Arc<RuntimeRevisionBundle>>,
+PASS
+
+== evidence contract ==
+363:/// This value is deliberately **not** a semantic certificate or publication
+366:/// can produce a detached candidate. Authoritative publication remains owned
+373:pub struct StorageResolvedRelationDelta {
+PASS
+
+== metrics ==
+declared tests: 243
+kernel-plan tests: 61
+rust LOC: 30053
+unsafe matches: 0
+external Cargo source entries: 0

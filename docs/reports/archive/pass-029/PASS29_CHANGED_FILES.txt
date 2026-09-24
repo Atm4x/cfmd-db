@@ -1,0 +1,13 @@
+Pass29 production source:
+crates/kernel-plan/src/lib.rs
+
+Pass29/current reports and specification:
+PASS29_REPORT.md
+IMPLEMENTATION_REPORT_pass29.md
+CFMD_IDEAL_DB_SPEC.md
+PASS28_VERIFICATION_REPORT.md
+
+Pass29 evidence:
+evidence/pass29/
+
+Note: kernel-query production source was not changed by Pass29 itself.

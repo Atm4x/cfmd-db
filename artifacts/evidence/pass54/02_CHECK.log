@@ -1,0 +1,7 @@
+    Checking kernel-query v0.1.0 (/mnt/data/cfmd_workspace_pass54/crates/kernel-query)
+    Checking kernel-durability v0.1.0 (/mnt/data/cfmd_workspace_pass54/crates/kernel-durability)
+    Checking kernel-transport v0.1.0 (/mnt/data/cfmd_workspace_pass54/crates/kernel-transport)
+    Checking storage-memory v0.1.0 (/mnt/data/cfmd_workspace_pass54/crates/storage-memory)
+    Checking kernel-plan v0.1.0 (/mnt/data/cfmd_workspace_pass54/crates/kernel-plan)
+    Checking kernel-integration v0.1.0 (/mnt/data/cfmd_workspace_pass54/crates/kernel-integration)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.10s

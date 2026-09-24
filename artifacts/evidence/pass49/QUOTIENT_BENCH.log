@@ -1,0 +1,7 @@
+
+running 1 test
+PASS44_MULTIWAY_BENCH baseline_median_ns=4648848 optimized_median_ns=31536 ratio_milli=147414
+test tests::pass44_multiway_join_reassociation_benchmark ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 127 filtered out; finished in 0.05s
+

@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/external_freshness_multiprocess.rs (/mnt/data/cfmd_pass118_target/debug/deps/external_freshness_multiprocess-6f28d1c67c234761)
+
+running 2 tests
+test freshness_authority_worker ... ok
+
+running 1 test
+test freshness_authority_worker ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.04s
+
+
+running 1 test
+test freshness_authority_worker ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.03s
+
+test external_process_anchor_survives_restart_and_fences_regression ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+

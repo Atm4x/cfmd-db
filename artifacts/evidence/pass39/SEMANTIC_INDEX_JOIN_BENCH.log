@@ -1,0 +1,18 @@
+=== release run 1 ===
+workload=TextAsciiCaseInsensitive,left_rows=1,delta_rows=1,rounds=7
+rows=1000,indexed_median_ns=1445,legacy_scan_median_ns=374,scan_over_indexed_x1000=258
+rows=10000,indexed_median_ns=1439,legacy_scan_median_ns=3337,scan_over_indexed_x1000=2318
+rows=50000,indexed_median_ns=1354,legacy_scan_median_ns=18414,scan_over_indexed_x1000=13599
+
+=== release run 2 ===
+workload=TextAsciiCaseInsensitive,left_rows=1,delta_rows=1,rounds=7
+rows=1000,indexed_median_ns=1631,legacy_scan_median_ns=362,scan_over_indexed_x1000=221
+rows=10000,indexed_median_ns=1355,legacy_scan_median_ns=5241,scan_over_indexed_x1000=3867
+rows=50000,indexed_median_ns=1500,legacy_scan_median_ns=18800,scan_over_indexed_x1000=12533
+
+=== release run 3 ===
+workload=TextAsciiCaseInsensitive,left_rows=1,delta_rows=1,rounds=7
+rows=1000,indexed_median_ns=2330,legacy_scan_median_ns=374,scan_over_indexed_x1000=160
+rows=10000,indexed_median_ns=2291,legacy_scan_median_ns=4620,scan_over_indexed_x1000=2016
+rows=50000,indexed_median_ns=1438,legacy_scan_median_ns=22954,scan_over_indexed_x1000=15962
+

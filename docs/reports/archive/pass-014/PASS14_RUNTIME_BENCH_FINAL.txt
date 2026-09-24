@@ -1,0 +1,39 @@
+=== process 1 ===
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=246402
+native_ns_per_iter_median=260351
+native_ns_per_iter_max=381481
+baseline_ns_per_iter_min=239142
+baseline_ns_per_iter_median=260366
+baseline_ns_per_iter_max=376118
+native_over_baseline_milli=999
+=== process 2 ===
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=249294
+native_ns_per_iter_median=297627
+native_ns_per_iter_max=353684
+baseline_ns_per_iter_min=252933
+baseline_ns_per_iter_median=256678
+baseline_ns_per_iter_max=331899
+native_over_baseline_milli=1159
+=== process 3 ===
+rows=100000
+matches=6250
+native_values_read=106250
+rounds=9
+iterations_per_round=30
+native_ns_per_iter_min=244572
+native_ns_per_iter_median=256389
+native_ns_per_iter_max=331055
+baseline_ns_per_iter_min=244567
+baseline_ns_per_iter_median=251293
+baseline_ns_per_iter_max=281689
+native_over_baseline_milli=1020

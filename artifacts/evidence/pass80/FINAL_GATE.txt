@@ -1,0 +1,11 @@
+PASS80 FINAL FROZEN-SOURCE GATE
+source freeze: 2026-09-21 20:32:49 UTC
+fmt: PASS
+check --workspace --all-targets: PASS
+debug tests: 512 passed / 0 failed / 8 ignored
+clippy -D warnings: PASS
+exact warmed release tests: 512 passed / 0 failed / 8 ignored
+release build: PASS
+rustdoc -D warnings: PASS
+exact warmed overflow-checks release tests: 512 passed / 0 failed / 8 ignored
+source freeze/post-gate hashes: IDENTICAL

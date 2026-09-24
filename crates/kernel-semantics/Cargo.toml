@@ -1,0 +1,15 @@
+[package]
+name = "kernel-semantics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-grounded-closure = { path = "../kernel-grounded-closure" }
+kernel-model = { path = "../kernel-model" }
+kernel-proof = { path = "../kernel-proof" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true

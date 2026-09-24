@@ -1,0 +1,2 @@
+$ cargo build --workspace --release
+    Finished `release` profile [optimized] target(s) in 0.01s

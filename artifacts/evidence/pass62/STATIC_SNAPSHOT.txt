@@ -1,0 +1,9 @@
+declared_tests=401
+kernel_plan_tests=151
+crates=21
+rust_loc=55476
+unsafe_hits=0
+allow_hits=19
+todo_fixme_hits=0
+generic_scan_hits=0
+orig_rej_temp=0

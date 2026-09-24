@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/kernel_lifecycle-58dcdc9d3c89ba1f)
+
+running 1 test
+tree_ns=88050596 dense_ns=2807426 ratio_milli=31363
+test tests::benchmark_dense_local_id_lifecycle_against_entity_tree_walk ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.12s
+

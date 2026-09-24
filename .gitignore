@@ -1,0 +1,94 @@
+# -----------------------------------------------------------------------------
+# CFMD repository ignore policy
+# -----------------------------------------------------------------------------
+# Keep Cargo.lock, vendor/, formal/, docs/, artifacts/, and retained certification
+# evidence tracked. vendor/ is intentionally committed because .cargo/config.toml
+# redirects crates.io to the vendored source tree for reproducible/offline builds.
+
+# Rust / Cargo build output
+/target/
+**/target/
+**/*.rs.bk
+
+# RustRover / IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# VS Code / editors
+.vscode/
+*.swp
+*.swo
+*.swn
+*~
+
+# OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Lean generated state / compiled artifacts
+.lake/
+**/.lake/
+*.olean
+*.ilean
+*.trace
+
+# Python caches / local virtual environments used by refinement scripts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Coverage / profiling / benchmark scratch
+/coverage/
+/htmlcov/
+/llvm-cov-target/
+*.profraw
+*.profdata
+tarpaulin-report.html
+
+# Local packaging / scratch output
+/dist/
+/out/
+/tmp/
+/scratch/
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Local logs. Retained project evidence under artifacts/ or docs/ may still be tracked.
+*.log
+!artifacts/**/*.log
+!docs/**/*.log
+
+# Local certification / VM scratch
+*.img
+*.qcow2
+*.raw
+*.iso
+*.pid
+*.sock
+/qemu-*/
+/cfmd13vm/
+/certification-local/
+
+# Local environment / credentials
+.env
+.env.*
+!.env.example
+.cargo/credentials
+.cargo/credentials.toml
+
+# Core dumps / crash artifacts
+core
+core.*
+*.dmp

@@ -1,0 +1,1219 @@
+diff -ruN /mnt/data/pass71_compare/crates/kernel-durability/src/lib.rs crates/kernel-durability/src/lib.rs
+--- /mnt/data/pass71_compare/crates/kernel-durability/src/lib.rs	2026-09-21 00:47:50.000000000 +0000
++++ crates/kernel-durability/src/lib.rs	2026-09-21 09:27:35.238008148 +0000
+@@ -18,6 +18,7 @@
+ pub const MAGIC: [u8; 4] = *b"CFMW";
+ pub const FORMAT_VERSION: u16 = 1;
+ pub const MUTATION_CODEC_VERSION: u16 = 5;
++pub const PHYSICAL_ARTIFACT_RECIPE_VERSION: u16 = 1;
+ pub const HEADER_LEN: usize = 36;
+ pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+ const MAX_COLLECTION_LEN: usize = 1_000_000;
+@@ -278,6 +279,126 @@
+     pub query: kernel_query::RelExpr,
+ }
+ 
++/// Layout-independent recipe for reconstructible physical state retained across
++/// checkpoint/reopen. Payload row handles are intentionally not durable; recovery
++/// rebuilds each artifact against the fresh runtime layout from authoritative data.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++pub struct DurableSemanticKeyPart {
++    pub column: usize,
++    pub equivalence: SemanticId,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++pub enum DurablePhysicalArtifactSpec {
++    SemanticIndex {
++        relation: SemanticId,
++        key_parts: Vec<DurableSemanticKeyPart>,
++        advisor_managed: bool,
++    },
++    SemanticQuotientFactor {
++        relation: SemanticId,
++        key_parts: Vec<DurableSemanticKeyPart>,
++        advisor_managed: bool,
++    },
++    SemanticStatistics {
++        relation: SemanticId,
++        key_parts: Vec<DurableSemanticKeyPart>,
++        advisor_managed: bool,
++    },
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++enum DurablePhysicalArtifactKey {
++    Index {
++        relation: SemanticId,
++        key_parts: Vec<DurableSemanticKeyPart>,
++    },
++    QuotientFactor {
++        relation: SemanticId,
++        key_parts: Vec<DurableSemanticKeyPart>,
++    },
++    Statistics {
++        relation: SemanticId,
++        key_parts: Vec<DurableSemanticKeyPart>,
++    },
++}
++
++fn canonical_physical_artifact_specs(
++    specs: &[DurablePhysicalArtifactSpec],
++) -> Vec<DurablePhysicalArtifactSpec> {
++    let mut ownership = BTreeMap::<DurablePhysicalArtifactKey, bool>::new();
++    for spec in specs {
++        let (key, advisor_managed) = match spec {
++            DurablePhysicalArtifactSpec::SemanticIndex {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => (
++                DurablePhysicalArtifactKey::Index {
++                    relation: *relation,
++                    key_parts: key_parts.clone(),
++                },
++                *advisor_managed,
++            ),
++            DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => (
++                DurablePhysicalArtifactKey::QuotientFactor {
++                    relation: *relation,
++                    key_parts: key_parts.clone(),
++                },
++                *advisor_managed,
++            ),
++            DurablePhysicalArtifactSpec::SemanticStatistics {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => (
++                DurablePhysicalArtifactKey::Statistics {
++                    relation: *relation,
++                    key_parts: key_parts.clone(),
++                },
++                *advisor_managed,
++            ),
++        };
++        ownership
++            .entry(key)
++            .and_modify(|managed| *managed &= advisor_managed)
++            .or_insert(advisor_managed);
++    }
++    ownership
++        .into_iter()
++        .map(|(key, advisor_managed)| match key {
++            DurablePhysicalArtifactKey::Index {
++                relation,
++                key_parts,
++            } => DurablePhysicalArtifactSpec::SemanticIndex {
++                relation,
++                key_parts,
++                advisor_managed,
++            },
++            DurablePhysicalArtifactKey::QuotientFactor {
++                relation,
++                key_parts,
++            } => DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++                relation,
++                key_parts,
++                advisor_managed,
++            },
++            DurablePhysicalArtifactKey::Statistics {
++                relation,
++                key_parts,
++            } => DurablePhysicalArtifactSpec::SemanticStatistics {
++                relation,
++                key_parts,
++                advisor_managed,
++            },
++        })
++        .collect()
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum DurableTransactionOutcome {
+     Unknown,
+@@ -1884,6 +2005,7 @@
+         let prepare = encode_prepare_payload(&descriptor).unwrap();
+         let metadata_bytes = metadata::encode(&metadata::DurableStoreMetadata {
+             materializations: Vec::new(),
++            physical_artifacts: Vec::new(),
+             committed_transactions: BTreeMap::from([(
+                 descriptor.transaction_id,
+                 descriptor.intent.clone(),
+diff -ruN /mnt/data/pass71_compare/crates/kernel-durability/src/metadata.rs crates/kernel-durability/src/metadata.rs
+--- /mnt/data/pass71_compare/crates/kernel-durability/src/metadata.rs	2026-09-21 00:47:50.000000000 +0000
++++ crates/kernel-durability/src/metadata.rs	2026-09-21 09:31:18.939265237 +0000
+@@ -9,16 +9,18 @@
+ };
+ 
+ use super::{
+-    CodecError, Cursor, DurableMaterializationSpec, DurableTransactionIntent, encode_value,
+-    push_bytes, push_len, push_u64, push_u128,
++    CodecError, Cursor, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
++    DurableSemanticKeyPart, DurableTransactionIntent, PHYSICAL_ARTIFACT_RECIPE_VERSION,
++    canonical_physical_artifact_specs, encode_value, push_bytes, push_len, push_u64, push_u128,
+ };
+ 
+-const METADATA_CODEC_VERSION: u16 = 4;
++const METADATA_CODEC_VERSION: u16 = 5;
+ const MAX_QUERY_DEPTH: usize = 128;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct DurableStoreMetadata {
+     pub materializations: Vec<DurableMaterializationSpec>,
++    pub physical_artifacts: Vec<DurablePhysicalArtifactSpec>,
+     pub committed_transactions: BTreeMap<ClientTransactionId, DurableTransactionIntent>,
+     pub semantic_modules: Vec<BuiltinSemanticModuleSpec>,
+ }
+@@ -27,6 +29,7 @@
+     let mut out = Vec::new();
+     out.extend_from_slice(&METADATA_CODEC_VERSION.to_le_bytes());
+     encode_materialization_specs(&mut out, &metadata.materializations)?;
++    encode_physical_artifact_specs(&mut out, &metadata.physical_artifacts)?;
+     push_len(&mut out, metadata.committed_transactions.len())?;
+     for (transaction_id, intent) in &metadata.committed_transactions {
+         push_u128(&mut out, transaction_id.raw());
+@@ -45,10 +48,20 @@
+ pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str> {
+     let mut cursor = Cursor::new(bytes);
+     let version = cursor.u16()?;
+-    if version != 1 && version != 2 && version != 3 && version != METADATA_CODEC_VERSION {
++    if version != 1
++        && version != 2
++        && version != 3
++        && version != 4
++        && version != METADATA_CODEC_VERSION
++    {
+         return Err("unsupported durable metadata codec version");
+     }
+     let materializations = decode_materialization_specs(&mut cursor)?;
++    let physical_artifacts = if version >= 5 {
++        decode_physical_artifact_specs(&mut cursor)?
++    } else {
++        Vec::new()
++    };
+ 
+     let transaction_count = cursor.len()?;
+     let mut committed_transactions = BTreeMap::new();
+@@ -88,6 +101,7 @@
+     cursor.finish()?;
+     Ok(DurableStoreMetadata {
+         materializations,
++        physical_artifacts,
+         committed_transactions,
+         semantic_modules,
+     })
+@@ -130,6 +144,134 @@
+     Ok(materializations)
+ }
+ 
++fn encode_physical_artifact_specs(
++    out: &mut Vec<u8>,
++    specs: &[DurablePhysicalArtifactSpec],
++) -> Result<(), CodecError> {
++    out.extend_from_slice(&PHYSICAL_ARTIFACT_RECIPE_VERSION.to_le_bytes());
++    let specs = canonical_physical_artifact_specs(specs);
++    push_len(out, specs.len())?;
++    for spec in specs {
++        match spec {
++            DurablePhysicalArtifactSpec::SemanticIndex {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => {
++                out.push(0);
++                encode_semantic_artifact_key(out, relation, &key_parts, advisor_managed)?;
++            }
++            DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => {
++                out.push(1);
++                encode_semantic_artifact_key(out, relation, &key_parts, advisor_managed)?;
++            }
++            DurablePhysicalArtifactSpec::SemanticStatistics {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => {
++                out.push(2);
++                encode_semantic_artifact_key(out, relation, &key_parts, advisor_managed)?;
++            }
++        }
++    }
++    Ok(())
++}
++
++fn encode_semantic_artifact_key(
++    out: &mut Vec<u8>,
++    relation: SemanticId,
++    key_parts: &[DurableSemanticKeyPart],
++    advisor_managed: bool,
++) -> Result<(), CodecError> {
++    push_u128(out, relation.raw());
++    push_len(out, key_parts.len())?;
++    for part in key_parts {
++        push_u64(
++            out,
++            u64::try_from(part.column).map_err(|_| CodecError::CollectionTooLarge)?,
++        );
++        push_u128(out, part.equivalence.raw());
++    }
++    out.push(u8::from(advisor_managed));
++    Ok(())
++}
++
++fn decode_physical_artifact_specs(
++    cursor: &mut Cursor<'_>,
++) -> Result<Vec<DurablePhysicalArtifactSpec>, &'static str> {
++    if cursor.u16()? != PHYSICAL_ARTIFACT_RECIPE_VERSION {
++        return Err("unsupported physical artifact recipe version");
++    }
++    let count = cursor.len()?;
++    let mut specs = Vec::with_capacity(count);
++    for _ in 0..count {
++        let tag = cursor.u8()?;
++        let spec = match tag {
++            0 => {
++                let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
++                DurablePhysicalArtifactSpec::SemanticIndex {
++                    relation,
++                    key_parts,
++                    advisor_managed,
++                }
++            }
++            1 => {
++                let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
++                DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++                    relation,
++                    key_parts,
++                    advisor_managed,
++                }
++            }
++            2 => {
++                let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
++                DurablePhysicalArtifactSpec::SemanticStatistics {
++                    relation,
++                    key_parts,
++                    advisor_managed,
++                }
++            }
++            _ => return Err("invalid physical artifact spec tag"),
++        };
++        specs.push(spec);
++    }
++    if specs.windows(2).any(|pair| pair[0] >= pair[1]) {
++        return Err("physical artifact specs are not strictly sorted and unique");
++    }
++    Ok(specs)
++}
++
++fn decode_semantic_artifact_key(
++    cursor: &mut Cursor<'_>,
++) -> Result<(SemanticId, Vec<DurableSemanticKeyPart>, bool), &'static str> {
++    let relation = SemanticId::new(cursor.u128()?);
++    let count = cursor.len()?;
++    if count == 0 {
++        return Err("physical artifact semantic key is empty");
++    }
++    let mut key_parts = Vec::with_capacity(count);
++    for _ in 0..count {
++        let column =
++            usize::try_from(cursor.u64()?).map_err(|_| "physical artifact column overflow")?;
++        let equivalence = SemanticId::new(cursor.u128()?);
++        key_parts.push(DurableSemanticKeyPart {
++            column,
++            equivalence,
++        });
++    }
++    let advisor_managed = match cursor.u8()? {
++        0 => false,
++        1 => true,
++        _ => return Err("invalid physical artifact ownership tag"),
++    };
++    Ok((relation, key_parts, advisor_managed))
++}
++
+ fn encode_transaction_intent(
+     out: &mut Vec<u8>,
+     intent: &DurableTransactionIntent,
+@@ -648,6 +790,7 @@
+                 id: MaterializationId::new(7),
+                 query,
+             }],
++            physical_artifacts: current_physical_artifact_specs(eq),
+             committed_transactions: [
+                 (
+                     ClientTransactionId::new(11),
+@@ -682,4 +825,100 @@
+         let bytes = encode(&metadata).unwrap();
+         assert_eq!(decode(&bytes).unwrap(), metadata);
+     }
++    fn current_physical_artifact_specs(eq: SemanticId) -> Vec<DurablePhysicalArtifactSpec> {
++        vec![
++            DurablePhysicalArtifactSpec::SemanticIndex {
++                relation: SemanticId::new(1),
++                key_parts: vec![DurableSemanticKeyPart {
++                    column: 0,
++                    equivalence: eq,
++                }],
++                advisor_managed: true,
++            },
++            DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++                relation: SemanticId::new(2),
++                key_parts: vec![DurableSemanticKeyPart {
++                    column: 1,
++                    equivalence: eq,
++                }],
++                advisor_managed: false,
++            },
++            DurablePhysicalArtifactSpec::SemanticStatistics {
++                relation: SemanticId::new(2),
++                key_parts: vec![DurableSemanticKeyPart {
++                    column: 0,
++                    equivalence: eq,
++                }],
++                advisor_managed: true,
++            },
++        ]
++    }
++
++    #[test]
++    fn physical_artifact_recipe_collapse_preserves_manual_pin() {
++        let eq = SemanticId::new(78);
++        let mut bytes = Vec::new();
++        encode_physical_artifact_specs(
++            &mut bytes,
++            &[
++                DurablePhysicalArtifactSpec::SemanticIndex {
++                    relation: SemanticId::new(77),
++                    key_parts: vec![DurableSemanticKeyPart {
++                        column: 0,
++                        equivalence: eq,
++                    }],
++                    advisor_managed: true,
++                },
++                DurablePhysicalArtifactSpec::SemanticIndex {
++                    relation: SemanticId::new(77),
++                    key_parts: vec![DurableSemanticKeyPart {
++                        column: 0,
++                        equivalence: eq,
++                    }],
++                    advisor_managed: false,
++                },
++            ],
++        )
++        .unwrap();
++        let mut cursor = Cursor::new(&bytes);
++        let decoded = decode_physical_artifact_specs(&mut cursor).unwrap();
++        cursor.finish().unwrap();
++        assert_eq!(
++            decoded,
++            vec![DurablePhysicalArtifactSpec::SemanticIndex {
++                relation: SemanticId::new(77),
++                key_parts: vec![DurableSemanticKeyPart {
++                    column: 0,
++                    equivalence: eq,
++                }],
++                advisor_managed: false,
++            }]
++        );
++    }
++
++    #[test]
++    fn metadata_v4_decodes_without_physical_artifact_manifest() {
++        let mut bytes = Vec::new();
++        bytes.extend_from_slice(&4_u16.to_le_bytes());
++        encode_materialization_specs(&mut bytes, &[]).unwrap();
++        push_len(&mut bytes, 0).unwrap();
++        push_len(&mut bytes, 0).unwrap();
++        let decoded = decode(&bytes).unwrap();
++        assert!(decoded.materializations.is_empty());
++        assert!(decoded.physical_artifacts.is_empty());
++        assert!(decoded.committed_transactions.is_empty());
++        assert!(decoded.semantic_modules.is_empty());
++    }
++
++    #[test]
++    fn physical_artifact_recipe_version_is_fail_closed() {
++        let mut bytes = Vec::new();
++        encode_physical_artifact_specs(&mut bytes, &[]).unwrap();
++        bytes[..2].copy_from_slice(&(PHYSICAL_ARTIFACT_RECIPE_VERSION + 1).to_le_bytes());
++        let mut cursor = Cursor::new(&bytes);
++        assert_eq!(
++            decode_physical_artifact_specs(&mut cursor),
++            Err("unsupported physical artifact recipe version")
++        );
++    }
+ }
+diff -ruN /mnt/data/pass71_compare/crates/kernel-durability/src/store.rs crates/kernel-durability/src/store.rs
+--- /mnt/data/pass71_compare/crates/kernel-durability/src/store.rs	2026-09-21 00:47:50.000000000 +0000
++++ crates/kernel-durability/src/store.rs	2026-09-21 09:27:34.646888765 +0000
+@@ -8,10 +8,11 @@
+ use kernel_types::{ClientTransactionId, RevisionId};
+ 
+ use super::{
+-    DurabilityError, DurableCommitReceipt, DurableMaterializationSpec, DurablePrepareToken,
+-    DurableRevisionChange, DurableRevisionDescriptor, DurableTransactionIntent,
+-    DurableTransactionOutcome, FileRevisionWal, RecoveryScan, RevisionDurability, checkpoint,
+-    crc32c, metadata, read_u16, read_u32, read_u64,
++    DurabilityError, DurableCommitReceipt, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
++    DurablePrepareToken, DurableRevisionChange, DurableRevisionDescriptor,
++    DurableTransactionIntent, DurableTransactionOutcome, FileRevisionWal, RecoveryScan,
++    RevisionDurability, canonical_physical_artifact_specs, checkpoint, crc32c, metadata, read_u16,
++    read_u32, read_u64,
+ };
+ 
+ const CHECKPOINT_MAGIC: [u8; 4] = *b"CFCP";
+@@ -75,6 +76,7 @@
+     wal: FileRevisionWal,
+     semantic_registry: SemanticRegistry,
+     materialization_specs: Vec<DurableMaterializationSpec>,
++    physical_artifact_specs: Vec<DurablePhysicalArtifactSpec>,
+     committed_transactions: BTreeMap<ClientTransactionId, DurableTransactionIntent>,
+     prepared_transactions: BTreeMap<u64, DurableRevisionDescriptor>,
+     poisoned: bool,
+@@ -145,7 +147,13 @@
+         base_revision: &Revision,
+         registry: &SemanticRegistry,
+     ) -> Result<Self, DurabilityError> {
+-        Self::create_with_materializations(directory, base_revision, &[], registry)
++        Self::create_with_materializations_and_physical_artifacts(
++            directory,
++            base_revision,
++            &[],
++            &[],
++            registry,
++        )
+     }
+ 
+     pub fn create_with_materializations(
+@@ -154,10 +162,27 @@
+         materialization_specs: &[DurableMaterializationSpec],
+         registry: &SemanticRegistry,
+     ) -> Result<Self, DurabilityError> {
++        Self::create_with_materializations_and_physical_artifacts(
++            directory,
++            base_revision,
++            materialization_specs,
++            &[],
++            registry,
++        )
++    }
++
++    pub fn create_with_materializations_and_physical_artifacts(
++        directory: impl AsRef<Path>,
++        base_revision: &Revision,
++        materialization_specs: &[DurableMaterializationSpec],
++        physical_artifact_specs: &[DurablePhysicalArtifactSpec],
++        registry: &SemanticRegistry,
++    ) -> Result<Self, DurabilityError> {
+         Self::create_with_hook(
+             directory.as_ref(),
+             base_revision,
+             materialization_specs,
++            physical_artifact_specs,
+             registry,
+             &mut NoStoreFault,
+         )
+@@ -167,6 +192,7 @@
+         directory: &Path,
+         base_revision: &Revision,
+         materialization_specs: &[DurableMaterializationSpec],
++        physical_artifact_specs: &[DurablePhysicalArtifactSpec],
+         registry: &SemanticRegistry,
+         hook: &mut impl StoreFaultHook,
+     ) -> Result<Self, DurabilityError> {
+@@ -194,8 +220,10 @@
+                 offset: 0,
+                 reason: "base revision requires unavailable semantic implementation",
+             })?;
++        let physical_artifact_specs = canonical_physical_artifact_specs(physical_artifact_specs);
+         let metadata_record = metadata::DurableStoreMetadata {
+             materializations: materialization_specs.to_vec(),
++            physical_artifacts: physical_artifact_specs.clone(),
+             committed_transactions: committed_transactions.clone(),
+             semantic_modules,
+         };
+@@ -223,6 +251,7 @@
+             wal,
+             semantic_registry: registry.clone(),
+             materialization_specs: materialization_specs.to_vec(),
++            physical_artifact_specs,
+             committed_transactions,
+             prepared_transactions: BTreeMap::new(),
+             poisoned: false,
+@@ -304,6 +333,7 @@
+                 wal,
+                 semantic_registry: registry,
+                 materialization_specs: metadata.materializations,
++                physical_artifact_specs: metadata.physical_artifacts,
+                 committed_transactions,
+                 prepared_transactions: BTreeMap::new(),
+                 poisoned: false,
+@@ -343,6 +373,11 @@
+     }
+ 
+     #[must_use]
++    pub fn physical_artifact_specs(&self) -> &[DurablePhysicalArtifactSpec] {
++        &self.physical_artifact_specs
++    }
++
++    #[must_use]
+     pub const fn semantic_registry(&self) -> &SemanticRegistry {
+         &self.semantic_registry
+     }
+@@ -373,7 +408,12 @@
+         revision: &Revision,
+     ) -> Result<DurableGenerationReceipt, DurabilityError> {
+         let materialization_specs = self.materialization_specs.clone();
+-        self.rotate_checkpoint_with_materializations(revision, &materialization_specs)
++        let physical_artifact_specs = self.physical_artifact_specs.clone();
++        self.rotate_checkpoint_with_materializations_and_physical_artifacts(
++            revision,
++            &materialization_specs,
++            &physical_artifact_specs,
++        )
+     }
+ 
+     pub fn rotate_checkpoint_with_materializations(
+@@ -381,6 +421,20 @@
+         revision: &Revision,
+         materialization_specs: &[DurableMaterializationSpec],
+     ) -> Result<DurableGenerationReceipt, DurabilityError> {
++        let physical_artifact_specs = self.physical_artifact_specs.clone();
++        self.rotate_checkpoint_with_materializations_and_physical_artifacts(
++            revision,
++            materialization_specs,
++            &physical_artifact_specs,
++        )
++    }
++
++    pub fn rotate_checkpoint_with_materializations_and_physical_artifacts(
++        &mut self,
++        revision: &Revision,
++        materialization_specs: &[DurableMaterializationSpec],
++        physical_artifact_specs: &[DurablePhysicalArtifactSpec],
++    ) -> Result<DurableGenerationReceipt, DurabilityError> {
+         if self.poisoned {
+             return Err(DurabilityError::Poisoned);
+         }
+@@ -390,8 +444,12 @@
+                 reason: "checkpoint revision does not match durable WAL head",
+             });
+         }
+-        let result =
+-            self.rotate_checkpoint_with_hook(revision, materialization_specs, &mut NoStoreFault);
++        let result = self.rotate_checkpoint_with_hook(
++            revision,
++            materialization_specs,
++            physical_artifact_specs,
++            &mut NoStoreFault,
++        );
+         if result.is_err() {
+             self.poisoned = true;
+         }
+@@ -402,6 +460,7 @@
+         &mut self,
+         revision: &Revision,
+         materialization_specs: &[DurableMaterializationSpec],
++        physical_artifact_specs: &[DurablePhysicalArtifactSpec],
+         hook: &mut impl StoreFaultHook,
+     ) -> Result<DurableGenerationReceipt, DurabilityError> {
+         let generation = next_generation(&self.directory)?;
+@@ -412,8 +471,10 @@
+         let mut wal = FileRevisionWal::create(&wal_file)?;
+         wal.barrier()?;
+         hook.hit(StoreFaultPoint::AfterWalSync);
++        let physical_artifact_specs = canonical_physical_artifact_specs(physical_artifact_specs);
+         let metadata_record = metadata::DurableStoreMetadata {
+             materializations: materialization_specs.to_vec(),
++            physical_artifacts: physical_artifact_specs.clone(),
+             committed_transactions: self.committed_transactions.clone(),
+             semantic_modules: self
+                 .semantic_registry
+@@ -442,6 +503,7 @@
+         self.checkpoint = revision.clone();
+         self.wal = wal;
+         self.materialization_specs = materialization_specs.to_vec();
++        self.physical_artifact_specs = physical_artifact_specs;
+         self.prepared_transactions.clear();
+         Ok(DurableGenerationReceipt {
+             generation,
+@@ -1442,7 +1504,7 @@
+         };
+         let specs = store.materialization_specs().to_vec();
+         store
+-            .rotate_checkpoint_with_hook(&next, &specs, &mut hook)
++            .rotate_checkpoint_with_hook(&next, &specs, &[], &mut hook)
+             .unwrap();
+         panic!("checkpoint crash point was not reached: {point:?}");
+     }
+diff -ruN /mnt/data/pass71_compare/crates/kernel-plan/src/lib.rs crates/kernel-plan/src/lib.rs
+--- /mnt/data/pass71_compare/crates/kernel-plan/src/lib.rs	2026-09-21 01:53:53.000000000 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-21 09:45:34.815023003 +0000
+@@ -8,9 +8,9 @@
+ 
+ use kernel_durability::{
+     DurabilityError, DurableCommitReceipt, DurableGenerationReceipt, DurableMaterializationSpec,
+-    DurableRelationMutation, DurableRevisionChange, DurableRevisionDescriptor,
+-    DurableRevisionStore, DurableTransactionIntent, DurableTransactionOutcome, RecoveryScan,
+-    RevisionDurability,
++    DurablePhysicalArtifactSpec, DurableRelationMutation, DurableRevisionChange,
++    DurableRevisionDescriptor, DurableRevisionStore, DurableSemanticKeyPart,
++    DurableTransactionIntent, DurableTransactionOutcome, RecoveryScan, RevisionDurability,
+ };
+ use kernel_identity::{DenseEntityIds, LocalEntityId};
+ use kernel_model::Value;
+@@ -1541,6 +1541,11 @@
+             .collect()
+     }
+ 
++    #[must_use]
++    pub fn durable_physical_artifact_specs(&self) -> Vec<DurablePhysicalArtifactSpec> {
++        self.physical.durable_physical_artifact_specs()
++    }
++
+     #[cfg(test)]
+     fn test_clone(&self) -> Self {
+         Self {
+@@ -2166,7 +2171,13 @@
+         if durability.durable_head() != live.revision.id() {
+             return Err(PhysicalExecutionError::DurableHeadMismatch.into());
+         }
+-        match durability.rotate_checkpoint(live.revision()) {
++        let materialization_specs = live.durable_materialization_specs();
++        let physical_artifact_specs = live.durable_physical_artifact_specs();
++        match durability.rotate_checkpoint_with_materializations_and_physical_artifacts(
++            live.revision(),
++            &materialization_specs,
++            &physical_artifact_specs,
++        ) {
+             Ok(receipt) => Ok(receipt),
+             Err(error) => {
+                 *state = RuntimeRevisionCellState::RecoveryRequired;
+@@ -2504,10 +2515,12 @@
+         registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<Self, DurabilityError> {
+         let materialization_specs = root.durable_materialization_specs();
+-        let durability = DurableRevisionStore::create_with_materializations(
++        let physical_artifact_specs = root.durable_physical_artifact_specs();
++        let durability = DurableRevisionStore::create_with_materializations_and_physical_artifacts(
+             directory,
+             root.revision(),
+             &materialization_specs,
++            &physical_artifact_specs,
+             registry,
+         )?;
+         Ok(Self {
+@@ -2528,10 +2541,12 @@
+                 query: spec.query.clone(),
+             })
+             .collect::<Vec<_>>();
++        let physical_artifact_specs = durability.physical_artifact_specs().to_vec();
+         let root = recover_runtime_bundle(
+             durability.checkpoint_revision(),
+             &scan,
+             &materialization_specs,
++            &physical_artifact_specs,
+             &registry,
+         )?;
+         if root.revision().id() != durability.durable_head() {
+@@ -2769,9 +2784,13 @@
+             .prepare_materialization_configuration(specs, registry)?;
+         let sealed = prepared.seal(&self.cell)?;
+         let durable_specs = sealed.durable_materialization_specs();
++        let physical_artifact_specs = sealed.candidate.durable_physical_artifact_specs();
+         let receipt = match durability
+-            .rotate_checkpoint_with_materializations(sealed.revision(), &durable_specs)
+-        {
++            .rotate_checkpoint_with_materializations_and_physical_artifacts(
++                sealed.revision(),
++                &durable_specs,
++                &physical_artifact_specs,
++            ) {
+             Ok(receipt) => receipt,
+             Err(error) => {
+                 sealed.require_recovery();
+@@ -3271,6 +3290,7 @@
+     base_revision: &kernel_revision::Revision,
+     scan: &RecoveryScan,
+     materialization_specs: &[RuntimeMaterializationSpec],
++    physical_artifact_specs: &[DurablePhysicalArtifactSpec],
+     registry: &kernel_semantics::SemanticRegistry,
+ ) -> Result<RuntimeRevisionBundle, RuntimeRecoveryError> {
+     let revision = replay_durable_revisions(base_revision, scan, registry)?;
+@@ -3306,6 +3326,11 @@
+         )?;
+         relation_layouts.insert(relation.id, LayoutBinding::RECOVERY_ROW_STORE);
+     }
++    physical.restore_durable_physical_artifacts(
++        physical_artifact_specs,
++        revision.semantic_context(),
++        registry,
++    );
+     Ok(RuntimeRevisionBundle::build(
+         revision,
+         physical,
+@@ -3365,6 +3390,37 @@
+     Ok(())
+ }
+ 
++fn durable_semantic_key_parts(binding: &SemanticIndexBinding) -> Vec<DurableSemanticKeyPart> {
++    binding
++        .key_parts
++        .iter()
++        .map(|part| DurableSemanticKeyPart {
++            column: part.column,
++            equivalence: part.equivalence,
++        })
++        .collect()
++}
++
++fn recovered_semantic_index_binding(
++    relation: SemanticId,
++    key_parts: &[DurableSemanticKeyPart],
++) -> Result<SemanticIndexBinding, PhysicalExecutionError> {
++    if key_parts.is_empty() {
++        return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++    }
++    Ok(SemanticIndexBinding {
++        relation,
++        layout: LayoutBinding::RECOVERY_ROW_STORE,
++        key_parts: key_parts
++            .iter()
++            .map(|part| SemanticIndexKeyPart {
++                column: part.column,
++                equivalence: part.equivalence,
++            })
++            .collect(),
++    })
++}
++
+ impl PhysicalStore {
+     fn relations_mut(&mut self) -> &mut BTreeMap<(SemanticId, LayoutId), Arc<InstalledRelation>> {
+         Arc::make_mut(&mut self.relations)
+@@ -3661,6 +3717,112 @@
+     }
+ 
+     #[must_use]
++    pub fn durable_physical_artifact_specs(&self) -> Vec<DurablePhysicalArtifactSpec> {
++        let mut specs = Vec::new();
++        for binding in self.semantic_indexes.keys() {
++            specs.push(DurablePhysicalArtifactSpec::SemanticIndex {
++                relation: binding.relation,
++                key_parts: durable_semantic_key_parts(binding),
++                advisor_managed: self
++                    .advisor_managed_artifacts
++                    .contains(&ManagedPhysicalArtifact::SemanticIndex(binding.clone())),
++            });
++        }
++        for binding in self.semantic_quotient_factors.keys() {
++            specs.push(DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++                relation: binding.relation,
++                key_parts: durable_semantic_key_parts(binding),
++                advisor_managed: self.advisor_managed_artifacts.contains(
++                    &ManagedPhysicalArtifact::SemanticQuotientFactor(binding.clone()),
++                ),
++            });
++        }
++        for binding in self.semantic_statistics.keys() {
++            specs.push(DurablePhysicalArtifactSpec::SemanticStatistics {
++                relation: binding.relation,
++                key_parts: durable_semantic_key_parts(binding),
++                advisor_managed: self.advisor_managed_artifacts.contains(
++                    &ManagedPhysicalArtifact::SemanticStatistics(binding.clone()),
++                ),
++            });
++        }
++        specs.sort();
++        specs.dedup();
++        specs
++    }
++
++    fn restore_durable_physical_artifacts(
++        &mut self,
++        specs: &[DurablePhysicalArtifactSpec],
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) {
++        for spec in specs {
++            // Recipes describe reconstructible optimization state, never logical
++            // authority. A syntactically valid recipe may become stale after a
++            // checkpoint's WAL tail performs a schema/Γ migration. In that case
++            // recovery drops only the optimization and continues from Revision.
++            let _ = self.try_restore_durable_physical_artifact(spec, context, registry);
++        }
++        self.state_identity = Arc::new(());
++    }
++
++    fn try_restore_durable_physical_artifact(
++        &mut self,
++        spec: &DurablePhysicalArtifactSpec,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        match spec {
++            DurablePhysicalArtifactSpec::SemanticIndex {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => {
++                let binding = recovered_semantic_index_binding(*relation, key_parts)?;
++                self.install_semantic_index(binding.clone(), context, registry)?;
++                if *advisor_managed {
++                    self.advisor_managed_artifacts_mut()
++                        .insert(ManagedPhysicalArtifact::SemanticIndex(binding));
++                }
++            }
++            DurablePhysicalArtifactSpec::SemanticQuotientFactor {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => {
++                let binding = recovered_semantic_index_binding(*relation, key_parts)?;
++                let relation_state = self.installed(binding.relation, binding.layout)?;
++                let state = MaterializedSemanticQuotientFactorState::build(
++                    binding.clone(),
++                    relation_state,
++                    context,
++                    registry,
++                )?;
++                self.semantic_quotient_factors_mut()
++                    .insert(binding.clone(), Arc::new(state));
++                if *advisor_managed {
++                    self.advisor_managed_artifacts_mut()
++                        .insert(ManagedPhysicalArtifact::SemanticQuotientFactor(binding));
++                }
++            }
++            DurablePhysicalArtifactSpec::SemanticStatistics {
++                relation,
++                key_parts,
++                advisor_managed,
++            } => {
++                let binding = recovered_semantic_index_binding(*relation, key_parts)?;
++                self.install_semantic_statistics(binding.clone(), context, registry)?;
++                if *advisor_managed {
++                    self.advisor_managed_artifacts_mut()
++                        .insert(ManagedPhysicalArtifact::SemanticStatistics(binding));
++                }
++            }
++        }
++        Ok(())
++    }
++
++    #[must_use]
+     pub fn artifact_memory_report(&self) -> PhysicalArtifactMemoryReport {
+         let mut report = PhysicalArtifactMemoryReport::default();
+         let mut add = |family: PhysicalArtifactFamily, bytes: usize, advisor_managed: bool| {
+@@ -24200,7 +24362,8 @@
+ 
+         let scan = kernel_durability::scan_wal(wal.crash_image(), base_revision.id()).unwrap();
+         assert_eq!(scan.durable_revision(), RevisionId::new(301));
+-        let recovered = recover_runtime_bundle(&base_revision, &scan, &specs, &registry).unwrap();
++        let recovered =
++            recover_runtime_bundle(&base_revision, &scan, &specs, &[], &registry).unwrap();
+         assert_eq!(recovered.revision(), live.revision());
+         assert_eq!(
+             runtime_physical_i64_values(&recovered, relation, LayoutBinding::RECOVERY_ROW_STORE,),
+@@ -24617,6 +24780,295 @@
+         drop(reopened);
+         std::fs::remove_dir_all(dir).unwrap();
+     }
++
++    #[test]
++    fn durable_checkpoint_rebuilds_physical_index_recipes_on_reopen() {
++        let dir = durable_test_dir("physical-recipes");
++        let (context, registry, relation, layout, root) =
++            scan_runtime_bundle(515, 1215, &[1, 2, 3, 3]);
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
++        let binding = SemanticIndexBinding::single(relation, layout, 0, sid(101));
++        runtime.install_semantic_index(binding, &registry).unwrap();
++        runtime.checkpoint().unwrap();
++        runtime.compact_obsolete_generations().unwrap();
++
++        {
++            let durability = runtime.durability.lock().unwrap();
++            assert_eq!(durability.physical_artifact_specs().len(), 1);
++        }
++
++        let delta = scan_delta(relation, &[4], &[1], &context, &registry);
++        let mutations = [RevisionRelationMutation {
++            relation,
++            delta: &delta,
++        }];
++        let snapshot = runtime.snapshot().unwrap();
++        let target = target_revision_for(snapshot.root(), 516, &mutations, &registry);
++        drop(snapshot);
++        runtime
++            .commit_revision(
++                ClientTransactionId::new(2516),
++                &RevisionTransitionRequest {
++                    target_revision: &target,
++                    mutations: &mutations,
++                    registry: &registry,
++                },
++            )
++            .unwrap();
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert_eq!(snapshot.revision_id(), RevisionId::new(516));
++        let recovered_binding =
++            SemanticIndexBinding::single(relation, LayoutBinding::RECOVERY_ROW_STORE, 0, sid(101));
++        assert_eq!(
++            snapshot
++                .physical_store()
++                .semantic_index(&recovered_binding)
++                .unwrap()
++                .row_count(),
++            4
++        );
++        assert!(
++            !snapshot
++                .physical_store()
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticIndex(
++                    recovered_binding.clone()
++                ))
++        );
++
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, LayoutBinding::RECOVERY_ROW_STORE);
++        let query = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            value: Value::I64(4),
++            equivalence: sid(101),
++        };
++        let prepared = prepare_with_catalog(query, &context, &registry, &catalog).unwrap();
++        let (result, stats) = prepared
++            .execute_native_pinned(snapshot.physical_store(), &registry)
++            .unwrap();
++        assert_eq!(result.rows(), &[vec![Value::I64(4)]]);
++        assert_eq!(stats.persisted_index_hits, 1);
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn durable_initial_recipes_rebuild_statistics_and_quotient_factor_with_ownership() {
++        let dir = durable_test_dir("physical-recipes-initial");
++        let (context, registry, relation, layout, mut root) =
++            scan_runtime_bundle(516, 1216, &[1, 1, 2, 3]);
++        let binding = SemanticIndexBinding::single(relation, layout, 0, sid(101));
++        root.physical
++            .install_semantic_statistics(binding.clone(), &context, &registry)
++            .unwrap();
++        let installed = root.physical.installed(relation, layout).unwrap();
++        let factor = MaterializedSemanticQuotientFactorState::build(
++            binding.clone(),
++            installed,
++            &context,
++            &registry,
++        )
++        .unwrap();
++        root.physical
++            .semantic_quotient_factors_mut()
++            .insert(binding.clone(), Arc::new(factor));
++        root.physical.advisor_managed_artifacts_mut().insert(
++            ManagedPhysicalArtifact::SemanticQuotientFactor(binding.clone()),
++        );
++
++        assert_eq!(root.durable_physical_artifact_specs().len(), 2);
++        drop(DurableRuntime::create(root, &dir, &registry).unwrap());
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        let recovered =
++            SemanticIndexBinding::single(relation, LayoutBinding::RECOVERY_ROW_STORE, 0, sid(101));
++        assert!(
++            snapshot
++                .physical_store()
++                .semantic_statistics
++                .contains_key(&recovered)
++        );
++        assert!(
++            snapshot
++                .physical_store()
++                .semantic_quotient_factors
++                .contains_key(&recovered)
++        );
++        assert!(
++            snapshot
++                .physical_store()
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticQuotientFactor(
++                    recovered.clone()
++                ))
++        );
++        assert!(
++            !snapshot
++                .physical_store()
++                .advisor_managed_artifacts
++                .contains(&ManagedPhysicalArtifact::SemanticStatistics(recovered))
++        );
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn stale_durable_physical_recipe_never_blocks_logical_recovery() {
++        let dir = durable_test_dir("stale-physical-recipe");
++        let (_, registry, _, _, root) = scan_runtime_bundle(517, 1217, &[1, 2]);
++        let materializations = root.durable_materialization_specs();
++        let stale = DurablePhysicalArtifactSpec::SemanticIndex {
++            relation: sid(0xdead),
++            key_parts: vec![DurableSemanticKeyPart {
++                column: 0,
++                equivalence: sid(101),
++            }],
++            advisor_managed: true,
++        };
++        drop(
++            DurableRevisionStore::create_with_materializations_and_physical_artifacts(
++                &dir,
++                root.revision(),
++                &materializations,
++                &[stale],
++                &registry,
++            )
++            .unwrap(),
++        );
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        assert_eq!(snapshot.revision_id(), RevisionId::new(517));
++        assert!(snapshot.physical_store().semantic_indexes.is_empty());
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    fn structural_durable_index_fixture() -> (
++        SemanticRegistry,
++        SemanticContext,
++        RuntimeRevisionBundle,
++        kernel_types::SemanticId,
++        kernel_types::SemanticId,
++    ) {
++        let relation = sid(1_320);
++        let structural = sid(1_321);
++        let ci = sid(1_322);
++        let mut registry = SemanticRegistry::default();
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(1_320));
++        environment.pin_module(ci, ci_digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(1_320));
++        schema
++            .define_structural_equivalence(
++                structural,
++                StructuralEquivalenceDef::Option { inner: ci },
++            )
++            .unwrap();
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Option(Box::new(TypeExpr::Scalar(
++                    ScalarType::Text,
++                )))],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![structural],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let option_text = |value: &str| Value::Option(Some(Box::new(Value::Text(value.into()))));
++        let mut rows = vec![vec![option_text("Alpha")], vec![option_text("alpha")]];
++        for index in 0..64 {
++            rows.push(vec![option_text(&format!("other-{index}"))]);
++        }
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(relation, rows.clone());
++        let revision = kernel_revision::Revision::build(
++            RevisionId::new(1_320),
++            &context,
++            &registry,
++            kernel_model::DatabaseState {
++                model,
++                ..kernel_model::DatabaseState::default()
++            },
++        )
++        .unwrap();
++        let layout = LayoutBinding {
++            id: LayoutId(1_320),
++            family: LayoutFamily::RowStore,
++        };
++        let mut physical = PhysicalStore::default();
++        physical
++            .install(relation, layout, NativeRelation::row_store(rows))
++            .unwrap();
++        physical
++            .install_semantic_index(
++                SemanticIndexBinding::single(relation, layout, 0, structural),
++                &context,
++                &registry,
++            )
++            .unwrap();
++        let root = RuntimeRevisionBundle::build(
++            revision,
++            physical,
++            BTreeMap::from([(relation, layout)]),
++            &[],
++            &registry,
++        )
++        .unwrap();
++        (registry, context, root, relation, structural)
++    }
++
++    #[test]
++    fn durable_structural_semantic_index_rebuilds_and_serves_after_reopen() {
++        let dir = durable_test_dir("structural-physical-recipe");
++        let (registry, context, root, relation, structural) = structural_durable_index_fixture();
++        drop(DurableRuntime::create(root, &dir, &registry).unwrap());
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        let snapshot = reopened.snapshot().unwrap();
++        let recovered_binding = SemanticIndexBinding::single(
++            relation,
++            LayoutBinding::RECOVERY_ROW_STORE,
++            0,
++            structural,
++        );
++        assert!(
++            snapshot
++                .physical_store()
++                .semantic_indexes
++                .contains_key(&recovered_binding)
++        );
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, LayoutBinding::RECOVERY_ROW_STORE);
++        let query = RelExpr::FilterEqConst {
++            input: Box::new(RelExpr::Scan(relation)),
++            column: 0,
++            value: Value::Option(Some(Box::new(Value::Text("ALPHA".into())))),
++            equivalence: structural,
++        };
++        let prepared = prepare_with_catalog(query, &context, &registry, &catalog).unwrap();
++        let (result, stats) = prepared
++            .execute_native_pinned(snapshot.physical_store(), &registry)
++            .unwrap();
++        assert_eq!(result.rows().len(), 2);
++        assert_eq!(stats.persisted_index_hits, 1);
++        drop(snapshot);
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
+ 
+     struct ExitAfterDurableCommit {
+         inner: kernel_durability::DurableRevisionStore,

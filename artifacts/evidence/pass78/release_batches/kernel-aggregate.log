@@ -1,0 +1,16 @@
+   Compiling kernel-aggregate v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-aggregate)
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_aggregate-a18de5b7b07318e8)
+
+running 8 tests
+test tests::catastrophic_cancellation_is_exact_and_order_independent ... ok
+test tests::exact_count_decrement_is_checked_and_demotes_after_big_boundary ... ok
+test tests::exact_count_is_mergeable_and_checks_result_range ... ok
+test tests::exact_count_promotes_losslessly_when_small_representation_overflows ... ok
+test tests::exact_f64_sum_removal_is_an_exact_inverse ... ok
+test tests::merge_is_reproducible_across_partitions ... ok
+test tests::non_finite_inputs_are_explicitly_rejected ... ok
+test tests::subnormal_values_sum_exactly ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

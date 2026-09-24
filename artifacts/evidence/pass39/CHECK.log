@@ -1,0 +1,11 @@
+    Checking kernel-semantics v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-semantics)
+    Checking kernel-validation v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-validation)
+    Checking kernel-query v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-query)
+    Checking kernel-revision v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-revision)
+    Checking kernel-durability v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-durability)
+    Checking kernel-transport v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-transport)
+    Checking storage-memory v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/storage-memory)
+    Checking kernel-plan v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-plan)
+    Checking kernel-semantic-index v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-semantic-index)
+    Checking kernel-integration v0.1.0 (/mnt/data/cfmd_pass39_work/cfmd_workspace_pass39/crates/kernel-integration)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.45s

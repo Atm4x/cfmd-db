@@ -1,0 +1,5 @@
+ Documenting kernel-plan v0.1.0 (/mnt/data/cfmd_pass32_work/cfmd_workspace_pass32/crates/kernel-plan)
+ Documenting kernel-integration v0.1.0 (/mnt/data/cfmd_pass32_work/cfmd_workspace_pass32/crates/kernel-integration)
+ Documenting kernel-durability v0.1.0 (/mnt/data/cfmd_pass32_work/cfmd_workspace_pass32/crates/kernel-durability)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.62s
+   Generated /mnt/data/cfmd_pass32_work/cfmd_workspace_pass32/target/doc/kernel_aggregate/index.html and 19 other files

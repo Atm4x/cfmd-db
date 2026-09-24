@@ -1,0 +1,3 @@
+rows=100000
+group_typed_stateful_hits=1
+top_typed_stateful_hits=1

@@ -1,0 +1,855 @@
+diff -ruN '--exclude=target' '--exclude=*.log' /mnt/data/pass64_work/crates/kernel-model/src/lib.rs /mnt/data/pass65_work/crates/kernel-model/src/lib.rs
+--- /mnt/data/pass64_work/crates/kernel-model/src/lib.rs	2026-09-20 19:33:04.000000000 +0000
++++ /mnt/data/pass65_work/crates/kernel-model/src/lib.rs	2026-09-20 23:18:32.761407440 +0000
+@@ -1,4 +1,7 @@
+-use std::collections::{BTreeMap, BTreeSet};
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    sync::Arc,
++};
+ 
+ use kernel_identity::{DenseEntityIds, DenseEntitySet, LocalEntityId};
+ use kernel_lifecycle::LifecycleGraph;
+@@ -138,58 +141,121 @@
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Default)]
+ pub struct LiveRefSensitivityIndex {
+-    by_target: BTreeMap<LocalEntityId, LiveRefConsumers>,
+-    unresolved: BTreeMap<EntityId, LiveRefConsumers>,
++    field_by_target: Arc<BTreeMap<LocalEntityId, BTreeSet<(SemanticId, EntityId)>>>,
++    field_unresolved: Arc<BTreeMap<EntityId, BTreeSet<(SemanticId, EntityId)>>>,
++    relations: BTreeMap<SemanticId, Arc<RelationLiveRefSensitivity>>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Default)]
++struct RelationLiveRefSensitivity {
++    by_target: BTreeMap<LocalEntityId, BTreeSet<usize>>,
++    unresolved: BTreeMap<EntityId, BTreeSet<usize>>,
+ }
+ 
+ impl LiveRefSensitivityIndex {
+     #[must_use]
+     pub fn compile(model: &FiniteModel, ids: &DenseEntityIds) -> Self {
+-        let mut index = Self::default();
++        let mut field_by_target = BTreeMap::<LocalEntityId, BTreeSet<_>>::new();
++        let mut field_unresolved = BTreeMap::<EntityId, BTreeSet<_>>::new();
+         for (&field, value) in &model.fields {
+             let mut targets = Vec::new();
+             value.collect_live_refs(&mut targets);
+             for target in targets {
+-                index.consumers_mut(ids, target).fields.insert(field);
++                if let Some(local) = ids.local(target) {
++                    field_by_target.entry(local).or_default().insert(field);
++                } else {
++                    field_unresolved.entry(target).or_default().insert(field);
++                }
+             }
+         }
+-        for (&relation, rows) in &model.relations {
+-            for (row_index, row) in rows.iter().enumerate() {
+-                let mut targets = Vec::new();
+-                for value in row {
+-                    value.collect_live_refs(&mut targets);
+-                }
+-                targets.sort_unstable();
+-                targets.dedup();
+-                for target in targets {
+-                    index
+-                        .consumers_mut(ids, target)
+-                        .relation_rows
+-                        .entry(relation)
++        let relations = model
++            .relations
++            .iter()
++            .map(|(&relation, rows)| (relation, Arc::new(Self::compile_relation(rows, ids))))
++            .collect();
++        Self {
++            field_by_target: Arc::new(field_by_target),
++            field_unresolved: Arc::new(field_unresolved),
++            relations,
++        }
++    }
++
++    fn compile_relation(rows: &[Vec<Value>], ids: &DenseEntityIds) -> RelationLiveRefSensitivity {
++        let mut sensitivity = RelationLiveRefSensitivity::default();
++        for (row_index, row) in rows.iter().enumerate() {
++            let mut targets = Vec::new();
++            for value in row {
++                value.collect_live_refs(&mut targets);
++            }
++            targets.sort_unstable();
++            targets.dedup();
++            for target in targets {
++                if let Some(local) = ids.local(target) {
++                    sensitivity
++                        .by_target
++                        .entry(local)
++                        .or_default()
++                        .insert(row_index);
++                } else {
++                    sensitivity
++                        .unresolved
++                        .entry(target)
+                         .or_default()
+                         .insert(row_index);
+                 }
+             }
+         }
+-        index
++        sensitivity
+     }
+ 
+-    fn consumers_mut(&mut self, ids: &DenseEntityIds, target: EntityId) -> &mut LiveRefConsumers {
+-        if let Some(local) = ids.local(target) {
+-            self.by_target.entry(local).or_default()
+-        } else {
+-            self.unresolved.entry(target).or_default()
++    #[must_use]
++    pub fn consumers(&self, target: LocalEntityId) -> Option<LiveRefConsumers> {
++        let mut consumers = LiveRefConsumers::default();
++        if let Some(fields) = self.field_by_target.get(&target) {
++            consumers.fields.clone_from(fields);
+         }
++        for (&relation, sensitivity) in &self.relations {
++            if let Some(rows) = sensitivity.by_target.get(&target) {
++                consumers.relation_rows.insert(relation, rows.clone());
++            }
++        }
++        (!consumers.fields.is_empty() || !consumers.relation_rows.is_empty()).then_some(consumers)
+     }
+ 
+     #[must_use]
+-    pub fn consumers(&self, target: LocalEntityId) -> Option<&LiveRefConsumers> {
+-        self.by_target.get(&target)
++    pub fn unresolved(&self, target: EntityId) -> Option<LiveRefConsumers> {
++        let mut consumers = LiveRefConsumers::default();
++        if let Some(fields) = self.field_unresolved.get(&target) {
++            consumers.fields.clone_from(fields);
++        }
++        for (&relation, sensitivity) in &self.relations {
++            if let Some(rows) = sensitivity.unresolved.get(&target) {
++                consumers.relation_rows.insert(relation, rows.clone());
++            }
++        }
++        (!consumers.fields.is_empty() || !consumers.relation_rows.is_empty()).then_some(consumers)
+     }
+ 
+     #[must_use]
+-    pub fn unresolved(&self, target: EntityId) -> Option<&LiveRefConsumers> {
+-        self.unresolved.get(&target)
++    pub fn with_relations_recompiled(
++        &self,
++        model: &FiniteModel,
++        ids: &DenseEntityIds,
++        relations: &BTreeSet<SemanticId>,
++    ) -> Self {
++        let mut next_relations = self.relations.clone();
++        for &relation in relations {
++            if let Some(rows) = model.relations.get(&relation) {
++                next_relations.insert(relation, Arc::new(Self::compile_relation(rows, ids)));
++            } else {
++                next_relations.remove(&relation);
++            }
++        }
++        Self {
++            field_by_target: Arc::clone(&self.field_by_target),
++            field_unresolved: Arc::clone(&self.field_unresolved),
++            relations: next_relations,
++        }
+     }
+ }
+ 
+@@ -213,7 +279,9 @@
+         live: &BTreeSet<EntityId>,
+         ids: &DenseEntityIds,
+         refs: &LiveRefSensitivityIndex,
+-    ) -> Result<(), ModelError> {
++    ) -> Result<bool, ModelError> {
++        let carrier_entries_before = self.carriers.values().map(BTreeSet::len).sum::<usize>();
++        let fields_before = self.fields.len();
+         for carrier in self.carriers.values_mut() {
+             carrier.retain(|entity| live.contains(entity));
+         }
+@@ -227,33 +295,43 @@
+         }
+ 
+         let mut relation_rows_to_remove = BTreeMap::<SemanticId, BTreeSet<usize>>::new();
+-        for (&target, consumers) in &refs.by_target {
++        for (&target, fields) in refs.field_by_target.as_ref() {
+             if live_dense.contains(target) {
+                 continue;
+             }
+-            if consumers
+-                .fields
+-                .iter()
+-                .any(|(_, owner)| live.contains(owner))
+-            {
++            if fields.iter().any(|(_, owner)| live.contains(owner)) {
+                 let external = ids
+                     .external(target)
+                     .expect("sensitivity target comes from dense identity map");
+                 return Err(ModelError::DanglingLiveReference(external));
+             }
+-            merge_relation_rows(&mut relation_rows_to_remove, &consumers.relation_rows);
+         }
+-        for (&target, consumers) in &refs.unresolved {
+-            if consumers
+-                .fields
+-                .iter()
+-                .any(|(_, owner)| live.contains(owner))
+-            {
++        for (&target, fields) in refs.field_unresolved.as_ref() {
++            if fields.iter().any(|(_, owner)| live.contains(owner)) {
+                 return Err(ModelError::DanglingLiveReference(target));
+             }
+-            merge_relation_rows(&mut relation_rows_to_remove, &consumers.relation_rows);
++        }
++        for (&relation, sensitivity) in &refs.relations {
++            for (&target, rows) in &sensitivity.by_target {
++                if !live_dense.contains(target) {
++                    relation_rows_to_remove
++                        .entry(relation)
++                        .or_default()
++                        .extend(rows.iter().copied());
++                }
++            }
++            for rows in sensitivity.unresolved.values() {
++                relation_rows_to_remove
++                    .entry(relation)
++                    .or_default()
++                    .extend(rows.iter().copied());
++            }
+         }
+ 
++        let removed_relation_rows = relation_rows_to_remove
++            .values()
++            .map(BTreeSet::len)
++            .sum::<usize>();
+         for (relation, rows_to_remove) in relation_rows_to_remove {
+             let Some(rows) = self.relations.get_mut(&relation) else {
+                 continue;
+@@ -265,16 +343,11 @@
+                 keep
+             });
+         }
+-        Ok(())
+-    }
+-}
+-
+-fn merge_relation_rows(
+-    target: &mut BTreeMap<SemanticId, BTreeSet<usize>>,
+-    source: &BTreeMap<SemanticId, BTreeSet<usize>>,
+-) {
+-    for (&relation, rows) in source {
+-        target.entry(relation).or_default().extend(rows);
++        Ok(
++            carrier_entries_before != self.carriers.values().map(BTreeSet::len).sum::<usize>()
++                || fields_before != self.fields.len()
++                || removed_relation_rows != 0,
++        )
+     }
+ }
+ 
+@@ -292,21 +365,50 @@
+     pub lifecycle: LifecycleGraph,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct NormalizedDatabaseState {
++    pub state: DatabaseState,
++    pub dense_entities: Arc<DenseEntityIds>,
++    pub live_ref_sensitivity: LiveRefSensitivityIndex,
++}
++
+ impl DatabaseState {
+-    pub fn normalize(mut self) -> Result<Self, ModelError> {
++    pub fn normalize(self) -> Result<Self, ModelError> {
++        Ok(self.normalize_certified()?.state)
++    }
++
++    pub fn normalize_certified(mut self) -> Result<NormalizedDatabaseState, ModelError> {
+         for entity in self.model.all_entities() {
+             if !self.lifecycle.entities.contains(&entity) {
+                 return Err(ModelError::EntityMissingFromLifecycle(entity));
+             }
+         }
+ 
+-        let ids = DenseEntityIds::compile(&self.lifecycle.entities)
++        let source_entities = self.lifecycle.entities.clone();
++        let ids = DenseEntityIds::compile(&source_entities)
+             .map_err(|_| ModelError::DenseIdentityCapacityExceeded)?;
+         let refs = LiveRefSensitivityIndex::compile(&self.model, &ids);
+         self.lifecycle = self.lifecycle.normalize();
+-        self.model
+-            .restrict_to_live_indexed(&self.lifecycle.entities, &ids, &refs)?;
+-        Ok(self)
++        let model_changed =
++            self.model
++                .restrict_to_live_indexed(&self.lifecycle.entities, &ids, &refs)?;
++        if self.lifecycle.entities == source_entities && !model_changed {
++            return Ok(NormalizedDatabaseState {
++                state: self,
++                dense_entities: Arc::new(ids),
++                live_ref_sensitivity: refs,
++            });
++        }
++        let final_ids = Arc::new(
++            DenseEntityIds::compile(&self.lifecycle.entities)
++                .map_err(|_| ModelError::DenseIdentityCapacityExceeded)?,
++        );
++        let final_refs = LiveRefSensitivityIndex::compile(&self.model, &final_ids);
++        Ok(NormalizedDatabaseState {
++            state: self,
++            dense_entities: final_ids,
++            live_ref_sensitivity: final_refs,
++        })
+     }
+ }
+ 
+@@ -471,6 +573,64 @@
+         );
+     }
+ 
++    #[test]
++    fn relation_sensitivity_recompile_shares_unaffected_partitions() {
++        let target = EntityId::new(2);
++        let entity_type = SemanticId::new(10);
++        let changed_relation = SemanticId::new(12);
++        let stable_relation = SemanticId::new(13);
++        let ids = DenseEntityIds::compile(&BTreeSet::from([target])).unwrap();
++        let mut model = FiniteModel::default();
++        model.relations.insert(
++            changed_relation,
++            vec![vec![Value::LiveEntityRef {
++                entity_type,
++                id: target,
++            }]],
++        );
++        model.relations.insert(
++            stable_relation,
++            vec![vec![Value::LiveEntityRef {
++                entity_type,
++                id: target,
++            }]],
++        );
++
++        let original = LiveRefSensitivityIndex::compile(&model, &ids);
++        let original_stable = Arc::clone(&original.relations[&stable_relation]);
++        let original_changed = Arc::clone(&original.relations[&changed_relation]);
++        model
++            .relations
++            .insert(changed_relation, vec![vec![Value::I64(7)]]);
++        let updated =
++            original.with_relations_recompiled(&model, &ids, &BTreeSet::from([changed_relation]));
++
++        assert!(Arc::ptr_eq(
++            &original.field_by_target,
++            &updated.field_by_target
++        ));
++        assert!(Arc::ptr_eq(
++            &original.field_unresolved,
++            &updated.field_unresolved
++        ));
++        assert!(Arc::ptr_eq(
++            &original_stable,
++            &updated.relations[&stable_relation]
++        ));
++        assert!(!Arc::ptr_eq(
++            &original_changed,
++            &updated.relations[&changed_relation]
++        ));
++        assert!(
++            updated
++                .consumers(ids.local(target).unwrap())
++                .unwrap()
++                .relation_rows()
++                .get(&changed_relation)
++                .is_none()
++        );
++    }
++
+     #[test]
+     fn indexed_lifecycle_restriction_preserves_previous_dangling_reference_semantics() {
+         let live = EntityId::new(1);
+diff -ruN '--exclude=target' '--exclude=*.log' /mnt/data/pass64_work/crates/kernel-plan/src/lib.rs /mnt/data/pass65_work/crates/kernel-plan/src/lib.rs
+--- /mnt/data/pass64_work/crates/kernel-plan/src/lib.rs	2026-09-20 22:34:48.457969770 +0000
++++ /mnt/data/pass65_work/crates/kernel-plan/src/lib.rs	2026-09-20 23:19:32.134539357 +0000
+@@ -2935,14 +2935,18 @@
+                     return Err(RuntimeRecoveryError::SemanticRevisionMismatch);
+                 }
+ 
+-                let mut next_state = current.state().clone();
++                let mut candidate = current.relation_update_candidate();
+                 for mutation in relation_mutations {
+                     let relation = RelExpr::Scan(mutation.relation);
+                     let result_type = relation
+                         .typecheck(current.semantic_context(), registry)
+                         .map_err(PhysicalExecutionError::from)?;
+                     let old = relation
+-                        .evaluate(&next_state.model, current.semantic_context(), registry)
++                        .evaluate(
++                            &candidate.state().model,
++                            current.semantic_context(),
++                            registry,
++                        )
+                         .map_err(PhysicalExecutionError::from)?;
+                     let delta = RelationDelta {
+                         inserted: mutation.inserted.clone(),
+@@ -2952,17 +2956,9 @@
+                     let next = delta
+                         .apply_to_value(old, current.semantic_context(), registry)
+                         .map_err(PhysicalExecutionError::from)?;
+-                    next_state
+-                        .model
+-                        .relations
+-                        .insert(mutation.relation, next.into_rows());
++                    candidate.replace_relation_rows(mutation.relation, next.into_rows());
+                 }
+-                current = kernel_revision::Revision::build(
+-                    descriptor.target_revision,
+-                    current.semantic_context(),
+-                    registry,
+-                    next_state,
+-                )?;
++                current = candidate.build(descriptor.target_revision, registry)?;
+             }
+             DurableRevisionChange::FullRevision { .. }
+             | DurableRevisionChange::FullRevisionAndMaterializations { .. } => {
+diff -ruN '--exclude=target' '--exclude=*.log' /mnt/data/pass64_work/crates/kernel-revision/src/lib.rs /mnt/data/pass65_work/crates/kernel-revision/src/lib.rs
+--- /mnt/data/pass64_work/crates/kernel-revision/src/lib.rs	2026-09-20 19:33:04.000000000 +0000
++++ /mnt/data/pass65_work/crates/kernel-revision/src/lib.rs	2026-09-20 23:21:18.255679501 +0000
+@@ -1,4 +1,4 @@
+-use std::sync::Arc;
++use std::{collections::BTreeSet, sync::Arc};
+ 
+ use kernel_identity::DenseEntityIds;
+ use kernel_lifecycle::DenseLifecycleProjection;
+@@ -6,13 +6,16 @@
+ use kernel_schema::SemanticContext;
+ use kernel_semantics::{SemanticError, SemanticRegistry};
+ use kernel_types::{RevisionId, SemanticRevision};
+-use kernel_validation::{ValidationError, validate_state_with_ids};
++use kernel_validation::{
++    DenseTypeExtents, ValidationError, validate_relations_with_extents, validate_state_with_extents,
++};
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum RevisionError {
+     InvalidModel(ModelError),
+     InvalidSemantics(SemanticError),
+     InvalidTypedModel(ValidationError),
++    InvalidRelationOnlyTransition,
+ }
+ 
+ impl From<ModelError> for RevisionError {
+@@ -30,9 +33,85 @@
+     dense_entities: Arc<DenseEntityIds>,
+     dense_lifecycle: DenseLifecycleProjection,
+     live_ref_sensitivity: LiveRefSensitivityIndex,
++    dense_type_extents: DenseTypeExtents,
++}
++
++#[derive(Debug)]
++pub struct RelationUpdateCandidate<'a> {
++    source: &'a Revision,
++    state: DatabaseState,
++    touched_relations: BTreeSet<kernel_types::SemanticId>,
++}
++
++impl RelationUpdateCandidate<'_> {
++    #[must_use]
++    pub const fn state(&self) -> &DatabaseState {
++        &self.state
++    }
++
++    pub fn replace_relation_rows(
++        &mut self,
++        relation: kernel_types::SemanticId,
++        rows: Vec<Vec<kernel_model::Value>>,
++    ) {
++        self.state.model.relations.insert(relation, rows);
++        self.touched_relations.insert(relation);
++    }
++
++    pub fn build(
++        mut self,
++        id: RevisionId,
++        registry: &SemanticRegistry,
++    ) -> Result<Revision, RevisionError> {
++        registry
++            .validate_context(&self.source.semantic_context)
++            .map_err(RevisionError::InvalidSemantics)?;
++        let live = &self.source.state.lifecycle.entities;
++        for relation in &self.touched_relations {
++            let Some(rows) = self.state.model.relations.get_mut(relation) else {
++                continue;
++            };
++            rows.retain(|row| {
++                row.iter()
++                    .all(|value| value.first_dangling_live_ref(live).is_none())
++            });
++        }
++        validate_relations_with_extents(
++            &self.source.semantic_context,
++            registry,
++            &self.state,
++            &self.source.dense_type_extents,
++            &self.touched_relations,
++        )
++        .map_err(RevisionError::InvalidTypedModel)?;
++        let live_ref_sensitivity = self.source.live_ref_sensitivity.with_relations_recompiled(
++            &self.state.model,
++            &self.source.dense_entities,
++            &self.touched_relations,
++        );
++        Ok(Revision {
++            id,
++            semantics: self.source.semantics,
++            semantic_context: self.source.semantic_context.clone(),
++            state: self.state,
++            dense_entities: Arc::clone(&self.source.dense_entities),
++            dense_lifecycle: self.source.dense_lifecycle.clone(),
++            live_ref_sensitivity,
++            dense_type_extents: self.source.dense_type_extents.clone(),
++        })
++    }
+ }
+ 
+ impl Revision {
++    #[must_use]
++    pub fn relation_update_candidate(&self) -> RelationUpdateCandidate<'_> {
++        RelationUpdateCandidate {
++            source: self,
++            state: self.state.clone(),
++            touched_relations: BTreeSet::new(),
++        }
++    }
++
+     pub fn build(
+         id: RevisionId,
+         context: &SemanticContext,
+@@ -45,17 +124,16 @@
+         registry
+             .validate_context(context)
+             .map_err(RevisionError::InvalidSemantics)?;
+-        let state = state.normalize()?;
+-        let dense_entities = Arc::new(
+-            DenseEntityIds::compile(&state.lifecycle.entities).map_err(|_| {
+-                RevisionError::InvalidModel(ModelError::DenseIdentityCapacityExceeded)
+-            })?,
+-        );
+-        validate_state_with_ids(context, registry, &state, &dense_entities)
++        let normalized = state.normalize_certified()?;
++        let state = normalized.state;
++        let dense_entities = normalized.dense_entities;
++        let dense_type_extents =
++            DenseTypeExtents::compile_with_ids(&state.model, &context.schema, &dense_entities);
++        validate_state_with_extents(context, registry, &state, &dense_type_extents)
+             .map_err(RevisionError::InvalidTypedModel)?;
+         let dense_lifecycle =
+             DenseLifecycleProjection::compile_with_ids(&state.lifecycle, &dense_entities);
+-        let live_ref_sensitivity = LiveRefSensitivityIndex::compile(&state.model, &dense_entities);
++        let live_ref_sensitivity = normalized.live_ref_sensitivity;
+         Ok(Self {
+             id,
+             semantics: context.revision(),
+@@ -64,9 +142,48 @@
+             dense_entities,
+             dense_lifecycle,
+             live_ref_sensitivity,
++            dense_type_extents,
+         })
+     }
+ 
++    pub fn build_relation_update(
++        id: RevisionId,
++        source: &Self,
++        registry: &SemanticRegistry,
++        state: DatabaseState,
++        touched_relations: &BTreeSet<kernel_types::SemanticId>,
++    ) -> Result<Self, RevisionError> {
++        registry
++            .validate_context(&source.semantic_context)
++            .map_err(RevisionError::InvalidSemantics)?;
++        if state.lifecycle != source.state.lifecycle
++            || state.model.carriers != source.state.model.carriers
++            || state.model.fields != source.state.model.fields
++        {
++            return Err(RevisionError::InvalidRelationOnlyTransition);
++        }
++        let source_untouched = source
++            .state
++            .model
++            .relations
++            .iter()
++            .filter(|(relation, _)| !touched_relations.contains(relation));
++        let target_untouched = state
++            .model
++            .relations
++            .iter()
++            .filter(|(relation, _)| !touched_relations.contains(relation));
++        if !source_untouched.eq(target_untouched) {
++            return Err(RevisionError::InvalidRelationOnlyTransition);
++        }
++        RelationUpdateCandidate {
++            source,
++            state,
++            touched_relations: touched_relations.clone(),
++        }
++        .build(id, registry)
++    }
++
+     #[must_use]
+     pub const fn id(&self) -> RevisionId {
+         self.id
+@@ -107,7 +224,7 @@
+ mod tests {
+     use kernel_model::{DatabaseState, FiniteModel, Value};
+     use kernel_schema::{FieldDef, ScalarType, Schema, SemanticEnvironment, TypeExpr};
+-    use kernel_semantics::SemanticRegistry;
++    use kernel_semantics::{EquivalenceModule, SemanticRegistry};
+     use kernel_types::{EntityId, SchemaRevisionId, SemanticEnvId, SemanticId};
+ 
+     use super::*;
+@@ -198,4 +315,141 @@
+         assert_eq!(left.local(second).unwrap().index(), 1);
+         assert_eq!(revision.dense_lifecycle().live_count(), 2);
+     }
++
++    #[test]
++    fn relation_update_reuses_revision_local_derivatives_and_rejects_static_changes() {
++        let relation = SemanticId::new(90);
++        let equivalence = SemanticId::new(91);
++        let mut context = empty_context();
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        context.environment.pin_module(equivalence, digest);
++        context
++            .schema
++            .define_relation(kernel_schema::RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
++                semantics: kernel_schema::RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let mut state = DatabaseState::default();
++        state
++            .model
++            .relations
++            .insert(relation, vec![vec![Value::I64(1)]]);
++        let source = Revision::build(RevisionId::new(1), &context, &registry, state).unwrap();
++        let source_ids = source.dense_entity_ids();
++
++        let mut target_state = source.state().clone();
++        target_state
++            .model
++            .relations
++            .insert(relation, vec![vec![Value::I64(2)]]);
++        let target = Revision::build_relation_update(
++            RevisionId::new(2),
++            &source,
++            &registry,
++            target_state,
++            &BTreeSet::from([relation]),
++        )
++        .unwrap();
++        assert!(Arc::ptr_eq(&source_ids, &target.dense_entity_ids()));
++
++        let mut invalid = target.state().clone();
++        invalid.lifecycle.entities.insert(EntityId::new(999));
++        assert_eq!(
++            Revision::build_relation_update(
++                RevisionId::new(3),
++                &target,
++                &registry,
++                invalid,
++                &BTreeSet::from([relation]),
++            ),
++            Err(RevisionError::InvalidRelationOnlyTransition),
++        );
++    }
++
++    #[test]
++    fn certified_relation_update_revalidates_the_pinned_semantic_registry() {
++        let relation = SemanticId::new(190);
++        let equivalence = SemanticId::new(191);
++        let mut context = empty_context();
++        let mut build_registry = SemanticRegistry::default();
++        let digest = build_registry.install_equivalence(EquivalenceModule::I64Exact);
++        context.environment.pin_module(equivalence, digest);
++        context
++            .schema
++            .define_relation(kernel_schema::RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
++                semantics: kernel_schema::RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let mut state = DatabaseState::default();
++        state
++            .model
++            .relations
++            .insert(relation, vec![vec![Value::I64(1)]]);
++        let source =
++            Revision::build(RevisionId::new(10), &context, &build_registry, state).unwrap();
++
++        let mut candidate = source.relation_update_candidate();
++        candidate.replace_relation_rows(relation, vec![vec![Value::I64(2)]]);
++        let error = candidate
++            .build(RevisionId::new(11), &SemanticRegistry::default())
++            .unwrap_err();
++
++        assert!(matches!(error, RevisionError::InvalidSemantics(_)));
++    }
++
++    #[test]
++    fn certified_relation_update_matches_full_normalization_for_dangling_live_ref_rows() {
++        let person = SemanticId::new(290);
++        let relation = SemanticId::new(291);
++        let equivalence = SemanticId::new(292);
++        let live = EntityId::new(10);
++        let dangling = EntityId::new(20);
++        let mut context = empty_context();
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::LiveEntityIdExact(person));
++        context.environment.pin_module(equivalence, digest);
++        context
++            .schema
++            .define_relation(kernel_schema::RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::LiveEntityRef(person))],
++                semantics: kernel_schema::RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let mut state = DatabaseState::default();
++        state.lifecycle.entities.insert(live);
++        state.lifecycle.roots.insert(live);
++        state.model.carriers.insert(person, BTreeSet::from([live]));
++        state.model.relations.insert(relation, Vec::new());
++        let source = Revision::build(RevisionId::new(20), &context, &registry, state).unwrap();
++        let dangling_row = vec![Value::LiveEntityRef {
++            entity_type: person,
++            id: dangling,
++        }];
++
++        let mut full_state = source.state().clone();
++        full_state
++            .model
++            .relations
++            .insert(relation, vec![dangling_row.clone()]);
++        let full = Revision::build(RevisionId::new(21), &context, &registry, full_state).unwrap();
++
++        let mut candidate = source.relation_update_candidate();
++        candidate.replace_relation_rows(relation, vec![dangling_row]);
++        let incremental = candidate.build(RevisionId::new(21), &registry).unwrap();
++
++        assert_eq!(incremental.state(), full.state());
++        assert!(incremental.state().model.relations[&relation].is_empty());
++    }
+ }
+diff -ruN '--exclude=target' '--exclude=*.log' /mnt/data/pass64_work/crates/kernel-validation/src/lib.rs /mnt/data/pass65_work/crates/kernel-validation/src/lib.rs
+--- /mnt/data/pass64_work/crates/kernel-validation/src/lib.rs	2026-09-20 19:33:04.000000000 +0000
++++ /mnt/data/pass65_work/crates/kernel-validation/src/lib.rs	2026-09-20 23:18:32.761878114 +0000
+@@ -145,6 +145,15 @@
+     ids: &DenseEntityIds,
+ ) -> Result<(), ValidationError> {
+     let entity_types = DenseTypeExtents::compile_with_ids(&state.model, &context.schema, ids);
++    validate_state_with_extents(context, registry, state, &entity_types)
++}
++
++pub fn validate_state_with_extents(
++    context: &SemanticContext,
++    registry: &SemanticRegistry,
++    state: &DatabaseState,
++    entity_types: &DenseTypeExtents,
++) -> Result<(), ValidationError> {
+     for (&(field_id, owner), value) in &state.model.fields {
+         let field = context
+             .schema
+@@ -162,7 +171,7 @@
+             &state.model,
+             context,
+             registry,
+-            &entity_types,
++            entity_types,
+             &BTreeMap::new(),
+         )?;
+     }
+@@ -187,7 +196,7 @@
+                     &state.model,
+                     context,
+                     registry,
+-                    &entity_types,
++                    entity_types,
+                     &BTreeMap::new(),
+                 )?;
+             }
+@@ -207,6 +216,62 @@
+     Ok(())
+ }
+ 
++pub fn validate_relations_with_extents(
++    context: &SemanticContext,
++    registry: &SemanticRegistry,
++    state: &DatabaseState,
++    entity_types: &DenseTypeExtents,
++    relation_ids: &BTreeSet<SemanticId>,
++) -> Result<(), ValidationError> {
++    let mut semantic_subset = FiniteModel::default();
++    for &relation_id in relation_ids {
++        let relation = context
++            .schema
++            .relation(relation_id)
++            .ok_or(ValidationError::UnknownRelation(relation_id))?;
++        let tuples = state
++            .model
++            .relations
++            .get(&relation_id)
++            .map(Vec::as_slice)
++            .unwrap_or_default();
++        for tuple in tuples {
++            if tuple.len() != relation.columns.len() {
++                return Err(ValidationError::RelationArityMismatch {
++                    relation: relation_id,
++                    expected: relation.columns.len(),
++                    actual: tuple.len(),
++                });
++            }
++            for (value, expected) in tuple.iter().zip(&relation.columns) {
++                validate_value(
++                    value,
++                    expected,
++                    &state.model,
++                    context,
++                    registry,
++                    entity_types,
++                    &BTreeMap::new(),
++                )?;
++            }
++        }
++        if let RelationSemantics::Set {
++            column_equivalences,
++        } = &relation.semantics
++        {
++            for (column, equivalence) in relation.columns.iter().zip(column_equivalences) {
++                validate_equivalence_type(*equivalence, column, context, registry)?;
++            }
++            ensure_relation_rows_unique(tuples, column_equivalences, context, registry)?;
++        }
++        if let Some(rows) = state.model.relations.get(&relation_id) {
++            semantic_subset.relations.insert(relation_id, rows.clone());
++        }
++    }
++    registry.validate_model(context, &semantic_subset)?;
++    Ok(())
++}
++
+ fn ensure_relation_rows_unique(
+     rows: &[Vec<Value>],
+     column_equivalences: &[SemanticId],

@@ -1,0 +1,12 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_fixpoint-4c5795bd67325b2f)
+
+running 5 tests
+test tests::checker_rejects_nonclosed_candidate ... ok
+test tests::checker_rejects_closed_but_nonleast_superset_without_witness ... ok
+test tests::generic_solver_boundary_exposes_only_checked_certificate_after_verification ... ok
+test tests::solver_emits_checkable_least_fixpoint_certificate ... ok
+test tests::adjacency_lowering_preserves_relation_scan_certificate_exactly ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

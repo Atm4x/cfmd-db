@@ -1,0 +1,5 @@
+RUN 1
+groups=50000 rounds=7 iterations_per_round=100
+maintained_median_ns=673
+baseline_median_ns=137
+ratio_milli=4912

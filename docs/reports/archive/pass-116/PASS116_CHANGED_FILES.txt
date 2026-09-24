@@ -1,0 +1,4 @@
+Cargo.toml
+Cargo.lock
+crates/kernel-deployment/Cargo.toml
+crates/kernel-deployment/src/lib.rs

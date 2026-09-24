@@ -1,0 +1,1039 @@
+diff -ruN --exclude target --exclude MANIFEST.sha256 /mnt/data/pass67_work/crates/kernel-durability/src/lib.rs /mnt/data/pass68_work/crates/kernel-durability/src/lib.rs
+--- /mnt/data/pass67_work/crates/kernel-durability/src/lib.rs	2026-09-20 01:17:38.000000000 +0000
++++ /mnt/data/pass68_work/crates/kernel-durability/src/lib.rs	2026-09-21 00:47:50.914230548 +0000
+@@ -17,7 +17,7 @@
+ 
+ pub const MAGIC: [u8; 4] = *b"CFMW";
+ pub const FORMAT_VERSION: u16 = 1;
+-pub const MUTATION_CODEC_VERSION: u16 = 4;
++pub const MUTATION_CODEC_VERSION: u16 = 5;
+ pub const HEADER_LEN: usize = 36;
+ pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+ const MAX_COLLECTION_LEN: usize = 1_000_000;
+@@ -46,12 +46,25 @@
+ }
+ 
+ /// Exact client-visible intent retained across WAL, checkpoint rotation and
+-/// restart.  New transactions persist the canonical target Revision bytes and
+-/// (when applicable) the complete materialization registry.  Legacy stores can
+-/// still be decoded, but their old target-id-only entries are never treated as
+-/// exact idempotency matches.
++/// restart. Relation-data transactions retain their immutable source/target
++/// lineage plus the exact typed delta instead of duplicating the complete target
++/// Revision. Full-revision replacements still retain canonical target bytes.
++/// Legacy stores can still be decoded, but their old target-id-only entries are
++/// never treated as exact idempotency matches.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum DurableTransactionIntent {
++    /// Exact relation-data request identity.  The immutable source revision plus
++    /// the canonical relation mutations determine the target logical state, so
++    /// retaining a second full target checkpoint is redundant.
++    RelationDataExact {
++        source_revision: RevisionId,
++        target_revision: RevisionId,
++        semantic_revision: SemanticRevision,
++        relation_mutations: Vec<DurableRelationMutation>,
++        semantic_modules: Vec<BuiltinSemanticModuleSpec>,
++    },
++    /// Exact full-revision replacement.  Full payload bytes remain necessary
++    /// because this transition is not derivable from a smaller typed delta.
+     Exact {
+         target_revision: RevisionId,
+         encoded_target_revision: Vec<u8>,
+@@ -64,6 +77,32 @@
+ }
+ 
+ impl DurableTransactionIntent {
++    pub fn relation_data(
++        source_revision: RevisionId,
++        target: &kernel_revision::Revision,
++        semantic_revision: SemanticRevision,
++        mut relation_mutations: Vec<DurableRelationMutation>,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, CodecError> {
++        relation_mutations.sort_by_key(|mutation| mutation.relation);
++        if relation_mutations
++            .windows(2)
++            .any(|pair| pair[0].relation == pair[1].relation)
++        {
++            return Err(CodecError::CollectionTooLarge);
++        }
++        let semantic_modules = registry
++            .builtin_modules_for_context(target.semantic_context())
++            .map_err(|_| CodecError::SemanticModuleUnavailable)?;
++        Ok(Self::RelationDataExact {
++            source_revision,
++            target_revision: target.id(),
++            semantic_revision,
++            relation_mutations,
++            semantic_modules,
++        })
++    }
++
+     pub fn revision(
+         target: &kernel_revision::Revision,
+         registry: &kernel_semantics::SemanticRegistry,
+@@ -106,7 +145,10 @@
+     #[must_use]
+     pub const fn target_revision(&self) -> RevisionId {
+         match self {
+-            Self::Exact {
++            Self::RelationDataExact {
++                target_revision, ..
++            }
++            | Self::Exact {
+                 target_revision, ..
+             }
+             | Self::LegacyTargetOnly { target_revision } => *target_revision,
+@@ -115,7 +157,7 @@
+ 
+     #[must_use]
+     pub const fn is_exact(&self) -> bool {
+-        matches!(self, Self::Exact { .. })
++        matches!(self, Self::RelationDataExact { .. } | Self::Exact { .. })
+     }
+ }
+ 
+@@ -141,7 +183,13 @@
+             transaction_id,
+             source_revision,
+             target_revision: target.id(),
+-            intent: DurableTransactionIntent::revision(target, registry)?,
++            intent: DurableTransactionIntent::relation_data(
++                source_revision,
++                target,
++                semantic_revision,
++                relation_mutations.clone(),
++                registry,
++            )?,
+             change: DurableRevisionChange::RelationData {
+                 semantic_revision,
+                 relation_mutations,
+@@ -1049,12 +1097,59 @@
+     })
+ }
+ 
++fn encode_relation_mutations(
++    out: &mut Vec<u8>,
++    relation_mutations: &[DurableRelationMutation],
++) -> Result<(), CodecError> {
++    push_len(out, relation_mutations.len())?;
++    let mut previous = None;
++    for mutation in relation_mutations {
++        if previous.is_some_and(|id: SemanticId| id >= mutation.relation) {
++            return Err(CodecError::CollectionTooLarge);
++        }
++        previous = Some(mutation.relation);
++        push_u128(out, mutation.relation.raw());
++        encode_rows(out, &mutation.inserted)?;
++        encode_rows(out, &mutation.removed)?;
++    }
++    Ok(())
++}
++
+ fn encode_prepare_payload(descriptor: &DurableRevisionDescriptor) -> Result<Vec<u8>, CodecError> {
+     let mut out = Vec::new();
+     push_u16(&mut out, MUTATION_CODEC_VERSION);
+     push_u128(&mut out, descriptor.transaction_id.raw());
+     push_u64(&mut out, descriptor.source_revision.raw());
+     match &descriptor.intent {
++        DurableTransactionIntent::RelationDataExact {
++            source_revision,
++            target_revision,
++            semantic_revision,
++            relation_mutations,
++            semantic_modules,
++        } => {
++            let DurableRevisionChange::RelationData {
++                semantic_revision: change_semantics,
++                relation_mutations: change_mutations,
++            } = &descriptor.change
++            else {
++                return Err(CodecError::CollectionTooLarge);
++            };
++            if *source_revision != descriptor.source_revision
++                || *target_revision != descriptor.target_revision
++                || semantic_revision != change_semantics
++                || relation_mutations != change_mutations
++            {
++                return Err(CodecError::CollectionTooLarge);
++            }
++            // Relation-data format v5 stores the typed delta exactly once.  The
++            // durable intent is reconstructed from the same bytes on recovery.
++            out.push(2);
++            metadata::encode_semantic_module_specs(&mut out, semantic_modules)?;
++            push_u64(&mut out, semantic_revision.schema.raw());
++            push_u64(&mut out, semantic_revision.environment.raw());
++            encode_relation_mutations(&mut out, relation_mutations)?;
++        }
+         DurableTransactionIntent::Exact {
+             target_revision,
+             encoded_target_revision,
+@@ -1074,41 +1169,16 @@
+                 }
+             }
+             metadata::encode_semantic_module_specs(&mut out, semantic_modules)?;
+-        }
+-        DurableTransactionIntent::LegacyTargetOnly { .. } => {
+-            return Err(CodecError::CollectionTooLarge);
+-        }
+-    }
+-    match &descriptor.change {
+-        DurableRevisionChange::RelationData {
+-            semantic_revision,
+-            relation_mutations,
+-        } => {
+-            out.push(0);
+-            push_u64(&mut out, semantic_revision.schema.raw());
+-            push_u64(&mut out, semantic_revision.environment.raw());
+-            push_len(&mut out, relation_mutations.len())?;
+-            let mut previous = None;
+-            for mutation in relation_mutations {
+-                if previous.is_some_and(|id: SemanticId| id >= mutation.relation) {
++            match &descriptor.change {
++                DurableRevisionChange::FullRevision { .. } => out.push(1),
++                DurableRevisionChange::FullRevisionAndMaterializations { .. } => out.push(2),
++                DurableRevisionChange::RelationData { .. } => {
+                     return Err(CodecError::CollectionTooLarge);
+                 }
+-                previous = Some(mutation.relation);
+-                push_u128(&mut out, mutation.relation.raw());
+-                encode_rows(&mut out, &mutation.inserted)?;
+-                encode_rows(&mut out, &mutation.removed)?;
+             }
+         }
+-        DurableRevisionChange::FullRevision {
+-            encoded_target_revision: _,
+-        } => {
+-            out.push(1);
+-        }
+-        DurableRevisionChange::FullRevisionAndMaterializations {
+-            encoded_target_revision: _,
+-            materializations: _,
+-        } => {
+-            out.push(2);
++        DurableTransactionIntent::LegacyTargetOnly { .. } => {
++            return Err(CodecError::CollectionTooLarge);
+         }
+     }
+     Ok(out)
+@@ -1166,7 +1236,10 @@
+             };
+             (intent, change)
+         }
+-        MUTATION_CODEC_VERSION => decode_current_prepare_payload(&mut cursor, target_revision)?,
++        4 => decode_v4_prepare_payload(&mut cursor, target_revision)?,
++        MUTATION_CODEC_VERSION => {
++            decode_current_prepare_payload(&mut cursor, source_revision, target_revision)?
++        }
+         _ => return Err("unsupported mutation codec version"),
+     };
+     cursor.finish()?;
+@@ -1179,7 +1252,7 @@
+     })
+ }
+ 
+-fn decode_current_prepare_payload(
++fn decode_v4_prepare_payload(
+     cursor: &mut Cursor<'_>,
+     target_revision: RevisionId,
+ ) -> Result<(DurableTransactionIntent, DurableRevisionChange), &'static str> {
+@@ -1228,6 +1301,71 @@
+     Ok((intent, change))
+ }
+ 
++fn decode_current_prepare_payload(
++    cursor: &mut Cursor<'_>,
++    source_revision: RevisionId,
++    target_revision: RevisionId,
++) -> Result<(DurableTransactionIntent, DurableRevisionChange), &'static str> {
++    match cursor.u8()? {
++        2 => {
++            let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
++            let semantic_revision = SemanticRevision::new(
++                kernel_types::SchemaRevisionId::new(cursor.u64()?),
++                kernel_types::SemanticEnvId::new(cursor.u64()?),
++            );
++            let relation_mutations = decode_relation_mutations(cursor)?;
++            let intent = DurableTransactionIntent::RelationDataExact {
++                source_revision,
++                target_revision,
++                semantic_revision,
++                relation_mutations: relation_mutations.clone(),
++                semantic_modules,
++            };
++            let change = DurableRevisionChange::RelationData {
++                semantic_revision,
++                relation_mutations,
++            };
++            Ok((intent, change))
++        }
++        1 => {
++            let encoded_target_revision = {
++                let len = cursor.len()?;
++                cursor.take(len)?.to_vec()
++            };
++            let materializations = match cursor.u8()? {
++                0 => None,
++                1 => Some(metadata::decode_materialization_specs(cursor)?),
++                _ => return Err("invalid durable transaction materialization tag"),
++            };
++            let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
++            let intent = DurableTransactionIntent::Exact {
++                target_revision,
++                encoded_target_revision: encoded_target_revision.clone(),
++                materializations: materializations.clone(),
++                semantic_modules,
++            };
++            let change = match cursor.u8()? {
++                1 => {
++                    if materializations.is_some() {
++                        return Err("full revision record unexpectedly carries materializations");
++                    }
++                    DurableRevisionChange::FullRevision {
++                        encoded_target_revision,
++                    }
++                }
++                2 => DurableRevisionChange::FullRevisionAndMaterializations {
++                    encoded_target_revision,
++                    materializations: materializations
++                        .ok_or("combined revision record is missing materialization registry")?,
++                },
++                _ => return Err("unknown durable revision change tag"),
++            };
++            Ok((intent, change))
++        }
++        _ => Err("new durable transaction intent tag is invalid"),
++    }
++}
++
+ fn decode_relation_mutations(
+     cursor: &mut Cursor<'_>,
+ ) -> Result<Vec<DurableRelationMutation>, &'static str> {
+@@ -1714,6 +1852,65 @@
+     }
+ 
+     #[test]
++    fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
++        let registry = SemanticRegistry::default();
++        let context = SemanticContext {
++            schema: Schema::new(SchemaRevisionId::new(70)),
++            environment: SemanticEnvironment::new(SemanticEnvId::new(80)),
++        };
++        let mut state = DatabaseState::default();
++        for raw in 1..=5_000_u128 {
++            let entity = EntityId::new(raw);
++            state.lifecycle.entities.insert(entity);
++            state.lifecycle.roots.insert(entity);
++        }
++        let target =
++            kernel_revision::Revision::build(RevisionId::new(2), &context, &registry, state)
++                .unwrap();
++        let descriptor = DurableRevisionDescriptor::relation_data(
++            ClientTransactionId::new(0x700),
++            RevisionId::new(1),
++            &target,
++            target.semantic_revision(),
++            vec![DurableRelationMutation {
++                relation: SemanticId::new(11),
++                inserted: vec![vec![Value::I64(7)]],
++                removed: Vec::new(),
++            }],
++            &registry,
++        )
++        .unwrap();
++        let full_revision = checkpoint::encode_revision(&target).unwrap();
++        let prepare = encode_prepare_payload(&descriptor).unwrap();
++        let metadata_bytes = metadata::encode(&metadata::DurableStoreMetadata {
++            materializations: Vec::new(),
++            committed_transactions: BTreeMap::from([(
++                descriptor.transaction_id,
++                descriptor.intent.clone(),
++            )]),
++            semantic_modules: Vec::new(),
++        })
++        .unwrap();
++
++        assert!(matches!(
++            descriptor.intent,
++            DurableTransactionIntent::RelationDataExact { .. }
++        ));
++        assert!(
++            prepare.len() * 100 < full_revision.len(),
++            "delta prepare={} full revision={}",
++            prepare.len(),
++            full_revision.len()
++        );
++        assert!(
++            metadata_bytes.len() * 100 < full_revision.len(),
++            "delta ledger={} full revision={}",
++            metadata_bytes.len(),
++            full_revision.len()
++        );
++    }
++
++    #[test]
+     fn full_revision_prepare_payload_roundtrips_and_revalidates_target() {
+         let registry = SemanticRegistry::default();
+         let context = SemanticContext {
+@@ -1860,6 +2057,25 @@
+     }
+ 
+     #[test]
++    fn scanner_rejects_same_target_transaction_reuse_with_different_delta() {
++        let mut wal = SimulatedRevisionWal::new();
++        let first = descriptor(1, 2, Value::I64(7));
++        let mut second = descriptor(1, 2, Value::I64(8));
++        second.transaction_id = first.transaction_id;
++        let prepared = wal.durably_prepare(&first).unwrap();
++        wal.durably_commit(prepared).unwrap();
++        wal.durably_prepare(&second).unwrap();
++
++        assert!(matches!(
++            scan_wal(wal.crash_image(), RevisionId::new(1)),
++            Err(DurabilityError::Protocol {
++                reason: "transaction id already committed to another exact intent",
++                ..
++            })
++        ));
++    }
++
++    #[test]
+     fn scanner_rejects_transaction_id_reuse_for_different_prepare() {
+         let mut wal = SimulatedRevisionWal::new();
+         let first = descriptor(1, 2, Value::I64(7));
+diff -ruN --exclude target --exclude MANIFEST.sha256 /mnt/data/pass67_work/crates/kernel-durability/src/metadata.rs /mnt/data/pass68_work/crates/kernel-durability/src/metadata.rs
+--- /mnt/data/pass67_work/crates/kernel-durability/src/metadata.rs	2026-09-20 10:35:37.000000000 +0000
++++ /mnt/data/pass68_work/crates/kernel-durability/src/metadata.rs	2026-09-21 00:47:50.914520145 +0000
+@@ -4,14 +4,16 @@
+ use kernel_semantics::{
+     BuiltinSemanticModuleSpec, EquivalenceModule, OrderingModule, TokenizerModule,
+ };
+-use kernel_types::{ClientTransactionId, MaterializationId, RevisionId, SemanticId};
++use kernel_types::{
++    ClientTransactionId, MaterializationId, RevisionId, SemanticId, SemanticRevision,
++};
+ 
+ use super::{
+     CodecError, Cursor, DurableMaterializationSpec, DurableTransactionIntent, encode_value,
+     push_bytes, push_len, push_u64, push_u128,
+ };
+ 
+-const METADATA_CODEC_VERSION: u16 = 3;
++const METADATA_CODEC_VERSION: u16 = 4;
+ const MAX_QUERY_DEPTH: usize = 128;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -43,7 +45,7 @@
+ pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str> {
+     let mut cursor = Cursor::new(bytes);
+     let version = cursor.u16()?;
+-    if version != 1 && version != 2 && version != METADATA_CODEC_VERSION {
++    if version != 1 && version != 2 && version != 3 && version != METADATA_CODEC_VERSION {
+         return Err("unsupported durable metadata codec version");
+     }
+     let materializations = decode_materialization_specs(&mut cursor)?;
+@@ -133,6 +135,21 @@
+     intent: &DurableTransactionIntent,
+ ) -> Result<(), CodecError> {
+     match intent {
++        DurableTransactionIntent::RelationDataExact {
++            source_revision,
++            target_revision,
++            semantic_revision,
++            relation_mutations,
++            semantic_modules,
++        } => {
++            out.push(2);
++            push_u64(out, source_revision.raw());
++            push_u64(out, target_revision.raw());
++            push_u64(out, semantic_revision.schema.raw());
++            push_u64(out, semantic_revision.environment.raw());
++            super::encode_relation_mutations(out, relation_mutations)?;
++            encode_semantic_module_specs(out, semantic_modules)?;
++        }
+         DurableTransactionIntent::Exact {
+             target_revision,
+             encoded_target_revision,
+@@ -183,6 +200,16 @@
+                 semantic_modules,
+             })
+         }
++        2 => Ok(DurableTransactionIntent::RelationDataExact {
++            source_revision: RevisionId::new(cursor.u64()?),
++            target_revision: RevisionId::new(cursor.u64()?),
++            semantic_revision: SemanticRevision::new(
++                kernel_types::SchemaRevisionId::new(cursor.u64()?),
++                kernel_types::SemanticEnvId::new(cursor.u64()?),
++            ),
++            relation_mutations: super::decode_relation_mutations(cursor)?,
++            semantic_modules: decode_semantic_module_specs(cursor)?,
++        }),
+         _ => Err("invalid transaction intent tag"),
+     }
+ }
+@@ -621,15 +648,34 @@
+                 id: MaterializationId::new(7),
+                 query,
+             }],
+-            committed_transactions: [(
+-                ClientTransactionId::new(11),
+-                DurableTransactionIntent::Exact {
+-                    target_revision: RevisionId::new(12),
+-                    encoded_target_revision: vec![1, 2, 3],
+-                    materializations: None,
+-                    semantic_modules: Vec::new(),
+-                },
+-            )]
++            committed_transactions: [
++                (
++                    ClientTransactionId::new(11),
++                    DurableTransactionIntent::Exact {
++                        target_revision: RevisionId::new(12),
++                        encoded_target_revision: vec![1, 2, 3],
++                        materializations: None,
++                        semantic_modules: Vec::new(),
++                    },
++                ),
++                (
++                    ClientTransactionId::new(13),
++                    DurableTransactionIntent::RelationDataExact {
++                        source_revision: RevisionId::new(12),
++                        target_revision: RevisionId::new(14),
++                        semantic_revision: kernel_types::SemanticRevision::new(
++                            kernel_types::SchemaRevisionId::new(3),
++                            kernel_types::SemanticEnvId::new(4),
++                        ),
++                        relation_mutations: vec![crate::DurableRelationMutation {
++                            relation: SemanticId::new(9),
++                            inserted: vec![vec![kernel_model::Value::I64(5)]],
++                            removed: Vec::new(),
++                        }],
++                        semantic_modules: Vec::new(),
++                    },
++                ),
++            ]
+             .into(),
+             semantic_modules: Vec::new(),
+         };
+diff -ruN --exclude target --exclude MANIFEST.sha256 /mnt/data/pass67_work/crates/kernel-durability/src/store.rs /mnt/data/pass68_work/crates/kernel-durability/src/store.rs
+--- /mnt/data/pass67_work/crates/kernel-durability/src/store.rs	2026-09-20 01:18:25.000000000 +0000
++++ /mnt/data/pass68_work/crates/kernel-durability/src/store.rs	2026-09-21 00:47:50.914683355 +0000
+@@ -9,9 +9,9 @@
+ 
+ use super::{
+     DurabilityError, DurableCommitReceipt, DurableMaterializationSpec, DurablePrepareToken,
+-    DurableRevisionDescriptor, DurableTransactionIntent, DurableTransactionOutcome,
+-    FileRevisionWal, RecoveryScan, RevisionDurability, checkpoint, crc32c, metadata, read_u16,
+-    read_u32, read_u64,
++    DurableRevisionChange, DurableRevisionDescriptor, DurableTransactionIntent,
++    DurableTransactionOutcome, FileRevisionWal, RecoveryScan, RevisionDurability, checkpoint,
++    crc32c, metadata, read_u16, read_u32, read_u64,
+ };
+ 
+ const CHECKPOINT_MAGIC: [u8; 4] = *b"CFCP";
+@@ -84,13 +84,17 @@
+     registry: &mut SemanticRegistry,
+     intent: &DurableTransactionIntent,
+ ) {
+-    if let DurableTransactionIntent::Exact {
+-        semantic_modules, ..
+-    } = intent
+-    {
+-        for spec in semantic_modules {
+-            registry.install_builtin_module_spec(*spec);
+-        }
++    let semantic_modules = match intent {
++        DurableTransactionIntent::RelationDataExact {
++            semantic_modules, ..
++        }
++        | DurableTransactionIntent::Exact {
++            semantic_modules, ..
++        } => semantic_modules,
++        DurableTransactionIntent::LegacyTargetOnly { .. } => return,
++    };
++    for spec in semantic_modules {
++        registry.install_builtin_module_spec(*spec);
+     }
+ }
+ 
+@@ -503,33 +507,68 @@
+                 reason: "prepare source revision does not match durable store head",
+             });
+         }
+-        let DurableTransactionIntent::Exact {
+-            target_revision,
+-            encoded_target_revision,
+-            semantic_modules,
+-            ..
+-        } = &descriptor.intent
+-        else {
+-            return Err(DurabilityError::Protocol {
+-                offset: 0,
+-                reason: "new durable prepare does not carry exact transaction intent",
+-            });
+-        };
+-        if *target_revision != descriptor.target_revision {
+-            return Err(DurabilityError::Protocol {
+-                offset: 0,
+-                reason: "transaction intent target does not match descriptor target",
+-            });
+-        }
+-        for spec in semantic_modules {
+-            self.semantic_registry.install_builtin_module_spec(*spec);
+-        }
+-        let target = checkpoint::decode_revision(encoded_target_revision, &self.semantic_registry)?;
+-        if target.id() != descriptor.target_revision {
+-            return Err(DurabilityError::Protocol {
+-                offset: 0,
+-                reason: "transaction intent revision payload does not match target id",
+-            });
++        match &descriptor.intent {
++            DurableTransactionIntent::RelationDataExact {
++                source_revision,
++                target_revision,
++                semantic_revision,
++                relation_mutations,
++                semantic_modules,
++            } => {
++                let DurableRevisionChange::RelationData {
++                    semantic_revision: change_semantics,
++                    relation_mutations: change_mutations,
++                } = &descriptor.change
++                else {
++                    return Err(DurabilityError::Protocol {
++                        offset: 0,
++                        reason: "relation-data intent is paired with a non-delta change",
++                    });
++                };
++                if *source_revision != descriptor.source_revision
++                    || *target_revision != descriptor.target_revision
++                    || semantic_revision != change_semantics
++                    || relation_mutations != change_mutations
++                {
++                    return Err(DurabilityError::Protocol {
++                        offset: 0,
++                        reason: "relation-data intent does not match descriptor delta",
++                    });
++                }
++                for spec in semantic_modules {
++                    self.semantic_registry.install_builtin_module_spec(*spec);
++                }
++            }
++            DurableTransactionIntent::Exact {
++                target_revision,
++                encoded_target_revision,
++                semantic_modules,
++                ..
++            } => {
++                if *target_revision != descriptor.target_revision {
++                    return Err(DurabilityError::Protocol {
++                        offset: 0,
++                        reason: "transaction intent target does not match descriptor target",
++                    });
++                }
++                for spec in semantic_modules {
++                    self.semantic_registry.install_builtin_module_spec(*spec);
++                }
++                let target =
++                    checkpoint::decode_revision(encoded_target_revision, &self.semantic_registry)?;
++                if target.id() != descriptor.target_revision {
++                    return Err(DurabilityError::Protocol {
++                        offset: 0,
++                        reason: "transaction intent revision payload does not match target id",
++                    });
++                }
++            }
++            DurableTransactionIntent::LegacyTargetOnly { .. } => {
++                return Err(DurabilityError::Protocol {
++                    offset: 0,
++                    reason: "new durable prepare does not carry exact transaction intent",
++                });
++            }
+         }
+         let token = self.wal.durably_prepare(descriptor)?;
+         if let Some(existing) = self
+diff -ruN --exclude target --exclude MANIFEST.sha256 /mnt/data/pass67_work/crates/kernel-plan/src/lib.rs /mnt/data/pass68_work/crates/kernel-plan/src/lib.rs
+--- /mnt/data/pass67_work/crates/kernel-plan/src/lib.rs	2026-09-21 00:10:19.104170595 +0000
++++ /mnt/data/pass68_work/crates/kernel-plan/src/lib.rs	2026-09-21 00:50:28.605585303 +0000
+@@ -1226,6 +1226,17 @@
+     pub registry: &'a kernel_semantics::SemanticRegistry,
+ }
+ 
++/// Compact durable relation-data request whose target content is derived by
++/// the runtime from one authoritative source Revision plus the supplied typed
++/// deltas. Unlike `RevisionTransitionRequest`, this surface does not accept an
++/// independently constructed target snapshot, so `(source, target id, delta)`
++/// is the complete client-controlled logical request identity.
++pub struct DerivedRelationTransitionRequest<'a> {
++    pub source_revision: RevisionId,
++    pub target_revision: RevisionId,
++    pub mutations: &'a [RevisionRelationMutation<'a>],
++}
++
+ /// Full semantic revision replacement. This is the correctness-first durable
+ /// path for schema/Γ/lifecycle/field changes that cannot be represented as an
+ /// incremental relation-data delta under one pinned semantic context.
+@@ -2041,6 +2052,43 @@
+         self.commit_prepared_durable(transaction_id, prepared, request.registry, durability)
+     }
+ 
++    /// Exact compatibility path for the legacy relation-data API that accepts
++    /// an independently supplied target Revision. The runtime publication can
++    /// still use the incremental prepared transition, but durable idempotency
++    /// must retain the complete target witness because `RevisionId` is nominal.
++    pub(crate) fn commit_revision_durable_full_exact<D: RevisionDurability>(
++        &self,
++        transaction_id: ClientTransactionId,
++        request: &RevisionTransitionRequest<'_>,
++        durability: &mut D,
++    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
++        let prepared = self.prepare_revision(request)?;
++        let descriptor = DurableRevisionDescriptor::full_revision(
++            transaction_id,
++            prepared.descriptor().source_revision(),
++            prepared.descriptor().target(),
++            request.registry,
++        )
++        .map_err(DurabilityError::Encode)
++        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
++        let durable_prepare = durability
++            .durably_prepare(&descriptor)
++            .map_err(DurableRuntimeCommitError::PrepareDurability)?;
++        let sealed = prepared.seal(self)?;
++        let durable = match durability.durably_commit(durable_prepare) {
++            Ok(durable) => durable,
++            Err(error) => {
++                sealed.require_recovery();
++                return Err(DurableRuntimeCommitError::CommitDurabilityUncertain(error));
++            }
++        };
++        let output_deltas = sealed.publish();
++        Ok(DurableRuntimeCommitReceipt {
++            durable,
++            publication: RuntimePublicationEffect::Incremental(output_deltas),
++        })
++    }
++
+     pub(crate) fn commit_full_revision_durable<D: RevisionDurability>(
+         &self,
+         transaction_id: ClientTransactionId,
+@@ -2380,6 +2428,71 @@
+ }
+ 
+ impl DurableRuntime {
++    fn canonical_durable_relation_mutations(
++        mutations: &[RevisionRelationMutation<'_>],
++    ) -> Result<Vec<DurableRelationMutation>, PhysicalExecutionError> {
++        let mut seen = BTreeSet::new();
++        let mut durable = Vec::with_capacity(mutations.len());
++        for mutation in mutations {
++            if !seen.insert(mutation.relation) {
++                return Err(PhysicalExecutionError::DuplicateRelationMutation(
++                    mutation.relation,
++                ));
++            }
++            durable.push(DurableRelationMutation {
++                relation: mutation.relation,
++                inserted: mutation.delta.inserted.clone(),
++                removed: mutation.delta.removed.clone(),
++            });
++        }
++        durable.sort_by_key(|mutation| mutation.relation);
++        Ok(durable)
++    }
++
++    fn derive_relation_target(
++        &self,
++        source: &kernel_revision::Revision,
++        target_revision: RevisionId,
++        mutations: &[RevisionRelationMutation<'_>],
++    ) -> Result<kernel_revision::Revision, DurableRuntimeCommitError> {
++        let mut candidate = source.relation_update_candidate();
++        for mutation in mutations {
++            let definition = source
++                .semantic_context()
++                .schema
++                .relation(mutation.relation)
++                .ok_or(PhysicalExecutionError::MissingRuntimeRelationBinding(
++                    mutation.relation,
++                ))?;
++            let rows = source
++                .state()
++                .model
++                .relations
++                .get(&mutation.relation)
++                .cloned()
++                .unwrap_or_default();
++            let old = relation_value_from_rows(
++                rows,
++                &RelType {
++                    columns: definition.columns.clone(),
++                    semantics: definition.semantics.clone(),
++                },
++                source.semantic_context(),
++                &self.registry,
++            )?;
++            let next = mutation
++                .delta
++                .apply_to_value(old, source.semantic_context(), &self.registry)
++                .map_err(PhysicalExecutionError::from)?;
++            candidate.replace_relation_rows(mutation.relation, next.into_rows());
++        }
++        candidate
++            .build(target_revision, &self.registry)
++            .map_err(|error| {
++                DurableRuntimeCommitError::Recovery(RuntimeRecoveryError::Revision(error))
++            })
++    }
++
+     pub fn create(
+         root: RuntimeRevisionBundle,
+         directory: impl AsRef<std::path::Path>,
+@@ -2466,6 +2579,68 @@
+             registry: &self.registry,
+         };
+         self.cell
++            .commit_revision_durable_full_exact(
++                transaction_id,
++                &authorized_request,
++                &mut *durability,
++            )
++            .map(DurableRuntimeCommitOutcome::Committed)
++    }
++
++    /// Delta-authoritative compact durability path. The caller names source
++    /// and target revisions and supplies only typed relation deltas; the target
++    /// Revision content is constructed from the live authoritative source by
++    /// this runtime and therefore cannot be independently substituted.
++    pub fn commit_derived_relation_data(
++        &self,
++        transaction_id: ClientTransactionId,
++        request: &DerivedRelationTransitionRequest<'_>,
++    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
++        let durable_mutations = Self::canonical_durable_relation_mutations(request.mutations)?;
++        let mut durability = self.durability.lock().map_err(|_| {
++            let _ = self.cell.force_recovery_required();
++            DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
++        })?;
++        if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
++            let matches = matches!(
++                committed_intent,
++                DurableTransactionIntent::RelationDataExact {
++                    source_revision,
++                    target_revision,
++                    relation_mutations,
++                    ..
++                } if *source_revision == request.source_revision
++                    && *target_revision == request.target_revision
++                    && relation_mutations == &durable_mutations
++            );
++            if matches {
++                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
++                    target_revision: request.target_revision,
++                });
++            }
++            return Err(DurableRuntimeCommitError::TransactionIdConflict {
++                transaction_id,
++                committed_target: committed_intent.target_revision(),
++                requested_target: request.target_revision,
++            });
++        }
++
++        let snapshot = self.cell.snapshot()?;
++        if snapshot.revision().id() != request.source_revision {
++            return Err(PhysicalExecutionError::InvalidRevisionTransition.into());
++        }
++        let target = self.derive_relation_target(
++            snapshot.revision(),
++            request.target_revision,
++            request.mutations,
++        )?;
++        drop(snapshot);
++        let authorized_request = RevisionTransitionRequest {
++            target_revision: &target,
++            mutations: request.mutations,
++            registry: &self.registry,
++        };
++        self.cell
+             .commit_revision_durable(transaction_id, &authorized_request, &mut *durability)
+             .map(DurableRuntimeCommitOutcome::Committed)
+     }
+@@ -24272,7 +24447,7 @@
+             inner: durability,
+             crash_marker: dir.join(".cfmd-plan-crash-ready"),
+         };
+-        let _ = cell.commit_revision_durable(
++        let _ = cell.commit_revision_durable_full_exact(
+             ClientTransactionId::new(1006),
+             &RevisionTransitionRequest {
+                 target_revision: &target,
+@@ -24800,10 +24975,11 @@
+         .unwrap();
+         drop(live);
+         assert!(matches!(
+-            runtime.replace_revision(
++            runtime.commit_revision(
+                 transaction_id,
+-                &FullRevisionTransitionRequest {
++                &RevisionTransitionRequest {
+                     target_revision: &conflicting_target,
++                    mutations: &mutations,
+                     registry: &registry,
+                 },
+             ),
+@@ -24897,10 +25073,11 @@
+         .unwrap();
+         drop(live);
+         assert!(matches!(
+-            reopened.replace_revision(
++            reopened.commit_revision(
+                 first_transaction,
+-                &FullRevisionTransitionRequest {
++                &RevisionTransitionRequest {
+                     target_revision: &conflicting_target,
++                    mutations: &first_mutations,
+                     registry: &registry,
+                 },
+             ),
+@@ -24912,6 +25089,140 @@
+         ));
+         drop(reopened);
+         std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
++        let dir = durable_test_dir("derived-relation-compact-exact");
++        let (context, registry, relation, _, root) = scan_runtime_bundle(875, 1295, &[1]);
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
++
++        let first_transaction = ClientTransactionId::new(0x8751);
++        let first_delta = scan_delta(relation, &[2], &[], &context, &registry);
++        let first_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &first_delta,
++        }];
++        let first_request = DerivedRelationTransitionRequest {
++            source_revision: RevisionId::new(875),
++            target_revision: RevisionId::new(876),
++            mutations: &first_mutations,
++        };
++        assert!(matches!(
++            runtime
++                .commit_derived_relation_data(first_transaction, &first_request)
++                .unwrap(),
++            DurableRuntimeCommitOutcome::Committed(_)
++        ));
++
++        let second_delta = scan_delta(relation, &[3], &[1], &context, &registry);
++        let second_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &second_delta,
++        }];
++        runtime
++            .commit_derived_relation_data(
++                ClientTransactionId::new(0x8752),
++                &DerivedRelationTransitionRequest {
++                    source_revision: RevisionId::new(876),
++                    target_revision: RevisionId::new(877),
++                    mutations: &second_mutations,
++                },
++            )
++            .unwrap();
++        runtime.checkpoint().unwrap();
++        runtime.compact_obsolete_generations().unwrap();
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        assert_eq!(
++            reopened
++                .commit_derived_relation_data(first_transaction, &first_request)
++                .unwrap(),
++            DurableRuntimeCommitOutcome::AlreadyCommitted {
++                target_revision: RevisionId::new(876),
++            }
++        );
++
++        let conflicting_delta = scan_delta(relation, &[99], &[], &context, &registry);
++        let conflicting_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &conflicting_delta,
++        }];
++        assert!(matches!(
++            reopened.commit_derived_relation_data(
++                first_transaction,
++                &DerivedRelationTransitionRequest {
++                    source_revision: RevisionId::new(875),
++                    target_revision: RevisionId::new(876),
++                    mutations: &conflicting_mutations,
++                },
++            ),
++            Err(DurableRuntimeCommitError::TransactionIdConflict { .. })
++        ));
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn derived_relation_commit_matches_authoritative_target_and_rejects_stale_source() {
++        let dir = durable_test_dir("derived-relation-authority-and-stale-source");
++        let (context, registry, relation, _, root) = scan_runtime_bundle(878, 1298, &[1]);
++        let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
++
++        let first_delta = scan_delta(relation, &[2], &[], &context, &registry);
++        let first_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &first_delta,
++        }];
++        let source = runtime.snapshot().unwrap();
++        let expected = target_revision_for(source.root(), 879, &first_mutations, &registry);
++        drop(source);
++        runtime
++            .commit_derived_relation_data(
++                ClientTransactionId::new(0x8781),
++                &DerivedRelationTransitionRequest {
++                    source_revision: RevisionId::new(878),
++                    target_revision: RevisionId::new(879),
++                    mutations: &first_mutations,
++                },
++            )
++            .unwrap();
++        assert_eq!(runtime.snapshot().unwrap().revision(), &expected);
++
++        let stale_delta = scan_delta(relation, &[3], &[], &context, &registry);
++        let stale_mutations = [RevisionRelationMutation {
++            relation,
++            delta: &stale_delta,
++        }];
++        let stale_transaction = ClientTransactionId::new(0x8782);
++        let stale_request = DerivedRelationTransitionRequest {
++            source_revision: RevisionId::new(878),
++            target_revision: RevisionId::new(880),
++            mutations: &stale_mutations,
++        };
++        assert!(matches!(
++            runtime.commit_derived_relation_data(stale_transaction, &stale_request),
++            Err(DurableRuntimeCommitError::Runtime(
++                PhysicalExecutionError::InvalidRevisionTransition
++            ))
++        ));
++        assert_eq!(
++            runtime.snapshot().unwrap().revision().id(),
++            RevisionId::new(879)
++        );
++        drop(runtime);
++
++        let reopened = DurableRuntime::open(&dir).unwrap();
++        assert_eq!(reopened.snapshot().unwrap().revision(), &expected);
++        assert!(matches!(
++            reopened.commit_derived_relation_data(stale_transaction, &stale_request),
++            Err(DurableRuntimeCommitError::Runtime(
++                PhysicalExecutionError::InvalidRevisionTransition
++            ))
++        ));
++        drop(reopened);
++        std::fs::remove_dir_all(dir).unwrap();
+     }
+ 
+     #[test]

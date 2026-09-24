@@ -1,0 +1,11 @@
+   Compiling kernel-proof v0.1.0 (/mnt/data/cfmd_pass78_work/crates/kernel-proof)
+    Finished `release` profile [optimized] target(s) in 0.22s
+     Running unittests src/lib.rs (/mnt/data/cfmd_target/release/deps/kernel_proof-363ef66ef46db1ad)
+
+running 3 tests
+test tests::checker_accepts_only_the_exact_filter_fusion_rule ... ok
+test tests::checker_rejects_wrong_rewrite_even_if_shape_is_similar ... ok
+test tests::optimizer_rewrite_uses_the_same_checked_certificate_boundary ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

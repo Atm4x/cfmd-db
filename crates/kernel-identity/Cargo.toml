@@ -1,0 +1,11 @@
+[package]
+name = "kernel-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true

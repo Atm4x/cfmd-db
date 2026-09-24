@@ -1,0 +1,22 @@
+   Compiling kernel-types v0.1.0 (/mnt/data/pass72_work/crates/kernel-types)
+   Compiling kernel-proof v0.1.0 (/mnt/data/pass72_work/crates/kernel-proof)
+   Compiling kernel-aggregate v0.1.0 (/mnt/data/pass72_work/crates/kernel-aggregate)
+   Compiling kernel-change v0.1.0 (/mnt/data/pass72_work/crates/kernel-change)
+   Compiling kernel-identity v0.1.0 (/mnt/data/pass72_work/crates/kernel-identity)
+   Compiling kernel-schema v0.1.0 (/mnt/data/pass72_work/crates/kernel-schema)
+   Compiling kernel-lifecycle v0.1.0 (/mnt/data/pass72_work/crates/kernel-lifecycle)
+   Compiling kernel-semantic-index v0.1.0 (/mnt/data/pass72_work/crates/kernel-semantic-index)
+   Compiling kernel-model v0.1.0 (/mnt/data/pass72_work/crates/kernel-model)
+   Compiling kernel-semantics v0.1.0 (/mnt/data/pass72_work/crates/kernel-semantics)
+   Compiling kernel-validation v0.1.0 (/mnt/data/pass72_work/crates/kernel-validation)
+   Compiling kernel-query v0.1.0 (/mnt/data/pass72_work/crates/kernel-query)
+   Compiling kernel-revision v0.1.0 (/mnt/data/pass72_work/crates/kernel-revision)
+   Compiling kernel-durability v0.1.0 (/mnt/data/pass72_work/crates/kernel-durability)
+   Compiling kernel-plan v0.1.0 (/mnt/data/pass72_work/crates/kernel-plan)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.32s
+     Running unittests src/lib.rs (target/debug/deps/kernel_plan-2390e2b837966927)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 177 filtered out; finished in 0.00s
+

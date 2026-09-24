@@ -1,0 +1,35 @@
+RUN 1
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=562
+baseline_median_ns=731
+ratio_milli=768
+full_replay_median_like_ns=311961
+maintained_vs_full_replay_milli=1
+RUN 2
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=757
+baseline_median_ns=826
+ratio_milli=916
+full_replay_median_like_ns=433924
+maintained_vs_full_replay_milli=1
+RUN 3
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=753
+baseline_median_ns=830
+ratio_milli=907
+full_replay_median_like_ns=389281
+maintained_vs_full_replay_milli=1
+RUN 4
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=534
+baseline_median_ns=674
+ratio_milli=792
+full_replay_median_like_ns=299538
+maintained_vs_full_replay_milli=1
+RUN 5
+rows=50000 k=10 rounds=7 iterations_per_round=1000
+maintained_median_ns=551
+baseline_median_ns=831
+ratio_milli=663
+full_replay_median_like_ns=310487
+maintained_vs_full_replay_milli=1

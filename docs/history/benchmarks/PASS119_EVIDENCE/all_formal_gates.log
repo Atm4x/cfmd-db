@@ -1,0 +1,6 @@
+P18 refinement check: PASS
+fault points: 10
+surface-to-kernel source refinement: PASS
+TypeExpr variants: Bag,Map,Mu,Option,Product,Scalar,Seq,Set,Sum,Var
+RelExpr/Plan variants: AntiJoin,Difference,Distinct,FilterEqColumns,FilterEqConst,Group,JoinEq,Project,PromoteToBag,Scan,TopKWithTies
+CFMD Lean mechanization + production refinement: PASS

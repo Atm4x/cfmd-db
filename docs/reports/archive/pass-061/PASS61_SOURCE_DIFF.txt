@@ -1,0 +1,487 @@
+--- /mnt/data/cfmd_workspace_pass60/crates/kernel-plan/src/lib.rs	2026-09-20 19:34:39.958622898 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 20:06:14.144628152 +0000
+@@ -742,7 +742,8 @@
+     relations: BTreeMap<(SemanticId, LayoutId), Arc<InstalledRelation>>,
+     i64_indexes: BTreeMap<I64IndexBinding, Arc<MaterializedI64IndexState>>,
+     semantic_indexes: BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>>,
+-    semantic_quotient_factors: BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>>,
++    semantic_quotient_factors:
++        BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticQuotientFactorState>>,
+     semantic_quotient_supports:
+         BTreeMap<SemanticQuotientSupportBinding, Arc<MaterializedSemanticQuotientSupportState>>,
+     semantic_statistics: BTreeMap<SemanticIndexBinding, Arc<MaterializedSemanticStatisticsState>>,
+@@ -3078,13 +3079,14 @@
+             context,
+             registry,
+         )?;
+-        validate_semantic_index_family_context(
+-            &self.semantic_quotient_factors,
+-            relation,
+-            layout,
+-            context,
+-            registry,
+-        )?;
++        for (binding, state) in &self.semantic_quotient_factors {
++            if binding.relation == relation
++                && binding.layout.id == layout.id
++                && !state.compatible_with(context, registry)?
++            {
++                return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
++            }
++        }
+         for (binding, state) in &self.semantic_statistics {
+             if binding.relation == relation
+                 && binding.layout.id == layout.id
+@@ -3101,6 +3103,8 @@
+         relation: SemanticId,
+         layout: LayoutBinding,
+         delta: &PhysicalRelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+         for (binding, state) in &self.i64_indexes {
+             if binding.relation == relation && binding.layout.id == layout.id {
+@@ -3108,12 +3112,11 @@
+             }
+         }
+         validate_semantic_index_family_delta(&self.semantic_indexes, relation, layout, delta)?;
+-        validate_semantic_index_family_delta(
+-            &self.semantic_quotient_factors,
+-            relation,
+-            layout,
+-            delta,
+-        )?;
++        for (binding, state) in &self.semantic_quotient_factors {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                state.validate_physical_delta(delta, context, registry)?;
++            }
++        }
+         for (binding, state) in &self.semantic_statistics {
+             if binding.relation == relation && binding.layout.id == layout.id {
+                 state.validate_physical_delta(delta)?;
+@@ -3127,6 +3130,8 @@
+         relation: SemanticId,
+         layout: LayoutBinding,
+         delta: &PhysicalRelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
+     ) -> Result<(), PhysicalExecutionError> {
+         for (binding, state) in &mut self.i64_indexes {
+             if binding.relation == relation && binding.layout.id == layout.id {
+@@ -3134,12 +3139,11 @@
+             }
+         }
+         apply_semantic_index_family_delta(&mut self.semantic_indexes, relation, layout, delta)?;
+-        apply_semantic_index_family_delta(
+-            &mut self.semantic_quotient_factors,
+-            relation,
+-            layout,
+-            delta,
+-        )?;
++        for (binding, state) in &mut self.semantic_quotient_factors {
++            if binding.relation == relation && binding.layout.id == layout.id {
++                Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
++            }
++        }
+         for (binding, state) in &mut self.semantic_statistics {
+             if binding.relation == relation && binding.layout.id == layout.id {
+                 Arc::make_mut(state).apply_physical_delta(delta)?;
+@@ -3305,7 +3309,7 @@
+             context,
+             registry,
+         )?;
+-        self.validate_relation_derived_delta(relation, layout, &physical_delta)?;
++        self.validate_relation_derived_delta(relation, layout, &physical_delta, context, registry)?;
+         let next_epoch = self
+             .transition_epoch
+             .checked_add(1)
+@@ -3318,7 +3322,7 @@
+             },
+         )?;
+         apply_planned_relation_delta(Arc::make_mut(installed), &physical_delta)?;
+-        self.apply_relation_derived_delta(relation, layout, &physical_delta)?;
++        self.apply_relation_derived_delta(relation, layout, &physical_delta, context, registry)?;
+         self.transition_epoch = next_epoch;
+         self.state_identity = Arc::new(());
+         let resolved_delta = RelationDelta {
+@@ -3391,7 +3395,7 @@
+     fn semantic_quotient_factor(
+         &self,
+         index: &SemanticIndexBinding,
+-    ) -> Option<&MaterializedSemanticIndexState> {
++    ) -> Option<&MaterializedSemanticQuotientFactorState> {
+         self.semantic_quotient_factors.get(index).map(Arc::as_ref)
+     }
+ 
+@@ -3749,13 +3753,6 @@
+         self.index.distinct_key_count()
+     }
+ 
+-    fn single_key_for(&self, row_id: PhysicalRowId) -> Option<&kernel_semantics::CanonicalEqKey> {
+-        if self.binding.key_parts.len() != 1 {
+-            return None;
+-        }
+-        self.index.key_for(&row_id).and_then(|key| key.first())
+-    }
+-
+     fn probe_values(
+         &self,
+         values: &[&Value],
+@@ -3822,6 +3819,170 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct MaterializedSemanticQuotientFactorState {
++    binding: SemanticIndexBinding,
++    semantic_context: kernel_schema::SemanticContext,
++    buckets: BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, Vec<PhysicalRowId>>,
++    reverse: BTreeMap<PhysicalRowId, Vec<kernel_semantics::CanonicalEqKey>>,
++}
++
++impl MaterializedSemanticQuotientFactorState {
++    fn build(
++        binding: SemanticIndexBinding,
++        relation: &InstalledRelation,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Self, PhysicalExecutionError> {
++        if binding.key_parts.is_empty() {
++            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
++        }
++        let definition = context
++            .schema
++            .relation(binding.relation)
++            .ok_or(RelQueryError::UnknownRelation(binding.relation))?;
++        for part in &binding.key_parts {
++            if part.column >= definition.columns.len() {
++                return Err(RelQueryError::ColumnOutOfBounds.into());
++            }
++            registry.equivalence_domain(context, part.equivalence)?;
++        }
++        let mut buckets = BTreeMap::new();
++        let mut reverse = BTreeMap::new();
++        for row_index in relation.scan_positions() {
++            let row = materialize_native_row(&relation.data, row_index)?;
++            let key = semantic_quotient_factor_row_key(&binding, context, registry, &row)?;
++            let row_id = relation.row_id_at(row_index)?;
++            buckets
++                .entry(key.clone())
++                .or_insert_with(Vec::new)
++                .push(row_id);
++            if reverse.insert(row_id, key).is_some() {
++                return Err(RelQueryError::InconsistentIncrementalDelta.into());
++            }
++        }
++        Ok(Self {
++            binding,
++            semantic_context: context.clone(),
++            buckets,
++            reverse,
++        })
++    }
++
++    fn compatible_with(
++        &self,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<bool, PhysicalExecutionError> {
++        if context != &self.semantic_context {
++            return Ok(false);
++        }
++        for part in &self.binding.key_parts {
++            registry.equivalence_domain(context, part.equivalence)?;
++        }
++        Ok(true)
++    }
++
++    #[must_use]
++    fn row_count(&self) -> usize {
++        self.reverse.len()
++    }
++
++    fn single_key_for(&self, row_id: PhysicalRowId) -> Option<&kernel_semantics::CanonicalEqKey> {
++        if self.binding.key_parts.len() != 1 {
++            return None;
++        }
++        self.reverse.get(&row_id).and_then(|key| key.first())
++    }
++
++    fn row_key(
++        &self,
++        row: &kernel_query::Row,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
++        semantic_quotient_factor_row_key(&self.binding, context, registry, row)
++    }
++
++    fn validate_physical_delta(
++        &self,
++        delta: &PhysicalRelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        if !self.compatible_with(context, registry)? {
++            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
++        }
++        for (row_id, row) in &delta.removed {
++            let key = self.row_key(row, context, registry)?;
++            if self.reverse.get(row_id) != Some(&key) {
++                return Err(RelQueryError::InconsistentIncrementalDelta.into());
++            }
++        }
++        for (_, row) in &delta.inserted {
++            let _ = self.row_key(row, context, registry)?;
++        }
++        Ok(())
++    }
++
++    fn apply_physical_delta(
++        &mut self,
++        delta: &PhysicalRelationDelta,
++        context: &kernel_schema::SemanticContext,
++        registry: &kernel_semantics::SemanticRegistry,
++    ) -> Result<(), PhysicalExecutionError> {
++        for (row_id, row) in &delta.removed {
++            let key = self.row_key(row, context, registry)?;
++            if self.reverse.get(row_id) != Some(&key) {
++                return Err(RelQueryError::InconsistentIncrementalDelta.into());
++            }
++            let bucket = self
++                .buckets
++                .get_mut(&key)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            let position = bucket
++                .iter()
++                .position(|candidate| candidate == row_id)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++            bucket.remove(position);
++            if bucket.is_empty() {
++                self.buckets.remove(&key);
++            }
++            self.reverse
++                .remove(row_id)
++                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++        }
++        for (row_id, row) in &delta.inserted {
++            let key = self.row_key(row, context, registry)?;
++            if self.reverse.insert(*row_id, key.clone()).is_some() {
++                return Err(RelQueryError::InconsistentIncrementalDelta.into());
++            }
++            self.buckets.entry(key).or_default().push(*row_id);
++        }
++        Ok(())
++    }
++}
++
++fn semantic_quotient_factor_row_key(
++    binding: &SemanticIndexBinding,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    row: &kernel_query::Row,
++) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
++    binding
++        .key_parts
++        .iter()
++        .map(|part| {
++            let value = row
++                .get(part.column)
++                .ok_or(RelQueryError::ColumnOutOfBounds)?;
++            registry
++                .canonical_equivalence_key(context, part.equivalence, value)
++                .map_err(Into::into)
++        })
++        .collect()
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct SemanticKeyStatistics {
+     pub row_count: usize,
+@@ -7792,9 +7953,18 @@
+ ) -> Result<Option<SemanticQuotientKeyCache>, PhysicalExecutionError> {
+     let mut cache = BTreeMap::new();
+     for (equivalence, endpoints) in specs {
+-        let Some(module) = registry.resolve_primitive_equivalence(context, *equivalence)? else {
++        if context
++            .schema
++            .structural_equivalence(*equivalence)
++            .is_some()
++        {
++            registry.equivalence_domain(context, *equivalence)?;
++        } else if registry
++            .resolve_primitive_equivalence(context, *equivalence)?
++            .is_none()
++        {
+             return Ok(None);
+-        };
++        }
+         for endpoint in endpoints {
+             let cache_key = (endpoint.leaf, endpoint.column, *equivalence);
+             if cache.contains_key(&cache_key) {
+@@ -7834,7 +8004,7 @@
+                 let value = row
+                     .get(endpoint.column)
+                     .ok_or(RelQueryError::ColumnOutOfBounds)?;
+-                keys.push(module.canonical_key(value)?);
++                keys.push(registry.canonical_equivalence_key(context, *equivalence, value)?);
+                 stats.values_read = stats.values_read.saturating_add(1);
+             }
+             cache.insert(cache_key, keys);
+@@ -12516,7 +12686,7 @@
+             let relation = store.installed(binding.relation, binding.layout)?;
+             prepared.push((
+                 binding.clone(),
+-                MaterializedSemanticIndexState::build(
++                MaterializedSemanticQuotientFactorState::build(
+                     binding,
+                     relation,
+                     &self.semantic_context,
+@@ -12657,7 +12827,7 @@
+ 
+     use kernel_schema::{
+         FieldDef, RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext,
+-        SemanticEnvironment, TypeExpr,
++        SemanticEnvironment, StructuralEquivalenceDef, TypeExpr,
+     };
+     use kernel_semantics::{EquivalenceModule, SemanticRegistry};
+     use kernel_types::{EntityId, MaterializationId, RevisionId, SchemaRevisionId, SemanticEnvId};
+@@ -16637,6 +16807,138 @@
+         );
+     }
+ 
++    fn assert_structural_quotient_factor_hits(
++        prepared: &PreparedPlan,
++        store: &PhysicalStore,
++        registry: &SemanticRegistry,
++        expected_rows: usize,
++    ) {
++        let mut leaves = Vec::new();
++        let mut predicates = Vec::new();
++        flatten_multiway_join_tree(prepared.physical(), store, &mut leaves, &mut predicates)
++            .unwrap()
++            .unwrap();
++        let mut stats = ExecutionStats::default();
++        let rows = execute_order_preserving_quotient_join(
++            &leaves,
++            &predicates,
++            prepared.semantic_quotient_program.as_ref(),
++            store,
++            prepared.semantic_context(),
++            registry,
++            &mut stats,
++        )
++        .unwrap()
++        .unwrap();
++        assert_eq!(rows.len(), expected_rows);
++        assert_eq!(stats.multiway_join_maintained_quotient_key_hits, 6);
++    }
++
++    #[test]
++    fn structural_gamma_quotient_factors_are_materialized_and_delta_maintained() {
++        let relations = [sid(1_200), sid(1_201), sid(1_202)];
++        let structural = sid(1_203);
++        let ci = sid(1_204);
++        let mut registry = SemanticRegistry::default();
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(1_200));
++        environment.pin_module(ci, ci_digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(1_200));
++        schema
++            .define_structural_equivalence(
++                structural,
++                StructuralEquivalenceDef::Option { inner: ci },
++            )
++            .unwrap();
++        for relation in relations {
++            schema
++                .define_relation(RelationDef {
++                    id: relation,
++                    columns: vec![TypeExpr::Option(Box::new(TypeExpr::Scalar(
++                        ScalarType::Text,
++                    )))],
++                    semantics: RelationSemantics::Bag {
++                        column_equivalences: vec![structural],
++                    },
++                })
++                .unwrap();
++        }
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let bindings = [1_200_u128, 1_201, 1_202].map(|id| LayoutBinding {
++            id: LayoutId(id),
++            family: LayoutFamily::RowStore,
++        });
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, binding) in relations.into_iter().zip(bindings) {
++            catalog.bind_relation(relation, binding);
++        }
++        let [a, b, c] = relations;
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(a)),
++                right: Box::new(RelExpr::Scan(b)),
++                left_column: 0,
++                right_column: 0,
++                equivalence: structural,
++            }),
++            right: Box::new(RelExpr::Scan(c)),
++            left_column: 0,
++            right_column: 0,
++            equivalence: structural,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let option_text = |value: &str| Value::Option(Some(Box::new(Value::Text(value.into()))));
++        let relation_rows = [
++            vec![vec![option_text("Alpha")], vec![option_text("Beta")]],
++            vec![vec![option_text("alpha")], vec![option_text("beta")]],
++            vec![vec![option_text("ALPHA")], vec![option_text("BETA")]],
++        ];
++        let mut store = PhysicalStore::default();
++        let mut model = kernel_model::FiniteModel::default();
++        for ((relation, binding), rows) in relations.into_iter().zip(bindings).zip(relation_rows) {
++            store
++                .install(relation, binding, NativeRelation::row_store(rows.clone()))
++                .unwrap();
++            model.relations.insert(relation, rows);
++        }
++        assert_eq!(
++            prepared
++                .materialize_semantic_quotient_factors(&mut store, &registry)
++                .unwrap(),
++            3
++        );
++        let (before, _) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            before,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(before.rows().len(), 2);
++        assert_structural_quotient_factor_hits(&prepared, &store, &registry, 2);
++
++        let delta = RelationDelta {
++            inserted: vec![vec![option_text("Gamma")]],
++            removed: vec![vec![option_text("ALPHA")]],
++            result_type: RelExpr::Scan(c).typecheck(&context, &registry).unwrap(),
++        };
++        store
++            .apply_relation_delta(c, bindings[2], &delta, &context, &registry)
++            .unwrap();
++        let c_rows = model.relations.get_mut(&c).unwrap();
++        c_rows.remove(0);
++        c_rows.push(vec![option_text("Gamma")]);
++        let (after, _) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        assert_eq!(
++            after,
++            logical.evaluate(&model, &context, &registry).unwrap()
++        );
++        assert_eq!(after.rows().len(), 1);
++        assert_structural_quotient_factor_hits(&prepared, &store, &registry, 1);
++    }
++
+     fn local_dq_quotient_fixture() -> (
+         SemanticContext,
+         SemanticRegistry,

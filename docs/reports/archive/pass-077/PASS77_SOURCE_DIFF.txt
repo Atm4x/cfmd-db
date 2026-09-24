@@ -1,0 +1,2595 @@
+diff -ruN /mnt/data/cfmd_pass76_work/crates/kernel-plan/src/algebraic_native.rs crates/kernel-plan/src/algebraic_native.rs
+--- /mnt/data/cfmd_pass76_work/crates/kernel-plan/src/algebraic_native.rs	2026-09-21 01:44:00.000000000 +0000
++++ crates/kernel-plan/src/algebraic_native.rs	2026-09-21 13:57:06.966053698 +0000
+@@ -610,10 +610,11 @@
+                 self.canonical_compiled_sum_at(index, compiled, variants)
+             }
+             CompiledEquivalenceNodeRef::Seq { element } => self
+-                .canonical_compiled_range_at(index, compiled, element, false)
++                .canonical_compiled_range_at(index, compiled, element)
+                 .map(CanonicalEqKey::Seq),
+             CompiledEquivalenceNodeRef::Set { element } => self
+-                .canonical_compiled_range_at(index, compiled, element, true)
++                .canonical_compiled_range_at(index, compiled, element)
++                .map(kernel_semantics::finite_measure_from_atoms)
+                 .map(CanonicalEqKey::Set),
+             CompiledEquivalenceNodeRef::Bag { element } => {
+                 self.canonical_compiled_bag_at(index, compiled, element)
+@@ -729,17 +730,18 @@
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+         };
+         let (start, end) = range(offsets, index)?;
+-        let mut entries = Vec::with_capacity(end.saturating_sub(start));
++        let mut atoms = Vec::with_capacity(end.saturating_sub(start));
+         for position in start..end {
+-            entries.push((
+-                payload.canonical_compiled_node_at(position, compiled, element)?,
+-                *counts
++            atoms.push(kernel_semantics::CanonicalBagAtom {
++                value: payload.canonical_compiled_node_at(position, compiled, element)?,
++                stored_count: *counts
+                     .get(position)
+                     .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?,
+-            ));
++            });
+         }
+-        entries.sort_unstable();
+-        Ok(kernel_semantics::CanonicalEqKey::Bag(entries))
++        Ok(kernel_semantics::CanonicalEqKey::Bag(
++            kernel_semantics::finite_measure_from_atoms(atoms),
++        ))
+     }
+ 
+     fn canonical_compiled_map_at(
+@@ -759,15 +761,16 @@
+             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+         };
+         let (start, end) = range(offsets, index)?;
+-        let mut entries = Vec::with_capacity(end.saturating_sub(start));
++        let mut atoms = Vec::with_capacity(end.saturating_sub(start));
+         for position in start..end {
+-            entries.push((
+-                keys.canonical_compiled_node_at(position, compiled, key)?,
+-                values.canonical_compiled_node_at(position, compiled, value)?,
+-            ));
+-        }
+-        entries.sort_unstable();
+-        Ok(kernel_semantics::CanonicalEqKey::Map(entries))
++            atoms.push(kernel_semantics::CanonicalMapAtom {
++                key: keys.canonical_compiled_node_at(position, compiled, key)?,
++                value: values.canonical_compiled_node_at(position, compiled, value)?,
++            });
++        }
++        Ok(kernel_semantics::CanonicalEqKey::Map(
++            kernel_semantics::finite_measure_from_atoms(atoms),
++        ))
+     }
+ 
+     fn canonical_compiled_range_at(
+@@ -775,7 +778,6 @@
+         index: usize,
+         compiled: &kernel_semantics::CompiledEquivalence,
+         element: usize,
+-        sort: bool,
+     ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, PhysicalExecutionError> {
+         let (offsets, payload) = match &self.storage {
+             AlgebraicStorage::Seq { offsets, payload }
+@@ -785,12 +787,9 @@
+             _ => return Err(PhysicalExecutionError::PhysicalTypeMismatch),
+         };
+         let (start, end) = range(offsets, index)?;
+-        let mut keys = (start..end)
++        let keys = (start..end)
+             .map(|position| payload.canonical_compiled_node_at(position, compiled, element))
+             .collect::<Result<Vec<_>, _>>()?;
+-        if sort {
+-            keys.sort_unstable();
+-        }
+         Ok(keys)
+     }
+ }
+diff -ruN /mnt/data/cfmd_pass76_work/crates/kernel-plan/src/lib.rs crates/kernel-plan/src/lib.rs
+--- /mnt/data/cfmd_pass76_work/crates/kernel-plan/src/lib.rs	2026-09-21 13:22:50.156527951 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-21 13:59:35.947689578 +0000
+@@ -14470,25 +14470,40 @@
+         CanonicalEqKey::OptionSome(value) | CanonicalEqKey::Variant { value, .. } => {
+             std::mem::size_of::<CanonicalEqKey>().saturating_add(canonical_eq_key_heap_bytes(value))
+         }
+-        CanonicalEqKey::Seq(values) | CanonicalEqKey::Set(values) => values
++        CanonicalEqKey::Seq(values) => values
+             .capacity()
+             .saturating_mul(std::mem::size_of::<CanonicalEqKey>())
+             .saturating_add(saturating_usize_sum(
+                 values.iter().map(canonical_eq_key_heap_bytes),
+             )),
++        CanonicalEqKey::Set(values) => values
++            .capacity()
++            .saturating_mul(std::mem::size_of::<
++                kernel_semantics::FiniteMeasureEntry<CanonicalEqKey>,
++            >())
++            .saturating_add(saturating_usize_sum(
++                values
++                    .iter()
++                    .map(|entry| canonical_eq_key_heap_bytes(&entry.atom)),
++            )),
+         CanonicalEqKey::Bag(values) => values
+             .capacity()
+-            .saturating_mul(std::mem::size_of::<(CanonicalEqKey, u64)>())
++            .saturating_mul(std::mem::size_of::<
++                kernel_semantics::FiniteMeasureEntry<kernel_semantics::CanonicalBagAtom>,
++            >())
+             .saturating_add(saturating_usize_sum(
+                 values
+                     .iter()
+-                    .map(|(value, _)| canonical_eq_key_heap_bytes(value)),
++                    .map(|entry| canonical_eq_key_heap_bytes(&entry.atom.value)),
+             )),
+         CanonicalEqKey::Map(values) => values
+             .capacity()
+-            .saturating_mul(std::mem::size_of::<(CanonicalEqKey, CanonicalEqKey)>())
+-            .saturating_add(saturating_usize_sum(values.iter().map(|(key, value)| {
+-                canonical_eq_key_heap_bytes(key).saturating_add(canonical_eq_key_heap_bytes(value))
++            .saturating_mul(std::mem::size_of::<
++                kernel_semantics::FiniteMeasureEntry<kernel_semantics::CanonicalMapAtom>,
++            >())
++            .saturating_add(saturating_usize_sum(values.iter().map(|entry| {
++                canonical_eq_key_heap_bytes(&entry.atom.key)
++                    .saturating_add(canonical_eq_key_heap_bytes(&entry.atom.value))
+             }))),
+     }
+ }
+diff -ruN /mnt/data/cfmd_pass76_work/crates/kernel-semantic-index/src/lib.rs crates/kernel-semantic-index/src/lib.rs
+--- /mnt/data/cfmd_pass76_work/crates/kernel-semantic-index/src/lib.rs	2026-09-21 01:51:12.000000000 +0000
++++ crates/kernel-semantic-index/src/lib.rs	2026-09-21 14:02:11.085754894 +0000
+@@ -3,7 +3,7 @@
+ use kernel_schema::{ModuleDigest, SemanticContext, StructuralEquivalenceDef};
+ use kernel_types::{SemanticId, SemanticRevision};
+ 
+-pub const KEY_ENCODING_REVISION: u64 = 1;
++pub const KEY_ENCODING_REVISION: u64 = 2;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum SemanticIndexCompatibility {
+@@ -432,6 +432,15 @@
+             )
+             .compatibility(&context, &[dependency]),
+             SemanticIndexCompatibility::RebuildKeyEncoding
++        );
++        assert_eq!(
++            SemanticIndexBinding::from_persisted(
++                context.revision(),
++                vec![dependency],
++                KEY_ENCODING_REVISION - 1,
++            )
++            .compatibility(&context, &[dependency]),
++            SemanticIndexCompatibility::RebuildKeyEncoding
+         );
+     }
+ 
+diff -ruN /mnt/data/cfmd_pass76_work/crates/kernel-semantics/src/anchor_pullback.rs crates/kernel-semantics/src/anchor_pullback.rs
+--- /mnt/data/cfmd_pass76_work/crates/kernel-semantics/src/anchor_pullback.rs	1970-01-01 00:00:00.000000000 +0000
++++ crates/kernel-semantics/src/anchor_pullback.rs	2026-09-21 14:30:26.616882258 +0000
+@@ -0,0 +1,1168 @@
++use std::collections::{BTreeMap, BTreeSet, VecDeque};
++
++use kernel_types::{EqClassId, RevisionObservableId, SemanticRevision};
++
++use crate::observable::{CertifiedSemanticMorphism, ObservableError, RevisionObservableCatalog};
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum AnchorPullbackError {
++    Observable(ObservableError),
++    DuplicateCoordinate(RevisionObservableId),
++    UnknownCoordinate(RevisionObservableId),
++    TupleArityMismatch {
++        expected: usize,
++        actual: usize,
++    },
++    WeightOverflow,
++    MorphismRevisionMismatch,
++    MorphismCatalogMismatch,
++    UndefinedMorphismSource {
++        morphism_index: usize,
++        source: Vec<EqClassId>,
++    },
++    ConflictingAssignment {
++        observable: RevisionObservableId,
++        existing: EqClassId,
++        proposed: EqClassId,
++    },
++}
++
++impl From<ObservableError> for AnchorPullbackError {
++    fn from(value: ObservableError) -> Self {
++        Self::Observable(value)
++    }
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct DeterminantClosureStats {
++    pub incidence_updates: usize,
++    pub target_attempts: usize,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++struct DeterminantRule {
++    source: BTreeSet<RevisionObservableId>,
++    target: BTreeSet<RevisionObservableId>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DeterminantTheory {
++    revision: SemanticRevision,
++    catalog_instance: u64,
++    coordinate_order: Vec<RevisionObservableId>,
++    coordinates: BTreeSet<RevisionObservableId>,
++    morphisms: Vec<CertifiedSemanticMorphism>,
++    rules: Vec<DeterminantRule>,
++    dependents: BTreeMap<RevisionObservableId, Vec<usize>>,
++}
++
++impl DeterminantTheory {
++    pub fn new(
++        catalog: &RevisionObservableCatalog,
++        coordinates: impl IntoIterator<Item = RevisionObservableId>,
++        morphisms: Vec<CertifiedSemanticMorphism>,
++    ) -> Result<Self, AnchorPullbackError> {
++        let mut coordinate_order = Vec::new();
++        let mut coordinate_set = BTreeSet::new();
++        for coordinate in coordinates {
++            if coordinate_set.insert(coordinate) {
++                coordinate_order.push(coordinate);
++            }
++        }
++        for coordinate in &coordinate_set {
++            catalog.definition(*coordinate)?;
++        }
++
++        let mut rules = Vec::with_capacity(morphisms.len());
++        for morphism in &morphisms {
++            if morphism.revision() != catalog.revision() {
++                return Err(AnchorPullbackError::MorphismRevisionMismatch);
++            }
++            if morphism.catalog_instance() != catalog.catalog_instance() {
++                return Err(AnchorPullbackError::MorphismCatalogMismatch);
++            }
++            let source = morphism.source().iter().copied().collect::<BTreeSet<_>>();
++            let target = morphism.target().iter().copied().collect::<BTreeSet<_>>();
++            for coordinate in source.iter().chain(&target) {
++                if !coordinate_set.contains(coordinate) {
++                    return Err(AnchorPullbackError::UnknownCoordinate(*coordinate));
++                }
++            }
++            if !target.is_subset(&source) {
++                rules.push(DeterminantRule { source, target });
++            }
++        }
++        rules.sort();
++        rules.dedup();
++
++        let mut dependents = BTreeMap::<RevisionObservableId, Vec<usize>>::new();
++        for (rule_index, rule) in rules.iter().enumerate() {
++            for source in &rule.source {
++                dependents.entry(*source).or_default().push(rule_index);
++            }
++        }
++
++        Ok(Self {
++            revision: catalog.revision(),
++            catalog_instance: catalog.catalog_instance(),
++            coordinate_order,
++            coordinates: coordinate_set,
++            morphisms,
++            rules,
++            dependents,
++        })
++    }
++
++    #[must_use]
++    pub const fn revision(&self) -> SemanticRevision {
++        self.revision
++    }
++
++    #[must_use]
++    pub fn coordinates(&self) -> &BTreeSet<RevisionObservableId> {
++        &self.coordinates
++    }
++
++    #[must_use]
++    pub fn coordinate_order(&self) -> &[RevisionObservableId] {
++        &self.coordinate_order
++    }
++
++    #[must_use]
++    pub fn morphisms(&self) -> &[CertifiedSemanticMorphism] {
++        &self.morphisms
++    }
++
++    pub fn closure(
++        &self,
++        seed: &BTreeSet<RevisionObservableId>,
++    ) -> Result<BTreeSet<RevisionObservableId>, AnchorPullbackError> {
++        self.closure_with_stats(seed).map(|(closure, _)| closure)
++    }
++
++    pub fn closure_with_stats(
++        &self,
++        seed: &BTreeSet<RevisionObservableId>,
++    ) -> Result<(BTreeSet<RevisionObservableId>, DeterminantClosureStats), AnchorPullbackError>
++    {
++        self.validate_coordinate_set(seed)?;
++        let mut known = seed.clone();
++        let mut remaining = Vec::with_capacity(self.rules.len());
++        let mut fired = vec![false; self.rules.len()];
++        let mut queue = VecDeque::new();
++        let mut stats = DeterminantClosureStats::default();
++
++        for rule in &self.rules {
++            remaining.push(
++                rule.source
++                    .iter()
++                    .filter(|coord| !known.contains(coord))
++                    .count(),
++            );
++        }
++
++        for (rule_index, rule) in self.rules.iter().enumerate() {
++            if remaining[rule_index] == 0 {
++                fired[rule_index] = true;
++                for target in &rule.target {
++                    stats.target_attempts = stats.target_attempts.saturating_add(1);
++                    if known.insert(*target) {
++                        queue.push_back(*target);
++                    }
++                }
++            }
++        }
++
++        while let Some(coordinate) = queue.pop_front() {
++            let Some(rule_ids) = self.dependents.get(&coordinate) else {
++                continue;
++            };
++            for &rule_index in rule_ids {
++                if fired[rule_index] || remaining[rule_index] == 0 {
++                    continue;
++                }
++                stats.incidence_updates = stats.incidence_updates.saturating_add(1);
++                remaining[rule_index] -= 1;
++                if remaining[rule_index] == 0 {
++                    fired[rule_index] = true;
++                    for target in &self.rules[rule_index].target {
++                        stats.target_attempts = stats.target_attempts.saturating_add(1);
++                        if known.insert(*target) {
++                            queue.push_back(*target);
++                        }
++                    }
++                }
++            }
++        }
++
++        Ok((known, stats))
++    }
++
++    pub fn stable_inclusion_minimal_generator(
++        &self,
++    ) -> Result<BTreeSet<RevisionObservableId>, AnchorPullbackError> {
++        let mut basis = self.coordinates.clone();
++        for coordinate in self.coordinate_order.iter().rev() {
++            let mut trial = basis.clone();
++            trial.remove(coordinate);
++            if self.closure(&trial)?.is_superset(&self.coordinates) {
++                basis = trial;
++            }
++        }
++        Ok(basis)
++    }
++
++    pub fn saturate_assignment(
++        &self,
++        catalog: &RevisionObservableCatalog,
++        seed: &BTreeMap<RevisionObservableId, EqClassId>,
++    ) -> Result<BTreeMap<RevisionObservableId, EqClassId>, AnchorPullbackError> {
++        self.ensure_catalog(catalog)?;
++        let mut assignment = seed.clone();
++        for (&observable, &class) in &assignment {
++            if !self.coordinates.contains(&observable) {
++                return Err(AnchorPullbackError::UnknownCoordinate(observable));
++            }
++            let record = catalog.class_record(class)?;
++            if record.observable != observable {
++                return Err(ObservableError::ForeignEqClass {
++                    class,
++                    expected: observable,
++                    actual: record.observable,
++                }
++                .into());
++            }
++        }
++
++        let mut remaining = Vec::with_capacity(self.morphisms.len());
++        let mut dependents = BTreeMap::<RevisionObservableId, Vec<usize>>::new();
++        let mut fired = vec![false; self.morphisms.len()];
++        let mut queue = VecDeque::new();
++
++        for (index, morphism) in self.morphisms.iter().enumerate() {
++            let unique_source = morphism.source().iter().copied().collect::<BTreeSet<_>>();
++            let missing = unique_source
++                .iter()
++                .filter(|coord| !assignment.contains_key(coord))
++                .count();
++            remaining.push(missing);
++            for coordinate in unique_source {
++                dependents.entry(coordinate).or_default().push(index);
++            }
++        }
++
++        for index in 0..self.morphisms.len() {
++            if remaining[index] == 0 {
++                fired[index] = true;
++                fire_morphism(index, &self.morphisms[index], &mut assignment, &mut queue)?;
++            }
++        }
++
++        while let Some(coordinate) = queue.pop_front() {
++            let Some(rule_ids) = dependents.get(&coordinate) else {
++                continue;
++            };
++            for &index in rule_ids {
++                if fired[index] || remaining[index] == 0 {
++                    continue;
++                }
++                remaining[index] -= 1;
++                if remaining[index] == 0 {
++                    fired[index] = true;
++                    fire_morphism(index, &self.morphisms[index], &mut assignment, &mut queue)?;
++                }
++            }
++        }
++
++        Ok(assignment)
++    }
++
++    fn validate_coordinate_set(
++        &self,
++        coordinates: &BTreeSet<RevisionObservableId>,
++    ) -> Result<(), AnchorPullbackError> {
++        if let Some(unknown) = coordinates
++            .iter()
++            .find(|coordinate| !self.coordinates.contains(coordinate))
++        {
++            return Err(AnchorPullbackError::UnknownCoordinate(*unknown));
++        }
++        Ok(())
++    }
++
++    fn ensure_catalog(
++        &self,
++        catalog: &RevisionObservableCatalog,
++    ) -> Result<(), AnchorPullbackError> {
++        if self.revision != catalog.revision() {
++            return Err(AnchorPullbackError::MorphismRevisionMismatch);
++        }
++        if self.catalog_instance != catalog.catalog_instance() {
++            return Err(AnchorPullbackError::MorphismCatalogMismatch);
++        }
++        Ok(())
++    }
++}
++
++fn fire_morphism(
++    morphism_index: usize,
++    morphism: &CertifiedSemanticMorphism,
++    assignment: &mut BTreeMap<RevisionObservableId, EqClassId>,
++    queue: &mut VecDeque<RevisionObservableId>,
++) -> Result<(), AnchorPullbackError> {
++    let source = morphism
++        .source()
++        .iter()
++        .map(|observable| assignment[observable])
++        .collect::<Vec<_>>();
++    let Some(target) = morphism.image(&source) else {
++        return Err(AnchorPullbackError::UndefinedMorphismSource {
++            morphism_index,
++            source,
++        });
++    };
++    for (&observable, &class) in morphism.target().iter().zip(target) {
++        match assignment.get(&observable).copied() {
++            Some(existing) if existing != class => {
++                return Err(AnchorPullbackError::ConflictingAssignment {
++                    observable,
++                    existing,
++                    proposed: class,
++                });
++            }
++            Some(_) => {}
++            None => {
++                assignment.insert(observable, class);
++                queue.push_back(observable);
++            }
++        }
++    }
++    Ok(())
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RevisionFiniteMeasure {
++    revision: SemanticRevision,
++    catalog_instance: u64,
++    coordinates: Vec<RevisionObservableId>,
++    rows: BTreeMap<Vec<EqClassId>, u64>,
++}
++
++impl RevisionFiniteMeasure {
++    pub fn new(
++        catalog: &RevisionObservableCatalog,
++        coordinates: Vec<RevisionObservableId>,
++        rows: impl IntoIterator<Item = (Vec<EqClassId>, u64)>,
++    ) -> Result<Self, AnchorPullbackError> {
++        let mut seen = BTreeSet::new();
++        for coordinate in &coordinates {
++            catalog.definition(*coordinate)?;
++            if !seen.insert(*coordinate) {
++                return Err(AnchorPullbackError::DuplicateCoordinate(*coordinate));
++            }
++        }
++
++        let mut merged = BTreeMap::<Vec<EqClassId>, u64>::new();
++        for (tuple, weight) in rows {
++            if tuple.len() != coordinates.len() {
++                return Err(AnchorPullbackError::TupleArityMismatch {
++                    expected: coordinates.len(),
++                    actual: tuple.len(),
++                });
++            }
++            for (&coordinate, &class) in coordinates.iter().zip(&tuple) {
++                let record = catalog.class_record(class)?;
++                if record.observable != coordinate {
++                    return Err(ObservableError::ForeignEqClass {
++                        class,
++                        expected: coordinate,
++                        actual: record.observable,
++                    }
++                    .into());
++                }
++            }
++            if weight == 0 {
++                continue;
++            }
++            let entry = merged.entry(tuple).or_default();
++            *entry = entry
++                .checked_add(weight)
++                .ok_or(AnchorPullbackError::WeightOverflow)?;
++        }
++
++        Ok(Self {
++            revision: catalog.revision(),
++            catalog_instance: catalog.catalog_instance(),
++            coordinates,
++            rows: merged,
++        })
++    }
++
++    #[must_use]
++    pub const fn revision(&self) -> SemanticRevision {
++        self.revision
++    }
++
++    #[must_use]
++    pub fn coordinates(&self) -> &[RevisionObservableId] {
++        &self.coordinates
++    }
++
++    #[must_use]
++    pub fn rows(&self) -> &BTreeMap<Vec<EqClassId>, u64> {
++        &self.rows
++    }
++
++    pub fn stable_anchor_basis(
++        &self,
++    ) -> Result<BTreeSet<RevisionObservableId>, AnchorPullbackError> {
++        let all = self.coordinates.iter().copied().collect::<BTreeSet<_>>();
++        let mut basis = all.clone();
++        for coordinate in self.coordinates.iter().rev() {
++            let mut trial = basis.clone();
++            trial.remove(coordinate);
++            if self.projection_is_injective(&trial)? {
++                basis = trial;
++            }
++        }
++        Ok(basis)
++    }
++
++    pub fn determinant_morphism(
++        &self,
++        catalog: &RevisionObservableCatalog,
++        source: Vec<RevisionObservableId>,
++        target: Vec<RevisionObservableId>,
++    ) -> Result<Option<CertifiedSemanticMorphism>, AnchorPullbackError> {
++        self.ensure_catalog(catalog)?;
++        let source_positions = self.ordered_positions(&source)?;
++        let target_positions = self.ordered_positions(&target)?;
++        let mut mapping = BTreeMap::<Vec<EqClassId>, Vec<EqClassId>>::new();
++        for tuple in self.rows.keys() {
++            let source_key = source_positions
++                .iter()
++                .map(|&position| tuple[position])
++                .collect::<Vec<_>>();
++            let target_value = target_positions
++                .iter()
++                .map(|&position| tuple[position])
++                .collect::<Vec<_>>();
++            if let Some(previous) = mapping.insert(source_key, target_value.clone())
++                && previous != target_value
++            {
++                return Ok(None);
++            }
++        }
++        CertifiedSemanticMorphism::from_revision_observations(catalog, source, target, mapping)
++            .map(Some)
++            .map_err(Into::into)
++    }
++
++    pub fn anchor_factorization(
++        &self,
++        catalog: &RevisionObservableCatalog,
++    ) -> Result<AnchorMeasureState, AnchorPullbackError> {
++        self.ensure_catalog(catalog)?;
++        let basis_set = self.stable_anchor_basis()?;
++        let basis = self
++            .coordinates
++            .iter()
++            .copied()
++            .filter(|coordinate| basis_set.contains(coordinate))
++            .collect::<Vec<_>>();
++        let target = self
++            .coordinates
++            .iter()
++            .copied()
++            .filter(|coordinate| !basis_set.contains(coordinate))
++            .collect::<Vec<_>>();
++        let basis_positions = self.positions(&basis_set)?;
++        let target_set = target.iter().copied().collect::<BTreeSet<_>>();
++        let target_positions = self.positions(&target_set)?;
++
++        let mut measure = BTreeMap::new();
++        for (tuple, weight) in &self.rows {
++            let anchor = basis_positions
++                .iter()
++                .map(|&position| tuple[position])
++                .collect::<Vec<_>>();
++            let reconstruction = target_positions
++                .iter()
++                .map(|&position| tuple[position])
++                .collect::<Vec<_>>();
++            let previous = measure.insert(
++                anchor,
++                AnchorMeasureEntry {
++                    reconstruction,
++                    weight: *weight,
++                },
++            );
++            debug_assert!(previous.is_none());
++        }
++
++        Ok(AnchorMeasureState {
++            revision: self.revision,
++            catalog_instance: self.catalog_instance,
++            coordinates: self.coordinates.clone(),
++            basis,
++            target,
++            measure,
++        })
++    }
++
++    fn projection_is_injective(
++        &self,
++        subset: &BTreeSet<RevisionObservableId>,
++    ) -> Result<bool, AnchorPullbackError> {
++        let positions = self.positions(subset)?;
++        let mut projections = BTreeSet::new();
++        for tuple in self.rows.keys() {
++            let projection = positions
++                .iter()
++                .map(|&position| tuple[position])
++                .collect::<Vec<_>>();
++            if !projections.insert(projection) {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
++    fn positions(
++        &self,
++        subset: &BTreeSet<RevisionObservableId>,
++    ) -> Result<Vec<usize>, AnchorPullbackError> {
++        if let Some(unknown) = subset
++            .iter()
++            .find(|coordinate| !self.coordinates.contains(coordinate))
++        {
++            return Err(AnchorPullbackError::UnknownCoordinate(*unknown));
++        }
++        Ok(self
++            .coordinates
++            .iter()
++            .enumerate()
++            .filter_map(|(position, coordinate)| subset.contains(coordinate).then_some(position))
++            .collect())
++    }
++
++    fn ordered_positions(
++        &self,
++        observables: &[RevisionObservableId],
++    ) -> Result<Vec<usize>, AnchorPullbackError> {
++        let mut seen = BTreeSet::new();
++        observables
++            .iter()
++            .map(|observable| {
++                if !seen.insert(*observable) {
++                    return Err(AnchorPullbackError::DuplicateCoordinate(*observable));
++                }
++                self.coordinates
++                    .iter()
++                    .position(|candidate| candidate == observable)
++                    .ok_or(AnchorPullbackError::UnknownCoordinate(*observable))
++            })
++            .collect()
++    }
++
++    fn ensure_catalog(
++        &self,
++        catalog: &RevisionObservableCatalog,
++    ) -> Result<(), AnchorPullbackError> {
++        if self.revision != catalog.revision() {
++            return Err(AnchorPullbackError::MorphismRevisionMismatch);
++        }
++        if self.catalog_instance != catalog.catalog_instance() {
++            return Err(AnchorPullbackError::MorphismCatalogMismatch);
++        }
++        Ok(())
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AnchorMeasureEntry {
++    pub reconstruction: Vec<EqClassId>,
++    pub weight: u64,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AnchorMeasureState {
++    revision: SemanticRevision,
++    catalog_instance: u64,
++    coordinates: Vec<RevisionObservableId>,
++    basis: Vec<RevisionObservableId>,
++    target: Vec<RevisionObservableId>,
++    measure: BTreeMap<Vec<EqClassId>, AnchorMeasureEntry>,
++}
++
++impl AnchorMeasureState {
++    #[must_use]
++    pub const fn revision(&self) -> SemanticRevision {
++        self.revision
++    }
++
++    #[must_use]
++    pub fn coordinates(&self) -> &[RevisionObservableId] {
++        &self.coordinates
++    }
++
++    #[must_use]
++    pub fn basis(&self) -> &[RevisionObservableId] {
++        &self.basis
++    }
++
++    #[must_use]
++    pub fn target(&self) -> &[RevisionObservableId] {
++        &self.target
++    }
++
++    #[must_use]
++    pub fn measure(&self) -> &BTreeMap<Vec<EqClassId>, AnchorMeasureEntry> {
++        &self.measure
++    }
++
++    pub fn reconstruction_morphism(
++        &self,
++        catalog: &RevisionObservableCatalog,
++    ) -> Result<CertifiedSemanticMorphism, AnchorPullbackError> {
++        self.ensure_catalog(catalog)?;
++        CertifiedSemanticMorphism::from_anchor_reconstruction(
++            catalog,
++            self.basis.clone(),
++            self.target.clone(),
++            self.measure
++                .iter()
++                .map(|(basis, entry)| (basis.clone(), entry.reconstruction.clone())),
++        )
++        .map_err(Into::into)
++    }
++
++    #[must_use]
++    pub fn reconstructed_measure(&self) -> BTreeMap<Vec<EqClassId>, u64> {
++        let basis_positions = self
++            .coordinates
++            .iter()
++            .enumerate()
++            .filter_map(|(position, coordinate)| {
++                self.basis.contains(coordinate).then_some(position)
++            })
++            .collect::<Vec<_>>();
++        let target_positions = self
++            .coordinates
++            .iter()
++            .enumerate()
++            .filter_map(|(position, coordinate)| {
++                self.target.contains(coordinate).then_some(position)
++            })
++            .collect::<Vec<_>>();
++        let mut rows = BTreeMap::new();
++        for (basis, entry) in &self.measure {
++            let mut row = vec![EqClassId::default(); self.coordinates.len()];
++            for (&position, &class) in basis_positions.iter().zip(basis) {
++                row[position] = class;
++            }
++            for (&position, &class) in target_positions.iter().zip(&entry.reconstruction) {
++                row[position] = class;
++            }
++            rows.insert(row, entry.weight);
++        }
++        rows
++    }
++
++    fn ensure_catalog(
++        &self,
++        catalog: &RevisionObservableCatalog,
++    ) -> Result<(), AnchorPullbackError> {
++        if self.revision != catalog.revision() {
++            return Err(AnchorPullbackError::MorphismRevisionMismatch);
++        }
++        if self.catalog_instance != catalog.catalog_instance() {
++            return Err(AnchorPullbackError::MorphismCatalogMismatch);
++        }
++        Ok(())
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DeterminantBranchFreeCertificate {
++    anchor_index: usize,
++    seed: BTreeSet<RevisionObservableId>,
++    closure: BTreeSet<RevisionObservableId>,
++}
++
++impl DeterminantBranchFreeCertificate {
++    #[must_use]
++    pub const fn anchor_index(&self) -> usize {
++        self.anchor_index
++    }
++
++    #[must_use]
++    pub fn seed(&self) -> &BTreeSet<RevisionObservableId> {
++        &self.seed
++    }
++
++    #[must_use]
++    pub fn closure(&self) -> &BTreeSet<RevisionObservableId> {
++        &self.closure
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AnchorPullbackNormalForm {
++    revision: SemanticRevision,
++    catalog_instance: u64,
++    anchors: Vec<AnchorMeasureState>,
++    determinant_theory: DeterminantTheory,
++    output_observables: Vec<RevisionObservableId>,
++}
++
++impl AnchorPullbackNormalForm {
++    pub fn new(
++        catalog: &RevisionObservableCatalog,
++        factors: Vec<RevisionFiniteMeasure>,
++        certified_morphisms: Vec<CertifiedSemanticMorphism>,
++        output_observables: Vec<RevisionObservableId>,
++    ) -> Result<Self, AnchorPullbackError> {
++        for output in &output_observables {
++            catalog.definition(*output)?;
++        }
++
++        let mut anchors = Vec::with_capacity(factors.len());
++        let mut coordinate_order = Vec::new();
++        let mut seen_coordinates = BTreeSet::new();
++        for output in &output_observables {
++            if seen_coordinates.insert(*output) {
++                coordinate_order.push(*output);
++            }
++        }
++        let mut morphisms = certified_morphisms;
++
++        for factor in factors {
++            factor.ensure_catalog(catalog)?;
++            for coordinate in factor.coordinates() {
++                if seen_coordinates.insert(*coordinate) {
++                    coordinate_order.push(*coordinate);
++                }
++            }
++            let anchor = factor.anchor_factorization(catalog)?;
++            morphisms.push(anchor.reconstruction_morphism(catalog)?);
++            anchors.push(anchor);
++        }
++        for morphism in &morphisms {
++            for coordinate in morphism.source().iter().chain(morphism.target()) {
++                if seen_coordinates.insert(*coordinate) {
++                    coordinate_order.push(*coordinate);
++                }
++            }
++        }
++
++        let determinant_theory = DeterminantTheory::new(catalog, coordinate_order, morphisms)?;
++        Ok(Self {
++            revision: catalog.revision(),
++            catalog_instance: catalog.catalog_instance(),
++            anchors,
++            determinant_theory,
++            output_observables,
++        })
++    }
++
++    #[must_use]
++    pub const fn revision(&self) -> SemanticRevision {
++        self.revision
++    }
++
++    #[must_use]
++    pub fn anchors(&self) -> &[AnchorMeasureState] {
++        &self.anchors
++    }
++
++    #[must_use]
++    pub const fn determinant_theory(&self) -> &DeterminantTheory {
++        &self.determinant_theory
++    }
++
++    #[must_use]
++    pub fn output_observables(&self) -> &[RevisionObservableId] {
++        &self.output_observables
++    }
++
++    pub fn branch_free_from_anchor(
++        &self,
++        anchor_index: usize,
++    ) -> Result<Option<DeterminantBranchFreeCertificate>, AnchorPullbackError> {
++        let Some(anchor) = self.anchors.get(anchor_index) else {
++            return Ok(None);
++        };
++        let seed = anchor.basis.iter().copied().collect::<BTreeSet<_>>();
++        let closure = self.determinant_theory.closure(&seed)?;
++        if closure.is_superset(self.determinant_theory.coordinates()) {
++            Ok(Some(DeterminantBranchFreeCertificate {
++                anchor_index,
++                seed,
++                closure,
++            }))
++        } else {
++            Ok(None)
++        }
++    }
++
++    pub fn ensure_catalog(
++        &self,
++        catalog: &RevisionObservableCatalog,
++    ) -> Result<(), AnchorPullbackError> {
++        if self.revision != catalog.revision() {
++            return Err(AnchorPullbackError::MorphismRevisionMismatch);
++        }
++        if self.catalog_instance != catalog.catalog_instance() {
++            return Err(AnchorPullbackError::MorphismCatalogMismatch);
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use kernel_model::Value;
++    use kernel_schema::{Schema, SemanticContext, SemanticEnvironment};
++    use kernel_types::{SchemaRevisionId, SemanticEnvId, SemanticId};
++
++    use super::*;
++    use crate::observable::SemanticMorphismCertificate;
++    use crate::{EquivalenceModule, SemanticRegistry};
++
++    fn fixture(count: usize) -> (SemanticContext, SemanticRegistry, Vec<SemanticId>) {
++        let ids = (0..count)
++            .map(|index| SemanticId::new(90_000 + index as u128))
++            .collect::<Vec<_>>();
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(90_000));
++        for id in &ids {
++            environment.pin_module(*id, digest);
++        }
++        (
++            SemanticContext {
++                schema: Schema::new(SchemaRevisionId::new(90_000)),
++                environment,
++            },
++            registry,
++            ids,
++        )
++    }
++
++    fn observables(
++        count: usize,
++    ) -> (
++        SemanticContext,
++        SemanticRegistry,
++        RevisionObservableCatalog,
++        Vec<RevisionObservableId>,
++    ) {
++        let (context, registry, ids) = fixture(count);
++        let mut catalog = RevisionObservableCatalog::new(&context).unwrap();
++        let observables = ids
++            .into_iter()
++            .map(|id| {
++                catalog
++                    .register_equivalence(&registry, &context, id)
++                    .unwrap()
++            })
++            .collect();
++        (context, registry, catalog, observables)
++    }
++
++    fn class(
++        catalog: &mut RevisionObservableCatalog,
++        registry: &SemanticRegistry,
++        context: &SemanticContext,
++        observable: RevisionObservableId,
++        value: i64,
++    ) -> EqClassId {
++        catalog
++            .observe_value(registry, context, observable, &Value::I64(value))
++            .unwrap()
++    }
++
++    #[test]
++    fn determinant_closure_handles_true_hypercycle_without_unary_scc_assumption() {
++        let (context, registry, mut catalog, obs) = observables(3);
++        let [a, b, c] = obs.as_slice() else {
++            unreachable!()
++        };
++        let a1 = class(&mut catalog, &registry, &context, *a, 1);
++        let b1 = class(&mut catalog, &registry, &context, *b, 2);
++        let c1 = class(&mut catalog, &registry, &context, *c, 3);
++
++        let rules = vec![
++            CertifiedSemanticMorphism::from_revision_observations(
++                &catalog,
++                vec![*a, *b],
++                vec![*c],
++                [(vec![a1, b1], vec![c1])],
++            )
++            .unwrap(),
++            CertifiedSemanticMorphism::from_revision_observations(
++                &catalog,
++                vec![*a, *c],
++                vec![*b],
++                [(vec![a1, c1], vec![b1])],
++            )
++            .unwrap(),
++            CertifiedSemanticMorphism::from_revision_observations(
++                &catalog,
++                vec![*b, *c],
++                vec![*a],
++                [(vec![b1, c1], vec![a1])],
++            )
++            .unwrap(),
++        ];
++        let theory = DeterminantTheory::new(&catalog, obs.clone(), rules).unwrap();
++        let basis = theory.stable_inclusion_minimal_generator().unwrap();
++        assert_eq!(basis.len(), 2);
++        assert_eq!(theory.closure(&basis).unwrap(), obs.into_iter().collect());
++        for coordinate in &basis {
++            let mut strict = basis.clone();
++            strict.remove(coordinate);
++            assert_ne!(theory.closure(&strict).unwrap(), *theory.coordinates());
++        }
++    }
++
++    #[test]
++    fn closure_worklist_scales_with_incidence_not_rule_scan_rounds() {
++        let (context, registry, mut catalog, obs) = observables(128);
++        let mut classes = Vec::new();
++        for (index, observable) in obs.iter().enumerate() {
++            classes.push(class(
++                &mut catalog,
++                &registry,
++                &context,
++                *observable,
++                i64::try_from(index).unwrap(),
++            ));
++        }
++        let rules = (0..127)
++            .rev()
++            .map(|index| {
++                CertifiedSemanticMorphism::from_revision_observations(
++                    &catalog,
++                    vec![obs[index]],
++                    vec![obs[index + 1]],
++                    [(vec![classes[index]], vec![classes[index + 1]])],
++                )
++                .unwrap()
++            })
++            .collect();
++        let theory = DeterminantTheory::new(&catalog, obs.clone(), rules).unwrap();
++        let seed = BTreeSet::from([obs[0]]);
++        let (closure, stats) = theory.closure_with_stats(&seed).unwrap();
++        assert_eq!(closure.len(), 128);
++        assert_eq!(stats.incidence_updates, 126);
++        assert_eq!(stats.target_attempts, 127);
++    }
++
++    #[test]
++    fn weighted_anchor_factorization_is_lossless_and_inclusion_minimal() {
++        let (context, registry, mut catalog, obs) = observables(3);
++        let [a, b, c] = obs.as_slice() else {
++            unreachable!()
++        };
++        let rows = [
++            (
++                vec![
++                    class(&mut catalog, &registry, &context, *a, 1),
++                    class(&mut catalog, &registry, &context, *b, 10),
++                    class(&mut catalog, &registry, &context, *c, 100),
++                ],
++                2,
++            ),
++            (
++                vec![
++                    class(&mut catalog, &registry, &context, *a, 2),
++                    class(&mut catalog, &registry, &context, *b, 10),
++                    class(&mut catalog, &registry, &context, *c, 200),
++                ],
++                5,
++            ),
++        ];
++        let factor = RevisionFiniteMeasure::new(&catalog, obs.clone(), rows.clone()).unwrap();
++        let anchor = factor.anchor_factorization(&catalog).unwrap();
++        assert_eq!(anchor.reconstructed_measure(), BTreeMap::from(rows));
++        let basis = anchor.basis().iter().copied().collect::<BTreeSet<_>>();
++        for coordinate in &basis {
++            let mut strict = basis.clone();
++            strict.remove(coordinate);
++            assert!(!factor.projection_is_injective(&strict).unwrap());
++        }
++        assert!(matches!(
++            anchor
++                .reconstruction_morphism(&catalog)
++                .unwrap()
++                .certificate(),
++            SemanticMorphismCertificate::AnchorReconstruction
++        ));
++    }
++
++    #[test]
++    fn finite_factor_derives_ordered_hyper_determinant_morphism_without_unary_special_case() {
++        let (context, registry, mut catalog, obs) = observables(4);
++        let [a, b, c, d] = obs.as_slice() else {
++            unreachable!()
++        };
++        let rows = [
++            vec![
++                class(&mut catalog, &registry, &context, *a, 1),
++                class(&mut catalog, &registry, &context, *b, 2),
++                class(&mut catalog, &registry, &context, *c, 3),
++                class(&mut catalog, &registry, &context, *d, 4),
++            ],
++            vec![
++                class(&mut catalog, &registry, &context, *a, 5),
++                class(&mut catalog, &registry, &context, *b, 6),
++                class(&mut catalog, &registry, &context, *c, 7),
++                class(&mut catalog, &registry, &context, *d, 8),
++            ],
++        ];
++        let factor = RevisionFiniteMeasure::new(
++            &catalog,
++            obs.clone(),
++            rows.iter().cloned().map(|row| (row, 1)),
++        )
++        .unwrap();
++        let morphism = factor
++            .determinant_morphism(&catalog, vec![*b, *a], vec![*d, *c])
++            .unwrap()
++            .unwrap();
++        assert_eq!(
++            morphism.image(&[rows[0][1], rows[0][0]]),
++            Some([rows[0][3], rows[0][2]].as_slice())
++        );
++        assert_eq!(morphism.source(), &[*b, *a]);
++        assert_eq!(morphism.target(), &[*d, *c]);
++    }
++
++    #[test]
++    fn finite_factor_rejects_non_functional_projection_and_preserves_duplicate_weight() {
++        let (context, registry, mut catalog, obs) = observables(2);
++        let [a, b] = obs.as_slice() else {
++            unreachable!()
++        };
++        let a1 = class(&mut catalog, &registry, &context, *a, 1);
++        let b1 = class(&mut catalog, &registry, &context, *b, 10);
++        let b2 = class(&mut catalog, &registry, &context, *b, 20);
++        let factor = RevisionFiniteMeasure::new(
++            &catalog,
++            obs.clone(),
++            [(vec![a1, b1], 2), (vec![a1, b1], 3), (vec![a1, b2], 7)],
++        )
++        .unwrap();
++        assert_eq!(factor.rows().get(&vec![a1, b1]), Some(&5));
++        assert!(
++            factor
++                .determinant_morphism(&catalog, vec![*a], vec![*b])
++                .unwrap()
++                .is_none()
++        );
++        let anchor = factor.anchor_factorization(&catalog).unwrap();
++        assert_eq!(anchor.reconstructed_measure(), factor.rows().clone());
++    }
++
++    #[test]
++    fn apnf_is_bound_to_one_observable_catalog_realization() {
++        let (context, registry, mut catalog, obs) = observables(1);
++        let [a] = obs.as_slice() else { unreachable!() };
++        let a1 = class(&mut catalog, &registry, &context, *a, 1);
++        let factor = RevisionFiniteMeasure::new(&catalog, vec![*a], [(vec![a1], 1)]).unwrap();
++        let apnf =
++            AnchorPullbackNormalForm::new(&catalog, vec![factor], Vec::new(), vec![*a]).unwrap();
++
++        let foreign = RevisionObservableCatalog::new(&context).unwrap();
++        assert_eq!(
++            apnf.ensure_catalog(&foreign),
++            Err(AnchorPullbackError::MorphismCatalogMismatch)
++        );
++    }
++
++    #[test]
++    fn value_saturation_is_confluent_and_rejects_conflicting_exact_images() {
++        let (context, registry, mut catalog, obs) = observables(3);
++        let [a, b, c] = obs.as_slice() else {
++            unreachable!()
++        };
++        let a1 = class(&mut catalog, &registry, &context, *a, 1);
++        let b1 = class(&mut catalog, &registry, &context, *b, 2);
++        let c1 = class(&mut catalog, &registry, &context, *c, 3);
++        let c2 = class(&mut catalog, &registry, &context, *c, 4);
++        let ab = CertifiedSemanticMorphism::from_revision_observations(
++            &catalog,
++            vec![*a],
++            vec![*b],
++            [(vec![a1], vec![b1])],
++        )
++        .unwrap();
++        let bc = CertifiedSemanticMorphism::from_revision_observations(
++            &catalog,
++            vec![*b],
++            vec![*c],
++            [(vec![b1], vec![c1])],
++        )
++        .unwrap();
++        let theory = DeterminantTheory::new(&catalog, obs.clone(), vec![bc, ab]).unwrap();
++        let saturated = theory
++            .saturate_assignment(&catalog, &BTreeMap::from([(*a, a1)]))
++            .unwrap();
++        assert_eq!(saturated.get(c), Some(&c1));
++        assert_eq!(
++            theory.saturate_assignment(&catalog, &BTreeMap::from([(*a, a1), (*c, c2)])),
++            Err(AnchorPullbackError::ConflictingAssignment {
++                observable: *c,
++                existing: c2,
++                proposed: c1,
++            })
++        );
++    }
++
++    #[test]
++    fn apnf_keeps_redundant_direct_morphism_and_can_prove_branch_free_anchor() {
++        let (context, registry, mut catalog, obs) = observables(3);
++        let [a, b, c] = obs.as_slice() else {
++            unreachable!()
++        };
++        let a1 = class(&mut catalog, &registry, &context, *a, 1);
++        let b1 = class(&mut catalog, &registry, &context, *b, 2);
++        let c1 = class(&mut catalog, &registry, &context, *c, 3);
++        let factor = RevisionFiniteMeasure::new(&catalog, vec![*a], [(vec![a1], 1)]).unwrap();
++        let morphisms = vec![
++            CertifiedSemanticMorphism::from_revision_observations(
++                &catalog,
++                vec![*a],
++                vec![*b],
++                [(vec![a1], vec![b1])],
++            )
++            .unwrap(),
++            CertifiedSemanticMorphism::from_revision_observations(
++                &catalog,
++                vec![*b],
++                vec![*c],
++                [(vec![b1], vec![c1])],
++            )
++            .unwrap(),
++            CertifiedSemanticMorphism::from_revision_observations(
++                &catalog,
++                vec![*a],
++                vec![*c],
++                [(vec![a1], vec![c1])],
++            )
++            .unwrap(),
++        ];
++        let apnf =
++            AnchorPullbackNormalForm::new(&catalog, vec![factor], morphisms, vec![*c]).unwrap();
++        assert_eq!(apnf.determinant_theory().morphisms().len(), 4);
++        let certificate = apnf.branch_free_from_anchor(0).unwrap().unwrap();
++        assert!(certificate.seed().is_empty());
++        assert!(
++            certificate
++                .closure()
++                .is_superset(&BTreeSet::from([*a, *b, *c]))
++        );
++    }
++}
+diff -ruN /mnt/data/cfmd_pass76_work/crates/kernel-semantics/src/lib.rs crates/kernel-semantics/src/lib.rs
+--- /mnt/data/cfmd_pass76_work/crates/kernel-semantics/src/lib.rs	2026-09-21 01:50:24.000000000 +0000
++++ crates/kernel-semantics/src/lib.rs	2026-09-21 14:26:32.689039382 +0000
+@@ -7,6 +7,9 @@
+ };
+ use kernel_types::SemanticId;
+ 
++pub mod anchor_pullback;
++pub mod observable;
++
+ fn structural_equivalence_children(definition: &StructuralEquivalenceDef) -> Vec<SemanticId> {
+     match definition {
+         StructuralEquivalenceDef::Mu { body } => vec![*body],
+@@ -123,6 +126,26 @@
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct FiniteMeasureEntry<T> {
++    pub atom: T,
++    pub multiplicity: u64,
++}
++
++pub type FiniteMeasure<T> = Vec<FiniteMeasureEntry<T>>;
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct CanonicalBagAtom {
++    pub value: CanonicalEqKey,
++    pub stored_count: u64,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct CanonicalMapAtom {
++    pub key: CanonicalEqKey,
++    pub value: CanonicalEqKey,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub enum CanonicalEqKey {
+     Unit,
+     Bool(bool),
+@@ -146,9 +169,25 @@
+         value: Box<Self>,
+     },
+     Seq(Vec<Self>),
+-    Set(Vec<Self>),
+-    Bag(Vec<(Self, u64)>),
+-    Map(Vec<(Self, Self)>),
++    Set(FiniteMeasure<Self>),
++    Bag(FiniteMeasure<CanonicalBagAtom>),
++    Map(FiniteMeasure<CanonicalMapAtom>),
++}
++
++/// Canonical finite counting measure over an ordered atom domain.
++#[must_use]
++pub fn finite_measure_from_atoms<T: Ord>(atoms: impl IntoIterator<Item = T>) -> FiniteMeasure<T> {
++    let mut counts = BTreeMap::<T, u64>::new();
++    for atom in atoms {
++        let count = counts.entry(atom).or_insert(0);
++        *count = count
++            .checked_add(1)
++            .expect("an in-memory collection cannot contain more than u64::MAX entries");
++    }
++    counts
++        .into_iter()
++        .map(|(atom, multiplicity)| FiniteMeasureEntry { atom, multiplicity })
++        .collect()
+ }
+ 
+ /// Stable durable encoding revision for [`CanonicalEqKey`].
+@@ -156,7 +195,7 @@
+ /// This is deliberately independent from Rust enum layout and `Ord`
+ /// implementation details. Any change to the byte contract must introduce a
+ /// new decoder revision rather than silently reinterpreting persisted keys.
+-pub const CANONICAL_EQ_KEY_ENCODING_VERSION: u32 = 1;
++pub const CANONICAL_EQ_KEY_ENCODING_VERSION: u32 = 2;
+ 
+ const CANONICAL_EQ_KEY_MAGIC: [u8; 4] = *b"CEK\0";
+ const CANONICAL_EQ_KEY_TUPLE_MAGIC: [u8; 4] = *b"CKT\0";
+@@ -286,21 +325,30 @@
+             encode_canonical_eq_key_payload(value, bytes);
+         }
+         CanonicalEqKey::Seq(values) => encode_key_vec(12, values, bytes),
+-        CanonicalEqKey::Set(values) => encode_key_vec(13, values, bytes),
++        CanonicalEqKey::Set(entries) => {
++            bytes.push(13);
++            encode_len(entries.len(), bytes);
++            for entry in entries {
++                encode_canonical_eq_key_payload(&entry.atom, bytes);
++                bytes.extend_from_slice(&entry.multiplicity.to_be_bytes());
++            }
++        }
+         CanonicalEqKey::Bag(entries) => {
+             bytes.push(14);
+             encode_len(entries.len(), bytes);
+-            for (key, count) in entries {
+-                encode_canonical_eq_key_payload(key, bytes);
+-                bytes.extend_from_slice(&count.to_be_bytes());
++            for entry in entries {
++                encode_canonical_eq_key_payload(&entry.atom.value, bytes);
++                bytes.extend_from_slice(&entry.atom.stored_count.to_be_bytes());
++                bytes.extend_from_slice(&entry.multiplicity.to_be_bytes());
+             }
+         }
+         CanonicalEqKey::Map(entries) => {
+             bytes.push(15);
+             encode_len(entries.len(), bytes);
+-            for (key, value) in entries {
+-                encode_canonical_eq_key_payload(key, bytes);
+-                encode_canonical_eq_key_payload(value, bytes);
++            for entry in entries {
++                encode_canonical_eq_key_payload(&entry.atom.key, bytes);
++                encode_canonical_eq_key_payload(&entry.atom.value, bytes);
++                bytes.extend_from_slice(&entry.multiplicity.to_be_bytes());
+             }
+         }
+     }
+@@ -380,7 +428,7 @@
+             Ok(CanonicalEqKey::Variant { tag, value })
+         }
+         12 => decode_key_vec(cursor, child_depth).map(CanonicalEqKey::Seq),
+-        13 => decode_key_vec(cursor, child_depth).map(CanonicalEqKey::Set),
++        13 => decode_set_key(cursor, child_depth),
+         14 => decode_bag_key(cursor, child_depth),
+         15 => decode_map_key(cursor, child_depth),
+         other => Err(CanonicalEqKeyCodecError::UnknownTag(other)),
+@@ -423,6 +471,20 @@
+         .collect()
+ }
+ 
++fn decode_set_key(
++    cursor: &mut CanonicalKeyCursor<'_>,
++    depth: usize,
++) -> Result<CanonicalEqKey, CanonicalEqKeyCodecError> {
++    let len = cursor.collection_len(9)?;
++    let mut entries = Vec::with_capacity(len);
++    for _ in 0..len {
++        let atom = decode_canonical_eq_key_payload(cursor, depth)?;
++        let multiplicity = u64::from_be_bytes(cursor.take_array()?);
++        entries.push(FiniteMeasureEntry { atom, multiplicity });
++    }
++    Ok(CanonicalEqKey::Set(entries))
++}
++
+ fn decode_bag_key(
+     cursor: &mut CanonicalKeyCursor<'_>,
+     depth: usize,
+@@ -430,9 +492,16 @@
+     let len = cursor.collection_len(9)?;
+     let mut entries = Vec::with_capacity(len);
+     for _ in 0..len {
+-        let key = decode_canonical_eq_key_payload(cursor, depth)?;
+-        let count = u64::from_be_bytes(cursor.take_array()?);
+-        entries.push((key, count));
++        let value = decode_canonical_eq_key_payload(cursor, depth)?;
++        let stored_count = u64::from_be_bytes(cursor.take_array()?);
++        let multiplicity = u64::from_be_bytes(cursor.take_array()?);
++        entries.push(FiniteMeasureEntry {
++            atom: CanonicalBagAtom {
++                value,
++                stored_count,
++            },
++            multiplicity,
++        });
+     }
+     Ok(CanonicalEqKey::Bag(entries))
+ }
+@@ -446,7 +515,11 @@
+     for _ in 0..len {
+         let key = decode_canonical_eq_key_payload(cursor, depth)?;
+         let value = decode_canonical_eq_key_payload(cursor, depth)?;
+-        entries.push((key, value));
++        let multiplicity = u64::from_be_bytes(cursor.take_array()?);
++        entries.push(FiniteMeasureEntry {
++            atom: CanonicalMapAtom { key, value },
++            multiplicity,
++        });
+     }
+     Ok(CanonicalEqKey::Map(entries))
+ }
+@@ -463,21 +536,26 @@
+             canonical_eq_key_shape_is_canonical(value)
+         }
+         CanonicalEqKey::Seq(values) => values.iter().all(canonical_eq_key_shape_is_canonical),
+-        CanonicalEqKey::Set(values) => {
+-            values.windows(2).all(|pair| pair[0] < pair[1])
+-                && values.iter().all(canonical_eq_key_shape_is_canonical)
++        CanonicalEqKey::Set(entries) => {
++            entries.windows(2).all(|pair| pair[0].atom < pair[1].atom)
++                && entries.iter().all(|entry| {
++                    entry.multiplicity > 0 && canonical_eq_key_shape_is_canonical(&entry.atom)
++                })
+         }
+         CanonicalEqKey::Bag(entries) => {
+-            entries.windows(2).all(|pair| pair[0].0 < pair[1].0)
+-                && entries
+-                    .iter()
+-                    .all(|(child, count)| *count > 0 && canonical_eq_key_shape_is_canonical(child))
++            entries.windows(2).all(|pair| pair[0].atom < pair[1].atom)
++                && entries.iter().all(|entry| {
++                    entry.multiplicity > 0
++                        && entry.atom.stored_count > 0
++                        && canonical_eq_key_shape_is_canonical(&entry.atom.value)
++                })
+         }
+         CanonicalEqKey::Map(entries) => {
+-            entries.windows(2).all(|pair| pair[0].0 < pair[1].0)
+-                && entries.iter().all(|(entry_key, value)| {
+-                    canonical_eq_key_shape_is_canonical(entry_key)
+-                        && canonical_eq_key_shape_is_canonical(value)
++            entries.windows(2).all(|pair| pair[0].atom < pair[1].atom)
++                && entries.iter().all(|entry| {
++                    entry.multiplicity > 0
++                        && canonical_eq_key_shape_is_canonical(&entry.atom.key)
++                        && canonical_eq_key_shape_is_canonical(&entry.atom.value)
+                 })
+         }
+         CanonicalEqKey::Unit
+@@ -730,33 +808,35 @@
+                 .collect::<Result<Vec<_>, _>>()
+                 .map(CanonicalEqKey::Seq),
+             (CompiledEquivalenceKind::Set { element }, Value::Set { elements, .. }) => {
+-                let mut key = elements
++                let atoms = elements
+                     .iter()
+                     .map(|value| self.canonical_key_at(*element, value))
+                     .collect::<Result<Vec<_>, _>>()?;
+-                key.sort_unstable();
+-                Ok(CanonicalEqKey::Set(key))
++                Ok(CanonicalEqKey::Set(finite_measure_from_atoms(atoms)))
+             }
+             (CompiledEquivalenceKind::Bag { element }, Value::Bag { entries, .. }) => {
+-                let mut key = entries
++                let atoms = entries
+                     .iter()
+-                    .map(|(value, count)| Ok((self.canonical_key_at(*element, value)?, *count)))
++                    .map(|(value, count)| {
++                        Ok(CanonicalBagAtom {
++                            value: self.canonical_key_at(*element, value)?,
++                            stored_count: *count,
++                        })
++                    })
+                     .collect::<Result<Vec<_>, SemanticError>>()?;
+-                key.sort_unstable();
+-                Ok(CanonicalEqKey::Bag(key))
++                Ok(CanonicalEqKey::Bag(finite_measure_from_atoms(atoms)))
+             }
+             (CompiledEquivalenceKind::Map { key, value }, Value::Map { entries, .. }) => {
+-                let mut canonical = entries
++                let atoms = entries
+                     .iter()
+                     .map(|(entry_key, entry_value)| {
+-                        Ok((
+-                            self.canonical_key_at(*key, entry_key)?,
+-                            self.canonical_key_at(*value, entry_value)?,
+-                        ))
++                        Ok(CanonicalMapAtom {
++                            key: self.canonical_key_at(*key, entry_key)?,
++                            value: self.canonical_key_at(*value, entry_value)?,
++                        })
+                     })
+                     .collect::<Result<Vec<_>, SemanticError>>()?;
+-                canonical.sort_unstable();
+-                Ok(CanonicalEqKey::Map(canonical))
++                Ok(CanonicalEqKey::Map(finite_measure_from_atoms(atoms)))
+             }
+             _ => Err(SemanticError::TypeMismatch(node.equivalence)),
+         }
+@@ -1974,25 +2054,24 @@
+                 .collect::<Result<Vec<_>, _>>()
+                 .map(CanonicalEqKey::Seq),
+             (StructuralEquivalenceDef::Set { element }, Value::Set { elements, .. }) => {
+-                let mut key = elements
++                let atoms = elements
+                     .iter()
+                     .map(|value| self.canonical_equivalence_key_unchecked(context, *element, value))
+                     .collect::<Result<Vec<_>, _>>()?;
+-                key.sort_unstable();
+-                Ok(CanonicalEqKey::Set(key))
++                Ok(CanonicalEqKey::Set(finite_measure_from_atoms(atoms)))
+             }
+             (StructuralEquivalenceDef::Bag { element }, Value::Bag { entries, .. }) => {
+-                let mut key = entries
++                let atoms = entries
+                     .iter()
+                     .map(|(value, count)| {
+-                        Ok((
+-                            self.canonical_equivalence_key_unchecked(context, *element, value)?,
+-                            *count,
+-                        ))
++                        Ok(CanonicalBagAtom {
++                            value: self
++                                .canonical_equivalence_key_unchecked(context, *element, value)?,
++                            stored_count: *count,
++                        })
+                     })
+                     .collect::<Result<Vec<_>, SemanticError>>()?;
+-                key.sort_unstable();
+-                Ok(CanonicalEqKey::Bag(key))
++                Ok(CanonicalEqKey::Bag(finite_measure_from_atoms(atoms)))
+             }
+             (
+                 StructuralEquivalenceDef::Map {
+@@ -2001,25 +2080,24 @@
+                 },
+                 Value::Map { entries, .. },
+             ) => {
+-                let mut key = entries
++                let atoms = entries
+                     .iter()
+                     .map(|(entry_key, entry_value)| {
+-                        Ok((
+-                            self.canonical_equivalence_key_unchecked(
++                        Ok(CanonicalMapAtom {
++                            key: self.canonical_equivalence_key_unchecked(
+                                 context,
+                                 *key_equivalence,
+                                 entry_key,
+                             )?,
+-                            self.canonical_equivalence_key_unchecked(
++                            value: self.canonical_equivalence_key_unchecked(
+                                 context,
+                                 *value_equivalence,
+                                 entry_value,
+                             )?,
+-                        ))
++                        })
+                     })
+                     .collect::<Result<Vec<_>, SemanticError>>()?;
+-                key.sort_unstable();
+-                Ok(CanonicalEqKey::Map(key))
++                Ok(CanonicalEqKey::Map(finite_measure_from_atoms(atoms)))
+             }
+             _ => Err(SemanticError::TypeMismatch(equivalence)),
+         }
+@@ -4343,6 +4421,83 @@
+     }
+ 
+     #[test]
++    fn coarse_unordered_structural_keys_use_canonical_finite_measures() {
++        let exact = SemanticId::new(81_100);
++        let ci = SemanticId::new(81_101);
++        let set_ci = SemanticId::new(81_102);
++        let bag_ci = SemanticId::new(81_103);
++        let map_ci = SemanticId::new(81_104);
++        let mut registry = SemanticRegistry::default();
++        let exact_digest = registry.install_equivalence(EquivalenceModule::TextExact);
++        let ci_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut schema = Schema::new(SchemaRevisionId::new(81_100));
++        schema
++            .define_structural_equivalence(set_ci, StructuralEquivalenceDef::Set { element: ci })
++            .unwrap();
++        schema
++            .define_structural_equivalence(bag_ci, StructuralEquivalenceDef::Bag { element: ci })
++            .unwrap();
++        schema
++            .define_structural_equivalence(
++                map_ci,
++                StructuralEquivalenceDef::Map {
++                    key: ci,
++                    value: exact,
++                },
++            )
++            .unwrap();
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(81_100));
++        environment.pin_module(exact, exact_digest);
++        environment.pin_module(ci, ci_digest);
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++
++        let values = [
++            (
++                set_ci,
++                Value::Set {
++                    equivalence: exact,
++                    elements: vec![Value::Text("A".into()), Value::Text("a".into())],
++                },
++            ),
++            (
++                bag_ci,
++                Value::Bag {
++                    equivalence: exact,
++                    entries: vec![(Value::Text("A".into()), 2), (Value::Text("a".into()), 2)],
++                },
++            ),
++            (
++                map_ci,
++                Value::Map {
++                    key_equivalence: exact,
++                    entries: vec![
++                        (Value::Text("A".into()), Value::Text("same".into())),
++                        (Value::Text("a".into()), Value::Text("same".into())),
++                    ],
++                },
++            ),
++        ];
++        for (equivalence, value) in values {
++            let key = registry
++                .canonical_equivalence_key(&context, equivalence, &value)
++                .unwrap();
++            assert_eq!(
++                decode_canonical_eq_key(&encode_canonical_eq_key(&key)),
++                Ok(key.clone())
++            );
++            match key {
++                CanonicalEqKey::Set(entries) => assert_eq!(entries[0].multiplicity, 2),
++                CanonicalEqKey::Bag(entries) => assert_eq!(entries[0].multiplicity, 2),
++                CanonicalEqKey::Map(entries) => assert_eq!(entries[0].multiplicity, 2),
++                _ => panic!("fixture must lower to an unordered finite measure"),
++            }
++        }
++    }
++
++    #[test]
+     fn canonical_eq_key_codec_roundtrips_recursive_structures_and_rejects_version_drift() {
+         let key = CanonicalEqKey::Product(vec![
+             (
+@@ -4354,21 +4509,36 @@
+             ),
+             (
+                 SemanticId::new(2),
+-                CanonicalEqKey::Map(vec![
+-                    (
+-                        CanonicalEqKey::TextExact("a".into()),
+-                        CanonicalEqKey::Bag(vec![(CanonicalEqKey::Bool(false), 2)]),
+-                    ),
+-                    (
+-                        CanonicalEqKey::TextExact("b".into()),
+-                        CanonicalEqKey::Set(vec![CanonicalEqKey::I64(1), CanonicalEqKey::I64(2)]),
+-                    ),
+-                ]),
++                CanonicalEqKey::Map(finite_measure_from_atoms([
++                    CanonicalMapAtom {
++                        key: CanonicalEqKey::TextExact("a".into()),
++                        value: CanonicalEqKey::Bag(finite_measure_from_atoms([CanonicalBagAtom {
++                            value: CanonicalEqKey::Bool(false),
++                            stored_count: 2,
++                        }])),
++                    },
++                    CanonicalMapAtom {
++                        key: CanonicalEqKey::TextExact("b".into()),
++                        value: CanonicalEqKey::Set(finite_measure_from_atoms([
++                            CanonicalEqKey::I64(1),
++                            CanonicalEqKey::I64(2),
++                        ])),
++                    },
++                ])),
+             ),
+         ]);
+         let encoded = encode_canonical_eq_key(&key);
+         assert_eq!(decode_canonical_eq_key(&encoded), Ok(key));
+ 
++        let mut previous = encoded.clone();
++        previous[4..8].copy_from_slice(&(CANONICAL_EQ_KEY_ENCODING_VERSION - 1).to_be_bytes());
++        assert_eq!(
++            decode_canonical_eq_key(&previous),
++            Err(CanonicalEqKeyCodecError::UnsupportedVersion(
++                CANONICAL_EQ_KEY_ENCODING_VERSION - 1
++            ))
++        );
++
+         let mut future = encoded.clone();
+         future[4..8].copy_from_slice(&(CANONICAL_EQ_KEY_ENCODING_VERSION + 1).to_be_bytes());
+         assert_eq!(
+@@ -4389,7 +4559,7 @@
+     }
+ 
+     #[test]
+-    fn canonical_eq_key_v1_has_golden_bytes_independent_of_rust_layout() {
++    fn canonical_eq_key_v2_has_golden_bytes_independent_of_rust_layout() {
+         let key = CanonicalEqKey::Product(vec![
+             (
+                 SemanticId::new(1),
+@@ -4400,7 +4570,7 @@
+         assert_eq!(
+             encode_canonical_eq_key(&key),
+             vec![
+-                67, 69, 75, 0, 0, 0, 0, 1, 8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++                67, 69, 75, 0, 0, 0, 0, 2, 8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 0, 0, 0, 0, 0, 1, 5, 0, 0, 0, 0, 0, 0, 0, 1, 97, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 0, 0, 0, 0, 2, 2, 255, 255, 255, 255, 255, 255, 255, 255,
+             ]
+@@ -4409,8 +4579,16 @@
+ 
+     #[test]
+     fn canonical_eq_key_codec_rejects_noncanonical_and_hostile_lengths() {
+-        let noncanonical =
+-            CanonicalEqKey::Set(vec![CanonicalEqKey::I64(2), CanonicalEqKey::I64(1)]);
++        let noncanonical = CanonicalEqKey::Set(vec![
++            FiniteMeasureEntry {
++                atom: CanonicalEqKey::I64(2),
++                multiplicity: 1,
++            },
++            FiniteMeasureEntry {
++                atom: CanonicalEqKey::I64(1),
++                multiplicity: 1,
++            },
++        ]);
+         assert_eq!(
+             decode_canonical_eq_key(&encode_canonical_eq_key(&noncanonical)),
+             Err(CanonicalEqKeyCodecError::NonCanonicalShape)
+diff -ruN /mnt/data/cfmd_pass76_work/crates/kernel-semantics/src/observable.rs crates/kernel-semantics/src/observable.rs
+--- /mnt/data/cfmd_pass76_work/crates/kernel-semantics/src/observable.rs	1970-01-01 00:00:00.000000000 +0000
++++ crates/kernel-semantics/src/observable.rs	2026-09-21 14:27:51.929778301 +0000
+@@ -0,0 +1,737 @@
++use std::{
++    collections::BTreeMap,
++    sync::atomic::{AtomicU64, Ordering},
++};
++
++use kernel_model::Value;
++use kernel_schema::SemanticContext;
++use kernel_types::{EqClassId, RevisionObservableId, SemanticId, SemanticRevision};
++
++use crate::{CanonicalEqKey, SemanticError, SemanticRegistry};
++
++static NEXT_OBSERVABLE_CATALOG_INSTANCE: AtomicU64 = AtomicU64::new(1);
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum SemanticObservableDefinition {
++    PinnedEquivalence(SemanticId),
++    Product(Vec<RevisionObservableId>),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum ObservableClassSignature {
++    Canonical(CanonicalEqKey),
++    Product(Vec<EqClassId>),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ObservableClassRecord {
++    pub observable: RevisionObservableId,
++    pub signature: ObservableClassSignature,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ObservableError {
++    Semantic(SemanticError),
++    CatalogIdExhausted,
++    ObservableIdExhausted,
++    EqClassIdExhausted,
++    UnknownObservable(RevisionObservableId),
++    UnknownEqClass(EqClassId),
++    ObservableKindMismatch(RevisionObservableId),
++    ArityMismatch {
++        expected: usize,
++        actual: usize,
++    },
++    ForeignEqClass {
++        class: EqClassId,
++        expected: RevisionObservableId,
++        actual: RevisionObservableId,
++    },
++    RevisionMismatch {
++        expected: SemanticRevision,
++        actual: SemanticRevision,
++    },
++    MorphismBoundaryMismatch,
++    ConflictingMorphismImage,
++    InvalidProjectionIndex(usize),
++    ObservableCatalogMismatch,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RevisionObservableCatalog {
++    revision: SemanticRevision,
++    catalog_instance: u64,
++    next_observable: u64,
++    next_class: u64,
++    definitions: BTreeMap<RevisionObservableId, SemanticObservableDefinition>,
++    definition_ids: BTreeMap<SemanticObservableDefinition, RevisionObservableId>,
++    classes: BTreeMap<(RevisionObservableId, ObservableClassSignature), EqClassId>,
++    class_records: BTreeMap<EqClassId, ObservableClassRecord>,
++}
++
++impl RevisionObservableCatalog {
++    pub fn new(context: &SemanticContext) -> Result<Self, ObservableError> {
++        let catalog_instance = NEXT_OBSERVABLE_CATALOG_INSTANCE
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
++                current.checked_add(1)
++            })
++            .map_err(|_| ObservableError::CatalogIdExhausted)?;
++        Ok(Self {
++            revision: context.revision(),
++            catalog_instance,
++            next_observable: 1,
++            next_class: 1,
++            definitions: BTreeMap::new(),
++            definition_ids: BTreeMap::new(),
++            classes: BTreeMap::new(),
++            class_records: BTreeMap::new(),
++        })
++    }
++
++    #[must_use]
++    pub const fn revision(&self) -> SemanticRevision {
++        self.revision
++    }
++
++    #[must_use]
++    pub(crate) const fn catalog_instance(&self) -> u64 {
++        self.catalog_instance
++    }
++
++    pub fn register_equivalence(
++        &mut self,
++        registry: &SemanticRegistry,
++        context: &SemanticContext,
++        equivalence: SemanticId,
++    ) -> Result<RevisionObservableId, ObservableError> {
++        self.ensure_revision(context.revision())?;
++        registry
++            .equivalence_domain(context, equivalence)
++            .map_err(ObservableError::Semantic)?;
++        self.intern_definition(SemanticObservableDefinition::PinnedEquivalence(equivalence))
++    }
++
++    pub fn register_product(
++        &mut self,
++        components: Vec<RevisionObservableId>,
++    ) -> Result<RevisionObservableId, ObservableError> {
++        for component in &components {
++            self.definition(*component)?;
++        }
++        self.intern_definition(SemanticObservableDefinition::Product(components))
++    }
++
++    fn intern_definition(
++        &mut self,
++        definition: SemanticObservableDefinition,
++    ) -> Result<RevisionObservableId, ObservableError> {
++        if let Some(id) = self.definition_ids.get(&definition) {
++            return Ok(*id);
++        }
++        let id = RevisionObservableId::new(compose_local_id(
++            self.catalog_instance,
++            self.next_observable,
++        ));
++        self.next_observable = self
++            .next_observable
++            .checked_add(1)
++            .ok_or(ObservableError::ObservableIdExhausted)?;
++        self.definition_ids.insert(definition.clone(), id);
++        self.definitions.insert(id, definition);
++        Ok(id)
++    }
++
++    pub fn definition(
++        &self,
++        observable: RevisionObservableId,
++    ) -> Result<&SemanticObservableDefinition, ObservableError> {
++        self.definitions
++            .get(&observable)
++            .ok_or(ObservableError::UnknownObservable(observable))
++    }
++
++    fn intern_equivalence_key(
++        &mut self,
++        observable: RevisionObservableId,
++        key: CanonicalEqKey,
++    ) -> Result<EqClassId, ObservableError> {
++        if !matches!(
++            self.definition(observable)?,
++            SemanticObservableDefinition::PinnedEquivalence(_)
++        ) {
++            return Err(ObservableError::ObservableKindMismatch(observable));
++        }
++        self.intern_class(observable, ObservableClassSignature::Canonical(key))
++    }
++
++    pub fn observe_value(
++        &mut self,
++        registry: &SemanticRegistry,
++        context: &SemanticContext,
++        observable: RevisionObservableId,
++        value: &Value,
++    ) -> Result<EqClassId, ObservableError> {
++        self.ensure_revision(context.revision())?;
++        let equivalence = match self.definition(observable)? {
++            SemanticObservableDefinition::PinnedEquivalence(equivalence) => *equivalence,
++            SemanticObservableDefinition::Product(_) => {
++                return Err(ObservableError::ObservableKindMismatch(observable));
++            }
++        };
++        let key = registry
++            .canonical_equivalence_key(context, equivalence, value)
++            .map_err(ObservableError::Semantic)?;
++        self.intern_equivalence_key(observable, key)
++    }
++
++    pub fn intern_product_class(
++        &mut self,
++        observable: RevisionObservableId,
++        components: Vec<EqClassId>,
++    ) -> Result<EqClassId, ObservableError> {
++        let expected = match self.definition(observable)? {
++            SemanticObservableDefinition::Product(expected) => expected.clone(),
++            SemanticObservableDefinition::PinnedEquivalence(_) => {
++                return Err(ObservableError::ObservableKindMismatch(observable));
++            }
++        };
++        self.validate_class_tuple(&expected, &components)?;
++        self.intern_class(observable, ObservableClassSignature::Product(components))
++    }
++
++    fn intern_class(
++        &mut self,
++        observable: RevisionObservableId,
++        signature: ObservableClassSignature,
++    ) -> Result<EqClassId, ObservableError> {
++        let lookup = (observable, signature.clone());
++        if let Some(id) = self.classes.get(&lookup) {
++            return Ok(*id);
++        }
++        let id = EqClassId::new(compose_local_id(self.catalog_instance, self.next_class));
++        self.next_class = self
++            .next_class
++            .checked_add(1)
++            .ok_or(ObservableError::EqClassIdExhausted)?;
++        self.classes.insert(lookup, id);
++        self.class_records.insert(
++            id,
++            ObservableClassRecord {
++                observable,
++                signature,
++            },
++        );
++        Ok(id)
++    }
++
++    pub fn class_record(
++        &self,
++        class: EqClassId,
++    ) -> Result<&ObservableClassRecord, ObservableError> {
++        self.class_records
++            .get(&class)
++            .ok_or(ObservableError::UnknownEqClass(class))
++    }
++
++    fn validate_class_tuple(
++        &self,
++        observables: &[RevisionObservableId],
++        classes: &[EqClassId],
++    ) -> Result<(), ObservableError> {
++        if observables.len() != classes.len() {
++            return Err(ObservableError::ArityMismatch {
++                expected: observables.len(),
++                actual: classes.len(),
++            });
++        }
++        for (&expected, &class) in observables.iter().zip(classes) {
++            let actual = self.class_record(class)?.observable;
++            if expected != actual {
++                return Err(ObservableError::ForeignEqClass {
++                    class,
++                    expected,
++                    actual,
++                });
++            }
++        }
++        Ok(())
++    }
++
++    fn ensure_revision(&self, actual: SemanticRevision) -> Result<(), ObservableError> {
++        if self.revision == actual {
++            Ok(())
++        } else {
++            Err(ObservableError::RevisionMismatch {
++                expected: self.revision,
++                actual,
++            })
++        }
++    }
++
++    fn product_classes(
++        &self,
++        observable: RevisionObservableId,
++    ) -> impl Iterator<Item = (EqClassId, &[EqClassId])> {
++        self.class_records.iter().filter_map(move |(id, record)| {
++            if record.observable != observable {
++                return None;
++            }
++            let ObservableClassSignature::Product(components) = &record.signature else {
++                return None;
++            };
++            Some((*id, components.as_slice()))
++        })
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum SemanticMorphismCertificate {
++    RevisionFiniteSupport,
++    AnchorReconstruction,
++    ProductProjection {
++        product: RevisionObservableId,
++        component_indices: Vec<usize>,
++    },
++    Composition,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct CertifiedSemanticMorphism {
++    revision: SemanticRevision,
++    catalog_instance: u64,
++    source: Vec<RevisionObservableId>,
++    target: Vec<RevisionObservableId>,
++    certificate: SemanticMorphismCertificate,
++    mapping: BTreeMap<Vec<EqClassId>, Vec<EqClassId>>,
++}
++
++impl CertifiedSemanticMorphism {
++    pub(crate) fn from_revision_observations(
++        catalog: &RevisionObservableCatalog,
++        source: Vec<RevisionObservableId>,
++        target: Vec<RevisionObservableId>,
++        observations: impl IntoIterator<Item = (Vec<EqClassId>, Vec<EqClassId>)>,
++    ) -> Result<Self, ObservableError> {
++        Self::from_certified_mapping(
++            catalog,
++            source,
++            target,
++            SemanticMorphismCertificate::RevisionFiniteSupport,
++            observations,
++        )
++    }
++
++    pub(crate) fn from_anchor_reconstruction(
++        catalog: &RevisionObservableCatalog,
++        source: Vec<RevisionObservableId>,
++        target: Vec<RevisionObservableId>,
++        observations: impl IntoIterator<Item = (Vec<EqClassId>, Vec<EqClassId>)>,
++    ) -> Result<Self, ObservableError> {
++        Self::from_certified_mapping(
++            catalog,
++            source,
++            target,
++            SemanticMorphismCertificate::AnchorReconstruction,
++            observations,
++        )
++    }
++
++    fn from_certified_mapping(
++        catalog: &RevisionObservableCatalog,
++        source: Vec<RevisionObservableId>,
++        target: Vec<RevisionObservableId>,
++        certificate: SemanticMorphismCertificate,
++        observations: impl IntoIterator<Item = (Vec<EqClassId>, Vec<EqClassId>)>,
++    ) -> Result<Self, ObservableError> {
++        validate_observables(catalog, &source)?;
++        validate_observables(catalog, &target)?;
++        let mut mapping = BTreeMap::new();
++        for (from, to) in observations {
++            catalog.validate_class_tuple(&source, &from)?;
++            catalog.validate_class_tuple(&target, &to)?;
++            if let Some(existing) = mapping.insert(from, to.clone())
++                && existing != to
++            {
++                return Err(ObservableError::ConflictingMorphismImage);
++            }
++        }
++        Ok(Self {
++            revision: catalog.revision(),
++            catalog_instance: catalog.catalog_instance,
++            source,
++            target,
++            certificate,
++            mapping,
++        })
++    }
++
++    pub fn product_projection(
++        catalog: &RevisionObservableCatalog,
++        product: RevisionObservableId,
++        component_indices: Vec<usize>,
++    ) -> Result<Self, ObservableError> {
++        let components = match catalog.definition(product)? {
++            SemanticObservableDefinition::Product(components) => components,
++            SemanticObservableDefinition::PinnedEquivalence(_) => {
++                return Err(ObservableError::ObservableKindMismatch(product));
++            }
++        };
++        let mut target = Vec::with_capacity(component_indices.len());
++        for &index in &component_indices {
++            let component = components
++                .get(index)
++                .copied()
++                .ok_or(ObservableError::InvalidProjectionIndex(index))?;
++            target.push(component);
++        }
++        let mut mapping = BTreeMap::new();
++        for (class, classes) in catalog.product_classes(product) {
++            let projected = component_indices
++                .iter()
++                .map(|&index| classes[index])
++                .collect::<Vec<_>>();
++            mapping.insert(vec![class], projected);
++        }
++        Ok(Self {
++            revision: catalog.revision(),
++            catalog_instance: catalog.catalog_instance,
++            source: vec![product],
++            target,
++            certificate: SemanticMorphismCertificate::ProductProjection {
++                product,
++                component_indices,
++            },
++            mapping,
++        })
++    }
++
++    pub fn compose(&self, next: &Self) -> Result<Self, ObservableError> {
++        if self.revision != next.revision {
++            return Err(ObservableError::RevisionMismatch {
++                expected: self.revision,
++                actual: next.revision,
++            });
++        }
++        if self.catalog_instance != next.catalog_instance {
++            return Err(ObservableError::ObservableCatalogMismatch);
++        }
++        if self.target != next.source {
++            return Err(ObservableError::MorphismBoundaryMismatch);
++        }
++        let mapping = self
++            .mapping
++            .iter()
++            .filter_map(|(source, middle)| {
++                next.mapping
++                    .get(middle)
++                    .map(|target| (source.clone(), target.clone()))
++            })
++            .collect();
++        Ok(Self {
++            revision: self.revision,
++            catalog_instance: self.catalog_instance,
++            source: self.source.clone(),
++            target: next.target.clone(),
++            certificate: SemanticMorphismCertificate::Composition,
++            mapping,
++        })
++    }
++
++    #[must_use]
++    pub const fn revision(&self) -> SemanticRevision {
++        self.revision
++    }
++
++    #[must_use]
++    pub(crate) const fn catalog_instance(&self) -> u64 {
++        self.catalog_instance
++    }
++
++    #[must_use]
++    pub fn source(&self) -> &[RevisionObservableId] {
++        &self.source
++    }
++
++    #[must_use]
++    pub fn target(&self) -> &[RevisionObservableId] {
++        &self.target
++    }
++
++    #[must_use]
++    pub const fn certificate(&self) -> &SemanticMorphismCertificate {
++        &self.certificate
++    }
++
++    #[must_use]
++    pub fn image(&self, source: &[EqClassId]) -> Option<&[EqClassId]> {
++        self.mapping.get(source).map(Vec::as_slice)
++    }
++
++    #[must_use]
++    pub fn materialized_mapping(&self) -> &BTreeMap<Vec<EqClassId>, Vec<EqClassId>> {
++        &self.mapping
++    }
++}
++
++fn compose_local_id(catalog_instance: u64, local: u64) -> u128 {
++    (u128::from(catalog_instance) << 64) | u128::from(local)
++}
++
++fn validate_observables(
++    catalog: &RevisionObservableCatalog,
++    observables: &[RevisionObservableId],
++) -> Result<(), ObservableError> {
++    for observable in observables {
++        catalog.definition(*observable)?;
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use kernel_schema::{Schema, SemanticEnvironment};
++    use kernel_types::{SchemaRevisionId, SemanticEnvId};
++
++    use super::*;
++
++    fn fixture(ids: &[SemanticId]) -> (SemanticContext, SemanticRegistry) {
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(crate::EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(9));
++        for id in ids {
++            environment.pin_module(*id, digest);
++        }
++        (
++            SemanticContext {
++                schema: Schema::new(SchemaRevisionId::new(7)),
++                environment,
++            },
++            registry,
++        )
++    }
++
++    #[test]
++    fn product_observable_is_revision_local_exact_meet_coordinate() {
++        let left_eq = SemanticId::new(10);
++        let right_eq = SemanticId::new(11);
++        let (context, registry) = fixture(&[left_eq, right_eq]);
++        let mut catalog = RevisionObservableCatalog::new(&context).unwrap();
++        let left = catalog
++            .register_equivalence(&registry, &context, left_eq)
++            .unwrap();
++        let right = catalog
++            .register_equivalence(&registry, &context, right_eq)
++            .unwrap();
++        let product = catalog.register_product(vec![left, right]).unwrap();
++
++        let left_a = catalog
++            .observe_value(&registry, &context, left, &Value::I64(1))
++            .unwrap();
++        let left_b = catalog
++            .observe_value(&registry, &context, left, &Value::I64(2))
++            .unwrap();
++        let right_a = catalog
++            .observe_value(&registry, &context, right, &Value::I64(7))
++            .unwrap();
++
++        let joint_a = catalog
++            .intern_product_class(product, vec![left_a, right_a])
++            .unwrap();
++        let joint_a_again = catalog
++            .intern_product_class(product, vec![left_a, right_a])
++            .unwrap();
++        let joint_b = catalog
++            .intern_product_class(product, vec![left_b, right_a])
++            .unwrap();
++        assert_eq!(joint_a, joint_a_again);
++        assert_ne!(joint_a, joint_b);
++
++        let projection =
++            CertifiedSemanticMorphism::product_projection(&catalog, product, vec![0, 1]).unwrap();
++        assert_eq!(
++            projection.image(&[joint_a]),
++            Some([left_a, right_a].as_slice())
++        );
++    }
++
++    #[test]
++    fn observable_registration_is_pinned_to_one_semantic_revision() {
++        let eq = SemanticId::new(12);
++        let (context, registry) = fixture(&[eq]);
++        let mut catalog = RevisionObservableCatalog::new(&context).unwrap();
++        let observable = catalog
++            .register_equivalence(&registry, &context, eq)
++            .unwrap();
++
++        let mut changed = context.clone();
++        changed.environment = SemanticEnvironment::new(SemanticEnvId::new(10));
++        assert!(matches!(
++            catalog.observe_value(&registry, &changed, observable, &Value::I64(1)),
++            Err(ObservableError::RevisionMismatch { .. })
++        ));
++    }
++
++    #[test]
++    fn morphism_ir_is_nary_to_mary_and_rejects_non_functions() {
++        let ids = [
++            SemanticId::new(1),
++            SemanticId::new(2),
++            SemanticId::new(3),
++            SemanticId::new(4),
++        ];
++        let (context, registry) = fixture(&ids);
++        let mut catalog = RevisionObservableCatalog::new(&context).unwrap();
++        let mut observables = Vec::new();
++        for id in ids {
++            observables.push(
++                catalog
++                    .register_equivalence(&registry, &context, id)
++                    .unwrap(),
++            );
++        }
++        let [a, b, c, d] = observables.as_slice() else {
++            unreachable!();
++        };
++        let a = *a;
++        let b = *b;
++        let c = *c;
++        let d = *d;
++        let a1 = catalog
++            .observe_value(&registry, &context, a, &Value::I64(1))
++            .unwrap();
++        let b1 = catalog
++            .observe_value(&registry, &context, b, &Value::I64(2))
++            .unwrap();
++        let c1 = catalog
++            .observe_value(&registry, &context, c, &Value::I64(3))
++            .unwrap();
++        let d1 = catalog
++            .observe_value(&registry, &context, d, &Value::I64(4))
++            .unwrap();
++        let d2 = catalog
++            .observe_value(&registry, &context, d, &Value::I64(5))
++            .unwrap();
++
++        let morphism = CertifiedSemanticMorphism::from_revision_observations(
++            &catalog,
++            vec![a, b],
++            vec![c, d],
++            [(vec![a1, b1], vec![c1, d1])],
++        )
++        .unwrap();
++        assert_eq!(morphism.image(&[a1, b1]), Some([c1, d1].as_slice()));
++
++        assert_eq!(
++            CertifiedSemanticMorphism::from_revision_observations(
++                &catalog,
++                vec![a, b],
++                vec![c, d],
++                [(vec![a1, b1], vec![c1, d1]), (vec![a1, b1], vec![c1, d2]),],
++            ),
++            Err(ObservableError::ConflictingMorphismImage)
++        );
++    }
++
++    #[test]
++    fn materialized_morphisms_compose_without_changing_semantic_revision() {
++        let ids = [
++            SemanticId::new(21),
++            SemanticId::new(22),
++            SemanticId::new(23),
++        ];
++        let (context, registry) = fixture(&ids);
++        let mut catalog = RevisionObservableCatalog::new(&context).unwrap();
++        let a = catalog
++            .register_equivalence(&registry, &context, ids[0])
++            .unwrap();
++        let b = catalog
++            .register_equivalence(&registry, &context, ids[1])
++            .unwrap();
++        let c = catalog
++            .register_equivalence(&registry, &context, ids[2])
++            .unwrap();
++        let a1 = catalog
++            .observe_value(&registry, &context, a, &Value::I64(1))
++            .unwrap();
++        let b1 = catalog
++            .observe_value(&registry, &context, b, &Value::I64(2))
++            .unwrap();
++        let c1 = catalog
++            .observe_value(&registry, &context, c, &Value::I64(3))
++            .unwrap();
++        let ab = CertifiedSemanticMorphism::from_revision_observations(
++            &catalog,
++            vec![a],
++            vec![b],
++            [(vec![a1], vec![b1])],
++        )
++        .unwrap();
++        let bc = CertifiedSemanticMorphism::from_revision_observations(
++            &catalog,
++            vec![b],
++            vec![c],
++            [(vec![b1], vec![c1])],
++        )
++        .unwrap();
++        let ac = ab.compose(&bc).unwrap();
++        assert_eq!(ac.revision(), context.revision());
++        assert_eq!(ac.image(&[a1]), Some([c1].as_slice()));
++        assert_eq!(ac.certificate(), &SemanticMorphismCertificate::Composition);
++    }
++
++    #[test]
++    fn independent_catalogs_cannot_alias_revision_local_observable_or_class_ids() {
++        let ids = [SemanticId::new(31), SemanticId::new(32)];
++        let (context, registry) = fixture(&ids);
++        let mut left_catalog = RevisionObservableCatalog::new(&context).unwrap();
++        let mut right_catalog = RevisionObservableCatalog::new(&context).unwrap();
++
++        let left_a = left_catalog
++            .register_equivalence(&registry, &context, ids[0])
++            .unwrap();
++        let left_b = left_catalog
++            .register_equivalence(&registry, &context, ids[1])
++            .unwrap();
++        let right_a = right_catalog
++            .register_equivalence(&registry, &context, ids[0])
++            .unwrap();
++        let right_b = right_catalog
++            .register_equivalence(&registry, &context, ids[1])
++            .unwrap();
++        assert_ne!(left_a, right_a);
++        assert_ne!(left_b, right_b);
++
++        let left_source_class = left_catalog
++            .observe_value(&registry, &context, left_a, &Value::I64(1))
++            .unwrap();
++        let left_target_class = left_catalog
++            .observe_value(&registry, &context, left_b, &Value::I64(2))
++            .unwrap();
++        let right_source_class = right_catalog
++            .observe_value(&registry, &context, right_a, &Value::I64(1))
++            .unwrap();
++        let right_target_class = right_catalog
++            .observe_value(&registry, &context, right_b, &Value::I64(2))
++            .unwrap();
++        assert_ne!(left_source_class, right_source_class);
++
++        let left = CertifiedSemanticMorphism::from_revision_observations(
++            &left_catalog,
++            vec![left_a],
++            vec![left_b],
++            [(vec![left_source_class], vec![left_target_class])],
++        )
++        .unwrap();
++        let right = CertifiedSemanticMorphism::from_revision_observations(
++            &right_catalog,
++            vec![right_a],
++            vec![right_b],
++            [(vec![right_source_class], vec![right_target_class])],
++        )
++        .unwrap();
++        assert_eq!(
++            left.compose(&right),
++            Err(ObservableError::ObservableCatalogMismatch)
++        );
++    }
++}
+diff -ruN /mnt/data/cfmd_pass76_work/crates/kernel-types/src/lib.rs crates/kernel-types/src/lib.rs
+--- /mnt/data/cfmd_pass76_work/crates/kernel-types/src/lib.rs	2026-09-19 23:51:28.000000000 +0000
++++ crates/kernel-types/src/lib.rs	2026-09-21 14:06:27.059021775 +0000
+@@ -30,6 +30,8 @@
+ semantic_id!(SchemaRevisionId, u64);
+ semantic_id!(SemanticEnvId, u64);
+ semantic_id!(RevisionId, u64);
++semantic_id!(RevisionObservableId, u128);
++semantic_id!(EqClassId, u128);
+ semantic_id!(MaterializationId, u128);
+ semantic_id!(ClientTransactionId, u128);
+ 

@@ -1,0 +1,1943 @@
+--- /mnt/data/cfmd_workspace_pass43/crates/kernel-plan/src/lib.rs	2026-09-20 11:17:14.153540921 +0000
++++ crates/kernel-plan/src/lib.rs	2026-09-20 11:56:17.830730135 +0000
+@@ -3069,6 +3069,11 @@
+         self.buckets.values().map(Vec::len).sum()
+     }
+ 
++    #[must_use]
++    pub fn distinct_key_count(&self) -> usize {
++        self.buckets.len()
++    }
++
+     fn probe(&self, key: i64) -> Option<&[PhysicalRowId]> {
+         self.buckets.get(&key).map(Vec::as_slice)
+     }
+@@ -3313,6 +3318,7 @@
+     pub typed_batch_chain_hits: usize,
+     pub typed_stateful_batch_hits: usize,
+     pub typed_stateful_producer_hits: usize,
++    pub multiway_join_reorders: usize,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -3438,6 +3444,29 @@
+             SemanticAccessPath::FullScan
+         }
+     }
++
++    #[must_use]
++    pub const fn choose_ephemeral_join(
++        left_rows: usize,
++        right_rows: usize,
++        right_distinct_keys: usize,
++        key_parts: usize,
++    ) -> SemanticAccessPath {
++        if left_rows == 0 || right_rows == 0 || right_distinct_keys == 0 {
++            return SemanticAccessPath::PersistedIndex;
++        }
++        let nested_work = left_rows.saturating_mul(right_rows);
++        let key_parts = if key_parts == 0 { 1 } else { key_parts };
++        let build_work = right_rows.saturating_mul(key_parts);
++        let average_bucket = right_rows.div_ceil(right_distinct_keys);
++        let indexed_work = build_work
++            .saturating_add(left_rows.saturating_mul(1_usize.saturating_add(average_bucket)));
++        if indexed_work < nested_work {
++            SemanticAccessPath::PersistedIndex
++        } else {
++            SemanticAccessPath::FullScan
++        }
++    }
+ }
+ 
+ /// Minimal physical-plan vocabulary for the correctness-first baseline.
+@@ -3831,6 +3860,9 @@
+         registry: &kernel_semantics::SemanticRegistry,
+         stats: &mut ExecutionStats,
+     ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
++        if let Some(rows) = try_execute_multiway_join(self, store, context, registry, stats)? {
++            return Ok(rows);
++        }
+         if let Some(rows) = try_execute_native_fast_path(self, store, context, registry, stats)? {
+             return Ok(rows);
+         }
+@@ -3899,10 +3931,7 @@
+             Self::Distinct {
+                 input,
+                 column_equivalences,
+-            } => {
+-                let rows = input.execute_native_rows(store, context, registry, stats)?;
+-                distinct_rows(rows, column_equivalences, context, registry)
+-            }
++            } => execute_distinct_plan(input, column_equivalences, store, context, registry, stats),
+             Self::Group {
+                 input,
+                 group_columns,
+@@ -3934,6 +3963,18 @@
+     }
+ }
+ 
++fn execute_distinct_plan(
++    input: &Plan,
++    column_equivalences: &[SemanticId],
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
++    let rows = input.execute_native_rows(store, context, registry, stats)?;
++    distinct_rows(rows, column_equivalences, context, registry)
++}
++
+ fn try_execute_native_fast_path(
+     plan: &Plan,
+     store: &PhysicalStore,
+@@ -4035,18 +4076,44 @@
+         equivalence: program.equivalence,
+     });
+     let mut ephemeral = BTreeMap::<i64, Vec<usize>>::new();
+-    if persisted.is_none() {
++    if let Some(index) = persisted {
++        if SemanticAccessCostModel::choose_join(
++            left_keys.len(),
++            right_keys.len(),
++            index.distinct_key_count(),
++        ) == SemanticAccessPath::FullScan
++        {
++            return Ok(None);
++        }
++        stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
++    } else {
++        if SemanticAccessCostModel::choose_ephemeral_join(
++            left_keys.len(),
++            right_keys.len(),
++            right_keys.len(),
++            1,
++        ) == SemanticAccessPath::FullScan
++        {
++            return Ok(None);
++        }
+         for position in program.right.scan_positions() {
+             ephemeral
+                 .entry(right_keys[position])
+                 .or_default()
+                 .push(position);
+         }
++        if SemanticAccessCostModel::choose_ephemeral_join(
++            left_keys.len(),
++            right_keys.len(),
++            ephemeral.len(),
++            1,
++        ) == SemanticAccessPath::FullScan
++        {
++            return Ok(None);
++        }
+         stats.scanned_rows = stats.scanned_rows.saturating_add(right_keys.len());
+         stats.values_read = stats.values_read.saturating_add(right_keys.len());
+         stats.ephemeral_index_builds = stats.ephemeral_index_builds.saturating_add(1);
+-    } else {
+-        stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+     }
+ 
+     let mut out = Vec::new();
+@@ -4329,6 +4396,9 @@
+     target.typed_stateful_producer_hits = target
+         .typed_stateful_producer_hits
+         .saturating_add(source.typed_stateful_producer_hits);
++    target.multiway_join_reorders = target
++        .multiway_join_reorders
++        .saturating_add(source.multiway_join_reorders);
+ }
+ 
+ struct TypedBatchSelection<'a> {
+@@ -6169,6 +6239,474 @@
+     Ok(Some(rows))
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct MultiwayJoinColumnRef {
++    leaf: usize,
++    column: usize,
++}
++
++#[derive(Debug, Clone)]
++struct MultiwayJoinLeaf {
++    plan: Plan,
++    relation: SemanticId,
++    layout: LayoutBinding,
++    width: usize,
++    rows: usize,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct MultiwayJoinPredicate {
++    left: MultiwayJoinColumnRef,
++    right: MultiwayJoinColumnRef,
++    equivalence: SemanticId,
++}
++
++#[derive(Debug, Clone)]
++struct MultiwayJoinCandidate {
++    plan: Plan,
++    cost: u128,
++    estimated_rows: usize,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct MultiwayJoinInterval {
++    start: usize,
++    split: usize,
++    end: usize,
++}
++
++struct MultiwayPlannerContext<'a> {
++    store: &'a PhysicalStore,
++    leaves: &'a [MultiwayJoinLeaf],
++    context: &'a kernel_schema::SemanticContext,
++    registry: &'a kernel_semantics::SemanticRegistry,
++}
++
++fn try_execute_multiway_join(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    if !matches!(plan, Plan::JoinEq { .. } | Plan::FilterEqColumns { .. }) {
++        return Ok(None);
++    }
++    let Some(optimized) = optimize_contiguous_multiway_join(plan, store, context, registry)? else {
++        return Ok(None);
++    };
++    stats.multiway_join_reorders = stats.multiway_join_reorders.saturating_add(1);
++    execute_multiway_join_candidate(&optimized, store, context, registry, stats).map(Some)
++}
++
++fn flatten_contiguous_join_tree(
++    plan: &Plan,
++    store: &PhysicalStore,
++    leaves: &mut Vec<MultiwayJoinLeaf>,
++    predicates: &mut Vec<MultiwayJoinPredicate>,
++) -> Result<Option<Vec<MultiwayJoinColumnRef>>, PhysicalExecutionError> {
++    match plan {
++        Plan::Scan {
++            relation,
++            layout,
++            algorithm: ScanAlgorithm::FullScan,
++        } => {
++            let installed = store.installed(*relation, *layout)?;
++            let width = native_column_count(&installed.data);
++            let leaf = leaves.len();
++            leaves.push(MultiwayJoinLeaf {
++                plan: plan.clone(),
++                relation: *relation,
++                layout: *layout,
++                width,
++                rows: native_row_count(&installed.data),
++            });
++            Ok(Some(
++                (0..width)
++                    .map(|column| MultiwayJoinColumnRef { leaf, column })
++                    .collect(),
++            ))
++        }
++        Plan::JoinEq {
++            left,
++            right,
++            left_column,
++            right_column,
++            equivalence,
++            ..
++        } => {
++            let Some(mut left_columns) =
++                flatten_contiguous_join_tree(left, store, leaves, predicates)?
++            else {
++                return Ok(None);
++            };
++            let Some(right_columns) =
++                flatten_contiguous_join_tree(right, store, leaves, predicates)?
++            else {
++                return Ok(None);
++            };
++            let Some(left_ref) = left_columns.get(*left_column).copied() else {
++                return Err(RelQueryError::ColumnOutOfBounds.into());
++            };
++            let Some(right_ref) = right_columns.get(*right_column).copied() else {
++                return Err(RelQueryError::ColumnOutOfBounds.into());
++            };
++            predicates.push(MultiwayJoinPredicate {
++                left: left_ref,
++                right: right_ref,
++                equivalence: *equivalence,
++            });
++            left_columns.extend(right_columns);
++            Ok(Some(left_columns))
++        }
++        Plan::FilterEqColumns {
++            input,
++            left_column,
++            right_column,
++            equivalence,
++        } => {
++            let Some(columns) = flatten_contiguous_join_tree(input, store, leaves, predicates)?
++            else {
++                return Ok(None);
++            };
++            let Some(left_ref) = columns.get(*left_column).copied() else {
++                return Err(RelQueryError::ColumnOutOfBounds.into());
++            };
++            let Some(right_ref) = columns.get(*right_column).copied() else {
++                return Err(RelQueryError::ColumnOutOfBounds.into());
++            };
++            if left_ref.leaf == right_ref.leaf {
++                return Ok(None);
++            }
++            predicates.push(MultiwayJoinPredicate {
++                left: left_ref,
++                right: right_ref,
++                equivalence: *equivalence,
++            });
++            Ok(Some(columns))
++        }
++        _ => Ok(None),
++    }
++}
++
++fn execute_multiway_join_candidate(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
++    match plan {
++        Plan::FilterEqColumns {
++            input,
++            left_column,
++            right_column,
++            equivalence,
++        } => {
++            let input_rows =
++                execute_multiway_join_candidate(input, store, context, registry, stats)?;
++            filter_rows_columns(
++                input_rows,
++                *left_column,
++                *right_column,
++                *equivalence,
++                context,
++                registry,
++                stats,
++            )
++        }
++        Plan::JoinEq {
++            left,
++            right,
++            left_column,
++            right_column,
++            equivalence,
++            algorithm,
++        } => execute_join_plan(
++            left,
++            right,
++            *left_column,
++            *right_column,
++            *equivalence,
++            *algorithm,
++            store,
++            context,
++            registry,
++            stats,
++        ),
++        _ => plan.execute_native_rows(store, context, registry, stats),
++    }
++}
++
++fn interval_width(leaves: &[MultiwayJoinLeaf], start: usize, end: usize) -> usize {
++    leaves[start..=end]
++        .iter()
++        .fold(0_usize, |width, leaf| width.saturating_add(leaf.width))
++}
++
++fn interval_column(
++    leaves: &[MultiwayJoinLeaf],
++    start: usize,
++    column: MultiwayJoinColumnRef,
++) -> usize {
++    leaves[start..column.leaf]
++        .iter()
++        .fold(0_usize, |offset, leaf| offset.saturating_add(leaf.width))
++        .saturating_add(column.column)
++}
++
++fn crossing_join_predicates(
++    predicates: &[MultiwayJoinPredicate],
++    start: usize,
++    split: usize,
++    end: usize,
++) -> Vec<MultiwayJoinPredicate> {
++    predicates
++        .iter()
++        .filter_map(|predicate| {
++            let left_in_left = (start..=split).contains(&predicate.left.leaf);
++            let right_in_right = ((split + 1)..=end).contains(&predicate.right.leaf);
++            if left_in_left && right_in_right {
++                Some(*predicate)
++            } else {
++                let right_in_left = (start..=split).contains(&predicate.right.leaf);
++                let left_in_right = ((split + 1)..=end).contains(&predicate.left.leaf);
++                (right_in_left && left_in_right).then_some(MultiwayJoinPredicate {
++                    left: predicate.right,
++                    right: predicate.left,
++                    equivalence: predicate.equivalence,
++                })
++            }
++        })
++        .collect()
++}
++
++fn multiway_persisted_index_estimate(
++    store: &PhysicalStore,
++    leaf: &MultiwayJoinLeaf,
++    predicate: MultiwayJoinPredicate,
++    left_rows: usize,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<(u128, usize)>, PhysicalExecutionError> {
++    if let Some(index) = store.i64_index(I64IndexBinding {
++        relation: leaf.relation,
++        layout: leaf.layout,
++        key_column: predicate.right.column,
++        equivalence: predicate.equivalence,
++    }) {
++        let distinct = index.distinct_key_count();
++        if SemanticAccessCostModel::choose_join(left_rows, leaf.rows, distinct)
++            == SemanticAccessPath::PersistedIndex
++        {
++            let average_bucket = if distinct == 0 {
++                0
++            } else {
++                leaf.rows.div_ceil(distinct)
++            };
++            return Ok(Some((
++                (left_rows as u128).saturating_mul(1_u128 + average_bucket as u128),
++                left_rows.saturating_mul(average_bucket),
++            )));
++        }
++    }
++
++    let binding = SemanticIndexBinding::single(
++        leaf.relation,
++        leaf.layout,
++        predicate.right.column,
++        predicate.equivalence,
++    );
++    if let Some(index) = store.semantic_index(&binding)
++        && index.compatible_with(context, registry)?
++    {
++        let distinct = index.distinct_key_count();
++        if SemanticAccessCostModel::choose_join(left_rows, leaf.rows, distinct)
++            == SemanticAccessPath::PersistedIndex
++        {
++            let average_bucket = if distinct == 0 {
++                0
++            } else {
++                leaf.rows.div_ceil(distinct)
++            };
++            return Ok(Some((
++                (left_rows as u128).saturating_mul(1_u128 + average_bucket as u128),
++                left_rows.saturating_mul(average_bucket),
++            )));
++        }
++    }
++    Ok(None)
++}
++
++fn multiway_join_merge_estimate(
++    planner: &MultiwayPlannerContext<'_>,
++    crossing: &[MultiwayJoinPredicate],
++    interval: MultiwayJoinInterval,
++    left_rows: usize,
++    right_rows: usize,
++) -> Result<(u128, usize, usize), PhysicalExecutionError> {
++    let nested_work = (left_rows as u128).saturating_mul(right_rows as u128);
++    let mut best = (nested_work, left_rows.saturating_mul(right_rows), 0_usize);
++    if interval.split + 1 != interval.end {
++        return Ok(best);
++    }
++    let right_leaf = &planner.leaves[interval.end];
++    for (index, predicate) in crossing.iter().copied().enumerate() {
++        if let Some((work, output_rows)) = multiway_persisted_index_estimate(
++            planner.store,
++            right_leaf,
++            predicate,
++            left_rows,
++            planner.context,
++            planner.registry,
++        )? && work < best.0
++        {
++            best = (work, output_rows, index);
++        }
++    }
++    Ok(best)
++}
++
++fn build_multiway_join_merge(
++    planner: &MultiwayPlannerContext<'_>,
++    interval: MultiwayJoinInterval,
++    left: Plan,
++    right: Plan,
++    crossing: &[MultiwayJoinPredicate],
++    primary_index: usize,
++) -> Plan {
++    let leaves = planner.leaves;
++    let primary = crossing[primary_index];
++    let left_column = interval_column(leaves, interval.start, primary.left);
++    let right_column = interval_column(leaves, interval.split + 1, primary.right);
++    let mut plan = Plan::JoinEq {
++        left: Box::new(left),
++        right: Box::new(right),
++        left_column,
++        right_column,
++        equivalence: primary.equivalence,
++        algorithm: JoinAlgorithm::IndexedPrimitiveIfAvailable,
++    };
++    let left_width = interval_width(leaves, interval.start, interval.split);
++    for (index, predicate) in crossing.iter().copied().enumerate() {
++        if index == primary_index {
++            continue;
++        }
++        plan = Plan::FilterEqColumns {
++            input: Box::new(plan),
++            left_column: interval_column(leaves, interval.start, predicate.left),
++            right_column: left_width.saturating_add(interval_column(
++                leaves,
++                interval.split + 1,
++                predicate.right,
++            )),
++            equivalence: predicate.equivalence,
++        };
++    }
++    debug_assert_eq!(
++        interval_width(leaves, interval.start, interval.end),
++        left_width + interval_width(leaves, interval.split + 1, interval.end)
++    );
++    plan
++}
++
++fn optimize_contiguous_multiway_join(
++    plan: &Plan,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++) -> Result<Option<Plan>, PhysicalExecutionError> {
++    let mut leaves = Vec::new();
++    let mut predicates = Vec::new();
++    let Some(_) = flatten_contiguous_join_tree(plan, store, &mut leaves, &mut predicates)? else {
++        return Ok(None);
++    };
++    if leaves.len() < 3 || leaves.len() > 32 {
++        return Ok(None);
++    }
++
++    let planner = MultiwayPlannerContext {
++        store,
++        leaves: &leaves,
++        context,
++        registry,
++    };
++    let count = leaves.len();
++    let mut best = BTreeMap::<(usize, usize), MultiwayJoinCandidate>::new();
++    for (index, leaf) in leaves.iter().enumerate() {
++        best.insert(
++            (index, index),
++            MultiwayJoinCandidate {
++                plan: leaf.plan.clone(),
++                cost: 0,
++                estimated_rows: leaf.rows,
++            },
++        );
++    }
++
++    for len in 2..=count {
++        for start in 0..=(count - len) {
++            let end = start + len - 1;
++            let mut interval_best: Option<MultiwayJoinCandidate> = None;
++            for split in start..end {
++                let crossing = crossing_join_predicates(&predicates, start, split, end);
++                if crossing.is_empty() {
++                    continue;
++                }
++                let Some(left) = best.get(&(start, split)) else {
++                    continue;
++                };
++                let Some(right) = best.get(&(split + 1, end)) else {
++                    continue;
++                };
++                let interval = MultiwayJoinInterval { start, split, end };
++                let (join_work, estimated_rows, primary_index) = multiway_join_merge_estimate(
++                    &planner,
++                    &crossing,
++                    interval,
++                    left.estimated_rows,
++                    right.estimated_rows,
++                )?;
++                let candidate = MultiwayJoinCandidate {
++                    plan: build_multiway_join_merge(
++                        &planner,
++                        interval,
++                        left.plan.clone(),
++                        right.plan.clone(),
++                        &crossing,
++                        primary_index,
++                    ),
++                    cost: left
++                        .cost
++                        .saturating_add(right.cost)
++                        .saturating_add(join_work),
++                    estimated_rows,
++                };
++                let replace = interval_best.as_ref().is_none_or(|current| {
++                    candidate.cost < current.cost
++                        || (candidate.cost == current.cost
++                            && candidate.estimated_rows < current.estimated_rows)
++                });
++                if replace {
++                    interval_best = Some(candidate);
++                }
++            }
++            if let Some(candidate) = interval_best {
++                best.insert((start, end), candidate);
++            }
++        }
++    }
++
++    let Some(candidate) = best.remove(&(0, count - 1)) else {
++        return Ok(None);
++    };
++    if candidate.plan == *plan {
++        Ok(None)
++    } else {
++        Ok(Some(candidate.plan))
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn execute_join_plan(
+     left: &Plan,
+@@ -6182,7 +6720,44 @@
+     registry: &kernel_semantics::SemanticRegistry,
+     stats: &mut ExecutionStats,
+ ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
++    let key = JoinKeySpec {
++        left_column,
++        right_column,
++        equivalence,
++    };
+     if algorithm == JoinAlgorithm::IndexedPrimitiveIfAvailable {
++        if direct_scan_relation(left).is_none() && direct_scan_relation(right).is_some() {
++            let left_rows = left.execute_native_rows(store, context, registry, stats)?;
++            if let Some(rows) = try_execute_indexed_right_scan_join_from_rows(
++                &left_rows, right, key, store, context, registry, stats,
++            )? {
++                return Ok(rows);
++            }
++            let right_rows = right.execute_native_rows(store, context, registry, stats)?;
++            return join_rows(
++                &left_rows,
++                &right_rows,
++                left_column,
++                right_column,
++                equivalence,
++                context,
++                registry,
++            );
++        }
++        if let Some(rows) = try_execute_indexed_i64_join(
++            left,
++            right,
++            left_column,
++            right_column,
++            equivalence,
++            store,
++            context,
++            registry,
++            stats,
++            false,
++        )? {
++            return Ok(rows);
++        }
+         if let Some(rows) = try_execute_persisted_semantic_join(
+             left,
+             right,
+@@ -6206,9 +6781,15 @@
+             context,
+             registry,
+             stats,
++            true,
+         )? {
+             return Ok(rows);
+         }
++        if let Some(rows) =
++            try_execute_ephemeral_semantic_join(left, right, key, store, context, registry, stats)?
++        {
++            return Ok(rows);
++        }
+     }
+     let left_rows = left.execute_native_rows(store, context, registry, stats)?;
+     let right_rows = right.execute_native_rows(store, context, registry, stats)?;
+@@ -6223,6 +6804,182 @@
+     )
+ }
+ 
++#[derive(Debug, Clone, Copy)]
++struct JoinKeySpec {
++    left_column: usize,
++    right_column: usize,
++    equivalence: SemanticId,
++}
++
++struct RightScanJoinInputs<'a> {
++    left_rows: &'a [kernel_query::Row],
++    right: &'a InstalledRelation,
++    right_relation: SemanticId,
++    right_layout: LayoutBinding,
++    key: JoinKeySpec,
++}
++
++fn try_join_rows_with_persisted_i64(
++    inputs: &RightScanJoinInputs<'_>,
++    resolved: Option<&kernel_semantics::ResolvedPrimitiveEquivalence>,
++    store: &PhysicalStore,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let Some(resolved) = resolved else {
++        return Ok(None);
++    };
++    if !matches!(
++        resolved.bind_right(&Value::I64(0)),
++        Ok(kernel_semantics::BoundPrimitivePredicate::I64(_))
++    ) {
++        return Ok(None);
++    }
++    let Some(index) = store.i64_index(I64IndexBinding {
++        relation: inputs.right_relation,
++        layout: inputs.right_layout,
++        key_column: inputs.key.right_column,
++        equivalence: inputs.key.equivalence,
++    }) else {
++        return Ok(None);
++    };
++    if SemanticAccessCostModel::choose_join(
++        inputs.left_rows.len(),
++        native_row_count(&inputs.right.data),
++        index.distinct_key_count(),
++    ) == SemanticAccessPath::FullScan
++    {
++        stats.persisted_index_cost_rejections =
++            stats.persisted_index_cost_rejections.saturating_add(1);
++        return Ok(None);
++    }
++
++    let mut out = Vec::new();
++    for left_row in inputs.left_rows {
++        let Some(Value::I64(key)) = left_row.get(inputs.key.left_column) else {
++            return Err(RelQueryError::ColumnOutOfBounds.into());
++        };
++        stats.scanned_rows = stats.scanned_rows.saturating_add(1);
++        stats.values_read = stats.values_read.saturating_add(1);
++        if let Some(right_ids) = index.probe(*key) {
++            for right_id in right_ids {
++                let position = inputs
++                    .right
++                    .position(*right_id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let right_row = materialize_native_row(&inputs.right.data, position)?;
++                let mut row = left_row.clone();
++                row.extend(right_row);
++                stats.values_read = stats.values_read.saturating_add(row.len());
++                out.push(row);
++            }
++        }
++    }
++    stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
++    Ok(Some(out))
++}
++
++fn try_join_rows_with_persisted_semantic(
++    inputs: &RightScanJoinInputs<'_>,
++    resolved: Option<&kernel_semantics::ResolvedPrimitiveEquivalence>,
++    store: &PhysicalStore,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let binding = SemanticIndexBinding::single(
++        inputs.right_relation,
++        inputs.right_layout,
++        inputs.key.right_column,
++        inputs.key.equivalence,
++    );
++    let Some(index) = store.semantic_index(&binding) else {
++        return Ok(None);
++    };
++    let Some(resolved) = resolved else {
++        return Ok(None);
++    };
++    if SemanticAccessCostModel::choose_join(
++        inputs.left_rows.len(),
++        native_row_count(&inputs.right.data),
++        index.distinct_key_count(),
++    ) == SemanticAccessPath::FullScan
++    {
++        stats.persisted_index_cost_rejections =
++            stats.persisted_index_cost_rejections.saturating_add(1);
++        return Ok(None);
++    }
++
++    let mut out = Vec::new();
++    for left_row in inputs.left_rows {
++        let left_key = left_row
++            .get(inputs.key.left_column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        stats.scanned_rows = stats.scanned_rows.saturating_add(1);
++        stats.values_read = stats.values_read.saturating_add(1);
++        if let Some(right_ids) = index.probe_value(left_key)? {
++            for right_id in right_ids {
++                let position = inputs
++                    .right
++                    .position(*right_id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let right_row = materialize_native_row(&inputs.right.data, position)?;
++                let right_key = right_row
++                    .get(inputs.key.right_column)
++                    .ok_or(RelQueryError::ColumnOutOfBounds)?;
++                if !resolved.equivalent(left_key, right_key)? {
++                    return Err(RelQueryError::InconsistentIncrementalDelta.into());
++                }
++                let mut row = left_row.clone();
++                row.extend(right_row);
++                stats.values_read = stats
++                    .values_read
++                    .saturating_add(row.len().saturating_add(1));
++                out.push(row);
++            }
++        }
++    }
++    stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
++    Ok(Some(out))
++}
++
++fn try_execute_indexed_right_scan_join_from_rows(
++    left_rows: &[kernel_query::Row],
++    right: &Plan,
++    key: JoinKeySpec,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let Some((right_relation, right_layout)) = direct_scan_relation(right) else {
++        return Ok(None);
++    };
++    let right_installed = store.installed(right_relation, right_layout)?;
++    let resolved = registry.resolve_primitive_equivalence(context, key.equivalence)?;
++    let inputs = RightScanJoinInputs {
++        left_rows,
++        right: right_installed,
++        right_relation,
++        right_layout,
++        key,
++    };
++
++    if let Some(rows) = try_join_rows_with_persisted_i64(&inputs, resolved.as_ref(), store, stats)?
++    {
++        return Ok(Some(rows));
++    }
++    let binding = SemanticIndexBinding::single(
++        right_relation,
++        right_layout,
++        key.right_column,
++        key.equivalence,
++    );
++    if let Some(index) = store.semantic_index(&binding)
++        && index.compatible_with(context, registry)?
++    {
++        return try_join_rows_with_persisted_semantic(&inputs, resolved.as_ref(), store, stats);
++    }
++    Ok(None)
++}
++
+ fn direct_columnar_scan(plan: &Plan) -> bool {
+     matches!(
+         plan,
+@@ -6400,6 +7157,14 @@
+         key_column: right_column,
+         equivalence,
+     }) {
++        if SemanticAccessCostModel::choose_join(
++            left_keys.len(),
++            right_keys.len(),
++            index.distinct_key_count(),
++        ) == SemanticAccessPath::FullScan
++        {
++            return Ok(None);
++        }
+         for left_index in left_installed.scan_positions() {
+             if let Some(right_rows) = index.probe(left_keys[left_index]) {
+                 for right_row_id in right_rows {
+@@ -6421,6 +7186,15 @@
+         return Ok(Some(out));
+     }
+ 
++    if SemanticAccessCostModel::choose_ephemeral_join(
++        left_keys.len(),
++        right_keys.len(),
++        right_keys.len(),
++        1,
++    ) == SemanticAccessPath::FullScan
++    {
++        return Ok(None);
++    }
+     let mut right_index: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+     for row_index in right_installed.scan_positions() {
+         right_index
+@@ -6428,6 +7202,15 @@
+             .or_default()
+             .push(row_index);
+     }
++    if SemanticAccessCostModel::choose_ephemeral_join(
++        left_keys.len(),
++        right_keys.len(),
++        right_index.len(),
++        1,
++    ) == SemanticAccessPath::FullScan
++    {
++        return Ok(None);
++    }
+     for left_index in left_installed.scan_positions() {
+         if let Some(right_rows) = right_index.get(&left_keys[left_index]) {
+             for &right_index in right_rows {
+@@ -7535,13 +8318,10 @@
+     Ok(Some(out))
+ }
+ 
+-#[allow(clippy::too_many_arguments)]
+-fn try_execute_indexed_i64_join(
++fn try_execute_ephemeral_semantic_join(
+     left: &Plan,
+     right: &Plan,
+-    left_column: usize,
+-    right_column: usize,
+-    equivalence: SemanticId,
++    key: JoinKeySpec,
+     store: &PhysicalStore,
+     context: &kernel_schema::SemanticContext,
+     registry: &kernel_semantics::SemanticRegistry,
+@@ -7553,76 +8333,195 @@
+     let Some((right_relation, right_layout)) = direct_scan_relation(right) else {
+         return Ok(None);
+     };
+-    let Some(resolved) = registry.resolve_primitive_equivalence(context, equivalence)? else {
++    let binding = SemanticIndexBinding::single(
++        right_relation,
++        right_layout,
++        key.right_column,
++        key.equivalence,
++    );
++    if !primitive_binding_supported(&binding, context, registry)? {
+         return Ok(None);
+-    };
+-    if !matches!(
++    }
++    if let Some(existing) = store.semantic_index(&binding)
++        && existing.compatible_with(context, registry)?
++    {
++        return Ok(None);
++    }
++    let resolved = registry
++        .resolve_primitive_equivalence(context, key.equivalence)?
++        .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
++    if matches!(
+         resolved.bind_right(&Value::I64(0)),
+         Ok(kernel_semantics::BoundPrimitivePredicate::I64(_))
+-    ) {
++    ) && store
++        .i64_index(I64IndexBinding {
++            relation: right_relation,
++            layout: right_layout,
++            key_column: key.right_column,
++            equivalence: key.equivalence,
++        })
++        .is_some()
++    {
+         return Ok(None);
+     }
+-
+     let left_installed = store.installed(left_relation, left_layout)?;
+-    let left_data = &left_installed.data;
+     let right_installed = store.installed(right_relation, right_layout)?;
+-    let right_data = &right_installed.data;
+-    validate_indexable_i64_relation(context, left_relation, left_data)?;
+-    validate_indexable_i64_relation(context, right_relation, right_data)?;
+-    let Some(left_keys) = native_i64_column(left_data, left_column) else {
++    let left_rows = native_row_count(&left_installed.data);
++    let right_rows = native_row_count(&right_installed.data);
++    if SemanticAccessCostModel::choose_ephemeral_join(left_rows, right_rows, right_rows, 1)
++        == SemanticAccessPath::FullScan
++    {
+         return Ok(None);
+-    };
+-    if let Some(index) = store.i64_index(I64IndexBinding {
+-        relation: right_relation,
+-        layout: right_layout,
+-        key_column: right_column,
+-        equivalence,
+-    }) {
+-        let left_i64_columns = native_all_i64_columns(left_data);
+-        let right_i64_columns = native_all_i64_columns(right_data);
+-        let mut out = Vec::with_capacity(left_keys.len());
+-        for left_index in left_installed.scan_positions() {
+-            let key = left_keys[left_index];
+-            if let Some(right_rows) = index.probe(key) {
+-                for right_row_id in right_rows {
+-                    let right_index = right_installed
+-                        .position(*right_row_id)
+-                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+-                    let mut row = Vec::with_capacity(
+-                        native_column_count(left_data)
+-                            .saturating_add(native_column_count(right_data)),
+-                    );
+-                    if let (Some(left_columns), Some(right_columns)) =
+-                        (&left_i64_columns, &right_i64_columns)
+-                    {
+-                        append_i64_row_values(&mut row, left_columns, left_index);
+-                        append_i64_row_values(&mut row, right_columns, right_index);
+-                    } else {
+-                        append_native_row_values(&mut row, left_data, left_index)?;
+-                        append_native_row_values(&mut row, right_data, right_index)?;
+-                    }
+-                    out.push(row);
++    }
++    let transient_index =
++        MaterializedSemanticIndexState::build(binding, right_installed, context, registry)?;
++    stats.ephemeral_index_builds = stats.ephemeral_index_builds.saturating_add(1);
++    if SemanticAccessCostModel::choose_ephemeral_join(
++        left_rows,
++        right_rows,
++        transient_index.distinct_key_count(),
++        1,
++    ) == SemanticAccessPath::FullScan
++    {
++        stats.persisted_index_cost_rejections =
++            stats.persisted_index_cost_rejections.saturating_add(1);
++        return Ok(None);
++    }
++    let mut out = Vec::new();
++    for left_position in left_installed.scan_positions() {
++        let left_row = materialize_native_row(&left_installed.data, left_position)?;
++        let left_key = left_row
++            .get(key.left_column)
++            .ok_or(RelQueryError::ColumnOutOfBounds)?;
++        stats.scanned_rows = stats.scanned_rows.saturating_add(1);
++        stats.values_read = stats.values_read.saturating_add(1);
++        if let Some(right_ids) = transient_index.probe_value(left_key)? {
++            for right_id in right_ids {
++                let right_position = right_installed
++                    .position(*right_id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let right_row = materialize_native_row(&right_installed.data, right_position)?;
++                let right_key = right_row
++                    .get(key.right_column)
++                    .ok_or(RelQueryError::ColumnOutOfBounds)?;
++                if !resolved.equivalent(left_key, right_key)? {
++                    return Err(RelQueryError::InconsistentIncrementalDelta.into());
+                 }
++                let mut row = left_row.clone();
++                row.extend(right_row);
++                stats.values_read = stats
++                    .values_read
++                    .saturating_add(row.len().saturating_add(1));
++                out.push(row);
+             }
+         }
+-        stats.scanned_rows = stats.scanned_rows.saturating_add(left_keys.len());
+-        account_join_reads(stats, left_keys.len(), 0, out.len(), left_data, right_data);
+-        stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+-        return Ok(Some(out));
+     }
+-    let Some(right_keys) = native_i64_column(right_data, right_column) else {
++    Ok(Some(out))
++}
++
++struct DirectI64JoinInputs<'a> {
++    left: &'a InstalledRelation,
++    right: &'a InstalledRelation,
++    left_keys: &'a [i64],
++    right_column: usize,
++}
++
++fn execute_persisted_i64_join(
++    inputs: &DirectI64JoinInputs<'_>,
++    index: &MaterializedI64IndexState,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let left_data = &inputs.left.data;
++    let right_data = &inputs.right.data;
++    if SemanticAccessCostModel::choose_join(
++        inputs.left_keys.len(),
++        native_row_count(right_data),
++        index.distinct_key_count(),
++    ) == SemanticAccessPath::FullScan
++    {
++        stats.persisted_index_cost_rejections =
++            stats.persisted_index_cost_rejections.saturating_add(1);
++        return Ok(None);
++    }
++    let left_i64_columns = native_all_i64_columns(left_data);
++    let right_i64_columns = native_all_i64_columns(right_data);
++    let mut out = Vec::with_capacity(inputs.left_keys.len());
++    for left_index in inputs.left.scan_positions() {
++        let key = inputs.left_keys[left_index];
++        if let Some(right_rows) = index.probe(key) {
++            for right_row_id in right_rows {
++                let right_index = inputs
++                    .right
++                    .position(*right_row_id)
++                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
++                let mut row = Vec::with_capacity(
++                    native_column_count(left_data).saturating_add(native_column_count(right_data)),
++                );
++                if let (Some(left_columns), Some(right_columns)) =
++                    (&left_i64_columns, &right_i64_columns)
++                {
++                    append_i64_row_values(&mut row, left_columns, left_index);
++                    append_i64_row_values(&mut row, right_columns, right_index);
++                } else {
++                    append_native_row_values(&mut row, left_data, left_index)?;
++                    append_native_row_values(&mut row, right_data, right_index)?;
++                }
++                out.push(row);
++            }
++        }
++    }
++    stats.scanned_rows = stats.scanned_rows.saturating_add(inputs.left_keys.len());
++    account_join_reads(
++        stats,
++        inputs.left_keys.len(),
++        0,
++        out.len(),
++        left_data,
++        right_data,
++    );
++    stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
++    Ok(Some(out))
++}
++
++fn execute_ephemeral_i64_join(
++    inputs: &DirectI64JoinInputs<'_>,
++    stats: &mut ExecutionStats,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let left_data = &inputs.left.data;
++    let right_data = &inputs.right.data;
++    let Some(right_keys) = native_i64_column(right_data, inputs.right_column) else {
+         return Ok(None);
+     };
++    if SemanticAccessCostModel::choose_ephemeral_join(
++        inputs.left_keys.len(),
++        right_keys.len(),
++        right_keys.len(),
++        1,
++    ) == SemanticAccessPath::FullScan
++    {
++        return Ok(None);
++    }
+ 
+     stats.ephemeral_index_builds = stats.ephemeral_index_builds.saturating_add(1);
+     let mut right_index: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+-    for row_index in right_installed.scan_positions() {
++    for row_index in inputs.right.scan_positions() {
+         let key = right_keys[row_index];
+         right_index.entry(key).or_default().push(row_index);
+     }
+-    let mut out = Vec::with_capacity(left_keys.len());
+-    for left_index in left_installed.scan_positions() {
+-        let key = left_keys[left_index];
++    if SemanticAccessCostModel::choose_ephemeral_join(
++        inputs.left_keys.len(),
++        right_keys.len(),
++        right_index.len(),
++        1,
++    ) == SemanticAccessPath::FullScan
++    {
++        stats.persisted_index_cost_rejections =
++            stats.persisted_index_cost_rejections.saturating_add(1);
++        return Ok(None);
++    }
++    let mut out = Vec::with_capacity(inputs.left_keys.len());
++    for left_index in inputs.left.scan_positions() {
++        let key = inputs.left_keys[left_index];
+         if let Some(right_rows) = right_index.get(&key) {
+             for right_index in right_rows {
+                 let mut row = Vec::with_capacity(
+@@ -7636,10 +8535,10 @@
+     }
+     stats.scanned_rows = stats
+         .scanned_rows
+-        .saturating_add(left_keys.len().saturating_add(right_keys.len()));
++        .saturating_add(inputs.left_keys.len().saturating_add(right_keys.len()));
+     account_join_reads(
+         stats,
+-        left_keys.len(),
++        inputs.left_keys.len(),
+         right_keys.len(),
+         out.len(),
+         left_data,
+@@ -7648,6 +8547,66 @@
+     Ok(Some(out))
+ }
+ 
++#[allow(clippy::too_many_arguments)]
++fn try_execute_indexed_i64_join(
++    left: &Plan,
++    right: &Plan,
++    left_column: usize,
++    right_column: usize,
++    equivalence: SemanticId,
++    store: &PhysicalStore,
++    context: &kernel_schema::SemanticContext,
++    registry: &kernel_semantics::SemanticRegistry,
++    stats: &mut ExecutionStats,
++    allow_ephemeral: bool,
++) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
++    let Some((left_relation, left_layout)) = direct_scan_relation(left) else {
++        return Ok(None);
++    };
++    let Some((right_relation, right_layout)) = direct_scan_relation(right) else {
++        return Ok(None);
++    };
++    let Some(resolved) = registry.resolve_primitive_equivalence(context, equivalence)? else {
++        return Ok(None);
++    };
++    if !matches!(
++        resolved.bind_right(&Value::I64(0)),
++        Ok(kernel_semantics::BoundPrimitivePredicate::I64(_))
++    ) {
++        return Ok(None);
++    }
++
++    let left_installed = store.installed(left_relation, left_layout)?;
++    let right_installed = store.installed(right_relation, right_layout)?;
++    validate_indexable_i64_relation(context, left_relation, &left_installed.data)?;
++    validate_indexable_i64_relation(context, right_relation, &right_installed.data)?;
++    let Some(left_keys) = native_i64_column(&left_installed.data, left_column) else {
++        return Ok(None);
++    };
++    let inputs = DirectI64JoinInputs {
++        left: left_installed,
++        right: right_installed,
++        left_keys,
++        right_column,
++    };
++    let binding = I64IndexBinding {
++        relation: right_relation,
++        layout: right_layout,
++        key_column: right_column,
++        equivalence,
++    };
++    if let Some(index) = store.i64_index(binding) {
++        if allow_ephemeral {
++            return Ok(None);
++        }
++        return execute_persisted_i64_join(&inputs, index, stats);
++    }
++    if !allow_ephemeral {
++        return Ok(None);
++    }
++    execute_ephemeral_i64_join(&inputs, stats)
++}
++
+ fn account_join_reads(
+     stats: &mut ExecutionStats,
+     left_keys: usize,
+@@ -9587,7 +10546,8 @@
+                 ..
+             }
+         ));
+-        let values = vec![1_i64, 1, 2];
++        let mut values = (1_i64..=64).collect::<Vec<_>>();
++        values.insert(1, 1);
+         let mut store = PhysicalStore::default();
+         store
+             .install(
+@@ -9607,9 +10567,9 @@
+         );
+         let reference = logical.evaluate(&model, &context, &registry).unwrap();
+         assert_eq!(native, reference);
+-        assert_eq!(stats.scanned_rows, 6);
+-        assert_eq!(stats.values_read, 16);
+-        assert_eq!(stats.output_rows, 5);
++        assert_eq!(stats.scanned_rows, 130);
++        assert_eq!(stats.output_rows, 67);
++        assert_eq!(stats.ephemeral_index_builds, 1);
+     }
+ 
+     #[test]
+@@ -9640,7 +10600,8 @@
+         catalog.bind_relation(relation, binding);
+         let prepared =
+             prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
+-        let values = vec![1_i64, 1, 2];
++        let mut values = (1_i64..=64).collect::<Vec<_>>();
++        values.insert(1, 1);
+         let mut store = PhysicalStore::default();
+         store
+             .install(
+@@ -9667,7 +10628,7 @@
+         assert_eq!(stats.persisted_index_hits, 1);
+         assert_eq!(stats.ephemeral_index_builds, 0);
+         assert_eq!(stats.fused_join_project_hits, 1);
+-        assert_eq!(stats.output_rows, 5);
++        assert_eq!(stats.output_rows, 67);
+     }
+ 
+     #[test]
+@@ -9704,7 +10665,8 @@
+         catalog.bind_relation(relation, binding);
+         let prepared =
+             prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
+-        let source_rows = [(1_i64, 10_i64), (1, 20), (2, 20)];
++        let mut source_rows = vec![(1_i64, 10_i64), (1, 20), (2, 20)];
++        source_rows.extend((3_i64..64).map(|key| (key, 1_000 + key)));
+         let mut store = PhysicalStore::default();
+         store
+             .install(
+@@ -9726,7 +10688,8 @@
+         model.relations.insert(
+             relation,
+             source_rows
+-                .into_iter()
++                .iter()
++                .copied()
+                 .map(|(key, payload)| vec![Value::I64(key), Value::I64(payload)])
+                 .collect(),
+         );
+@@ -9769,7 +10732,8 @@
+             .install(
+                 relation,
+                 binding,
+-                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 1, 2])]).unwrap(),
++                NativeRelation::typed_columnar(vec![NativeColumn::I64((1_i64..=64).collect())])
++                    .unwrap(),
+             )
+             .unwrap();
+         store
+@@ -9786,7 +10750,7 @@
+             .unwrap();
+ 
+         let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
+-        assert_eq!(native.rows().len(), 5);
++        assert_eq!(native.rows().len(), 64);
+         assert_eq!(stats.persisted_index_hits, 1);
+         assert_eq!(stats.ephemeral_index_builds, 0);
+ 
+@@ -9794,7 +10758,7 @@
+             .typecheck(&context, &registry)
+             .unwrap();
+         let delta = RelationDelta {
+-            inserted: vec![vec![Value::I64(3)]],
++            inserted: vec![vec![Value::I64(65)]],
+             removed: vec![vec![Value::I64(1)]],
+             result_type,
+         };
+@@ -9809,10 +10773,10 @@
+                 equivalence: sid(101),
+             })
+             .unwrap();
+-        assert_eq!(index.row_count(), 3);
+-        assert_eq!(index.probe(1).unwrap().len(), 1);
++        assert_eq!(index.row_count(), 64);
++        assert!(index.probe(1).is_none());
+         assert_eq!(index.probe(2).unwrap().len(), 1);
+-        assert_eq!(index.probe(3).unwrap().len(), 1);
++        assert_eq!(index.probe(65).unwrap().len(), 1);
+     }
+ 
+     #[test]
+@@ -11211,6 +12175,7 @@
+         let prepared =
+             prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
+         let mut rows = vec![(1_i64, 10_i64), (1, 20), (2, 30), (3, 40)];
++        rows.extend((5_i64..=64).map(|key| (key, 1_000 + key)));
+         let mut store = PhysicalStore::default();
+         store
+             .install(
+@@ -11455,6 +12420,70 @@
+         assert_eq!(native, reference);
+     }
+ 
++    #[test]
++    fn large_text_join_builds_profitable_ephemeral_semantic_index() {
++        let relation = sid(344);
++        let equivalence = sid(345);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(36));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(36));
++        schema
++            .define_relation(RelationDef {
++                id: relation,
++                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
++                semantics: RelationSemantics::Bag {
++                    column_equivalences: vec![equivalence],
++                },
++            })
++            .unwrap();
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let binding = LayoutBinding {
++            id: LayoutId(936),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(relation)),
++            right: Box::new(RelExpr::Scan(relation)),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let mut values = vec!["Needle".to_owned(), "needle".to_owned()];
++        values.extend((2..128).map(|value| format!("key-{value}")));
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::Text(values.clone())]).unwrap(),
++            )
++            .unwrap();
++
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            values
++                .into_iter()
++                .map(|value| vec![Value::Text(value)])
++                .collect(),
++        );
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(native.rows().len(), 130);
++        assert_eq!(stats.persisted_index_hits, 0);
++        assert_eq!(stats.ephemeral_index_builds, 1);
++    }
++
+     fn text_semantic_index_fixture() -> (
+         SemanticContext,
+         SemanticRegistry,
+@@ -11548,6 +12577,500 @@
+     }
+ 
+     #[test]
++    fn cost_model_rejects_unprofitable_persisted_i64_index_without_ephemeral_fallback() {
++        let (context, registry, relation) = planning_context();
++        let binding = LayoutBinding {
++            id: LayoutId(997),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(relation)),
++            right: Box::new(RelExpr::Scan(relation)),
++            left_column: 0,
++            right_column: 0,
++            equivalence: sid(101),
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![NativeColumn::I64(vec![1, 2])]).unwrap(),
++            )
++            .unwrap();
++        store
++            .install_i64_index(
++                I64IndexBinding {
++                    relation,
++                    layout: binding,
++                    key_column: 0,
++                    equivalence: sid(101),
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model
++            .relations
++            .insert(relation, vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(stats.persisted_index_hits, 0);
++        assert_eq!(stats.persisted_index_cost_rejections, 1);
++        assert_eq!(stats.ephemeral_index_builds, 0);
++    }
++
++    #[test]
++    fn cost_model_rejects_unprofitable_i64_index_before_join_batch_fast_path() {
++        let relation = sid(346);
++        let equivalence = sid(347);
++        let (context, registry) = two_i64_column_context(relation, equivalence, 43);
++        let logical = RelExpr::Project {
++            input: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(relation)),
++                right: Box::new(RelExpr::Scan(relation)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            columns: vec![1, 3],
++        };
++        let binding = LayoutBinding {
++            id: LayoutId(998),
++            family: LayoutFamily::Columnar,
++        };
++        let mut catalog = PhysicalCatalog::default();
++        catalog.bind_relation(relation, binding);
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let mut store = PhysicalStore::default();
++        store
++            .install(
++                relation,
++                binding,
++                NativeRelation::typed_columnar(vec![
++                    NativeColumn::I64(vec![1, 2]),
++                    NativeColumn::I64(vec![10, 20]),
++                ])
++                .unwrap(),
++            )
++            .unwrap();
++        store
++            .install_i64_index(
++                I64IndexBinding {
++                    relation,
++                    layout: binding,
++                    key_column: 0,
++                    equivalence,
++                },
++                &context,
++                &registry,
++            )
++            .unwrap();
++
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            relation,
++            vec![
++                vec![Value::I64(1), Value::I64(10)],
++                vec![Value::I64(2), Value::I64(20)],
++            ],
++        );
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(stats.persisted_index_hits, 0);
++        assert_eq!(stats.ephemeral_index_builds, 0);
++        assert_eq!(stats.fused_join_project_hits, 0);
++        assert_eq!(stats.persisted_index_cost_rejections, 1);
++    }
++
++    fn three_relation_i64_context() -> (
++        SemanticContext,
++        SemanticRegistry,
++        [SemanticId; 3],
++        SemanticId,
++    ) {
++        let relations = [sid(700), sid(701), sid(702)];
++        let equivalence = sid(703);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(700));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(700));
++        for relation in relations {
++            schema
++                .define_relation(RelationDef {
++                    id: relation,
++                    columns: vec![TypeExpr::Scalar(ScalarType::I64)],
++                    semantics: RelationSemantics::Bag {
++                        column_equivalences: vec![equivalence],
++                    },
++                })
++                .unwrap();
++        }
++        (
++            SemanticContext {
++                schema,
++                environment,
++            },
++            registry,
++            relations,
++            equivalence,
++        )
++    }
++
++    #[test]
++    fn multiway_join_planner_reassociates_contiguous_tree_and_reuses_indexes_after_intermediate() {
++        let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();
++        let bindings = [
++            LayoutBinding {
++                id: LayoutId(1000),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1001),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1002),
++                family: LayoutFamily::Columnar,
++            },
++        ];
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, binding) in [a, b, c].into_iter().zip(bindings) {
++            catalog.bind_relation(relation, binding);
++        }
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(a)),
++            right: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(b)),
++                right: Box::new(RelExpr::Scan(c)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let a_values = vec![1_i64, 2];
++        let b_values = (1_i64..=1_000).collect::<Vec<_>>();
++        let c_values = (1_i64..=1_000).collect::<Vec<_>>();
++        let mut store = PhysicalStore::default();
++        for (relation, binding, values) in [
++            (a, bindings[0], a_values.clone()),
++            (b, bindings[1], b_values.clone()),
++            (c, bindings[2], c_values.clone()),
++        ] {
++            store
++                .install(
++                    relation,
++                    binding,
++                    NativeRelation::typed_columnar(vec![NativeColumn::I64(values)]).unwrap(),
++                )
++                .unwrap();
++        }
++        for (relation, binding) in [(b, bindings[1]), (c, bindings[2])] {
++            store
++                .install_semantic_index(
++                    SemanticIndexBinding::single(relation, binding, 0, equivalence),
++                    &context,
++                    &registry,
++                )
++                .unwrap();
++        }
++
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let mut model = kernel_model::FiniteModel::default();
++        model.relations.insert(
++            a,
++            a_values
++                .into_iter()
++                .map(|value| vec![Value::I64(value)])
++                .collect(),
++        );
++        model.relations.insert(
++            b,
++            b_values
++                .into_iter()
++                .map(|value| vec![Value::I64(value)])
++                .collect(),
++        );
++        model.relations.insert(
++            c,
++            c_values
++                .into_iter()
++                .map(|value| vec![Value::I64(value)])
++                .collect(),
++        );
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(stats.multiway_join_reorders, 1);
++        assert_eq!(stats.persisted_index_hits, 2);
++        assert_eq!(native.rows().len(), 2);
++    }
++
++    #[test]
++    #[ignore = "diagnostic release benchmark"]
++    fn pass44_multiway_join_reassociation_benchmark() {
++        let (context, registry, [a, b, c], equivalence) = three_relation_i64_context();
++        let bindings = [
++            LayoutBinding {
++                id: LayoutId(1010),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1011),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1012),
++                family: LayoutFamily::Columnar,
++            },
++        ];
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, binding) in [a, b, c].into_iter().zip(bindings) {
++            catalog.bind_relation(relation, binding);
++        }
++        let logical = RelExpr::JoinEq {
++            left: Box::new(RelExpr::Scan(a)),
++            right: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(b)),
++                right: Box::new(RelExpr::Scan(c)),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            left_column: 0,
++            right_column: 0,
++            equivalence,
++        };
++        let prepared = prepare_with_catalog(logical, &context, &registry, &catalog).unwrap();
++        let mut store = PhysicalStore::default();
++        for (relation, binding, values) in [
++            (a, bindings[0], (1_i64..=50).collect::<Vec<_>>()),
++            (b, bindings[1], (1_i64..=10_000).collect::<Vec<_>>()),
++            (c, bindings[2], (1_i64..=10_000).collect::<Vec<_>>()),
++        ] {
++            store
++                .install(
++                    relation,
++                    binding,
++                    NativeRelation::typed_columnar(vec![NativeColumn::I64(values)]).unwrap(),
++                )
++                .unwrap();
++        }
++        for (relation, binding) in [(b, bindings[1]), (c, bindings[2])] {
++            store
++                .install_semantic_index(
++                    SemanticIndexBinding::single(relation, binding, 0, equivalence),
++                    &context,
++                    &registry,
++                )
++                .unwrap();
++        }
++        let optimized =
++            optimize_contiguous_multiway_join(prepared.physical(), &store, &context, &registry)
++                .unwrap()
++                .unwrap();
++        let mut baseline_ns = Vec::new();
++        let mut optimized_ns = Vec::new();
++        for _ in 0..7 {
++            let start = std::time::Instant::now();
++            let baseline = execute_multiway_join_candidate(
++                prepared.physical(),
++                &store,
++                &context,
++                &registry,
++                &mut ExecutionStats::default(),
++            )
++            .unwrap();
++            baseline_ns.push(start.elapsed().as_nanos());
++
++            let start = std::time::Instant::now();
++            let optimized_rows = execute_multiway_join_candidate(
++                &optimized,
++                &store,
++                &context,
++                &registry,
++                &mut ExecutionStats::default(),
++            )
++            .unwrap();
++            optimized_ns.push(start.elapsed().as_nanos());
++            assert_eq!(baseline, optimized_rows);
++        }
++        baseline_ns.sort_unstable();
++        optimized_ns.sort_unstable();
++        let baseline_median = baseline_ns[baseline_ns.len() / 2];
++        let optimized_median = optimized_ns[optimized_ns.len() / 2];
++        let ratio_milli = baseline_median
++            .saturating_mul(1_000)
++            .checked_div(optimized_median.max(1))
++            .unwrap_or(u128::MAX);
++        println!(
++            "PASS44_MULTIWAY_BENCH baseline_median_ns={baseline_median} optimized_median_ns={optimized_median} ratio_milli={ratio_milli}"
++        );
++    }
++
++    fn multiway_filter_store_and_model(
++        context: &SemanticContext,
++        registry: &SemanticRegistry,
++        relations: [SemanticId; 3],
++        bindings: [LayoutBinding; 3],
++        equivalence: SemanticId,
++    ) -> (PhysicalStore, kernel_model::FiniteModel) {
++        let [a, b, c] = relations;
++        let rows = [
++            vec![(1_i64, 10_i64), (1, 10), (2, 20)],
++            (1_i64..=1_000).map(|key| (key, key)).collect(),
++            (1_i64..=1_000)
++                .map(|key| {
++                    (
++                        key,
++                        if key == 1 {
++                            10
++                        } else if key == 2 {
++                            20
++                        } else {
++                            0
++                        },
++                    )
++                })
++                .collect(),
++        ];
++        let mut store = PhysicalStore::default();
++        let mut model = kernel_model::FiniteModel::default();
++        for ((relation, binding), relation_rows) in [a, b, c].into_iter().zip(bindings).zip(rows) {
++            store
++                .install(
++                    relation,
++                    binding,
++                    NativeRelation::typed_columnar(vec![
++                        NativeColumn::I64(relation_rows.iter().map(|row| row.0).collect()),
++                        NativeColumn::I64(relation_rows.iter().map(|row| row.1).collect()),
++                    ])
++                    .unwrap(),
++                )
++                .unwrap();
++            model.relations.insert(
++                relation,
++                relation_rows
++                    .into_iter()
++                    .map(|(left, right)| vec![Value::I64(left), Value::I64(right)])
++                    .collect(),
++            );
++        }
++        for (relation, binding) in [(b, bindings[1]), (c, bindings[2])] {
++            store
++                .install_semantic_index(
++                    SemanticIndexBinding::single(relation, binding, 0, equivalence),
++                    context,
++                    registry,
++                )
++                .unwrap();
++        }
++        (store, model)
++    }
++
++    fn multiway_filter_fixture() -> (
++        SemanticContext,
++        SemanticRegistry,
++        RelExpr,
++        PreparedPlan,
++        PhysicalStore,
++        kernel_model::FiniteModel,
++    ) {
++        let relations = [sid(710), sid(711), sid(712)];
++        let [a, b, c] = relations;
++        let equivalence = sid(713);
++        let mut registry = SemanticRegistry::default();
++        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
++        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(710));
++        environment.pin_module(equivalence, digest);
++        let mut schema = Schema::new(SchemaRevisionId::new(710));
++        for relation in relations {
++            schema
++                .define_relation(RelationDef {
++                    id: relation,
++                    columns: vec![
++                        TypeExpr::Scalar(ScalarType::I64),
++                        TypeExpr::Scalar(ScalarType::I64),
++                    ],
++                    semantics: RelationSemantics::Bag {
++                        column_equivalences: vec![equivalence, equivalence],
++                    },
++                })
++                .unwrap();
++        }
++        let context = SemanticContext {
++            schema,
++            environment,
++        };
++        let bindings = [
++            LayoutBinding {
++                id: LayoutId(1010),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1011),
++                family: LayoutFamily::Columnar,
++            },
++            LayoutBinding {
++                id: LayoutId(1012),
++                family: LayoutFamily::Columnar,
++            },
++        ];
++        let mut catalog = PhysicalCatalog::default();
++        for (relation, binding) in [a, b, c].into_iter().zip(bindings) {
++            catalog.bind_relation(relation, binding);
++        }
++        let logical = RelExpr::FilterEqColumns {
++            input: Box::new(RelExpr::JoinEq {
++                left: Box::new(RelExpr::Scan(a)),
++                right: Box::new(RelExpr::JoinEq {
++                    left: Box::new(RelExpr::Scan(b)),
++                    right: Box::new(RelExpr::Scan(c)),
++                    left_column: 1,
++                    right_column: 0,
++                    equivalence,
++                }),
++                left_column: 0,
++                right_column: 0,
++                equivalence,
++            }),
++            left_column: 1,
++            right_column: 5,
++            equivalence,
++        };
++        let prepared =
++            prepare_with_catalog(logical.clone(), &context, &registry, &catalog).unwrap();
++        let (store, model) =
++            multiway_filter_store_and_model(&context, &registry, relations, bindings, equivalence);
++        (context, registry, logical, prepared, store, model)
++    }
++
++    #[test]
++    fn multiway_join_planner_preserves_cross_relation_filter_predicates_and_bag_order() {
++        let (context, registry, logical, prepared, store, model) = multiway_filter_fixture();
++        let (native, stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
++        let reference = logical.evaluate(&model, &context, &registry).unwrap();
++        assert_eq!(native, reference);
++        assert_eq!(native.rows().len(), 3);
++        assert_eq!(stats.multiway_join_reorders, 1);
++        assert_eq!(stats.persisted_index_hits, 2);
++    }
++
++    #[test]
+     fn cost_model_uses_selective_persisted_text_semantic_index() {
+         let relation = sid(344);
+         let equivalence = sid(345);

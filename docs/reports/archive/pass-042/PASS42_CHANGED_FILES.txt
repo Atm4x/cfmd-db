@@ -1,0 +1,17 @@
+ARCHITECTURE.md
+CFMD_IDEAL_DB_SPEC.md
+IMPLEMENTATION_REPORT.md
+IMPLEMENTATION_REPORT_pass42.md
+PASS42_REPORT.md
+crates/kernel-durability/src/metadata.rs
+crates/kernel-plan/src/lib.rs
+crates/kernel-query/src/lib.rs
+crates/kernel-semantic-index/src/lib.rs
+crates/kernel-transport/src/lib.rs
+evidence/pass42/FINAL_DEBUG_GATE.log
+evidence/pass42/FINAL_OVERFLOW_RELEASE.log
+evidence/pass42/FINAL_RELEASE_BUILD.log
+evidence/pass42/FINAL_RELEASE_TESTS.log
+evidence/pass42/FINAL_RUSTDOC.log
+evidence/pass42/STATIC_AUDIT.txt
+evidence/pass42/TARGETED_PASS42_RELEASE.log

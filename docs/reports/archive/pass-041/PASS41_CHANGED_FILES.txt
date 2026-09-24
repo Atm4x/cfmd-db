@@ -1,0 +1,18 @@
+Pass41 files changed relative to verified Pass40 baseline:
+ARCHITECTURE.md
+CFMD_IDEAL_DB_SPEC.md
+IMPLEMENTATION_REPORT.md
+IMPLEMENTATION_REPORT_pass41.md
+PASS41_CHANGED_FILES.txt
+PASS41_REPORT.md
+PASS41_SOURCE_DIFF.txt
+crates/kernel-aggregate/src/lib.rs
+crates/kernel-plan/src/lib.rs
+crates/kernel-query/src/lib.rs
+evidence/pass41/FINAL_DEBUG_GATE.log
+evidence/pass41/FINAL_OVERFLOW_RELEASE.log
+evidence/pass41/FINAL_RELEASE_BUILD.log
+evidence/pass41/FINAL_RELEASE_TESTS.log
+evidence/pass41/FINAL_RUSTDOC.log
+evidence/pass41/STATEFUL_OPERATOR_BENCH.log
+evidence/pass41/STATIC_AUDIT.txt

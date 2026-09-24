@@ -1,0 +1,15 @@
+Pass77 final gate used one Cargo command per tool call with shared CARGO_TARGET_DIR=/mnt/data/cfmd_pass77_target.
+
+Completed PASS results:
+- cargo fmt --all -- --check
+- cargo check --workspace --all-targets
+- cargo test --workspace --all-targets: 471 passed / 0 failed / 8 ignored
+- cargo clippy --workspace --all-targets -- -D warnings
+- cargo test --workspace --all-targets --release: 471 / 0 / 8
+- cargo build --workspace --release
+- RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+- RUSTFLAGS='-C overflow-checks=yes' cargo test --workspace --all-targets --release: 471 / 0 / 8
+
+One cold ordinary-release attempt and two overflow-release warm-up attempts exceeded the external command window while compiling. They are not counted as PASS or FAIL. The later complete invocations are the recorded results.
+
+Freeze/post-gate crates SHA inventories are byte-identical.

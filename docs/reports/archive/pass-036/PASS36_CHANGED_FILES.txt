@@ -1,0 +1,18 @@
+Production source changed from Pass35:
+Cargo.lock
+crates/kernel-durability/Cargo.toml
+crates/kernel-durability/src/lib.rs
+crates/kernel-durability/src/metadata.rs (new)
+crates/kernel-durability/src/store.rs
+crates/kernel-plan/src/lib.rs
+crates/kernel-types/src/lib.rs
+
+Pass36 documentation/evidence:
+PASS36_REPORT.md
+IMPLEMENTATION_REPORT_pass36.md
+IMPLEMENTATION_REPORT.md
+CFMD_IDEAL_DB_SPEC.md
+ARCHITECTURE.md
+PASS36_CHANGED_FILES.txt
+PASS36_SOURCE_DIFF.txt
+evidence/pass36/DURABLE_CONTROL_STRESS.log

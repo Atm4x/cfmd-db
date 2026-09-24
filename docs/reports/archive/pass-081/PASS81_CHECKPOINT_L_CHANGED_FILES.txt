@@ -1,0 +1,7 @@
+Cargo.lock
+crates/kernel-plan/Cargo.toml
+crates/kernel-plan/src/lib.rs
+PASS81_INTEGRATION_LEDGER.md
+PASS81_CHECKPOINT_L_RUNTIME_MIGRATION.md
+PASS81_CHECKPOINT_L_CHANGED_FILES.txt
+PASS81_CHECKPOINT_L_FREEZE.txt
