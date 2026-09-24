@@ -92,3 +92,11 @@ tarpaulin-report.html
 core
 core.*
 *.dmp
+
+
+# Cargo vendor package metadata.
+# These files are part of the exact cargo-vendor snapshot and are referenced
+# by vendor/*/.cargo-checksum.json. Keep them even if a global Git ignore
+# contains a broad *.orig rule.
+!vendor/**/Cargo.toml.orig
+!vendor/**/.cargo-checksum.json
