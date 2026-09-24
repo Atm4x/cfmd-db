@@ -48,4 +48,4 @@ jobs:
           "$HOME/.elan/bin/elan" override set leanprover/lean4:v4.34.0
           "$HOME/.elan/bin/lean" --version
       - name: Lean + source-refinement gates
-        run: ./scripts/ci-formal.sh
+        run: bash ./scripts/ci-formal.sh
