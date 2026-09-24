@@ -41,4 +41,4 @@ jobs:
       - name: Repository layout
         run: ./scripts/verify-repository.sh
       - name: Rust gates
-        run: ./scripts/ci-rust.sh
+        run: bash ./scripts/ci-rust.sh
