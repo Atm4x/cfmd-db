@@ -3,11 +3,12 @@ mod delta_abi;
 mod execgraph;
 mod linear_island;
 mod sealed_group_v3;
+#[cfg(test)]
 mod topk_i64;
 pub use delta_abi::{
     AdaptiveDelta, BinaryDeltaKernel, CompactDelta, CompiledDeltaEdgeIdentity, DeltaSink,
-    DeltaView, InlineDelta, PlannedDeltaEffect, RelationDeltaView, UnaryDeltaKernel,
-    ValidatedTransitionFrame, Weighted,
+    DeltaView, ExactDelta, ExactDeltaSink, ExactDeltaView, ExactWeighted, InlineDelta,
+    PlannedDeltaEffect, RelationDeltaView, UnaryDeltaKernel, ValidatedTransitionFrame, Weighted,
 };
 pub use execgraph::{
     ExecutionInputSlot, NodeId, NodeInbox, PreparedRelGraph, UnifiedTransitionProgram,
@@ -24,6 +25,7 @@ use kernel_change::{
     SeqChangeError, SeqSplice,
 };
 use kernel_model::Value;
+use kernel_persistent::{PersistentOrdMap, PersistentVec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Impact {
@@ -504,13 +506,13 @@ impl RelationDelta {
 }
 
 type CanonicalRowKey = Vec<kernel_semantics::CanonicalEqKey>;
-type SupportLookup = BTreeMap<CanonicalRowKey, usize>;
+type SupportLookup = PersistentOrdMap<CanonicalRowKey, usize>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SetSupportPatchEntry {
     key: CanonicalRowKey,
     representative: Row,
-    after: i64,
+    after: kernel_exact::ExactNatural,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,7 +524,7 @@ struct SetSupportPatch {
 pub struct MaterializedSetSupportState {
     result_type: RelType,
     semantic_context: kernel_schema::SemanticContext,
-    supports: Vec<(Row, i64)>,
+    supports: PersistentVec<(Row, kernel_exact::ExactNatural)>,
     support_lookup: SupportLookup,
 }
 
@@ -549,7 +551,7 @@ impl MaterializedSetSupportState {
         Ok(Self {
             result_type,
             semantic_context: context.clone(),
-            supports,
+            supports: supports.into(),
             support_lookup,
         })
     }
@@ -583,17 +585,23 @@ impl MaterializedSetSupportState {
             context,
             registry,
         )?;
-        Ok(self
+        let count = self
             .support_lookup
             .get(&key)
-            .map_or(0, |index| self.supports[*index].1))
+            .map_or_else(kernel_exact::ExactNatural::zero, |index| {
+                self.supports[*index].1.clone()
+            });
+        count
+            .to_u64()
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(RelQueryError::DerivedIdentityExhausted)
     }
 
     fn output_value(&self) -> RelationValue {
         let rows = self
             .supports
             .iter()
-            .filter(|(_, count)| *count > 0)
+            .filter(|(_, count)| !count.is_zero())
             .map(|(row, _)| row.clone())
             .collect();
         relation_value_from_rows(rows, &self.result_type)
@@ -612,24 +620,24 @@ impl MaterializedSetSupportState {
             result_type: self.result_type.clone(),
         };
         let planned = self.plan_delta_view(&delta.as_delta_view(), context, registry)?;
-        let effect = materialize_delta_view(&planned.effect, self.result_type.clone())?;
+        let effect = materialize_exact_delta_view(&planned.effect, self.result_type.clone())?;
         self.commit_support_patch(planned.patch);
         Ok(effect)
     }
 
-    fn plan_delta_view<D: DeltaView<Row>>(
+    fn plan_delta_view<D: ExactDeltaView<Row>>(
         &self,
         delta: &D,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedDeltaEffect<SetSupportPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
+    ) -> Result<PlannedDeltaEffect<SetSupportPatch, ExactDelta<Row>>, RelQueryError> {
         self.check_context(context)?;
         let column_equivalences = relation_column_equivalences(&self.result_type);
         let mut changes = Vec::<SupportDeltaPlan>::new();
         let mut change_lookup = BTreeMap::<Vec<kernel_semantics::CanonicalEqKey>, usize>::new();
         let mut visit_error = None;
-        delta.visit(|weight, row| {
-            if weight == 0 || visit_error.is_some() {
+        delta.visit_exact(|weight, row| {
+            if weight.is_zero() || visit_error.is_some() {
                 return;
             }
             if let Err(error) = Self::validate_rows(
@@ -656,29 +664,19 @@ impl MaterializedSetSupportState {
                 changes.push(SupportDeltaPlan {
                     key,
                     representative: row.clone(),
-                    removals: 0,
-                    insertions: 0,
+                    removals: kernel_exact::ExactNatural::zero(),
+                    insertions: kernel_exact::ExactNatural::zero(),
                 });
                 index
             };
-            if weight < 0 {
-                let removals = weight
-                    .checked_neg()
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta);
-                match removals.and_then(|amount| {
-                    changes[change_index]
-                        .removals
-                        .checked_add(amount)
-                        .ok_or(RelQueryError::InconsistentIncrementalDelta)
-                }) {
-                    Ok(total) => changes[change_index].removals = total,
-                    Err(error) => visit_error = Some(error),
-                }
+            if weight.is_negative() {
+                changes[change_index]
+                    .removals
+                    .add_assign(weight.magnitude());
             } else {
-                match changes[change_index].insertions.checked_add(weight) {
-                    Some(total) => changes[change_index].insertions = total,
-                    None => visit_error = Some(RelQueryError::InconsistentIncrementalDelta),
-                }
+                changes[change_index]
+                    .insertions
+                    .add_assign(weight.magnitude());
             }
         });
         if let Some(error) = visit_error {
@@ -686,23 +684,29 @@ impl MaterializedSetSupportState {
         }
 
         let mut patch_entries = Vec::with_capacity(changes.len());
-        let mut effect = AdaptiveDelta::<Row, 4>::default();
+        let mut effect = ExactDelta::<Row>::default();
         for change in changes {
             let before = self
                 .support_lookup
                 .get(&change.key)
-                .map_or(0, |index| self.supports[*index].1);
-            if change.removals > before {
+                .map_or_else(kernel_exact::ExactNatural::zero, |index| {
+                    self.supports[*index].1.clone()
+                });
+            let mut after = before.clone();
+            if !after.checked_sub_assign(&change.removals) {
                 return Err(RelQueryError::InconsistentIncrementalDelta);
             }
-            let after = before
-                .checked_sub(change.removals)
-                .and_then(|value| value.checked_add(change.insertions))
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-            if before == 0 && after > 0 {
-                effect.push_weighted(1, change.representative.clone());
-            } else if before > 0 && after == 0 {
-                effect.push_weighted(-1, change.representative.clone());
+            after.add_assign(&change.insertions);
+            if before.is_zero() && !after.is_zero() {
+                effect.push_exact(
+                    kernel_exact::ExactInteger::from_i64(1),
+                    change.representative.clone(),
+                );
+            } else if !before.is_zero() && after.is_zero() {
+                effect.push_exact(
+                    kernel_exact::ExactInteger::from_i64(-1),
+                    change.representative.clone(),
+                );
             }
             patch_entries.push(SetSupportPatchEntry {
                 key: change.key,
@@ -722,7 +726,7 @@ impl MaterializedSetSupportState {
         for entry in patch.entries {
             if let Some(index) = self.support_lookup.get(&entry.key).copied() {
                 self.supports[index].1 = entry.after;
-            } else if entry.after > 0 {
+            } else if !entry.after.is_zero() {
                 let index = self.supports.len();
                 self.supports
                     .push((entry.representative.clone(), entry.after));
@@ -860,7 +864,7 @@ impl MaterializedRelDeltaState {
             }
             MaterializedRelDeltaOperator::Distinct { input } => (input, None),
         };
-        let input_delta = rel_delta_optimized_inner(input, old, change, context, registry)?
+        let input_delta = rel_delta_optimized(input, old, change, context, registry)?
             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
         let (inserted, removed) = if let Some(columns) = projected_columns {
             (
@@ -875,61 +879,49 @@ impl MaterializedRelDeltaState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct IndexedRowId(u64);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct IndexedJoinSide {
-    rows: BTreeMap<IndexedRowId, Row>,
-    index:
-        kernel_semantic_index::SemanticBucketIndex<kernel_semantics::CanonicalEqKey, IndexedRowId>,
-    next_id: u64,
+struct CountedJoinClass {
+    representative: Row,
+    multiplicity: kernel_exact::ExactNatural,
 }
 
-#[derive(Debug)]
-struct IndexedRelationMutationPlan {
-    remove_ids: Vec<IndexedRowId>,
-    inserted: Vec<(IndexedRowId, kernel_semantics::CanonicalEqKey, Row)>,
-    next_id: u64,
+type CountedJoinBucket = PersistentOrdMap<CanonicalRowKey, CountedJoinClass>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CountedJoinSide {
+    buckets: PersistentOrdMap<kernel_semantics::CanonicalEqKey, CountedJoinBucket>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SemanticIndexedJoinStorage {
-    encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
-    left: IndexedJoinSide,
-    right: IndexedJoinSide,
+struct CountedJoinStorage {
+    left: CountedJoinSide,
+    right: CountedJoinSide,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StructuralIndexedJoinSide {
-    rows: BTreeMap<IndexedRowId, Row>,
-    keys: BTreeMap<IndexedRowId, kernel_semantics::CanonicalEqKey>,
-    buckets: BTreeMap<kernel_semantics::CanonicalEqKey, Vec<IndexedRowId>>,
-    next_id: u64,
+struct CountedJoinDeltaAtom {
+    join_key: kernel_semantics::CanonicalEqKey,
+    row_key: CanonicalRowKey,
+    representative: Row,
+    weight: kernel_exact::ExactInteger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StructuralIndexedJoinStorage {
-    equivalence: kernel_types::SemanticId,
-    left: StructuralIndexedJoinSide,
-    right: StructuralIndexedJoinSide,
+struct CountedJoinMutationPlan {
+    next: CountedJoinSide,
+    delta: Vec<CountedJoinDeltaAtom>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MaintainedJoinStorage {
-    I64 {
-        left: BTreeMap<i64, Vec<Row>>,
-        right: BTreeMap<i64, Vec<Row>>,
-    },
-    SemanticIndexed(Box<SemanticIndexedJoinStorage>),
-    StructuralIndexed(Box<StructuralIndexedJoinStorage>),
+    Counted(Box<CountedJoinStorage>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RelationMutationPlan {
     remove_indices: Vec<usize>,
     inserted: Vec<Row>,
-    canonical_keys: Option<CanonicalRelationMutationKeys>,
+    canonical_keys: CanonicalRelationMutationKeys,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -940,8 +932,64 @@ struct CanonicalRelationMutationKeys {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CanonicalRowPositionIndex {
-    by_key: BTreeMap<CanonicalRowKey, Vec<usize>>,
-    by_position: Vec<CanonicalRowKey>,
+    by_key: PersistentOrdMap<CanonicalRowKey, PersistentVec<usize>>,
+    by_position: PersistentVec<CanonicalRowKey>,
+    bucket_slot_by_position: PersistentVec<usize>,
+}
+
+impl CanonicalRowPositionIndex {
+    fn remove_position(&mut self, position: usize) {
+        let last_position = self
+            .by_position
+            .len()
+            .checked_sub(1)
+            .expect("validated canonical Scan removal requires a row");
+        let key = self.by_position[position].clone();
+        let bucket_slot = self.bucket_slot_by_position[position];
+        let mut bucket = self
+            .by_key
+            .get(&key)
+            .cloned()
+            .expect("validated canonical Scan removal key must exist");
+        let removed_position = bucket.swap_remove(bucket_slot);
+        debug_assert_eq!(removed_position, position);
+        if bucket_slot < bucket.len() {
+            let bucket_moved_position = bucket[bucket_slot];
+            self.bucket_slot_by_position[bucket_moved_position] = bucket_slot;
+        }
+        if bucket.is_empty() {
+            self.by_key.remove(&key);
+        } else {
+            self.by_key.insert(key, bucket);
+        }
+        if position != last_position {
+            let moved_key = self.by_position[last_position].clone();
+            let moved_bucket_slot = self.bucket_slot_by_position[last_position];
+            let mut moved_bucket = self
+                .by_key
+                .get(&moved_key)
+                .cloned()
+                .expect("moved canonical Scan key must exist");
+            debug_assert_eq!(moved_bucket[moved_bucket_slot], last_position);
+            moved_bucket.set(moved_bucket_slot, position);
+            self.by_key.insert(moved_key.clone(), moved_bucket);
+            self.by_position.set(position, moved_key);
+            self.bucket_slot_by_position
+                .set(position, moved_bucket_slot);
+        }
+        self.by_position.pop();
+        self.bucket_slot_by_position.pop();
+    }
+
+    fn push_key(&mut self, key: CanonicalRowKey) {
+        let position = self.by_position.len();
+        let mut bucket = self.by_key.get(&key).cloned().unwrap_or_default();
+        let bucket_slot = bucket.len();
+        bucket.push(position);
+        self.by_key.insert(key.clone(), bucket);
+        self.by_position.push(key);
+        self.bucket_slot_by_position.push(bucket_slot);
+    }
 }
 
 /// R&D V3 scan-level commit patch.  Both semantic deltas and
@@ -956,38 +1004,13 @@ enum MaintainedScanCommitPatch {
 #[derive(Debug)]
 struct StorageResolvedScanPatch {
     removed_handles: Vec<kernel_types::StableRowHandle>,
-    inserted: Vec<(kernel_types::StableRowHandle, Row)>,
+    inserted: Vec<(kernel_types::StableRowHandle, CanonicalRowKey, Row)>,
 }
 
 #[derive(Debug)]
-struct PlannedI64JoinSide {
-    buckets: BTreeMap<i64, Vec<Row>>,
-}
-
-#[derive(Debug)]
-enum JoinDeltaPatch {
-    I64 {
-        left: PlannedI64JoinSide,
-        right: PlannedI64JoinSide,
-    },
-    SemanticIndexed {
-        left: IndexedRelationMutationPlan,
-        right: IndexedRelationMutationPlan,
-    },
-    StructuralIndexed {
-        left: IndexedRelationMutationPlan,
-        right: IndexedRelationMutationPlan,
-    },
-}
-
-#[derive(Clone, Copy)]
-struct JoinI64MaintenanceSpec<'a> {
-    left_column: usize,
-    right_column: usize,
-    left_type: &'a RelType,
-    right_type: &'a RelType,
-    context: &'a kernel_schema::SemanticContext,
-    registry: &'a kernel_semantics::SemanticRegistry,
+struct JoinDeltaPatch {
+    left: CountedJoinSide,
+    right: CountedJoinSide,
 }
 
 #[derive(Clone, Copy)]
@@ -1000,237 +1023,41 @@ struct GenericJoinMaintenanceSpec<'a> {
     registry: &'a kernel_semantics::SemanticRegistry,
 }
 
-struct NormalizedDeltaRows {
-    removed: Vec<(usize, Row)>,
-    inserted: Vec<(usize, Row)>,
-}
-
-fn normalized_delta_rows<D: DeltaView<Row>>(
-    delta: &D,
-) -> Result<NormalizedDeltaRows, RelQueryError> {
-    let mut removed = Vec::new();
-    let mut inserted = Vec::new();
-    let mut error = None;
-    delta.visit(|weight, row| {
-        if weight == 0 || error.is_some() {
-            return;
-        }
-        let magnitude = if weight < 0 {
-            let Some(value) = weight.checked_neg() else {
-                error = Some(RelQueryError::InconsistentIncrementalDelta);
-                return;
-            };
-            value
-        } else {
-            weight
-        };
-        let Ok(magnitude) = usize::try_from(magnitude) else {
-            error = Some(RelQueryError::InconsistentIncrementalDelta);
-            return;
-        };
-        if weight < 0 {
-            removed.push((magnitude, row.clone()));
-        } else {
-            inserted.push((magnitude, row.clone()));
-        }
-    });
-    if let Some(error) = error {
-        return Err(error);
-    }
-    Ok(NormalizedDeltaRows { removed, inserted })
-}
-
-impl IndexedJoinSide {
+impl CountedJoinSide {
     fn build(
         rows: &[Row],
-        column: usize,
-        encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
-        context: &kernel_schema::SemanticContext,
-    ) -> Result<Self, RelQueryError> {
-        let dependency = kernel_semantic_index::SemanticModuleBinding {
-            semantic_id: encoder.equivalence(),
-            module_digest: encoder.module_digest(),
-        };
-        let mut index = kernel_semantic_index::SemanticBucketIndex::new(
-            kernel_semantic_index::SemanticIndexBinding::new(context, vec![dependency]),
-        );
-        let mut stored = BTreeMap::new();
-        let mut next_id = 0_u64;
-        for row in rows {
-            let value = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
-            let key = encoder.canonical_key(value)?;
-            let id = IndexedRowId(next_id);
-            next_id = next_id
-                .checked_add(1)
-                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
-            let previous_key = index.insert(id, key);
-            let previous_row = stored.insert(id, row.clone());
-            debug_assert!(previous_key.is_none());
-            debug_assert!(previous_row.is_none());
-        }
-        Ok(Self {
-            rows: stored,
-            index,
-            next_id,
-        })
-    }
-
-    fn plan_mutation_view<D: DeltaView<Row>>(
-        &self,
-        delta: &D,
         join_column: usize,
-        encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
+        equivalence: kernel_types::SemanticId,
         ty: &RelType,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<IndexedRelationMutationPlan, RelQueryError> {
-        let normalized = normalized_delta_rows(delta)?;
-        let equivalences = relation_column_equivalences(ty);
-        let mut used = BTreeSet::new();
-        let mut remove_ids = Vec::new();
-        for (magnitude, removed) in &normalized.removed {
-            for _ in 0..*magnitude {
-                let key = encoder.canonical_key(
-                    removed
-                        .get(join_column)
-                        .ok_or(RelQueryError::ColumnOutOfBounds)?,
-                )?;
-                let bucket = self
-                    .index
-                    .bucket(&key)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                let mut found = None;
-                for id in bucket {
-                    if used.contains(id) {
-                        continue;
-                    }
-                    let candidate = self
-                        .rows
-                        .get(id)
-                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                    if rows_semantically_equal(candidate, removed, equivalences, context, registry)?
-                    {
-                        found = Some(*id);
-                        break;
-                    }
-                }
-                let Some(id) = found else {
-                    return Err(RelQueryError::InconsistentIncrementalDelta);
-                };
-                used.insert(id);
-                remove_ids.push(id);
-            }
-        }
-
-        let is_set = matches!(ty.semantics, kernel_schema::RelationSemantics::Set { .. });
-        let mut inserted = Vec::new();
-        let mut next_id = self.next_id;
-        for (magnitude, row) in &normalized.inserted {
-            for _ in 0..*magnitude {
-                let key = encoder.canonical_key(
-                    row.get(join_column)
-                        .ok_or(RelQueryError::ColumnOutOfBounds)?,
-                )?;
-                if is_set {
-                    if let Some(bucket) = self.index.bucket(&key) {
-                        for id in bucket {
-                            if used.contains(id) {
-                                continue;
-                            }
-                            let candidate = self
-                                .rows
-                                .get(id)
-                                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                            if rows_semantically_equal(
-                                candidate,
-                                row,
-                                equivalences,
-                                context,
-                                registry,
-                            )? {
-                                return Err(RelQueryError::InconsistentIncrementalDelta);
-                            }
-                        }
-                    }
-                    for (_, previous_key, previous_row) in &inserted {
-                        if previous_key == &key
-                            && rows_semantically_equal(
-                                previous_row,
-                                row,
-                                equivalences,
-                                context,
-                                registry,
-                            )?
-                        {
-                            return Err(RelQueryError::InconsistentIncrementalDelta);
-                        }
-                    }
-                }
-                let id = IndexedRowId(next_id);
-                next_id = next_id
-                    .checked_add(1)
-                    .ok_or(RelQueryError::DerivedIdentityExhausted)?;
-                inserted.push((id, key, row.clone()));
-            }
-        }
-        Ok(IndexedRelationMutationPlan {
-            remove_ids,
-            inserted,
-            next_id,
-        })
-    }
-
-    fn commit_plan(&mut self, plan: IndexedRelationMutationPlan) {
-        for id in plan.remove_ids {
-            let removed_key = self.index.remove(&id);
-            let removed_row = self.rows.remove(&id);
-            debug_assert!(removed_key.is_some());
-            debug_assert!(removed_row.is_some());
-        }
-        for (id, key, row) in plan.inserted {
-            let previous_key = self.index.insert(id, key);
-            let previous_row = self.rows.insert(id, row);
-            debug_assert!(previous_key.is_none());
-            debug_assert!(previous_row.is_none());
-        }
-        self.next_id = plan.next_id;
-    }
-}
-
-impl StructuralIndexedJoinSide {
-    fn build(
-        rows: &[Row],
-        column: usize,
-        equivalence: kernel_types::SemanticId,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, RelQueryError> {
-        let mut stored = BTreeMap::new();
-        let mut keys = BTreeMap::new();
-        let mut buckets = BTreeMap::<kernel_semantics::CanonicalEqKey, Vec<IndexedRowId>>::new();
-        let mut next_id = 0_u64;
+        let row_equivalences = relation_column_equivalences(ty);
+        let mut side = Self::default();
         for row in rows {
-            let value = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
-            let key = registry.canonical_equivalence_key(context, equivalence, value)?;
-            let id = IndexedRowId(next_id);
-            next_id = next_id
-                .checked_add(1)
-                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
-            buckets.entry(key.clone()).or_default().push(id);
-            keys.insert(id, key);
-            stored.insert(id, row.clone());
+            let join_key = Self::join_key(row, join_column, equivalence, context, registry)?;
+            let row_key = canonical_row_key(row, row_equivalences, context, registry)?;
+            let mut bucket = side.buckets.get(&join_key).cloned().unwrap_or_default();
+            if let Some(mut class) = bucket.get(&row_key).cloned() {
+                class.multiplicity.add_u128(1);
+                bucket.insert(row_key, class);
+            } else {
+                bucket.insert(
+                    row_key,
+                    CountedJoinClass {
+                        representative: row.clone(),
+                        multiplicity: kernel_exact::ExactNatural::one(),
+                    },
+                );
+            }
+            side.buckets.insert(join_key, bucket);
         }
-        Ok(Self {
-            rows: stored,
-            keys,
-            buckets,
-            next_id,
-        })
+        Ok(side)
     }
 
-    fn canonical_key(
+    fn join_key(
         row: &Row,
-        column: usize,
+        join_column: usize,
         equivalence: kernel_types::SemanticId,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
@@ -1239,16 +1066,17 @@ impl StructuralIndexedJoinSide {
             .canonical_equivalence_key(
                 context,
                 equivalence,
-                row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?,
+                row.get(join_column)
+                    .ok_or(RelQueryError::ColumnOutOfBounds)?,
             )
             .map_err(Into::into)
     }
 
-    fn bucket(&self, key: &kernel_semantics::CanonicalEqKey) -> Option<&[IndexedRowId]> {
-        self.buckets.get(key).map(Vec::as_slice)
+    fn bucket(&self, key: &kernel_semantics::CanonicalEqKey) -> Option<&CountedJoinBucket> {
+        self.buckets.get(key)
     }
 
-    fn plan_mutation_view<D: DeltaView<Row>>(
+    fn plan_mutation_view<D: ExactDeltaView<Row>>(
         &self,
         delta: &D,
         join_column: usize,
@@ -1256,118 +1084,104 @@ impl StructuralIndexedJoinSide {
         ty: &RelType,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<IndexedRelationMutationPlan, RelQueryError> {
-        let normalized = normalized_delta_rows(delta)?;
-        let equivalences = relation_column_equivalences(ty);
-        let mut used = BTreeSet::new();
-        let mut remove_ids = Vec::new();
-        for (magnitude, removed) in &normalized.removed {
-            for _ in 0..*magnitude {
-                let key =
-                    Self::canonical_key(removed, join_column, equivalence, context, registry)?;
-                let bucket = self
-                    .bucket(&key)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                let mut found = None;
-                for id in bucket {
-                    if used.contains(id) {
-                        continue;
-                    }
-                    let candidate = self
-                        .rows
-                        .get(id)
-                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                    if rows_semantically_equal(candidate, removed, equivalences, context, registry)?
-                    {
-                        found = Some(*id);
-                        break;
-                    }
-                }
-                let Some(id) = found else {
-                    return Err(RelQueryError::InconsistentIncrementalDelta);
-                };
-                used.insert(id);
-                remove_ids.push(id);
+    ) -> Result<CountedJoinMutationPlan, RelQueryError> {
+        let row_equivalences = relation_column_equivalences(ty);
+        let mut classes = BTreeMap::<CanonicalRowKey, CountedJoinDeltaAtom>::new();
+        let mut error = None;
+        delta.visit_exact(|weight, row| {
+            if weight.is_zero() || error.is_some() {
+                return;
             }
+            let join_key = match Self::join_key(row, join_column, equivalence, context, registry) {
+                Ok(key) => key,
+                Err(next) => {
+                    error = Some(next);
+                    return;
+                }
+            };
+            let row_key = match canonical_row_key(row, row_equivalences, context, registry) {
+                Ok(key) => key,
+                Err(next) => {
+                    error = Some(next);
+                    return;
+                }
+            };
+            let coefficient = weight.clone();
+            match classes.entry(row_key.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(CountedJoinDeltaAtom {
+                        join_key,
+                        row_key,
+                        representative: row.clone(),
+                        weight: coefficient,
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get().join_key != join_key {
+                        error = Some(RelQueryError::InconsistentIncrementalDelta);
+                        return;
+                    }
+                    entry.get_mut().weight.add_assign(&coefficient);
+                }
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
         }
 
         let is_set = matches!(ty.semantics, kernel_schema::RelationSemantics::Set { .. });
-        let mut inserted = Vec::new();
-        let mut next_id = self.next_id;
-        for (magnitude, row) in &normalized.inserted {
-            for _ in 0..*magnitude {
-                let key = Self::canonical_key(row, join_column, equivalence, context, registry)?;
-                if is_set {
-                    if let Some(bucket) = self.bucket(&key) {
-                        for id in bucket {
-                            if used.contains(id) {
-                                continue;
-                            }
-                            let candidate = self
-                                .rows
-                                .get(id)
-                                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                            if rows_semantically_equal(
-                                candidate,
-                                row,
-                                equivalences,
-                                context,
-                                registry,
-                            )? {
-                                return Err(RelQueryError::InconsistentIncrementalDelta);
-                            }
-                        }
-                    }
-                    for (_, previous_key, previous_row) in &inserted {
-                        if previous_key == &key
-                            && rows_semantically_equal(
-                                previous_row,
-                                row,
-                                equivalences,
-                                context,
-                                registry,
-                            )?
-                        {
-                            return Err(RelQueryError::InconsistentIncrementalDelta);
-                        }
-                    }
-                }
-                let id = IndexedRowId(next_id);
-                next_id = next_id
-                    .checked_add(1)
-                    .ok_or(RelQueryError::DerivedIdentityExhausted)?;
-                inserted.push((id, key, row.clone()));
-            }
-        }
-        Ok(IndexedRelationMutationPlan {
-            remove_ids,
-            inserted,
-            next_id,
-        })
-    }
-
-    fn commit_plan(&mut self, plan: IndexedRelationMutationPlan) {
-        for id in plan.remove_ids {
-            let Some(key) = self.keys.remove(&id) else {
-                debug_assert!(false, "planned structural index removal must have a key");
+        let mut next = self.clone();
+        let mut normalized = Vec::with_capacity(classes.len());
+        for (_, atom) in classes {
+            if atom.weight.is_zero() {
                 continue;
-            };
-            if let Some(bucket) = self.buckets.get_mut(&key) {
-                if let Some(position) = bucket.iter().position(|candidate| *candidate == id) {
-                    bucket.remove(position);
-                }
-                if bucket.is_empty() {
-                    self.buckets.remove(&key);
-                }
             }
-            self.rows.remove(&id);
+            let mut bucket = next
+                .buckets
+                .get(&atom.join_key)
+                .cloned()
+                .unwrap_or_default();
+            let existing = bucket.get(&atom.row_key).cloned();
+            let mut multiplicity = existing
+                .as_ref()
+                .map_or_else(kernel_exact::ExactNatural::zero, |class| {
+                    class.multiplicity.clone()
+                });
+            if atom.weight.is_negative() {
+                if !multiplicity.checked_sub_assign(atom.weight.magnitude()) {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                }
+            } else {
+                multiplicity.add_assign(atom.weight.magnitude());
+            }
+            if is_set && multiplicity > kernel_exact::ExactNatural::one() {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            }
+            if multiplicity.is_zero() {
+                bucket.remove(&atom.row_key);
+            } else {
+                bucket.insert(
+                    atom.row_key.clone(),
+                    CountedJoinClass {
+                        representative: existing.map_or_else(
+                            || atom.representative.clone(),
+                            |class| class.representative,
+                        ),
+                        multiplicity,
+                    },
+                );
+            }
+            if bucket.is_empty() {
+                next.buckets.remove(&atom.join_key);
+            } else {
+                next.buckets.insert(atom.join_key.clone(), bucket);
+            }
+            normalized.push(atom);
         }
-        for (id, key, row) in plan.inserted {
-            self.buckets.entry(key.clone()).or_default().push(id);
-            self.keys.insert(id, key);
-            self.rows.insert(id, row);
-        }
-        self.next_id = plan.next_id;
+        Ok(CountedJoinMutationPlan {
+            next,
+            delta: normalized,
+        })
     }
 }
 
@@ -1398,6 +1212,32 @@ impl MaterializedJoinDeltaState {
         let left_value = left.evaluate(old, context, registry)?;
         let right_value = right.evaluate(old, context, registry)?;
         Self::build_from_input_values(query, &left_value, &right_value, context, registry)
+    }
+
+    fn build_counted_storage(
+        left_value: &RelationValue,
+        right_value: &RelationValue,
+        equivalence: kernel_types::SemanticId,
+        spec: GenericJoinMaintenanceSpec<'_>,
+    ) -> Result<CountedJoinStorage, RelQueryError> {
+        Ok(CountedJoinStorage {
+            left: CountedJoinSide::build(
+                left_value.rows(),
+                spec.left_column,
+                equivalence,
+                spec.left_type,
+                spec.context,
+                spec.registry,
+            )?,
+            right: CountedJoinSide::build(
+                right_value.rows(),
+                spec.right_column,
+                equivalence,
+                spec.right_type,
+                spec.context,
+                spec.registry,
+            )?,
+        })
     }
 
     fn build_from_input_values(
@@ -1433,52 +1273,20 @@ impl MaterializedJoinDeltaState {
             context,
             registry,
         )?;
-        let primitive_equivalence =
-            registry.resolve_primitive_equivalence(context, *equivalence)?;
-        let exact_i64 = matches!(
-            left_type.columns.get(*left_column),
-            Some(kernel_schema::TypeExpr::Scalar(
-                kernel_schema::ScalarType::I64
-            ))
-        ) && matches!(
-            right_type.columns.get(*right_column),
-            Some(kernel_schema::TypeExpr::Scalar(
-                kernel_schema::ScalarType::I64
-            ))
-        ) && matches!(
-            primitive_equivalence.map(|resolved| resolved.bind_right(&Value::I64(0))),
-            Some(Ok(kernel_semantics::BoundPrimitivePredicate::I64(0)))
-        );
-        let storage = if exact_i64 {
-            MaintainedJoinStorage::I64 {
-                left: Self::build_i64_buckets(left_value.rows(), *left_column)?,
-                right: Self::build_i64_buckets(right_value.rows(), *right_column)?,
-            }
-        } else if let Some(encoder) = primitive_equivalence {
-            MaintainedJoinStorage::SemanticIndexed(Box::new(SemanticIndexedJoinStorage {
-                encoder,
-                left: IndexedJoinSide::build(left_value.rows(), *left_column, encoder, context)?,
-                right: IndexedJoinSide::build(right_value.rows(), *right_column, encoder, context)?,
-            }))
-        } else {
-            MaintainedJoinStorage::StructuralIndexed(Box::new(StructuralIndexedJoinStorage {
-                equivalence: *equivalence,
-                left: StructuralIndexedJoinSide::build(
-                    left_value.rows(),
-                    *left_column,
-                    *equivalence,
-                    context,
-                    registry,
-                )?,
-                right: StructuralIndexedJoinSide::build(
-                    right_value.rows(),
-                    *right_column,
-                    *equivalence,
-                    context,
-                    registry,
-                )?,
-            }))
+        let spec = GenericJoinMaintenanceSpec {
+            left_column: *left_column,
+            right_column: *right_column,
+            left_type: &left_type,
+            right_type: &right_type,
+            context,
+            registry,
         };
+        let storage = MaintainedJoinStorage::Counted(Box::new(Self::build_counted_storage(
+            left_value,
+            right_value,
+            *equivalence,
+            spec,
+        )?));
         Ok(Some(Self {
             query: query.clone(),
             semantic_context: context.clone(),
@@ -1497,66 +1305,27 @@ impl MaterializedJoinDeltaState {
         _context: &kernel_schema::SemanticContext,
         _registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<RelationValue, RelQueryError> {
-        match &self.storage {
-            MaintainedJoinStorage::I64 { left, right } => {
-                let mut rows = Vec::new();
-                for (key, left_rows) in left {
-                    let Some(right_rows) = right.get(key) else {
-                        continue;
-                    };
-                    for left_row in left_rows {
-                        for right_row in right_rows {
-                            rows.push(Self::join_pair(left_row, right_row));
-                        }
-                    }
+        let MaintainedJoinStorage::Counted(storage) = &self.storage;
+        let mut rows = Vec::new();
+        for (join_key, left_bucket) in &storage.left.buckets {
+            let Some(right_bucket) = storage.right.bucket(join_key) else {
+                continue;
+            };
+            for left_class in left_bucket.values() {
+                for right_class in right_bucket.values() {
+                    let multiplicity = left_class
+                        .multiplicity
+                        .multiplied(&right_class.multiplicity)
+                        .to_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or(RelQueryError::DerivedIdentityExhausted)?;
+                    let joined =
+                        Self::join_pair(&left_class.representative, &right_class.representative);
+                    rows.extend(std::iter::repeat_n(joined, multiplicity));
                 }
-                Ok(relation_value_from_rows(rows, &self.result_type))
-            }
-            MaintainedJoinStorage::SemanticIndexed(storage) => {
-                let mut rows = Vec::new();
-                for (left_id, left_row) in &storage.left.rows {
-                    let key = storage
-                        .left
-                        .index
-                        .key_for(left_id)
-                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                    let Some(right_ids) = storage.right.index.bucket(key) else {
-                        continue;
-                    };
-                    for right_id in right_ids {
-                        let right_row = storage
-                            .right
-                            .rows
-                            .get(right_id)
-                            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                        rows.push(Self::join_pair(left_row, right_row));
-                    }
-                }
-                Ok(relation_value_from_rows(rows, &self.result_type))
-            }
-            MaintainedJoinStorage::StructuralIndexed(storage) => {
-                let mut rows = Vec::new();
-                for (left_id, left_row) in &storage.left.rows {
-                    let key = storage
-                        .left
-                        .keys
-                        .get(left_id)
-                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                    let Some(right_ids) = storage.right.bucket(key) else {
-                        continue;
-                    };
-                    for right_id in right_ids {
-                        let right_row = storage
-                            .right
-                            .rows
-                            .get(right_id)
-                            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                        rows.push(Self::join_pair(left_row, right_row));
-                    }
-                }
-                Ok(relation_value_from_rows(rows, &self.result_type))
             }
         }
+        Ok(relation_value_from_rows(rows, &self.result_type))
     }
 
     #[must_use]
@@ -1574,210 +1343,88 @@ impl MaterializedJoinDeltaState {
         if left_delta.result_type != self.left_type || right_delta.result_type != self.right_type {
             return Err(RelQueryError::TypeMismatch);
         }
-        let planned = self.plan_delta_views(
+        let planned = self.plan_exact_delta_views(
             &left_delta.as_delta_view(),
             &right_delta.as_delta_view(),
             context,
             registry,
         )?;
-        let effect = materialize_delta_view(&planned.effect, self.result_type.clone())?;
+        let effect = self.materialize_exact_effect(&planned.effect)?;
         self.commit_join_patch(planned.patch);
         Ok(effect)
     }
 
-    fn plan_delta_views<LD: DeltaView<Row>, RD: DeltaView<Row>>(
+    fn plan_delta_views<
+        LD: DeltaView<Row> + ExactDeltaView<Row>,
+        RD: DeltaView<Row> + ExactDeltaView<Row>,
+    >(
         &self,
         left_delta: &LD,
         right_delta: &RD,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<PlannedDeltaEffect<JoinDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
+        let exact = self.plan_exact_delta_views(left_delta, right_delta, context, registry)?;
+        Ok(PlannedDeltaEffect {
+            patch: exact.patch,
+            effect: Self::exact_effect_to_legacy(&exact.effect)?,
+        })
+    }
+
+    fn plan_exact_delta_views<LD: ExactDeltaView<Row>, RD: ExactDeltaView<Row>>(
+        &self,
+        left_delta: &LD,
+        right_delta: &RD,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedDeltaEffect<JoinDeltaPatch, ExactDelta<Row>>, RelQueryError> {
         if context != &self.semantic_context {
             return Err(RelQueryError::SemanticRevisionMismatch);
         }
-        Self::validate_delta_view_rows(left_delta, &self.left_type, context, registry)?;
-        Self::validate_delta_view_rows(right_delta, &self.right_type, context, registry)?;
-
-        match &self.storage {
-            MaintainedJoinStorage::I64 { left, right } => {
-                self.plan_i64_delta_views(left, right, left_delta, right_delta, context, registry)
-            }
-            MaintainedJoinStorage::SemanticIndexed(storage) => {
-                self.plan_semantic_delta_views(storage, left_delta, right_delta, context, registry)
-            }
-            MaintainedJoinStorage::StructuralIndexed(storage) => self.plan_structural_delta_views(
-                storage,
-                left_delta,
-                right_delta,
-                context,
-                registry,
-            ),
-        }
-    }
-
-    fn plan_i64_delta_views<LD: DeltaView<Row>, RD: DeltaView<Row>>(
-        &self,
-        left: &BTreeMap<i64, Vec<Row>>,
-        right: &BTreeMap<i64, Vec<Row>>,
-        left_delta: &LD,
-        right_delta: &RD,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedDeltaEffect<JoinDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
-        let spec = JoinI64MaintenanceSpec {
-            left_column: self.left_column,
-            right_column: self.right_column,
-            left_type: &self.left_type,
-            right_type: &self.right_type,
-            context,
-            registry,
-        };
-        let planned_left = Self::plan_i64_side_view(
-            left,
-            left_delta,
-            spec.left_column,
-            spec.left_type,
-            spec.context,
-            spec.registry,
-        )?;
-        let planned_right = Self::plan_i64_side_view(
-            right,
-            right_delta,
-            spec.right_column,
-            spec.right_type,
-            spec.context,
-            spec.registry,
-        )?;
-        let effect = Self::plan_i64_join_effect(
-            left,
-            right,
-            &planned_left.buckets,
-            left_delta,
-            right_delta,
-            spec,
-        )?;
-        Ok(PlannedDeltaEffect {
-            patch: JoinDeltaPatch::I64 {
-                left: planned_left,
-                right: planned_right,
-            },
-            effect,
-        })
-    }
-
-    fn plan_semantic_delta_views<LD: DeltaView<Row>, RD: DeltaView<Row>>(
-        &self,
-        storage: &SemanticIndexedJoinStorage,
-        left_delta: &LD,
-        right_delta: &RD,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedDeltaEffect<JoinDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
-        let spec = GenericJoinMaintenanceSpec {
-            left_column: self.left_column,
-            right_column: self.right_column,
-            left_type: &self.left_type,
-            right_type: &self.right_type,
-            context,
-            registry,
-        };
+        Self::validate_exact_delta_view_rows(left_delta, &self.left_type, context, registry)?;
+        Self::validate_exact_delta_view_rows(right_delta, &self.right_type, context, registry)?;
+        let MaintainedJoinStorage::Counted(storage) = &self.storage;
         let left_plan = storage.left.plan_mutation_view(
             left_delta,
-            spec.left_column,
-            storage.encoder,
-            spec.left_type,
-            spec.context,
-            spec.registry,
+            self.left_column,
+            self.equivalence,
+            &self.left_type,
+            context,
+            registry,
         )?;
         let right_plan = storage.right.plan_mutation_view(
             right_delta,
-            spec.right_column,
-            storage.encoder,
-            spec.right_type,
-            spec.context,
-            spec.registry,
-        )?;
-        let effect = Self::plan_semantic_join_effect(
-            storage.encoder,
-            &storage.left,
-            &storage.right,
-            &left_plan,
-            left_delta,
-            right_delta,
-            spec,
-        )?;
-        Ok(PlannedDeltaEffect {
-            patch: JoinDeltaPatch::SemanticIndexed {
-                left: left_plan,
-                right: right_plan,
-            },
-            effect,
-        })
-    }
-
-    fn plan_structural_delta_views<LD: DeltaView<Row>, RD: DeltaView<Row>>(
-        &self,
-        storage: &StructuralIndexedJoinStorage,
-        left_delta: &LD,
-        right_delta: &RD,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedDeltaEffect<JoinDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
-        let spec = GenericJoinMaintenanceSpec {
-            left_column: self.left_column,
-            right_column: self.right_column,
-            left_type: &self.left_type,
-            right_type: &self.right_type,
+            self.right_column,
+            self.equivalence,
+            &self.right_type,
             context,
             registry,
-        };
-        let left_plan = storage.left.plan_mutation_view(
-            left_delta,
-            spec.left_column,
-            storage.equivalence,
-            spec.left_type,
-            spec.context,
-            spec.registry,
         )?;
-        let right_plan = storage.right.plan_mutation_view(
-            right_delta,
-            spec.right_column,
-            storage.equivalence,
-            spec.right_type,
-            spec.context,
-            spec.registry,
-        )?;
-        let effect = Self::plan_structural_join_effect(
-            storage.equivalence,
-            &storage.left,
+        let effect = self.plan_exact_join_effect(
             &storage.right,
             &left_plan,
-            left_delta,
-            right_delta,
-            spec,
+            &right_plan,
+            context,
+            registry,
         )?;
         Ok(PlannedDeltaEffect {
-            patch: JoinDeltaPatch::StructuralIndexed {
-                left: left_plan,
-                right: right_plan,
+            patch: JoinDeltaPatch {
+                left: left_plan.next,
+                right: right_plan.next,
             },
             effect,
         })
     }
 
-    fn validate_delta_view_rows<D: DeltaView<Row>>(
+    fn validate_exact_delta_view_rows<D: ExactDeltaView<Row>>(
         delta: &D,
         ty: &RelType,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<(), RelQueryError> {
         let mut error = None;
-        delta.visit(|weight, row| {
-            if weight == 0 || error.is_some() {
-                return;
-            }
-            if weight == i64::MIN {
-                error = Some(RelQueryError::InconsistentIncrementalDelta);
+        delta.visit_exact(|weight, row| {
+            if weight.is_zero() || error.is_some() {
                 return;
             }
             if let Err(next) = MaterializedSetSupportState::validate_rows(
@@ -1793,406 +1440,88 @@ impl MaterializedJoinDeltaState {
     }
 
     fn commit_join_patch(&mut self, patch: JoinDeltaPatch) {
-        match (patch, &mut self.storage) {
-            (
-                JoinDeltaPatch::I64 { left, right },
-                MaintainedJoinStorage::I64 {
-                    left: left_state,
-                    right: right_state,
-                },
-            ) => {
-                Self::commit_i64_buckets(left_state, left.buckets);
-                Self::commit_i64_buckets(right_state, right.buckets);
-            }
-            (
-                JoinDeltaPatch::SemanticIndexed { left, right },
-                MaintainedJoinStorage::SemanticIndexed(storage),
-            ) => {
-                storage.left.commit_plan(left);
-                storage.right.commit_plan(right);
-            }
-            (
-                JoinDeltaPatch::StructuralIndexed { left, right },
-                MaintainedJoinStorage::StructuralIndexed(storage),
-            ) => {
-                storage.left.commit_plan(left);
-                storage.right.commit_plan(right);
-            }
-            _ => unreachable!("Join patch/backend mismatch"),
-        }
-    }
-
-    fn plan_semantic_join_effect<LD: DeltaView<Row>, RD: DeltaView<Row>>(
-        encoder: kernel_semantics::ResolvedPrimitiveEquivalence,
-        left: &IndexedJoinSide,
-        right: &IndexedJoinSide,
-        left_plan: &IndexedRelationMutationPlan,
-        left_delta: &LD,
-        right_delta: &RD,
-        spec: GenericJoinMaintenanceSpec<'_>,
-    ) -> Result<AdaptiveDelta<Row, 4>, RelQueryError> {
-        let mut effect = AdaptiveDelta::<Row, 4>::default();
-        let mut error = None;
-        left_delta.visit(|weight, left_row| {
-            if weight == 0 || error.is_some() {
-                return;
-            }
-            let key = match left_row
-                .get(spec.left_column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)
-                .and_then(|value| encoder.canonical_key(value).map_err(Into::into))
-            {
-                Ok(key) => key,
-                Err(next) => {
-                    error = Some(next);
-                    return;
-                }
-            };
-            let Some(right_ids) = right.index.bucket(&key) else {
-                return;
-            };
-            for right_id in right_ids {
-                let Some(right_row) = right.rows.get(right_id) else {
-                    error = Some(RelQueryError::InconsistentIncrementalDelta);
-                    return;
-                };
-                effect.push_weighted(weight, Self::join_pair(left_row, right_row));
-            }
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-
-        let removed_left = left_plan
-            .remove_ids
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        right_delta.visit(|weight, right_row| {
-            if weight == 0 || error.is_some() {
-                return;
-            }
-            let key = match right_row
-                .get(spec.right_column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)
-                .and_then(|value| encoder.canonical_key(value).map_err(Into::into))
-            {
-                Ok(key) => key,
-                Err(next) => {
-                    error = Some(next);
-                    return;
-                }
-            };
-            if let Some(left_ids) = left.index.bucket(&key) {
-                for left_id in left_ids {
-                    if removed_left.contains(left_id) {
-                        continue;
-                    }
-                    let Some(left_row) = left.rows.get(left_id) else {
-                        error = Some(RelQueryError::InconsistentIncrementalDelta);
-                        return;
-                    };
-                    effect.push_weighted(weight, Self::join_pair(left_row, right_row));
-                }
-            }
-            for (_, inserted_key, left_row) in &left_plan.inserted {
-                if inserted_key == &key {
-                    effect.push_weighted(weight, Self::join_pair(left_row, right_row));
-                }
-            }
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-        Ok(effect)
-    }
-
-    fn plan_structural_join_effect<LD: DeltaView<Row>, RD: DeltaView<Row>>(
-        equivalence: kernel_types::SemanticId,
-        left: &StructuralIndexedJoinSide,
-        right: &StructuralIndexedJoinSide,
-        left_plan: &IndexedRelationMutationPlan,
-        left_delta: &LD,
-        right_delta: &RD,
-        spec: GenericJoinMaintenanceSpec<'_>,
-    ) -> Result<AdaptiveDelta<Row, 4>, RelQueryError> {
-        let mut effect = AdaptiveDelta::<Row, 4>::default();
-        let mut error = None;
-        left_delta.visit(|weight, left_row| {
-            if weight == 0 || error.is_some() {
-                return;
-            }
-            let key = match StructuralIndexedJoinSide::canonical_key(
-                left_row,
-                spec.left_column,
-                equivalence,
-                spec.context,
-                spec.registry,
-            ) {
-                Ok(key) => key,
-                Err(next) => {
-                    error = Some(next);
-                    return;
-                }
-            };
-            let Some(right_ids) = right.bucket(&key) else {
-                return;
-            };
-            for right_id in right_ids {
-                let Some(right_row) = right.rows.get(right_id) else {
-                    error = Some(RelQueryError::InconsistentIncrementalDelta);
-                    return;
-                };
-                effect.push_weighted(weight, Self::join_pair(left_row, right_row));
-            }
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-
-        let removed_left = left_plan
-            .remove_ids
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        right_delta.visit(|weight, right_row| {
-            if weight == 0 || error.is_some() {
-                return;
-            }
-            let key = match StructuralIndexedJoinSide::canonical_key(
-                right_row,
-                spec.right_column,
-                equivalence,
-                spec.context,
-                spec.registry,
-            ) {
-                Ok(key) => key,
-                Err(next) => {
-                    error = Some(next);
-                    return;
-                }
-            };
-            if let Some(left_ids) = left.bucket(&key) {
-                for left_id in left_ids {
-                    if removed_left.contains(left_id) {
-                        continue;
-                    }
-                    let Some(left_row) = left.rows.get(left_id) else {
-                        error = Some(RelQueryError::InconsistentIncrementalDelta);
-                        return;
-                    };
-                    effect.push_weighted(weight, Self::join_pair(left_row, right_row));
-                }
-            }
-            for (_, inserted_key, left_row) in &left_plan.inserted {
-                if inserted_key == &key {
-                    effect.push_weighted(weight, Self::join_pair(left_row, right_row));
-                }
-            }
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-        Ok(effect)
+        let MaintainedJoinStorage::Counted(storage) = &mut self.storage;
+        storage.left = patch.left;
+        storage.right = patch.right;
     }
 
     fn plan_relation_mutation(
-        value: &RelationValue,
+        value: &PersistentVec<Row>,
         delta: &RelationDelta,
         ty: &RelType,
-        canonical_lookup: Option<&CanonicalRowPositionIndex>,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<RelationMutationPlan, RelQueryError> {
-        if let Some(lookup) = canonical_lookup {
-            let equivalences = relation_column_equivalences(ty);
-            let mut removed_per_key = BTreeMap::<CanonicalRowKey, usize>::new();
-            let mut remove_indices = Vec::with_capacity(delta.removed.len());
-            let mut removed_keys = Vec::with_capacity(delta.removed.len());
-            for removed in &delta.removed {
-                let Some(key) = try_canonical_row_key(removed, equivalences, context, registry)?
-                else {
-                    return Self::plan_relation_mutation_linear(
-                        value, delta, ty, context, registry,
-                    );
-                };
-                let used = removed_per_key.entry(key.clone()).or_default();
-                let bucket = lookup
-                    .by_key
-                    .get(&key)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                let index = bucket
-                    .len()
-                    .checked_sub(*used + 1)
-                    .and_then(|position| bucket.get(position).copied())
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                *used += 1;
-                remove_indices.push(index);
-                removed_keys.push(key);
-            }
-
-            let mut inserted_keys = Vec::with_capacity(delta.inserted.len());
-            for inserted in &delta.inserted {
-                let Some(key) = try_canonical_row_key(inserted, equivalences, context, registry)?
-                else {
-                    return Self::plan_relation_mutation_linear(
-                        value, delta, ty, context, registry,
-                    );
-                };
-                if matches!(ty.semantics, kernel_schema::RelationSemantics::Set { .. }) {
-                    let existing = lookup.by_key.get(&key).map_or(0, Vec::len);
-                    let removing = removed_per_key.get(&key).copied().unwrap_or(0);
-                    if existing > removing || inserted_keys.iter().any(|previous| previous == &key)
-                    {
-                        return Err(RelQueryError::InconsistentIncrementalDelta);
-                    }
-                }
-                inserted_keys.push(key);
-            }
-            return Ok(RelationMutationPlan {
-                remove_indices,
-                inserted: delta.inserted.clone(),
-                canonical_keys: Some(CanonicalRelationMutationKeys {
-                    removed: removed_keys,
-                    inserted: inserted_keys,
-                }),
-            });
-        }
-        Self::plan_relation_mutation_linear(value, delta, ty, context, registry)
-    }
-
-    fn plan_relation_mutation_linear(
-        value: &RelationValue,
-        delta: &RelationDelta,
-        ty: &RelType,
+        canonical_lookup: &CanonicalRowPositionIndex,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<RelationMutationPlan, RelQueryError> {
         let equivalences = relation_column_equivalences(ty);
-        let mut used = vec![false; value.rows().len()];
+        let mut removed_per_key = BTreeMap::<CanonicalRowKey, usize>::new();
         let mut remove_indices = Vec::with_capacity(delta.removed.len());
+        let mut removed_keys = Vec::with_capacity(delta.removed.len());
         for removed in &delta.removed {
-            let mut found = None;
-            for (index, candidate) in value.rows().iter().enumerate() {
-                if !used[index]
-                    && rows_semantically_equal(candidate, removed, equivalences, context, registry)?
-                {
-                    found = Some(index);
-                    break;
-                }
-            }
-            let Some(index) = found else {
-                return Err(RelQueryError::InconsistentIncrementalDelta);
-            };
-            used[index] = true;
+            let key = canonical_row_key(removed, equivalences, context, registry)?;
+            let used = removed_per_key.entry(key.clone()).or_default();
+            let bucket = canonical_lookup
+                .by_key
+                .get(&key)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let index = bucket
+                .len()
+                .checked_sub(*used + 1)
+                .and_then(|position| bucket.get(position).copied())
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            *used += 1;
             remove_indices.push(index);
+            removed_keys.push(key);
         }
-        if matches!(ty.semantics, kernel_schema::RelationSemantics::Set { .. }) {
-            for (insert_index, inserted) in delta.inserted.iter().enumerate() {
-                for (index, candidate) in value.rows().iter().enumerate() {
-                    if !used[index]
-                        && rows_semantically_equal(
-                            candidate,
-                            inserted,
-                            equivalences,
-                            context,
-                            registry,
-                        )?
-                    {
-                        return Err(RelQueryError::InconsistentIncrementalDelta);
-                    }
-                }
-                for previous in &delta.inserted[..insert_index] {
-                    if rows_semantically_equal(previous, inserted, equivalences, context, registry)?
-                    {
-                        return Err(RelQueryError::InconsistentIncrementalDelta);
-                    }
+
+        let is_set = matches!(ty.semantics, kernel_schema::RelationSemantics::Set { .. });
+        let mut inserted_keys = Vec::with_capacity(delta.inserted.len());
+        let mut inserted_set = BTreeSet::new();
+        for inserted in &delta.inserted {
+            let key = canonical_row_key(inserted, equivalences, context, registry)?;
+            if is_set {
+                let existing = canonical_lookup
+                    .by_key
+                    .get(&key)
+                    .map_or(0, PersistentVec::len);
+                let removing = removed_per_key.get(&key).copied().unwrap_or(0);
+                if existing > removing || !inserted_set.insert(key.clone()) {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
                 }
             }
+            inserted_keys.push(key);
         }
+        let _ = value;
         Ok(RelationMutationPlan {
             remove_indices,
             inserted: delta.inserted.clone(),
-            canonical_keys: None,
+            canonical_keys: CanonicalRelationMutationKeys {
+                removed: removed_keys,
+                inserted: inserted_keys,
+            },
         })
     }
 
     fn commit_relation_mutation(
-        value: &mut RelationValue,
-        canonical_lookup: &mut Option<CanonicalRowPositionIndex>,
-        mut plan: RelationMutationPlan,
+        value: &mut PersistentVec<Row>,
+        canonical_lookup: &mut CanonicalRowPositionIndex,
+        plan: RelationMutationPlan,
     ) {
-        if let (Some(lookup), Some(keys)) = (canonical_lookup.as_mut(), plan.canonical_keys.take())
-        {
-            let mut removals = plan
-                .remove_indices
-                .into_iter()
-                .zip(keys.removed)
-                .collect::<Vec<_>>();
-            removals.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
-            let rows = value.rows_mut();
-            for (index, key) in removals {
-                let last_index = rows.len() - 1;
-                let bucket = lookup
-                    .by_key
-                    .get_mut(&key)
-                    .expect("planned canonical Scan removal key must exist");
-                let position = bucket
-                    .iter()
-                    .position(|candidate| *candidate == index)
-                    .expect("planned canonical Scan removal index must exist");
-                bucket.swap_remove(position);
-                if bucket.is_empty() {
-                    lookup.by_key.remove(&key);
-                }
-                if index != last_index {
-                    rows.swap(index, last_index);
-                    let moved_key = lookup.by_position[last_index].clone();
-                    let moved_bucket = lookup
-                        .by_key
-                        .get_mut(&moved_key)
-                        .expect("moved canonical Scan key must exist");
-                    let moved_position = moved_bucket
-                        .iter()
-                        .position(|candidate| *candidate == last_index)
-                        .expect("moved canonical Scan index must exist");
-                    moved_bucket[moved_position] = index;
-                    lookup.by_position.swap(index, last_index);
-                }
-                rows.pop();
-                lookup.by_position.pop();
-            }
-            for (row, key) in plan.inserted.into_iter().zip(keys.inserted) {
-                let index = rows.len();
-                rows.push(row);
-                lookup.by_position.push(key.clone());
-                lookup.by_key.entry(key).or_default().push(index);
-            }
-            return;
+        let keys = plan.canonical_keys;
+        let mut removals = plan
+            .remove_indices
+            .into_iter()
+            .zip(keys.removed)
+            .collect::<Vec<_>>();
+        removals.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        for (index, _) in removals {
+            canonical_lookup.remove_position(index);
+            value.swap_remove(index);
         }
-
-        plan.remove_indices
-            .sort_unstable_by(|left, right| right.cmp(left));
-        let rows = value.rows_mut();
-        for index in plan.remove_indices {
-            rows.remove(index);
+        for (row, key) in plan.inserted.into_iter().zip(keys.inserted) {
+            value.push(row);
+            canonical_lookup.push_key(key);
         }
-        rows.extend(plan.inserted);
-        *canonical_lookup = None;
-    }
-
-    fn build_i64_buckets(
-        rows: &[Row],
-        column: usize,
-    ) -> Result<BTreeMap<i64, Vec<Row>>, RelQueryError> {
-        let mut buckets = BTreeMap::<i64, Vec<Row>>::new();
-        for row in rows {
-            let Value::I64(key) = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)? else {
-                return Err(RelQueryError::TypeMismatch);
-            };
-            buckets.entry(*key).or_default().push(row.clone());
-        }
-        Ok(buckets)
     }
 
     fn join_pair(left: &Row, right: &Row) -> Row {
@@ -2202,152 +1531,128 @@ impl MaterializedJoinDeltaState {
         joined
     }
 
-    fn plan_i64_side_view<D: DeltaView<Row>>(
-        current: &BTreeMap<i64, Vec<Row>>,
-        delta: &D,
-        column: usize,
-        ty: &RelType,
+    fn plan_exact_join_effect(
+        &self,
+        old_right: &CountedJoinSide,
+        left_plan: &CountedJoinMutationPlan,
+        right_plan: &CountedJoinMutationPlan,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedI64JoinSide, RelQueryError> {
-        type WeightedRowsByKey = BTreeMap<i64, (Vec<(usize, Row)>, Vec<(usize, Row)>)>;
-
-        let normalized = normalized_delta_rows(delta)?;
-        let mut changes = WeightedRowsByKey::new();
-        for (magnitude, row) in normalized.removed {
-            let Value::I64(key) = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)? else {
-                return Err(RelQueryError::TypeMismatch);
-            };
-            changes.entry(*key).or_default().0.push((magnitude, row));
-        }
-        for (magnitude, row) in normalized.inserted {
-            let Value::I64(key) = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)? else {
-                return Err(RelQueryError::TypeMismatch);
-            };
-            changes.entry(*key).or_default().1.push((magnitude, row));
-        }
-
-        let equivalences = relation_column_equivalences(ty);
-        let is_set = matches!(ty.semantics, kernel_schema::RelationSemantics::Set { .. });
-        let mut planned = BTreeMap::new();
-        for (key, (removed, inserted)) in changes {
-            let mut bucket = current.get(&key).cloned().unwrap_or_default();
-            for (magnitude, row) in removed {
-                for _ in 0..magnitude {
-                    let mut found = None;
-                    for (index, candidate) in bucket.iter().enumerate() {
-                        if rows_semantically_equal(
-                            candidate,
-                            &row,
-                            equivalences,
-                            context,
-                            registry,
-                        )? {
-                            found = Some(index);
-                            break;
-                        }
+    ) -> Result<ExactDelta<Row>, RelQueryError> {
+        let result_equivalences = relation_column_equivalences(&self.result_type);
+        let mut quotient = BTreeMap::<CanonicalRowKey, (Row, kernel_exact::ExactInteger)>::new();
+        let mut accumulate =
+            |row: Row, weight: kernel_exact::ExactInteger| -> Result<(), RelQueryError> {
+                if weight.is_zero() {
+                    return Ok(());
+                }
+                let key = canonical_row_key(&row, result_equivalences, context, registry)?;
+                match quotient.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((row, weight));
                     }
-                    let Some(index) = found else {
-                        return Err(RelQueryError::InconsistentIncrementalDelta);
-                    };
-                    bucket.remove(index);
-                }
-            }
-            for (magnitude, row) in inserted {
-                for _ in 0..magnitude {
-                    if is_set {
-                        for candidate in &bucket {
-                            if rows_semantically_equal(
-                                candidate,
-                                &row,
-                                equivalences,
-                                context,
-                                registry,
-                            )? {
-                                return Err(RelQueryError::InconsistentIncrementalDelta);
-                            }
-                        }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().1.add_assign(&weight);
                     }
-                    bucket.push(row.clone());
                 }
-            }
-            planned.insert(key, bucket);
-        }
-        Ok(PlannedI64JoinSide { buckets: planned })
-    }
-
-    fn plan_i64_join_effect<LD: DeltaView<Row>, RD: DeltaView<Row>>(
-        left: &BTreeMap<i64, Vec<Row>>,
-        right: &BTreeMap<i64, Vec<Row>>,
-        planned_left: &BTreeMap<i64, Vec<Row>>,
-        left_delta: &LD,
-        right_delta: &RD,
-        spec: JoinI64MaintenanceSpec<'_>,
-    ) -> Result<AdaptiveDelta<Row, 4>, RelQueryError> {
-        let mut effect = AdaptiveDelta::<Row, 4>::default();
-        let mut error = None;
-        left_delta.visit(|weight, row| {
-            if weight == 0 || error.is_some() {
-                return;
-            }
-            let key = match row.get(spec.left_column) {
-                Some(Value::I64(key)) => *key,
-                Some(_) => {
-                    error = Some(RelQueryError::TypeMismatch);
-                    return;
-                }
-                None => {
-                    error = Some(RelQueryError::ColumnOutOfBounds);
-                    return;
-                }
+                Ok(())
             };
-            if let Some(right_bucket) = right.get(&key) {
-                for right_row in right_bucket {
-                    effect.push_weighted(weight, Self::join_pair(row, right_row));
-                }
+
+        // Bilinear differential law: dL ⋈ R + (L + dL) ⋈ dR.
+        for atom in &left_plan.delta {
+            let Some(right_bucket) = old_right.bucket(&atom.join_key) else {
+                continue;
+            };
+            for right_class in right_bucket.values() {
+                accumulate(
+                    Self::join_pair(&atom.representative, &right_class.representative),
+                    atom.weight.scale_by_natural(&right_class.multiplicity),
+                )?;
             }
-        });
-        if let Some(error) = error {
-            return Err(error);
+        }
+        for atom in &right_plan.delta {
+            let Some(left_bucket) = left_plan.next.bucket(&atom.join_key) else {
+                continue;
+            };
+            for left_class in left_bucket.values() {
+                accumulate(
+                    Self::join_pair(&left_class.representative, &atom.representative),
+                    atom.weight.scale_by_natural(&left_class.multiplicity),
+                )?;
+            }
         }
 
-        right_delta.visit(|weight, row| {
-            if weight == 0 || error.is_some() {
-                return;
-            }
-            let key = match row.get(spec.right_column) {
-                Some(Value::I64(key)) => *key,
-                Some(_) => {
-                    error = Some(RelQueryError::TypeMismatch);
-                    return;
-                }
-                None => {
-                    error = Some(RelQueryError::ColumnOutOfBounds);
-                    return;
-                }
-            };
-            let left_bucket = planned_left
-                .get(&key)
-                .or_else(|| left.get(&key))
-                .map_or(&[][..], Vec::as_slice);
-            for left_row in left_bucket {
-                effect.push_weighted(weight, Self::join_pair(left_row, row));
-            }
-        });
-        if let Some(error) = error {
-            return Err(error);
+        let mut effect = ExactDelta::with_capacity(quotient.len());
+        for (_, (row, weight)) in quotient {
+            effect.push_exact(weight, row);
         }
         Ok(effect)
     }
 
-    fn commit_i64_buckets(target: &mut BTreeMap<i64, Vec<Row>>, planned: BTreeMap<i64, Vec<Row>>) {
-        for (key, bucket) in planned {
-            if bucket.is_empty() {
-                target.remove(&key);
+    fn exact_integer_to_i64(weight: &kernel_exact::ExactInteger) -> Option<i64> {
+        let magnitude = weight.magnitude().to_u64()?;
+        if weight.is_negative() {
+            if magnitude == (1_u64 << 63) {
+                Some(i64::MIN)
             } else {
-                target.insert(key, bucket);
+                i64::try_from(magnitude).ok().map(|value| -value)
             }
+        } else {
+            i64::try_from(magnitude).ok()
         }
+    }
+
+    fn exact_effect_to_legacy(
+        effect: &ExactDelta<Row>,
+    ) -> Result<AdaptiveDelta<Row, 4>, RelQueryError> {
+        let mut legacy = AdaptiveDelta::default();
+        let mut error = None;
+        effect.visit_exact(|weight, row| {
+            if error.is_some() {
+                return;
+            }
+            let Some(weight) = Self::exact_integer_to_i64(weight) else {
+                error = Some(RelQueryError::DerivedIdentityExhausted);
+                return;
+            };
+            legacy.push_weighted(weight, row.clone());
+        });
+        error.map_or(Ok(legacy), Err)
+    }
+
+    fn materialize_exact_effect(
+        &self,
+        effect: &ExactDelta<Row>,
+    ) -> Result<RelationDelta, RelQueryError> {
+        let mut inserted = Vec::new();
+        let mut removed = Vec::new();
+        let mut error = None;
+        effect.visit_exact(|weight, row| {
+            if error.is_some() || weight.is_zero() {
+                return;
+            }
+            let Some(magnitude) = weight
+                .magnitude()
+                .to_u64()
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                error = Some(RelQueryError::DerivedIdentityExhausted);
+                return;
+            };
+            if weight.is_negative() {
+                removed.extend(std::iter::repeat_n(row.clone(), magnitude));
+            } else {
+                inserted.extend(std::iter::repeat_n(row.clone(), magnitude));
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(RelationDelta {
+            result_type: self.result_type.clone(),
+            inserted,
+            removed,
+        })
     }
 }
 
@@ -2406,13 +1711,7 @@ impl MaterializedJoinGroupTopKState {
         else {
             return Ok(None);
         };
-        if !matches!(join.storage, MaintainedJoinStorage::I64 { .. })
-            || !group.fast_i64_count
-            || !matches!(
-                top_k.storage,
-                MaintainedTopKStorage::I64Scalar(_) | MaintainedTopKStorage::I64Rows(_)
-            )
-        {
+        if !group.fast_i64_count {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -2463,39 +1762,57 @@ enum MaintainedBlockerKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct DifferenceBlockerClass {
-    left: Vec<Row>,
-    right: Vec<Row>,
+    representative: Option<Row>,
+    left_count: kernel_exact::ExactNatural,
+    right_count: kernel_exact::ExactNatural,
 }
 
 impl DifferenceBlockerClass {
-    fn output_count(&self) -> usize {
-        self.left.len().saturating_sub(self.right.len())
+    fn output_count(&self) -> kernel_exact::ExactNatural {
+        let mut count = self.left_count.clone();
+        if !count.checked_sub_assign(&self.right_count) {
+            return kernel_exact::ExactNatural::zero();
+        }
+        count
     }
 
     fn representative(&self) -> Option<&Row> {
-        self.left.first()
+        self.representative.as_ref()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.left_count.is_zero() && self.right_count.is_zero()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CountedBlockerRowClass {
+    representative: Row,
+    multiplicity: kernel_exact::ExactNatural,
+}
+
+type CountedBlockerRows = PersistentOrdMap<CanonicalRowKey, CountedBlockerRowClass>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AntiJoinBlockerClass {
-    left: Vec<Row>,
-    right_count: usize,
+    left: CountedBlockerRows,
+    right_count: kernel_exact::ExactNatural,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MaintainedBlockerStorage {
     Difference {
         equivalences: Vec<kernel_types::SemanticId>,
-        classes: BTreeMap<CanonicalRowKey, DifferenceBlockerClass>,
+        classes: PersistentOrdMap<CanonicalRowKey, Arc<DifferenceBlockerClass>>,
     },
     AntiJoin {
         left_column: usize,
         right_column: usize,
         equivalence: kernel_types::SemanticId,
-        classes: BTreeMap<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>,
+        left_equivalences: Vec<kernel_types::SemanticId>,
+        classes: PersistentOrdMap<kernel_semantics::CanonicalEqKey, Arc<AntiJoinBlockerClass>>,
     },
 }
 
@@ -2530,13 +1847,15 @@ enum DifferenceBlockerSide {
 }
 
 type DifferenceBlockerWrites = Vec<(CanonicalRowKey, DifferenceBlockerClass)>;
-type DifferenceBlockerEffect = (AdaptiveDelta<Row, 4>, DifferenceBlockerWrites);
+type DifferenceBlockerEffect = (ExactDelta<Row>, DifferenceBlockerWrites);
 type AntiJoinBlockerWrites = Vec<(kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass)>;
-type AntiJoinBlockerEffect = (AdaptiveDelta<Row, 4>, AntiJoinBlockerWrites);
-type AntiJoinChangeMap = BTreeMap<kernel_semantics::CanonicalEqKey, Vec<(usize, Row)>>;
+type AntiJoinBlockerEffect = (ExactDelta<Row>, AntiJoinBlockerWrites);
+type AntiJoinChangeMap = BTreeMap<
+    kernel_semantics::CanonicalEqKey,
+    BTreeMap<CanonicalRowKey, (Row, kernel_exact::ExactInteger)>,
+>;
 
 struct AntiJoinLeftChanges {
-    removed: AntiJoinChangeMap,
     inserted: AntiJoinChangeMap,
 }
 
@@ -2562,29 +1881,25 @@ impl MaterializedBlockerDeltaState {
                 let mut classes = BTreeMap::<CanonicalRowKey, DifferenceBlockerClass>::new();
                 for row in left.rows() {
                     let key = canonical_row_key(row, &equivalences, context, registry)?;
-                    classes
-                        .entry(key)
-                        .or_insert_with(|| DifferenceBlockerClass {
-                            left: Vec::new(),
-                            right: Vec::new(),
-                        })
-                        .left
-                        .push(row.clone());
+                    let class = classes.entry(key).or_default();
+                    class
+                        .left_count
+                        .add_assign(&kernel_exact::ExactNatural::one());
+                    class.representative.get_or_insert_with(|| row.clone());
                 }
                 for row in right.rows() {
                     let key = canonical_row_key(row, &equivalences, context, registry)?;
-                    classes
-                        .entry(key)
-                        .or_insert_with(|| DifferenceBlockerClass {
-                            left: Vec::new(),
-                            right: Vec::new(),
-                        })
-                        .right
-                        .push(row.clone());
+                    let class = classes.entry(key).or_default();
+                    class
+                        .right_count
+                        .add_assign(&kernel_exact::ExactNatural::one());
                 }
                 MaintainedBlockerStorage::Difference {
                     equivalences,
-                    classes,
+                    classes: classes
+                        .into_iter()
+                        .map(|(key, class)| (key, Arc::new(class)))
+                        .collect(),
                 }
             }
             MaintainedBlockerKind::AntiJoin {
@@ -2592,19 +1907,27 @@ impl MaterializedBlockerDeltaState {
                 right_column,
                 equivalence,
             } => {
+                let left_equivalences = relation_column_equivalences(&left_type).to_vec();
                 let mut classes =
                     BTreeMap::<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>::new();
                 for row in left.rows() {
                     let key =
                         Self::anti_join_key(row, *left_column, *equivalence, context, registry)?;
-                    classes
-                        .entry(key)
-                        .or_insert_with(|| AntiJoinBlockerClass {
-                            left: Vec::new(),
-                            right_count: 0,
-                        })
-                        .left
-                        .push(row.clone());
+                    let row_key = canonical_row_key(row, &left_equivalences, context, registry)?;
+                    let class = classes.entry(key).or_insert_with(|| AntiJoinBlockerClass {
+                        left: PersistentOrdMap::default(),
+                        right_count: kernel_exact::ExactNatural::zero(),
+                    });
+                    let mut row_class = class.left.get(&row_key).cloned().unwrap_or_else(|| {
+                        CountedBlockerRowClass {
+                            representative: row.clone(),
+                            multiplicity: kernel_exact::ExactNatural::zero(),
+                        }
+                    });
+                    row_class
+                        .multiplicity
+                        .add_assign(&kernel_exact::ExactNatural::one());
+                    class.left.insert(row_key, row_class);
                 }
                 for row in right.rows() {
                     let key =
@@ -2612,16 +1935,21 @@ impl MaterializedBlockerDeltaState {
                     classes
                         .entry(key)
                         .or_insert_with(|| AntiJoinBlockerClass {
-                            left: Vec::new(),
-                            right_count: 0,
+                            left: PersistentOrdMap::default(),
+                            right_count: kernel_exact::ExactNatural::zero(),
                         })
-                        .right_count += 1;
+                        .right_count
+                        .add_assign(&kernel_exact::ExactNatural::one());
                 }
                 MaintainedBlockerStorage::AntiJoin {
                     left_column: *left_column,
                     right_column: *right_column,
                     equivalence: *equivalence,
-                    classes,
+                    left_equivalences,
+                    classes: classes
+                        .into_iter()
+                        .map(|(key, class)| (key, Arc::new(class)))
+                        .collect(),
                 }
             }
         };
@@ -2647,29 +1975,43 @@ impl MaterializedBlockerDeltaState {
             .map_err(RelQueryError::from)
     }
 
-    fn output_value(&self) -> RelationValue {
+    fn output_value(&self) -> Result<RelationValue, RelQueryError> {
         let mut rows = Vec::new();
         match &self.storage {
             MaintainedBlockerStorage::Difference { classes, .. } => {
                 for class in classes.values() {
                     let count = class.output_count();
-                    if count == 0 {
+                    if count.is_zero() {
                         continue;
                     }
                     if let Some(row) = class.representative() {
+                        let count = count
+                            .to_u64()
+                            .and_then(|count| usize::try_from(count).ok())
+                            .ok_or(RelQueryError::DerivedIdentityExhausted)?;
                         rows.extend(std::iter::repeat_n(row.clone(), count));
                     }
                 }
             }
             MaintainedBlockerStorage::AntiJoin { classes, .. } => {
                 for class in classes.values() {
-                    if class.right_count == 0 {
-                        rows.extend(class.left.iter().cloned());
+                    if class.right_count.is_zero() {
+                        for row_class in class.left.values() {
+                            let count = row_class
+                                .multiplicity
+                                .to_u64()
+                                .and_then(|count| usize::try_from(count).ok())
+                                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
+                            rows.extend(std::iter::repeat_n(
+                                row_class.representative.clone(),
+                                count,
+                            ));
+                        }
                     }
                 }
             }
         }
-        relation_value_from_rows(rows, &self.result_type)
+        Ok(relation_value_from_rows(rows, &self.result_type))
     }
 
     fn plan_delta_views<LD: DeltaView<Row>, RD: DeltaView<Row>>(
@@ -2679,16 +2021,32 @@ impl MaterializedBlockerDeltaState {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<PlannedDeltaEffect<BlockerDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
+        let left = exact_delta_from_legacy(left_delta);
+        let right = exact_delta_from_legacy(right_delta);
+        let planned = self.plan_exact_delta_views(&left, &right, context, registry)?;
+        Ok(PlannedDeltaEffect {
+            patch: planned.patch,
+            effect: exact_delta_to_legacy_checked(&planned.effect)?,
+        })
+    }
+
+    fn plan_exact_delta_views<LD: ExactDeltaView<Row>, RD: ExactDeltaView<Row>>(
+        &self,
+        left_delta: &LD,
+        right_delta: &RD,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedDeltaEffect<BlockerDeltaPatch, ExactDelta<Row>>, RelQueryError> {
         if context != &self.semantic_context {
             return Err(RelQueryError::SemanticRevisionMismatch);
         }
-        MaterializedJoinDeltaState::validate_delta_view_rows(
+        MaterializedJoinDeltaState::validate_exact_delta_view_rows(
             left_delta,
             &self.left_type,
             context,
             registry,
         )?;
-        MaterializedJoinDeltaState::validate_delta_view_rows(
+        MaterializedJoinDeltaState::validate_exact_delta_view_rows(
             right_delta,
             &self.right_type,
             context,
@@ -2698,7 +2056,7 @@ impl MaterializedBlockerDeltaState {
             MaintainedBlockerStorage::Difference {
                 equivalences,
                 classes,
-            } => Self::plan_difference(
+            } => Self::plan_exact_difference(
                 equivalences,
                 classes,
                 left_delta,
@@ -2710,11 +2068,13 @@ impl MaterializedBlockerDeltaState {
                 left_column,
                 right_column,
                 equivalence,
+                left_equivalences,
                 classes,
-            } => self.plan_anti_join(
+            } => Self::plan_exact_anti_join(
                 *left_column,
                 *right_column,
                 *equivalence,
+                left_equivalences,
                 classes,
                 left_delta,
                 right_delta,
@@ -2724,31 +2084,64 @@ impl MaterializedBlockerDeltaState {
         }
     }
 
-    fn plan_difference<LD: DeltaView<Row>, RD: DeltaView<Row>>(
+    fn apply_exact_to_natural(
+        value: &mut kernel_exact::ExactNatural,
+        weight: &kernel_exact::ExactInteger,
+    ) -> Result<(), RelQueryError> {
+        if weight.is_negative() {
+            if !value.checked_sub_assign(weight.magnitude()) {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            }
+        } else {
+            value.add_assign(weight.magnitude());
+        }
+        Ok(())
+    }
+
+    fn exact_natural_difference(
+        after: &kernel_exact::ExactNatural,
+        before: &kernel_exact::ExactNatural,
+    ) -> kernel_exact::ExactInteger {
+        match after.cmp(before) {
+            std::cmp::Ordering::Equal => kernel_exact::ExactInteger::default(),
+            std::cmp::Ordering::Greater => {
+                let mut magnitude = after.clone();
+                let subtracted = magnitude.checked_sub_assign(before);
+                debug_assert!(subtracted);
+                kernel_exact::ExactInteger::from_parts(false, magnitude)
+            }
+            std::cmp::Ordering::Less => {
+                let mut magnitude = before.clone();
+                let subtracted = magnitude.checked_sub_assign(after);
+                debug_assert!(subtracted);
+                kernel_exact::ExactInteger::from_parts(true, magnitude)
+            }
+        }
+    }
+
+    fn plan_exact_difference<LD: ExactDeltaView<Row>, RD: ExactDeltaView<Row>>(
         equivalences: &[kernel_types::SemanticId],
-        classes: &BTreeMap<CanonicalRowKey, DifferenceBlockerClass>,
+        classes: &PersistentOrdMap<CanonicalRowKey, Arc<DifferenceBlockerClass>>,
         left_delta: &LD,
         right_delta: &RD,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedDeltaEffect<BlockerDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
-        let left = normalized_delta_rows(left_delta)?;
-        let right = normalized_delta_rows(right_delta)?;
+    ) -> Result<PlannedDeltaEffect<BlockerDeltaPatch, ExactDelta<Row>>, RelQueryError> {
         let mut local = BTreeMap::<CanonicalRowKey, DifferenceBlockerClass>::new();
-        Self::apply_difference_delta(
+        Self::apply_exact_difference_delta(
             &mut local,
             classes,
             equivalences,
-            &left,
+            left_delta,
             DifferenceBlockerSide::Left,
             context,
             registry,
         )?;
-        Self::apply_difference_delta(
+        Self::apply_exact_difference_delta(
             &mut local,
             classes,
             equivalences,
-            &right,
+            right_delta,
             DifferenceBlockerSide::Right,
             context,
             registry,
@@ -2761,145 +2154,119 @@ impl MaterializedBlockerDeltaState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_difference_delta(
+    fn apply_exact_difference_delta<D: ExactDeltaView<Row>>(
         local: &mut BTreeMap<CanonicalRowKey, DifferenceBlockerClass>,
-        classes: &BTreeMap<CanonicalRowKey, DifferenceBlockerClass>,
+        classes: &PersistentOrdMap<CanonicalRowKey, Arc<DifferenceBlockerClass>>,
         equivalences: &[kernel_types::SemanticId],
-        delta: &NormalizedDeltaRows,
+        delta: &D,
         side: DifferenceBlockerSide,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<(), RelQueryError> {
-        for (magnitude, row) in &delta.removed {
-            let key = canonical_row_key(row, equivalences, context, registry)?;
-            let class = local.entry(key.clone()).or_insert_with(|| {
-                classes
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or(DifferenceBlockerClass {
-                        left: Vec::new(),
-                        right: Vec::new(),
-                    })
-            });
-            let rows = match side {
-                DifferenceBlockerSide::Left => &mut class.left,
-                DifferenceBlockerSide::Right => &mut class.right,
-            };
-            if rows.len() < *magnitude {
-                return Err(RelQueryError::InconsistentIncrementalDelta);
+        let mut error = None;
+        delta.visit_exact(|weight, row| {
+            if error.is_some() || weight.is_zero() {
+                return;
             }
-            rows.truncate(rows.len() - *magnitude);
-        }
-        for (magnitude, row) in &delta.inserted {
-            let key = canonical_row_key(row, equivalences, context, registry)?;
-            let class = local.entry(key.clone()).or_insert_with(|| {
-                classes
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or(DifferenceBlockerClass {
-                        left: Vec::new(),
-                        right: Vec::new(),
-                    })
-            });
-            let rows = match side {
-                DifferenceBlockerSide::Left => &mut class.left,
-                DifferenceBlockerSide::Right => &mut class.right,
-            };
-            rows.extend(std::iter::repeat_n(row.clone(), *magnitude));
-        }
-        Ok(())
+            let result = (|| {
+                let key = canonical_row_key(row, equivalences, context, registry)?;
+                let class = local.entry(key.clone()).or_insert_with(|| {
+                    classes
+                        .get(&key)
+                        .map_or_else(DifferenceBlockerClass::default, |class| {
+                            class.as_ref().clone()
+                        })
+                });
+                let count = match side {
+                    DifferenceBlockerSide::Left => &mut class.left_count,
+                    DifferenceBlockerSide::Right => &mut class.right_count,
+                };
+                Self::apply_exact_to_natural(count, weight)?;
+                if matches!(side, DifferenceBlockerSide::Left) {
+                    if class.left_count.is_zero() {
+                        class.representative = None;
+                    } else {
+                        class.representative.get_or_insert_with(|| row.clone());
+                    }
+                }
+                Ok::<(), RelQueryError>(())
+            })();
+            if let Err(err) = result {
+                error = Some(err);
+            }
+        });
+        error.map_or(Ok(()), Err)
     }
 
     fn difference_effect(
-        classes: &BTreeMap<CanonicalRowKey, DifferenceBlockerClass>,
+        classes: &PersistentOrdMap<CanonicalRowKey, Arc<DifferenceBlockerClass>>,
         local: BTreeMap<CanonicalRowKey, DifferenceBlockerClass>,
     ) -> Result<DifferenceBlockerEffect, RelQueryError> {
-        let mut effect = AdaptiveDelta::<Row, 4>::default();
+        let mut effect = ExactDelta::<Row>::default();
         let mut writes = Vec::with_capacity(local.len());
         for (key, after) in local {
             let before = classes
                 .get(&key)
-                .cloned()
-                .unwrap_or(DifferenceBlockerClass {
-                    left: Vec::new(),
-                    right: Vec::new(),
+                .map_or(DifferenceBlockerClass::default(), |class| {
+                    class.as_ref().clone()
                 });
             let before_count = before.output_count();
             let after_count = after.output_count();
-            if after_count > before_count {
-                let row = after
-                    .representative()
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                effect.push_weighted(
-                    i64::try_from(after_count - before_count)
-                        .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?,
-                    row.clone(),
-                );
-            } else if before_count > after_count {
-                let row = before
-                    .representative()
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                effect.push_weighted(
-                    -i64::try_from(before_count - after_count)
-                        .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?,
-                    row.clone(),
-                );
+            let weight = Self::exact_natural_difference(&after_count, &before_count);
+            if !weight.is_zero() {
+                let row = if weight.is_negative() {
+                    before.representative()
+                } else {
+                    after.representative()
+                }
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                effect.push_exact(weight, row.clone());
             }
             writes.push((key, after));
         }
         Ok((effect, writes))
     }
 
-    fn remove_anti_join_left_occurrence(
-        rows: &mut Vec<Row>,
-        target: &Row,
-        equivalences: &[kernel_types::SemanticId],
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<(), RelQueryError> {
-        for (index, candidate) in rows.iter().enumerate() {
-            if rows_semantically_equal(candidate, target, equivalences, context, registry)? {
-                rows.remove(index);
-                return Ok(());
-            }
+    fn empty_anti_join_class() -> AntiJoinBlockerClass {
+        AntiJoinBlockerClass {
+            left: PersistentOrdMap::default(),
+            right_count: kernel_exact::ExactNatural::zero(),
         }
-        Err(RelQueryError::InconsistentIncrementalDelta)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn plan_anti_join<LD: DeltaView<Row>, RD: DeltaView<Row>>(
-        &self,
+    fn plan_exact_anti_join<LD: ExactDeltaView<Row>, RD: ExactDeltaView<Row>>(
         left_column: usize,
         right_column: usize,
         equivalence: kernel_types::SemanticId,
-        classes: &BTreeMap<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>,
+        left_equivalences: &[kernel_types::SemanticId],
+        classes: &PersistentOrdMap<kernel_semantics::CanonicalEqKey, Arc<AntiJoinBlockerClass>>,
         left_delta: &LD,
         right_delta: &RD,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedDeltaEffect<BlockerDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
-        let left = normalized_delta_rows(left_delta)?;
-        let right = normalized_delta_rows(right_delta)?;
+    ) -> Result<PlannedDeltaEffect<BlockerDeltaPatch, ExactDelta<Row>>, RelQueryError> {
         let mut local = BTreeMap::<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>::new();
-        let changes = self.apply_anti_join_left_delta(
+        let changes = Self::apply_exact_anti_join_left_delta(
             &mut local,
             classes,
-            &left,
+            left_delta,
             left_column,
             equivalence,
+            left_equivalences,
             context,
             registry,
         )?;
-        Self::apply_anti_join_right_delta(
+        Self::apply_exact_anti_join_right_delta(
             &mut local,
             classes,
-            &right,
+            right_delta,
             right_column,
             equivalence,
             context,
             registry,
         )?;
-        let (effect, writes) = Self::anti_join_effect(classes, local, &changes)?;
+        let (effect, writes) = Self::anti_join_effect(classes, local, &changes);
         Ok(PlannedDeltaEffect {
             patch: BlockerDeltaPatch::AntiJoin(writes),
             effect,
@@ -2907,151 +2274,155 @@ impl MaterializedBlockerDeltaState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_anti_join_left_delta(
-        &self,
+    fn apply_exact_anti_join_left_delta<D: ExactDeltaView<Row>>(
         local: &mut BTreeMap<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>,
-        classes: &BTreeMap<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>,
-        delta: &NormalizedDeltaRows,
+        classes: &PersistentOrdMap<kernel_semantics::CanonicalEqKey, Arc<AntiJoinBlockerClass>>,
+        delta: &D,
         left_column: usize,
         equivalence: kernel_types::SemanticId,
+        left_equivalences: &[kernel_types::SemanticId],
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<AntiJoinLeftChanges, RelQueryError> {
-        let left_equivalences = relation_column_equivalences(&self.left_type);
-        let mut removed = AntiJoinChangeMap::new();
-        let mut inserted = AntiJoinChangeMap::new();
-        for (magnitude, row) in &delta.removed {
-            let key = Self::anti_join_key(row, left_column, equivalence, context, registry)?;
-            let class = local.entry(key.clone()).or_insert_with(|| {
-                classes.get(&key).cloned().unwrap_or(AntiJoinBlockerClass {
-                    left: Vec::new(),
-                    right_count: 0,
-                })
-            });
-            for _ in 0..*magnitude {
-                Self::remove_anti_join_left_occurrence(
-                    &mut class.left,
-                    row,
-                    left_equivalences,
-                    context,
-                    registry,
-                )?;
+        let mut changes = AntiJoinChangeMap::new();
+        let mut error = None;
+        delta.visit_exact(|weight, row| {
+            if error.is_some() || weight.is_zero() {
+                return;
             }
-            removed
-                .entry(key)
-                .or_default()
-                .push((*magnitude, row.clone()));
+            let result = (|| {
+                let join_key =
+                    Self::anti_join_key(row, left_column, equivalence, context, registry)?;
+                let row_key = canonical_row_key(row, left_equivalences, context, registry)?;
+                let class = local.entry(join_key.clone()).or_insert_with(|| {
+                    classes
+                        .get(&join_key)
+                        .map_or_else(Self::empty_anti_join_class, |class| class.as_ref().clone())
+                });
+                let existing = class.left.get(&row_key).cloned();
+                let mut multiplicity = existing
+                    .as_ref()
+                    .map_or_else(kernel_exact::ExactNatural::zero, |class| {
+                        class.multiplicity.clone()
+                    });
+                Self::apply_exact_to_natural(&mut multiplicity, weight)?;
+                if multiplicity.is_zero() {
+                    class.left.remove(&row_key);
+                } else {
+                    class.left.insert(
+                        row_key.clone(),
+                        CountedBlockerRowClass {
+                            representative: existing
+                                .map_or_else(|| row.clone(), |class| class.representative),
+                            multiplicity,
+                        },
+                    );
+                }
+                let row_changes = changes.entry(join_key).or_default();
+                let entry = row_changes
+                    .entry(row_key)
+                    .or_insert_with(|| (row.clone(), kernel_exact::ExactInteger::default()));
+                entry.1.add_assign(weight);
+                Ok::<(), RelQueryError>(())
+            })();
+            if let Err(err) = result {
+                error = Some(err);
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
         }
-        for (magnitude, row) in &delta.inserted {
-            let key = Self::anti_join_key(row, left_column, equivalence, context, registry)?;
-            let class = local.entry(key.clone()).or_insert_with(|| {
-                classes.get(&key).cloned().unwrap_or(AntiJoinBlockerClass {
-                    left: Vec::new(),
-                    right_count: 0,
-                })
-            });
-            class
-                .left
-                .extend(std::iter::repeat_n(row.clone(), *magnitude));
-            inserted
-                .entry(key)
-                .or_default()
-                .push((*magnitude, row.clone()));
+        for changes in changes.values_mut() {
+            changes.retain(|_, (_, weight)| !weight.is_zero());
         }
-        Ok(AntiJoinLeftChanges { removed, inserted })
+        Ok(AntiJoinLeftChanges { inserted: changes })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_anti_join_right_delta(
+    fn apply_exact_anti_join_right_delta<D: ExactDeltaView<Row>>(
         local: &mut BTreeMap<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>,
-        classes: &BTreeMap<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>,
-        delta: &NormalizedDeltaRows,
+        classes: &PersistentOrdMap<kernel_semantics::CanonicalEqKey, Arc<AntiJoinBlockerClass>>,
+        delta: &D,
         right_column: usize,
         equivalence: kernel_types::SemanticId,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<(), RelQueryError> {
-        for (magnitude, row) in &delta.removed {
-            let key = Self::anti_join_key(row, right_column, equivalence, context, registry)?;
-            let class = local.entry(key.clone()).or_insert_with(|| {
-                classes.get(&key).cloned().unwrap_or(AntiJoinBlockerClass {
-                    left: Vec::new(),
-                    right_count: 0,
-                })
-            });
-            if class.right_count < *magnitude {
-                return Err(RelQueryError::InconsistentIncrementalDelta);
+        let mut error = None;
+        delta.visit_exact(|weight, row| {
+            if error.is_some() || weight.is_zero() {
+                return;
             }
-            class.right_count -= *magnitude;
-        }
-        for (magnitude, row) in &delta.inserted {
-            let key = Self::anti_join_key(row, right_column, equivalence, context, registry)?;
-            let class = local.entry(key.clone()).or_insert_with(|| {
-                classes.get(&key).cloned().unwrap_or(AntiJoinBlockerClass {
-                    left: Vec::new(),
-                    right_count: 0,
-                })
-            });
-            class.right_count = class
-                .right_count
-                .checked_add(*magnitude)
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-        }
-        Ok(())
+            let result = (|| {
+                let key = Self::anti_join_key(row, right_column, equivalence, context, registry)?;
+                let class = local.entry(key.clone()).or_insert_with(|| {
+                    classes
+                        .get(&key)
+                        .map_or_else(Self::empty_anti_join_class, |class| class.as_ref().clone())
+                });
+                Self::apply_exact_to_natural(&mut class.right_count, weight)
+            })();
+            if let Err(err) = result {
+                error = Some(err);
+            }
+        });
+        error.map_or(Ok(()), Err)
     }
 
     fn anti_join_effect(
-        classes: &BTreeMap<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>,
+        classes: &PersistentOrdMap<kernel_semantics::CanonicalEqKey, Arc<AntiJoinBlockerClass>>,
         local: BTreeMap<kernel_semantics::CanonicalEqKey, AntiJoinBlockerClass>,
         changes: &AntiJoinLeftChanges,
-    ) -> Result<AntiJoinBlockerEffect, RelQueryError> {
-        let mut effect = AdaptiveDelta::<Row, 4>::default();
+    ) -> AntiJoinBlockerEffect {
+        let mut effect = ExactDelta::<Row>::default();
         let mut writes = Vec::with_capacity(local.len());
         for (key, after) in local {
-            let before = classes.get(&key).cloned().unwrap_or(AntiJoinBlockerClass {
-                left: Vec::new(),
-                right_count: 0,
-            });
-            match (before.right_count == 0, after.right_count == 0) {
+            let before = classes
+                .get(&key)
+                .map_or_else(Self::empty_anti_join_class, |class| class.as_ref().clone());
+            match (before.right_count.is_zero(), after.right_count.is_zero()) {
                 (true, true) => {
-                    Self::append_anti_join_changes(&mut effect, changes.removed.get(&key), -1)?;
-                    Self::append_anti_join_changes(&mut effect, changes.inserted.get(&key), 1)?;
+                    Self::append_anti_join_changes(&mut effect, changes.inserted.get(&key));
                 }
                 (true, false) => {
-                    for row in &before.left {
-                        effect.push_weighted(-1, row.clone());
+                    for class in before.left.values() {
+                        effect.push_exact(
+                            kernel_exact::ExactInteger::from_parts(
+                                true,
+                                class.multiplicity.clone(),
+                            ),
+                            class.representative.clone(),
+                        );
                     }
                 }
                 (false, true) => {
-                    for row in &after.left {
-                        effect.push_weighted(1, row.clone());
+                    for class in after.left.values() {
+                        effect.push_exact(
+                            kernel_exact::ExactInteger::from_parts(
+                                false,
+                                class.multiplicity.clone(),
+                            ),
+                            class.representative.clone(),
+                        );
                     }
                 }
                 (false, false) => {}
             }
             writes.push((key, after));
         }
-        Ok((effect, writes))
+        (effect, writes)
     }
 
     fn append_anti_join_changes(
-        effect: &mut AdaptiveDelta<Row, 4>,
-        changes: Option<&Vec<(usize, Row)>>,
-        sign: i64,
-    ) -> Result<(), RelQueryError> {
+        effect: &mut ExactDelta<Row>,
+        changes: Option<&BTreeMap<CanonicalRowKey, (Row, kernel_exact::ExactInteger)>>,
+    ) {
         let Some(changes) = changes else {
-            return Ok(());
+            return;
         };
-        for (magnitude, row) in changes {
-            let magnitude = i64::try_from(*magnitude)
-                .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?;
-            effect.push_weighted(
-                sign.checked_mul(magnitude)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?,
-                row.clone(),
-            );
+        for (row, weight) in changes.values() {
+            effect.push_exact(weight.clone(), row.clone());
         }
-        Ok(())
     }
 
     fn commit_patch(&mut self, patch: BlockerDeltaPatch) {
@@ -3061,10 +2432,10 @@ impl MaterializedBlockerDeltaState {
                 BlockerDeltaPatch::Difference(writes),
             ) => {
                 for (key, class) in writes {
-                    if class.left.is_empty() && class.right.is_empty() {
+                    if class.is_empty() {
                         classes.remove(&key);
                     } else {
-                        classes.insert(key, class);
+                        classes.insert(key, Arc::new(class));
                     }
                 }
             }
@@ -3073,10 +2444,10 @@ impl MaterializedBlockerDeltaState {
                 BlockerDeltaPatch::AntiJoin(writes),
             ) => {
                 for (key, class) in writes {
-                    if class.left.is_empty() && class.right_count == 0 {
+                    if class.left.is_empty() && class.right_count.is_zero() {
                         classes.remove(&key);
                     } else {
-                        classes.insert(key, class);
+                        classes.insert(key, Arc::new(class));
                     }
                 }
             }
@@ -3090,9 +2461,9 @@ impl MaterializedBlockerDeltaState {
 enum MaintainedRelPlanNode {
     Scan {
         relation: kernel_types::SemanticId,
-        value: RelationValue,
+        value: PersistentVec<Row>,
         handles: Option<MaintainedLeafHandles>,
-        canonical_lookup: Option<CanonicalRowPositionIndex>,
+        canonical_lookup: CanonicalRowPositionIndex,
     },
     Filter {
         input: Box<MaterializedRelPlanState>,
@@ -3157,9 +2528,9 @@ struct BuiltFlatMaintainedSubtree {
 enum FlatMaintainedRelPlanNodeKind {
     Scan {
         relation: kernel_types::SemanticId,
-        value: RelationValue,
+        value: PersistentVec<Row>,
         handles: Option<MaintainedLeafHandles>,
-        canonical_lookup: Option<CanonicalRowPositionIndex>,
+        canonical_lookup: CanonicalRowPositionIndex,
     },
     Filter {
         input: NodeId,
@@ -3279,17 +2650,17 @@ struct MaintainedLeafLink {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MaintainedLeafHandles {
-    dense_ids: Vec<kernel_types::StableRowHandle>,
-    positions: BTreeMap<kernel_types::StableRowHandle, usize>,
-    links: BTreeMap<kernel_types::StableRowHandle, MaintainedLeafLink>,
+    dense_ids: PersistentVec<kernel_types::StableRowHandle>,
+    positions: PersistentOrdMap<kernel_types::StableRowHandle, usize>,
+    links: PersistentOrdMap<kernel_types::StableRowHandle, MaintainedLeafLink>,
     logical_head: Option<kernel_types::StableRowHandle>,
     logical_tail: Option<kernel_types::StableRowHandle>,
 }
 
 impl MaintainedLeafHandles {
     fn new(ids: Vec<kernel_types::StableRowHandle>) -> Result<Self, RelQueryError> {
-        let mut positions = BTreeMap::new();
-        let mut links = BTreeMap::new();
+        let mut positions = PersistentOrdMap::default();
+        let mut links = PersistentOrdMap::default();
         for (position, id) in ids.iter().copied().enumerate() {
             if positions.insert(id, position).is_some() {
                 return Err(RelQueryError::InconsistentIncrementalDelta);
@@ -3303,7 +2674,7 @@ impl MaintainedLeafHandles {
         Ok(Self {
             logical_head: ids.first().copied(),
             logical_tail: ids.last().copied(),
-            dense_ids: ids,
+            dense_ids: ids.into(),
             positions,
             links,
         })
@@ -3311,7 +2682,7 @@ impl MaintainedLeafHandles {
 
     fn row_for_handle<'a>(
         &self,
-        value: &'a RelationValue,
+        value: &'a PersistentVec<Row>,
         id: kernel_types::StableRowHandle,
     ) -> Result<&'a Row, RelQueryError> {
         let position = self
@@ -3320,13 +2691,12 @@ impl MaintainedLeafHandles {
             .copied()
             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
         value
-            .rows()
             .get(position)
             .ok_or(RelQueryError::InconsistentIncrementalDelta)
     }
 
-    fn ordered_rows(&self, value: &RelationValue) -> Result<Vec<Row>, RelQueryError> {
-        if value.rows().len() != self.dense_ids.len()
+    fn ordered_rows(&self, value: &PersistentVec<Row>) -> Result<Vec<Row>, RelQueryError> {
+        if value.len() != self.dense_ids.len()
             || self.positions.len() != self.dense_ids.len()
             || self.links.len() != self.dense_ids.len()
         {
@@ -3354,7 +2724,7 @@ impl MaintainedLeafHandles {
 
     fn remove(
         &mut self,
-        value: &mut RelationValue,
+        value: &mut PersistentVec<Row>,
         id: kernel_types::StableRowHandle,
     ) -> Result<(), RelQueryError> {
         let position = self
@@ -3368,25 +2738,28 @@ impl MaintainedLeafHandles {
 
         match link.previous {
             Some(previous) => {
-                self.links
-                    .get_mut(&previous)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?
-                    .next = link.next;
+                let mut previous_link = *self
+                    .links
+                    .get(&previous)
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                previous_link.next = link.next;
+                self.links.insert(previous, previous_link);
             }
             None => self.logical_head = link.next,
         }
         match link.next {
             Some(next) => {
-                self.links
-                    .get_mut(&next)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?
-                    .previous = link.previous;
+                let mut next_link = *self
+                    .links
+                    .get(&next)
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                next_link.previous = link.previous;
+                self.links.insert(next, next_link);
             }
             None => self.logical_tail = link.previous,
         }
 
-        let rows = value.rows_mut();
-        rows.swap_remove(position);
+        value.swap_remove(position);
         let removed_id = self.dense_ids.swap_remove(position);
         if removed_id != id {
             return Err(RelQueryError::InconsistentIncrementalDelta);
@@ -3399,16 +2772,15 @@ impl MaintainedLeafHandles {
 
     fn insert(
         &mut self,
-        value: &mut RelationValue,
+        value: &mut PersistentVec<Row>,
         id: kernel_types::StableRowHandle,
         row: Row,
     ) -> Result<(), RelQueryError> {
         if self.positions.contains_key(&id) || self.links.contains_key(&id) {
             return Err(RelQueryError::InconsistentIncrementalDelta);
         }
-        let rows = value.rows_mut();
-        let position = rows.len();
-        rows.push(row);
+        let position = value.len();
+        value.push(row);
         self.dense_ids.push(id);
         self.positions.insert(id, position);
         self.links.insert(
@@ -3419,10 +2791,12 @@ impl MaintainedLeafHandles {
             },
         );
         if let Some(previous) = self.logical_tail {
-            self.links
-                .get_mut(&previous)
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?
-                .next = Some(id);
+            let mut previous_link = *self
+                .links
+                .get(&previous)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            previous_link.next = Some(id);
+            self.links.insert(previous, previous_link);
         } else {
             self.logical_head = Some(id);
         }
@@ -3476,13 +2850,13 @@ pub struct MaterializedRelPlanState {
     result_type: RelType,
     #[cfg(debug_assertions)]
     node: Option<Arc<MaintainedRelPlanNode>>,
-    arena: Arc<Vec<Arc<FlatMaintainedRelPlanNode>>>,
+    arena: PersistentVec<Arc<FlatMaintainedRelPlanNode>>,
     execgraph_scratch: UnifiedTransitionScratch<MaintainedDelta>,
     transition_epoch: u64,
     revision: Option<kernel_types::RevisionId>,
 }
 
-type MaintainedDelta = AdaptiveDelta<Row, 4>;
+type MaintainedDelta = ExactDelta<Row>;
 
 impl Clone for MaterializedRelPlanState {
     fn clone(&self) -> Self {
@@ -3493,7 +2867,7 @@ impl Clone for MaterializedRelPlanState {
             result_type: self.result_type.clone(),
             #[cfg(debug_assertions)]
             node: self.node.as_ref().map(Arc::clone),
-            arena: Arc::clone(&self.arena),
+            arena: self.arena.clone(),
             execgraph_scratch: UnifiedTransitionScratch::default(),
             transition_epoch: self.transition_epoch,
             revision: self.revision,
@@ -3557,7 +2931,7 @@ impl MaterializedRelPlanState {
             result_type,
             #[cfg(debug_assertions)]
             node,
-            arena: Arc::new(arena),
+            arena: arena.into(),
             execgraph_scratch: UnifiedTransitionScratch::default(),
             transition_epoch: 0,
             revision: None,
@@ -3593,7 +2967,7 @@ impl MaterializedRelPlanState {
                 (
                     FlatMaintainedRelPlanNodeKind::Scan {
                         relation: *relation,
-                        value: value.clone(),
+                        value: value.rows().to_vec().into(),
                         handles: None,
                         canonical_lookup,
                     },
@@ -3742,7 +3116,7 @@ impl MaterializedRelPlanState {
                         registry,
                     },
                 )?;
-                let output = state.output_value();
+                let output = state.output_value()?;
                 (
                     FlatMaintainedRelPlanNodeKind::Blocker {
                         left: left.id,
@@ -3790,7 +3164,7 @@ impl MaterializedRelPlanState {
                         registry,
                     },
                 )?;
-                let output = state.output_value();
+                let output = state.output_value()?;
                 (
                     FlatMaintainedRelPlanNodeKind::Blocker {
                         left: left.id,
@@ -3884,7 +3258,7 @@ impl MaterializedRelPlanState {
                     registry,
                 )?
                 .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                let output = state.output_value();
+                let output = state.output_value()?;
                 (
                     FlatMaintainedRelPlanNodeKind::TopK {
                         input: input.id,
@@ -3933,7 +3307,7 @@ impl MaterializedRelPlanState {
                         context,
                         differential,
                     )?)),
-                    arena: Arc::new(Vec::new()),
+                    arena: PersistentVec::default(),
                     execgraph_scratch: UnifiedTransitionScratch::default(),
                     transition_epoch: 0,
                     revision: None,
@@ -4129,13 +3503,12 @@ impl MaterializedRelPlanState {
             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
         match &node.kind {
             FlatMaintainedRelPlanNodeKind::Scan { value, handles, .. } => {
-                let Some(handles) = handles else {
-                    return Ok(value.clone());
+                let rows = if let Some(handles) = handles {
+                    handles.ordered_rows(value)?
+                } else {
+                    value.iter().cloned().collect()
                 };
-                Ok(relation_value_from_rows(
-                    handles.ordered_rows(value)?,
-                    &node.result_type,
-                ))
+                Ok(relation_value_from_rows(rows, &node.result_type))
             }
             FlatMaintainedRelPlanNodeKind::Filter {
                 input,
@@ -4205,12 +3578,12 @@ impl MaterializedRelPlanState {
                 self.output_value_from_arena(*input, context, registry)?
                     .into_rows(),
             )),
-            FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => Ok(state.output_value()),
+            FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => state.output_value(),
             FlatMaintainedRelPlanNodeKind::Join { state, .. } => {
                 state.output_value(context, registry)
             }
             FlatMaintainedRelPlanNodeKind::Group { state, .. } => state.output_value(),
-            FlatMaintainedRelPlanNodeKind::TopK { state, .. } => Ok(state.output_value()),
+            FlatMaintainedRelPlanNodeKind::TopK { state, .. } => state.output_value(),
         }
     }
 
@@ -4226,13 +3599,12 @@ impl MaterializedRelPlanState {
             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
         match node {
             MaintainedRelPlanNode::Scan { value, handles, .. } => {
-                let Some(handles) = handles else {
-                    return Ok(value.clone());
+                let rows = if let Some(handles) = handles {
+                    handles.ordered_rows(value)?
+                } else {
+                    value.iter().cloned().collect()
                 };
-                Ok(relation_value_from_rows(
-                    handles.ordered_rows(value)?,
-                    &self.result_type,
-                ))
+                Ok(relation_value_from_rows(rows, &self.result_type))
             }
             MaintainedRelPlanNode::Filter {
                 input,
@@ -4290,10 +3662,10 @@ impl MaterializedRelPlanState {
             MaintainedRelPlanNode::PromoteToBag { input } => Ok(RelationValue::Bag(
                 input.output_value_recursive(context, registry)?.into_rows(),
             )),
-            MaintainedRelPlanNode::Blocker { state, .. } => Ok(state.output_value()),
+            MaintainedRelPlanNode::Blocker { state, .. } => state.output_value(),
             MaintainedRelPlanNode::Join { state, .. } => state.output_value(context, registry),
             MaintainedRelPlanNode::Group { state, .. } => state.output_value(),
-            MaintainedRelPlanNode::TopK { state, .. } => Ok(state.output_value()),
+            MaintainedRelPlanNode::TopK { state, .. } => state.output_value(),
         }
     }
 
@@ -4332,7 +3704,7 @@ impl MaterializedRelPlanState {
             .ok_or(RelQueryError::TransitionEpochExhausted)?;
         let planned =
             self.plan_relation_deltas_execgraph(&mut validated_frames, context, registry)?;
-        let output = materialize_delta_view(&planned.root_effect, self.result_type.clone())?;
+        let output = materialize_exact_delta_view(&planned.root_effect, self.result_type.clone())?;
         #[cfg(debug_assertions)]
         if !relation_deltas_semantically_equivalent(
             &output,
@@ -4389,7 +3761,7 @@ impl MaterializedRelPlanState {
         relation: kernel_types::SemanticId,
         rows: &[(kernel_types::StableRowHandle, Row)],
     ) -> Result<MaintainedLeafHandles, RelQueryError> {
-        for node in self.arena.iter() {
+        for node in &self.arena {
             let FlatMaintainedRelPlanNodeKind::Scan {
                 relation: current,
                 value,
@@ -4401,9 +3773,8 @@ impl MaterializedRelPlanState {
             if *current != relation {
                 continue;
             }
-            if value.rows().len() != rows.len()
+            if value.len() != rows.len()
                 || value
-                    .rows()
                     .iter()
                     .zip(rows.iter().map(|(_, row)| row))
                     .any(|(logical, physical)| logical != physical)
@@ -4419,9 +3790,12 @@ impl MaterializedRelPlanState {
         relation: kernel_types::SemanticId,
         handles: &MaintainedLeafHandles,
     ) {
-        let arena = Arc::make_mut(&mut self.arena);
-        for node in arena {
-            let node = Arc::make_mut(node);
+        for index in 0..self.arena.len() {
+            let node = Arc::make_mut(
+                self.arena
+                    .get_mut(index)
+                    .expect("flat arena index must remain valid"),
+            );
             let FlatMaintainedRelPlanNodeKind::Scan {
                 relation: current,
                 handles: target,
@@ -4456,9 +3830,8 @@ impl MaterializedRelPlanState {
                 if *current != relation {
                     return Ok(());
                 }
-                if value.rows().len() != rows.len()
+                if value.len() != rows.len()
                     || value
-                        .rows()
                         .iter()
                         .zip(rows.iter().map(|(_, row)| row))
                         .any(|(logical, physical)| logical != physical)
@@ -4580,7 +3953,7 @@ impl MaterializedRelPlanState {
             .ok_or(RelQueryError::TransitionEpochExhausted)?;
         let planned =
             self.plan_relation_deltas_execgraph(&mut validated_frames, context, registry)?;
-        let output = materialize_delta_view(&planned.root_effect, self.result_type.clone())?;
+        let output = materialize_exact_delta_view(&planned.root_effect, self.result_type.clone())?;
         #[cfg(debug_assertions)]
         if !relation_deltas_semantically_equivalent(
             &output,
@@ -4683,8 +4056,17 @@ impl MaterializedRelPlanState {
                     .inserted_handles
                     .iter()
                     .copied()
-                    .zip(resolved.delta.inserted.iter().cloned())
-                    .collect(),
+                    .zip(&resolved.delta.inserted)
+                    .map(|(id, row)| {
+                        canonical_row_key(
+                            row,
+                            relation_column_equivalences(&node.result_type),
+                            context,
+                            registry,
+                        )
+                        .map(|key| (id, key, row.clone()))
+                    })
+                    .collect::<Result<Vec<_>, RelQueryError>>()?,
             };
             if frames
                 .insert(
@@ -4704,22 +4086,29 @@ impl MaterializedRelPlanState {
     }
 
     fn commit_storage_resolved_scan_patch(
-        value: &mut RelationValue,
+        value: &mut PersistentVec<Row>,
         handles: &mut Option<MaintainedLeafHandles>,
+        canonical_lookup: &mut CanonicalRowPositionIndex,
         patch: StorageResolvedScanPatch,
     ) {
         let handles = handles
             .as_mut()
             .expect("sealed storage-resolved Scan patch requires bound handles");
         for id in patch.removed_handles {
+            let position = *handles
+                .positions
+                .get(&id)
+                .expect("validated storage-resolved Scan removal must have a position");
+            canonical_lookup.remove_position(position);
             handles
                 .remove(value, id)
                 .expect("validated storage-resolved Scan removal must commit");
         }
-        for (id, row) in patch.inserted {
+        for (id, key, row) in patch.inserted {
             handles
                 .insert(value, id, row)
                 .expect("validated storage-resolved Scan insertion must commit");
+            canonical_lookup.push_key(key);
         }
     }
 
@@ -4755,7 +4144,7 @@ impl MaterializedRelPlanState {
             .ok_or(RelQueryError::TransitionEpochExhausted)?;
         let planned =
             self.plan_relation_deltas_execgraph(&mut validated_frames, context, registry)?;
-        let output = materialize_delta_view(&planned.root_effect, self.result_type.clone())?;
+        let output = materialize_exact_delta_view(&planned.root_effect, self.result_type.clone())?;
         #[cfg(debug_assertions)]
         if !relation_deltas_semantically_equivalent(
             &output,
@@ -4830,7 +4219,7 @@ impl MaterializedRelPlanState {
                 value,
                 delta,
                 &node.result_type,
-                canonical_lookup.as_ref(),
+                canonical_lookup,
                 context,
                 registry,
             )?;
@@ -5063,7 +4452,7 @@ impl MaterializedRelPlanState {
             FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => {
                 let left = inbox.take_left().unwrap_or_else(empty);
                 let right = inbox.take_right().unwrap_or_else(empty);
-                let planned = state.plan_delta_views(&left, &right, context, registry)?;
+                let planned = state.plan_exact_delta_views(&left, &right, context, registry)?;
                 Ok(PlannedGraphNodeTransition {
                     patch: Some(GraphNodePatch::Blocker(planned.patch)),
                     effect: planned.effect,
@@ -5072,7 +4461,7 @@ impl MaterializedRelPlanState {
             FlatMaintainedRelPlanNodeKind::Join { state, .. } => {
                 let left = inbox.take_left().unwrap_or_else(empty);
                 let right = inbox.take_right().unwrap_or_else(empty);
-                let planned = state.plan_delta_views(&left, &right, context, registry)?;
+                let planned = state.plan_exact_delta_views(&left, &right, context, registry)?;
                 Ok(PlannedGraphNodeTransition {
                     patch: Some(GraphNodePatch::Join(planned.patch)),
                     effect: planned.effect,
@@ -5080,7 +4469,7 @@ impl MaterializedRelPlanState {
             }
             FlatMaintainedRelPlanNodeKind::Group { state, .. } => {
                 let input = inbox.take_unary().unwrap_or_else(empty);
-                let planned = state.plan_delta_view(&input, context, registry)?;
+                let planned = state.plan_exact_delta_view(&input, context, registry)?;
                 let patch =
                     sealed_group_v3::seal_group_patch(state, planned.patch, context, registry)?;
                 Ok(PlannedGraphNodeTransition {
@@ -5092,7 +4481,7 @@ impl MaterializedRelPlanState {
             }
             FlatMaintainedRelPlanNodeKind::TopK { state, .. } => {
                 let input = inbox.take_unary().unwrap_or_else(empty);
-                let planned = state.plan_delta_view(&input, context, registry)?;
+                let planned = state.plan_exact_delta_view(&input, context, registry)?;
                 Ok(PlannedGraphNodeTransition {
                     patch: Some(GraphNodePatch::TopK(planned.patch)),
                     effect: planned.effect,
@@ -5103,14 +4492,13 @@ impl MaterializedRelPlanState {
     }
 
     fn commit_graph_patch_set(&mut self, mut patch_set: GraphPatchSet) {
-        let arena = Arc::make_mut(&mut self.arena);
-        debug_assert_eq!(arena.len(), patch_set.nodes.len());
+        debug_assert_eq!(self.arena.len(), patch_set.nodes.len());
         for (node_id, patch) in patch_set.nodes.iter_mut().enumerate() {
             let Some(patch) = patch.take() else {
                 continue;
             };
             let node = Arc::make_mut(
-                arena
+                self.arena
                     .get_mut(node_id)
                     .expect("execgraph patch NodeId must exist in flat arena"),
             );
@@ -5132,8 +4520,12 @@ impl MaterializedRelPlanState {
                         );
                     }
                     MaintainedScanCommitPatch::StorageResolved(plan) => {
-                        Self::commit_storage_resolved_scan_patch(value, handles, plan);
-                        *canonical_lookup = None;
+                        Self::commit_storage_resolved_scan_patch(
+                            value,
+                            handles,
+                            canonical_lookup,
+                            plan,
+                        );
                     }
                 },
                 (
@@ -5185,7 +4577,7 @@ impl MaterializedRelPlanState {
             return Err(RelQueryError::InconsistentIncrementalDelta);
         }
         let output =
-            materialize_delta_view_uncounted(&planned.effect, candidate.result_type.clone())?;
+            materialize_exact_delta_view_uncounted(&planned.effect, candidate.result_type.clone())?;
         candidate.commit_relation_plan(planned.patch);
         Ok((candidate, output))
     }
@@ -5334,8 +4726,12 @@ impl MaterializedRelPlanState {
     ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
         let left = left.plan_relation_deltas_inner(plan)?;
         let right = right.plan_relation_deltas_inner(plan)?;
-        let planned =
-            state.plan_delta_views(&left.effect, &right.effect, plan.context, plan.registry)?;
+        let planned = state.plan_exact_delta_views(
+            &left.effect,
+            &right.effect,
+            plan.context,
+            plan.registry,
+        )?;
         Ok(PlannedMaintainedRelPlanTransition {
             patch: MaintainedRelPlanPatch::Blocker {
                 left: Box::new(left.patch),
@@ -5355,8 +4751,12 @@ impl MaterializedRelPlanState {
     ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
         let left = left.plan_relation_deltas_inner(plan)?;
         let right = right.plan_relation_deltas_inner(plan)?;
-        let planned =
-            state.plan_delta_views(&left.effect, &right.effect, plan.context, plan.registry)?;
+        let planned = state.plan_exact_delta_views(
+            &left.effect,
+            &right.effect,
+            plan.context,
+            plan.registry,
+        )?;
         Ok(PlannedMaintainedRelPlanTransition {
             patch: MaintainedRelPlanPatch::Join {
                 left: Box::new(left.patch),
@@ -5374,7 +4774,7 @@ impl MaterializedRelPlanState {
         plan: &mut RelationDeltaPlanContext<'_>,
     ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
         let child = input.plan_relation_deltas_inner(plan)?;
-        let planned = state.plan_delta_view(&child.effect, plan.context, plan.registry)?;
+        let planned = state.plan_exact_delta_view(&child.effect, plan.context, plan.registry)?;
         let patch = MaintainedGroupCommitPatch::Sealed(sealed_group_v3::seal_group_patch(
             state,
             planned.patch,
@@ -5397,7 +4797,7 @@ impl MaterializedRelPlanState {
         plan: &mut RelationDeltaPlanContext<'_>,
     ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
         let child = input.plan_relation_deltas_inner(plan)?;
-        let planned = state.plan_delta_view(&child.effect, plan.context, plan.registry)?;
+        let planned = state.plan_exact_delta_view(&child.effect, plan.context, plan.registry)?;
         Ok(PlannedMaintainedRelPlanTransition {
             patch: MaintainedRelPlanPatch::TopK {
                 input: Box::new(child.patch),
@@ -5405,6 +4805,23 @@ impl MaterializedRelPlanState {
             },
             effect: planned.effect,
         })
+    }
+
+    #[cfg(debug_assertions)]
+    fn commit_debug_scan_patch(
+        value: &mut PersistentVec<Row>,
+        handles: &mut Option<MaintainedLeafHandles>,
+        canonical_lookup: &mut CanonicalRowPositionIndex,
+        patch: MaintainedScanCommitPatch,
+    ) {
+        match patch {
+            MaintainedScanCommitPatch::Semantic(plan) => {
+                MaterializedJoinDeltaState::commit_relation_mutation(value, canonical_lookup, plan);
+            }
+            MaintainedScanCommitPatch::StorageResolved(plan) => {
+                Self::commit_storage_resolved_scan_patch(value, handles, canonical_lookup, plan);
+            }
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -5425,19 +4842,7 @@ impl MaterializedRelPlanState {
                     ..
                 },
                 MaintainedRelPlanPatch::Scan(Some(plan)),
-            ) => match plan {
-                MaintainedScanCommitPatch::Semantic(plan) => {
-                    MaterializedJoinDeltaState::commit_relation_mutation(
-                        value,
-                        canonical_lookup,
-                        plan,
-                    );
-                }
-                MaintainedScanCommitPatch::StorageResolved(plan) => {
-                    Self::commit_storage_resolved_scan_patch(value, handles, plan);
-                    *canonical_lookup = None;
-                }
-            },
+            ) => Self::commit_debug_scan_patch(value, handles, canonical_lookup, plan),
             (MaintainedRelPlanNode::Scan { .. }, MaintainedRelPlanPatch::Scan(None)) => {}
             (
                 MaintainedRelPlanNode::Filter { input, .. }
@@ -5566,7 +4971,7 @@ impl RelationDeltaPlanContext<'_> {
 }
 
 fn filter_delta_view(
-    input_delta: &impl DeltaView<Row>,
+    input_delta: &impl ExactDeltaView<Row>,
     input_type: &RelType,
     column: usize,
     value: &Value,
@@ -5589,8 +4994,8 @@ fn filter_delta_view(
 
     let mut output = MaintainedDelta::default();
     let mut error = None;
-    input_delta.visit(|weight, row| {
-        if weight == 0 || error.is_some() {
+    input_delta.visit_exact(|weight, row| {
+        if weight.is_zero() || error.is_some() {
             return;
         }
         let Some(candidate) = row.get(column) else {
@@ -5598,7 +5003,7 @@ fn filter_delta_view(
             return;
         };
         match registry.equivalent(context, equivalence, candidate, value) {
-            Ok(true) => output.push_weighted(weight, row.clone()),
+            Ok(true) => output.push_exact(weight.clone(), row.clone()),
             Ok(false) => {}
             Err(cause) => error = Some(cause.into()),
         }
@@ -5607,7 +5012,7 @@ fn filter_delta_view(
 }
 
 fn filter_columns_delta_view(
-    input_delta: &impl DeltaView<Row>,
+    input_delta: &impl ExactDeltaView<Row>,
     input_type: &RelType,
     left_column: usize,
     right_column: usize,
@@ -5638,8 +5043,8 @@ fn filter_columns_delta_view(
 
     let mut output = MaintainedDelta::default();
     let mut error = None;
-    input_delta.visit(|weight, row| {
-        if weight == 0 || error.is_some() {
+    input_delta.visit_exact(|weight, row| {
+        if weight.is_zero() || error.is_some() {
             return;
         }
         let Some(left) = row.get(left_column) else {
@@ -5651,7 +5056,7 @@ fn filter_columns_delta_view(
             return;
         };
         match registry.equivalent(context, equivalence, left, right) {
-            Ok(true) => output.push_weighted(weight, row.clone()),
+            Ok(true) => output.push_exact(weight.clone(), row.clone()),
             Ok(false) => {}
             Err(cause) => error = Some(cause.into()),
         }
@@ -5660,81 +5065,65 @@ fn filter_columns_delta_view(
 }
 
 fn project_bag_delta_view(
-    input_delta: &impl DeltaView<Row>,
+    input_delta: &impl ExactDeltaView<Row>,
     columns: &[usize],
     result_type: &RelType,
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<MaintainedDelta, RelQueryError> {
-    let (inserted, removed) = collect_projected_signed_rows(input_delta, columns)?;
-    let column_equivalences = relation_column_equivalences(result_type);
-    let normalized_inserted =
-        unmatched_semantic_rows(&inserted, &removed, column_equivalences, context, registry)?;
-    let normalized_removed =
-        unmatched_semantic_rows(&removed, &inserted, column_equivalences, context, registry)?;
-    Ok(maintained_delta_from_rows(
-        normalized_inserted,
-        normalized_removed,
-    ))
-}
-
-fn collect_projected_signed_rows(
-    input_delta: &impl DeltaView<Row>,
-    columns: &[usize],
-) -> Result<(Vec<Row>, Vec<Row>), RelQueryError> {
-    let mut inserted = Vec::new();
-    let mut removed = Vec::new();
+    let equivalences = relation_column_equivalences(result_type);
+    let mut canonical = BTreeMap::<CanonicalRowKey, usize>::new();
+    let mut classes =
+        Vec::<(Row, kernel_exact::ExactInteger)>::with_capacity(input_delta.support_len());
     let mut error = None;
-    input_delta.visit(|weight, row| {
-        if weight == 0 || error.is_some() {
+    input_delta.visit_exact(|weight, row| {
+        if weight.is_zero() || error.is_some() {
             return;
         }
-        let magnitude = if weight < 0 {
-            let Some(value) = weight.checked_neg() else {
-                error = Some(RelQueryError::InconsistentIncrementalDelta);
-                return;
-            };
-            value
-        } else {
-            weight
-        };
-        let Ok(magnitude) = usize::try_from(magnitude) else {
-            error = Some(RelQueryError::InconsistentIncrementalDelta);
-            return;
-        };
         let projected = match project_row(row, columns) {
-            Ok(projected) => projected,
+            Ok(row) => row,
             Err(cause) => {
                 error = Some(cause);
                 return;
             }
         };
-        let target = if weight < 0 {
-            &mut removed
-        } else {
-            &mut inserted
+        let key = match canonical_row_key(&projected, equivalences, context, registry) {
+            Ok(key) => key,
+            Err(cause) => {
+                error = Some(cause);
+                return;
+            }
         };
-        if target.try_reserve(magnitude).is_err() {
-            error = Some(RelQueryError::InconsistentIncrementalDelta);
-            return;
+        if let Some(index) = canonical.get(&key).copied() {
+            classes[index].1.add_assign(weight);
+        } else {
+            canonical.insert(key, classes.len());
+            classes.push((projected, weight.clone()));
         }
-        target.extend(std::iter::repeat_n(projected, magnitude));
     });
-    error.map_or(Ok((inserted, removed)), Err)
+    if let Some(error) = error {
+        return Err(error);
+    }
+
+    let mut output = MaintainedDelta::default();
+    for (row, weight) in classes {
+        output.push_exact(weight, row);
+    }
+    Ok(output)
 }
 
 fn project_delta_view(
-    input_delta: &impl DeltaView<Row>,
+    input_delta: &impl ExactDeltaView<Row>,
     columns: &[usize],
 ) -> Result<MaintainedDelta, RelQueryError> {
     let mut projected = MaintainedDelta::default();
     let mut error = None;
-    input_delta.visit(|weight, row| {
-        if weight == 0 || error.is_some() {
+    input_delta.visit_exact(|weight, row| {
+        if weight.is_zero() || error.is_some() {
             return;
         }
         match project_row(row, columns) {
-            Ok(row) => projected.push_weighted(weight, row),
+            Ok(row) => projected.push_exact(weight.clone(), row),
             Err(cause) => error = Some(cause),
         }
     });
@@ -5808,6 +5197,7 @@ impl DenseWindowGroupCount {
         self.index(key).map(|index| &self.counts[index])
     }
 
+    #[cfg(test)]
     fn set(&mut self, key: i64, count: kernel_aggregate::ExactCount) -> bool {
         let Some(index) = self.index(key) else {
             return false;
@@ -5829,6 +5219,12 @@ struct GenericGroupPatch {
     planned: Vec<(Row, Option<MaintainedGroupBucket>)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum IndexedGroupKey {
+    I64(i64),
+    Semantic(Vec<kernel_semantics::CanonicalEqKey>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GroupDeltaPatch {
     Generic(GenericGroupPatch),
@@ -5845,11 +5241,10 @@ pub struct MaterializedGroupDeltaState {
     group_equivalences: Vec<kernel_types::SemanticId>,
     aggregate: AggregateSpec,
     result_type: RelType,
-    groups: Vec<MaintainedGroupBucket>,
-    i64_lookup: Option<BTreeMap<i64, usize>>,
-    semantic_lookup: Option<BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, usize>>,
+    groups: PersistentVec<MaintainedGroupBucket>,
+    i64_lookup: Option<PersistentOrdMap<i64, usize>>,
+    semantic_lookup: Option<PersistentOrdMap<Vec<kernel_semantics::CanonicalEqKey>, usize>>,
     group_encoders: Option<Vec<kernel_semantics::ResolvedPrimitiveEquivalence>>,
-    canonical_group_lookup: bool,
     fast_i64_count: bool,
     dense_i64_count: Option<DenseWindowGroupCount>,
 }
@@ -5906,7 +5301,7 @@ impl MaterializedGroupDeltaState {
                     .map(|resolved| resolved.bind_right(&Value::I64(0))),
                 Some(Ok(kernel_semantics::BoundPrimitivePredicate::I64(0)))
             ) {
-            Some(BTreeMap::new())
+            Some(PersistentOrdMap::default())
         } else {
             None
         };
@@ -5926,10 +5321,7 @@ impl MaterializedGroupDeltaState {
         } else {
             None
         };
-        let canonical_group_lookup = i64_lookup.is_none()
-            && !group_columns.is_empty()
-            && Self::canonical_group_lookup_supported(context, registry, group_equivalences)?;
-        let semantic_lookup = canonical_group_lookup.then(BTreeMap::new);
+        let semantic_lookup = i64_lookup.is_none().then(PersistentOrdMap::default);
         let fast_i64_count = i64_lookup.is_some()
             && matches!(aggregate, AggregateSpec::Count { .. })
             && matches!(
@@ -5951,11 +5343,10 @@ impl MaterializedGroupDeltaState {
             group_equivalences: group_equivalences.clone(),
             aggregate: aggregate.clone(),
             result_type,
-            groups: Vec::new(),
+            groups: PersistentVec::default(),
             i64_lookup,
             semantic_lookup,
             group_encoders,
-            canonical_group_lookup,
             fast_i64_count,
             dense_i64_count: None,
         };
@@ -5963,32 +5354,12 @@ impl MaterializedGroupDeltaState {
             state.insert_row(&row, context, registry)?;
         }
         if state.group_columns.is_empty() && state.groups.is_empty() {
-            state.groups.push(Self::empty_bucket(Vec::new()));
+            state.push_group_bucket(Self::empty_bucket(Vec::new()), registry)?;
         }
         if state.fast_i64_count {
-            state.dense_i64_count = DenseWindowGroupCount::try_build(&state.groups);
+            state.dense_i64_count = DenseWindowGroupCount::try_build(state.groups.as_slice());
         }
         Ok(Some(state))
-    }
-
-    fn canonical_group_lookup_supported(
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-        group_equivalences: &[kernel_types::SemanticId],
-    ) -> Result<bool, RelQueryError> {
-        for equivalence in group_equivalences {
-            if context
-                .schema
-                .structural_equivalence(*equivalence)
-                .is_none()
-                && registry
-                    .resolve_primitive_equivalence(context, *equivalence)?
-                    .is_none()
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     fn output_value(&self) -> Result<RelationValue, RelQueryError> {
@@ -6023,7 +5394,7 @@ impl MaterializedGroupDeltaState {
         if context != &self.semantic_context {
             return Err(RelQueryError::SemanticRevisionMismatch);
         }
-        let input_delta = rel_delta_optimized_inner(&self.input, old, change, context, registry)?
+        let input_delta = rel_delta_optimized(&self.input, old, change, context, registry)?
             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
         self.apply_input_delta(&input_delta, context, registry)
     }
@@ -6037,10 +5408,214 @@ impl MaterializedGroupDeltaState {
         if input_delta.result_type != self.input_type {
             return Err(RelQueryError::TypeMismatch);
         }
-        let planned = self.plan_delta_view(&input_delta.as_delta_view(), context, registry)?;
-        let effect = materialize_delta_view(&planned.effect, self.result_type.clone())?;
-        self.commit_group_patch(planned.patch, context, registry)?;
+        let planned =
+            self.plan_exact_delta_view(&input_delta.as_delta_view(), context, registry)?;
+        let effect = materialize_exact_delta_view(&planned.effect, self.result_type.clone())?;
+        let sealed = sealed_group_v3::seal_group_patch(self, planned.patch, context, registry)?;
+        sealed_group_v3::commit_sealed_group_patch(self, sealed);
         Ok(effect)
+    }
+
+    fn plan_exact_delta_view<D: ExactDeltaView<Row>>(
+        &self,
+        input_delta: &D,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedDeltaEffect<GroupDeltaPatch, ExactDelta<Row>>, RelQueryError> {
+        if context != &self.semantic_context {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let mut validation_error = None;
+        input_delta.visit_exact(|weight, row| {
+            if weight.is_zero() || validation_error.is_some() {
+                return;
+            }
+            if let Err(error) = MaterializedSetSupportState::validate_rows(
+                std::slice::from_ref(row),
+                &self.input_type,
+                context,
+                registry,
+            ) {
+                validation_error = Some(error);
+            }
+        });
+        if let Some(error) = validation_error {
+            return Err(error);
+        }
+        if self.fast_i64_count {
+            let planned = self.plan_exact_i64_count_delta(input_delta)?;
+            return Ok(PlannedDeltaEffect {
+                patch: GroupDeltaPatch::I64Count(planned.patch),
+                effect: planned.effect,
+            });
+        }
+        self.plan_exact_generic_delta_view(input_delta, context, registry)
+    }
+
+    fn plan_exact_generic_delta_view<D: ExactDeltaView<Row>>(
+        &self,
+        input_delta: &D,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedDeltaEffect<GroupDeltaPatch, ExactDelta<Row>>, RelQueryError> {
+        let mut grouped =
+            BTreeMap::<IndexedGroupKey, (Row, Vec<(kernel_exact::ExactInteger, Row)>)>::new();
+        let mut error = None;
+        input_delta.visit_exact(|weight, row| {
+            if weight.is_zero() || error.is_some() {
+                return;
+            }
+            let key = match self.key_for_row(row) {
+                Ok(key) => key,
+                Err(next) => {
+                    error = Some(next);
+                    return;
+                }
+            };
+            let indexed = match self.indexed_group_key(&key, registry) {
+                Ok(indexed) => indexed,
+                Err(next) => {
+                    error = Some(next);
+                    return;
+                }
+            };
+            grouped
+                .entry(indexed)
+                .or_insert_with(|| (key, Vec::new()))
+                .1
+                .push((weight.clone(), row.clone()));
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+
+        let equivalences = relation_column_equivalences(&self.result_type);
+        let mut planned = Vec::with_capacity(grouped.len());
+        let mut effect = ExactDelta::<Row>::default();
+        for (indexed, (key, bucket_entries)) in grouped {
+            let current = self.group_index_by_indexed_key(&indexed);
+            let before = self.output_for_bucket(current.map(|index| &self.groups[index]))?;
+            let mut next = current.map_or_else(
+                || Self::empty_bucket(key.clone()),
+                |index| self.groups[index].clone(),
+            );
+            for (weight, row) in bucket_entries {
+                self.apply_exact_weight_to_bucket(&mut next, &row, &weight)?;
+            }
+            let next = if next.count.is_zero() && !self.group_columns.is_empty() {
+                None
+            } else {
+                Some(next)
+            };
+            let after = self.output_for_bucket(next.as_ref())?;
+            match (before, after) {
+                (Some(old_row), Some(new_row)) => {
+                    if !rows_semantically_equal(
+                        &old_row,
+                        &new_row,
+                        equivalences,
+                        context,
+                        registry,
+                    )? {
+                        effect.push_exact(kernel_exact::ExactInteger::from_i64(-1), old_row);
+                        effect.push_exact(kernel_exact::ExactInteger::from_i64(1), new_row);
+                    }
+                }
+                (Some(old_row), None) => {
+                    effect.push_exact(kernel_exact::ExactInteger::from_i64(-1), old_row);
+                }
+                (None, Some(new_row)) => {
+                    effect.push_exact(kernel_exact::ExactInteger::from_i64(1), new_row);
+                }
+                (None, None) => {}
+            }
+            planned.push((key, next));
+        }
+        Ok(PlannedDeltaEffect {
+            patch: GroupDeltaPatch::Generic(GenericGroupPatch { planned }),
+            effect,
+        })
+    }
+
+    fn plan_exact_i64_count_delta<D: ExactDeltaView<Row>>(
+        &self,
+        input_delta: &D,
+    ) -> Result<PlannedDeltaEffect<I64CountGroupPatch, ExactDelta<Row>>, RelQueryError> {
+        let group_column = self.group_columns[0];
+        let mut signed = BTreeMap::<i64, kernel_exact::ExactInteger>::new();
+        let mut error = None;
+        input_delta.visit_exact(|weight, row| {
+            if error.is_some() || weight.is_zero() {
+                return;
+            }
+            let Some(Value::I64(key)) = row.get(group_column) else {
+                error = Some(RelQueryError::TypeMismatch);
+                return;
+            };
+            signed.entry(*key).or_default().add_assign(weight);
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        signed.retain(|_, weight| !weight.is_zero());
+
+        let retain_dense = self
+            .dense_i64_count
+            .as_ref()
+            .is_some_and(|dense| signed.keys().all(|key| dense.index(*key).is_some()));
+        let lookup = self
+            .i64_lookup
+            .as_ref()
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let mut changes = Vec::with_capacity(signed.len());
+        let mut effect = ExactDelta::<Row>::default();
+        for (key, weight) in signed {
+            let current = if retain_dense {
+                self.dense_i64_count
+                    .as_ref()
+                    .and_then(|dense| dense.count(key))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                lookup
+                    .get(&key)
+                    .map(|index| self.groups[*index].count.clone())
+                    .unwrap_or_default()
+            };
+            let before = (!current.is_zero())
+                .then(|| current.finish_i64())
+                .transpose()?;
+            let mut next = current;
+            if weight.is_negative() {
+                next.remove_exact(weight.magnitude())?;
+            } else {
+                next.add_exact(weight.magnitude());
+            }
+            let after = (!next.is_zero()).then(|| next.finish_i64()).transpose()?;
+            if before != after {
+                if let Some(value) = before {
+                    effect.push_exact(
+                        kernel_exact::ExactInteger::from_i64(-1),
+                        vec![Value::I64(key), Value::I64(value)],
+                    );
+                }
+                if let Some(value) = after {
+                    effect.push_exact(
+                        kernel_exact::ExactInteger::from_i64(1),
+                        vec![Value::I64(key), Value::I64(value)],
+                    );
+                }
+            }
+            changes.push((key, next));
+        }
+        Ok(PlannedDeltaEffect {
+            patch: I64CountGroupPatch {
+                changes,
+                retain_dense,
+                dense_move: None,
+            },
+            effect,
+        })
     }
 
     fn plan_delta_view<D: DeltaView<Row>>(
@@ -6103,59 +5678,46 @@ impl MaterializedGroupDeltaState {
         if let Some(error) = visit_error {
             return Err(error);
         }
+        self.plan_indexed_generic_entries(&entries, context, registry)
+    }
 
-        let mut affected = Vec::<Row>::new();
-        for (_, row) in &entries {
+    fn plan_indexed_generic_entries(
+        &self,
+        entries: &[(i64, Row)],
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedDeltaEffect<GroupDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
+        let mut grouped = BTreeMap::<IndexedGroupKey, (Row, Vec<(i64, Row)>)>::new();
+        for (weight, row) in entries {
             let key = self.key_for_row(row)?;
-            if !self.affected_contains_key(&affected, &key, context, registry)? {
-                affected.push(key);
-            }
+            let indexed = self.indexed_group_key(&key, registry)?;
+            grouped
+                .entry(indexed)
+                .or_insert_with(|| (key, Vec::new()))
+                .1
+                .push((*weight, row.clone()));
         }
-        if self.group_columns.is_empty() && affected.is_empty() {
-            affected.push(Vec::new());
-        }
-        let before = affected
-            .iter()
-            .map(|key| self.output_for_key(key, context, registry))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut planned = Vec::with_capacity(affected.len());
-        for key in &affected {
-            let current = self
-                .find_group(key, context, registry)?
-                .map(|index| self.groups[index].clone());
-            let mut next = current.unwrap_or_else(|| Self::empty_bucket(key.clone()));
-            for (weight, row) in &entries {
-                let row_key = self.key_for_row(row)?;
-                if !self.keys_equal(key, &row_key, context, registry)? {
-                    continue;
-                }
-                if *weight < 0 {
-                    for _ in 0..weight.unsigned_abs() {
-                        self.remove_from_bucket(&mut next, row)?;
-                    }
-                } else {
-                    for _ in 0..u64::try_from(*weight)
-                        .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?
-                    {
-                        self.add_to_bucket(&mut next, row)?;
-                    }
-                }
+
+        let equivalences = relation_column_equivalences(&self.result_type);
+        let mut planned = Vec::with_capacity(grouped.len());
+        let mut effect = AdaptiveDelta::<Row, 4>::default();
+        for (indexed, (key, bucket_entries)) in grouped {
+            let current = self.group_index_by_indexed_key(&indexed);
+            let before = self.output_for_bucket(current.map(|index| &self.groups[index]))?;
+            let mut next = current.map_or_else(
+                || Self::empty_bucket(key.clone()),
+                |index| self.groups[index].clone(),
+            );
+            for (weight, row) in bucket_entries {
+                self.apply_weight_to_bucket(&mut next, &row, weight)?;
             }
             let next = if next.count.is_zero() && !self.group_columns.is_empty() {
                 None
             } else {
                 Some(next)
             };
-            planned.push((key.clone(), next));
-        }
-        let after = planned
-            .iter()
-            .map(|(_, bucket)| self.output_for_bucket(bucket.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let equivalences = relation_column_equivalences(&self.result_type);
-        let mut effect = AdaptiveDelta::<Row, 4>::default();
-        for (old_row, new_row) in before.into_iter().zip(after) {
-            match (old_row, new_row) {
+            let after = self.output_for_bucket(next.as_ref())?;
+            match (before, after) {
                 (Some(old_row), Some(new_row)) => {
                     if !rows_semantically_equal(
                         &old_row,
@@ -6172,6 +5734,7 @@ impl MaterializedGroupDeltaState {
                 (None, Some(new_row)) => effect.push_weighted(1, new_row),
                 (None, None) => {}
             }
+            planned.push((key, next));
         }
         Ok(PlannedDeltaEffect {
             patch: GroupDeltaPatch::Generic(GenericGroupPatch { planned }),
@@ -6239,15 +5802,12 @@ impl MaterializedGroupDeltaState {
                 .transpose()?;
             let mut next = current;
             if weight < 0 {
-                for _ in 0..weight.unsigned_abs() {
-                    next.remove_one()?;
-                }
+                next.remove_many(weight.unsigned_abs())?;
             } else {
-                for _ in 0..u128::try_from(weight)
-                    .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?
-                {
-                    next.add_one();
-                }
+                next.add_many(
+                    u128::try_from(weight)
+                        .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?,
+                );
             }
             let after = (!next.is_zero()).then(|| next.finish_i64()).transpose()?;
             if before != after {
@@ -6447,6 +6007,7 @@ impl MaterializedGroupDeltaState {
         Ok((source.is_one() && target.is_zero()).then_some((removed, inserted)))
     }
 
+    #[cfg(test)]
     fn commit_group_patch(
         &mut self,
         patch: GroupDeltaPatch,
@@ -6461,6 +6022,7 @@ impl MaterializedGroupDeltaState {
         }
     }
 
+    #[cfg(test)]
     fn commit_i64_count_patch(&mut self, patch: I64CountGroupPatch) -> Result<(), RelQueryError> {
         if !patch.retain_dense {
             self.dense_i64_count = None;
@@ -6514,6 +6076,7 @@ impl MaterializedGroupDeltaState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn remove_i64_group_at(&mut self, index: usize) -> Result<(), RelQueryError> {
         let [Value::I64(removed_key)] = self.groups[index].key.as_slice() else {
             return Err(RelQueryError::TypeMismatch);
@@ -6535,6 +6098,7 @@ impl MaterializedGroupDeltaState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn commit_generic_group_patch(
         &mut self,
         patch: GenericGroupPatch,
@@ -6575,30 +6139,34 @@ impl MaterializedGroupDeltaState {
             .collect()
     }
 
-    fn keys_equal(
+    fn indexed_group_key(
         &self,
-        left: &Row,
-        right: &Row,
-        context: &kernel_schema::SemanticContext,
+        key: &Row,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<bool, RelQueryError> {
-        if self.semantic_lookup.is_some() {
-            let left = self
-                .canonical_group_key(left, registry)?
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-            let right = self
-                .canonical_group_key(right, registry)?
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-            return Ok(left == right);
+    ) -> Result<IndexedGroupKey, RelQueryError> {
+        if self.i64_lookup.is_some() {
+            let [Value::I64(key)] = key.as_slice() else {
+                return Err(RelQueryError::TypeMismatch);
+            };
+            return Ok(IndexedGroupKey::I64(*key));
         }
-        rows_semantically_equal(left, right, &self.group_equivalences, context, registry)
+        Ok(IndexedGroupKey::Semantic(
+            self.canonical_group_key(key, registry)?,
+        ))
+    }
+
+    fn group_index_by_indexed_key(&self, key: &IndexedGroupKey) -> Option<usize> {
+        match key {
+            IndexedGroupKey::I64(key) => self.i64_lookup.as_ref()?.get(key).copied(),
+            IndexedGroupKey::Semantic(key) => self.semantic_lookup.as_ref()?.get(key).copied(),
+        }
     }
 
     fn canonical_group_key(
         &self,
         key: &Row,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<Option<Vec<kernel_semantics::CanonicalEqKey>>, RelQueryError> {
+    ) -> Result<Vec<kernel_semantics::CanonicalEqKey>, RelQueryError> {
         if let Some(encoders) = &self.group_encoders {
             if encoders.len() != key.len() {
                 return Err(RelQueryError::EquivalenceArityMismatch);
@@ -6607,11 +6175,7 @@ impl MaterializedGroupDeltaState {
                 .iter()
                 .zip(key)
                 .map(|(encoder, value)| encoder.canonical_key(value).map_err(RelQueryError::from))
-                .collect::<Result<Vec<_>, _>>()
-                .map(Some);
-        }
-        if !self.canonical_group_lookup {
-            return Ok(None);
+                .collect();
         }
         if self.group_equivalences.len() != key.len() {
             return Err(RelQueryError::EquivalenceArityMismatch);
@@ -6624,14 +6188,13 @@ impl MaterializedGroupDeltaState {
                     .canonical_equivalence_key(&self.semantic_context, *equivalence, value)
                     .map_err(RelQueryError::from)
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
+            .collect()
     }
 
     fn find_group(
         &self,
         key: &Row,
-        context: &kernel_schema::SemanticContext,
+        _context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Option<usize>, RelQueryError> {
         if let Some(lookup) = &self.i64_lookup {
@@ -6640,33 +6203,12 @@ impl MaterializedGroupDeltaState {
             };
             return Ok(lookup.get(key).copied());
         }
-        if let Some(lookup) = &self.semantic_lookup {
-            let canonical = self
-                .canonical_group_key(key, registry)?
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-            return Ok(lookup.get(&canonical).copied());
-        }
-        for (index, group) in self.groups.iter().enumerate() {
-            if self.keys_equal(&group.key, key, context, registry)? {
-                return Ok(Some(index));
-            }
-        }
-        Ok(None)
-    }
-
-    fn affected_contains_key(
-        &self,
-        affected: &[Row],
-        key: &Row,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<bool, RelQueryError> {
-        for existing in affected {
-            if self.keys_equal(existing, key, context, registry)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let lookup = self
+            .semantic_lookup
+            .as_ref()
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let canonical = self.canonical_group_key(key, registry)?;
+        Ok(lookup.get(&canonical).copied())
     }
 
     fn insert_row(
@@ -6687,12 +6229,91 @@ impl MaterializedGroupDeltaState {
         Ok(())
     }
 
-    fn add_to_bucket(
+    fn apply_exact_weight_to_bucket(
         &self,
         bucket: &mut MaintainedGroupBucket,
         row: &Row,
+        weight: &kernel_exact::ExactInteger,
     ) -> Result<(), RelQueryError> {
-        Self::add_to_bucket_with(&self.aggregate, bucket, row)
+        Self::apply_exact_weight_to_bucket_with(&self.aggregate, bucket, row, weight)
+    }
+
+    fn apply_exact_weight_to_bucket_with(
+        aggregate: &AggregateSpec,
+        bucket: &mut MaintainedGroupBucket,
+        row: &Row,
+        weight: &kernel_exact::ExactInteger,
+    ) -> Result<(), RelQueryError> {
+        if weight.is_zero() {
+            return Ok(());
+        }
+        let mut count = bucket.count.clone();
+        if weight.is_negative() {
+            count.remove_exact(weight.magnitude())?;
+        } else {
+            count.add_exact(weight.magnitude());
+        }
+        let mut sum = bucket.sum.clone();
+        if let AggregateSpec::ExactF64Sum { value_column, .. } = aggregate {
+            let Value::F64Bits(bits) = row
+                .get(*value_column)
+                .ok_or(RelQueryError::ColumnOutOfBounds)?
+            else {
+                return Err(RelQueryError::TypeMismatch);
+            };
+            if weight.is_negative() {
+                sum.remove_exact(f64::from_bits(*bits), weight.magnitude())?;
+            } else {
+                sum.add_exact(f64::from_bits(*bits), weight.magnitude())?;
+            }
+        }
+        bucket.count = count;
+        bucket.sum = sum;
+        Ok(())
+    }
+
+    fn apply_weight_to_bucket(
+        &self,
+        bucket: &mut MaintainedGroupBucket,
+        row: &Row,
+        weight: i64,
+    ) -> Result<(), RelQueryError> {
+        Self::apply_weight_to_bucket_with(&self.aggregate, bucket, row, weight)
+    }
+
+    fn apply_weight_to_bucket_with(
+        aggregate: &AggregateSpec,
+        bucket: &mut MaintainedGroupBucket,
+        row: &Row,
+        weight: i64,
+    ) -> Result<(), RelQueryError> {
+        if weight == 0 {
+            return Ok(());
+        }
+        let magnitude = u128::from(weight.unsigned_abs());
+        let mut count = bucket.count.clone();
+        if weight < 0 {
+            count.remove_many(magnitude)?;
+        } else {
+            count.add_many(magnitude);
+        }
+        let mut sum = bucket.sum.clone();
+        if let AggregateSpec::ExactF64Sum { value_column, .. } = aggregate {
+            let Value::F64Bits(bits) = row
+                .get(*value_column)
+                .ok_or(RelQueryError::ColumnOutOfBounds)?
+            else {
+                return Err(RelQueryError::TypeMismatch);
+            };
+            if weight < 0 {
+                sum.remove_many(f64::from_bits(*bits), weight.unsigned_abs())?;
+            } else {
+                sum.add_many(f64::from_bits(*bits), weight.unsigned_abs())?;
+            }
+        }
+        bucket.count = count;
+        bucket.sum = sum;
+        Ok(())
     }
 
     fn add_to_bucket_with(
@@ -6700,43 +6321,7 @@ impl MaterializedGroupDeltaState {
         bucket: &mut MaintainedGroupBucket,
         row: &Row,
     ) -> Result<(), RelQueryError> {
-        bucket.count.add_one();
-        if let AggregateSpec::ExactF64Sum { value_column, .. } = aggregate {
-            let Value::F64Bits(bits) = row
-                .get(*value_column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)?
-            else {
-                return Err(RelQueryError::TypeMismatch);
-            };
-            bucket.sum.add(f64::from_bits(*bits))?;
-        }
-        Ok(())
-    }
-
-    fn remove_from_bucket(
-        &self,
-        bucket: &mut MaintainedGroupBucket,
-        row: &Row,
-    ) -> Result<(), RelQueryError> {
-        Self::remove_from_bucket_with(&self.aggregate, bucket, row)
-    }
-
-    fn remove_from_bucket_with(
-        aggregate: &AggregateSpec,
-        bucket: &mut MaintainedGroupBucket,
-        row: &Row,
-    ) -> Result<(), RelQueryError> {
-        bucket.count.remove_one()?;
-        if let AggregateSpec::ExactF64Sum { value_column, .. } = aggregate {
-            let Value::F64Bits(bits) = row
-                .get(*value_column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)?
-            else {
-                return Err(RelQueryError::TypeMismatch);
-            };
-            bucket.sum.remove(f64::from_bits(*bits))?;
-        }
-        Ok(())
+        Self::apply_weight_to_bucket_with(aggregate, bucket, row, 1)
     }
 
     fn push_group_bucket(
@@ -6751,9 +6336,7 @@ impl MaterializedGroupDeltaState {
             };
             lookup.insert(*key, index);
         } else if self.semantic_lookup.is_some() {
-            let canonical = self
-                .canonical_group_key(&bucket.key, registry)?
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let canonical = self.canonical_group_key(&bucket.key, registry)?;
             if let Some(lookup) = &mut self.semantic_lookup {
                 lookup.insert(canonical, index);
             }
@@ -6762,6 +6345,7 @@ impl MaterializedGroupDeltaState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn remove_group_at(
         &mut self,
         index: usize,
@@ -6773,9 +6357,7 @@ impl MaterializedGroupDeltaState {
             };
             lookup.remove(removed_key);
         } else if self.semantic_lookup.is_some() {
-            let canonical = self
-                .canonical_group_key(&self.groups[index].key, registry)?
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let canonical = self.canonical_group_key(&self.groups[index].key, registry)?;
             if let Some(lookup) = &mut self.semantic_lookup {
                 lookup.remove(&canonical);
             }
@@ -6788,27 +6370,13 @@ impl MaterializedGroupDeltaState {
                 };
                 lookup.insert(*moved_key, index);
             } else if self.semantic_lookup.is_some() {
-                let canonical = self
-                    .canonical_group_key(&self.groups[index].key, registry)?
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                let canonical = self.canonical_group_key(&self.groups[index].key, registry)?;
                 if let Some(lookup) = &mut self.semantic_lookup {
                     lookup.insert(canonical, index);
                 }
             }
         }
         Ok(())
-    }
-
-    fn output_for_key(
-        &self,
-        key: &Row,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<Option<Row>, RelQueryError> {
-        let Some(index) = self.find_group(key, context, registry)? else {
-            return Ok(None);
-        };
-        self.output_for_bucket(Some(&self.groups[index]))
     }
 
     fn output_for_bucket(
@@ -6903,352 +6471,266 @@ pub fn rel_delta_optimized(
     program.apply(old, change, context, registry).map(Some)
 }
 
-fn rel_delta_optimized_inner(
-    query: &RelExpr,
-    old: &kernel_model::FiniteModel,
-    change: &Change<kernel_model::FiniteModel>,
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<RelationDelta>, RelQueryError> {
-    match query {
-        RelExpr::Scan(relation) => {
-            rel_delta_scan(*relation, old, change, context, registry).map(Some)
-        }
-        RelExpr::FilterEqConst {
-            input,
-            column,
-            value,
-            equivalence,
-        } => {
-            let Some(input_delta) =
-                rel_delta_optimized_inner(input, old, change, context, registry)?
-            else {
-                return Ok(None);
-            };
-            rel_delta_filter(input_delta, *column, value, *equivalence, context, registry).map(Some)
-        }
-        RelExpr::FilterEqColumns {
-            input,
-            left_column,
-            right_column,
-            equivalence,
-        } => {
-            let Some(input_delta) =
-                rel_delta_optimized_inner(input, old, change, context, registry)?
-            else {
-                return Ok(None);
-            };
-            rel_delta_filter_columns(
-                input_delta,
-                *left_column,
-                *right_column,
-                *equivalence,
-                context,
-                registry,
-            )
-            .map(Some)
-        }
-        RelExpr::Project { input, columns } => {
-            let Some(input_delta) =
-                rel_delta_optimized_inner(input, old, change, context, registry)?
-            else {
-                return Ok(None);
-            };
-            if matches!(
-                input_delta.result_type.semantics,
-                kernel_schema::RelationSemantics::Set { .. }
-            ) {
-                return rel_delta_project_set(
-                    input,
-                    input_delta,
-                    columns,
-                    query,
-                    old,
-                    context,
-                    registry,
-                )
-                .map(Some);
-            }
-            rel_delta_project_bag(input_delta, columns, query, context, registry).map(Some)
-        }
-        RelExpr::Distinct {
-            input,
-            column_equivalences: _,
-        } => {
-            let Some(input_delta) =
-                rel_delta_optimized_inner(input, old, change, context, registry)?
-            else {
-                return Ok(None);
-            };
-            rel_delta_distinct(input, input_delta, query, old, context, registry).map(Some)
-        }
-        RelExpr::PromoteToBag(input) => {
-            let Some(input_delta) =
-                rel_delta_optimized_inner(input, old, change, context, registry)?
-            else {
-                return Ok(None);
-            };
-            let result_type = query.typecheck(context, registry)?;
-            Ok(Some(RelationDelta {
-                inserted: input_delta.inserted,
-                removed: input_delta.removed,
-                result_type,
-            }))
-        }
-        RelExpr::JoinEq { .. } => rel_delta_join_optimized(query, old, change, context, registry),
-        RelExpr::Difference { .. } | RelExpr::AntiJoin { .. } => {
-            rel_delta_by_recompute(query, old, change, context, registry).map(Some)
-        }
-        RelExpr::TopKWithTies { .. } => {
-            rel_delta_top_k_optimized(query, old, change, context, registry)
-        }
-        RelExpr::Group { .. } => rel_delta_group_optimized(query, old, change, context, registry),
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CountedTopKClass {
+    representative: Row,
+    multiplicity: kernel_exact::ExactNatural,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IndexedOrderedRows {
-    rows: BTreeMap<IndexedRowId, Row>,
-    index: kernel_semantic_index::SemanticBucketIndex<
-        kernel_semantics::CanonicalOrderKey,
-        IndexedRowId,
-    >,
-    next_id: u64,
+type CountedTopKBucket = PersistentOrdMap<CanonicalRowKey, CountedTopKClass>;
+
+#[derive(Clone, Copy)]
+struct TopKMutationSpec<'a> {
+    column: usize,
+    encoder: kernel_semantics::ResolvedPrimitiveOrdering,
+    ty: &'a RelType,
+    context: &'a kernel_schema::SemanticContext,
+    registry: &'a kernel_semantics::SemanticRegistry,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IndexedOrderedMutationPlan {
-    remove_ids: Vec<IndexedRowId>,
-    inserted: Vec<(IndexedRowId, kernel_semantics::CanonicalOrderKey, Row)>,
-    next_id: u64,
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CountedOrderedRows {
+    buckets: PersistentOrdMap<kernel_semantics::CanonicalOrderKey, CountedTopKBucket>,
+    row_orders: PersistentOrdMap<CanonicalRowKey, kernel_semantics::CanonicalOrderKey>,
+    total_rows: kernel_exact::ExactNatural,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MaintainedTopKStorage {
-    I64Scalar(topk_i64::I64TopKState),
-    I64Rows(BTreeMap<i64, Vec<Row>>),
-    SemanticOrdered {
+    Counted {
         encoder: kernel_semantics::ResolvedPrimitiveOrdering,
-        rows: Box<IndexedOrderedRows>,
+        rows: Box<CountedOrderedRows>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct I64RowsMutationPlan {
-    changes: Vec<(i64, Option<Vec<Row>>)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum TopKDeltaPatch {
-    I64Scalar(topk_i64::I64TopKPatch),
-    I64Rows(I64RowsMutationPlan),
-    SemanticOrdered(IndexedOrderedMutationPlan),
+    Counted(CountedOrderedRows),
 }
 
-impl IndexedOrderedRows {
+impl CountedOrderedRows {
     fn build(
         rows: Vec<Row>,
         column: usize,
         encoder: kernel_semantics::ResolvedPrimitiveOrdering,
+        ty: &RelType,
         context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, RelQueryError> {
-        let dependency = kernel_semantic_index::SemanticModuleBinding {
-            semantic_id: encoder.ordering(),
-            module_digest: encoder.module_digest(),
+        let mut state = Self::default();
+        let one = kernel_exact::ExactInteger::from_i64(1);
+        let spec = TopKMutationSpec {
+            column,
+            encoder,
+            ty,
+            context,
+            registry,
         };
-        let mut index = kernel_semantic_index::SemanticBucketIndex::new(
-            kernel_semantic_index::SemanticIndexBinding::new(context, vec![dependency]),
-        );
-        let mut stored = BTreeMap::new();
-        let mut next_id = 0_u64;
         for row in rows {
-            let key =
-                encoder.canonical_key(row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?)?;
-            let id = IndexedRowId(next_id);
-            next_id = next_id
-                .checked_add(1)
-                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
-            let previous_key = index.insert(id, key);
-            let previous_row = stored.insert(id, row);
-            debug_assert!(previous_key.is_none());
-            debug_assert!(previous_row.is_none());
+            state.apply_row_weight(&row, &one, spec)?;
         }
-        Ok(Self {
-            rows: stored,
-            index,
-            next_id,
-        })
+        Ok(state)
     }
 
-    fn plan_mutation_view<D: DeltaView<Row>>(
+    fn apply_row_weight(
+        &mut self,
+        row: &Row,
+        weight: &kernel_exact::ExactInteger,
+        spec: TopKMutationSpec<'_>,
+    ) -> Result<(), RelQueryError> {
+        if weight.is_zero() {
+            return Ok(());
+        }
+        let order_key = spec.encoder.canonical_key(
+            row.get(spec.column)
+                .ok_or(RelQueryError::ColumnOutOfBounds)?,
+        )?;
+        let row_key = canonical_row_key(
+            row,
+            relation_column_equivalences(spec.ty),
+            spec.context,
+            spec.registry,
+        )?;
+        if let Some(existing_order) = self.row_orders.get(&row_key)
+            && existing_order != &order_key
+        {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        let mut bucket = self.buckets.get(&order_key).cloned().unwrap_or_default();
+        let mut class = bucket
+            .get(&row_key)
+            .cloned()
+            .unwrap_or_else(|| CountedTopKClass {
+                representative: row.clone(),
+                multiplicity: kernel_exact::ExactNatural::zero(),
+            });
+        MaterializedBlockerDeltaState::apply_exact_to_natural(&mut class.multiplicity, weight)?;
+        MaterializedBlockerDeltaState::apply_exact_to_natural(&mut self.total_rows, weight)?;
+        if matches!(
+            spec.ty.semantics,
+            kernel_schema::RelationSemantics::Set { .. }
+        ) && class.multiplicity > kernel_exact::ExactNatural::one()
+        {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        if class.multiplicity.is_zero() {
+            if bucket.remove(&row_key).is_none() {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            }
+            self.row_orders.remove(&row_key);
+        } else {
+            bucket.insert(row_key.clone(), class);
+            self.row_orders.insert(row_key, order_key.clone());
+        }
+        if bucket.is_empty() {
+            self.buckets.remove(&order_key);
+        } else {
+            self.buckets.insert(order_key, bucket);
+        }
+        Ok(())
+    }
+
+    fn plan_exact_mutation<D: ExactDeltaView<Row>>(
         &self,
         input_delta: &D,
-        column: usize,
-        encoder: kernel_semantics::ResolvedPrimitiveOrdering,
-        input_type: &RelType,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<IndexedOrderedMutationPlan, RelQueryError> {
-        let mut entries = Vec::<(i64, Row)>::with_capacity(input_delta.support_len());
-        input_delta.visit(|weight, row| {
-            if weight != 0 {
-                entries.push((weight, row.clone()));
+        spec: TopKMutationSpec<'_>,
+    ) -> Result<Self, RelQueryError> {
+        let mut classes = BTreeMap::<
+            (kernel_semantics::CanonicalOrderKey, CanonicalRowKey),
+            (Row, kernel_exact::ExactInteger),
+        >::new();
+        let mut error = None;
+        input_delta.visit_exact(|weight, row| {
+            if weight.is_zero() || error.is_some() {
+                return;
             }
+            let Some(value) = row.get(spec.column) else {
+                error = Some(RelQueryError::ColumnOutOfBounds);
+                return;
+            };
+            let order_key = match spec.encoder.canonical_key(value) {
+                Ok(key) => key,
+                Err(cause) => {
+                    error = Some(cause.into());
+                    return;
+                }
+            };
+            let row_key = match canonical_row_key(
+                row,
+                relation_column_equivalences(spec.ty),
+                spec.context,
+                spec.registry,
+            ) {
+                Ok(key) => key,
+                Err(cause) => {
+                    error = Some(cause);
+                    return;
+                }
+            };
+            let entry = classes
+                .entry((order_key, row_key))
+                .or_insert_with(|| (row.clone(), kernel_exact::ExactInteger::default()));
+            entry.1.add_assign(weight);
         });
-        self.plan_mutation_entries(&entries, column, encoder, input_type, context, registry)
+        if let Some(error) = error {
+            return Err(error);
+        }
+        let mut next = self.clone();
+        for ((_, _), (row, weight)) in classes {
+            if !weight.is_zero() {
+                next.apply_row_weight(&row, &weight, spec)?;
+            }
+        }
+        Ok(next)
     }
 
-    fn plan_mutation_entries(
+    fn selected_measure(
         &self,
-        entries: &[(i64, Row)],
-        column: usize,
-        encoder: kernel_semantics::ResolvedPrimitiveOrdering,
-        input_type: &RelType,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<IndexedOrderedMutationPlan, RelQueryError> {
-        let equivalences = relation_column_equivalences(input_type);
-        let mut used = BTreeSet::new();
-        let mut remove_ids = Vec::new();
-        for (weight, removed) in entries.iter().filter(|(weight, _)| *weight < 0) {
-            for _ in 0..weight.unsigned_abs() {
-                let key = encoder.canonical_key(
-                    removed
-                        .get(column)
-                        .ok_or(RelQueryError::ColumnOutOfBounds)?,
-                )?;
-                let bucket = self
-                    .index
-                    .bucket(&key)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                let mut found = None;
-                for id in bucket {
-                    if used.contains(id) {
-                        continue;
-                    }
-                    let candidate = self
-                        .rows
-                        .get(id)
-                        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                    if rows_semantically_equal(candidate, removed, equivalences, context, registry)?
-                    {
-                        found = Some(*id);
-                        break;
-                    }
-                }
-                let Some(id) = found else {
-                    return Err(RelQueryError::InconsistentIncrementalDelta);
-                };
-                used.insert(id);
-                remove_ids.push(id);
-            }
-        }
-
-        let is_set = matches!(
-            input_type.semantics,
-            kernel_schema::RelationSemantics::Set { .. }
-        );
-        let mut inserted = Vec::new();
-        let mut next_id = self.next_id;
-        for (weight, row) in entries.iter().filter(|(weight, _)| *weight > 0) {
-            let magnitude =
-                u64::try_from(*weight).map_err(|_| RelQueryError::InconsistentIncrementalDelta)?;
-            for _ in 0..magnitude {
-                let key = encoder
-                    .canonical_key(row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?)?;
-                if is_set {
-                    if let Some(bucket) = self.index.bucket(&key) {
-                        for id in bucket {
-                            if used.contains(id) {
-                                continue;
-                            }
-                            let candidate = self
-                                .rows
-                                .get(id)
-                                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                            if rows_semantically_equal(
-                                candidate,
-                                row,
-                                equivalences,
-                                context,
-                                registry,
-                            )? {
-                                return Err(RelQueryError::InconsistentIncrementalDelta);
-                            }
-                        }
-                    }
-                    for (_, previous_key, previous_row) in &inserted {
-                        if previous_key == &key
-                            && rows_semantically_equal(
-                                previous_row,
-                                row,
-                                equivalences,
-                                context,
-                                registry,
-                            )?
-                        {
-                            return Err(RelQueryError::InconsistentIncrementalDelta);
-                        }
-                    }
-                }
-                let id = IndexedRowId(next_id);
-                next_id = next_id
-                    .checked_add(1)
-                    .ok_or(RelQueryError::DerivedIdentityExhausted)?;
-                inserted.push((id, key, row.clone()));
-            }
-        }
-        Ok(IndexedOrderedMutationPlan {
-            remove_ids,
-            inserted,
-            next_id,
-        })
-    }
-
-    fn commit_plan(&mut self, plan: IndexedOrderedMutationPlan) {
-        for id in plan.remove_ids {
-            let removed_key = self.index.remove(&id);
-            let removed_row = self.rows.remove(&id);
-            debug_assert!(removed_key.is_some());
-            debug_assert!(removed_row.is_some());
-        }
-        for (id, key, row) in plan.inserted {
-            let previous_key = self.index.insert(id, key);
-            let previous_row = self.rows.insert(id, row);
-            debug_assert!(previous_key.is_none());
-            debug_assert!(previous_row.is_none());
-        }
-        self.next_id = plan.next_id;
-    }
-
-    fn output_rows(&self, direction: OrderDirection, k: usize) -> Vec<Row> {
+        direction: OrderDirection,
+        k: usize,
+    ) -> BTreeMap<CanonicalRowKey, (Row, kernel_exact::ExactNatural)> {
+        let mut selected = BTreeMap::new();
         if k == 0 {
-            return Vec::new();
+            return selected;
         }
-        let mut out = Vec::new();
+        let target = kernel_exact::ExactNatural::from_u128(k as u128);
+        let mut cumulative = kernel_exact::ExactNatural::zero();
+        let mut visit_bucket = |bucket: &CountedTopKBucket| {
+            for (row_key, class) in bucket {
+                selected.insert(
+                    row_key.clone(),
+                    (class.representative.clone(), class.multiplicity.clone()),
+                );
+                cumulative.add_assign(&class.multiplicity);
+            }
+            cumulative >= target
+        };
         match direction {
             OrderDirection::Ascending => {
-                for (_, ids) in self.index.buckets() {
-                    for id in ids {
-                        out.push(self.rows[id].clone());
-                    }
-                    if out.len() >= k {
+                for bucket in self.buckets.values() {
+                    if visit_bucket(bucket) {
                         break;
                     }
                 }
             }
             OrderDirection::Descending => {
-                for (_, ids) in self.index.buckets().rev() {
-                    for id in ids {
-                        out.push(self.rows[id].clone());
-                    }
-                    if out.len() >= k {
+                for bucket in self.buckets.values().rev() {
+                    if visit_bucket(bucket) {
                         break;
                     }
                 }
             }
         }
-        out
+        selected
+    }
+
+    fn selected_effect(&self, next: &Self, direction: OrderDirection, k: usize) -> ExactDelta<Row> {
+        let before = self.selected_measure(direction, k);
+        let after = next.selected_measure(direction, k);
+        let keys = before
+            .keys()
+            .chain(after.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut effect = ExactDelta::with_capacity(keys.len());
+        for key in keys {
+            let before_count = before
+                .get(&key)
+                .map_or_else(kernel_exact::ExactNatural::zero, |(_, count)| count.clone());
+            let after_count = after
+                .get(&key)
+                .map_or_else(kernel_exact::ExactNatural::zero, |(_, count)| count.clone());
+            let weight = MaterializedBlockerDeltaState::exact_natural_difference(
+                &after_count,
+                &before_count,
+            );
+            if weight.is_zero() {
+                continue;
+            }
+            let row = after
+                .get(&key)
+                .or_else(|| before.get(&key))
+                .expect("selected TopK class must exist on one side")
+                .0
+                .clone();
+            effect.push_exact(weight, row);
+        }
+        effect
+    }
+
+    fn output_rows(&self, direction: OrderDirection, k: usize) -> Result<Vec<Row>, RelQueryError> {
+        let selected = self.selected_measure(direction, k);
+        let mut rows = Vec::new();
+        for (_, (row, count)) in selected {
+            let count = count
+                .to_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
+            rows.try_reserve(count)
+                .map_err(|_| RelQueryError::DerivedIdentityExhausted)?;
+            rows.extend(std::iter::repeat_n(row, count));
+        }
+        Ok(rows)
     }
 }
 
@@ -7306,61 +6788,15 @@ impl MaterializedTopKDeltaState {
             context,
             registry,
         )?;
-        let use_i64 = matches!(
-            registry.ordering_domain(context, *ordering)?,
-            kernel_semantics::OrderingDomain::I64
-        ) && matches!(
-            input_type.columns.get(*column),
-            Some(kernel_schema::TypeExpr::Scalar(
-                kernel_schema::ScalarType::I64
-            ))
-        );
-        let rows = input_value.into_rows();
-        let scalar_i64 = use_i64
-            && input_type.columns.len() == 1
-            && relation_column_equivalences(&input_type).len() == 1
-            && matches!(
-                registry
-                    .resolve_primitive_equivalence(
-                        context,
-                        relation_column_equivalences(&input_type)[0],
-                    )?
-                    .map(|resolved| resolved.bind_right(&Value::I64(0))),
-                Some(Ok(kernel_semantics::BoundPrimitivePredicate::I64(0)))
-            );
-        let storage = if scalar_i64 {
-            let mut buckets = BTreeMap::<i64, usize>::new();
-            for row in rows {
-                let [Value::I64(key)] = row.as_slice() else {
-                    return Err(RelQueryError::TypeMismatch);
-                };
-                *buckets.entry(*key).or_default() += 1;
-            }
-            let is_set = matches!(
-                input_type.semantics,
-                kernel_schema::RelationSemantics::Set { .. }
-            );
-            MaintainedTopKStorage::I64Scalar(
-                topk_i64::I64TopKState::build(&buckets, *k, *direction, is_set)
-                    .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?,
-            )
-        } else if use_i64 {
-            let mut buckets = BTreeMap::<i64, Vec<Row>>::new();
-            for row in rows {
-                let Value::I64(key) = row.get(*column).ok_or(RelQueryError::ColumnOutOfBounds)?
-                else {
-                    return Err(RelQueryError::TypeMismatch);
-                };
-                buckets.entry(*key).or_default().push(row);
-            }
-            MaintainedTopKStorage::I64Rows(buckets)
-        } else {
-            let encoder = registry.resolve_primitive_ordering(context, *ordering)?;
-            MaintainedTopKStorage::SemanticOrdered {
-                encoder,
-                rows: Box::new(IndexedOrderedRows::build(rows, *column, encoder, context)?),
-            }
-        };
+        let encoder = registry.resolve_primitive_ordering(context, *ordering)?;
+        let rows = CountedOrderedRows::build(
+            input_value.into_rows(),
+            *column,
+            encoder,
+            &input_type,
+            context,
+            registry,
+        )?;
         Ok(Some(Self {
             query: query.clone(),
             semantic_context: context.clone(),
@@ -7371,7 +6807,10 @@ impl MaterializedTopKDeltaState {
             ordering: *ordering,
             direction: *direction,
             k: *k,
-            storage,
+            storage: MaintainedTopKStorage::Counted {
+                encoder,
+                rows: Box::new(rows),
+            },
         }))
     }
 
@@ -7382,11 +6821,11 @@ impl MaterializedTopKDeltaState {
 
     #[must_use]
     pub fn row_count(&self) -> usize {
-        match &self.storage {
-            MaintainedTopKStorage::I64Scalar(state) => state.total_rows(),
-            MaintainedTopKStorage::I64Rows(buckets) => buckets.values().map(Vec::len).sum(),
-            MaintainedTopKStorage::SemanticOrdered { rows, .. } => rows.index.len(),
-        }
+        let MaintainedTopKStorage::Counted { rows, .. } = &self.storage;
+        rows.total_rows
+            .to_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(usize::MAX)
     }
 
     pub fn apply_model_change(
@@ -7399,7 +6838,7 @@ impl MaterializedTopKDeltaState {
         if context != &self.semantic_context {
             return Err(RelQueryError::SemanticRevisionMismatch);
         }
-        let input_delta = rel_delta_optimized_inner(&self.input, old, change, context, registry)?
+        let input_delta = rel_delta_optimized(&self.input, old, change, context, registry)?
             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
         self.apply_input_delta(&input_delta, context, registry)
     }
@@ -7422,18 +6861,18 @@ impl MaterializedTopKDeltaState {
         Ok(effect)
     }
 
-    fn plan_delta_view<D: DeltaView<Row>>(
+    fn plan_exact_delta_view<D: ExactDeltaView<Row>>(
         &self,
         input_delta: &D,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedDeltaEffect<TopKDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
+    ) -> Result<PlannedDeltaEffect<TopKDeltaPatch, ExactDelta<Row>>, RelQueryError> {
         if context != &self.semantic_context {
             return Err(RelQueryError::SemanticRevisionMismatch);
         }
         let mut validation_error = None;
-        input_delta.visit(|weight, row| {
-            if weight == 0 || validation_error.is_some() {
+        input_delta.visit_exact(|weight, row| {
+            if weight.is_zero() || validation_error.is_some() {
                 return;
             }
             if let Err(error) = MaterializedSetSupportState::validate_row_shapes(
@@ -7446,442 +6885,48 @@ impl MaterializedTopKDeltaState {
         if let Some(error) = validation_error {
             return Err(error);
         }
-        match &self.storage {
-            MaintainedTopKStorage::I64Scalar(_) => {
-                let planned = self.plan_i64_scalar_delta(input_delta)?;
-                Ok(PlannedDeltaEffect {
-                    patch: TopKDeltaPatch::I64Scalar(planned.patch),
-                    effect: planned.effect,
-                })
-            }
-            MaintainedTopKStorage::I64Rows(buckets) => {
-                let planned = self.plan_i64_rows_delta(buckets, input_delta, context, registry)?;
-                Ok(PlannedDeltaEffect {
-                    patch: TopKDeltaPatch::I64Rows(planned.patch),
-                    effect: planned.effect,
-                })
-            }
-            MaintainedTopKStorage::SemanticOrdered { encoder, rows } => {
-                let patch = rows.plan_mutation_view(
-                    input_delta,
-                    self.column,
-                    *encoder,
-                    &self.input_type,
-                    context,
-                    registry,
-                )?;
-                let before = rows.output_rows(self.direction, self.k);
-                let after =
-                    Self::semantic_output_rows_after_patch(rows, &patch, self.direction, self.k);
-                let effect = adaptive_delta_between_rows(
-                    &before,
-                    &after,
-                    &self.result_type,
-                    context,
-                    registry,
-                )?;
-                Ok(PlannedDeltaEffect {
-                    patch: TopKDeltaPatch::SemanticOrdered(patch),
-                    effect,
-                })
-            }
-        }
+        let MaintainedTopKStorage::Counted { encoder, rows } = &self.storage;
+        let next = rows.plan_exact_mutation(
+            input_delta,
+            TopKMutationSpec {
+                column: self.column,
+                encoder: *encoder,
+                ty: &self.input_type,
+                context,
+                registry,
+            },
+        )?;
+        let effect = rows.selected_effect(&next, self.direction, self.k);
+        Ok(PlannedDeltaEffect {
+            patch: TopKDeltaPatch::Counted(next),
+            effect,
+        })
     }
 
-    /// Computes the selected WITH-TIES output after one already-validated
-    /// semantic ordered mutation without cloning the complete ordered store.
-    ///
-    /// The mutation patch changes only the canonical-order buckets named by
-    /// removed/inserted identities.  A merge of the immutable base bucket
-    /// stream with those changed buckets is therefore sufficient to recover
-    /// the exact post-state prefix.  Work is proportional to the visible
-    /// prefix plus the delta, rather than to the complete relation.
-    fn semantic_output_rows_after_patch(
-        rows: &IndexedOrderedRows,
-        patch: &IndexedOrderedMutationPlan,
-        direction: OrderDirection,
-        k: usize,
-    ) -> Vec<Row> {
-        if k == 0 {
-            return Vec::new();
-        }
-
-        let removed = patch.remove_ids.iter().copied().collect::<BTreeSet<_>>();
-        let mut inserted = BTreeMap::<&kernel_semantics::CanonicalOrderKey, Vec<&Row>>::new();
-        for (_, key, row) in &patch.inserted {
-            inserted.entry(key).or_default().push(row);
-        }
-
-        let mut output = Vec::new();
-        let emit_base = |ids: &[IndexedRowId], output: &mut Vec<Row>| {
-            for id in ids {
-                if !removed.contains(id) {
-                    output.push(rows.rows[id].clone());
-                }
-            }
-        };
-        let emit_inserted = |values: &[&Row], output: &mut Vec<Row>| {
-            output.extend(values.iter().map(|row| (*row).clone()));
-        };
-
-        match direction {
-            OrderDirection::Ascending => {
-                let mut base = rows.index.buckets().peekable();
-                let mut delta = inserted.iter().peekable();
-                while output.len() < k {
-                    let base_key = base.peek().map(|(key, _)| *key);
-                    let delta_key = delta.peek().map(|(key, _)| **key);
-                    match (base_key, delta_key) {
-                        (Some(base_key), Some(delta_key)) => match base_key.cmp(delta_key) {
-                            std::cmp::Ordering::Less => {
-                                let (_, ids) = base.next().expect("peeked base bucket");
-                                emit_base(ids, &mut output);
-                            }
-                            std::cmp::Ordering::Equal => {
-                                let (_, ids) = base.next().expect("peeked base bucket");
-                                let (_, values) = delta.next().expect("peeked delta bucket");
-                                emit_base(ids, &mut output);
-                                emit_inserted(values, &mut output);
-                            }
-                            std::cmp::Ordering::Greater => {
-                                let (_, values) = delta.next().expect("peeked delta bucket");
-                                emit_inserted(values, &mut output);
-                            }
-                        },
-                        (Some(_), None) => {
-                            let (_, ids) = base.next().expect("peeked base bucket");
-                            emit_base(ids, &mut output);
-                        }
-                        (None, Some(_)) => {
-                            let (_, values) = delta.next().expect("peeked delta bucket");
-                            emit_inserted(values, &mut output);
-                        }
-                        (None, None) => break,
-                    }
-                }
-            }
-            OrderDirection::Descending => {
-                let mut base = rows.index.buckets().rev().peekable();
-                let mut delta = inserted.iter().rev().peekable();
-                while output.len() < k {
-                    let base_key = base.peek().map(|(key, _)| *key);
-                    let delta_key = delta.peek().map(|(key, _)| **key);
-                    match (base_key, delta_key) {
-                        (Some(base_key), Some(delta_key)) => match base_key.cmp(delta_key) {
-                            std::cmp::Ordering::Greater => {
-                                let (_, ids) = base.next().expect("peeked base bucket");
-                                emit_base(ids, &mut output);
-                            }
-                            std::cmp::Ordering::Equal => {
-                                let (_, ids) = base.next().expect("peeked base bucket");
-                                let (_, values) = delta.next().expect("peeked delta bucket");
-                                emit_base(ids, &mut output);
-                                emit_inserted(values, &mut output);
-                            }
-                            std::cmp::Ordering::Less => {
-                                let (_, values) = delta.next().expect("peeked delta bucket");
-                                emit_inserted(values, &mut output);
-                            }
-                        },
-                        (Some(_), None) => {
-                            let (_, ids) = base.next().expect("peeked base bucket");
-                            emit_base(ids, &mut output);
-                        }
-                        (None, Some(_)) => {
-                            let (_, values) = delta.next().expect("peeked delta bucket");
-                            emit_inserted(values, &mut output);
-                        }
-                        (None, None) => break,
-                    }
-                }
-            }
-        }
-        output
+    fn plan_delta_view<D: DeltaView<Row>>(
+        &self,
+        input_delta: &D,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedDeltaEffect<TopKDeltaPatch, AdaptiveDelta<Row, 4>>, RelQueryError> {
+        let exact = exact_delta_from_legacy(input_delta);
+        let planned = self.plan_exact_delta_view(&exact, context, registry)?;
+        Ok(PlannedDeltaEffect {
+            patch: planned.patch,
+            effect: exact_delta_to_legacy_checked(&planned.effect)?,
+        })
     }
 
     fn commit_topk_patch(&mut self, patch: TopKDeltaPatch) {
-        match (patch, &mut self.storage) {
-            (TopKDeltaPatch::I64Scalar(patch), MaintainedTopKStorage::I64Scalar(state)) => {
-                state.commit_patch(patch);
-            }
-            (TopKDeltaPatch::I64Rows(plan), MaintainedTopKStorage::I64Rows(buckets)) => {
-                for (key, bucket) in plan.changes {
-                    if let Some(bucket) = bucket {
-                        buckets.insert(key, bucket);
-                    } else {
-                        buckets.remove(&key);
-                    }
-                }
-            }
-            (
-                TopKDeltaPatch::SemanticOrdered(plan),
-                MaintainedTopKStorage::SemanticOrdered { rows, .. },
-            ) => rows.commit_plan(plan),
-            _ => unreachable!("TopK patch/backend mismatch"),
-        }
+        let TopKDeltaPatch::Counted(next) = patch;
+        let MaintainedTopKStorage::Counted { rows, .. } = &mut self.storage;
+        **rows = next;
     }
 
-    fn plan_i64_scalar_delta<D: DeltaView<Row>>(
-        &self,
-        input_delta: &D,
-    ) -> Result<PlannedDeltaEffect<topk_i64::I64TopKPatch, AdaptiveDelta<Row, 4>>, RelQueryError>
-    {
-        let MaintainedTopKStorage::I64Scalar(state) = &self.storage else {
-            return Err(RelQueryError::InconsistentIncrementalDelta);
-        };
-        let mut changes = BTreeMap::<i64, i64>::new();
-        let mut error = None;
-        input_delta.visit(|weight, row| {
-            if error.is_some() || weight == 0 {
-                return;
-            }
-            let [Value::I64(key)] = row.as_slice() else {
-                error = Some(RelQueryError::TypeMismatch);
-                return;
-            };
-            let entry = changes.entry(*key).or_default();
-            *entry = if let Some(next) = entry.checked_add(weight) {
-                next
-            } else {
-                error = Some(RelQueryError::InconsistentIncrementalDelta);
-                return;
-            };
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-        changes.retain(|_, weight| *weight != 0);
-        let plan = state
-            .plan_signed(&changes)
-            .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?;
-        let mut effect = AdaptiveDelta::<Row, 4>::default();
-        for (key, weight) in plan.effect {
-            effect.push_weighted(weight, vec![Value::I64(key)]);
-        }
-        Ok(PlannedDeltaEffect {
-            patch: plan.patch,
-            effect,
-        })
-    }
-
-    fn plan_i64_rows_delta<D: DeltaView<Row>>(
-        &self,
-        buckets: &BTreeMap<i64, Vec<Row>>,
-        input_delta: &D,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<PlannedDeltaEffect<I64RowsMutationPlan, AdaptiveDelta<Row, 4>>, RelQueryError> {
-        let mut affected = BTreeMap::<i64, Vec<(i64, Row)>>::new();
-        let mut error = None;
-        input_delta.visit(|weight, row| {
-            if error.is_some() || weight == 0 {
-                return;
-            }
-            let Some(Value::I64(key)) = row.get(self.column) else {
-                error = Some(RelQueryError::TypeMismatch);
-                return;
-            };
-            affected
-                .entry(*key)
-                .or_default()
-                .push((weight, row.clone()));
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-        let equivalences = relation_column_equivalences(&self.input_type);
-        let is_set = matches!(
-            self.input_type.semantics,
-            kernel_schema::RelationSemantics::Set { .. }
-        );
-        let mut changes = Vec::with_capacity(affected.len());
-        for (key, entries) in affected {
-            let mut bucket = buckets.get(&key).cloned().unwrap_or_default();
-            for (weight, row) in entries.iter().filter(|(weight, _)| *weight < 0) {
-                for _ in 0..weight.unsigned_abs() {
-                    Self::remove_semantic_row(&mut bucket, row, equivalences, context, registry)?;
-                }
-            }
-            for (weight, row) in entries.iter().filter(|(weight, _)| *weight > 0) {
-                let magnitude = u64::try_from(*weight)
-                    .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?;
-                for _ in 0..magnitude {
-                    if is_set
-                        && Self::contains_semantic_row(
-                            &bucket,
-                            row,
-                            equivalences,
-                            context,
-                            registry,
-                        )?
-                    {
-                        return Err(RelQueryError::InconsistentIncrementalDelta);
-                    }
-                    bucket.push(row.clone());
-                }
-            }
-            changes.push((key, (!bucket.is_empty()).then_some(bucket)));
-        }
-        let before = self.i64_output_rows(buckets);
-        let after = self.i64_output_rows_after_changes(buckets, &changes);
-        let effect =
-            adaptive_delta_between_rows(&before, &after, &self.result_type, context, registry)?;
-        Ok(PlannedDeltaEffect {
-            patch: I64RowsMutationPlan { changes },
-            effect,
-        })
-    }
-
-    /// Computes the post-mutation WITH-TIES prefix by merging the immutable
-    /// ordered buckets with the sorted changed-bucket overlay.  No complete
-    /// `BTreeMap<i64, Vec<Row>>` candidate is constructed.
-    fn i64_output_rows_after_changes(
-        &self,
-        buckets: &BTreeMap<i64, Vec<Row>>,
-        changes: &[(i64, Option<Vec<Row>>)],
-    ) -> Vec<Row> {
-        if self.k == 0 {
-            return Vec::new();
-        }
-        let mut output = Vec::new();
-        match self.direction {
-            OrderDirection::Ascending => {
-                let mut base = buckets.iter().peekable();
-                let mut delta = changes.iter().peekable();
-                while output.len() < self.k {
-                    let base_key = base.peek().map(|(key, _)| **key);
-                    let delta_key = delta.peek().map(|change| change.0);
-                    match (base_key, delta_key) {
-                        (Some(base_key), Some(delta_key)) => match base_key.cmp(&delta_key) {
-                            std::cmp::Ordering::Less => {
-                                let (_, rows) = base.next().expect("peeked base bucket");
-                                output.extend(rows.iter().cloned());
-                            }
-                            std::cmp::Ordering::Equal => {
-                                let _ = base.next().expect("peeked base bucket");
-                                let (_, replacement) = delta.next().expect("peeked delta bucket");
-                                if let Some(rows) = replacement {
-                                    output.extend(rows.iter().cloned());
-                                }
-                            }
-                            std::cmp::Ordering::Greater => {
-                                let (_, replacement) = delta.next().expect("peeked delta bucket");
-                                if let Some(rows) = replacement {
-                                    output.extend(rows.iter().cloned());
-                                }
-                            }
-                        },
-                        (Some(_), None) => {
-                            let (_, rows) = base.next().expect("peeked base bucket");
-                            output.extend(rows.iter().cloned());
-                        }
-                        (None, Some(_)) => {
-                            let (_, replacement) = delta.next().expect("peeked delta bucket");
-                            if let Some(rows) = replacement {
-                                output.extend(rows.iter().cloned());
-                            }
-                        }
-                        (None, None) => break,
-                    }
-                }
-            }
-            OrderDirection::Descending => {
-                let mut base = buckets.iter().rev().peekable();
-                let mut delta = changes.iter().rev().peekable();
-                while output.len() < self.k {
-                    let base_key = base.peek().map(|(key, _)| **key);
-                    let delta_key = delta.peek().map(|change| change.0);
-                    match (base_key, delta_key) {
-                        (Some(base_key), Some(delta_key)) => match base_key.cmp(&delta_key) {
-                            std::cmp::Ordering::Greater => {
-                                let (_, rows) = base.next().expect("peeked base bucket");
-                                output.extend(rows.iter().cloned());
-                            }
-                            std::cmp::Ordering::Equal => {
-                                let _ = base.next().expect("peeked base bucket");
-                                let (_, replacement) = delta.next().expect("peeked delta bucket");
-                                if let Some(rows) = replacement {
-                                    output.extend(rows.iter().cloned());
-                                }
-                            }
-                            std::cmp::Ordering::Less => {
-                                let (_, replacement) = delta.next().expect("peeked delta bucket");
-                                if let Some(rows) = replacement {
-                                    output.extend(rows.iter().cloned());
-                                }
-                            }
-                        },
-                        (Some(_), None) => {
-                            let (_, rows) = base.next().expect("peeked base bucket");
-                            output.extend(rows.iter().cloned());
-                        }
-                        (None, Some(_)) => {
-                            let (_, replacement) = delta.next().expect("peeked delta bucket");
-                            if let Some(rows) = replacement {
-                                output.extend(rows.iter().cloned());
-                            }
-                        }
-                        (None, None) => break,
-                    }
-                }
-            }
-        }
-        output
-    }
-
-    fn i64_scalar_output_rows(state: &topk_i64::I64TopKState) -> Vec<Row> {
-        state
-            .selected_counts()
-            .into_iter()
-            .flat_map(|(key, count)| (0..count).map(move |_| vec![Value::I64(key)]))
-            .collect()
-    }
-
-    fn remove_semantic_row(
-        rows: &mut Vec<Row>,
-        row: &Row,
-        equivalences: &[kernel_types::SemanticId],
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<(), RelQueryError> {
-        let mut found = None;
-        for (index, candidate) in rows.iter().enumerate() {
-            if rows_semantically_equal(candidate, row, equivalences, context, registry)? {
-                found = Some(index);
-                break;
-            }
-        }
-        let Some(index) = found else {
-            return Err(RelQueryError::InconsistentIncrementalDelta);
-        };
-        rows.remove(index);
-        Ok(())
-    }
-
-    fn contains_semantic_row(
-        rows: &[Row],
-        row: &Row,
-        equivalences: &[kernel_types::SemanticId],
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<bool, RelQueryError> {
-        for candidate in rows {
-            if rows_semantically_equal(candidate, row, equivalences, context, registry)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn output_value(&self) -> RelationValue {
-        let rows = match &self.storage {
-            MaintainedTopKStorage::I64Scalar(state) => Self::i64_scalar_output_rows(state),
-            MaintainedTopKStorage::I64Rows(buckets) => self.i64_output_rows(buckets),
-            MaintainedTopKStorage::SemanticOrdered { rows, .. } => {
-                rows.output_rows(self.direction, self.k)
-            }
-        };
-        match &self.result_type.semantics {
+    fn output_value(&self) -> Result<RelationValue, RelQueryError> {
+        let MaintainedTopKStorage::Counted { rows, .. } = &self.storage;
+        let rows = rows.output_rows(self.direction, self.k)?;
+        Ok(match &self.result_type.semantics {
             kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
             kernel_schema::RelationSemantics::Set {
                 column_equivalences,
@@ -7889,150 +6934,8 @@ impl MaterializedTopKDeltaState {
                 rows,
                 column_equivalences: column_equivalences.clone(),
             },
-        }
+        })
     }
-
-    fn i64_output_rows(&self, buckets: &BTreeMap<i64, Vec<Row>>) -> Vec<Row> {
-        if self.k == 0 {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        match self.direction {
-            OrderDirection::Ascending => {
-                for bucket in buckets.values() {
-                    out.extend(bucket.iter().cloned());
-                    if out.len() >= self.k {
-                        break;
-                    }
-                }
-            }
-            OrderDirection::Descending => {
-                for bucket in buckets.values().rev() {
-                    out.extend(bucket.iter().cloned());
-                    if out.len() >= self.k {
-                        break;
-                    }
-                }
-            }
-        }
-        out
-    }
-}
-
-fn rel_delta_group_optimized(
-    query: &RelExpr,
-    old: &kernel_model::FiniteModel,
-    change: &Change<kernel_model::FiniteModel>,
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<RelationDelta>, RelQueryError> {
-    let RelExpr::Group {
-        input,
-        group_columns,
-        group_equivalences,
-        aggregate,
-    } = query
-    else {
-        return Ok(None);
-    };
-    let Some(input_delta) = rel_delta_optimized_inner(input, old, change, context, registry)?
-    else {
-        return Ok(None);
-    };
-    rel_delta_group_local_replay(
-        input,
-        &input_delta,
-        query,
-        old,
-        GroupReplaySpec {
-            group_columns,
-            group_equivalences,
-            aggregate,
-            context,
-            registry,
-        },
-    )
-    .map(Some)
-}
-
-fn rel_delta_join_optimized(
-    query: &RelExpr,
-    old: &kernel_model::FiniteModel,
-    change: &Change<kernel_model::FiniteModel>,
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<RelationDelta>, RelQueryError> {
-    let RelExpr::JoinEq {
-        left,
-        right,
-        left_column,
-        right_column,
-        equivalence,
-    } = query
-    else {
-        return Ok(None);
-    };
-    let Some(left_delta) = rel_delta_optimized_inner(left, old, change, context, registry)? else {
-        return Ok(None);
-    };
-    let Some(right_delta) = rel_delta_optimized_inner(right, old, change, context, registry)?
-    else {
-        return Ok(None);
-    };
-    rel_delta_join_local_replay(
-        left,
-        right,
-        &left_delta,
-        &right_delta,
-        query,
-        old,
-        JoinReplaySpec {
-            left_column: *left_column,
-            right_column: *right_column,
-            equivalence: *equivalence,
-            context,
-            registry,
-        },
-    )
-    .map(Some)
-}
-
-fn rel_delta_top_k_optimized(
-    query: &RelExpr,
-    old: &kernel_model::FiniteModel,
-    change: &Change<kernel_model::FiniteModel>,
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<RelationDelta>, RelQueryError> {
-    let RelExpr::TopKWithTies {
-        input,
-        column,
-        ordering,
-        direction,
-        k,
-    } = query
-    else {
-        return Ok(None);
-    };
-    let Some(input_delta) = rel_delta_optimized_inner(input, old, change, context, registry)?
-    else {
-        return Ok(None);
-    };
-    rel_delta_top_k_local_replay(
-        input,
-        &input_delta,
-        query,
-        old,
-        TopKReplaySpec {
-            column: *column,
-            ordering: *ordering,
-            direction: *direction,
-            k: *k,
-            context,
-            registry,
-        },
-    )
-    .map(Some)
 }
 
 fn rel_delta_scan(
@@ -8297,6 +7200,76 @@ fn relation_delta_materialization_count() -> usize {
     RELATION_DELTA_MATERIALIZATIONS.with(std::cell::Cell::get)
 }
 
+fn exact_delta_from_legacy<D: DeltaView<Row>>(delta: &D) -> ExactDelta<Row> {
+    let mut exact = ExactDelta::with_capacity(delta.support_len());
+    delta.visit(|weight, row| {
+        exact.push_exact(kernel_exact::ExactInteger::from_i64(weight), row.clone());
+    });
+    exact
+}
+
+fn exact_delta_to_legacy_checked<D: ExactDeltaView<Row>>(
+    delta: &D,
+) -> Result<AdaptiveDelta<Row, 4>, RelQueryError> {
+    let mut legacy = AdaptiveDelta::default();
+    let mut error = None;
+    delta.visit_exact(|weight, row| {
+        if error.is_some() {
+            return;
+        }
+        let Some(weight) = MaterializedJoinDeltaState::exact_integer_to_i64(weight) else {
+            error = Some(RelQueryError::DerivedIdentityExhausted);
+            return;
+        };
+        legacy.push_weighted(weight, row.clone());
+    });
+    error.map_or(Ok(legacy), Err)
+}
+
+fn materialize_exact_delta_view<D: ExactDeltaView<Row>>(
+    delta: &D,
+    result_type: RelType,
+) -> Result<RelationDelta, RelQueryError> {
+    #[cfg(test)]
+    RELATION_DELTA_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+    materialize_exact_delta_view_uncounted(delta, result_type)
+}
+
+fn materialize_exact_delta_view_uncounted<D: ExactDeltaView<Row>>(
+    delta: &D,
+    result_type: RelType,
+) -> Result<RelationDelta, RelQueryError> {
+    let mut inserted = Vec::new();
+    let mut removed = Vec::new();
+    let mut error = None;
+    delta.visit_exact(|weight, row| {
+        if error.is_some() || weight.is_zero() {
+            return;
+        }
+        let Some(magnitude) = weight
+            .magnitude()
+            .to_u64()
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            error = Some(RelQueryError::DerivedIdentityExhausted);
+            return;
+        };
+        if weight.is_negative() {
+            removed.extend(std::iter::repeat_n(row.clone(), magnitude));
+        } else {
+            inserted.extend(std::iter::repeat_n(row.clone(), magnitude));
+        }
+    });
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(RelationDelta {
+        inserted,
+        removed,
+        result_type,
+    })
+}
+
 fn maintained_delta_from_relation_delta(delta: RelationDelta) -> MaintainedDelta {
     maintained_delta_from_rows(delta.inserted, delta.removed)
 }
@@ -8304,10 +7277,10 @@ fn maintained_delta_from_relation_delta(delta: RelationDelta) -> MaintainedDelta
 fn maintained_delta_from_rows(inserted: Vec<Row>, removed: Vec<Row>) -> MaintainedDelta {
     let mut delta = MaintainedDelta::default();
     for row in removed {
-        delta.push_weighted(-1, row);
+        delta.push_exact(kernel_exact::ExactInteger::from_i64(-1), row);
     }
     for row in inserted {
-        delta.push_weighted(1, row);
+        delta.push_exact(kernel_exact::ExactInteger::from_i64(1), row);
     }
     delta
 }
@@ -8365,8 +7338,8 @@ fn set_output_delta_from_supports(
 struct SupportDeltaPlan {
     key: CanonicalRowKey,
     representative: Row,
-    removals: i64,
-    insertions: i64,
+    removals: kernel_exact::ExactNatural,
+    insertions: kernel_exact::ExactNatural,
 }
 
 fn canonical_row_key(
@@ -8393,20 +7366,24 @@ fn canonical_row_position_index(
     column_equivalences: &[kernel_types::SemanticId],
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<CanonicalRowPositionIndex>, RelQueryError> {
-    let mut by_key = BTreeMap::<CanonicalRowKey, Vec<usize>>::new();
-    let mut by_position = Vec::with_capacity(rows.len());
+) -> Result<CanonicalRowPositionIndex, RelQueryError> {
+    let mut by_key = PersistentOrdMap::<CanonicalRowKey, PersistentVec<usize>>::default();
+    let mut by_position = PersistentVec::default();
+    let mut bucket_slot_by_position = PersistentVec::default();
     for (index, row) in rows.iter().enumerate() {
-        let Some(key) = try_canonical_row_key(row, column_equivalences, context, registry)? else {
-            return Ok(None);
-        };
-        by_key.entry(key.clone()).or_default().push(index);
+        let key = canonical_row_key(row, column_equivalences, context, registry)?;
+        let mut bucket = by_key.get(&key).cloned().unwrap_or_default();
+        let bucket_slot = bucket.len();
+        bucket.push(index);
+        by_key.insert(key.clone(), bucket);
         by_position.push(key);
+        bucket_slot_by_position.push(bucket_slot);
     }
-    Ok(Some(CanonicalRowPositionIndex {
+    Ok(CanonicalRowPositionIndex {
         by_key,
         by_position,
-    }))
+        bucket_slot_by_position,
+    })
 }
 
 fn canonical_row_supports(
@@ -8414,16 +7391,16 @@ fn canonical_row_supports(
     column_equivalences: &[kernel_types::SemanticId],
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-) -> Result<(Vec<(Row, i64)>, SupportLookup), RelQueryError> {
-    let mut supports: Vec<(Row, i64)> = Vec::new();
-    let mut lookup = SupportLookup::new();
+) -> Result<(Vec<(Row, kernel_exact::ExactNatural)>, SupportLookup), RelQueryError> {
+    let mut supports: Vec<(Row, kernel_exact::ExactNatural)> = Vec::new();
+    let mut lookup = SupportLookup::default();
     for row in rows {
         let key = canonical_row_key(row, column_equivalences, context, registry)?;
         if let Some(index) = lookup.get(&key).copied() {
-            supports[index].1 += 1;
+            supports[index].1.add_u128(1);
         } else {
             let index = supports.len();
-            supports.push((row.clone(), 1));
+            supports.push((row.clone(), kernel_exact::ExactNatural::one()));
             lookup.insert(key, index);
         }
     }
@@ -8498,75 +7475,88 @@ fn relation_value_from_rows(rows: Vec<Row>, relation_type: &RelType) -> Relation
     }
 }
 
-#[derive(Clone, Copy)]
-struct JoinReplaySpec<'a> {
-    left_column: usize,
-    right_column: usize,
-    equivalence: kernel_types::SemanticId,
-    context: &'a kernel_schema::SemanticContext,
-    registry: &'a kernel_semantics::SemanticRegistry,
-}
-
-fn rel_delta_join_local_replay(
-    left: &RelExpr,
-    right: &RelExpr,
-    left_delta: &RelationDelta,
-    right_delta: &RelationDelta,
-    query: &RelExpr,
-    old: &kernel_model::FiniteModel,
-    spec: JoinReplaySpec<'_>,
-) -> Result<RelationDelta, RelQueryError> {
-    let old_left = left.evaluate(old, spec.context, spec.registry)?;
-    let old_right = right.evaluate(old, spec.context, spec.registry)?;
-    let next_left =
-        apply_relation_delta_to_value(old_left.clone(), left_delta, spec.context, spec.registry)?;
-    let next_right =
-        apply_relation_delta_to_value(old_right.clone(), right_delta, spec.context, spec.registry)?;
-    let old_output = join_relation_values(
-        old_left,
-        old_right,
-        spec.left_column,
-        spec.right_column,
-        spec.equivalence,
-        spec.context,
-        spec.registry,
-    )?;
-    let next_output = join_relation_values(
-        next_left,
-        next_right,
-        spec.left_column,
-        spec.right_column,
-        spec.equivalence,
-        spec.context,
-        spec.registry,
-    )?;
-    relation_delta_between_values(
-        &old_output,
-        &next_output,
-        query.typecheck(spec.context, spec.registry)?,
-        spec.context,
-        spec.registry,
-    )
-}
-
-fn adaptive_delta_between_rows(
-    old: &[Row],
-    next: &[Row],
-    result_type: &RelType,
+fn materialize_quotient_delta_view<D: DeltaView<Row>>(
+    delta: &D,
+    result_type: RelType,
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-) -> Result<AdaptiveDelta<Row, 4>, RelQueryError> {
-    let column_equivalences = relation_column_equivalences(result_type);
-    let inserted = unmatched_semantic_rows(next, old, column_equivalences, context, registry)?;
-    let removed = unmatched_semantic_rows(old, next, column_equivalences, context, registry)?;
-    let mut effect = AdaptiveDelta::<Row, 4>::default();
-    for row in removed {
-        effect.push_weighted(-1, row);
+) -> Result<RelationDelta, RelQueryError> {
+    struct SignedClass {
+        weight: i128,
+        positive_representative: Option<Row>,
+        negative_representative: Option<Row>,
     }
-    for row in inserted {
-        effect.push_weighted(1, row);
+
+    let equivalences = relation_column_equivalences(&result_type);
+    let mut classes = BTreeMap::<CanonicalRowKey, SignedClass>::new();
+    let mut error = None;
+    delta.visit(|weight, row| {
+        if weight == 0 || error.is_some() {
+            return;
+        }
+        let key = match canonical_row_key(row, equivalences, context, registry) {
+            Ok(key) => key,
+            Err(next) => {
+                error = Some(next);
+                return;
+            }
+        };
+        let class = classes.entry(key).or_insert_with(|| SignedClass {
+            weight: 0,
+            positive_representative: None,
+            negative_representative: None,
+        });
+        let Some(next_weight) = class.weight.checked_add(i128::from(weight)) else {
+            error = Some(RelQueryError::InconsistentIncrementalDelta);
+            return;
+        };
+        class.weight = next_weight;
+        if weight > 0 {
+            class
+                .positive_representative
+                .get_or_insert_with(|| row.clone());
+        } else {
+            class
+                .negative_representative
+                .get_or_insert_with(|| row.clone());
+        }
+    });
+    if let Some(error) = error {
+        return Err(error);
     }
-    Ok(effect)
+
+    let is_set = matches!(
+        result_type.semantics,
+        kernel_schema::RelationSemantics::Set { .. }
+    );
+    let mut inserted = Vec::new();
+    let mut removed = Vec::new();
+    for class in classes.into_values() {
+        if class.weight == 0 {
+            continue;
+        }
+        let magnitude = usize::try_from(class.weight.unsigned_abs())
+            .map_err(|_| RelQueryError::InconsistentIncrementalDelta)?;
+        if is_set && magnitude > 1 {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        if class.weight > 0 {
+            let representative = class
+                .positive_representative
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            inserted.extend(std::iter::repeat_n(representative, magnitude));
+        } else {
+            let representative = class
+                .negative_representative
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            removed.extend(std::iter::repeat_n(representative, magnitude));
+        }
+    }
+    Ok(RelationDelta {
+        inserted,
+        removed,
+        result_type,
+    })
 }
 
 fn relation_delta_between_values(
@@ -8620,21 +7610,32 @@ fn join_relation_values(
     };
     let left_rows = left_value.into_rows();
     let right_rows = right_value.into_rows();
+    let mut right_buckets = BTreeMap::<kernel_semantics::CanonicalEqKey, Vec<Row>>::new();
+    for right_row in right_rows {
+        let right_key = right_row
+            .get(right_column)
+            .ok_or(RelQueryError::ColumnOutOfBounds)?;
+        let canonical = registry
+            .canonical_equivalence_key(context, equivalence, right_key)
+            .map_err(RelQueryError::from)?;
+        right_buckets.entry(canonical).or_default().push(right_row);
+    }
     let mut out = Vec::new();
     for left_row in &left_rows {
         let left_key = left_row
             .get(left_column)
             .ok_or(RelQueryError::ColumnOutOfBounds)?;
-        for right_row in &right_rows {
-            let right_key = right_row
-                .get(right_column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)?;
-            if registry.equivalent(context, equivalence, left_key, right_key)? {
-                let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
-                joined.extend(left_row.iter().cloned());
-                joined.extend(right_row.iter().cloned());
-                out.push(joined);
-            }
+        let canonical = registry
+            .canonical_equivalence_key(context, equivalence, left_key)
+            .map_err(RelQueryError::from)?;
+        let Some(matches) = right_buckets.get(&canonical) else {
+            continue;
+        };
+        for right_row in matches {
+            let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
+            joined.extend(left_row.iter().cloned());
+            joined.extend(right_row.iter().cloned());
+            out.push(joined);
         }
     }
     Ok(match output_set_equivalences {
@@ -8644,97 +7645,6 @@ fn join_relation_values(
         },
         None => RelationValue::Bag(out),
     })
-}
-
-#[derive(Clone, Copy)]
-struct TopKReplaySpec<'a> {
-    column: usize,
-    ordering: kernel_types::SemanticId,
-    direction: OrderDirection,
-    k: usize,
-    context: &'a kernel_schema::SemanticContext,
-    registry: &'a kernel_semantics::SemanticRegistry,
-}
-
-fn rel_delta_top_k_local_replay(
-    input: &RelExpr,
-    input_delta: &RelationDelta,
-    query: &RelExpr,
-    old: &kernel_model::FiniteModel,
-    spec: TopKReplaySpec<'_>,
-) -> Result<RelationDelta, RelQueryError> {
-    let old_input = input.evaluate(old, spec.context, spec.registry)?;
-    let next_input =
-        apply_relation_delta_to_value(old_input.clone(), input_delta, spec.context, spec.registry)?;
-    let old_output = top_k_relation_value(
-        old_input,
-        spec.column,
-        spec.ordering,
-        spec.direction,
-        spec.k,
-        spec.context,
-        spec.registry,
-    )?;
-    let next_output = top_k_relation_value(
-        next_input,
-        spec.column,
-        spec.ordering,
-        spec.direction,
-        spec.k,
-        spec.context,
-        spec.registry,
-    )?;
-    relation_delta_between_values(
-        &old_output,
-        &next_output,
-        query.typecheck(spec.context, spec.registry)?,
-        spec.context,
-        spec.registry,
-    )
-}
-
-#[derive(Clone, Copy)]
-struct GroupReplaySpec<'a> {
-    group_columns: &'a [usize],
-    group_equivalences: &'a [kernel_types::SemanticId],
-    aggregate: &'a AggregateSpec,
-    context: &'a kernel_schema::SemanticContext,
-    registry: &'a kernel_semantics::SemanticRegistry,
-}
-
-fn rel_delta_group_local_replay(
-    input: &RelExpr,
-    input_delta: &RelationDelta,
-    query: &RelExpr,
-    old: &kernel_model::FiniteModel,
-    spec: GroupReplaySpec<'_>,
-) -> Result<RelationDelta, RelQueryError> {
-    let old_input = input.evaluate(old, spec.context, spec.registry)?;
-    let next_input =
-        apply_relation_delta_to_value(old_input.clone(), input_delta, spec.context, spec.registry)?;
-    let old_output = group_relation_value(
-        old_input,
-        spec.group_columns,
-        spec.group_equivalences,
-        spec.aggregate,
-        spec.context,
-        spec.registry,
-    )?;
-    let next_output = group_relation_value(
-        next_input,
-        spec.group_columns,
-        spec.group_equivalences,
-        spec.aggregate,
-        spec.context,
-        spec.registry,
-    )?;
-    relation_delta_between_values(
-        &old_output,
-        &next_output,
-        query.typecheck(spec.context, spec.registry)?,
-        spec.context,
-        spec.registry,
-    )
 }
 
 fn top_k_relation_value(
@@ -8757,7 +7667,21 @@ fn top_k_relation_value(
     if k == 0 || rows.is_empty() {
         rows.clear();
     } else {
-        fallible_insertion_sort_rows(&mut rows, column, ordering, direction, context, registry)?;
+        let mut keyed_rows = rows
+            .into_iter()
+            .map(|row| {
+                let value = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
+                let key = registry
+                    .canonical_order_key(context, ordering, value)
+                    .map_err(RelQueryError::from)?;
+                Ok((key, row))
+            })
+            .collect::<Result<Vec<_>, RelQueryError>>()?;
+        keyed_rows.sort_by(|(left, _), (right, _)| match direction {
+            OrderDirection::Ascending => left.cmp(right),
+            OrderDirection::Descending => right.cmp(left),
+        });
+        rows = keyed_rows.into_iter().map(|(_, row)| row).collect();
         if k < rows.len() {
             let threshold = rows[k - 1]
                 .get(column)
@@ -8882,15 +7806,13 @@ fn rows_as_multisets_equivalent(
     if left.len() != right.len() {
         return Ok(false);
     }
-    if let (Some(left_counts), Some(right_counts)) = (
-        canonical_row_multiset_counts(left, column_equivalences, context, registry)?,
-        canonical_row_multiset_counts(right, column_equivalences, context, registry)?,
-    ) {
-        return Ok(left_counts == right_counts);
-    }
-    rows_as_multisets_equivalent_by_matching(left, right, column_equivalences, context, registry)
+    Ok(
+        canonical_row_multiset_counts(left, column_equivalences, context, registry)?
+            == canonical_row_multiset_counts(right, column_equivalences, context, registry)?,
+    )
 }
 
+#[cfg(test)]
 fn rows_as_multisets_equivalent_by_matching(
     left: &[Row],
     right: &[Row],
@@ -8927,35 +7849,13 @@ fn canonical_row_multiset_counts(
     column_equivalences: &[kernel_types::SemanticId],
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<BTreeMap<CanonicalRowKey, usize>>, RelQueryError> {
+) -> Result<BTreeMap<CanonicalRowKey, usize>, RelQueryError> {
     let mut counts = BTreeMap::new();
     for row in rows {
-        let Some(key) = try_canonical_row_key(row, column_equivalences, context, registry)? else {
-            return Ok(None);
-        };
+        let key = canonical_row_key(row, column_equivalences, context, registry)?;
         *counts.entry(key).or_insert(0) += 1;
     }
-    Ok(Some(counts))
-}
-
-fn try_canonical_row_key(
-    row: &Row,
-    column_equivalences: &[kernel_types::SemanticId],
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<CanonicalRowKey>, RelQueryError> {
-    if row.len() != column_equivalences.len() {
-        return Err(RelQueryError::EquivalenceArityMismatch);
-    }
-    let mut key = Vec::with_capacity(row.len());
-    for (value, equivalence) in row.iter().zip(column_equivalences) {
-        match registry.canonical_equivalence_key(context, *equivalence, value) {
-            Ok(part) => key.push(part),
-            Err(kernel_semantics::SemanticError::WrongModuleKind(_)) => return Ok(None),
-            Err(error) => return Err(RelQueryError::Semantic(error)),
-        }
-    }
-    Ok(Some(key))
+    Ok(counts)
 }
 
 fn rows_semantically_equal(
@@ -8984,39 +7884,27 @@ fn unmatched_semantic_rows(
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<Vec<Row>, RelQueryError> {
-    if let Some(mut target_counts) =
-        canonical_row_multiset_counts(target, column_equivalences, context, registry)?
-    {
-        let mut unmatched = Vec::new();
-        for source_row in source {
-            let Some(key) =
-                try_canonical_row_key(source_row, column_equivalences, context, registry)?
-            else {
-                return unmatched_semantic_rows_by_matching(
-                    source,
-                    target,
-                    column_equivalences,
-                    context,
-                    registry,
-                );
-            };
-            let supported = target_counts.get_mut(&key).is_some_and(|count| {
-                if *count == 0 {
-                    false
-                } else {
-                    *count -= 1;
-                    true
-                }
-            });
-            if !supported {
-                unmatched.push(source_row.clone());
+    let mut target_counts =
+        canonical_row_multiset_counts(target, column_equivalences, context, registry)?;
+    let mut unmatched = Vec::new();
+    for source_row in source {
+        let key = canonical_row_key(source_row, column_equivalences, context, registry)?;
+        let supported = target_counts.get_mut(&key).is_some_and(|count| {
+            if *count == 0 {
+                false
+            } else {
+                *count -= 1;
+                true
             }
+        });
+        if !supported {
+            unmatched.push(source_row.clone());
         }
-        return Ok(unmatched);
     }
-    unmatched_semantic_rows_by_matching(source, target, column_equivalences, context, registry)
+    Ok(unmatched)
 }
 
+#[cfg(test)]
 fn unmatched_semantic_rows_by_matching(
     source: &[Row],
     target: &[Row],
@@ -9157,12 +8045,6 @@ pub enum RelationValue {
 impl RelationValue {
     #[must_use]
     pub fn rows(&self) -> &[Row] {
-        match self {
-            Self::Bag(rows) | Self::Set { rows, .. } => rows,
-        }
-    }
-
-    fn rows_mut(&mut self) -> &mut Vec<Row> {
         match self {
             Self::Bag(rows) | Self::Set { rows, .. } => rows,
         }
@@ -9530,9 +8412,6 @@ enum RelDifferentialNode {
         left_expr: RelExpr,
         right_expr: RelExpr,
         result_expr: RelExpr,
-        left_column: usize,
-        right_column: usize,
-        equivalence: kernel_types::SemanticId,
     },
     Difference {
         left: Box<Self>,
@@ -9553,18 +8432,11 @@ enum RelDifferentialNode {
         input: Box<Self>,
         input_expr: RelExpr,
         result_expr: RelExpr,
-        group_columns: Vec<usize>,
-        group_equivalences: Vec<kernel_types::SemanticId>,
-        aggregate: AggregateSpec,
     },
     TopKWithTies {
         input: Box<Self>,
         input_expr: RelExpr,
         result_expr: RelExpr,
-        column: usize,
-        ordering: kernel_types::SemanticId,
-        direction: OrderDirection,
-        k: usize,
     },
     PromoteToBag {
         input: Box<Self>,
@@ -9629,13 +8501,7 @@ impl RelDifferentialNode {
                     ),
                 })
             }
-            RelExpr::JoinEq {
-                left,
-                right,
-                left_column,
-                right_column,
-                equivalence,
-            } => {
+            RelExpr::JoinEq { left, right, .. } => {
                 let (left_id, right_id) = Self::binary_children(node, graph)?;
                 Ok(Self::JoinEq {
                     left: Box::new(Self::compile(left, left_id, graph)?),
@@ -9643,9 +8509,6 @@ impl RelDifferentialNode {
                     left_expr: left.as_ref().clone(),
                     right_expr: right.as_ref().clone(),
                     result_expr: expr.clone(),
-                    left_column: *left_column,
-                    right_column: *right_column,
-                    equivalence: *equivalence,
                 })
             }
             RelExpr::Difference { left, right } => {
@@ -9662,38 +8525,20 @@ impl RelDifferentialNode {
                     result_expr: expr.clone(),
                 })
             }
-            RelExpr::Group {
-                input,
-                group_columns,
-                group_equivalences,
-                aggregate,
-            } => {
+            RelExpr::Group { input, .. } => {
                 let input_id = Self::unary_child(node, graph)?;
                 Ok(Self::Group {
                     input: Box::new(Self::compile(input, input_id, graph)?),
                     input_expr: input.as_ref().clone(),
                     result_expr: expr.clone(),
-                    group_columns: group_columns.clone(),
-                    group_equivalences: group_equivalences.clone(),
-                    aggregate: aggregate.clone(),
                 })
             }
-            RelExpr::TopKWithTies {
-                input,
-                column,
-                ordering,
-                direction,
-                k,
-            } => {
+            RelExpr::TopKWithTies { input, .. } => {
                 let input_id = Self::unary_child(node, graph)?;
                 Ok(Self::TopKWithTies {
                     input: Box::new(Self::compile(input, input_id, graph)?),
                     input_expr: input.as_ref().clone(),
                     result_expr: expr.clone(),
-                    column: *column,
-                    ordering: *ordering,
-                    direction: *direction,
-                    k: *k,
                 })
             }
             RelExpr::PromoteToBag(input) => {
@@ -9852,8 +8697,8 @@ impl RelDifferentialNode {
             ),
             Self::Project { .. } => self.apply_project(old, change, context, registry),
             Self::JoinEq { .. } => self.apply_join(old, change, context, registry),
-            Self::Difference { result_expr, .. } | Self::AntiJoin { result_expr, .. } => {
-                rel_delta_by_recompute(result_expr, old, change, context, registry)
+            Self::Difference { .. } | Self::AntiJoin { .. } => {
+                self.apply_blocker(old, change, context, registry)
             }
             Self::Distinct {
                 input,
@@ -9913,6 +8758,79 @@ impl RelDifferentialNode {
         }
     }
 
+    fn apply_blocker(
+        &self,
+        old: &kernel_model::FiniteModel,
+        change: &Change<kernel_model::FiniteModel>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelationDelta, RelQueryError> {
+        let (Self::Difference {
+            left,
+            right,
+            result_expr,
+        }
+        | Self::AntiJoin {
+            left,
+            right,
+            result_expr,
+        }) = self
+        else {
+            unreachable!("apply_blocker is only called for blocker nodes");
+        };
+        let left_delta = left.apply(old, change, context, registry)?;
+        let right_delta = right.apply(old, change, context, registry)?;
+        let (left_expr, right_expr, kind) = match result_expr {
+            RelExpr::Difference { left, right } => (
+                left.as_ref(),
+                right.as_ref(),
+                MaintainedBlockerKind::Difference,
+            ),
+            RelExpr::AntiJoin {
+                left,
+                right,
+                left_column,
+                right_column,
+                equivalence,
+            } => (
+                left.as_ref(),
+                right.as_ref(),
+                MaintainedBlockerKind::AntiJoin {
+                    left_column: *left_column,
+                    right_column: *right_column,
+                    equivalence: *equivalence,
+                },
+            ),
+            _ => unreachable!("blocker differential node/query mismatch"),
+        };
+        let left_value = left_expr.evaluate(old, context, registry)?;
+        let right_value = right_expr.evaluate(old, context, registry)?;
+        let state = MaterializedBlockerDeltaState::build(
+            &left_value,
+            &right_value,
+            BlockerBuildSpec {
+                kind: &kind,
+                left_type: left_expr.typecheck(context, registry)?,
+                right_type: right_expr.typecheck(context, registry)?,
+                result_type: result_expr.typecheck(context, registry)?,
+                context,
+                registry,
+            },
+        )?;
+        let planned = state.plan_delta_views(
+            &left_delta.as_delta_view(),
+            &right_delta.as_delta_view(),
+            context,
+            registry,
+        )?;
+        materialize_quotient_delta_view(
+            &planned.effect,
+            state.result_type.clone(),
+            context,
+            registry,
+        )
+    }
+
     fn apply_join(
         &self,
         old: &kernel_model::FiniteModel,
@@ -9926,29 +8844,33 @@ impl RelDifferentialNode {
             left_expr,
             right_expr,
             result_expr,
-            left_column,
-            right_column,
-            equivalence,
         } = self
         else {
             unreachable!("apply_join is only called for join nodes");
         };
         let left_delta = left.apply(old, change, context, registry)?;
         let right_delta = right.apply(old, change, context, registry)?;
-        rel_delta_join_local_replay(
-            left_expr,
-            right_expr,
-            &left_delta,
-            &right_delta,
+        let left_value = left_expr.evaluate(old, context, registry)?;
+        let right_value = right_expr.evaluate(old, context, registry)?;
+        let state = MaterializedJoinDeltaState::build_from_input_values(
             result_expr,
-            old,
-            JoinReplaySpec {
-                left_column: *left_column,
-                right_column: *right_column,
-                equivalence: *equivalence,
-                context,
-                registry,
-            },
+            &left_value,
+            &right_value,
+            context,
+            registry,
+        )?
+        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let planned = state.plan_delta_views(
+            &left_delta.as_delta_view(),
+            &right_delta.as_delta_view(),
+            context,
+            registry,
+        )?;
+        materialize_quotient_delta_view(
+            &planned.effect,
+            state.result_type.clone(),
+            context,
+            registry,
         )
     }
 
@@ -9963,26 +8885,25 @@ impl RelDifferentialNode {
             input,
             input_expr,
             result_expr,
-            group_columns,
-            group_equivalences,
-            aggregate,
         } = self
         else {
             unreachable!("apply_group is only called for group nodes");
         };
         let input_delta = input.apply(old, change, context, registry)?;
-        rel_delta_group_local_replay(
-            input_expr,
-            &input_delta,
+        let input_value = input_expr.evaluate(old, context, registry)?;
+        let state = MaterializedGroupDeltaState::build_from_input_value(
             result_expr,
-            old,
-            GroupReplaySpec {
-                group_columns,
-                group_equivalences,
-                aggregate,
-                context,
-                registry,
-            },
+            input_value,
+            context,
+            registry,
+        )?
+        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let planned = state.plan_delta_view(&input_delta.as_delta_view(), context, registry)?;
+        materialize_quotient_delta_view(
+            &planned.effect,
+            state.result_type.clone(),
+            context,
+            registry,
         )
     }
 
@@ -9997,28 +8918,25 @@ impl RelDifferentialNode {
             input,
             input_expr,
             result_expr,
-            column,
-            ordering,
-            direction,
-            k,
         } = self
         else {
             unreachable!("apply_top_k is only called for TopK nodes");
         };
         let input_delta = input.apply(old, change, context, registry)?;
-        rel_delta_top_k_local_replay(
-            input_expr,
-            &input_delta,
+        let input_value = input_expr.evaluate(old, context, registry)?;
+        let state = MaterializedTopKDeltaState::build_from_input_value(
             result_expr,
-            old,
-            TopKReplaySpec {
-                column: *column,
-                ordering: *ordering,
-                direction: *direction,
-                k: *k,
-                context,
-                registry,
-            },
+            input_value,
+            context,
+            registry,
+        )?
+        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let planned = state.plan_delta_view(&input_delta.as_delta_view(), context, registry)?;
+        materialize_quotient_delta_view(
+            &planned.effect,
+            state.result_type.clone(),
+            context,
+            registry,
         )
     }
 }
@@ -10128,8 +9046,7 @@ impl RelObservationGuard {
         let value = prepared.evaluate(model, context, registry)?;
         let column_equivalences = relation_column_equivalences(prepared.result_type());
         let rows =
-            canonical_row_multiset_counts(value.rows(), column_equivalences, context, registry)?
-                .ok_or(RelQueryError::CanonicalObservationUnavailable)?;
+            canonical_row_multiset_counts(value.rows(), column_equivalences, context, registry)?;
         let mut source_relations = BTreeSet::new();
         collect_rel_source_relations(query, &mut source_relations);
         Ok(Self {
@@ -11194,6 +10111,7 @@ fn group_relation_value(
 
     let rows = input_value.into_rows();
     let mut groups: Vec<(Vec<Value>, State)> = Vec::new();
+    let mut group_lookup = BTreeMap::<CanonicalRowKey, usize>::new();
     if rows.is_empty() && group_columns.is_empty() {
         let state = match aggregate {
             AggregateSpec::Count { .. } => State::Count(kernel_aggregate::ExactCount::default()),
@@ -11212,17 +10130,8 @@ fn group_relation_value(
                     .ok_or(RelQueryError::ColumnOutOfBounds)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut found = None;
-        'groups: for (index, (existing, _)) in groups.iter().enumerate() {
-            for ((left, right), equivalence) in existing.iter().zip(&key).zip(group_equivalences) {
-                if !registry.equivalent(context, *equivalence, left, right)? {
-                    continue 'groups;
-                }
-            }
-            found = Some(index);
-            break;
-        }
-        let index = if let Some(index) = found {
+        let canonical_key = canonical_row_key(&key, group_equivalences, context, registry)?;
+        let index = if let Some(index) = group_lookup.get(&canonical_key).copied() {
             index
         } else {
             let state = match aggregate {
@@ -11233,8 +10142,10 @@ fn group_relation_value(
                     State::ExactF64Sum(kernel_aggregate::ExactF64Sum::default())
                 }
             };
+            let index = groups.len();
             groups.push((key, state));
-            groups.len() - 1
+            group_lookup.insert(canonical_key, index);
+            index
         };
         match (&mut groups[index].1, aggregate) {
             (State::Count(count), AggregateSpec::Count { .. }) => count.add_one(),
@@ -11286,35 +10197,6 @@ fn compare_with_direction(
         OrderDirection::Ascending => ordering,
         OrderDirection::Descending => ordering.reverse(),
     })
-}
-
-fn fallible_insertion_sort_rows(
-    rows: &mut [Row],
-    column: usize,
-    ordering: kernel_types::SemanticId,
-    direction: OrderDirection,
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<(), RelQueryError> {
-    for index in 1..rows.len() {
-        let mut cursor = index;
-        while cursor > 0 {
-            let right = rows[cursor]
-                .get(column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)?;
-            let left = rows[cursor - 1]
-                .get(column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)?;
-            if compare_with_direction(context, registry, ordering, right, left, direction)?
-                != std::cmp::Ordering::Less
-            {
-                break;
-            }
-            rows.swap(cursor - 1, cursor);
-            cursor -= 1;
-        }
-    }
-    Ok(())
 }
 
 fn value_shape_matches_type(value: &Value, ty: &kernel_schema::TypeExpr) -> bool {
@@ -11489,29 +10371,13 @@ fn distinct_rows(
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<Vec<Row>, RelQueryError> {
-    if let Some(first) = rows.first()
-        && first.len() != column_equivalences.len()
-    {
-        return Err(RelQueryError::EquivalenceArityMismatch);
-    }
-    let mut out: Vec<Row> = Vec::new();
-    'candidate: for row in rows {
-        if row.len() != column_equivalences.len() {
-            return Err(RelQueryError::EquivalenceArityMismatch);
+    let mut seen = BTreeSet::<CanonicalRowKey>::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key = canonical_row_key(&row, column_equivalences, context, registry)?;
+        if seen.insert(key) {
+            out.push(row);
         }
-        for existing in &out {
-            let mut same = true;
-            for ((left, right), equivalence) in existing.iter().zip(&row).zip(column_equivalences) {
-                if !registry.equivalent(context, *equivalence, left, right)? {
-                    same = false;
-                    break;
-                }
-            }
-            if same {
-                continue 'candidate;
-            }
-        }
-        out.push(row);
     }
     Ok(out)
 }
@@ -11743,7 +10609,7 @@ mod relational_tests {
         assert_eq!(effect, vec![(-2, alpha.clone())]);
         assert_eq!(state, before);
         state.commit_patch(planned.patch);
-        assert!(state.output_value().rows().is_empty());
+        assert!(state.output_value().unwrap().rows().is_empty());
 
         let before_invalid = state.clone();
         let mut invalid = AdaptiveDelta::<Row, 4>::default();
@@ -11758,6 +10624,59 @@ mod relational_tests {
             Err(RelQueryError::InconsistentIncrementalDelta)
         ));
         assert_eq!(state, before_invalid);
+    }
+
+    #[test]
+    fn blocker_difference_keeps_max_weight_compact() {
+        let (context, registry, _, left_id, right_id) = setup();
+        let left_type = RelExpr::Scan(left_id)
+            .typecheck(&context, &registry)
+            .unwrap();
+        let right_type = RelExpr::Scan(right_id)
+            .typecheck(&context, &registry)
+            .unwrap();
+        let alpha = vec![Value::Text("Alpha".into()), Value::I64(1)];
+        let kind = MaintainedBlockerKind::Difference;
+        let state = MaterializedBlockerDeltaState::build(
+            &RelationValue::Bag(Vec::new()),
+            &RelationValue::Bag(Vec::new()),
+            BlockerBuildSpec {
+                kind: &kind,
+                left_type: left_type.clone(),
+                right_type,
+                result_type: left_type,
+                context: &context,
+                registry: &registry,
+            },
+        )
+        .unwrap();
+        let magnitude = kernel_exact::ExactNatural::from_u128(u128::from(i64::MAX as u64) + 7);
+        let mut left_delta = ExactDelta::<Row>::default();
+        left_delta.push_exact(
+            kernel_exact::ExactInteger::from_parts(false, magnitude.clone()),
+            alpha.clone(),
+        );
+        let planned = state
+            .plan_exact_delta_views(
+                &left_delta,
+                &ExactDelta::<Row>::default(),
+                &context,
+                &registry,
+            )
+            .unwrap();
+        let mut effect = Vec::new();
+        planned
+            .effect
+            .visit_exact(|weight, row| effect.push((weight.clone(), row.clone())));
+        assert_eq!(effect.len(), 1);
+        assert_eq!(effect[0].0.magnitude(), &magnitude);
+        assert_eq!(effect[0].1, alpha);
+        let BlockerDeltaPatch::Difference(writes) = planned.patch else {
+            panic!("expected Difference patch");
+        };
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1.left_count, magnitude);
+        assert!(writes[0].1.right_count.is_zero());
     }
 
     #[test]
@@ -11836,7 +10755,7 @@ mod relational_tests {
         assert!(crossing_effect.iter().any(|(_, row)| row == &replacement));
         assert_eq!(state, before_crossing);
         state.commit_patch(crossing.patch);
-        assert!(state.output_value().rows().is_empty());
+        assert!(state.output_value().unwrap().rows().is_empty());
 
         let before_invalid = state.clone();
         let mut invalid = AdaptiveDelta::<Row, 4>::default();
@@ -12047,7 +10966,7 @@ mod relational_tests {
         );
         let state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
         let mut candidate = state.clone();
-        assert!(Arc::ptr_eq(&state.arena, &candidate.arena));
+        assert!(state.arena.shares_storage_with(&candidate.arena));
 
         let delta = RelationDelta {
             inserted: vec![vec![Value::Text("Gamma".into()), Value::I64(3)]],
@@ -12058,7 +10977,7 @@ mod relational_tests {
             .apply_relation_deltas(&BTreeMap::from([(relation, delta)]), &context, &registry)
             .unwrap();
 
-        assert!(!Arc::ptr_eq(&state.arena, &candidate.arena));
+        assert!(!state.arena.shares_storage_with(&candidate.arena));
         assert_eq!(
             state.output_value(&context, &registry).unwrap().rows(),
             &[
@@ -12072,6 +10991,307 @@ mod relational_tests {
                 vec![Value::Text("Beta".into()), Value::I64(2)],
                 vec![Value::Text("Gamma".into()), Value::I64(3)],
             ]
+        );
+    }
+
+    #[test]
+    fn maintained_plan_arena_path_copy_preserves_untouched_node_arcs() {
+        let (context, registry, text_eq, relation, _) = setup();
+        let query = RelExpr::FilterEqConst {
+            input: Box::new(RelExpr::Scan(relation)),
+            column: 0,
+            value: Value::Text("ALPHA".into()),
+            equivalence: text_eq,
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            relation,
+            vec![
+                vec![Value::Text("Alpha".into()), Value::I64(1)],
+                vec![Value::Text("Beta".into()), Value::I64(2)],
+            ],
+        );
+        let state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        assert_eq!(state.arena.len(), 2);
+        let mut candidate = state.clone();
+        let delta = RelationDelta {
+            inserted: vec![vec![Value::Text("Gamma".into()), Value::I64(3)]],
+            removed: Vec::new(),
+            result_type: RelExpr::Scan(relation)
+                .typecheck(&context, &registry)
+                .unwrap(),
+        };
+        candidate
+            .apply_relation_deltas(&BTreeMap::from([(relation, delta)]), &context, &registry)
+            .unwrap();
+
+        assert!(!state.arena.shares_storage_with(&candidate.arena));
+        assert!(!Arc::ptr_eq(&state.arena[0], &candidate.arena[0]));
+        assert!(
+            Arc::ptr_eq(&state.arena[1], &candidate.arena[1]),
+            "immutable filter node must stay physically shared after scan-only commit"
+        );
+    }
+
+    #[test]
+    fn scan_payload_path_copies_rows_under_reader_snapshot() {
+        let (context, registry, _, relation, _) = setup();
+        let rows = (0_i64..1_024)
+            .map(|value| vec![Value::Text(format!("k{value}")), Value::I64(value)])
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(relation, rows);
+        let query = RelExpr::Scan(relation);
+        let state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        let mut next = state.clone();
+
+        let FlatMaintainedRelPlanNodeKind::Scan { value: before, .. } = &state.arena[0].kind else {
+            panic!("root must be scan");
+        };
+        let FlatMaintainedRelPlanNodeKind::Scan { value: shared, .. } = &next.arena[0].kind else {
+            panic!("root must be scan");
+        };
+        assert!(before.shares_storage_with(shared));
+
+        next.apply_relation_deltas(
+            &BTreeMap::from([(
+                relation,
+                RelationDelta {
+                    inserted: vec![vec![Value::Text("replacement".into()), Value::I64(2_000)]],
+                    removed: vec![vec![Value::Text("k0".into()), Value::I64(0)]],
+                    result_type: query.typecheck(&context, &registry).unwrap(),
+                },
+            )]),
+            &context,
+            &registry,
+        )
+        .unwrap();
+
+        let FlatMaintainedRelPlanNodeKind::Scan { value: after, .. } = &next.arena[0].kind else {
+            panic!("root must be scan");
+        };
+        assert!(!before.shares_storage_with(after));
+        assert!(
+            before.shares_page_with(after, 512),
+            "untouched middle scan page must remain physically shared"
+        );
+        assert_eq!(before.len(), 1_024);
+        assert_eq!(after.len(), 1_024);
+        assert_eq!(
+            state.output_value(&context, &registry).unwrap().rows()[0][1],
+            Value::I64(0)
+        );
+        assert!(
+            next.output_value(&context, &registry)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row[1] == Value::I64(2_000))
+        );
+    }
+
+    #[test]
+    fn set_support_payload_path_copies_under_reader_snapshot() {
+        let (context, registry, text_eq, left, _) = setup();
+        let i64_eq = SemanticId::new(101);
+        let rows = (0_i64..1_024)
+            .map(|value| vec![Value::Text(format!("k{value}")), Value::I64(value)])
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, rows);
+        let query = RelExpr::Distinct {
+            input: Box::new(RelExpr::Scan(left)),
+            column_equivalences: vec![text_eq, i64_eq],
+        };
+        let state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        let mut next = state.clone();
+        let before = state
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Distinct { supports, .. } => Some(supports),
+                _ => None,
+            })
+            .unwrap();
+        let snapshot = next
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Distinct { supports, .. } => Some(supports),
+                _ => None,
+            })
+            .unwrap();
+        assert!(before.supports.shares_storage_with(&snapshot.supports));
+        assert!(
+            before
+                .support_lookup
+                .shares_root_with(&snapshot.support_lookup)
+        );
+        next.apply_relation_deltas(
+            &BTreeMap::from([(
+                left,
+                RelationDelta {
+                    inserted: vec![vec![Value::Text("new".into()), Value::I64(9_999)]],
+                    removed: Vec::new(),
+                    result_type: RelExpr::Scan(left).typecheck(&context, &registry).unwrap(),
+                },
+            )]),
+            &context,
+            &registry,
+        )
+        .unwrap();
+        let after = next
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Distinct { supports, .. } => Some(supports),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!before.supports.shares_storage_with(&after.supports));
+        assert!(
+            !before
+                .support_lookup
+                .shares_root_with(&after.support_lookup)
+        );
+    }
+
+    #[test]
+    fn blocker_payload_path_copies_under_reader_snapshot() {
+        let (context, registry, _, left, right) = setup();
+        let rows = (0_i64..1_024)
+            .map(|value| vec![Value::Text(format!("k{value}")), Value::I64(value)])
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, rows);
+        model.relations.insert(right, Vec::new());
+        let query = RelExpr::Difference {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(right)),
+        };
+        let state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        let mut next = state.clone();
+        let before = state
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => match &state.storage {
+                    MaintainedBlockerStorage::Difference { classes, .. } => Some(classes),
+                    MaintainedBlockerStorage::AntiJoin { .. } => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        let snapshot = next
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => match &state.storage {
+                    MaintainedBlockerStorage::Difference { classes, .. } => Some(classes),
+                    MaintainedBlockerStorage::AntiJoin { .. } => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        assert!(before.shares_root_with(snapshot));
+        next.apply_relation_deltas(
+            &BTreeMap::from([(
+                left,
+                RelationDelta {
+                    inserted: vec![vec![Value::Text("blocker-new".into()), Value::I64(10_000)]],
+                    removed: Vec::new(),
+                    result_type: RelExpr::Scan(left).typecheck(&context, &registry).unwrap(),
+                },
+            )]),
+            &context,
+            &registry,
+        )
+        .unwrap();
+        let after = next
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => match &state.storage {
+                    MaintainedBlockerStorage::Difference { classes, .. } => Some(classes),
+                    MaintainedBlockerStorage::AntiJoin { .. } => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        assert!(!before.shares_root_with(after));
+    }
+
+    #[test]
+    fn generic_group_payload_path_copies_under_reader_snapshot() {
+        let (context, registry, text_eq, left, _) = setup();
+        let i64_eq = SemanticId::new(101);
+        let rows = (0_i64..1_024)
+            .map(|value| vec![Value::Text(format!("k{value}")), Value::I64(value)])
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, rows);
+        let query = RelExpr::Group {
+            input: Box::new(RelExpr::Scan(left)),
+            group_columns: vec![0],
+            group_equivalences: vec![text_eq],
+            aggregate: AggregateSpec::Count {
+                result_equivalence: i64_eq,
+            },
+        };
+        let state = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        let mut next = state.clone();
+        let before = state
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Group { state, .. } => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        let snapshot = next
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Group { state, .. } => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        assert!(before.groups.shares_storage_with(&snapshot.groups));
+        assert!(
+            before
+                .semantic_lookup
+                .as_ref()
+                .zip(snapshot.semantic_lookup.as_ref())
+                .is_some_and(|(left, right)| left.shares_root_with(right))
+        );
+        next.apply_relation_deltas(
+            &BTreeMap::from([(
+                left,
+                RelationDelta {
+                    inserted: vec![vec![Value::Text("group-new".into()), Value::I64(10_001)]],
+                    removed: Vec::new(),
+                    result_type: RelExpr::Scan(left).typecheck(&context, &registry).unwrap(),
+                },
+            )]),
+            &context,
+            &registry,
+        )
+        .unwrap();
+        let after = next
+            .arena
+            .iter()
+            .find_map(|node| match &node.kind {
+                FlatMaintainedRelPlanNodeKind::Group { state, .. } => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!before.groups.shares_storage_with(&after.groups));
+        assert!(
+            !before
+                .semantic_lookup
+                .as_ref()
+                .zip(after.semantic_lookup.as_ref())
+                .is_some_and(|(left, right)| left.shares_root_with(right))
         );
     }
 
@@ -13175,6 +12395,132 @@ mod relational_tests {
             Err(RelQueryError::InconsistentIncrementalDelta)
         );
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn project_bag_keeps_max_weight_compact_and_cancels_semantically() {
+        let (context, registry, _, relation, _) = setup();
+        let query = RelExpr::Project {
+            input: Box::new(RelExpr::Scan(relation)),
+            columns: vec![0],
+        };
+        let result_type = query.typecheck(&context, &registry).unwrap();
+        let positive = vec![Value::Text("Alpha".into()), Value::I64(1)];
+        let negative = vec![Value::Text("alpha".into()), Value::I64(2)];
+        let cancel = CompactDelta::Two(
+            Weighted {
+                weight: i64::MAX,
+                row: positive.clone(),
+            },
+            Weighted {
+                weight: -i64::MAX,
+                row: negative,
+            },
+        );
+        let cancelled =
+            project_bag_delta_view(&cancel, &[0], &result_type, &context, &registry).unwrap();
+        assert_eq!(cancelled.support_len(), 0);
+
+        let one = CompactDelta::one(i64::MAX, positive);
+        let projected =
+            project_bag_delta_view(&one, &[0], &result_type, &context, &registry).unwrap();
+        let mut effect = Vec::new();
+        projected.visit_exact(|weight, row| {
+            effect.push((
+                MaterializedJoinDeltaState::exact_integer_to_i64(weight).unwrap(),
+                row.clone(),
+            ));
+        });
+        assert_eq!(effect, vec![(i64::MAX, vec![Value::Text("Alpha".into())])]);
+    }
+
+    #[test]
+    fn project_bag_keeps_exact_coefficient_beyond_i64_as_one_atom() {
+        let (context, registry, _, relation, _) = setup();
+        let query = RelExpr::Project {
+            input: Box::new(RelExpr::Scan(relation)),
+            columns: vec![0],
+        };
+        let result_type = query.typecheck(&context, &registry).unwrap();
+        let row = vec![Value::Text("Alpha".into()), Value::I64(1)];
+        let coefficient = kernel_exact::ExactInteger::from_i64(i64::MAX)
+            .scale_by_natural(&kernel_exact::ExactNatural::from_u64(2));
+        let mut input = ExactDelta::default();
+        input.push_exact(coefficient.clone(), row);
+
+        let projected =
+            project_bag_delta_view(&input, &[0], &result_type, &context, &registry).unwrap();
+        assert_eq!(projected.support_len(), 1);
+        projected.visit_exact(|weight, row| {
+            assert_eq!(weight, &coefficient);
+            assert_eq!(row, &vec![Value::Text("Alpha".into())]);
+        });
+    }
+
+    #[test]
+    fn set_support_tracks_exact_multiplicity_beyond_i64_without_expansion() {
+        let (context, registry, text_eq, _, _) = setup();
+        let result_type = RelType {
+            semantics: RelationSemantics::Set {
+                column_equivalences: vec![text_eq],
+            },
+            columns: vec![kernel_schema::TypeExpr::Scalar(
+                kernel_schema::ScalarType::Text,
+            )],
+        };
+        let row = vec![Value::Text("Alpha".into())];
+        let mut state =
+            MaterializedSetSupportState::build(&[], result_type, &context, &registry).unwrap();
+        let magnitude = kernel_exact::ExactNatural::from_u128(u128::from(i64::MAX as u64) + 7);
+        let mut inserted = ExactDelta::default();
+        inserted.push_exact(
+            kernel_exact::ExactInteger::from_parts(false, magnitude.clone()),
+            row.clone(),
+        );
+        let planned = state
+            .plan_delta_view(&inserted, &context, &registry)
+            .unwrap();
+        assert_eq!(planned.effect.support_len(), 1);
+        state.commit_support_patch(planned.patch);
+        assert_eq!(state.supports[0].1, magnitude);
+
+        let mut removed = ExactDelta::default();
+        removed.push_exact(kernel_exact::ExactInteger::from_parts(true, magnitude), row);
+        let planned = state
+            .plan_delta_view(&removed, &context, &registry)
+            .unwrap();
+        assert_eq!(planned.effect.support_len(), 1);
+        state.commit_support_patch(planned.patch);
+        assert!(state.supports[0].1.is_zero());
+    }
+
+    #[test]
+    fn materialized_group_applies_max_weight_without_expanding_multiplicity() {
+        let (context, registry, text_eq, relation, _) = setup();
+        let query = RelExpr::Group {
+            input: Box::new(RelExpr::Scan(relation)),
+            group_columns: vec![0],
+            group_equivalences: vec![text_eq],
+            aggregate: AggregateSpec::Count {
+                result_equivalence: SemanticId::new(101),
+            },
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(relation, Vec::new());
+        let state = MaterializedGroupDeltaState::build(&query, &model, &context, &registry)
+            .unwrap()
+            .unwrap();
+        let row = vec![Value::Text("A".into()), Value::I64(1)];
+        let delta = CompactDelta::one(i64::MAX, row);
+        let planned = state.plan_delta_view(&delta, &context, &registry).unwrap();
+        let mut effect = Vec::new();
+        planned
+            .effect
+            .visit(|weight, row| effect.push((weight, row.clone())));
+        assert_eq!(
+            effect,
+            vec![(1, vec![Value::Text("A".into()), Value::I64(i64::MAX)],)]
+        );
     }
 
     #[test]
@@ -15410,7 +14756,7 @@ mod relational_tests {
             .unwrap();
         assert!(matches!(
             state.storage,
-            MaintainedTopKStorage::SemanticOrdered { .. }
+            MaintainedTopKStorage::Counted { .. }
         ));
         for values in &states[1..] {
             let next = model_for(values);
@@ -15426,6 +14772,159 @@ mod relational_tests {
             );
             old = next;
         }
+    }
+
+    #[test]
+    fn materialized_top_k_semantic_duplicate_order_bucket_resolves_stable_row_id() {
+        let relation = SemanticId::new(9_645);
+        let order_eq = SemanticId::new(9_646);
+        let payload_eq = SemanticId::new(9_647);
+        let text_order = SemanticId::new(9_648);
+        let mut registry = SemanticRegistry::default();
+        let order_eq_digest =
+            registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let payload_eq_digest = registry.install_equivalence(EquivalenceModule::TextExact);
+        let order_digest = registry.install_ordering(OrderingModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(9_645));
+        environment.pin_module(order_eq, order_eq_digest);
+        environment.pin_module(payload_eq, payload_eq_digest);
+        environment.pin_module(text_order, order_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(9_645));
+        schema
+            .define_relation(RelationDef {
+                id: relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::Text),
+                    TypeExpr::Scalar(ScalarType::Text),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![order_eq, payload_eq],
+                },
+            })
+            .unwrap();
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let query = RelExpr::TopKWithTies {
+            input: Box::new(RelExpr::Scan(relation)),
+            column: 0,
+            ordering: text_order,
+            direction: OrderDirection::Ascending,
+            k: 1,
+        };
+        let rows = (0..2_048)
+            .map(|index| {
+                vec![
+                    Value::Text("same".into()),
+                    Value::Text(format!("payload-{index}")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(relation, rows.clone());
+        let mut state = MaterializedTopKDeltaState::build(&query, &model, &context, &registry)
+            .unwrap()
+            .unwrap();
+        let snapshot = state.clone();
+        let MaintainedTopKStorage::Counted { rows: indexed, .. } = &state.storage;
+        let MaintainedTopKStorage::Counted {
+            rows: snapshot_rows,
+            ..
+        } = &snapshot.storage;
+        assert!(indexed.buckets.shares_root_with(&snapshot_rows.buckets));
+        assert_eq!(
+            indexed.total_rows,
+            kernel_exact::ExactNatural::from_u64(2_048)
+        );
+        assert_eq!(indexed.buckets.values().next().unwrap().len(), 2_048);
+
+        let delta = RelationDelta {
+            inserted: vec![],
+            removed: vec![rows[2_047].clone()],
+            result_type: RelExpr::Scan(relation)
+                .typecheck(&context, &registry)
+                .unwrap(),
+        };
+        let planned = state
+            .plan_delta_view(&delta.as_delta_view(), &context, &registry)
+            .unwrap();
+        let TopKDeltaPatch::Counted(plan) = planned.patch;
+        assert_eq!(plan.total_rows, kernel_exact::ExactNatural::from_u64(2_047));
+        assert_eq!(plan.buckets.values().next().unwrap().len(), 2_047);
+
+        state
+            .apply_input_delta(&delta, &context, &registry)
+            .unwrap();
+        let MaintainedTopKStorage::Counted { rows: after, .. } = &state.storage;
+        assert!(!after.buckets.shares_root_with(&snapshot_rows.buckets));
+        assert_eq!(
+            snapshot_rows.total_rows,
+            kernel_exact::ExactNatural::from_u64(2_048)
+        );
+        assert_eq!(
+            after.total_rows,
+            kernel_exact::ExactNatural::from_u64(2_047)
+        );
+    }
+
+    #[test]
+    fn top_k_exact_ordered_measure_keeps_weight_beyond_i64_compact() {
+        let relation = SemanticId::new(97_210);
+        let i64_eq = SemanticId::new(97_211);
+        let i64_order = SemanticId::new(97_212);
+        let mut registry = SemanticRegistry::default();
+        let eq_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let order_digest = registry.install_ordering(OrderingModule::I64Ascending);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(97_210));
+        environment.pin_module(i64_eq, eq_digest);
+        environment.pin_module(i64_order, order_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(97_210));
+        schema
+            .define_relation(RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![i64_eq],
+                },
+            })
+            .unwrap();
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let query = RelExpr::TopKWithTies {
+            input: Box::new(RelExpr::Scan(relation)),
+            column: 0,
+            ordering: i64_order,
+            direction: OrderDirection::Ascending,
+            k: 1,
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(relation, Vec::new());
+        let state = MaterializedTopKDeltaState::build(&query, &model, &context, &registry)
+            .unwrap()
+            .unwrap();
+        let magnitude = kernel_exact::ExactNatural::from_u128(u128::from(i64::MAX as u64) + 7);
+        let row = vec![Value::I64(1)];
+        let mut delta = ExactDelta::<Row>::default();
+        delta.push_exact(
+            kernel_exact::ExactInteger::from_parts(false, magnitude.clone()),
+            row.clone(),
+        );
+        let planned = state
+            .plan_exact_delta_view(&delta, &context, &registry)
+            .unwrap();
+        assert_eq!(planned.effect.support_len(), 1);
+        planned.effect.visit_exact(|weight, actual| {
+            assert_eq!(actual, &row);
+            assert_eq!(weight.magnitude(), &magnitude);
+            assert!(!weight.is_negative());
+        });
+        let TopKDeltaPatch::Counted(next) = planned.patch;
+        assert_eq!(next.total_rows, magnitude);
+        assert_eq!(next.buckets.len(), 1);
+        assert_eq!(next.buckets.values().next().unwrap().len(), 1);
     }
 
     #[test]
@@ -15475,7 +14974,10 @@ mod relational_tests {
         let mut state = MaterializedTopKDeltaState::build(&query, &old, &context, &registry)
             .unwrap()
             .unwrap();
-        assert!(matches!(state.storage, MaintainedTopKStorage::I64Rows(_)));
+        assert!(matches!(
+            state.storage,
+            MaintainedTopKStorage::Counted { .. }
+        ));
 
         let mut next = FiniteModel::default();
         next.relations.insert(
@@ -15507,6 +15009,81 @@ mod relational_tests {
         );
         assert_eq!(state, before);
         assert_eq!(state.row_count(), old.relations[&relation].len());
+    }
+
+    #[test]
+    fn materialized_top_k_i64_duplicate_bucket_resolves_stable_row_id() {
+        let relation = SemanticId::new(9_635);
+        let i64_eq = SemanticId::new(9_636);
+        let text_eq = SemanticId::new(9_637);
+        let i64_order = SemanticId::new(9_638);
+        let mut registry = SemanticRegistry::default();
+        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let text_digest = registry.install_equivalence(EquivalenceModule::TextExact);
+        let order_digest = registry.install_ordering(OrderingModule::I64Ascending);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(9_635));
+        environment.pin_module(i64_eq, i64_digest);
+        environment.pin_module(text_eq, text_digest);
+        environment.pin_module(i64_order, order_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(9_635));
+        schema
+            .define_relation(RelationDef {
+                id: relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::I64),
+                    TypeExpr::Scalar(ScalarType::Text),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![i64_eq, text_eq],
+                },
+            })
+            .unwrap();
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let query = RelExpr::TopKWithTies {
+            input: Box::new(RelExpr::Scan(relation)),
+            column: 0,
+            ordering: i64_order,
+            direction: OrderDirection::Ascending,
+            k: 1,
+        };
+        let rows = (0..2_048)
+            .map(|index| vec![Value::I64(7), Value::Text(format!("row-{index}"))])
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(relation, rows.clone());
+        let state = MaterializedTopKDeltaState::build(&query, &model, &context, &registry)
+            .unwrap()
+            .unwrap();
+        let MaintainedTopKStorage::Counted { rows: indexed, .. } = &state.storage;
+        assert_eq!(
+            indexed.total_rows,
+            kernel_exact::ExactNatural::from_u64(2_048)
+        );
+        assert_eq!(indexed.buckets.values().next().unwrap().len(), 2_048);
+
+        let delta = RelationDelta {
+            inserted: vec![],
+            removed: vec![rows[2_047].clone()],
+            result_type: RelExpr::Scan(relation)
+                .typecheck(&context, &registry)
+                .unwrap(),
+        };
+        let planned = state
+            .plan_delta_view(&delta.as_delta_view(), &context, &registry)
+            .unwrap();
+        let TopKDeltaPatch::Counted(plan) = planned.patch;
+        assert_eq!(plan.total_rows, kernel_exact::ExactNatural::from_u64(2_047));
+        assert_eq!(plan.buckets.values().next().unwrap().len(), 2_047);
+        let before_buckets = indexed.buckets.clone();
+        let mut next = state.clone();
+        next.commit_topk_patch(TopKDeltaPatch::Counted(plan));
+        let MaintainedTopKStorage::Counted { rows: after, .. } = &next.storage;
+        assert_eq!(before_buckets.values().next().unwrap().len(), 2_048);
+        assert_eq!(after.buckets.values().next().unwrap().len(), 2_047);
+        assert!(!before_buckets.shares_root_with(&after.buckets));
     }
 
     #[test]
@@ -15551,7 +15128,7 @@ mod relational_tests {
             .unwrap();
         assert!(matches!(
             state.storage,
-            MaintainedTopKStorage::SemanticOrdered { .. }
+            MaintainedTopKStorage::Counted { .. }
         ));
         let before = state.clone();
         let malformed = RelationDelta {
@@ -15839,6 +15416,161 @@ mod relational_tests {
     }
 
     #[test]
+    fn counted_join_exact_effect_does_not_expand_large_bilinear_coefficient() {
+        let left = SemanticId::new(97_140);
+        let right = SemanticId::new(97_141);
+        let i64_eq = SemanticId::new(97_142);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(97_140));
+        environment.pin_module(i64_eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(97_140));
+        for relation in [left, right] {
+            schema
+                .define_relation(RelationDef {
+                    id: relation,
+                    columns: vec![
+                        TypeExpr::Scalar(ScalarType::I64),
+                        TypeExpr::Scalar(ScalarType::I64),
+                    ],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![i64_eq, i64_eq],
+                    },
+                })
+                .unwrap();
+        }
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let query = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(right)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: i64_eq,
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, Vec::new());
+        model.relations.insert(
+            right,
+            vec![
+                vec![Value::I64(1), Value::I64(100)],
+                vec![Value::I64(1), Value::I64(100)],
+            ],
+        );
+        let state = MaterializedJoinDeltaState::build(&query, &model, &context, &registry)
+            .unwrap()
+            .unwrap();
+        let MaintainedJoinStorage::Counted(storage) = &state.storage;
+        let right_class = storage
+            .right
+            .buckets
+            .values()
+            .next()
+            .and_then(|bucket| bucket.values().next())
+            .unwrap();
+        assert_eq!(right_class.multiplicity.to_u64(), Some(2));
+
+        let mut left_delta = AdaptiveDelta::<Row, 1>::default();
+        left_delta.push_weighted(i64::MAX, vec![Value::I64(1), Value::I64(7)]);
+        let right_delta = AdaptiveDelta::<Row, 1>::default();
+        let planned = state
+            .plan_exact_delta_views(&left_delta, &right_delta, &context, &registry)
+            .unwrap();
+        assert_eq!(planned.effect.support_len(), 1);
+        planned.effect.visit_exact(|weight, row| {
+            assert_eq!(
+                row,
+                &vec![Value::I64(1), Value::I64(7), Value::I64(1), Value::I64(100)]
+            );
+            assert_eq!(
+                weight.magnitude().to_decimal_string(),
+                "18446744073709551614"
+            );
+            assert!(!weight.is_negative());
+            assert!(weight.magnitude() > &kernel_exact::ExactNatural::from_u64(i64::MAX as u64));
+        });
+        assert!(matches!(
+            state.plan_delta_views(&left_delta, &right_delta, &context, &registry),
+            Err(RelQueryError::DerivedIdentityExhausted)
+        ));
+    }
+
+    #[test]
+    fn materialized_join_i64_duplicate_bucket_uses_stable_row_class_ids() {
+        let left = SemanticId::new(97_150);
+        let right = SemanticId::new(97_151);
+        let i64_eq = SemanticId::new(97_152);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(97_150));
+        environment.pin_module(i64_eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(97_150));
+        for relation in [left, right] {
+            schema
+                .define_relation(RelationDef {
+                    id: relation,
+                    columns: vec![
+                        TypeExpr::Scalar(ScalarType::I64),
+                        TypeExpr::Scalar(ScalarType::I64),
+                    ],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![i64_eq, i64_eq],
+                    },
+                })
+                .unwrap();
+        }
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let query = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(right)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: i64_eq,
+        };
+        let left_rows = (0..2_048)
+            .map(|payload| vec![Value::I64(1), Value::I64(payload)])
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, left_rows);
+        model
+            .relations
+            .insert(right, vec![vec![Value::I64(1), Value::I64(10_000)]]);
+
+        let state = MaterializedJoinDeltaState::build(&query, &model, &context, &registry)
+            .unwrap()
+            .unwrap();
+        let MaintainedJoinStorage::Counted(storage) = &state.storage;
+        let side = &storage.left;
+        assert_eq!(side.buckets.len(), 1);
+        assert_eq!(side.buckets.values().next().unwrap().len(), 2_048);
+
+        let left_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
+        let delta = RelationDelta {
+            inserted: Vec::new(),
+            removed: vec![vec![Value::I64(1), Value::I64(2_047)]],
+            result_type: left_type.clone(),
+        };
+        let plan = side
+            .plan_mutation_view(
+                &delta.as_delta_view(),
+                0,
+                i64_eq,
+                &left_type,
+                &context,
+                &registry,
+            )
+            .unwrap();
+        assert_eq!(plan.delta.len(), 1);
+        assert!(plan.delta[0].weight.is_negative());
+        assert_eq!(plan.next.buckets.values().next().unwrap().len(), 2_047);
+    }
+
+    #[test]
     fn materialized_join_generic_preserves_ascii_ci_semantics() {
         let (context, registry, text_eq, left, right) = setup();
         let query = RelExpr::JoinEq {
@@ -15856,10 +15588,11 @@ mod relational_tests {
         let mut state = MaterializedJoinDeltaState::build(&query, &old, &context, &registry)
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            state.storage,
-            MaintainedJoinStorage::SemanticIndexed(_)
-        ));
+        let snapshot = state.clone();
+        let MaintainedJoinStorage::Counted(before) = &snapshot.storage;
+        let MaintainedJoinStorage::Counted(shared) = &state.storage;
+        assert!(before.left.buckets.shares_root_with(&shared.left.buckets));
+        assert!(before.right.buckets.shares_root_with(&shared.right.buckets));
         let left_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
         let right_type = RelExpr::Scan(right).typecheck(&context, &registry).unwrap();
         let left_delta = RelationDelta {
@@ -15892,6 +15625,9 @@ mod relational_tests {
         let maintained = state
             .apply_input_deltas(&left_delta, &right_delta, &context, &registry)
             .unwrap();
+        let MaintainedJoinStorage::Counted(after) = &state.storage;
+        assert!(!before.left.buckets.shares_root_with(&after.left.buckets));
+        assert!(!before.right.buckets.shares_root_with(&after.right.buckets));
         assert!(
             relation_deltas_semantically_equivalent(&maintained, &oracle, &context, &registry,)
                 .unwrap()
@@ -16524,7 +16260,7 @@ mod relational_tests {
             MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
         let before = state.clone();
         let epoch = state.transition_epoch();
-        let shared_arena = Arc::clone(&state.arena);
+        let shared_arena = state.arena.clone();
         let handles = [
             kernel_types::StableRowHandle {
                 slot: 0,
@@ -16545,13 +16281,13 @@ mod relational_tests {
         );
         assert_eq!(state, before);
         assert_eq!(state.transition_epoch(), epoch);
-        assert!(Arc::ptr_eq(&state.arena, &shared_arena));
+        assert!(state.arena.shares_storage_with(&shared_arena));
 
         state
             .attach_storage_rows(relation, &[(handles[0], alpha), (handles[1], beta)])
             .unwrap();
         assert_eq!(state.transition_epoch(), epoch + 1);
-        assert!(!Arc::ptr_eq(&state.arena, &shared_arena));
+        assert!(!state.arena.shares_storage_with(&shared_arena));
         assert_eq!(
             before.output_value(&context, &registry).unwrap(),
             state.output_value(&context, &registry).unwrap()
@@ -16674,7 +16410,7 @@ mod relational_tests {
             .unwrap();
         assert!(state.semantic_lookup.is_some());
         assert!(state.group_encoders.is_none());
-        assert!(state.canonical_group_lookup);
+        assert!(state.semantic_lookup.is_some());
         assert_eq!(state.group_count(), 2);
 
         let mut next = FiniteModel::default();
@@ -16771,7 +16507,7 @@ mod relational_tests {
             .unwrap();
         assert!(matches!(
             state.storage,
-            MaintainedTopKStorage::SemanticOrdered { .. }
+            MaintainedTopKStorage::Counted { .. }
         ));
         for values in &states[1..] {
             let next = model_for(values);
@@ -16897,10 +16633,7 @@ mod relational_tests {
         let state = MaterializedJoinDeltaState::build(&query, &model, &context, &registry)
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            state.storage,
-            MaintainedJoinStorage::StructuralIndexed(_)
-        ));
+        assert!(matches!(state.storage, MaintainedJoinStorage::Counted(_)));
         let mut state = state;
         let left_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
         let right_type = RelExpr::Scan(right).typecheck(&context, &registry).unwrap();

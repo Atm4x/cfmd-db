@@ -80,8 +80,8 @@ fn build_fixture(use_mixed_typed_batch: bool) -> Fixture {
     let mut store = PhysicalStore::default();
     let data = if use_mixed_typed_batch {
         NativeRelation::typed_columnar(vec![
-            NativeColumn::I64(predicate.clone()),
-            NativeColumn::I64(payload.clone()),
+            NativeColumn::I64(predicate.clone().into()),
+            NativeColumn::I64(payload.clone().into()),
         ])
         .unwrap()
     } else {

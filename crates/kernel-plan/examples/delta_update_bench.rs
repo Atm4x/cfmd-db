@@ -52,9 +52,11 @@ fn run(rows: usize, persisted_index: bool, remove_last: bool) -> u128 {
     let payloads = (0..rows)
         .map(|i| i64::try_from(i * 3).unwrap())
         .collect::<Vec<_>>();
-    let native =
-        NativeRelation::typed_columnar(vec![NativeColumn::I64(keys), NativeColumn::I64(payloads)])
-            .unwrap();
+    let native = NativeRelation::typed_columnar(vec![
+        NativeColumn::I64(keys.into()),
+        NativeColumn::I64(payloads.into()),
+    ])
+    .unwrap();
     let result_type = RelExpr::Scan(relation)
         .typecheck(&context, &registry)
         .unwrap();

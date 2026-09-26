@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+kernel-exact = { path = "../kernel-exact" }
 kernel-grounded-closure = { path = "../kernel-grounded-closure" }
 kernel-types = { path = "../kernel-types" }
 kernel-proof = { path = "../kernel-proof" }

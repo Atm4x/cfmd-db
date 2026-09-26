@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 kernel-grounded-closure = { path = "../kernel-grounded-closure" }
 kernel-model = { path = "../kernel-model" }
+kernel-persistent = { path = "../kernel-persistent" }
 kernel-proof = { path = "../kernel-proof" }
 kernel-schema = { path = "../kernel-schema" }
 kernel-types = { path = "../kernel-types" }

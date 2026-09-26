@@ -11,6 +11,19 @@ ROOT = Path(__file__).resolve().parents[2]
 def read(rel):
     return (ROOT / rel).read_text(encoding='utf-8')
 
+def read_rust_source_tree(rel):
+    """Read production Rust sources without assuming a monolithic lib.rs."""
+    root = ROOT / rel
+    sources = [root / 'lib.rs']
+    sources.extend(
+        path
+        for path in sorted(root.rglob('*.rs'))
+        if path != root / 'lib.rs'
+        and path.name != 'tests.rs'
+        and not any(part in {'tests', 'test_parts'} for part in path.parts)
+    )
+    return '\n'.join(path.read_text(encoding='utf-8') for path in sources)
+
 def enum_variants(text, enum_name):
     m = re.search(rf'pub enum {re.escape(enum_name)}\s*\{{', text)
     if not m:
@@ -29,7 +42,7 @@ def require(text, needle, where):
 
 schema = read('crates/kernel-schema/src/lib.rs')
 query = read('crates/kernel-query/src/lib.rs')
-plan = read('crates/kernel-plan/src/lib.rs')
+plan = read_rust_source_tree('crates/kernel-plan/src')
 change = read('crates/kernel-change/src/lib.rs')
 violation = read('crates/kernel-violation/src/lib.rs')
 retention = read('crates/kernel-retention/src/lib.rs')

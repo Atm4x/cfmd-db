@@ -4,5 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+kernel-persistent = { path = "../kernel-persistent" }
+
 [lints]
 workspace = true

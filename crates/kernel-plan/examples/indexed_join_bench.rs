@@ -81,8 +81,8 @@ fn fixture() -> Fixture {
             relation,
             binding,
             NativeRelation::typed_columnar(vec![
-                NativeColumn::I64(keys.clone()),
-                NativeColumn::I64(payloads.clone()),
+                NativeColumn::I64(keys.clone().into()),
+                NativeColumn::I64(payloads.clone().into()),
             ])
             .unwrap(),
         )

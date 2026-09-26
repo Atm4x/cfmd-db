@@ -3,12 +3,58 @@ use std::{collections::BTreeSet, sync::Arc};
 use kernel_identity::DenseEntityIds;
 use kernel_lifecycle::DenseLifecycleProjection;
 use kernel_model::{DatabaseState, LiveRefSensitivityIndex, ModelError};
-use kernel_schema::SemanticContext;
+use kernel_schema::{RelationSemantics, SemanticContext};
 use kernel_semantics::{SemanticError, SemanticRegistry};
 use kernel_types::{RevisionId, SemanticRevision};
 use kernel_validation::{
     DenseTypeExtents, ValidationError, validate_relations_with_extents, validate_state_with_extents,
 };
+
+#[derive(Debug, Clone)]
+struct RelationOnlyProvenance {
+    identity: Arc<()>,
+    source_identity: Option<Arc<()>>,
+    touched_relations: Arc<BTreeSet<kernel_types::SemanticId>>,
+}
+
+impl RelationOnlyProvenance {
+    fn root() -> Self {
+        Self {
+            identity: Arc::new(()),
+            source_identity: None,
+            touched_relations: Arc::new(BTreeSet::new()),
+        }
+    }
+
+    fn derived(source: &Self, touched_relations: BTreeSet<kernel_types::SemanticId>) -> Self {
+        Self {
+            identity: Arc::new(()),
+            source_identity: Some(Arc::clone(&source.identity)),
+            touched_relations: Arc::new(touched_relations),
+        }
+    }
+
+    fn certifies_from(
+        &self,
+        source: &Self,
+        touched_relations: &BTreeSet<kernel_types::SemanticId>,
+    ) -> bool {
+        self.source_identity.as_ref().is_some_and(|identity| {
+            Arc::ptr_eq(identity, &source.identity)
+                && self.touched_relations.as_ref() == touched_relations
+        })
+    }
+}
+
+// Provenance is non-semantic runtime evidence. Two Revisions compare by their
+// logical contents, not by which certified construction path produced them.
+impl PartialEq for RelationOnlyProvenance {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RelationOnlyProvenance {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevisionError {
@@ -24,16 +70,26 @@ impl From<ModelError> for RevisionError {
     }
 }
 
+/// Dense revision-local validation basis whose value depends only on the
+/// entity universe, lifecycle graph and pinned schema -- never on relation
+/// tuples. Relation-data-only revisions therefore share this root exactly;
+/// full/schema/lifecycle reconstruction builds a new root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevisionDenseBasis {
+    entities: Arc<DenseEntityIds>,
+    lifecycle: DenseLifecycleProjection,
+    type_extents: DenseTypeExtents,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revision {
     id: RevisionId,
     semantics: SemanticRevision,
     semantic_context: SemanticContext,
     state: DatabaseState,
-    dense_entities: Arc<DenseEntityIds>,
-    dense_lifecycle: DenseLifecycleProjection,
+    dense_basis: Arc<RevisionDenseBasis>,
     live_ref_sensitivity: LiveRefSensitivityIndex,
-    dense_type_extents: DenseTypeExtents,
+    relation_only_provenance: RelationOnlyProvenance,
 }
 
 #[derive(Debug)]
@@ -80,13 +136,13 @@ impl RelationUpdateCandidate<'_> {
             &self.source.semantic_context,
             registry,
             &self.state,
-            &self.source.dense_type_extents,
+            &self.source.dense_basis.type_extents,
             &self.touched_relations,
         )
         .map_err(RevisionError::InvalidTypedModel)?;
         let live_ref_sensitivity = self.source.live_ref_sensitivity.with_relations_recompiled(
             &self.state.model,
-            &self.source.dense_entities,
+            &self.source.dense_basis.entities,
             &self.touched_relations,
         );
         Ok(Revision {
@@ -94,15 +150,91 @@ impl RelationUpdateCandidate<'_> {
             semantics: self.source.semantics,
             semantic_context: self.source.semantic_context.clone(),
             state: self.state,
-            dense_entities: Arc::clone(&self.source.dense_entities),
-            dense_lifecycle: self.source.dense_lifecycle.clone(),
+            dense_basis: Arc::clone(&self.source.dense_basis),
             live_ref_sensitivity,
-            dense_type_extents: self.source.dense_type_extents.clone(),
+            relation_only_provenance: RelationOnlyProvenance::derived(
+                &self.source.relation_only_provenance,
+                self.touched_relations,
+            ),
         })
     }
 }
 
 impl Revision {
+    /// Builds the exact endpoint of an append-only Bag transition without
+    /// materializing the source relation.
+    ///
+    /// This path is deliberately narrow.  It is valid only when the source
+    /// relation has no live-reference sensitivity and the appended rows add no
+    /// live references.  Bag semantics has no uniqueness witness, so a valid
+    /// source plus individually validated appended rows preserves relation-local
+    /// validity without rescanning the old support.
+    pub fn build_append_only_bag_relations(
+        id: RevisionId,
+        source: &Self,
+        registry: &SemanticRegistry,
+        appends: &[(kernel_types::SemanticId, Vec<Vec<kernel_model::Value>>)],
+    ) -> Result<Self, RevisionError> {
+        registry
+            .validate_context(&source.semantic_context)
+            .map_err(RevisionError::InvalidSemantics)?;
+        let mut validation_state = source.state.clone();
+        let mut touched = BTreeSet::new();
+        for (relation, inserted) in appends {
+            if !touched.insert(*relation) {
+                return Err(RevisionError::InvalidRelationOnlyTransition);
+            }
+            let definition = source
+                .semantic_context
+                .schema
+                .relation(*relation)
+                .ok_or(RevisionError::InvalidRelationOnlyTransition)?;
+            if !matches!(definition.semantics, RelationSemantics::Bag { .. })
+                || source
+                    .live_ref_sensitivity
+                    .relation_has_live_refs(*relation)
+                || inserted
+                    .iter()
+                    .flatten()
+                    .any(kernel_model::Value::contains_live_ref)
+            {
+                return Err(RevisionError::InvalidRelationOnlyTransition);
+            }
+            validation_state
+                .model
+                .relations
+                .insert(*relation, inserted.clone());
+        }
+        validate_relations_with_extents(
+            &source.semantic_context,
+            registry,
+            &validation_state,
+            &source.dense_basis.type_extents,
+            &touched,
+        )
+        .map_err(RevisionError::InvalidTypedModel)?;
+
+        let mut state = source.state.clone();
+        for (relation, inserted) in appends {
+            state
+                .model
+                .relations
+                .append_persistent(*relation, inserted.clone());
+        }
+        Ok(Self {
+            id,
+            semantics: source.semantics,
+            semantic_context: source.semantic_context.clone(),
+            state,
+            dense_basis: Arc::clone(&source.dense_basis),
+            live_ref_sensitivity: source.live_ref_sensitivity.clone(),
+            relation_only_provenance: RelationOnlyProvenance::derived(
+                &source.relation_only_provenance,
+                touched,
+            ),
+        })
+    }
+
     #[must_use]
     pub fn relation_update_candidate(&self) -> RelationUpdateCandidate<'_> {
         RelationUpdateCandidate {
@@ -139,10 +271,13 @@ impl Revision {
             semantics: context.revision(),
             semantic_context: context.clone(),
             state,
-            dense_entities,
-            dense_lifecycle,
+            dense_basis: Arc::new(RevisionDenseBasis {
+                entities: dense_entities,
+                lifecycle: dense_lifecycle,
+                type_extents: dense_type_extents,
+            }),
             live_ref_sensitivity,
-            dense_type_extents,
+            relation_only_provenance: RelationOnlyProvenance::root(),
         })
     }
 
@@ -204,14 +339,34 @@ impl Revision {
         &self.state
     }
 
+    /// Returns whether this revision was constructed by the certified
+    /// relation-only builder from this exact source revision lineage, touching
+    /// exactly the named relations. This proves that lifecycle/carriers/fields
+    /// and every untouched relation were inherited from `source`; callers must
+    /// still validate any claimed relation delta against the touched endpoint.
     #[must_use]
-    pub fn dense_entity_ids(&self) -> Arc<DenseEntityIds> {
-        Arc::clone(&self.dense_entities)
+    pub fn certifies_relation_only_from(
+        &self,
+        source: &Self,
+        touched_relations: &BTreeSet<kernel_types::SemanticId>,
+    ) -> bool {
+        self.relation_only_provenance
+            .certifies_from(&source.relation_only_provenance, touched_relations)
     }
 
     #[must_use]
-    pub const fn dense_lifecycle(&self) -> &DenseLifecycleProjection {
-        &self.dense_lifecycle
+    pub fn dense_entity_ids(&self) -> Arc<DenseEntityIds> {
+        Arc::clone(&self.dense_basis.entities)
+    }
+
+    #[must_use]
+    pub fn dense_lifecycle(&self) -> &DenseLifecycleProjection {
+        &self.dense_basis.lifecycle
+    }
+
+    #[must_use]
+    pub fn dense_type_extents(&self) -> &DenseTypeExtents {
+        &self.dense_basis.type_extents
     }
 
     #[must_use]
@@ -356,6 +511,36 @@ mod tests {
         )
         .unwrap();
         assert!(Arc::ptr_eq(&source_ids, &target.dense_entity_ids()));
+        assert!(Arc::ptr_eq(&source.dense_basis, &target.dense_basis));
+        assert!(target.certifies_relation_only_from(&source, &BTreeSet::from([relation])));
+        assert!(!target.certifies_relation_only_from(&source, &BTreeSet::new()));
+        assert_eq!(
+            source.dense_type_extents().entity_count(),
+            target.dense_type_extents().entity_count(),
+        );
+
+        let append_target = Revision::build_append_only_bag_relations(
+            RevisionId::new(4),
+            &target,
+            &registry,
+            &[(relation, vec![vec![Value::I64(3)]])],
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&target.dense_basis, &append_target.dense_basis));
+        assert!(append_target.certifies_relation_only_from(&target, &BTreeSet::from([relation])));
+        assert!(!append_target.certifies_relation_only_from(&source, &BTreeSet::from([relation])));
+
+        let independently_rebuilt = Revision::build(
+            RevisionId::new(2),
+            &context,
+            &registry,
+            target.state().clone(),
+        )
+        .unwrap();
+        assert!(
+            !independently_rebuilt
+                .certifies_relation_only_from(&source, &BTreeSet::from([relation]))
+        );
 
         let mut invalid = target.state().clone();
         invalid.lifecycle.entities.insert(EntityId::new(999));

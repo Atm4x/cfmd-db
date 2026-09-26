@@ -27,6 +27,7 @@ The repository intentionally keeps internal concerns split into small crates. Th
 ### Logical and semantic model
 
 - `kernel-types` — stable nominal/revision identifiers and basic shared types.
+- `kernel-exact` — shared exact `ℕ`/`ℤ` coefficient arithmetic for finite measures and signed deltas.
 - `kernel-schema` — type expressions, schema/semantic symbols and versioned `Γ` structures.
 - `kernel-model` — finite structural values, carriers, relations and model state.
 - `kernel-semantics` — pinned semantic-context/module execution.
@@ -38,7 +39,7 @@ The repository intentionally keeps internal concerns split into small crates. Th
 - `kernel-plan` — physical plans and checked lowering.
 - `kernel-change` — typed changes/rewrites.
 - `kernel-lens` — writable/dependent view calculus.
-- `kernel-aggregate`, `kernel-fixpoint`, `kernel-grounded-closure` — higher-level maintained operators/calculi.
+- `kernel-aggregate`, `kernel-fixpoint`, `kernel-grounded-closure` — higher-level maintained operators/calculi built over shared exact coefficients where multiplicity is unbounded.
 - `kernel-validation`, `kernel-violation` — validation and violation-query boundaries.
 
 ### Physical semantic indexing

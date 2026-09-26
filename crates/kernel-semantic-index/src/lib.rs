@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-
+use kernel_persistent::{PersistentOrdMap, PersistentOrdMapIter};
 use kernel_schema::{ModuleDigest, SemanticContext, StructuralEquivalenceDef};
 use kernel_types::{SemanticId, SemanticRevision};
 
@@ -155,10 +154,59 @@ impl SemanticIndexBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticBucketIndex<K, I> {
+pub struct SemanticBucket<I: Clone> {
+    entries: PersistentOrdMap<u64, I>,
+}
+
+impl<I: Clone> Default for SemanticBucket<I> {
+    fn default() -> Self {
+        Self {
+            entries: PersistentOrdMap::default(),
+        }
+    }
+}
+
+impl<I: Clone> SemanticBucket<I> {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &I> {
+        self.entries.values()
+    }
+}
+
+impl<'a, I: Clone> IntoIterator for &'a SemanticBucket<I> {
+    type Item = &'a I;
+    type IntoIter = std::iter::Map<PersistentOrdMapIter<'a, u64, I>, fn((&'a u64, &'a I)) -> &'a I>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(bucket_value::<I>)
+    }
+}
+
+fn bucket_value<'a, I>((_, value): (&'a u64, &'a I)) -> &'a I {
+    value
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticReverseEntry<K> {
+    key: K,
+    ordinal: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticBucketIndex<K: Ord + Clone, I: Ord + Clone> {
     binding: SemanticIndexBinding,
-    buckets: BTreeMap<K, Vec<I>>,
-    reverse: BTreeMap<I, K>,
+    buckets: PersistentOrdMap<K, SemanticBucket<I>>,
+    reverse: PersistentOrdMap<I, SemanticReverseEntry<K>>,
 }
 
 impl<K, I> SemanticBucketIndex<K, I>
@@ -170,8 +218,8 @@ where
     pub fn new(binding: SemanticIndexBinding) -> Self {
         Self {
             binding,
-            buckets: BTreeMap::new(),
-            reverse: BTreeMap::new(),
+            buckets: PersistentOrdMap::default(),
+            reverse: PersistentOrdMap::default(),
         }
     }
 
@@ -196,26 +244,24 @@ where
     }
 
     #[must_use]
-    pub fn bucket(&self, key: &K) -> Option<&[I]> {
-        self.buckets.get(key).map(Vec::as_slice)
+    pub fn bucket(&self, key: &K) -> Option<&SemanticBucket<I>> {
+        self.buckets.get(key)
     }
 
     #[must_use]
-    pub fn buckets(&self) -> impl DoubleEndedIterator<Item = (&K, &[I])> {
-        self.buckets
-            .iter()
-            .map(|(key, identities)| (key, identities.as_slice()))
+    pub fn buckets(&self) -> impl DoubleEndedIterator<Item = (&K, &SemanticBucket<I>)> {
+        self.buckets.iter()
     }
 
     #[must_use]
     pub fn key_for(&self, identity: &I) -> Option<&K> {
-        self.reverse.get(identity)
+        self.reverse.get(identity).map(|entry| &entry.key)
     }
 
     /// Deterministic retained-size estimate for budget decisions.
     ///
-    /// This accounts for owned key/identity payloads and vector capacities,
-    /// including the reverse-map key clone. Allocator/BTree node overhead is
+    /// This accounts for owned key/identity payloads, including the reverse-map
+    /// key clone and ordered occurrence payloads. Allocator/BTree node overhead is
     /// intentionally outside the contract and must not be confused with RSS.
     #[must_use]
     pub fn estimated_retained_bytes(&self, key_heap_bytes: impl Fn(&K) -> usize) -> usize {
@@ -247,22 +293,18 @@ where
                 entries.saturating_mul(std::mem::size_of::<(SemanticId, SemanticId)>()),
             );
         }
-        for (key, identities) in &self.buckets {
+        for (key, bucket) in &self.buckets {
             bytes = bytes
                 .saturating_add(std::mem::size_of::<K>())
                 .saturating_add(key_heap_bytes(key))
-                .saturating_add(std::mem::size_of::<Vec<I>>())
-                .saturating_add(
-                    identities
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<I>()),
-                );
+                .saturating_add(std::mem::size_of::<SemanticBucket<I>>())
+                .saturating_add(bucket.len().saturating_mul(std::mem::size_of::<(u64, I)>()));
         }
-        for key in self.reverse.values() {
+        for entry in self.reverse.values() {
             bytes = bytes
                 .saturating_add(std::mem::size_of::<I>())
-                .saturating_add(std::mem::size_of::<K>())
-                .saturating_add(key_heap_bytes(key));
+                .saturating_add(std::mem::size_of::<SemanticReverseEntry<K>>())
+                .saturating_add(key_heap_bytes(&entry.key));
         }
         bytes
     }
@@ -272,35 +314,68 @@ where
         if self
             .reverse
             .get(&identity)
-            .is_some_and(|current| current == &key)
+            .is_some_and(|current| current.key == key)
         {
             return Some(key);
         }
 
-        let previous = self.reverse.insert(identity.clone(), key.clone());
-        if let Some(previous_key) = &previous {
-            self.remove_from_bucket(previous_key, &identity);
+        let previous = self.reverse.remove(&identity);
+        if let Some(previous_entry) = &previous {
+            self.remove_from_bucket(&previous_entry.key, previous_entry.ordinal);
         }
-        self.buckets.entry(key).or_default().push(identity);
-        previous
+
+        let ordinal = self.next_ordinal(&key);
+        let mut bucket = self.buckets.get(&key).cloned().unwrap_or_default();
+        bucket.entries.insert(ordinal, identity.clone());
+        self.buckets.insert(key.clone(), bucket);
+        self.reverse
+            .insert(identity, SemanticReverseEntry { key, ordinal });
+        previous.map(|entry| entry.key)
     }
 
     pub fn remove(&mut self, identity: &I) -> Option<K> {
-        let key = self.reverse.remove(identity)?;
-        self.remove_from_bucket(&key, identity);
-        Some(key)
+        let entry = self.reverse.remove(identity)?;
+        self.remove_from_bucket(&entry.key, entry.ordinal);
+        Some(entry.key)
     }
 
-    fn remove_from_bucket(&mut self, key: &K, identity: &I) {
-        let mut remove_bucket = false;
-        if let Some(bucket) = self.buckets.get_mut(key) {
-            if let Some(position) = bucket.iter().position(|candidate| candidate == identity) {
-                bucket.remove(position);
-            }
-            remove_bucket = bucket.is_empty();
+    fn next_ordinal(&mut self, key: &K) -> u64 {
+        let Some(bucket) = self.buckets.get(key) else {
+            return 0;
+        };
+        let Some((&last, _)) = bucket.entries.iter().next_back() else {
+            return 0;
+        };
+        if let Some(next) = last.checked_add(1) {
+            return next;
         }
-        if remove_bucket {
+
+        let identities = bucket.entries.values().cloned().collect::<Vec<_>>();
+        let mut bucket = SemanticBucket::default();
+        for (ordinal, identity) in identities.into_iter().enumerate() {
+            let ordinal = u64::try_from(ordinal)
+                .expect("live bucket cardinality cannot exceed u64 address space");
+            bucket.entries.insert(ordinal, identity.clone());
+            if let Some(mut reverse) = self.reverse.get(&identity).cloned() {
+                reverse.ordinal = ordinal;
+                self.reverse.insert(identity, reverse);
+            }
+        }
+        let next = u64::try_from(bucket.len())
+            .expect("live bucket cardinality cannot exceed u64 address space");
+        self.buckets.insert(key.clone(), bucket);
+        next
+    }
+
+    fn remove_from_bucket(&mut self, key: &K, ordinal: u64) {
+        let Some(mut bucket) = self.buckets.get(key).cloned() else {
+            return;
+        };
+        bucket.entries.remove(&ordinal);
+        if bucket.is_empty() {
             self.buckets.remove(key);
+        } else {
+            self.buckets.insert(key.clone(), bucket);
         }
     }
 }
@@ -329,10 +404,10 @@ mod tests {
             SemanticBucketIndex::new(SemanticIndexBinding::new(&context, vec![dependency]));
         assert_eq!(index.insert(10_u64, "a"), None);
         assert_eq!(index.insert(11_u64, "a"), None);
-        assert_eq!(index.bucket(&"a").map(<[_]>::len), Some(2));
+        assert_eq!(index.bucket(&"a").map(SemanticBucket::len), Some(2));
         assert_eq!(index.key_for(&10), Some(&"a"));
         assert_eq!(index.remove(&10), Some("a"));
-        assert_eq!(index.bucket(&"a").map(<[_]>::len), Some(1));
+        assert_eq!(index.bucket(&"a").map(SemanticBucket::len), Some(1));
         assert_eq!(index.remove(&11), Some("a"));
         assert!(index.bucket(&"a").is_none());
     }
@@ -344,7 +419,7 @@ mod tests {
         assert_eq!(index.insert(1_u64, 10_i64), None);
         assert_eq!(index.insert(1_u64, 20_i64), Some(10));
         assert!(index.bucket(&10).is_none());
-        assert_eq!(index.bucket(&20).map(<[_]>::len), Some(1));
+        assert_eq!(index.bucket(&20).map(SemanticBucket::len), Some(1));
     }
 
     #[test]
@@ -354,9 +429,99 @@ mod tests {
         assert_eq!(index.insert(7_u64, "a"), None);
         assert_eq!(index.insert(2_u64, "a"), None);
         assert_eq!(index.insert(5_u64, "a"), None);
-        assert_eq!(index.bucket(&"a"), Some([7_u64, 2, 5].as_slice()));
+        assert_eq!(
+            index
+                .bucket(&"a")
+                .map(|bucket| bucket.iter().copied().collect::<Vec<_>>()),
+            Some(vec![7_u64, 2, 5])
+        );
         assert_eq!(index.insert(2_u64, "a"), Some("a"));
-        assert_eq!(index.bucket(&"a"), Some([7_u64, 2, 5].as_slice()));
+        assert_eq!(
+            index
+                .bucket(&"a")
+                .map(|bucket| bucket.iter().copied().collect::<Vec<_>>()),
+            Some(vec![7_u64, 2, 5])
+        );
+    }
+
+    #[test]
+    fn ordered_bucket_delete_rebind_and_reinsert_preserve_insertion_order() {
+        let context = context();
+        let mut index = SemanticBucketIndex::new(SemanticIndexBinding::new(&context, Vec::new()));
+        for identity in [7_u64, 2, 5, 11] {
+            assert_eq!(index.insert(identity, "a"), None);
+        }
+        assert_eq!(index.remove(&2), Some("a"));
+        assert_eq!(
+            index
+                .bucket(&"a")
+                .map(|bucket| bucket.iter().copied().collect::<Vec<_>>()),
+            Some(vec![7, 5, 11])
+        );
+        assert_eq!(index.insert(2, "a"), None);
+        assert_eq!(
+            index
+                .bucket(&"a")
+                .map(|bucket| bucket.iter().copied().collect::<Vec<_>>()),
+            Some(vec![7, 5, 11, 2])
+        );
+        assert_eq!(index.insert(5, "b"), Some("a"));
+        assert_eq!(
+            index
+                .bucket(&"a")
+                .map(|bucket| bucket.iter().copied().collect::<Vec<_>>()),
+            Some(vec![7, 11, 2])
+        );
+        assert_eq!(
+            index
+                .bucket(&"b")
+                .map(|bucket| bucket.iter().copied().collect::<Vec<_>>()),
+            Some(vec![5])
+        );
+    }
+
+    #[test]
+    fn snapshot_mutation_path_copies_only_touched_semantic_bucket_state() {
+        let context = context();
+        let mut index = SemanticBucketIndex::new(SemanticIndexBinding::new(&context, Vec::new()));
+        for key in 0_i64..16_384 {
+            assert_eq!(index.insert(key.cast_unsigned(), key), None);
+        }
+
+        let snapshot = index.clone();
+        assert!(index.buckets.shares_root_with(&snapshot.buckets));
+        assert!(index.reverse.shares_root_with(&snapshot.reverse));
+
+        assert_eq!(index.insert(20_000_u64, 20_000_i64), None);
+        assert!(!index.buckets.shares_root_with(&snapshot.buckets));
+        assert!(!index.reverse.shares_root_with(&snapshot.reverse));
+        assert!(snapshot.bucket(&20_000).is_none());
+        assert_eq!(index.bucket(&20_000).map(SemanticBucket::len), Some(1));
+
+        let untouched_snapshot = snapshot.bucket(&8_192).unwrap();
+        let untouched_next = index.bucket(&8_192).unwrap();
+        assert!(
+            untouched_snapshot
+                .entries
+                .shares_root_with(&untouched_next.entries),
+            "novel-key insertion must not clone unrelated semantic bucket contents"
+        );
+
+        let before_existing = index.clone();
+        assert_eq!(index.insert(30_000_u64, 8_192_i64), None);
+        let old_bucket = before_existing.bucket(&8_192).unwrap();
+        let new_bucket = index.bucket(&8_192).unwrap();
+        assert!(!old_bucket.entries.shares_root_with(&new_bucket.entries));
+        assert_eq!(old_bucket.len(), 1);
+        assert_eq!(new_bucket.len(), 2);
+        assert!(
+            before_existing
+                .bucket(&8_193)
+                .unwrap()
+                .entries
+                .shares_root_with(&index.bucket(&8_193).unwrap().entries),
+            "existing-key mutation must keep neighboring bucket contents shared"
+        );
     }
 
     #[test]

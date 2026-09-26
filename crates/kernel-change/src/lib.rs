@@ -629,6 +629,22 @@ pub enum RewriteEffect<T> {
     Replace(T),
 }
 
+impl<T> RewriteEffect<T> {
+    /// Borrows the exact extensional endpoint carried by this effect.
+    ///
+    /// `FineChange` is currently endpoint-backed, so callers that only need to
+    /// validate the represented result must not materialize another `T` via
+    /// `apply`. This accessor is representation-level only; it does not grant
+    /// semantic authority beyond the prepared Rewrite that owns the effect.
+    #[must_use]
+    pub const fn endpoint(&self) -> &T {
+        match self {
+            Self::Fine(fine) => fine.endpoint(),
+            Self::Replace(next) => next,
+        }
+    }
+}
+
 impl<T: Clone> RewriteEffect<T> {
     #[must_use]
     pub fn apply(&self, old: &T) -> T {

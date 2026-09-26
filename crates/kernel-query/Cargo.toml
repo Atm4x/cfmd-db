@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 kernel-aggregate = { path = "../kernel-aggregate" }
 kernel-change = { path = "../kernel-change" }
+kernel-exact = { path = "../kernel-exact" }
 kernel-fixpoint = { path = "../kernel-fixpoint" }
 kernel-model = { path = "../kernel-model" }
+kernel-persistent = { path = "../kernel-persistent" }
 kernel-schema = { path = "../kernel-schema" }
 kernel-semantic-index = { path = "../kernel-semantic-index" }
 kernel-semantics = { path = "../kernel-semantics" }

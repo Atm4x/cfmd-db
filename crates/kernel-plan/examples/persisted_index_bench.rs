@@ -78,8 +78,8 @@ fn fixture() -> Fixture {
         .map(|i| i64::try_from(i * 3).unwrap())
         .collect::<Vec<_>>();
     let native = NativeRelation::typed_columnar(vec![
-        NativeColumn::I64(keys.clone()),
-        NativeColumn::I64(payloads.clone()),
+        NativeColumn::I64(keys.clone().into()),
+        NativeColumn::I64(payloads.clone().into()),
     ])
     .unwrap();
     let mut ephemeral = PhysicalStore::default();

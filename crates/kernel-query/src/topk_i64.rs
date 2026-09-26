@@ -1,4 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+use kernel_persistent::PersistentOrdMap;
 
 use crate::OrderDirection;
 
@@ -46,7 +51,7 @@ impl Default for RadixPage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PagedRadix {
-    pages: BTreeMap<u64, RadixPage>,
+    pages: PersistentOrdMap<u64, Arc<RadixPage>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,20 +295,26 @@ impl PagedRadix {
     fn set(&mut self, key: i64, count: usize) {
         let (page_key, slot) = Self::split(key);
         if count == 0 {
-            let mut remove_page = false;
-            if let Some(page) = self.pages.get_mut(&page_key) {
-                page.counts[slot] = 0;
-                page.occupied[slot >> 6] &= !(1_u64 << (slot & 63));
-                remove_page = page.occupied.iter().all(|word| *word == 0);
-            }
-            if remove_page {
+            let Some(current) = self.pages.get(&page_key) else {
+                return;
+            };
+            let mut page = (**current).clone();
+            page.counts[slot] = 0;
+            page.occupied[slot >> 6] &= !(1_u64 << (slot & 63));
+            if page.occupied.iter().all(|word| *word == 0) {
                 self.pages.remove(&page_key);
+            } else {
+                self.pages.insert(page_key, Arc::new(page));
             }
             return;
         }
-        let page = self.pages.entry(page_key).or_default();
+        let mut page = self
+            .pages
+            .get(&page_key)
+            .map_or_else(RadixPage::default, |current| (**current).clone());
         page.counts[slot] = count;
         page.occupied[slot >> 6] |= 1_u64 << (slot & 63);
+        self.pages.insert(page_key, Arc::new(page));
     }
 
     fn previous_key(&self, key: i64) -> Option<i64> {
@@ -317,7 +328,7 @@ impl PagedRadix {
                 }
             }
         }
-        let (&previous_page_key, page) = self.pages.range(..page_key).next_back()?;
+        let (&previous_page_key, page) = self.pages.predecessor(&page_key)?;
         for candidate in (0..RADIX_SLOTS).rev() {
             if page.counts[candidate] != 0 {
                 let rank = (previous_page_key << RADIX_SHIFT)
@@ -339,7 +350,7 @@ impl PagedRadix {
                 }
             }
         }
-        let (&next_page_key, page) = self.pages.range((page_key + 1)..).next()?;
+        let (&next_page_key, page) = self.pages.successor(&page_key)?;
         for candidate in 0..RADIX_SLOTS {
             if page.counts[candidate] != 0 {
                 let rank = (next_page_key << RADIX_SHIFT)
@@ -547,10 +558,6 @@ impl I64TopKState {
     #[cfg(test)]
     pub(crate) fn kind(&self) -> I64TopKPhysicalKind {
         self.counts.kind()
-    }
-
-    pub(crate) const fn total_rows(&self) -> usize {
-        self.total_rows
     }
 
     pub(crate) fn selected_counts(&self) -> BTreeMap<i64, usize> {
@@ -1166,6 +1173,43 @@ mod tests {
         let mut promoted = state.clone();
         promoted.commit_patch(plan.patch);
         assert_eq!(promoted.kind(), I64TopKPhysicalKind::PagedRadix);
+    }
+
+    #[test]
+    fn paged_radix_snapshot_patch_copies_only_touched_pages() {
+        let counts = (0_i64..2_048)
+            .map(|index| (index * 100_000, 1_usize))
+            .collect::<BTreeMap<_, _>>();
+        let state = I64TopKState::build(&counts, 17, OrderDirection::Ascending, false).unwrap();
+        assert_eq!(state.kind(), I64TopKPhysicalKind::PagedRadix);
+        let snapshot = state.clone();
+        let PhysicalCounts::PagedRadix(before) = &snapshot.counts else {
+            unreachable!();
+        };
+        let PhysicalCounts::PagedRadix(shared) = &state.counts else {
+            unreachable!();
+        };
+        assert!(before.pages.shares_root_with(&shared.pages));
+
+        let untouched_key = 1_024_i64 * 100_000;
+        let (untouched_page_key, _) = PagedRadix::split(untouched_key);
+        let untouched_before = Arc::clone(before.pages.get(&untouched_page_key).unwrap());
+
+        let change = BTreeMap::from([(0_i64, -1_i64), (999_999_999_i64, 1_i64)]);
+        let plan = state.plan_signed(&change).unwrap();
+        let mut next = state.clone();
+        next.commit_patch(plan.patch);
+        let PhysicalCounts::PagedRadix(after) = &next.counts else {
+            unreachable!();
+        };
+        assert!(!before.pages.shares_root_with(&after.pages));
+        assert!(Arc::ptr_eq(
+            &untouched_before,
+            after.pages.get(&untouched_page_key).unwrap()
+        ));
+        assert_eq!(snapshot.counts.count(0), 1);
+        assert_eq!(next.counts.count(0), 0);
+        assert_eq!(next.counts.count(999_999_999), 1);
     }
 
     #[test]

@@ -1,12 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/kernel-persistent",
   "crates/kernel-types",
   "crates/kernel-schema",
   "crates/kernel-change",
   "crates/kernel-query",
   "crates/kernel-fixpoint",
   "crates/kernel-grounded-closure",
+  "crates/kernel-exact",
   "crates/kernel-aggregate",
   "crates/kernel-lens",
   "crates/kernel-lifecycle",

@@ -2924,6 +2924,14 @@ impl SemanticRegistry {
             .collect()
     }
 
+    /// Returns the canonical quotient-class witness for one pinned Γ-equivalence.
+    ///
+    /// For every value in the equivalence domain this operation is total, and
+    /// the registry maintains the quotient-completeness law
+    /// `equivalent(e, x, y) <=> canonical_key(e, x) == canonical_key(e, y)`.
+    /// Structural equivalences preserve the law compositionally; primitive
+    /// leaves are certified `EquivalenceModule`s whose canonical-key law is
+    /// tested against their executable equivalence contract.
     pub fn canonical_equivalence_key(
         &self,
         context: &SemanticContext,
@@ -3620,27 +3628,23 @@ impl SemanticRegistry {
         left: &[(Value, u64)],
         right: &[(Value, u64)],
     ) -> Result<bool, SemanticError> {
-        if left.len() != right.len() {
-            return Ok(false);
-        }
-        let mut used = vec![false; right.len()];
-        for (left_value, left_count) in left {
-            let mut found = None;
-            for (index, (right_value, right_count)) in right.iter().enumerate() {
-                if !used[index]
-                    && left_count == right_count
-                    && self.equivalent_unchecked(context, equivalence, left_value, right_value)?
-                {
-                    found = Some(index);
-                    break;
-                }
-            }
-            let Some(index) = found else {
-                return Ok(false);
-            };
-            used[index] = true;
-        }
-        Ok(true)
+        let canonicalize = |entries: &[(Value, u64)]| {
+            entries
+                .iter()
+                .map(|(value, count)| {
+                    Ok(CanonicalBagAtom {
+                        value: self.canonical_equivalence_key_unchecked(
+                            context,
+                            equivalence,
+                            value,
+                        )?,
+                        stored_count: *count,
+                    })
+                })
+                .collect::<Result<Vec<_>, SemanticError>>()
+                .map(finite_measure_from_atoms)
+        };
+        Ok(canonicalize(left)? == canonicalize(right)?)
     }
 
     fn map_values_equivalent(
@@ -3651,32 +3655,27 @@ impl SemanticRegistry {
         left: &[(Value, Value)],
         right: &[(Value, Value)],
     ) -> Result<bool, SemanticError> {
-        if left.len() != right.len() {
-            return Ok(false);
-        }
-        let mut used = vec![false; right.len()];
-        for (left_key, left_value) in left {
-            let mut found = None;
-            for (index, (right_key, right_value)) in right.iter().enumerate() {
-                if !used[index]
-                    && self.equivalent_unchecked(context, key_equivalence, left_key, right_key)?
-                    && self.equivalent_unchecked(
-                        context,
-                        value_equivalence,
-                        left_value,
-                        right_value,
-                    )?
-                {
-                    found = Some(index);
-                    break;
-                }
-            }
-            let Some(index) = found else {
-                return Ok(false);
-            };
-            used[index] = true;
-        }
-        Ok(true)
+        let canonicalize = |entries: &[(Value, Value)]| {
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    Ok(CanonicalMapAtom {
+                        key: self.canonical_equivalence_key_unchecked(
+                            context,
+                            key_equivalence,
+                            key,
+                        )?,
+                        value: self.canonical_equivalence_key_unchecked(
+                            context,
+                            value_equivalence,
+                            value,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, SemanticError>>()
+                .map(finite_measure_from_atoms)
+        };
+        Ok(canonicalize(left)? == canonicalize(right)?)
     }
 
     fn unordered_values_equivalent(
@@ -3686,26 +3685,14 @@ impl SemanticRegistry {
         left: &[Value],
         right: &[Value],
     ) -> Result<bool, SemanticError> {
-        if left.len() != right.len() {
-            return Ok(false);
-        }
-        let mut used = vec![false; right.len()];
-        for left_value in left {
-            let mut found = None;
-            for (index, right_value) in right.iter().enumerate() {
-                if !used[index]
-                    && self.equivalent_unchecked(context, equivalence, left_value, right_value)?
-                {
-                    found = Some(index);
-                    break;
-                }
-            }
-            let Some(index) = found else {
-                return Ok(false);
-            };
-            used[index] = true;
-        }
-        Ok(true)
+        let canonicalize = |values: &[Value]| {
+            values
+                .iter()
+                .map(|value| self.canonical_equivalence_key_unchecked(context, equivalence, value))
+                .collect::<Result<Vec<_>, _>>()
+                .map(finite_measure_from_atoms)
+        };
+        Ok(canonicalize(left)? == canonicalize(right)?)
     }
 
     pub fn validate_model(

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use kernel_identity::{DenseEntityIds, DenseEntitySet, LocalEntityId};
@@ -76,26 +76,117 @@ impl<'a, K, V> IntoIterator for &'a CowMap<K, V> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SharedRelationRows(Arc<Vec<Vec<Value>>>);
+#[derive(Debug)]
+struct RelationRowsAppendPatch {
+    base: SharedRelationRows,
+    inserted: Arc<Vec<Vec<Value>>>,
+    materialized: OnceLock<Vec<Vec<Value>>>,
+}
+
+#[derive(Debug, Clone)]
+enum SharedRelationRowsRepr {
+    Materialized(Arc<Vec<Vec<Value>>>),
+    AppendPatch(Arc<RelationRowsAppendPatch>),
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedRelationRows(SharedRelationRowsRepr);
+
+impl Default for SharedRelationRows {
+    fn default() -> Self {
+        Self::from(Vec::new())
+    }
+}
 
 impl From<Vec<Vec<Value>>> for SharedRelationRows {
     fn from(rows: Vec<Vec<Value>>) -> Self {
-        Self(Arc::new(rows))
+        Self(SharedRelationRowsRepr::Materialized(Arc::new(rows)))
     }
 }
+
+impl SharedRelationRows {
+    #[must_use]
+    pub fn append_persistent(&self, inserted: Vec<Vec<Value>>) -> Self {
+        if inserted.is_empty() {
+            return self.clone();
+        }
+        Self(SharedRelationRowsRepr::AppendPatch(Arc::new(
+            RelationRowsAppendPatch {
+                base: self.clone(),
+                inserted: Arc::new(inserted),
+                materialized: OnceLock::new(),
+            },
+        )))
+    }
+
+    fn materialized(&self) -> &Vec<Vec<Value>> {
+        match &self.0 {
+            SharedRelationRowsRepr::Materialized(rows) => rows,
+            SharedRelationRowsRepr::AppendPatch(patch) => patch.materialized.get_or_init(|| {
+                let mut segments = Vec::new();
+                patch.base.collect_materialized_segments(&mut segments);
+                segments.push(patch.inserted.as_slice());
+                let capacity = segments
+                    .iter()
+                    .fold(0_usize, |len, segment| len.saturating_add(segment.len()));
+                let mut rows = Vec::with_capacity(capacity);
+                for segment in segments {
+                    rows.extend(segment.iter().cloned());
+                }
+                rows
+            }),
+        }
+    }
+
+    fn collect_materialized_segments<'a>(&'a self, output: &mut Vec<&'a [Vec<Value>]>) {
+        let mut tail = Vec::new();
+        let mut cursor = self;
+        loop {
+            match &cursor.0 {
+                SharedRelationRowsRepr::Materialized(rows) => {
+                    output.push(rows.as_slice());
+                    break;
+                }
+                SharedRelationRowsRepr::AppendPatch(patch) => {
+                    if let Some(rows) = patch.materialized.get() {
+                        output.push(rows.as_slice());
+                        break;
+                    }
+                    tail.push(patch.inserted.as_slice());
+                    cursor = &patch.base;
+                }
+            }
+        }
+        output.extend(tail.into_iter().rev());
+    }
+}
+
+impl PartialEq for SharedRelationRows {
+    fn eq(&self, other: &Self) -> bool {
+        self.materialized() == other.materialized()
+    }
+}
+
+impl Eq for SharedRelationRows {}
 
 impl Deref for SharedRelationRows {
     type Target = Vec<Vec<Value>>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.materialized()
     }
 }
 
 impl DerefMut for SharedRelationRows {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(&mut self.0)
+        if let SharedRelationRowsRepr::AppendPatch(_) = &self.0 {
+            let rows = self.materialized().clone();
+            self.0 = SharedRelationRowsRepr::Materialized(Arc::new(rows));
+        }
+        match &mut self.0 {
+            SharedRelationRowsRepr::Materialized(rows) => Arc::make_mut(rows),
+            SharedRelationRowsRepr::AppendPatch(_) => unreachable!(),
+        }
     }
 }
 
@@ -104,7 +195,7 @@ impl<'a> IntoIterator for &'a SharedRelationRows {
     type IntoIter = std::slice::Iter<'a, Vec<Value>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+        self.materialized().iter()
     }
 }
 
@@ -133,6 +224,14 @@ impl RelationStore {
 
     pub fn get_mut(&mut self, relation: &SemanticId) -> Option<&mut Vec<Vec<Value>>> {
         self.0.get_mut(relation).map(SharedRelationRows::deref_mut)
+    }
+
+    pub fn append_persistent(&mut self, relation: SemanticId, inserted: Vec<Vec<Value>>) {
+        let next = match self.0.get(&relation) {
+            Some(rows) => rows.append_persistent(inserted),
+            None => SharedRelationRows::from(inserted),
+        };
+        self.0.insert(relation, next);
     }
 
     pub fn remove(&mut self, relation: &SemanticId) -> Option<SharedRelationRows> {
@@ -200,6 +299,30 @@ pub enum Value {
 }
 
 impl Value {
+    #[must_use]
+    pub fn contains_live_ref(&self) -> bool {
+        match self {
+            Self::LiveEntityRef { .. } => true,
+            Self::HistoricalEntityId { .. }
+            | Self::Unit
+            | Self::Bool(_)
+            | Self::I64(_)
+            | Self::F64Bits(_)
+            | Self::Text(_) => false,
+            Self::Product(values) => values.values().any(Self::contains_live_ref),
+            Self::Seq(values)
+            | Self::Set {
+                elements: values, ..
+            } => values.iter().any(Self::contains_live_ref),
+            Self::Variant { value, .. } => value.contains_live_ref(),
+            Self::Option(value) => value.as_deref().is_some_and(Self::contains_live_ref),
+            Self::Bag { entries, .. } => entries.iter().any(|(value, _)| value.contains_live_ref()),
+            Self::Map { entries, .. } => entries
+                .iter()
+                .any(|(key, value)| key.contains_live_ref() || value.contains_live_ref()),
+        }
+    }
+
     #[must_use]
     pub fn first_dangling_live_ref(&self, live: &BTreeSet<EntityId>) -> Option<EntityId> {
         match self {
@@ -308,6 +431,13 @@ struct RelationLiveRefSensitivity {
 }
 
 impl LiveRefSensitivityIndex {
+    #[must_use]
+    pub fn relation_has_live_refs(&self, relation: SemanticId) -> bool {
+        self.relations.get(&relation).is_some_and(|sensitivity| {
+            !sensitivity.by_target.is_empty() || !sensitivity.unresolved.is_empty()
+        })
+    }
+
     #[must_use]
     pub fn compile(model: &FiniteModel, ids: &DenseEntityIds) -> Self {
         let mut field_by_target = BTreeMap::<LocalEntityId, BTreeSet<_>>::new();
@@ -844,16 +974,47 @@ mod tests {
             &original.model.relations.0.0,
             &candidate.model.relations.0.0
         ));
-        assert!(Arc::ptr_eq(
-            &original.model.relations.0[&stable_relation].0,
-            &candidate.model.relations.0[&stable_relation].0
-        ));
-        assert!(!Arc::ptr_eq(
-            &original.model.relations.0[&changed_relation].0,
-            &candidate.model.relations.0[&changed_relation].0
-        ));
+        let original_stable = match &original.model.relations.0[&stable_relation].0 {
+            SharedRelationRowsRepr::Materialized(rows) => rows,
+            SharedRelationRowsRepr::AppendPatch(_) => panic!("unexpected patch"),
+        };
+        let candidate_stable = match &candidate.model.relations.0[&stable_relation].0 {
+            SharedRelationRowsRepr::Materialized(rows) => rows,
+            SharedRelationRowsRepr::AppendPatch(_) => panic!("unexpected patch"),
+        };
+        let original_changed = match &original.model.relations.0[&changed_relation].0 {
+            SharedRelationRowsRepr::Materialized(rows) => rows,
+            SharedRelationRowsRepr::AppendPatch(_) => panic!("unexpected patch"),
+        };
+        let candidate_changed = match &candidate.model.relations.0[&changed_relation].0 {
+            SharedRelationRowsRepr::Materialized(rows) => rows,
+            SharedRelationRowsRepr::AppendPatch(_) => panic!("unexpected patch"),
+        };
+        assert!(Arc::ptr_eq(original_stable, candidate_stable));
+        assert!(!Arc::ptr_eq(original_changed, candidate_changed));
         assert_eq!(original.model.relations[&changed_relation].len(), 1);
         assert_eq!(candidate.model.relations[&changed_relation].len(), 2);
+    }
+
+    #[test]
+    fn persistent_relation_append_defers_materialization_and_preserves_source() {
+        let base = SharedRelationRows::from(vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
+        let appended = base.append_persistent(vec![vec![Value::I64(3)]]);
+
+        let SharedRelationRowsRepr::AppendPatch(patch) = &appended.0 else {
+            panic!("append must create a persistent patch");
+        };
+        assert!(patch.materialized.get().is_none());
+        assert_eq!(base.as_slice(), &[vec![Value::I64(1)], vec![Value::I64(2)]]);
+        assert_eq!(
+            appended.as_slice(),
+            &[
+                vec![Value::I64(1)],
+                vec![Value::I64(2)],
+                vec![Value::I64(3)]
+            ]
+        );
+        assert!(patch.materialized.get().is_some());
     }
 
     #[test]

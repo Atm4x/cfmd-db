@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use kernel_persistent::{PersistentOrdMap, PersistentOrdSet};
 use kernel_types::{EqClassId, RevisionObservableId, SemanticRevision};
 
 use crate::observable::{
@@ -33,9 +34,9 @@ impl<RowId> From<ObservableError> for SupportAtomError<RowId> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SupportAtom<RowId> {
+struct SupportAtom<RowId: Ord + Clone> {
     signature: Vec<EqClassId>,
-    rows: BTreeSet<RowId>,
+    rows: PersistentOrdSet<RowId>,
 }
 
 /// Finite partition of physical support by one revision-local product observable.
@@ -44,15 +45,15 @@ struct SupportAtom<RowId> {
 /// is durable semantic authority: the whole structure is reconstructible from the
 /// pinned revision, observable recipe, and authoritative relation rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SupportAtomFabric<RowId> {
+pub struct SupportAtomFabric<RowId: Ord + Clone> {
     revision: SemanticRevision,
     catalog_instance: u64,
     product: RevisionObservableId,
     coordinates: Vec<RevisionObservableId>,
-    signature_to_atom: BTreeMap<Vec<EqClassId>, EqClassId>,
-    atoms: BTreeMap<EqClassId, SupportAtom<RowId>>,
-    row_to_atom: BTreeMap<RowId, EqClassId>,
-    inverse: Vec<BTreeMap<EqClassId, BTreeSet<EqClassId>>>,
+    signature_to_atom: PersistentOrdMap<Vec<EqClassId>, EqClassId>,
+    atoms: PersistentOrdMap<EqClassId, SupportAtom<RowId>>,
+    row_to_atom: PersistentOrdMap<RowId, EqClassId>,
+    inverse: Vec<PersistentOrdMap<EqClassId, PersistentOrdSet<EqClassId>>>,
 }
 
 impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
@@ -72,11 +73,11 @@ impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
             revision: catalog.revision(),
             catalog_instance: catalog.catalog_instance(),
             product,
-            inverse: vec![BTreeMap::new(); coordinates.len()],
+            inverse: vec![PersistentOrdMap::default(); coordinates.len()],
             coordinates,
-            signature_to_atom: BTreeMap::new(),
-            atoms: BTreeMap::new(),
-            row_to_atom: BTreeMap::new(),
+            signature_to_atom: PersistentOrdMap::default(),
+            atoms: PersistentOrdMap::default(),
+            row_to_atom: PersistentOrdMap::default(),
         })
     }
 
@@ -115,13 +116,13 @@ impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
     pub fn projection_atom_reference_count(&self) -> usize {
         self.inverse
             .iter()
-            .map(|classes| classes.values().map(BTreeSet::len).sum::<usize>())
+            .map(|classes| classes.values().map(PersistentOrdSet::len).sum::<usize>())
             .sum()
     }
 
     #[must_use]
     pub fn projected_class_count(&self) -> usize {
-        self.inverse.iter().map(BTreeMap::len).sum()
+        self.inverse.iter().map(PersistentOrdMap::len).sum()
     }
 
     pub fn insert(
@@ -138,11 +139,12 @@ impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
             return Err(SupportAtomError::DuplicateRow(row));
         }
 
-        if let Some(atom) = self.atoms.get_mut(&atom_class) {
+        if let Some(mut atom) = self.atoms.get(&atom_class).cloned() {
             if atom.signature != signature {
                 return Err(SupportAtomError::InvalidProductClass(atom_class));
             }
             atom.rows.insert(row.clone());
+            self.atoms.insert(atom_class, atom);
         } else {
             if let Some(existing) = self
                 .signature_to_atom
@@ -152,16 +154,15 @@ impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
                 return Err(SupportAtomError::InvalidProductClass(atom_class));
             }
             for (slot, class) in signature.iter().copied().enumerate() {
-                self.inverse[slot]
-                    .entry(class)
-                    .or_default()
-                    .insert(atom_class);
+                let mut atom_classes = self.inverse[slot].get(&class).cloned().unwrap_or_default();
+                atom_classes.insert(atom_class);
+                self.inverse[slot].insert(class, atom_classes);
             }
             self.atoms.insert(
                 atom_class,
                 SupportAtom {
                     signature: signature.to_owned(),
-                    rows: BTreeSet::from([row.clone()]),
+                    rows: [row.clone()].into_iter().collect(),
                 },
             );
         }
@@ -174,9 +175,10 @@ impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
             .row_to_atom
             .remove(row)
             .ok_or_else(|| SupportAtomError::UnknownRow(row.clone()))?;
-        let atom = self
+        let mut atom = self
             .atoms
-            .get_mut(&atom_class)
+            .get(&atom_class)
+            .cloned()
             .expect("row-to-atom map references an existing atom");
         atom.rows.remove(row);
         let signature = atom.signature.clone();
@@ -184,14 +186,19 @@ impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
             self.atoms.remove(&atom_class);
             self.signature_to_atom.remove(&signature);
             for (slot, class) in signature.iter().copied().enumerate() {
-                let atom_classes = self.inverse[slot]
-                    .get_mut(&class)
+                let mut atom_classes = self.inverse[slot]
+                    .get(&class)
+                    .cloned()
                     .expect("inverse projection contains every live atom");
                 atom_classes.remove(&atom_class);
                 if atom_classes.is_empty() {
                     self.inverse[slot].remove(&class);
+                } else {
+                    self.inverse[slot].insert(class, atom_classes);
                 }
             }
+        } else {
+            self.atoms.insert(atom_class, atom);
         }
         Ok(signature)
     }
@@ -205,8 +212,8 @@ impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
     }
 
     #[must_use]
-    pub fn joint_fiber(&self, signature: &[EqClassId]) -> Option<&BTreeSet<RowId>> {
-        let atom_class = self.signature_to_atom.get(signature)?;
+    pub fn joint_fiber(&self, signature: &[EqClassId]) -> Option<&PersistentOrdSet<RowId>> {
+        let atom_class = self.signature_to_atom.get(&signature.to_vec())?;
         self.atoms.get(atom_class).map(|atom| &atom.rows)
     }
 
@@ -341,7 +348,7 @@ pub struct SupportAtomAnnotationOverlay<A> {
 
 impl<A> SupportAtomAnnotationOverlay<A> {
     #[must_use]
-    pub fn new<RowId>(fabric: &SupportAtomFabric<RowId>) -> Self {
+    pub fn new<RowId: Ord + Clone>(fabric: &SupportAtomFabric<RowId>) -> Self {
         Self {
             revision: fabric.revision,
             catalog_instance: fabric.catalog_instance,
@@ -378,7 +385,7 @@ impl<A> SupportAtomAnnotationOverlay<A> {
         Ok(())
     }
 
-    fn ensure_fabric<RowId>(
+    fn ensure_fabric<RowId: Ord + Clone>(
         &self,
         fabric: &SupportAtomFabric<RowId>,
     ) -> Result<(), SupportAtomOverlayError<RowId>> {
@@ -470,7 +477,7 @@ impl<K: Ord + Clone> SupportAtomOrderedOverlay<K> {
     }
 
     #[must_use]
-    pub fn compatible_with<RowId>(&self, fabric: &SupportAtomFabric<RowId>) -> bool {
+    pub fn compatible_with<RowId: Ord + Clone>(&self, fabric: &SupportAtomFabric<RowId>) -> bool {
         self.revision == fabric.revision
             && self.catalog_instance == fabric.catalog_instance
             && self.product == fabric.product
@@ -571,6 +578,53 @@ mod tests {
         assert_eq!(fabric.atom_count(), 1);
         assert!(fabric.joint_fiber(&[l1, r7]).is_none());
         assert_eq!(fabric.projected_count(1, r7).unwrap(), 1);
+    }
+
+    #[test]
+    fn support_atom_snapshot_path_copies_only_touched_atom_and_row_directories() {
+        let (context, registry, left_eq, right_eq) = fixture();
+        let mut catalog = RevisionObservableCatalog::new(&context).unwrap();
+        let left = catalog
+            .register_equivalence(&registry, &context, left_eq)
+            .unwrap();
+        let right = catalog
+            .register_equivalence(&registry, &context, right_eq)
+            .unwrap();
+        let product = catalog.register_product(vec![left, right]).unwrap();
+        let mut fabric = SupportAtomFabric::new(&catalog, product, vec![left, right]).unwrap();
+
+        let l1 = catalog
+            .observe_value(&registry, &context, left, &Value::I64(1))
+            .unwrap();
+        let l2 = catalog
+            .observe_value(&registry, &context, left, &Value::I64(2))
+            .unwrap();
+        let r7 = catalog
+            .observe_value(&registry, &context, right, &Value::I64(7))
+            .unwrap();
+        let a17 = catalog.intern_product_class(product, vec![l1, r7]).unwrap();
+        let a27 = catalog.intern_product_class(product, vec![l2, r7]).unwrap();
+
+        for row in 0..2048_u64 {
+            fabric.insert(&catalog, row, a17, &[l1, r7]).unwrap();
+            fabric
+                .insert(&catalog, 10_000 + row, a27, &[l2, r7])
+                .unwrap();
+        }
+        let snapshot = fabric.clone();
+        fabric.remove(&1024).unwrap();
+
+        let old_untouched = snapshot.atoms.get(&a27).unwrap();
+        let new_untouched = fabric.atoms.get(&a27).unwrap();
+        assert!(old_untouched.rows.shares_root_with(&new_untouched.rows));
+        assert!(
+            snapshot
+                .signature_to_atom
+                .shares_root_with(&fabric.signature_to_atom)
+        );
+        assert!(snapshot.inverse[0].shares_root_with(&fabric.inverse[0]));
+        assert!(snapshot.row_signature(&1024).is_some());
+        assert!(fabric.row_signature(&1024).is_none());
     }
 
     #[test]

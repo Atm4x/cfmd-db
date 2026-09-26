@@ -112,6 +112,9 @@ dependencies = [
 [[package]]
 name = "kernel-aggregate"
 version = "0.1.0"
+dependencies = [
+ "kernel-exact",
+]
 
 [[package]]
 name = "kernel-auth"
@@ -155,9 +158,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-exact"
+version = "0.1.0"
+
+[[package]]
 name = "kernel-fixpoint"
 version = "0.1.0"
 dependencies = [
+ "kernel-exact",
  "kernel-grounded-closure",
  "kernel-proof",
  "kernel-types",
@@ -166,6 +174,9 @@ dependencies = [
 [[package]]
 name = "kernel-grounded-closure"
 version = "0.1.0"
+dependencies = [
+ "kernel-persistent",
+]
 
 [[package]]
 name = "kernel-identity"
@@ -225,6 +236,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-persistent"
+version = "0.1.0"
+
+[[package]]
 name = "kernel-plan"
 version = "0.1.0"
 dependencies = [
@@ -236,6 +251,7 @@ dependencies = [
  "kernel-identity",
  "kernel-lens",
  "kernel-model",
+ "kernel-persistent",
  "kernel-proof",
  "kernel-query",
  "kernel-revision",
@@ -258,8 +274,10 @@ version = "0.1.0"
 dependencies = [
  "kernel-aggregate",
  "kernel-change",
+ "kernel-exact",
  "kernel-fixpoint",
  "kernel-model",
+ "kernel-persistent",
  "kernel-schema",
  "kernel-semantic-index",
  "kernel-semantics",
@@ -297,6 +315,7 @@ dependencies = [
 name = "kernel-semantic-index"
 version = "0.1.0"
 dependencies = [
+ "kernel-persistent",
  "kernel-schema",
  "kernel-types",
 ]
@@ -307,6 +326,7 @@ version = "0.1.0"
 dependencies = [
  "kernel-grounded-closure",
  "kernel-model",
+ "kernel-persistent",
  "kernel-proof",
  "kernel-schema",
  "kernel-types",

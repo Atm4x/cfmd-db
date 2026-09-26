@@ -3,6 +3,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use kernel_persistent::PersistentOrdMap;
+
 use kernel_model::Value;
 use kernel_schema::SemanticContext;
 use kernel_types::{EqClassId, RevisionObservableId, SemanticId, SemanticRevision};
@@ -73,10 +75,10 @@ pub struct RevisionObservableCatalog {
     catalog_instance: u64,
     next_observable: u64,
     next_class: u64,
-    definitions: BTreeMap<RevisionObservableId, SemanticObservableDefinition>,
-    definition_ids: BTreeMap<SemanticObservableDefinition, RevisionObservableId>,
-    classes: BTreeMap<(RevisionObservableId, ObservableClassSignature), EqClassId>,
-    class_records: BTreeMap<EqClassId, ObservableClassRecord>,
+    definitions: PersistentOrdMap<RevisionObservableId, SemanticObservableDefinition>,
+    definition_ids: PersistentOrdMap<SemanticObservableDefinition, RevisionObservableId>,
+    classes: PersistentOrdMap<(RevisionObservableId, ObservableClassSignature), EqClassId>,
+    class_records: PersistentOrdMap<EqClassId, ObservableClassRecord>,
 }
 
 impl RevisionObservableCatalog {
@@ -91,10 +93,10 @@ impl RevisionObservableCatalog {
             catalog_instance,
             next_observable: 1,
             next_class: 1,
-            definitions: BTreeMap::new(),
-            definition_ids: BTreeMap::new(),
-            classes: BTreeMap::new(),
-            class_records: BTreeMap::new(),
+            definitions: PersistentOrdMap::default(),
+            definition_ids: PersistentOrdMap::default(),
+            classes: PersistentOrdMap::default(),
+            class_records: PersistentOrdMap::default(),
         })
     }
 

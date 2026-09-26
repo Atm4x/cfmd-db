@@ -237,7 +237,6 @@ def elaborateQuery : SurfaceQuery → KernelQuery
   | .promoteToBag q => .promoteToBag (elaborateQuery q)
 
 inductive ScanAlgorithm where | row | columnar deriving DecidableEq, Repr
-inductive JoinAlgorithm where | nestedLoop | indexed deriving DecidableEq, Repr
 inductive GroupAlgorithm where | generic | denseI64 deriving DecidableEq, Repr
 inductive TopKAlgorithm where | generic | maintained deriving DecidableEq, Repr
 
@@ -246,7 +245,7 @@ inductive Plan where
   | filterConst (input : Plan) (column : Column) (value : ValueToken) (equivalence : Id)
   | filterColumns (input : Plan) (left right : Column) (equivalence : Id)
   | project (input : Plan) (columns : List Column)
-  | join (left right : Plan) (leftCol rightCol : Column) (equivalence : Id) (algorithm : JoinAlgorithm)
+  | join (left right : Plan) (leftCol rightCol : Column) (equivalence : Id)
   | difference (left right : Plan)
   | antiJoin (left right : Plan) (leftCol rightCol : Column) (equivalence : Id)
   | distinct (input : Plan) (equivalences : List Id)
@@ -260,7 +259,7 @@ def lower : KernelQuery → Plan
   | .filterConst q c v e => .filterConst (lower q) c v e
   | .filterColumns q l r e => .filterColumns (lower q) l r e
   | .project q cs => .project (lower q) cs
-  | .join l r lc rc e => .join (lower l) (lower r) lc rc e .nestedLoop
+  | .join l r lc rc e => .join (lower l) (lower r) lc rc e
   | .difference l r => .difference (lower l) (lower r)
   | .antiJoin l r lc rc e => .antiJoin (lower l) (lower r) lc rc e
   | .distinct q es => .distinct (lower q) es
@@ -273,7 +272,7 @@ def erase : Plan → KernelQuery
   | .filterConst q c v e => .filterConst (erase q) c v e
   | .filterColumns q l r e => .filterColumns (erase q) l r e
   | .project q cs => .project (erase q) cs
-  | .join l r lc rc e _ => .join (erase l) (erase r) lc rc e
+  | .join l r lc rc e => .join (erase l) (erase r) lc rc e
   | .difference l r => .difference (erase l) (erase r)
   | .antiJoin l r lc rc e => .antiJoin (erase l) (erase r) lc rc e
   | .distinct q es => .distinct (erase q) es

@@ -1,0 +1,27 @@
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionStats {
+    pub scanned_rows: usize,
+    pub values_read: usize,
+    pub output_rows: usize,
+    pub persisted_index_hits: usize,
+    pub persisted_index_cost_rejections: usize,
+    pub ephemeral_index_builds: usize,
+    pub fused_join_project_hits: usize,
+    pub typed_batch_chain_hits: usize,
+    pub typed_stateful_batch_hits: usize,
+    pub typed_stateful_producer_hits: usize,
+    pub multiway_join_reorders: usize,
+    pub multiway_join_order_preserving_enumerations: usize,
+    pub multiway_join_semantic_quotient_constraints: usize,
+    pub multiway_join_semantic_quotient_pruned_rows: usize,
+    pub multiway_join_prepared_quotient_hits: usize,
+    pub multiway_join_maintained_quotient_key_hits: usize,
+    pub multiway_join_maintained_quotient_support_hits: usize,
+    pub multiway_join_cyclic_budget_rejections: usize,
+    pub multiway_join_cyclic_prefix_index_lookups: usize,
+    pub multiway_join_semantic_quotient_candidate_visits: usize,
+    pub multiway_join_apnf_executions: usize,
+    pub multiway_join_apnf_branch_free: usize,
+    pub multiway_join_apnf_candidate_visits: usize,
+}
+

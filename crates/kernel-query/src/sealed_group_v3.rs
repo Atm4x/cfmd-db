@@ -60,9 +60,7 @@ fn lookup_key_for(
         return Ok(SealedLookupKey::I64(*value));
     }
     if state.semantic_lookup.is_some() {
-        let canonical = state
-            .canonical_group_key(key, registry)?
-            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let canonical = state.canonical_group_key(key, registry)?;
         return Ok(SealedLookupKey::Semantic(canonical));
     }
     Ok(SealedLookupKey::None)

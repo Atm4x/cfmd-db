@@ -12,6 +12,85 @@ pub struct Weighted<R> {
     pub row: R,
 }
 
+/// One row in the exact signed Γ-measure carrier.
+///
+/// Unlike [`Weighted`], the coefficient is not bounded by the machine delta
+/// word. This is the coefficient domain required by bilinear maintained
+/// operators such as Join, where multiplicities multiply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactWeighted<R> {
+    pub weight: kernel_exact::ExactInteger,
+    pub row: R,
+}
+
+/// Read-only interface for a finite signed Γ-measure over rows.
+pub trait ExactDeltaView<R: ?Sized> {
+    fn support_len(&self) -> usize;
+    fn visit_exact(&self, visitor: impl FnMut(&kernel_exact::ExactInteger, &R));
+}
+
+/// Mutable construction boundary for exact signed Γ-measures.
+pub trait ExactDeltaSink<R> {
+    fn clear(&mut self);
+    fn push_exact(&mut self, weight: kernel_exact::ExactInteger, row: R);
+}
+
+/// Exact-coefficient carrier used while migrating maintained operators away
+/// from the legacy `i64` coefficient boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExactDelta<R> {
+    entries: Vec<ExactWeighted<R>>,
+}
+
+impl<R> ExactDelta<R> {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn push_scaled_i64(
+        &mut self,
+        weight: i64,
+        multiplicity: &kernel_exact::ExactNatural,
+        row: R,
+    ) {
+        let coefficient =
+            kernel_exact::ExactInteger::from_i64(weight).scale_by_natural(multiplicity);
+        if !coefficient.is_zero() {
+            self.entries.push(ExactWeighted {
+                weight: coefficient,
+                row,
+            });
+        }
+    }
+}
+
+impl<R> ExactDeltaSink<R> for ExactDelta<R> {
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn push_exact(&mut self, weight: kernel_exact::ExactInteger, row: R) {
+        if !weight.is_zero() {
+            self.entries.push(ExactWeighted { weight, row });
+        }
+    }
+}
+
+impl<R> ExactDeltaView<R> for ExactDelta<R> {
+    fn support_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn visit_exact(&self, mut visitor: impl FnMut(&kernel_exact::ExactInteger, &R)) {
+        for entry in &self.entries {
+            visitor(&entry.weight, &entry.row);
+        }
+    }
+}
+
 /// Stable identity of one compiled maintained-plan edge within a transition.
 ///
 /// The ordinal is assigned by deterministic depth-first traversal of the
@@ -286,7 +365,7 @@ impl<R, const INLINE: usize> DeltaSink<R> for AdaptiveDelta<R, INLINE> {
 impl<R, const INLINE: usize> DeltaView<R> for AdaptiveDelta<R, INLINE> {
     fn support_len(&self) -> usize {
         match self {
-            Self::Inline(inline) => inline.support_len(),
+            Self::Inline(inline) => DeltaView::support_len(inline),
             Self::Spill(spill) => spill.len(),
         }
     }
@@ -324,6 +403,58 @@ impl DeltaView<crate::Row> for RelationDeltaView<'_> {
     }
 }
 
+impl<R> ExactDeltaView<R> for CompactDelta<R> {
+    fn support_len(&self) -> usize {
+        DeltaView::support_len(self)
+    }
+
+    fn visit_exact(&self, mut visitor: impl FnMut(&kernel_exact::ExactInteger, &R)) {
+        self.visit(|weight, row| {
+            let exact = kernel_exact::ExactInteger::from_i64(weight);
+            visitor(&exact, row);
+        });
+    }
+}
+
+impl<R, const INLINE: usize> ExactDeltaView<R> for InlineDelta<R, INLINE> {
+    fn support_len(&self) -> usize {
+        DeltaView::support_len(self)
+    }
+
+    fn visit_exact(&self, mut visitor: impl FnMut(&kernel_exact::ExactInteger, &R)) {
+        self.visit(|weight, row| {
+            let exact = kernel_exact::ExactInteger::from_i64(weight);
+            visitor(&exact, row);
+        });
+    }
+}
+
+impl<R, const INLINE: usize> ExactDeltaView<R> for AdaptiveDelta<R, INLINE> {
+    fn support_len(&self) -> usize {
+        DeltaView::support_len(self)
+    }
+
+    fn visit_exact(&self, mut visitor: impl FnMut(&kernel_exact::ExactInteger, &R)) {
+        self.visit(|weight, row| {
+            let exact = kernel_exact::ExactInteger::from_i64(weight);
+            visitor(&exact, row);
+        });
+    }
+}
+
+impl ExactDeltaView<crate::Row> for RelationDeltaView<'_> {
+    fn support_len(&self) -> usize {
+        DeltaView::support_len(self)
+    }
+
+    fn visit_exact(&self, mut visitor: impl FnMut(&kernel_exact::ExactInteger, &crate::Row)) {
+        self.visit(|weight, row| {
+            let exact = kernel_exact::ExactInteger::from_i64(weight);
+            visitor(&exact, row);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use kernel_model::Value;
@@ -357,6 +488,22 @@ mod tests {
         }
         assert!(delta.is_spilled());
         assert_eq!(delta.spill_capacity(), Some(capacity));
+    }
+
+    #[test]
+    fn exact_delta_scales_multiplicity_without_expanding_support() {
+        let mut delta = ExactDelta::with_capacity(1);
+        let multiplicity = kernel_exact::ExactNatural::from_u128(u128::MAX);
+        delta.push_scaled_i64(i64::MAX, &multiplicity, 7_i64);
+        assert_eq!(ExactDeltaView::support_len(&delta), 1);
+        let mut seen = 0;
+        delta.visit_exact(|weight, row| {
+            assert!(!weight.is_zero());
+            assert!(!weight.is_negative());
+            assert_eq!(*row, 7);
+            seen += 1;
+        });
+        assert_eq!(seen, 1);
     }
 
     #[test]

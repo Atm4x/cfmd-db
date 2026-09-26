@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use kernel_exact::ExactNatural;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateError {
     NonFiniteInput,
@@ -7,254 +9,89 @@ pub enum AggregateError {
     CountUnderflow,
 }
 
-fn low_u64(value: u128) -> u64 {
-    let bytes = value.to_le_bytes();
-    u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ])
-}
-
+/// Aggregate-domain wrapper around the shared exact natural coefficient.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct BigUnsigned {
-    limbs: Vec<u64>,
-}
-
-impl BigUnsigned {
-    fn from_shifted_u64(value: u64, shift: usize) -> Self {
-        if value == 0 {
-            return Self::default();
-        }
-        let limb_shift = shift / 64;
-        let bit_shift = shift % 64;
-        let mut limbs = vec![0; limb_shift + 2];
-        limbs[limb_shift] = value << bit_shift;
-        if bit_shift != 0 {
-            limbs[limb_shift + 1] = value >> (64 - bit_shift);
-        }
-        let mut result = Self { limbs };
-        result.normalize();
-        result
-    }
-
-    fn is_zero(&self) -> bool {
-        self.limbs.is_empty()
-    }
-
-    fn normalize(&mut self) {
-        while self.limbs.last() == Some(&0) {
-            self.limbs.pop();
-        }
-    }
-
-    fn add_assign(&mut self, other: &Self) {
-        let max_len = self.limbs.len().max(other.limbs.len());
-        self.limbs.resize(max_len, 0);
-        let mut carry = 0_u128;
-        for index in 0..max_len {
-            let sum = u128::from(self.limbs[index])
-                + u128::from(other.limbs.get(index).copied().unwrap_or(0))
-                + carry;
-            self.limbs[index] = low_u64(sum);
-            carry = sum >> 64;
-        }
-        if carry != 0 {
-            self.limbs.push(1);
-        }
-    }
-
-    fn sub_assign(&mut self, other: &Self) {
-        debug_assert_ne!(BigUnsigned::cmp(&*self, other), Ordering::Less);
-        let mut borrow = 0_u128;
-        for index in 0..self.limbs.len() {
-            let left = u128::from(self.limbs[index]);
-            let right = u128::from(other.limbs.get(index).copied().unwrap_or(0)) + borrow;
-            if left >= right {
-                self.limbs[index] = low_u64(left - right);
-                borrow = 0;
-            } else {
-                self.limbs[index] = low_u64((1_u128 << 64) + left - right);
-                borrow = 1;
-            }
-        }
-        debug_assert_eq!(borrow, 0);
-        self.normalize();
-    }
-
-    fn bit_len(&self) -> usize {
-        self.limbs.last().map_or(0, |last| {
-            (self.limbs.len() - 1) * 64 + (64 - last.leading_zeros() as usize)
-        })
-    }
-
-    fn bit(&self, index: usize) -> bool {
-        let limb = index / 64;
-        let bit = index % 64;
-        self.limbs
-            .get(limb)
-            .is_some_and(|value| (value & (1_u64 << bit)) != 0)
-    }
-
-    fn any_bits_below(&self, exclusive: usize) -> bool {
-        if exclusive == 0 {
-            return false;
-        }
-        let full_limbs = exclusive / 64;
-        if self.limbs.iter().take(full_limbs).any(|&value| value != 0) {
-            return true;
-        }
-        let remaining = exclusive % 64;
-        if remaining == 0 {
-            return false;
-        }
-        self.limbs
-            .get(full_limbs)
-            .is_some_and(|value| (*value & ((1_u64 << remaining) - 1)) != 0)
-    }
-
-    fn shr_to_u64(&self, shift: usize) -> u64 {
-        let limb = shift / 64;
-        let bits = shift % 64;
-        let low = self.limbs.get(limb).copied().unwrap_or(0) >> bits;
-        if bits == 0 {
-            low
-        } else {
-            let high = self.limbs.get(limb + 1).copied().unwrap_or(0) << (64 - bits);
-            low | high
-        }
-    }
-}
-
-impl Ord for BigUnsigned {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.limbs
-            .len()
-            .cmp(&other.limbs.len())
-            .then_with(|| self.limbs.iter().rev().cmp(other.limbs.iter().rev()))
-    }
-}
-
-impl PartialOrd for BigUnsigned {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CountRepr {
-    Small(u64),
-    Big(BigUnsigned),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExactCount(CountRepr);
-
-impl Default for ExactCount {
-    fn default() -> Self {
-        Self(CountRepr::Small(0))
-    }
-}
+pub struct ExactCount(ExactNatural);
 
 impl ExactCount {
     pub fn add_one(&mut self) {
-        match &mut self.0 {
-            CountRepr::Small(value) => {
-                if let Some(next) = value.checked_add(1) {
-                    *value = next;
-                } else {
-                    let mut promoted = BigUnsigned::from_shifted_u64(*value, 0);
-                    promoted.add_assign(&BigUnsigned::from_shifted_u64(1, 0));
-                    self.0 = CountRepr::Big(promoted);
-                }
-            }
-            CountRepr::Big(value) => {
-                value.add_assign(&BigUnsigned::from_shifted_u64(1, 0));
-            }
-        }
+        self.0.add_u128(1);
+    }
+
+    pub fn add_many(&mut self, amount: u128) {
+        self.0.add_u128(amount);
+    }
+
+    pub fn add_exact(&mut self, amount: &ExactNatural) {
+        self.0.add_assign(amount);
     }
 
     pub fn merge(&mut self, other: &Self) {
-        match (&mut self.0, &other.0) {
-            (CountRepr::Small(left), CountRepr::Small(right)) => {
-                if let Some(sum) = left.checked_add(*right) {
-                    *left = sum;
-                } else {
-                    let mut promoted = BigUnsigned::from_shifted_u64(*left, 0);
-                    promoted.add_assign(&BigUnsigned::from_shifted_u64(*right, 0));
-                    self.0 = CountRepr::Big(promoted);
-                }
-            }
-            (CountRepr::Big(left), CountRepr::Small(right)) => {
-                left.add_assign(&BigUnsigned::from_shifted_u64(*right, 0));
-            }
-            (CountRepr::Big(left), CountRepr::Big(right)) => left.add_assign(right),
-            (CountRepr::Small(left), CountRepr::Big(right)) => {
-                let mut promoted = BigUnsigned::from_shifted_u64(*left, 0);
-                promoted.add_assign(right);
-                self.0 = CountRepr::Big(promoted);
-            }
-        }
+        self.0.add_assign(&other.0);
     }
 
     pub fn remove_one(&mut self) -> Result<(), AggregateError> {
-        match &mut self.0 {
-            CountRepr::Small(value) => {
-                let Some(next) = value.checked_sub(1) else {
-                    return Err(AggregateError::CountUnderflow);
-                };
-                *value = next;
-            }
-            CountRepr::Big(value) => {
-                if value.is_zero() {
-                    return Err(AggregateError::CountUnderflow);
-                }
-                value.sub_assign(&BigUnsigned::from_shifted_u64(1, 0));
-                if value.bit_len() <= 64 {
-                    self.0 = CountRepr::Small(value.shr_to_u64(0));
-                }
-            }
+        self.remove_many(1)
+    }
+
+    pub fn remove_many(&mut self, amount: u128) -> Result<(), AggregateError> {
+        self.remove_exact(&ExactNatural::from_u128(amount))
+    }
+
+    pub fn remove_exact(&mut self, amount: &ExactNatural) -> Result<(), AggregateError> {
+        if self.0.checked_sub_assign(amount) {
+            Ok(())
+        } else {
+            Err(AggregateError::CountUnderflow)
         }
-        Ok(())
     }
 
     #[must_use]
     pub fn is_zero(&self) -> bool {
-        match &self.0 {
-            CountRepr::Small(value) => *value == 0,
-            CountRepr::Big(value) => value.is_zero(),
-        }
+        self.0.is_zero()
     }
 
     #[must_use]
     pub fn is_one(&self) -> bool {
-        match &self.0 {
-            CountRepr::Small(value) => *value == 1,
-            CountRepr::Big(value) => value.bit_len() == 1 && value.shr_to_u64(0) == 1,
-        }
+        self.0.is_one()
+    }
+
+    #[must_use]
+    pub fn from_u128(value: u128) -> Self {
+        Self(ExactNatural::from_u128(value))
     }
 
     pub fn finish_i64(&self) -> Result<i64, AggregateError> {
-        match &self.0 {
-            CountRepr::Small(value) => {
-                i64::try_from(*value).map_err(|_| AggregateError::CountOverflow)
-            }
-            CountRepr::Big(value) => {
-                if value.bit_len() > 63 {
-                    return Err(AggregateError::CountOverflow);
-                }
-                i64::try_from(value.shr_to_u64(0)).map_err(|_| AggregateError::CountOverflow)
-            }
-        }
+        self.0
+            .to_u64()
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(AggregateError::CountOverflow)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExactF64Sum {
     negative: bool,
-    magnitude: BigUnsigned,
+    magnitude: ExactNatural,
 }
 
 impl ExactF64Sum {
     pub fn add(&mut self, value: f64) -> Result<(), AggregateError> {
+        self.add_many(value, 1)
+    }
+
+    pub fn add_many(&mut self, value: f64, multiplicity: u64) -> Result<(), AggregateError> {
+        self.add_exact(value, &ExactNatural::from_u64(multiplicity))
+    }
+
+    pub fn add_exact(
+        &mut self,
+        value: f64,
+        multiplicity: &ExactNatural,
+    ) -> Result<(), AggregateError> {
+        if multiplicity.is_zero() {
+            return Ok(());
+        }
         let bits = value.to_bits();
         let exponent = ((bits >> 52) & 0x7ff) as u16;
         let fraction = bits & ((1_u64 << 52) - 1);
@@ -273,14 +110,27 @@ impl ExactF64Sum {
                 usize::from(exponent.saturating_sub(1)),
             )
         };
-        let term = BigUnsigned::from_shifted_u64(mantissa, shift);
+        let mut term = ExactNatural::from_shifted_u64(mantissa, shift);
+        term.multiply_assign(multiplicity);
         let term_negative = (bits >> 63) != 0;
         self.add_signed(term_negative, &term);
         Ok(())
     }
 
     pub fn remove(&mut self, value: f64) -> Result<(), AggregateError> {
-        self.add(-value)
+        self.remove_many(value, 1)
+    }
+
+    pub fn remove_many(&mut self, value: f64, multiplicity: u64) -> Result<(), AggregateError> {
+        self.remove_exact(value, &ExactNatural::from_u64(multiplicity))
+    }
+
+    pub fn remove_exact(
+        &mut self,
+        value: f64,
+        multiplicity: &ExactNatural,
+    ) -> Result<(), AggregateError> {
+        self.add_exact(-value, multiplicity)
     }
 
     pub fn merge(&mut self, other: &Self) {
@@ -357,7 +207,7 @@ impl ExactF64Sum {
         f64::from_bits(sign | exponent_bits | fraction)
     }
 
-    fn add_signed(&mut self, negative: bool, magnitude: &BigUnsigned) {
+    fn add_signed(&mut self, negative: bool, magnitude: &ExactNatural) {
         if magnitude.is_zero() {
             return;
         }
@@ -371,14 +221,18 @@ impl ExactF64Sum {
             return;
         }
         match self.magnitude.cmp(magnitude) {
-            Ordering::Greater => self.magnitude.sub_assign(magnitude),
+            Ordering::Greater => {
+                let subtracted = self.magnitude.checked_sub_assign(magnitude);
+                debug_assert!(subtracted);
+            }
             Ordering::Equal => {
-                self.magnitude = BigUnsigned::default();
+                self.magnitude = ExactNatural::default();
                 self.negative = false;
             }
             Ordering::Less => {
                 let mut next = magnitude.clone();
-                next.sub_assign(&self.magnitude);
+                let subtracted = next.checked_sub_assign(&self.magnitude);
+                debug_assert!(subtracted);
                 self.magnitude = next;
                 self.negative = negative;
             }
@@ -432,6 +286,24 @@ mod tests {
         assert_eq!(sum.add(f64::INFINITY), Err(AggregateError::NonFiniteInput));
     }
     #[test]
+    fn exact_count_bulk_updates_cross_representation_boundaries_exactly() {
+        let mut count = ExactCount::default();
+        count.add_many(u128::from(u64::MAX) + 1);
+        count.remove_many(u128::from(u64::MAX)).unwrap();
+        assert_eq!(count.finish_i64(), Ok(1));
+        assert_eq!(count.remove_many(2), Err(AggregateError::CountUnderflow));
+        assert_eq!(count.finish_i64(), Ok(1));
+    }
+
+    #[test]
+    fn exact_f64_bulk_update_matches_repeated_algebra_without_repetition() {
+        let mut bulk = ExactF64Sum::default();
+        bulk.add_many(0.25, u64::MAX).unwrap();
+        bulk.remove_many(0.25, u64::MAX - 3).unwrap();
+        assert_eq!(bulk.finish().to_bits(), 0.75_f64.to_bits());
+    }
+
+    #[test]
     fn exact_count_is_mergeable_and_checks_result_range() {
         let mut left = ExactCount::default();
         left.add_one();
@@ -440,32 +312,30 @@ mod tests {
         right.add_one();
         left.merge(&right);
         assert_eq!(left.finish_i64(), Ok(3));
-        let overflow = ExactCount(CountRepr::Big(BigUnsigned::from_shifted_u64(1, 63)));
+        let overflow = ExactCount::from_u128(1_u128 << 63);
         assert_eq!(overflow.finish_i64(), Err(AggregateError::CountOverflow));
     }
 
     #[test]
     fn exact_count_promotes_losslessly_when_small_representation_overflows() {
-        let mut by_increment = ExactCount(CountRepr::Small(u64::MAX));
+        let mut by_increment = ExactCount::from_u128(u128::from(u64::MAX));
         by_increment.add_one();
-        assert!(matches!(by_increment.0, CountRepr::Big(_)));
         assert_eq!(
             by_increment.finish_i64(),
             Err(AggregateError::CountOverflow)
         );
 
-        let mut by_merge = ExactCount(CountRepr::Small(u64::MAX));
-        by_merge.merge(&ExactCount(CountRepr::Small(1)));
+        let mut by_merge = ExactCount::from_u128(u128::from(u64::MAX));
+        by_merge.merge(&ExactCount::from_u128(1));
         assert_eq!(by_increment, by_merge);
     }
 
     #[test]
     fn exact_count_decrement_is_checked_and_demotes_after_big_boundary() {
-        let mut count = ExactCount(CountRepr::Small(u64::MAX));
+        let mut count = ExactCount::from_u128(u128::from(u64::MAX));
         count.add_one();
-        assert!(matches!(count.0, CountRepr::Big(_)));
         count.remove_one().unwrap();
-        assert_eq!(count, ExactCount(CountRepr::Small(u64::MAX)));
+        assert_eq!(count, ExactCount::from_u128(u128::from(u64::MAX)));
 
         let mut zero = ExactCount::default();
         assert_eq!(zero.remove_one(), Err(AggregateError::CountUnderflow));
