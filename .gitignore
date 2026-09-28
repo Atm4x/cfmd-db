@@ -90,7 +90,7 @@ tarpaulin-report.html
 
 # Core dumps / crash artifacts
 core
-core.*
+core.[0-9]*
 *.dmp
 
 # Cargo vendor package metadata.
