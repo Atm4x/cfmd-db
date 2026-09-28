@@ -73,7 +73,11 @@ impl LinuxNamespaceProcessRuntime {
             .current_dir(executable.parent().ok_or(DeploymentError::RuntimeFailure)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if cfg!(test) {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .map_err(|_| DeploymentError::RuntimeFailure)?;
         let mut stdin = child.stdin.take().ok_or(DeploymentError::RuntimeFailure)?;

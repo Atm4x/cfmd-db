@@ -42,5 +42,12 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
           rustup override set 1.98.1
+      - name: Check Linux namespace support
+        run: |
+          if ! /usr/bin/unshare --user --map-root-user --mount --pid --fork --kill-child --net --ipc --uts --propagation private /bin/true; then
+            echo '::error::Runner cannot create the namespaces required by LinuxNamespaceProcessRuntime'
+            sysctl kernel.unprivileged_userns_clone user.max_user_namespaces kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true
+            exit 1
+          fi
       - name: Rust gates
         run: bash ./scripts/ci-rust.sh
