@@ -1,4 +1,34 @@
 impl RuntimeRevisionBundle {
+    fn relation_base_witnesses(
+        revision: &kernel_revision::Revision,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PersistentOrdMap<SemanticId, RelationBaseWitness>, PhysicalExecutionError> {
+        let mut witnesses = PersistentOrdMap::default();
+        for definition in revision.semantic_context().schema.relations() {
+            let relation = definition.id;
+            let result_type = RelExpr::Scan(relation)
+                .typecheck(revision.semantic_context(), registry)?;
+            let rows = revision
+                .state()
+                .model
+                .relations
+                .get(&relation)
+                .map_or(&[][..], Vec::as_slice);
+            witnesses.insert(
+                relation,
+                RelationBaseWitness::build(
+                    revision.id(),
+                    relation,
+                    rows,
+                    result_type,
+                    revision.semantic_context(),
+                    registry,
+                )?,
+            );
+        }
+        Ok(witnesses)
+    }
+
     fn materialization_dependency_indexes(
         specs: &PersistentOrdMap<kernel_types::MaterializationId, RelExpr>,
     ) -> (
@@ -133,6 +163,7 @@ impl RuntimeRevisionBundle {
         Self::validate_physical_snapshot(&revision, &physical, &relation_layouts, registry)?;
         let violation_state = RuntimeViolationState::build(&revision, registry)?;
         violation_state.require_zero()?;
+        let relation_bases = Self::relation_base_witnesses(&revision, registry)?;
         physical.bind_revision(revision.id())?;
 
         let mut materializations = PersistentOrdMap::default();
@@ -154,6 +185,7 @@ impl RuntimeRevisionBundle {
                 let rows = physical.logical_rows_with_handles(relation, layout)?;
                 maintained.attach_storage_rows(relation, &rows)?;
             }
+            maintained.bind_revision(revision.id())?;
             materialization_spec_map.insert(spec.id, spec.query.clone());
             materializations.insert(spec.id, maintained);
         }
@@ -166,6 +198,7 @@ impl RuntimeRevisionBundle {
             violation_state,
             physical,
             relation_layouts: relation_layouts.into_iter().collect(),
+            relation_bases,
             materialization_specs: materialization_spec_map,
             materializations,
             materialization_dependencies,

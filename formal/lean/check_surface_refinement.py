@@ -40,10 +40,10 @@ def require(text, needle, where):
     if needle not in text:
         raise AssertionError(f'{where}: missing {needle!r}')
 
-schema = read('crates/kernel-schema/src/lib.rs')
-query = read('crates/kernel-query/src/lib.rs')
+schema = read_rust_source_tree('crates/kernel-schema/src')
+query = read_rust_source_tree('crates/kernel-query/src')
 plan = read_rust_source_tree('crates/kernel-plan/src')
-change = read('crates/kernel-change/src/lib.rs')
+change = read_rust_source_tree('crates/kernel-change/src')
 violation = read('crates/kernel-violation/src/lib.rs')
 retention = read('crates/kernel-retention/src/lib.rs')
 formal = read('formal/lean/CFMD/SurfaceKernel.lean')

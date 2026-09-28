@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use kernel_auth::{AuthorityDigest, FreshnessCut, KeyId, SignedFreshnessCut};
 
-use crate::{DurabilityError, ExternalFreshnessAuthority};
+use crate::runtime::DurabilityError;
+use crate::store::ExternalFreshnessAuthority;
 
 const MAGIC: [u8; 4] = *b"CFFA";
 const VERSION: u16 = 1;
@@ -129,7 +130,7 @@ fn decode_response(bytes: &[u8]) -> Result<Option<SignedFreshnessCut>, Durabilit
     Ok(result)
 }
 
-pub(crate) fn decode_request(bytes: &[u8]) -> Result<FreshnessWireRequest, DurabilityError> {
+fn decode_request(bytes: &[u8]) -> Result<FreshnessWireRequest, DurabilityError> {
     let mut cursor = Cursor::new(bytes);
     if cursor.take_array::<4>()? != MAGIC || cursor.take_u16()? != VERSION {
         return Err(protocol("freshness request has incompatible wire header"));
@@ -150,7 +151,7 @@ pub(crate) fn decode_request(bytes: &[u8]) -> Result<FreshnessWireRequest, Durab
     Ok(request)
 }
 
-pub(crate) fn encode_response(response: FreshnessWireResponse) -> Vec<u8> {
+fn encode_response(response: FreshnessWireResponse) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_be_bytes());
@@ -167,7 +168,7 @@ pub(crate) fn encode_response(response: FreshnessWireResponse) -> Vec<u8> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FreshnessWireRequest {
+enum FreshnessWireRequest {
     Read {
         store_id: [u8; 32],
     },
@@ -178,14 +179,14 @@ pub(crate) enum FreshnessWireRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FreshnessWireResponse {
+enum FreshnessWireResponse {
     None,
     Record(Box<SignedFreshnessCut>),
     CasMismatch,
     Rejected,
 }
 
-pub(crate) fn read_wire_frame(stream: &mut impl Read) -> Result<Vec<u8>, DurabilityError> {
+fn read_wire_frame(stream: &mut impl Read) -> Result<Vec<u8>, DurabilityError> {
     let mut len = [0_u8; 4];
     stream.read_exact(&mut len)?;
     let len = usize::try_from(u32::from_be_bytes(len))
@@ -198,10 +199,7 @@ pub(crate) fn read_wire_frame(stream: &mut impl Read) -> Result<Vec<u8>, Durabil
     Ok(bytes)
 }
 
-pub(crate) fn write_wire_frame(
-    stream: &mut impl Write,
-    bytes: &[u8],
-) -> Result<(), DurabilityError> {
+fn write_wire_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<(), DurabilityError> {
     let len = u32::try_from(bytes.len())
         .map_err(|_| protocol("freshness wire frame exceeds length encoding"))?;
     stream.write_all(&len.to_be_bytes())?;
@@ -347,6 +345,34 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn oversized_state_record_is_rejected_before_decode() {
+        let dir = std::env::temp_dir().join(format!(
+            "cfmd-freshness-record-bound-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = TcpExternalFreshnessAuthorityServer::from_listener(
+            listener,
+            &dir,
+            ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]),
+        )
+        .unwrap();
+        let store_id = [0x33; 32];
+        std::fs::write(record_path(&dir, store_id), vec![0_u8; MAX_FRAME_LEN + 1]).unwrap();
+        assert!(matches!(
+            server.read_record(store_id),
+            Err(DurabilityError::Protocol {
+                reason: "freshness authority state record exceeds hard limit",
+                ..
+            })
+        ));
+        drop(server);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 use std::fs::{self, File, OpenOptions};
@@ -446,11 +472,31 @@ impl TcpExternalFreshnessAuthorityServer {
         store_id: [u8; 32],
     ) -> Result<Option<SignedFreshnessCut>, DurabilityError> {
         let path = record_path(&self.state_directory, store_id);
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
+        let file = match File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        if file.metadata()?.len()
+            > u64::try_from(MAX_FRAME_LEN).expect("freshness frame limit fits u64")
+        {
+            return Err(protocol(
+                "freshness authority state record exceeds hard limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(MAX_FRAME_LEN)
+            .map_err(|_| DurabilityError::PayloadTooLarge)?;
+        file.take(
+            u64::try_from(MAX_FRAME_LEN + 1).expect("freshness frame limit plus sentinel fits u64"),
+        )
+        .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_FRAME_LEN {
+            return Err(protocol(
+                "freshness authority state record exceeds hard limit",
+            ));
+        }
         let record = decode_response(&bytes)?
             .ok_or_else(|| protocol("freshness authority state record is empty"))?;
         if record.cut.store_id != store_id {

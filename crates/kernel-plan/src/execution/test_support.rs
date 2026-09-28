@@ -2,10 +2,10 @@
 // HOSTILE[P177][TEST-ONLY][CLEAN]: batch-index and TopK representation types are hidden behind
 // behavior-oriented test probes instead of leaking into the root test module.
 use super::{
-    ExecutionStats, JoinBatchIndex, NativeColumn, StatefulBatchEnv, TopKBatchSpec,
-    build_indexed_join_batch_program, execute_bound_typed_filter,
-    execute_fused_filter_project_scan, merge_execution_stats, select_join_batch_index,
-    select_top_k_i64_positions, select_top_k_semantic_positions, typed_column_matches_bound,
+    ExecutionStats, JoinBatchIndex, NativeColumn, TopKBatchSpec, build_indexed_join_batch_program,
+    execute_bound_typed_filter, execute_fused_filter_project_scan, merge_execution_stats,
+    select_join_batch_index, select_top_k_i64_positions, select_top_k_semantic_positions,
+    typed_column_matches_bound,
 };
 use crate::{LayoutBinding, PhysicalExecutionError, PhysicalStore, Plan};
 use kernel_model::Value;
@@ -75,6 +75,7 @@ pub(crate) fn select_top_k_semantic_positions_for_test(
     registry: &kernel_semantics::SemanticRegistry,
     stats: &mut ExecutionStats,
 ) -> Result<(), PhysicalExecutionError> {
+    let compiled_ordering = registry.compile_ordering(context, ordering)?;
     select_top_k_semantic_positions(
         positions,
         order_column,
@@ -84,7 +85,7 @@ pub(crate) fn select_top_k_semantic_positions_for_test(
             direction,
             k,
         },
-        &StatefulBatchEnv { context, registry },
+        &compiled_ordering,
         stats,
     )
 }

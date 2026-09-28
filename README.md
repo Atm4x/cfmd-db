@@ -1,22 +1,57 @@
 # CFMD
 
-CFMD is an experimental embedded database kernel built around a constructive finite-model view of database state. The repository currently contains the production kernel, durability/replication/security layers, executable law tests, and Lean mechanizations that bind selected architectural claims to the Rust implementation.
+CFMD is an experimental embedded/local database kernel built around a constructive finite-model view of state. The repository contains the Rust kernel, revision/change/query machinery, durability/recovery, trust/deployment layers, executable law tests, and Lean artifacts that bind selected architectural claims to the implementation.
 
-## Repository status
+## Current status
 
-The historical kernel backlog (#1–#22) is closed for the declared supported scope. The final durability item (#13) is certified for the recorded QEMU/TCG + Linux/ext4 profile; additional bare-metal or filesystem profiles require separate certification evidence.
+The historical kernel backlog (#1–#22) is closed for the declared support scope, and the global hostile/refactor campaign is **COMPLETE / FROZEN after Pass280**. Every kernel crate has received either a dedicated hostile closure pass or a grouped audit proportional to its size; the historically heavy `query/plan/semantics/durability` line was revalidated against the final workspace before freeze.
 
-CFMD is now transitioning from kernel R&D to a stable user-facing Rust library surface. The internal crates are **not** the intended public API.
+`FROZEN` does not mean “bug-free forever”. It means kernel cleanup is no longer continued by inertia: reopen a frozen area only for a concrete correctness counterexample, proof/authority seam, measured complexity/performance regression, new R&D requirement, or public API/DX requirement.
 
-See:
+The active project phase is now **productization**, with a Python-first application facade as the primary product target and a compact Rust facade/runtime service underneath it.
 
-- [`SPEC.md`](SPEC.md) — concise project specification and invariants;
-- [`docs/spec/CFMD_CORE_SPEC.md`](docs/spec/CFMD_CORE_SPEC.md) — full normative core specification;
-- [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) — current repository architecture;
-- [`docs/status/PROJECT_STATUS.md`](docs/status/PROJECT_STATUS.md) — current state and next phase;
-- [`docs/status/HISTORICAL_PROBLEMS_LEDGER.md`](docs/status/HISTORICAL_PROBLEMS_LEDGER.md) — closed historical ledger;
-- [`docs/api/RUST_API_ROADMAP.md`](docs/api/RUST_API_ROADMAP.md) — next public-Rust-API phase;
-- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — RustRover/offline development guide;
+## Product direction
+
+The intended application experience is familiar lazy querying over deep domain paths, with CFMD-specific capabilities around the query:
+
+```python
+users = db.users.where(
+    lambda u: u.active & (u.passport.country.code == "RU")
+)
+
+async for delta in users.watch():
+    ...
+
+future = db.preview(plan)
+future.delta(users)
+future.why_changed(users)
+future.commit()
+```
+
+The facade rules are stricter than a conventional ORM:
+
+- no hidden storage I/O from ordinary materialized Python attribute access;
+- deep relationship traversal is symbolic inside query construction;
+- many-valued paths require explicit `any/all/match/aggregate` semantics;
+- current, historical and speculative candidate worlds are explicit;
+- exact watch is a runtime protocol, not callback-driven polling;
+- Plans/Candidates/history use the same authoritative transition pipeline;
+- one authoritative runtime owns writes; external Studio/tooling attaches to it rather than editing files independently.
+
+See [`docs/api/PRODUCT_ROADMAP.md`](docs/api/PRODUCT_ROADMAP.md) and the retained design source [`docs/api/CFMD_PYTHON_FACADE_THEORY.md`](docs/api/CFMD_PYTHON_FACADE_THEORY.md).
+
+## Documentation map
+
+- [`SPEC.md`](SPEC.md) — concise repository-facing specification;
+- [`docs/spec/CFMD_CORE_SPEC.md`](docs/spec/CFMD_CORE_SPEC.md) — full normative core specification and append-only implementation record;
+- [`docs/status/PROJECT_STATUS.md`](docs/status/PROJECT_STATUS.md) — current phase and release boundary;
+- [`docs/status/KERNEL_HOSTILE_LEDGER.md`](docs/status/KERNEL_HOSTILE_LEDGER.md) — current kernel audit/freeze inventory;
+- [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) — current runtime/product layering;
+- [`docs/architecture/CRATE_MAP.md`](docs/architecture/CRATE_MAP.md) — internal workspace crate graph;
+- [`docs/api/PRODUCT_ROADMAP.md`](docs/api/PRODUCT_ROADMAP.md) — Python-first product roadmap;
+- [`docs/api/RUST_API_ROADMAP.md`](docs/api/RUST_API_ROADMAP.md) — supporting Rust runtime/facade roadmap;
+- [`docs/reports/current/PASS280_REPORT.md`](docs/reports/current/PASS280_REPORT.md) — kernel-refactor closeout report;
+- [`docs/reports/current/RELEASE_PREP_2026-09-28.md`](docs/reports/current/RELEASE_PREP_2026-09-28.md) — repository/CI/documentation release-prep report;
 - [`docs/status/SUPPORT_MATRIX.md`](docs/status/SUPPORT_MATRIX.md) — certified durability scope;
 - [`formal/lean/README.md`](formal/lean/README.md) — Lean proof artifacts and refinement gates.
 
@@ -24,50 +59,58 @@ See:
 
 - Rust: **1.98.1**, edition 2024.
 - Lean: **4.34.0**, core-only proof artifacts (no Mathlib dependency).
-- Third-party Rust dependencies are vendored under `vendor/` so the workspace can build offline.
+- Third-party Rust dependencies are vendored under `vendor/` for reproducible/offline builds.
 
 ## Quick verification
 
-```bash
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --offline
-cargo clippy --workspace --all-targets --offline -- -D warnings
-cargo test --workspace --all-targets --offline
-```
-
-Formal checks:
+Repository completeness first:
 
 ```bash
-./scripts/ci-formal.sh
+bash ./scripts/verify-repository.sh
 ```
 
-The formal gate requires Lean 4.34.0 locally. GitHub CI installs the pinned Lean toolchain automatically when proof-relevant files change.
+Rust gates:
+
+```bash
+bash ./scripts/ci-rust.sh
+```
+
+Formal/refinement gates:
+
+```bash
+bash ./scripts/ci-formal.sh
+```
+
+The repository verifier checks required project files, the repository manifest, and literal Rust `include!("...")` targets. A partial upload such as `physical_store.rs` without `physical_store/core.rs` therefore fails before Cargo compilation.
 
 ## Layout
 
 ```text
-crates/                 production Rust kernel crates
+crates/                 27 internal Rust workspace crates
 formal/lean/            Lean proofs + source-refinement binders
 vendor/                 vendored Rust dependency closure
-artifacts/               retained diagnostics, evidence, certification records
+artifacts/              retained diagnostics/evidence/certification records
 docs/spec/              normative specification
 docs/architecture/      current architecture documentation
-docs/status/            project status and ledgers
-docs/api/               public API design/roadmap
-docs/reports/current/   current pass/repository reports
-docs/history/           archived pass reports/spec snapshots/manifests
+docs/status/            project status, support and hostile ledger
+docs/api/               product/facade design and roadmaps
+docs/reports/current/   current closeout/release-prep reports
+docs/reports/archive/   historical pass reports
+docs/history/           older provenance/spec snapshots/manifests
 .github/workflows/      Rust and Lean CI
 scripts/                local verification/statistics helpers
 ```
 
 ## Development policy
 
-1. The logical/semantic contract is authoritative; physical optimizations must not silently redefine it.
-2. Exact semantic equality/order is defined by pinned `Γ`, not by incidental Rust `Eq`/`Hash`/`Ord` where semantic modules apply.
-3. Recoverable failure must happen before authoritative publication/commit boundaries.
+1. Logical/semantic contracts are authoritative; physical optimizations must not silently redefine them.
+2. Exact semantic equality/order is defined by pinned `Γ`, not incidental Rust `Eq`/`Hash`/`Ord` where semantic modules apply.
+3. Recoverable failure must occur before authoritative publication/commit boundaries.
 4. Durability claims are scoped to certified storage profiles; unsupported profiles fail closed.
-5. New surface/kernel vocabulary that changes the #20 proof boundary must update the Lean artifact and refinement binder in the same change.
-6. New publication fault points or durability protocol changes that affect #18 must update its Lean/refinement boundary.
+5. Public facades must not expose internal crate ownership/layout merely because those types exist in Rust.
+6. Exact watch/Candidate/history/tooling must share the same revision/change semantics rather than grow parallel event systems.
+7. New proof-boundary vocabulary or durability fault points must update the corresponding formal/refinement gate.
+8. Frozen kernels reopen only on evidence, not cleanup-by-inertia.
 
 ## License
 

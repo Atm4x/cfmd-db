@@ -9,7 +9,7 @@ use super::{
     OrderedViewSnapshot, PersistentOrdMap, PersistentOrdSet, PhysicalArtifactAdvisorPolicy,
     PhysicalExecutionError, PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy,
     PhysicalRecoveryReport, PhysicalStore, PreparedRelationRewrite, RelExpr, RelObservationGuard,
-    RelType, RelationDelta, RelationValue, RevisionDurability,
+    RelType, RelationBaseWitness, RelationDelta, RelationValue, RevisionDurability,
     RevisionEffectResidualChainCertificate, RevisionEffectResidualCubeLayerCertificate,
     RevisionEffectResidualMixedChainCertificate, RevisionEffectResidualNormalizedLayerCertificate,
     RevisionEffectResidualSquareChainCertificate, RevisionEffectResidualSquareLayerCertificate,

@@ -4,7 +4,37 @@ import re
 import sys
 
 root = Path(__file__).resolve().parents[2]
-store = (root / 'crates/kernel-durability/src/store.rs').read_text()
+
+def expand_rust_source_closure(path: Path) -> str:
+    text = path.read_text()
+    include_pattern = re.compile(r'include!\("([^"]+)"\);')
+
+    def replace_include(match: re.Match[str]) -> str:
+        included = (path.parent / match.group(1)).resolve()
+        return expand_rust_source_closure(included)
+
+    text = include_pattern.sub(replace_include, text)
+    module_pattern = re.compile(
+        r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;'
+    )
+
+    def replace_module(match: re.Match[str]) -> str:
+        name = match.group('name')
+        candidates = []
+        if path.name not in {'lib.rs', 'main.rs', 'mod.rs'}:
+            candidates.append(path.parent / path.stem / f'{name}.rs')
+            candidates.append(path.parent / path.stem / name / 'mod.rs')
+        candidates.append(path.parent / f'{name}.rs')
+        candidates.append(path.parent / name / 'mod.rs')
+        module_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if module_path is None:
+            return match.group(0)
+        return expand_rust_source_closure(module_path.resolve())
+
+    return module_pattern.sub(replace_module, text)
+
+
+store = expand_rust_source_closure(root / 'crates/kernel-durability/src/store.rs')
 model = (root / 'crates/kernel-durability/src/store/publication_model.rs').read_text()
 lean = (root / 'formal/lean/CFMD/Publication.lean').read_text()
 
@@ -55,7 +85,7 @@ publish = store[publish_start:publish_end]
 publish_needles = [
     'file.sync_all()?;',
     'hook.hit(StoreFaultPoint::AfterPendingManifestSync)?;',
-    '*authority_uncertain = true;',
+    'publication.mark_manifest_rename_attempted();',
     'fs::rename(&pending_path, &final_path)?;',
     'hook.hit(StoreFaultPoint::AfterManifestRename)?;',
     'sync_directory(directory)?;',
@@ -64,6 +94,22 @@ publish_needles = [
 pos = [publish.find(n) for n in publish_needles]
 if any(p < 0 for p in pos) or pos != sorted(pos):
     raise SystemExit(f'manifest publication refinement changed: {pos}')
+
+# Synchronous generation rotation must publish the already-durable local
+# authority before attempting the external freshness acknowledgement.
+rotate_start = store.find('fn rotate_checkpoint_with_hook(')
+rotate_end = store.find('pub fn compact_obsolete_generations(', rotate_start)
+rotate = store[rotate_start:rotate_end]
+rotate_needles = [
+    'publish_manifest_with_hook(',
+    'self.generation = generation;',
+    'self.checkpoint = revision.clone();',
+    'self.wal = wal;',
+    'freshness.advance(&self.directory, generation, 0, freshness_digest)',
+]
+pos = [rotate.find(n) for n in rotate_needles]
+if any(p < 0 for p in pos) or pos != sorted(pos):
+    raise SystemExit(f'synchronous publication authority order changed: {pos}')
 
 compact_start = store.find('fn compact_obsolete_generations_with_hook(')
 compact_end = store.find('\nfn bind_prepare_descriptor', compact_start)

@@ -24,6 +24,14 @@ impl RuntimeRevisionBundle {
         &self.physical
     }
 
+    #[must_use]
+    pub fn relation_base_witness(
+        &self,
+        relation: SemanticId,
+    ) -> Option<&RelationBaseWitness> {
+        self.relation_bases.get(&relation)
+    }
+
     /// Captures one exact OFC observation fiber against this immutable runtime
     /// root. The returned guard is root/revision bound and can later classify
     /// prepared transitions without trusting caller-provided dependency sets.
@@ -195,10 +203,10 @@ impl RuntimeRevisionBundle {
 
     /// Reader-visible revision for a runtime-owned maintained materialization.
     ///
-    /// Runtime-owned maintained plans deliberately remain internally unbound:
-    /// `RuntimeRevisionBundle` is the sole publication/revision authority. This
-    /// avoids rewriting every materialization merely because an unrelated base
-    /// relation advanced the global revision.
+    /// The bundle owns the globally published revision. A maintained plan's
+    /// internal revision is only its dependency-frontier transition anchor, so
+    /// an unrelated relation may advance the bundle without path-copying that
+    /// plan merely to rewrite an otherwise irrelevant revision tag.
     #[must_use]
     pub fn materialization_revision(
         &self,

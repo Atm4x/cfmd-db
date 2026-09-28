@@ -423,6 +423,7 @@ pub struct PreparedOrderedView<'a> {
     plan: &'a PreparedPlan,
     spec: OrderedViewSpec,
     equivalences: Vec<SemanticId>,
+    compiled_ordering: kernel_semantics::CompiledOrdering,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,6 +441,7 @@ pub struct OrderedViewSnapshot {
     result_type: RelType,
     equivalences: Vec<SemanticId>,
     spec: OrderedViewSpec,
+    compiled_ordering: kernel_semantics::CompiledOrdering,
     runs: BTreeMap<
         kernel_semantics::CanonicalOrderClassKey,
         BTreeMap<Vec<kernel_semantics::CanonicalEqKey>, OrderedViewRun>,

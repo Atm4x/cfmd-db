@@ -144,7 +144,7 @@ impl DurableRuntime {
             .iter()
             .map(|rewrite| RevisionRelationMutation {
                 relation: rewrite.relation,
-                delta: &rewrite.rewrite.delta,
+                delta: rewrite.rewrite.delta(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -213,7 +213,7 @@ impl DurableRuntime {
             .iter()
             .map(|rewrite| RevisionRelationMutation {
                 relation: rewrite.relation,
-                delta: &rewrite.rewrite.delta,
+                delta: rewrite.rewrite.delta(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -436,7 +436,7 @@ impl DurableRuntime {
             .iter()
             .map(|rewrite| RevisionRelationMutation {
                 relation: rewrite.relation,
-                delta: &rewrite.rewrite.delta,
+                delta: rewrite.rewrite.delta(),
             })
             .collect::<Vec<_>>();
         let target =

@@ -1,9 +1,10 @@
-//! Certified internal signed-delta carrier boundary.
+//! Certified signed-delta carrier boundary.
 //!
-//! This module is intentionally execution-neutral in its first production
-//! stage: existing maintained operators still consume `RelationDelta`.  The
-//! types here establish one representation-independent ABI so later passes can
-//! migrate internal edges without changing query semantics.
+//! Maintained query execution uses the exact Γ-measure carrier internally.
+//! `RelationDelta` remains an observation/input boundary whose zero-copy view
+//! embeds unit row insertions/removals into the same exact coefficient algebra.
+//! Legacy machine-word carriers are compatibility/test representations, not an
+//! alternative production calculus.
 
 /// One weighted row in a finite signed delta.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +36,7 @@ pub trait ExactDeltaSink<R> {
     fn push_exact(&mut self, weight: kernel_exact::ExactInteger, row: R);
 }
 
-/// Exact-coefficient carrier used while migrating maintained operators away
-/// from the legacy `i64` coefficient boundary.
+/// Canonical exact-coefficient carrier for maintained query transitions.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExactDelta<R> {
     entries: Vec<ExactWeighted<R>>,

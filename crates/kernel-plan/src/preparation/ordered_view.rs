@@ -13,11 +13,7 @@ impl PreparedOrderedView<'_> {
         let order_value = row
             .get(self.spec.column)
             .ok_or(RelQueryError::ColumnOutOfBounds)?;
-        let order_class = registry.canonical_order_key(
-            &self.plan.semantic_context,
-            self.spec.ordering,
-            order_value,
-        )?;
+        let order_class = self.compiled_ordering.canonical_key(order_value)?;
         let row_key = row
             .iter()
             .zip(&self.equivalences)
@@ -64,6 +60,7 @@ impl PreparedOrderedView<'_> {
             result_type: self.plan.result_type.clone(),
             equivalences: self.equivalences.clone(),
             spec: self.spec.clone(),
+            compiled_ordering: self.compiled_ordering.clone(),
             runs,
         })
     }
@@ -114,11 +111,7 @@ impl OrderedViewSnapshot {
         let order_value = row
             .get(self.spec.column)
             .ok_or(RelQueryError::ColumnOutOfBounds)?;
-        let order_class = registry.canonical_order_key(
-            &self.semantic_context,
-            self.spec.ordering,
-            order_value,
-        )?;
+        let order_class = self.compiled_ordering.canonical_key(order_value)?;
         let row_key = row
             .iter()
             .zip(&self.equivalences)

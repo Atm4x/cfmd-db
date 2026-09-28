@@ -4,8 +4,8 @@ Describe the user/kernel behavior changed by this PR.
 
 ## Verification
 
-- [ ] `./scripts/verify-repository.sh`
-- [ ] `./scripts/ci-rust.sh`
+- [ ] `bash ./scripts/verify-repository.sh`
+- [ ] `bash ./scripts/ci-rust.sh`
 - [ ] Lean/refinement gate updated and run if proof-relevant
 - [ ] durability/support evidence updated if support claims changed
 - [ ] public API compatibility considered if facade surface changed

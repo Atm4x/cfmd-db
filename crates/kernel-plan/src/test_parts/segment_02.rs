@@ -97,6 +97,7 @@ fn storage_resolved_delta_updates_recursive_scan_without_semantic_relookup() {
         .unwrap();
     let rows = store.logical_rows_with_handles(relation, binding).unwrap();
     maintained.attach_storage_rows(relation, &rows).unwrap();
+    maintained.bind_revision(RevisionId::new(1)).unwrap();
 
     let result_type = query.typecheck(&context, &registry).unwrap();
     let delta = RelationDelta {
@@ -109,9 +110,15 @@ fn storage_resolved_delta_updates_recursive_scan_without_semantic_relookup() {
         .unwrap();
     let mut resolved_map = BTreeMap::new();
     resolved_map.insert(relation, resolved.clone());
-    let emitted = maintained
-        .apply_storage_resolved_deltas(&resolved_map, &context, &registry)
+    let (next, emitted) = maintained
+        .candidate_from_storage_resolved_deltas_for_revision(
+            RevisionId::new(2),
+            &resolved_map,
+            &context,
+            &registry,
+        )
         .unwrap();
+    maintained = next;
     assert_eq!(emitted, delta);
 
     let output = maintained.output_value(&context, &registry).unwrap();
@@ -128,7 +135,12 @@ fn storage_resolved_delta_updates_recursive_scan_without_semantic_relookup() {
 
     let before = maintained.clone();
     assert_eq!(
-        maintained.apply_storage_resolved_deltas(&resolved_map, &context, &registry),
+        maintained.candidate_from_storage_resolved_deltas_for_revision(
+            RevisionId::new(3),
+            &resolved_map,
+            &context,
+            &registry,
+        ),
         Err(RelQueryError::InconsistentIncrementalDelta)
     );
     assert_eq!(maintained, before);
@@ -404,8 +416,14 @@ fn two_independent_materialization_runtime() -> (
 fn runtime_relation_transition_updates_only_dependency_consumers() {
     let (context, registry, left, right, left_id, right_id, runtime) =
         two_independent_materialization_runtime();
-    assert_eq!(runtime.materialization(left_id).unwrap().revision(), None);
-    assert_eq!(runtime.materialization(right_id).unwrap().revision(), None);
+    assert_eq!(
+        runtime.materialization(left_id).unwrap().revision(),
+        Some(RevisionId::new(8_972_010))
+    );
+    assert_eq!(
+        runtime.materialization(right_id).unwrap().revision(),
+        Some(RevisionId::new(8_972_010))
+    );
     assert!(runtime.materialization_dependency_contains_for_test(left, left_id));
     assert!(!runtime.materialization_dependency_contains_for_test(left, right_id));
     assert!(runtime.materialization_dependency_contains_for_test(right, right_id));
@@ -441,8 +459,85 @@ fn runtime_relation_transition_updates_only_dependency_consumers() {
         right_epoch
     );
     assert_eq!(
+        prepared
+            .candidate_materialization_for_test(right_id)
+            .unwrap()
+            .revision(),
+        Some(RevisionId::new(8_972_010))
+    );
+    assert_eq!(
+        prepared
+            .candidate_materialization_for_test(left_id)
+            .unwrap()
+            .revision(),
+        Some(RevisionId::new(8_972_020))
+    );
+    assert_eq!(
         prepared.candidate_materialization_revision_for_test(right_id),
         Some(RevisionId::new(8_972_020))
+    );
+}
+
+#[test]
+fn dependency_frontier_revision_anchor_skips_unrelated_revisions_without_rebinding() {
+    let (context, registry, left, right, left_id, right_id, runtime) =
+        two_independent_materialization_runtime();
+
+    let left_delta = scan_delta(left, &[3], &[1], &context, &registry);
+    let left_mutations = [RevisionRelationMutation {
+        relation: left,
+        delta: &left_delta,
+    }];
+    let left_target = target_revision_for(&runtime, 8_972_020, &left_mutations, &registry);
+    let left_prepared = runtime
+        .prepare_revision_for_test(&RevisionTransitionRequest {
+            target_revision: &left_target,
+            mutations: &left_mutations,
+            registry: &registry,
+        })
+        .unwrap();
+    let cell = RuntimeRevisionCell::new(runtime);
+    let _ = left_prepared.seal(&cell).unwrap().publish();
+    let after_left = cell.snapshot().unwrap();
+
+    assert_eq!(
+        after_left.materialization(left_id).unwrap().revision(),
+        Some(RevisionId::new(8_972_020))
+    );
+    assert_eq!(
+        after_left.materialization(right_id).unwrap().revision(),
+        Some(RevisionId::new(8_972_010))
+    );
+
+    let right_delta = scan_delta(right, &[30], &[10], &context, &registry);
+    let right_mutations = [RevisionRelationMutation {
+        relation: right,
+        delta: &right_delta,
+    }];
+    let right_target = target_revision_for(&after_left, 8_972_030, &right_mutations, &registry);
+    let right_prepared = after_left
+        .prepare_revision_for_test(&RevisionTransitionRequest {
+            target_revision: &right_target,
+            mutations: &right_mutations,
+            registry: &registry,
+        })
+        .unwrap();
+
+    assert_eq!(right_prepared.output_deltas()[&right_id], right_delta);
+    assert!(!right_prepared.output_deltas().contains_key(&left_id));
+    assert_eq!(
+        right_prepared
+            .candidate_materialization_for_test(left_id)
+            .unwrap()
+            .revision(),
+        Some(RevisionId::new(8_972_020))
+    );
+    assert_eq!(
+        right_prepared
+            .candidate_materialization_for_test(right_id)
+            .unwrap()
+            .revision(),
+        Some(RevisionId::new(8_972_030))
     );
 }
 
@@ -639,18 +734,18 @@ fn relation_cube_certificate(
     let b = rewrite(90_102, final_endpoint);
     let c = rewrite(90_103, final_endpoint);
     let witness = kernel_change::RewriteResidualCubeWitness {
-        b_after_a: rewrite(90_111, final_endpoint),
-        a_after_b: rewrite(90_112, final_endpoint),
-        c_after_a: rewrite(90_113, final_endpoint),
-        a_after_c: rewrite(90_114, final_endpoint),
-        c_after_b: rewrite(90_115, final_endpoint),
-        b_after_c: rewrite(90_116, final_endpoint),
-        c_after_ab: rewrite(90_121, final_endpoint),
-        b_after_ac: rewrite(90_122, final_endpoint),
-        c_after_ba: rewrite(90_121, final_endpoint),
-        a_after_bc: rewrite(90_123, final_endpoint),
-        b_after_ca: rewrite(90_124, final_endpoint),
-        a_after_cb: rewrite(90_125, final_endpoint),
+        b_after_a: rewrite(90_111, final_endpoint).into(),
+        a_after_b: rewrite(90_112, final_endpoint).into(),
+        c_after_a: rewrite(90_113, final_endpoint).into(),
+        a_after_c: rewrite(90_114, final_endpoint).into(),
+        c_after_b: rewrite(90_115, final_endpoint).into(),
+        b_after_c: rewrite(90_116, final_endpoint).into(),
+        c_after_ab: rewrite(90_121, final_endpoint).into(),
+        b_after_ac: rewrite(90_122, final_endpoint).into(),
+        c_after_ba: rewrite(90_121, final_endpoint).into(),
+        a_after_bc: rewrite(90_123, final_endpoint).into(),
+        b_after_ca: rewrite(90_124, final_endpoint).into(),
+        a_after_cb: rewrite(90_125, final_endpoint).into(),
     };
     let mut registry = kernel_change::RewriteResidualFamilyRegistry::default();
     register_pair(
@@ -701,11 +796,12 @@ fn relation_cube_certificate(
         &witness.b_after_ca,
         &witness.a_after_cb,
     );
-    registry.certify_cube(base, &a, &b, &c, witness).unwrap()
+    let _ = base;
+    registry.certify_cube(&a, &b, &c, witness).unwrap()
 }
 
 fn relation_residual_chain_certificate(
-    base: &RelationValue,
+    _base: &RelationValue,
     final_endpoint: &RelationValue,
 ) -> kernel_change::RevisionEffectResidualChainCertificate<RelationValue, Value> {
     fn rewrite(
@@ -739,20 +835,19 @@ fn relation_residual_chain_certificate(
     let left_ideal = kernel_change::RevisionEffectIdeal::new(vec![kernel_change::RevisionEffect {
         id: kernel_change::RevisionEffectId(91_301),
         prerequisites: BTreeSet::new(),
-        payload: left,
+        payload: kernel_change::SharedPreparedRewrite::new(left),
     }])
     .unwrap();
     let right_ideal =
         kernel_change::RevisionEffectIdeal::new(vec![kernel_change::RevisionEffect {
             id: kernel_change::RevisionEffectId(91_302),
             prerequisites: BTreeSet::new(),
-            payload: right,
+            payload: kernel_change::SharedPreparedRewrite::new(right),
         }])
         .unwrap();
     left_ideal
         .certify_registered_residual_chain(
             &right_ideal,
-            base,
             &residuals,
             &kernel_change::RewriteSequentialFamilyRegistry::default(),
             kernel_change::RevisionEffectResidualChainWitness {
@@ -860,7 +955,7 @@ fn revision_prepare_is_invisible_until_sealed_publish() {
             .materialization(test_materialization_id())
             .unwrap()
             .revision(),
-        None
+        Some(RevisionId::new(41))
     );
     assert_eq!(
         runtime_physical_i64_values(&runtime, relation, binding),
@@ -882,10 +977,10 @@ fn relation_rewrite_prepare_preserves_intent_and_uses_existing_vmf_dtc_boundary(
     let spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(44_001)),
         law_set: RewriteLawSetId(SemanticId::new(44_002)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let rewrite = delta
-        .prepare_relation_rewrite(&old, &context, &registry, &spec, vec![Value::I64(4)])
+        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, vec![Value::I64(4)])
         .unwrap();
     let mutation = RevisionRelationMutation {
         relation,
@@ -924,7 +1019,47 @@ fn relation_rewrite_prepare_preserves_intent_and_uses_existing_vmf_dtc_boundary(
 }
 
 #[test]
-fn relation_rewrite_prepare_rejects_effect_not_derived_from_its_delta() {
+fn runtime_relation_base_witness_binds_rewrite_without_recanonicalizing_source_rows() {
+    let (context, registry, relation, _, runtime) = scan_runtime_bundle(442, 9965, &[1, 2, 3]);
+    let delta = scan_delta(relation, &[4], &[1], &context, &registry);
+    let spec = kernel_change::RewriteSpec {
+        id: RewriteSpecId(SemanticId::new(44_201)),
+        law_set: RewriteLawSetId(SemanticId::new(44_202)),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
+    };
+    let base = runtime.relation_base_witness(relation).unwrap();
+    let rewrite = delta
+        .prepare_relation_rewrite_on_base(base, &registry, &spec, Vec::<Value>::new())
+        .unwrap();
+    assert!(rewrite.rewrite().effect().certifies_base_witness(base));
+
+    let mutation = RevisionRelationMutation {
+        relation,
+        delta: &delta,
+    };
+    let target = target_revision_for(&runtime, 443, &[mutation], &registry);
+    let rewrites = [RevisionRelationRewrite {
+        relation,
+        rewrite: &rewrite,
+    }];
+    let prepared = runtime
+        .prepare_rewrites_for_test(&RevisionRewriteTransitionRequest {
+            target_revision: &target,
+            rewrites: &rewrites,
+            registry: &registry,
+        })
+        .unwrap();
+    let cell = RuntimeRevisionCell::new(runtime);
+    let sealed = prepared.seal(&cell).unwrap();
+    let _ = sealed.publish();
+    let published = cell.snapshot().unwrap();
+    let next_base = published.relation_base_witness(relation).unwrap();
+    assert_eq!(next_base.revision(), RevisionId::new(443));
+    assert!(!rewrite.rewrite().effect().certifies_base_witness(next_base));
+}
+
+#[test]
+fn prepared_relation_rewrite_has_single_structural_delta_authority() {
     let (context, registry, relation, _, runtime) = scan_runtime_bundle(450, 9962, &[1, 2, 3]);
     let delta = scan_delta(relation, &[4], &[1], &context, &registry);
     let old = RelExpr::Scan(relation)
@@ -933,30 +1068,17 @@ fn relation_rewrite_prepare_rejects_effect_not_derived_from_its_delta() {
     let spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(45_001)),
         law_set: RewriteLawSetId(SemanticId::new(45_002)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
-    let mut rewrite = delta
-        .prepare_relation_rewrite(&old, &context, &registry, &spec, Vec::<Value>::new())
+    let rewrite = delta
+        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
         .unwrap();
-    rewrite.rewrite.effect = kernel_change::RewriteEffect::Replace(old.clone());
-    let mutation = RevisionRelationMutation {
-        relation,
-        delta: &delta,
-    };
-    let target = target_revision_for(&runtime, 451, &[mutation], &registry);
-    let rewrites = [RevisionRelationRewrite {
-        relation,
-        rewrite: &rewrite,
-    }];
 
-    assert!(matches!(
-        runtime.prepare_rewrites_for_test(&RevisionRewriteTransitionRequest {
-            target_revision: &target,
-            rewrites: &rewrites,
-            registry: &registry,
-        }),
-        Err(PhysicalExecutionError::RewriteEffectMismatch(found)) if found == relation
+    assert!(std::ptr::eq(
+        rewrite.delta(),
+        rewrite.rewrite().effect().delta(),
     ));
+    assert_eq!(rewrite.delta(), &delta);
 }
 
 #[test]
@@ -976,10 +1098,10 @@ fn derived_rewrite_endpoint_certificate_is_bound_to_exact_delta_payload() {
     let spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(45_201)),
         law_set: RewriteLawSetId(SemanticId::new(45_202)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let different_rewrite = different_delta
-        .prepare_relation_rewrite(&old, &context, &registry, &spec, Vec::<Value>::new())
+        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
         .unwrap();
     let rewrites = [RevisionRelationRewrite {
         relation,
@@ -998,7 +1120,7 @@ fn derived_rewrite_endpoint_certificate_is_bound_to_exact_delta_payload() {
 }
 
 #[test]
-fn derived_rewrite_effect_is_checked_against_certified_target_endpoint() {
+fn derived_rewrite_effect_is_bound_to_its_prepared_gamma_base() {
     let (context, registry, relation, _, runtime) = scan_runtime_bundle(454, 9964, &[1, 2, 3]);
     let delta = scan_delta(relation, &[4], &[1], &context, &registry);
     let mutation = RevisionRelationMutation {
@@ -1007,18 +1129,26 @@ fn derived_rewrite_effect_is_checked_against_certified_target_endpoint() {
     };
     let target = target_revision_for(&runtime, 455, &[mutation], &registry);
 
-    let old = RelExpr::Scan(relation)
-        .evaluate(&runtime.revision().state().model, &context, &registry)
-        .unwrap();
+    let wrong_old = kernel_query::RelationValue::Bag(vec![
+        vec![Value::I64(1)],
+        vec![Value::I64(2)],
+        vec![Value::I64(99)],
+    ]);
     let spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(45_401)),
         law_set: RewriteLawSetId(SemanticId::new(45_402)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
-    let mut rewrite = delta
-        .prepare_relation_rewrite(&old, &context, &registry, &spec, Vec::<Value>::new())
+    let rewrite = delta
+        .prepare_relation_rewrite(
+            relation,
+            &wrong_old,
+            &context,
+            &registry,
+            &spec,
+            Vec::<Value>::new(),
+        )
         .unwrap();
-    rewrite.rewrite.effect = kernel_change::RewriteEffect::Replace(old);
     let rewrites = [RevisionRelationRewrite {
         relation,
         rewrite: &rewrite,
@@ -1107,10 +1237,10 @@ fn coherent_resolution_binding_requires_cube_endpoint_and_candidate_vmf_closure(
     let spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(45_101)),
         law_set: RewriteLawSetId(SemanticId::new(45_102)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let rewrite = delta
-        .prepare_relation_rewrite(&old, &context, &registry, &spec, Vec::<Value>::new())
+        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
         .unwrap();
     let mutation = RevisionRelationMutation {
         relation,
@@ -1128,7 +1258,7 @@ fn coherent_resolution_binding_requires_cube_endpoint_and_candidate_vmf_closure(
             registry: &registry,
         })
         .unwrap();
-    let final_endpoint = rewrite.rewrite.apply(&old);
+    let final_endpoint = rewrite.apply_structural(&old, &registry).unwrap();
     let cube = relation_cube_certificate(&old, &final_endpoint);
     let coherent = prepared
         .bind_coherent_resolution(relation, cube, &registry)
@@ -2219,7 +2349,10 @@ fn materialization_registry_advances_all_registered_plans_atomically() {
             runtime.materialization_revision(id),
             Some(RevisionId::new(151))
         );
-        assert_eq!(runtime.materialization(id).unwrap().revision(), None);
+        assert_eq!(
+            runtime.materialization(id).unwrap().revision(),
+            Some(RevisionId::new(151))
+        );
     }
     let expected_filter = filter_query
         .evaluate(&runtime.revision().state().model, &context, &registry)
@@ -2285,7 +2418,7 @@ fn duplicate_materialization_id_is_rejected_at_bootstrap() {
 }
 
 #[test]
-fn revision_bound_states_reject_legacy_semantic_mutation_entrypoints() {
+fn revision_bound_states_reject_legacy_mutation_and_accept_candidate_transition() {
     let (context, registry, relation) = planning_context();
     let binding = LayoutBinding {
         id: LayoutId(966),
@@ -2327,10 +2460,17 @@ fn revision_bound_states_reject_legacy_semantic_mutation_entrypoints() {
         Err(PhysicalExecutionError::RevisionBoundMutationRequiresPreparedTransition)
     );
     assert_eq!(store, store_before);
+    let semantic_map = BTreeMap::from([(relation, delta.clone())]);
+    let plan_before = maintained.clone();
+    assert_eq!(
+        maintained.apply_relation_deltas(&semantic_map, &context, &registry),
+        Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition)
+    );
+    assert_eq!(maintained, plan_before);
 
     let resolved = StorageResolvedRelationDelta::from_parts(
         relation,
-        delta,
+        delta.clone(),
         vec![rows[0].0],
         vec![kernel_types::StableRowHandle {
             slot: rows[0].0.slot,
@@ -2339,11 +2479,17 @@ fn revision_bound_states_reject_legacy_semantic_mutation_entrypoints() {
     );
     let mut resolved_map = BTreeMap::new();
     resolved_map.insert(relation, resolved);
-    let plan_before = maintained.clone();
-    assert_eq!(
-        maintained.apply_storage_resolved_deltas(&resolved_map, &context, &registry),
-        Err(RelQueryError::RevisionBoundMutationRequiresPreparedTransition)
-    );
+    let (candidate, emitted) = maintained
+        .candidate_from_storage_resolved_deltas_for_revision(
+            RevisionId::new(91),
+            &resolved_map,
+            &context,
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(emitted, delta);
+    assert_eq!(candidate.revision(), Some(RevisionId::new(91)));
+    assert_eq!(maintained.revision(), Some(RevisionId::new(90)));
     assert_eq!(maintained, plan_before);
 }
 

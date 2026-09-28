@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kernel_auth::{KeyId, Sha256Digest, TrustRootSet, sha256};
 
-use super::DurabilityError;
+use crate::runtime::DurabilityError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportedDurabilityProfile {

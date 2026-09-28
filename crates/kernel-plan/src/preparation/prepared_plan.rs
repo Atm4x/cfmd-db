@@ -43,10 +43,12 @@ impl PreparedPlan {
         )? {
             return Err(RelQueryError::OrderingNotCongruentWithEquality.into());
         }
+        let compiled_ordering = registry.compile_ordering(&self.semantic_context, spec.ordering)?;
         Ok(PreparedOrderedView {
             plan: self,
             spec,
             equivalences: equivalences.clone(),
+            compiled_ordering,
         })
     }
 

@@ -1891,10 +1891,10 @@ fn derived_relation_rewrite_persists_intent_and_idempotency_distinguishes_spec()
     let spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(88_501)),
         law_set: RewriteLawSetId(SemanticId::new(88_502)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let rewrite = delta
-        .prepare_relation_rewrite(&old, &context, &registry, &spec, Vec::<Value>::new())
+        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
         .unwrap();
     let rewrites = [RevisionRelationRewrite {
         relation,
@@ -1936,10 +1936,11 @@ fn derived_relation_rewrite_persists_intent_and_idempotency_distinguishes_spec()
     let conflicting_spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(88_503)),
         law_set: RewriteLawSetId(SemanticId::new(88_504)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let conflicting_rewrite = delta
         .prepare_relation_rewrite(
+            relation,
             &old,
             &context,
             &registry,
@@ -1983,10 +1984,10 @@ fn coherent_resolution_gate_precedes_durable_rewrite_publication() {
     let spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(88_701)),
         law_set: RewriteLawSetId(SemanticId::new(88_702)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let rewrite = delta
-        .prepare_relation_rewrite(&old, &context, &registry, &spec, Vec::<Value>::new())
+        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
         .unwrap();
     let rewrites = [RevisionRelationRewrite {
         relation,
@@ -2013,7 +2014,7 @@ fn coherent_resolution_gate_precedes_durable_rewrite_publication() {
         RevisionId::new(887)
     );
 
-    let endpoint = rewrite.rewrite.apply(&old);
+    let endpoint = rewrite.apply_structural(&old, &registry).unwrap();
     assert!(matches!(
         runtime
             .commit_derived_coherent_resolution(
@@ -2093,10 +2094,10 @@ fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
     let spec = kernel_change::RewriteSpec {
         id: RewriteSpecId(SemanticId::new(90_301)),
         law_set: RewriteLawSetId(SemanticId::new(90_302)),
-        footprint: kernel_change::RewriteFootprint::default(),
+        footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let rewrite = delta
-        .prepare_relation_rewrite(&old, &context, &registry, &spec, Vec::<Value>::new())
+        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
         .unwrap();
     let rewrites = [RevisionRelationRewrite {
         relation,
@@ -2108,7 +2109,7 @@ fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
         rewrites: &rewrites,
     };
     let transaction_id = ClientTransactionId::new(0x9003);
-    let endpoint = rewrite.rewrite.apply(&old);
+    let endpoint = rewrite.apply_structural(&old, &registry).unwrap();
     runtime
         .commit_derived_multi_parent_residual_chain_resolution(
             transaction_id,

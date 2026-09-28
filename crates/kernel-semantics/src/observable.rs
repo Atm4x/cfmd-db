@@ -9,7 +9,9 @@ use kernel_model::Value;
 use kernel_schema::SemanticContext;
 use kernel_types::{EqClassId, RevisionObservableId, SemanticId, SemanticRevision};
 
-use crate::{CanonicalEqKey, SemanticError, SemanticRegistry};
+use crate::canonical_key::CanonicalEqKey;
+use crate::error::SemanticError;
+use crate::registry::SemanticRegistry;
 
 static NEXT_OBSERVABLE_CATALOG_INSTANCE: AtomicU64 = AtomicU64::new(1);
 

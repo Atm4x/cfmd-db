@@ -40,13 +40,13 @@ impl DurableRuntime {
             }
             mutations.push(DurableRelationMutation {
                 relation: rewrite.relation,
-                inserted: rewrite.rewrite.delta.inserted.clone(),
-                removed: rewrite.rewrite.delta.removed.clone(),
+                inserted: rewrite.rewrite.delta().inserted.clone(),
+                removed: rewrite.rewrite.delta().removed.clone(),
             });
             intents.push(DurableRelationRewriteIntent {
                 relation: rewrite.relation,
-                rewrite_spec: rewrite.rewrite.rewrite.spec.0,
-                law_set: rewrite.rewrite.rewrite.law_set.0,
+                rewrite_spec: rewrite.rewrite.rewrite().spec().0,
+                law_set: rewrite.rewrite.rewrite().law_set().0,
             });
         }
         mutations.sort_by_key(|mutation| mutation.relation);

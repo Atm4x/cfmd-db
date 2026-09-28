@@ -1,12 +1,12 @@
 # Contributing
 
-CFMD is currently in a kernel-to-product transition. Changes should preserve the explicit semantic/formal boundaries already established.
+CFMD has frozen the Pass280 global kernel hostile/refactor campaign and is now in productization. Changes should preserve the explicit semantic/formal boundaries already established.
 
 ## Required local gates
 
 ```bash
-./scripts/ci-rust.sh
-./scripts/ci-formal.sh   # when Lean is installed / proof-relevant files changed
+bash ./scripts/ci-rust.sh
+bash ./scripts/ci-formal.sh   # when Lean is installed / proof-relevant files changed
 ```
 
 ## Change discipline
@@ -17,3 +17,5 @@ CFMD is currently in a kernel-to-product transition. Changes should preserve the
 - Do not broaden a durability support claim without a new exact platform fingerprint and certification campaign.
 - Prefer a stable facade addition over exposing another internal kernel type publicly.
 - Add tests for both positive behavior and hostile/fail-closed cases when changing authority, durability or semantic boundaries.
+
+- Frozen kernels reopen only on concrete evidence (counterexample, proof/authority seam, measured regression, R&D requirement, or facade/DX requirement), not cleanup-by-inertia.

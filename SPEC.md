@@ -1,74 +1,95 @@
 # CFMD Project Specification
 
-This file is the concise, repository-facing specification. The full normative model remains in [`docs/spec/CFMD_CORE_SPEC.md`](docs/spec/CFMD_CORE_SPEC.md). Historical pass-by-pass corrections are archived under `docs/history/` and are not the primary entry point for new development.
+This is the concise repository-facing specification. The full normative model and append-only implementation record remain in [`docs/spec/CFMD_CORE_SPEC.md`](docs/spec/CFMD_CORE_SPEC.md). Historical pass artifacts are provenance, not the primary current-status interface.
 
 ## 1. State model
 
-A logical CFMD revision is treated as a coherent revisioned state, conventionally written as `Revision = (S, Γ, M)`:
+A logical CFMD revision is a coherent revisioned state, conventionally:
 
-- `S` — structural/schema state;
-- `Γ` — pinned semantic environment defining certified semantic equality, ordering, tokenization and related meaning-bearing operations;
-- `M` — logical model/data state.
+```text
+Revision = (Schema S, SemanticEnvironment Γ, finite Model M)
+```
 
-Runtime publication additionally owns the authoritative physical store and maintained materializations associated with that exact semantic revision. A published runtime revision must never mix components from different revisions.
+- `S` defines structural/nominal types, relations, constraints and semantic dependencies;
+- `Γ` pins meaning-bearing equality/order/canonicalization and certified semantic modules;
+- `M` is the finite typed model for the revision.
+
+Runtime publication additionally owns physical roots, maintained materializations and durable authority for that same revision. Published state must not mix components from different revisions.
 
 ## 2. Type and surface model
 
-The logical type universe is structural and nominal. Core structural constructors include products, sums, option, set, bag, sequence, map and guarded recursive `μ` types. Entities/references remain nominal where identity semantics require it.
+The logical universe is structural plus nominal identity. Core structural constructors include products, sums, option, set, bag, sequence, map and guarded recursive `μ` types. Entities/references remain nominal where identity semantics require it.
 
-Object/document/relational forms are surface views over the same typed kernel rather than independent peer database models.
+Object/document/relational forms are surface views over one typed kernel, not independent database models.
 
 ## 3. Semantic environment Γ
 
-Meaning is revisioned data. Operations whose behavior depends on equality, ordering, canonicalization or other semantic modules must be evaluated against the pinned `Γ` for the revision. Kernel code must not substitute incidental Rust equality/hash/order for a certified semantic operation.
+Meaning is revisioned data. Operations depending on semantic equality, ordering or canonicalization are evaluated against pinned `Γ`. Kernel code must not substitute incidental Rust `Eq`/`Hash`/`Ord` when a certified semantic operation is authoritative.
 
-Semantic implementations are authenticated/deployed through the dedicated trust boundary. Authentication proves package identity/authority; it does not replace semantic refinement/correctness checks.
+Authentication/deployment of semantic modules and semantic correctness are separate obligations.
 
 ## 4. Query and change calculus
 
-Queries are exact typed expressions over the logical model. Physical plans may vary, but checked lowering must erase exactly to the logical query and may not introduce hidden logical nodes.
+Queries are exact typed expressions over the logical model. Physical plans may specialize aggressively, but checked lowering must erase to the same logical query.
 
-Every logical type has a change semantics. Incremental execution, maintained views and writable/rewrite paths operate through typed changes rather than through ad-hoc page mutation semantics.
+Every logical type has change semantics. Incremental execution, maintained views, exact watch and writable/rewrite paths operate through typed changes rather than ad-hoc page mutation semantics.
 
-## 5. Transactions and rewrites
+## 5. Transactions, Plans and Candidates
 
-Writes are typed rewrites over revisioned state. Publication boundaries are designed so recoverable errors occur before authority changes; sealed/committed transitions are total across the authoritative publication step.
+Writes are typed rewrites over revisioned state. Recoverable errors occur before authoritative publication.
 
-## 6. Physical/runtime model
+At the product surface, advanced writes are exposed as **Plans** before commit. `preview(plan)` creates a queryable **Candidate** future world. Candidate validation, query delta, explanation, freshness/rebase and commit must reuse the same kernel/revision semantics rather than form a parallel transaction model.
 
-The current runtime uses compiled/prepared logical and physical metadata, NodeId-addressed maintained state, exact semantic indexes, persistent/COW roots where applicable, and maintained delta execution for the supported relational operators.
+## 6. Exact watch
 
-Internal physical representations are implementation details. The upcoming user-facing Rust facade must not expose kernel ownership/layout types as stable API.
+Exact watch observes the **result of a logical query**, not merely “a table changed”. A commit publishes one coherent revision-tagged delta batch. If an operator lacks a certified exact derivative, exact watch fails explicitly; optional full recomputation must be an explicit caller choice.
 
-## 7. Durability and recovery
+The watch protocol is language-neutral so Python, GUI adapters, .NET and Studio can share it.
 
-Durability uses immutable generations, WAL/prerequisite ordering, explicit directory/file synchronization, authenticated durable evidence and fail-closed recovery/publication rules.
+## 7. Physical/runtime model
 
-The publication/GC model is mechanically checked in Lean (#18) and source-bound to the Rust implementation by refinement scripts. Real durability claims are profile-scoped: a filesystem/device/kernel/QEMU configuration is supported only when its platform fingerprint and destructive campaign evidence are certified.
+The runtime uses prepared logical/physical metadata, exact semantic indexes, persistent/COW roots where appropriate, and maintained delta execution for supported operators.
 
-Current certified profile: QEMU 8.2.2 TCG, Alpine Linux 3.24.2 / Linux 6.18.52-0-virt, dedicated raw virtio device, ext4 `data=ordered`, QEMU `cache=none,aio=threads`. This does not imply bare-metal NVMe/SATA certification.
+Internal `kernel-*` representations remain implementation details. Public bindings consume a compact stable runtime/facade boundary, not crate ownership/layout types.
 
-## 8. Distribution, consensus and authenticity
+## 8. Durability and recovery
 
-The kernel contains replication/consensus authority machinery with authenticated evidence. Trust-root/key lifecycle, signed evidence and external freshness/anti-rollback boundaries are distinct from logical query semantics.
+Durability uses immutable generations, WAL/prerequisite ordering, explicit sync/publication steps, authenticated durable evidence and fail-closed recovery rules.
 
-## 9. Proof boundary
+Publication/GC obligations are mechanically checked in Lean for the declared boundary. Real durability claims remain platform-profile-scoped.
 
-Lean artifacts currently mechanize:
+Current certified profile remains the repository support-matrix profile; this does not imply blanket bare-metal/filesystem certification.
 
-- immutable-generation publication/fsync/rename/GC obligations (#18);
-- surface-to-kernel preservation and the checked-lowering boundary (#20).
+## 9. Distribution, trust and deployment
 
-The proof artifacts do not claim arbitrary Rust machine-code verification. Source-refinement binders fail closed if the production vocabulary/protocol drifts away from the mechanized model.
+Replication/transport authority, trust-root/key lifecycle, signed evidence and freshness/anti-rollback are distinct from logical query semantics. Large external artifacts are authenticated metadata-first and read through bounded contracts where applicable.
 
-## 10. Current product boundary
+## 10. Formal boundary
 
-The historical kernel problems are closed for the declared scope. The next engineering phase is the stable user-facing Rust API and release surface:
+Lean artifacts mechanize selected publication and surface-to-kernel obligations. Source-refinement binders fail closed when proof-relevant Rust vocabulary/protocol drifts from those artifacts. They do not claim arbitrary machine-code verification.
 
-- one public facade crate (`cfmd` or equivalent);
-- stable error taxonomy and resource lifecycle;
-- ergonomic schema/query/transaction APIs;
-- bulk/batch boundaries that avoid per-row abstraction overhead;
-- packaging, documentation, examples, benchmarks and compatibility work.
+## 11. Kernel status
 
-The internal `kernel-*` crates remain unstable implementation modules until that facade is defined.
+The global hostile/refactor campaign is **COMPLETE / FROZEN after Pass280** for the current declared scope.
+
+Every kernel crate has received a dedicated or grouped hostile audit proportional to its size, and the historically heavy `query/plan/semantics/durability` line was revalidated against the final workspace. `FROZEN` is evidence-driven: reopen on a counterexample, proof/authority seam, measured complexity regression, new mathematical requirement or public API/DX requirement—not for cleanup by inertia.
+
+Current inventory: [`docs/status/KERNEL_HOSTILE_LEDGER.md`](docs/status/KERNEL_HOSTILE_LEDGER.md).
+
+## 12. Product boundary
+
+The active product direction is **Python-first embedded/local CFMD**, backed by a Rust facade/runtime service and language-neutral protocol.
+
+Primary surface goals:
+
+- explicit database-bound entity sets (`db.users`);
+- familiar lazy `match/where/select/order/aggregate` operations;
+- deep symbolic relationship traversal without manual join plumbing;
+- no hidden I/O on materialized Python objects;
+- Plan → Candidate → commit workflows;
+- revision/history access and semantic inverse/undo preview;
+- exact async query-result watch;
+- one authoritative runtime shared by the application and local Studio/tooling;
+- inspectable dependencies/capabilities/explainability.
+
+Detailed design: [`docs/api/CFMD_PYTHON_FACADE_THEORY.md`](docs/api/CFMD_PYTHON_FACADE_THEORY.md). Implementation sequence: [`docs/api/PRODUCT_ROADMAP.md`](docs/api/PRODUCT_ROADMAP.md).

@@ -30,9 +30,25 @@ struct PreparedGraphNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceProgram {
-    occurrences: usize,
-    feeds: Box<[EdgeTarget]>,
-    is_root: bool,
+    occurrences: Box<[SourceOccurrence]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SourceOccurrence {
+    ordinal: u32,
+    node: NodeId,
+}
+
+impl SourceOccurrence {
+    #[must_use]
+    pub(crate) const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub(crate) const fn node(self) -> NodeId {
+        self.node
+    }
 }
 
 /// One physical transition scheduler for every relational graph shape.
@@ -54,7 +70,6 @@ pub struct PreparedRelGraph {
     nodes: Box<[PreparedGraphNode]>,
     result_types: Option<Box<[RelType]>>,
     users: Box<[Box<[NodeId]>]>,
-    source_index: BTreeMap<kernel_types::SemanticId, Box<[NodeId]>>,
     program: UnifiedTransitionProgram,
 }
 
@@ -91,12 +106,9 @@ impl PreparedRelGraph {
         root: NodeId,
     ) -> Self {
         let mut users = vec![Vec::new(); nodes.len()];
-        let mut source_index = BTreeMap::<kernel_types::SemanticId, Vec<NodeId>>::new();
         for (node_id, node) in nodes.iter().enumerate() {
             match node.inputs {
-                PreparedNodeInputs::Source(relation) => {
-                    source_index.entry(relation).or_default().push(node_id);
-                }
+                PreparedNodeInputs::Source(_) => {}
                 PreparedNodeInputs::Unary(input) => users[input].push(node_id),
                 PreparedNodeInputs::Binary { left, right } => {
                     users[left].push(node_id);
@@ -104,22 +116,17 @@ impl PreparedRelGraph {
                 }
             }
         }
-        let source_index = source_index
-            .into_iter()
-            .map(|(relation, ids)| (relation, ids.into_boxed_slice()))
-            .collect::<BTreeMap<_, _>>();
         let users = users
             .into_iter()
             .map(Vec::into_boxed_slice)
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let nodes = nodes.into_boxed_slice();
-        let program = UnifiedTransitionProgram::compile(&nodes, &users, &source_index, root);
+        let program = UnifiedTransitionProgram::compile(&nodes, &users, root);
         Self {
             nodes,
             result_types,
             users,
-            source_index,
             program,
         }
     }
@@ -136,7 +143,7 @@ impl PreparedRelGraph {
 
     #[must_use]
     pub fn source_count(&self) -> usize {
-        self.source_index.len()
+        self.program.source_count()
     }
 
     #[must_use]
@@ -175,12 +182,7 @@ impl PreparedRelGraph {
 }
 
 impl UnifiedTransitionProgram {
-    fn compile(
-        nodes: &[PreparedGraphNode],
-        users: &[Box<[NodeId]>],
-        source_index: &BTreeMap<kernel_types::SemanticId, Box<[NodeId]>>,
-        root: NodeId,
-    ) -> Self {
+    fn compile(nodes: &[PreparedGraphNode], users: &[Box<[NodeId]>], root: NodeId) -> Self {
         let mut out_edges = vec![Vec::<EdgeTarget>::new(); nodes.len()];
         for (child, node_users) in users.iter().enumerate() {
             for &user in node_users {
@@ -190,20 +192,31 @@ impl UnifiedTransitionProgram {
             }
         }
 
+        let mut occurrence_directory =
+            BTreeMap::<kernel_types::SemanticId, Vec<SourceOccurrence>>::new();
+        let mut next_ordinal = 0_u32;
+        for (node, prepared) in nodes.iter().enumerate() {
+            let PreparedNodeInputs::Source(relation) = prepared.inputs else {
+                continue;
+            };
+            occurrence_directory
+                .entry(relation)
+                .or_default()
+                .push(SourceOccurrence {
+                    ordinal: next_ordinal,
+                    node,
+                });
+            next_ordinal = next_ordinal
+                .checked_add(1)
+                .expect("compiled source occurrence count must fit u32");
+        }
+
         let mut sources = BTreeMap::new();
-        for (&relation, occurrences) in source_index {
-            let mut feeds = Vec::new();
-            let mut is_root = false;
-            for &source in occurrences {
-                is_root |= source == root;
-                feeds.extend(out_edges[source].iter().copied());
-            }
+        for (relation, compiled_occurrences) in occurrence_directory {
             sources.insert(
                 relation,
                 SourceProgram {
-                    occurrences: occurrences.len(),
-                    feeds: feeds.into_boxed_slice(),
-                    is_root,
+                    occurrences: compiled_occurrences.into_boxed_slice(),
                 },
             );
         }
@@ -231,25 +244,62 @@ impl UnifiedTransitionProgram {
     }
 
     #[must_use]
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    #[must_use]
     pub fn contains_source(&self, relation: kernel_types::SemanticId) -> bool {
         self.sources.contains_key(&relation)
     }
 
     #[must_use]
     pub fn source_occurrences(&self, relation: kernel_types::SemanticId) -> Option<usize> {
-        self.sources.get(&relation).map(|source| source.occurrences)
+        self.sources
+            .get(&relation)
+            .map(|source| source.occurrences.len())
+    }
+
+    pub(crate) fn source_occurrence_directory(
+        &self,
+        relation: kernel_types::SemanticId,
+    ) -> Option<&[SourceOccurrence]> {
+        self.sources
+            .get(&relation)
+            .map(|source| source.occurrences.as_ref())
+    }
+
+    pub(crate) fn source_node_for_occurrence(
+        &self,
+        relation: kernel_types::SemanticId,
+        ordinal: u32,
+    ) -> Option<NodeId> {
+        let occurrences = self.source_occurrence_directory(relation)?;
+        let index = occurrences
+            .binary_search_by_key(&ordinal, |occurrence| occurrence.ordinal)
+            .ok()?;
+        Some(occurrences[index].node)
     }
 
     #[must_use]
     pub fn source_is_root(&self, relation: kernel_types::SemanticId) -> bool {
-        self.sources
-            .get(&relation)
-            .is_some_and(|source| source.is_root)
+        self.sources.get(&relation).is_some_and(|source| {
+            source
+                .occurrences
+                .iter()
+                .any(|entry| entry.node == self.root)
+        })
     }
 
     #[must_use]
     pub fn source_feed_count(&self, relation: kernel_types::SemanticId) -> Option<usize> {
-        self.sources.get(&relation).map(|source| source.feeds.len())
+        self.sources.get(&relation).map(|source| {
+            source
+                .occurrences
+                .iter()
+                .map(|entry| self.out_edges[entry.node].len())
+                .sum()
+        })
     }
 
     #[must_use]
@@ -567,71 +617,29 @@ impl<D> NodeInbox<D> {
     }
 }
 
-const INBOX_PAGE: usize = 64;
-
-#[derive(Debug, Default)]
-struct PagedInboxArena<D> {
-    pages: Vec<Option<Box<[NodeInbox<D>; INBOX_PAGE]>>>,
-}
-
-impl<D> PagedInboxArena<D> {
-    fn ensure_nodes(&mut self, nodes: usize) {
-        let pages = nodes.div_ceil(INBOX_PAGE);
-        if self.pages.len() < pages {
-            self.pages.resize_with(pages, || None);
-        }
-    }
-
-    fn get_mut(&mut self, node: NodeId) -> &mut NodeInbox<D> {
-        let page = node / INBOX_PAGE;
-        let slot = node % INBOX_PAGE;
-        let entries = self.pages[page]
-            .get_or_insert_with(|| Box::new(std::array::from_fn(|_| NodeInbox::default())));
-        &mut entries[slot]
-    }
-
-    fn take(&mut self, node: NodeId) -> NodeInbox<D> {
-        let page = node / INBOX_PAGE;
-        let slot = node % INBOX_PAGE;
-        self.pages
-            .get_mut(page)
-            .and_then(Option::as_mut)
-            .map(|entries| std::mem::take(&mut entries[slot]))
-            .unwrap_or_default()
-    }
-
-    fn clear(&mut self, node: NodeId) {
-        let page = node / INBOX_PAGE;
-        let slot = node % INBOX_PAGE;
-        if let Some(Some(entries)) = self.pages.get_mut(page) {
-            entries[slot] = NodeInbox::default();
-        }
-    }
-}
-
 #[derive(Debug)]
 struct ReadyNode<D> {
     node: NodeId,
     inbox: NodeInbox<D>,
 }
 
-/// Reusable V4 scheduling scratch. No source-specific route is selected.
-/// A direct chain stays entirely in `continuation`; branching spills into the
-/// hierarchical ready-set and lazily allocated inbox pages.
+/// Reusable sparse scheduling scratch.
+///
+/// A linear chain remains allocation-free in `continuation`. Real branching
+/// spills only affected ready nodes into the ordered map, so candidate clones
+/// never allocate capacity proportional to the complete compiled graph.
 #[derive(Debug, Default)]
 pub struct UnifiedTransitionScratch<D> {
-    inboxes: PagedInboxArena<D>,
-    dirty: Vec<NodeId>,
+    node_bound: usize,
     continuation: Option<ReadyNode<D>>,
-    active: HierarchicalActivationQueue,
+    ready: BTreeMap<NodeId, NodeInbox<D>>,
 }
 
 impl<D> UnifiedTransitionScratch<D> {
     pub fn ensure_nodes(&mut self, nodes: usize) {
-        self.inboxes.ensure_nodes(nodes);
-        if self.active.capacity() != nodes {
-            self.active = HierarchicalActivationQueue::new(nodes);
-        }
+        debug_assert!(self.continuation.is_none());
+        debug_assert!(self.ready.is_empty());
+        self.node_bound = nodes;
     }
 
     pub fn deliver(
@@ -640,13 +648,16 @@ impl<D> UnifiedTransitionScratch<D> {
         slot: ExecutionInputSlot,
         delta: D,
     ) -> Result<(), RelQueryError> {
+        if node >= self.node_bound {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
         if let Some(continuation) = self.continuation.as_mut()
             && continuation.node == node
         {
             return put_side(&mut continuation.inbox, slot, delta);
         }
-        if self.active.contains(node) {
-            return put_side(self.inboxes.get_mut(node), slot, delta);
+        if let Some(inbox) = self.ready.get_mut(&node) {
+            return put_side(inbox, slot, delta);
         }
 
         let mut inbox = NodeInbox::default();
@@ -655,9 +666,9 @@ impl<D> UnifiedTransitionScratch<D> {
         match self.continuation.take() {
             None => {
                 if self
-                    .active
-                    .peek_min()
-                    .is_none_or(|queued| ready.node < queued)
+                    .ready
+                    .first_key_value()
+                    .is_none_or(|(&queued, _)| ready.node < queued)
                 {
                     self.continuation = Some(ready);
                 } else {
@@ -677,16 +688,9 @@ impl<D> UnifiedTransitionScratch<D> {
     }
 
     fn spill(&mut self, ready: ReadyNode<D>) -> Result<(), RelQueryError> {
-        if self.active.contains(ready.node) {
+        if ready.node >= self.node_bound || self.ready.insert(ready.node, ready.inbox).is_some() {
             return Err(RelQueryError::InconsistentIncrementalDelta);
         }
-        let inbox = self.inboxes.get_mut(ready.node);
-        if inbox.unary.is_some() || inbox.left.is_some() || inbox.right.is_some() {
-            return Err(RelQueryError::InconsistentIncrementalDelta);
-        }
-        *inbox = ready.inbox;
-        self.dirty.push(ready.node);
-        self.active.insert(ready.node);
         Ok(())
     }
 
@@ -694,22 +698,17 @@ impl<D> UnifiedTransitionScratch<D> {
         if let Some(ready) = self.continuation.take() {
             return Some((ready.node, ready.inbox));
         }
-        let node = self.active.pop_min()?;
-        Some((node, self.inboxes.take(node)))
+        self.ready.pop_first()
     }
 
     pub fn finish_success(&mut self) {
         debug_assert!(self.continuation.is_none());
-        debug_assert!(self.active.is_empty());
-        self.dirty.clear();
+        debug_assert!(self.ready.is_empty());
     }
 
     pub fn reset(&mut self) {
         self.continuation = None;
-        self.active.clear_all();
-        for node in self.dirty.drain(..) {
-            self.inboxes.clear(node);
-        }
+        self.ready.clear();
     }
 }
 
@@ -728,126 +727,6 @@ fn put_side<D>(
     }
     *target = Some(delta);
     Ok(())
-}
-
-#[derive(Debug, Default)]
-struct HierarchicalActivationQueue {
-    capacity: usize,
-    levels: Vec<Vec<u64>>,
-}
-
-impl HierarchicalActivationQueue {
-    fn new(capacity: usize) -> Self {
-        let mut levels = Vec::new();
-        let mut words = capacity.div_ceil(64).max(1);
-        levels.push(vec![0; words]);
-        while words > 1 {
-            words = words.div_ceil(64);
-            levels.push(vec![0; words]);
-        }
-        Self { capacity, levels }
-    }
-
-    const fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn insert(&mut self, node: NodeId) {
-        debug_assert!(node < self.capacity);
-        let word = node / 64;
-        let bit = node % 64;
-        let mask = 1_u64 << bit;
-        if self.levels[0][word] & mask != 0 {
-            return;
-        }
-        let was_zero = self.levels[0][word] == 0;
-        self.levels[0][word] |= mask;
-        if was_zero {
-            self.propagate_set(1, word);
-        }
-    }
-
-    fn propagate_set(&mut self, level: usize, child_word: usize) {
-        if level >= self.levels.len() {
-            return;
-        }
-        let word = child_word / 64;
-        let bit = child_word % 64;
-        let mask = 1_u64 << bit;
-        let was_zero = self.levels[level][word] == 0;
-        self.levels[level][word] |= mask;
-        if was_zero {
-            self.propagate_set(level + 1, word);
-        }
-    }
-
-    fn contains(&self, node: NodeId) -> bool {
-        if node >= self.capacity || self.levels.is_empty() {
-            return false;
-        }
-        self.levels[0][node / 64] & (1_u64 << (node % 64)) != 0
-    }
-
-    fn peek_min(&self) -> Option<NodeId> {
-        if self.levels.is_empty() || self.levels.last()?.first().copied().unwrap_or(0) == 0 {
-            return None;
-        }
-        let mut word_index = 0usize;
-        for level in (1..self.levels.len()).rev() {
-            let word = self.levels[level][word_index];
-            word_index = word_index * 64 + word.trailing_zeros() as usize;
-        }
-        let word = self.levels[0][word_index];
-        let node = word_index * 64 + word.trailing_zeros() as usize;
-        (node < self.capacity).then_some(node)
-    }
-
-    fn pop_min(&mut self) -> Option<NodeId> {
-        let node = self.peek_min()?;
-        self.clear_node(node);
-        Some(node)
-    }
-
-    fn clear_node(&mut self, node: NodeId) {
-        if node >= self.capacity || self.levels.is_empty() {
-            return;
-        }
-        let word = node / 64;
-        let bit = node % 64;
-        let mask = 1_u64 << bit;
-        if self.levels[0][word] & mask == 0 {
-            return;
-        }
-        self.levels[0][word] &= !mask;
-        if self.levels[0][word] == 0 {
-            self.propagate_clear(1, word);
-        }
-    }
-
-    fn propagate_clear(&mut self, level: usize, child_word: usize) {
-        if level >= self.levels.len() {
-            return;
-        }
-        let word = child_word / 64;
-        let bit = child_word % 64;
-        self.levels[level][word] &= !(1_u64 << bit);
-        if self.levels[level][word] == 0 {
-            self.propagate_clear(level + 1, word);
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.levels
-            .last()
-            .and_then(|level| level.first())
-            .copied()
-            .unwrap_or(0)
-            == 0
-    }
-
-    fn clear_all(&mut self) {
-        while self.pop_min().is_some() {}
-    }
 }
 
 #[cfg(test)]
@@ -943,19 +822,33 @@ mod tests {
         assert_eq!(program.source_occurrences(relation), Some(2));
         assert_eq!(program.source_feed_count(relation), Some(2));
         assert!(program.contains_source(kernel_types::SemanticId::new(2)));
+        let repeated = program.source_occurrence_directory(relation).unwrap();
+        assert_eq!(repeated.len(), 2);
+        assert_eq!(repeated[0].ordinal(), 0);
+        assert_eq!(repeated[0].node(), 0);
+        assert_eq!(repeated[1].ordinal(), 1);
+        assert_eq!(repeated[1].node(), 1);
+        let other = program
+            .source_occurrence_directory(kernel_types::SemanticId::new(2))
+            .unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].ordinal(), 2);
+        assert_eq!(program.source_node_for_occurrence(relation, 1), Some(1));
     }
 
     #[test]
-    fn hierarchical_queue_orders_and_deduplicates_without_route_choice() {
-        let mut queue = HierarchicalActivationQueue::new(10_000);
-        for node in [9999, 2, 4097, 2, 64, 63, 4096, 1] {
-            queue.insert(node);
+    fn sparse_ready_map_orders_only_affected_nodes_without_capacity_allocation() {
+        let mut scratch = UnifiedTransitionScratch::<i32>::default();
+        scratch.ensure_nodes(1_000_000);
+        for node in [999_999, 2, 4097, 64, 63, 4096, 1] {
+            scratch.deliver(node, ExecutionInputSlot::Unary, 1).unwrap();
         }
         let mut actual = Vec::new();
-        while let Some(node) = queue.pop_min() {
+        while let Some((node, _)) = scratch.pop_next() {
             actual.push(node);
         }
-        assert_eq!(actual, vec![1, 2, 63, 64, 4096, 4097, 9999]);
+        assert_eq!(actual, vec![1, 2, 63, 64, 4096, 4097, 999_999]);
+        scratch.finish_success();
     }
 
     #[test]
@@ -979,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_schedule_reset_discards_paged_mailboxes_and_ready_nodes() {
+    fn failed_schedule_reset_discards_sparse_ready_nodes() {
         let mut scratch = UnifiedTransitionScratch::<i32>::default();
         scratch.ensure_nodes(4097);
         scratch.deliver(4096, ExecutionInputSlot::Right, 9).unwrap();

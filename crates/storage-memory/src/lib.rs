@@ -587,6 +587,9 @@ impl MemoryStore {
 
     #[must_use]
     pub fn ancestors_including(&self, start: RevisionId) -> BTreeSet<RevisionId> {
+        if !self.revisions.contains_key(&start) {
+            return BTreeSet::new();
+        }
         let mut result = BTreeSet::new();
         let mut queue = VecDeque::from([start]);
         while let Some(current) = queue.pop_front() {
@@ -602,8 +605,25 @@ impl MemoryStore {
 
     #[must_use]
     pub fn is_ancestor(&self, possible_ancestor: RevisionId, revision: RevisionId) -> bool {
-        self.ancestors_including(revision)
-            .contains(&possible_ancestor)
+        if !self.revisions.contains_key(&possible_ancestor)
+            || !self.revisions.contains_key(&revision)
+        {
+            return false;
+        }
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::from([revision]);
+        while let Some(current) = queue.pop_front() {
+            if current == possible_ancestor {
+                return true;
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(node) = self.revisions.get(&current) {
+                queue.extend(node.parents.iter().copied());
+            }
+        }
+        false
     }
 
     #[must_use]
@@ -619,16 +639,23 @@ impl MemoryStore {
             .copied()
             .collect();
 
-        common
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                !common
-                    .iter()
-                    .copied()
-                    .any(|other| other != *candidate && self.is_ancestor(*candidate, other))
-            })
-            .collect()
+        // Common ancestors are downward-closed under parent edges: every parent
+        // of a common ancestor is itself a common ancestor. Therefore a common
+        // node is non-lowest iff it is the direct parent of another common node.
+        // One pass over the induced common subgraph is sufficient; no pairwise
+        // transitive ancestry queries are needed.
+        let mut dominated = BTreeSet::new();
+        for revision in &common {
+            if let Some(node) = self.revisions.get(revision) {
+                dominated.extend(
+                    node.parents
+                        .iter()
+                        .copied()
+                        .filter(|parent| common.contains(parent)),
+                );
+            }
+        }
+        common.difference(&dominated).copied().collect()
     }
 
     pub fn unique_merge_base(
@@ -636,6 +663,11 @@ impl MemoryStore {
         left: RevisionId,
         right: RevisionId,
     ) -> Result<RevisionId, StoreError> {
+        for revision in [left, right] {
+            if !self.revisions.contains_key(&revision) {
+                return Err(StoreError::UnknownRevision(revision));
+            }
+        }
         let lcas = self.lowest_common_ancestors(left, right);
         match (lcas.len(), lcas.iter().next().copied()) {
             (1, Some(only)) => Ok(only),
@@ -790,6 +822,23 @@ mod tests {
         assert_eq!(
             store.head().map(kernel_revision::Revision::id),
             Some(revision_id)
+        );
+    }
+
+    #[test]
+    fn unknown_revisions_never_form_synthetic_ancestry_or_merge_bases() {
+        let mut store = MemoryStore::default();
+        let context = context();
+        let root = store.bootstrap(&context, DatabaseState::default()).unwrap();
+        let unknown = RevisionId::new(999_999);
+
+        assert!(store.ancestors_including(unknown).is_empty());
+        assert!(!store.is_ancestor(unknown, unknown));
+        assert!(!store.is_ancestor(root, unknown));
+        assert!(store.lowest_common_ancestors(unknown, unknown).is_empty());
+        assert_eq!(
+            store.unique_merge_base(unknown, root),
+            Err(StoreError::UnknownRevision(unknown))
         );
     }
 

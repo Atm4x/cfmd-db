@@ -190,6 +190,37 @@ impl DenseUnit {
             }
         }
     }
+
+    fn visit_ordered_until(
+        &self,
+        direction: OrderDirection,
+        mut visitor: impl FnMut(i64, usize) -> bool,
+    ) {
+        let mut visit_index = |index: usize| {
+            let occupied = (self.occupied[index >> 6] >> (index & 63)) & 1 != 0;
+            occupied
+                && visitor(
+                    self.base + i64::try_from(index).expect("dense slot fits i64"),
+                    1,
+                )
+        };
+        match direction {
+            OrderDirection::Ascending => {
+                for index in 0..self.slots {
+                    if visit_index(index) {
+                        break;
+                    }
+                }
+            }
+            OrderDirection::Descending => {
+                for index in (0..self.slots).rev() {
+                    if visit_index(index) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl DenseCounted {
@@ -254,6 +285,37 @@ impl DenseCounted {
                     self.base + i64::try_from(index).expect("dense slot fits i64"),
                     count,
                 );
+            }
+        }
+    }
+
+    fn visit_ordered_until(
+        &self,
+        direction: OrderDirection,
+        mut visitor: impl FnMut(i64, usize) -> bool,
+    ) {
+        let mut visit_index = |index: usize| {
+            let count = self.counts[index];
+            count != 0
+                && visitor(
+                    self.base + i64::try_from(index).expect("dense slot fits i64"),
+                    count,
+                )
+        };
+        match direction {
+            OrderDirection::Ascending => {
+                for index in 0..self.counts.len() {
+                    if visit_index(index) {
+                        break;
+                    }
+                }
+            }
+            OrderDirection::Descending => {
+                for index in (0..self.counts.len()).rev() {
+                    if visit_index(index) {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -375,6 +437,53 @@ impl PagedRadix {
             }
         }
     }
+
+    fn visit_ordered_until(
+        &self,
+        direction: OrderDirection,
+        mut visitor: impl FnMut(i64, usize) -> bool,
+    ) {
+        let mut visit_page = |page_key: u64, page: &RadixPage, descending: bool| {
+            if descending {
+                for slot in (0..RADIX_SLOTS).rev() {
+                    if page.counts[slot] != 0 {
+                        let rank =
+                            (page_key << RADIX_SHIFT) | u64::try_from(slot).expect("slot fits");
+                        if visitor(Self::key(rank), page.counts[slot]) {
+                            return true;
+                        }
+                    }
+                }
+            } else {
+                for slot in 0..RADIX_SLOTS {
+                    if page.counts[slot] != 0 {
+                        let rank =
+                            (page_key << RADIX_SHIFT) | u64::try_from(slot).expect("slot fits");
+                        if visitor(Self::key(rank), page.counts[slot]) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+        match direction {
+            OrderDirection::Ascending => {
+                for (&page_key, page) in &self.pages {
+                    if visit_page(page_key, page, false) {
+                        break;
+                    }
+                }
+            }
+            OrderDirection::Descending => {
+                for (&page_key, page) in self.pages.iter().rev() {
+                    if visit_page(page_key, page, true) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl PhysicalCounts {
@@ -488,13 +597,16 @@ impl PhysicalCounts {
         map
     }
 
-    fn ordered_entries(&self, direction: OrderDirection) -> Vec<(i64, usize)> {
-        let mut entries = Vec::new();
-        self.visit(|key, count| entries.push((key, count)));
-        if matches!(direction, OrderDirection::Descending) {
-            entries.reverse();
+    fn visit_ordered_until(
+        &self,
+        direction: OrderDirection,
+        visitor: impl FnMut(i64, usize) -> bool,
+    ) {
+        match self {
+            Self::DenseUnit(state) => state.visit_ordered_until(direction, visitor),
+            Self::DenseCounted(state) => state.visit_ordered_until(direction, visitor),
+            Self::PagedRadix(state) => state.visit_ordered_until(direction, visitor),
         }
-        entries
     }
 
     fn previous_numeric(&self, key: i64) -> Option<i64> {
@@ -565,11 +677,11 @@ impl I64TopKState {
             return BTreeMap::new();
         };
         let mut selected = BTreeMap::new();
-        self.counts.visit(|key, count| {
-            if self.selected_by_threshold(key, threshold) {
+        self.counts
+            .visit_ordered_until(self.direction, |key, count| {
                 selected.insert(key, count);
-            }
-        });
+                key == threshold
+            });
         selected
     }
 
@@ -1075,16 +1187,22 @@ impl I64TopKState {
             return;
         }
         let mut better_rows = 0_usize;
-        for (key, count) in self.counts.ordered_entries(self.direction) {
-            if better_rows.saturating_add(count) >= effective_k {
-                self.threshold = Some(key);
-                self.threshold_count = count;
-                self.better_rows = better_rows;
-                return;
-            }
-            better_rows = better_rows.saturating_add(count);
-        }
-        unreachable!("positive effective k must have a threshold");
+        let mut boundary = None;
+        self.counts
+            .visit_ordered_until(self.direction, |key, count| {
+                if better_rows.saturating_add(count) >= effective_k {
+                    boundary = Some((key, count, better_rows));
+                    true
+                } else {
+                    better_rows = better_rows.saturating_add(count);
+                    false
+                }
+            });
+        let (threshold, threshold_count, better_rows) =
+            boundary.expect("positive effective k must have a threshold");
+        self.threshold = Some(threshold);
+        self.threshold_count = threshold_count;
+        self.better_rows = better_rows;
     }
 
     fn selected_by_threshold(&self, key: i64, threshold: i64) -> bool {
@@ -1134,6 +1252,46 @@ fn selected_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_threshold_visit_stops_at_boundary_for_all_physical_counts() {
+        let cases = [
+            (
+                BTreeMap::from([(0, 1), (1, 1), (2, 1)]),
+                I64TopKPhysicalKind::DenseUnit,
+            ),
+            (
+                BTreeMap::from([(0, 2), (1, 1)]),
+                I64TopKPhysicalKind::DenseCounted,
+            ),
+            (
+                BTreeMap::from([(0, 1), (1_000_000, 1)]),
+                I64TopKPhysicalKind::PagedRadix,
+            ),
+        ];
+
+        for (counts, expected_kind) in cases {
+            let physical = PhysicalCounts::build(&counts);
+            assert_eq!(physical.kind(), expected_kind);
+            for (direction, expected_key) in [
+                (
+                    OrderDirection::Ascending,
+                    *counts.first_key_value().unwrap().0,
+                ),
+                (
+                    OrderDirection::Descending,
+                    *counts.last_key_value().unwrap().0,
+                ),
+            ] {
+                let mut visited = Vec::new();
+                physical.visit_ordered_until(direction, |key, _| {
+                    visited.push(key);
+                    true
+                });
+                assert_eq!(visited, vec![expected_key]);
+            }
+        }
+    }
 
     fn oracle(
         counts: &BTreeMap<i64, usize>,

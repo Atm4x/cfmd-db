@@ -13,7 +13,7 @@ use kernel_schema::{
     TypeExpr,
 };
 use kernel_semantics::{EquivalenceModule, SemanticRegistry};
-use kernel_types::{SchemaRevisionId, SemanticEnvId, SemanticId};
+use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
 
 fn sid(value: u128) -> SemanticId {
     SemanticId::new(value)
@@ -87,6 +87,23 @@ fn median(mut samples: Vec<u128>) -> u128 {
     samples[samples.len() / 2]
 }
 
+fn advance_certified(
+    state: &MaterializedRelPlanState,
+    deltas: &BTreeMap<SemanticId, kernel_query::StorageResolvedRelationDelta>,
+    context: &SemanticContext,
+    registry: &SemanticRegistry,
+) -> MaterializedRelPlanState {
+    state
+        .candidate_from_storage_resolved_deltas_for_revision(
+            RevisionId::new(2),
+            deltas,
+            context,
+            registry,
+        )
+        .unwrap()
+        .0
+}
+
 fn run(rows: usize) -> (u128, u128, u128) {
     let (context, registry, relation, binding, model, native, delta) = setup(rows);
     let query = RelExpr::Scan(relation);
@@ -126,15 +143,14 @@ fn run(rows: usize) -> (u128, u128, u128) {
             MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
         let rows = store.logical_rows_with_handles(relation, binding).unwrap();
         state.attach_storage_rows(relation, &rows).unwrap();
+        state.bind_revision(RevisionId::new(1)).unwrap();
         let certified = store
             .apply_relation_delta_resolved(relation, binding, &delta, &context, &registry)
             .unwrap();
         let mut certified_map = BTreeMap::new();
         certified_map.insert(relation, certified);
         let start = Instant::now();
-        state
-            .apply_storage_resolved_deltas(black_box(&certified_map), &context, &registry)
-            .unwrap();
+        let state = advance_certified(&state, black_box(&certified_map), &context, &registry);
         certified_samples.push(start.elapsed().as_nanos());
         black_box(state);
     }
@@ -158,6 +174,7 @@ fn run(rows: usize) -> (u128, u128, u128) {
             MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
         let rows = store.logical_rows_with_handles(relation, binding).unwrap();
         state.attach_storage_rows(relation, &rows).unwrap();
+        state.bind_revision(RevisionId::new(1)).unwrap();
         let start = Instant::now();
         let certified = store
             .apply_relation_delta_resolved(
@@ -170,9 +187,7 @@ fn run(rows: usize) -> (u128, u128, u128) {
             .unwrap();
         let mut certified_map = BTreeMap::new();
         certified_map.insert(relation, certified);
-        state
-            .apply_storage_resolved_deltas(&certified_map, &context, &registry)
-            .unwrap();
+        let state = advance_certified(&state, &certified_map, &context, &registry);
         end_to_end_samples.push(start.elapsed().as_nanos());
         black_box((state, store));
     }

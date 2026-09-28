@@ -1,47 +1,59 @@
-# User-Facing Rust API Roadmap
+# Rust Runtime / Facade Roadmap
 
-The next major project phase is a stable Rust facade over the now-converged kernel.
+## Role after Pass280
 
-## Design rule
+Rust remains the implementation/runtime language and needs a stable boundary above the internal `kernel-*` crates. It is **not** the reason to delay the Python-first product surface until a large standalone Rust application API is perfected.
 
-Applications should depend on one public crate and should not need to import `kernel-*` crates directly.
+The intended layering is:
 
-Conceptual target:
-
-```rust,ignore
-use cfmd::{Database, Result};
-
-fn main() -> Result<()> {
-    let db = Database::open("app.cfmd")?;
-    // schema/query/transaction API to be designed at the facade layer
-    Ok(())
-}
+```text
+Python public facade
+        │
+        │ compact typed query/rewrite/runtime IR
+        ▼
+Python binding bridge
+        │
+        ▼
+Rust facade / runtime service
+        │
+        ├── query compile / execution
+        ├── revision contexts
+        ├── Plan / Candidate
+        ├── exact watch protocol
+        ├── history / inverse
+        └── tooling transport
+        ▼
+internal CFMD kernel crates
 ```
 
-## Public surface goals
+## Required Rust boundary
 
-- stable `Database` / open/create/close lifecycle;
-- explicit transaction/revision boundary without exposing internal publication machinery;
-- typed schema/model construction;
-- ergonomic query builder that compiles to the existing exact `RelExpr`/prepared-plan machinery;
-- typed rewrite/write API;
-- bulk insert/query/change boundaries;
-- stable error taxonomy separating validation, semantic, conflict, durability, authentication and unsupported-platform failures;
-- diagnostics/introspection that exposes supported facts without leaking mutable internal structures;
-- explicit opt-in APIs for advanced Γ/deployment/replication functionality.
+The Rust facade/runtime layer must provide stable ownership/lifecycle contracts for bindings without exposing internal crate topology:
 
-## Non-goals for the first facade
+- database open/create/close and authoritative runtime ownership;
+- schema introspection and typed identifier handles;
+- compact query IR submission/compilation/execution;
+- revision/historical contexts;
+- Plan/rewrite submission;
+- Candidate creation/query/delta/validation/rebase/commit/discard;
+- exact watch register/resume/cancel and revision-tagged delta delivery;
+- history access/inverse construction;
+- diagnostics/explainability;
+- local tooling transport entry points;
+- stable error/resource-limit taxonomy.
 
-- exposing internal `NodeId`, maintained-plan nodes or physical COW ownership;
-- making every internal crate semver-stable;
-- implementing a complete SQL parser before the native API is usable;
-- tying the first public API to Python/FFI constraints.
+## Boundary rules
 
-## Acceptance criteria for API v0.1
+- applications/bindings do not import internal `kernel-*` types as public contracts;
+- no public NodeId/maintained-plan/COW ownership leakage;
+- bulk operations cross the facade in batches rather than per-row FFI calls;
+- internal kernel refactors may continue behind the facade without changing application semantics;
+- Python/.NET/Rust clients must share one semantic runtime protocol rather than separate implementations of watch/Candidate/history.
 
-1. A small embedded application can create/open a DB, define data, transact and query using only the facade crate.
-2. Ordinary users never need to construct internal revision/plan/publication types.
-3. Bulk operations avoid per-row facade overhead.
-4. Public errors are deterministic and documented.
-5. Examples are executable tests.
-6. Internal crate refactors can occur without breaking facade callers unless the public contract itself changes.
+## Rust application API
+
+A direct Rust application facade remains desirable after the runtime boundary stabilizes. It can then expose idiomatic typed builders over the same IR/protocol used by Python instead of creating a competing semantic surface.
+
+## Acceptance gate
+
+The boundary is ready when Python bindings can implement the product roadmap without calling internal kernel crates directly, without per-row abstraction overhead, and without reproducing query/watch/Candidate logic in Python.

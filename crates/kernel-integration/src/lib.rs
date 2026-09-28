@@ -1,3 +1,19 @@
+mod certification;
+mod join;
+mod preimage;
+mod projection;
+
+use certification::{OwnerCertificationContext, certify_owner_candidate};
+use join::{
+    PreparedDirectJoinLift,
+    synthesize_direct_scan_join_source_rewrite_with_constructor_for_commit_prepared,
+};
+#[cfg(test)]
+use join::{
+    synthesize_direct_scan_join_source_rewrite_for_commit,
+    synthesize_direct_scan_join_source_rewrite_with_constructor_for_commit,
+    validate_direct_lookup_key_uniqueness,
+};
 use kernel_change::PreparedRewrite;
 use kernel_lens::{
     RelRewriteLiftError, RelRewriteLiftStage, RelWritableBindingError, RelWritableCompilation,
@@ -10,7 +26,9 @@ use kernel_plan::{
 };
 use kernel_query::RelationValue;
 use kernel_types::{ClientTransactionId, RevisionId};
-use std::collections::BTreeMap;
+use preimage::GammaPreimageCatalog;
+use projection::PreparedProjectionPath;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub enum WritableViewCommitError {
@@ -52,12 +70,155 @@ pub enum PreparedWritableCompilationError {
     Coordinates(WritableCoordinatePrepareError),
     Bindings(RelWritableBindingError),
     Determinants(kernel_semantics::anchor_pullback::AnchorPullbackError),
+    Lift(RelRewriteLiftError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedWritableCompilation {
-    pub coordinates: PreparedRelWritableCoordinates,
-    pub compilation: RelWritableCompilation,
+    coordinates: PreparedRelWritableCoordinates,
+    compilation: RelWritableCompilation,
+    strategy: PreparedRelWritableLiftStrategy,
+}
+
+impl PreparedWritableCompilation {
+    #[must_use]
+    pub const fn coordinates(&self) -> &PreparedRelWritableCoordinates {
+        &self.coordinates
+    }
+
+    #[must_use]
+    pub const fn compilation(&self) -> &RelWritableCompilation {
+        &self.compilation
+    }
+}
+
+fn prepared_writable_plan(
+    compilation: &RelWritableCompilation,
+) -> Result<&RelWritableViewPlan, RelRewriteLiftError> {
+    match compilation {
+        RelWritableCompilation::Writable(plan)
+        | RelWritableCompilation::Conditional { plan, .. } => Ok(plan),
+        RelWritableCompilation::ReadOnly(_) => {
+            Err(RelRewriteLiftError::CandidateGenerationUnsupported)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedLiftBase {
+    owner_query: kernel_query::PreparedRelExpr,
+    view_query: kernel_query::PreparedRelExpr,
+}
+
+impl PreparedLiftBase {
+    fn prepare(
+        plan: &RelWritableViewPlan,
+        semantic: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelRewriteLiftError> {
+        Ok(Self {
+            owner_query: kernel_query::RelExpr::Scan(plan.owner_relation)
+                .prepare(semantic, registry)?,
+            view_query: plan.query.prepare(semantic, registry)?,
+        })
+    }
+
+    fn owner_type(&self) -> &kernel_query::RelType {
+        self.owner_query.result_type()
+    }
+
+    fn view_type(&self) -> &kernel_query::RelType {
+        self.view_query.result_type()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedIdentityLift {
+    base: PreparedLiftBase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedProjectLift {
+    base: PreparedLiftBase,
+    projection: PreparedProjectionPath,
+}
+
+impl PreparedProjectLift {
+    fn prepare(
+        plan: &RelWritableViewPlan,
+        semantic: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelRewriteLiftError> {
+        let base = PreparedLiftBase::prepare(plan, semantic, registry)?;
+        let projection = PreparedProjectionPath::from_output_origins(
+            &plan.output_origins,
+            plan.owner_relation,
+            base.owner_type().columns.len(),
+        )?;
+        Ok(Self { base, projection })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedFilterLift {
+    base: PreparedLiftBase,
+    complement_query: kernel_query::PreparedRelExpr,
+}
+
+impl PreparedFilterLift {
+    fn prepare(
+        plan: &RelWritableViewPlan,
+        semantic: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelRewriteLiftError> {
+        let base = PreparedLiftBase::prepare(plan, semantic, registry)?;
+        let complement_query = kernel_query::RelExpr::Difference {
+            left: Box::new(kernel_query::RelExpr::Scan(plan.owner_relation)),
+            right: Box::new(plan.query.clone()),
+        }
+        .prepare(semantic, registry)?;
+        Ok(Self {
+            base,
+            complement_query,
+        })
+    }
+}
+
+fn synthesize_identity_source_rewrite_for_commit<I: Clone>(
+    plan: &RelWritableViewPlan,
+    prepared: &PreparedIdentityLift,
+    source: &kernel_model::FiniteModel,
+    semantic: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+    source_spec: &kernel_change::RewriteSpec,
+    requested_view: &PreparedRewrite<RelationValue, I>,
+) -> Result<kernel_query::PreparedRelationRewrite<I>, RelRewriteLiftError> {
+    if source_spec.id != plan.rewrite_spec {
+        return Err(RelRewriteLiftError::SourceRewriteSpecMismatch {
+            expected: plan.rewrite_spec,
+            actual: source_spec.id,
+        });
+    }
+    let old_owner = prepared
+        .base
+        .owner_query
+        .evaluate(source, semantic, registry)?;
+    let requested_endpoint = requested_view.apply(&old_owner);
+    let delta = kernel_query::RelationDelta::between_values(
+        &old_owner,
+        &requested_endpoint,
+        prepared.base.owner_type().clone(),
+        semantic,
+        registry,
+    )?;
+    Ok(delta.prepare_relation_rewrite(
+        plan.owner_relation,
+        &old_owner,
+        semantic,
+        registry,
+        source_spec,
+        requested_view.explicit_inputs.clone(),
+    )?)
 }
 
 /// Compiles a writable relational query directly from the same pinned
@@ -89,61 +250,51 @@ pub fn compile_prepared_relational_writable_query(
     };
     let compilation = kernel_lens::compile_rel_writable_query(prepared.logical(), &context)
         .map_err(PreparedWritableCompilationError::Determinants)?;
+    let strategy = match &compilation {
+        RelWritableCompilation::Writable(plan)
+        | RelWritableCompilation::Conditional { plan, .. } => {
+            prepare_rel_writable_lift_strategy(plan, prepared.semantic_context(), registry)
+                .map_err(PreparedWritableCompilationError::Lift)?
+        }
+        RelWritableCompilation::ReadOnly(_) => PreparedRelWritableLiftStrategy::ReadOnly,
+    };
     Ok(PreparedWritableCompilation {
         coordinates,
         compilation,
+        strategy,
     })
 }
 
 fn synthesize_filter_source_rewrite_for_commit<I: Clone>(
     plan: &RelWritableViewPlan,
+    prepared: &PreparedFilterLift,
     source: &kernel_model::FiniteModel,
     semantic: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
     source_spec: &kernel_change::RewriteSpec,
     requested_view: &PreparedRewrite<RelationValue, I>,
 ) -> Result<kernel_query::PreparedRelationRewrite<I>, RelRewriteLiftError> {
-    use std::collections::BTreeSet;
-
     if source_spec.id != plan.rewrite_spec {
         return Err(RelRewriteLiftError::SourceRewriteSpecMismatch {
             expected: plan.rewrite_spec,
             actual: source_spec.id,
         });
     }
-    let allowed = BTreeSet::from([
-        RelWritableObligation::PredicateAdmissibility,
-        RelWritableObligation::DtcGuardNoImpact,
-        RelWritableObligation::VmfInvariantClosure,
-    ]);
-    if !plan.required_obligations.is_subset(&allowed)
-        || plan.stages.is_empty()
-        || !plan.stages.iter().all(|stage| {
-            matches!(
-                stage,
-                RelRewriteLiftStage::FilterEqConst { .. }
-                    | RelRewriteLiftStage::FilterEqColumns { .. }
-            )
-        })
-    {
-        return Err(RelRewriteLiftError::UnresolvedObligations(
-            plan.required_obligations.clone(),
-        ));
-    }
-
-    let scan = kernel_query::RelExpr::Scan(plan.owner_relation);
-    let old_owner = scan.evaluate(source, semantic, registry)?;
-    let old_view = plan.query.evaluate(source, semantic, registry)?;
+    let old_owner = prepared
+        .base
+        .owner_query
+        .evaluate(source, semantic, registry)?;
+    let old_view = prepared
+        .base
+        .view_query
+        .evaluate(source, semantic, registry)?;
     let requested_endpoint = requested_view.apply(&old_view);
-    let complement = kernel_query::RelExpr::Difference {
-        left: Box::new(scan.clone()),
-        right: Box::new(plan.query.clone()),
-    }
-    .evaluate(source, semantic, registry)?;
-    let owner_type = scan.typecheck(semantic, registry)?;
+    let complement = prepared
+        .complement_query
+        .evaluate(source, semantic, registry)?;
     let mut reconstructed_rows = requested_endpoint.rows().to_vec();
     reconstructed_rows.extend(complement.rows().iter().cloned());
-    let reconstructed = match &owner_type.semantics {
+    let reconstructed = match &prepared.base.owner_type().semantics {
         kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(reconstructed_rows),
         kernel_schema::RelationSemantics::Set {
             column_equivalences,
@@ -152,42 +303,26 @@ fn synthesize_filter_source_rewrite_for_commit<I: Clone>(
             column_equivalences: column_equivalences.clone(),
         },
     };
-    let delta = kernel_query::RelationDelta::between_values(
+    certify_owner_candidate(
+        plan,
+        requested_view,
         &old_owner,
-        &reconstructed,
-        owner_type,
-        semantic,
-        registry,
-    )?;
-    let normalized_endpoint = delta.apply_to_value(old_owner.clone(), semantic, registry)?;
-    let mut candidate_model = source.clone();
-    candidate_model
-        .relations
-        .insert(plan.owner_relation, normalized_endpoint.into_rows());
-    let actual_view = plan.query.evaluate(&candidate_model, semantic, registry)?;
-    let view_type = plan.query.typecheck(semantic, registry)?;
-    if !kernel_query::RelationDelta::between_values(
-        &actual_view,
         &requested_endpoint,
-        view_type,
-        semantic,
-        registry,
-    )?
-    .is_empty()
-    {
-        return Err(RelRewriteLiftError::RequestedViewInadmissible);
-    }
-    Ok(delta.prepare_relation_rewrite(
-        &old_owner,
-        semantic,
-        registry,
-        source_spec,
-        requested_view.explicit_inputs.clone(),
-    )?)
+        &reconstructed,
+        &OwnerCertificationContext {
+            source,
+            semantic,
+            registry,
+            source_spec,
+            owner_type: prepared.base.owner_type(),
+            view_query: &prepared.base.view_query,
+        },
+    )
 }
 
 fn synthesize_bijective_project_source_rewrite_for_commit<I: Clone>(
     plan: &RelWritableViewPlan,
+    prepared: &PreparedProjectLift,
     source: &kernel_model::FiniteModel,
     semantic: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
@@ -200,51 +335,22 @@ fn synthesize_bijective_project_source_rewrite_for_commit<I: Clone>(
             actual: source_spec.id,
         });
     }
-    if !plan.required_obligations.is_empty()
-        || plan.stages.is_empty()
-        || !plan
-            .stages
-            .iter()
-            .all(|stage| matches!(stage, RelRewriteLiftStage::Project { .. }))
-    {
-        return Err(RelRewriteLiftError::UnresolvedObligations(
-            plan.required_obligations.clone(),
-        ));
-    }
-
-    let scan = kernel_query::RelExpr::Scan(plan.owner_relation);
-    let old_owner = scan.evaluate(source, semantic, registry)?;
-    let old_view = plan.query.evaluate(source, semantic, registry)?;
+    let old_owner = prepared
+        .base
+        .owner_query
+        .evaluate(source, semantic, registry)?;
+    let old_view = prepared
+        .base
+        .view_query
+        .evaluate(source, semantic, registry)?;
     let requested_endpoint = requested_view.apply(&old_view);
-    let owner_type = scan.typecheck(semantic, registry)?;
+    let rows = requested_endpoint
+        .rows()
+        .iter()
+        .map(|row| prepared.projection.invert_bijective_row(row))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let mut rows = requested_endpoint.rows().to_vec();
-    for stage in plan.stages.iter().rev() {
-        let RelRewriteLiftStage::Project { columns } = stage else {
-            unreachable!("project-only stage predicate checked above");
-        };
-        if columns.len() != owner_type.columns.len() {
-            return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-        }
-        let mut seen = vec![false; columns.len()];
-        for &source_column in columns {
-            if source_column >= columns.len() || seen[source_column] {
-                return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-            }
-            seen[source_column] = true;
-        }
-        for row in &mut rows {
-            if row.len() != columns.len() {
-                return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-            }
-            let projected = row.clone();
-            for (view_column, &source_column) in columns.iter().enumerate() {
-                row[source_column] = projected[view_column].clone();
-            }
-        }
-    }
-
-    let reconstructed = match &owner_type.semantics {
+    let reconstructed = match &prepared.base.owner_type().semantics {
         kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
         kernel_schema::RelationSemantics::Set {
             column_equivalences,
@@ -253,136 +359,49 @@ fn synthesize_bijective_project_source_rewrite_for_commit<I: Clone>(
             column_equivalences: column_equivalences.clone(),
         },
     };
-    let delta = kernel_query::RelationDelta::between_values(
+    certify_owner_candidate(
+        plan,
+        requested_view,
         &old_owner,
-        &reconstructed,
-        owner_type,
-        semantic,
-        registry,
-    )?;
-    let normalized_endpoint = delta.apply_to_value(old_owner.clone(), semantic, registry)?;
-    let mut candidate_model = source.clone();
-    candidate_model
-        .relations
-        .insert(plan.owner_relation, normalized_endpoint.into_rows());
-    let actual_view = plan.query.evaluate(&candidate_model, semantic, registry)?;
-    let view_type = plan.query.typecheck(semantic, registry)?;
-    if !kernel_query::RelationDelta::between_values(
-        &actual_view,
         &requested_endpoint,
-        view_type,
-        semantic,
-        registry,
-    )?
-    .is_empty()
-    {
-        return Err(RelRewriteLiftError::RequestedViewInadmissible);
-    }
-    Ok(delta.prepare_relation_rewrite(
-        &old_owner,
-        semantic,
-        registry,
-        source_spec,
-        requested_view.explicit_inputs.clone(),
-    )?)
-}
-
-fn project_owner_row(
-    plan: &RelWritableViewPlan,
-    row: &[kernel_model::Value],
-) -> Result<kernel_query::Row, RelRewriteLiftError> {
-    let mut projected = row.to_vec();
-    for stage in &plan.stages {
-        let RelRewriteLiftStage::Project { columns } = stage else {
-            return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-        };
-        let previous = projected;
-        projected = columns
-            .iter()
-            .map(|&column| {
-                previous
-                    .get(column)
-                    .cloned()
-                    .ok_or(RelRewriteLiftError::CandidateGenerationUnsupported)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-    }
-    Ok(projected)
-}
-
-fn rows_equal_for_type(
-    left: &[kernel_model::Value],
-    right: &[kernel_model::Value],
-    relation_type: &kernel_query::RelType,
-    semantic: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<bool, RelRewriteLiftError> {
-    let equivalences = match &relation_type.semantics {
-        kernel_schema::RelationSemantics::Set {
-            column_equivalences,
-        }
-        | kernel_schema::RelationSemantics::Bag {
-            column_equivalences,
-        } => column_equivalences,
-    };
-    if left.len() != right.len() || left.len() != equivalences.len() {
-        return Ok(false);
-    }
-    for ((left, right), &equivalence) in left.iter().zip(right).zip(equivalences) {
-        if !registry
-            .equivalent(semantic, equivalence, left, right)
-            .map_err(kernel_query::RelQueryError::from)?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+        &reconstructed,
+        &OwnerCertificationContext {
+            source,
+            semantic,
+            registry,
+            source_spec,
+            owner_type: prepared.base.owner_type(),
+            view_query: &prepared.base.view_query,
+        },
+    )
 }
 
 fn reconstruct_lossy_project_deletion(
-    plan: &RelWritableViewPlan,
     old_owner: &RelationValue,
     owner_type: &kernel_query::RelType,
     view_type: &kernel_query::RelType,
     removed_rows: &[kernel_query::Row],
     semantic: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
+    catalog: &mut GammaPreimageCatalog,
 ) -> Result<RelationValue, RelRewriteLiftError> {
     let view_is_set = matches!(
         view_type.semantics,
         kernel_schema::RelationSemantics::Set { .. }
     );
-    let mut remaining = old_owner.rows().to_vec();
+    let mut removed = vec![false; old_owner.rows().len()];
     for removed_view in removed_rows {
-        let mut matching = Vec::new();
-        for (index, source_row) in remaining.iter().enumerate() {
-            let projected = project_owner_row(plan, source_row)?;
-            if rows_equal_for_type(&projected, removed_view, view_type, semantic, registry)? {
-                matching.push(index);
-            }
-        }
-        let Some(&first) = matching.first() else {
-            return Err(RelRewriteLiftError::RequestedViewInadmissible);
-        };
-        if view_is_set {
-            for index in matching.into_iter().rev() {
-                remaining.remove(index);
-            }
-            continue;
-        }
-        for &index in matching.iter().skip(1) {
-            if !rows_equal_for_type(
-                &remaining[first],
-                &remaining[index],
-                owner_type,
-                semantic,
-                registry,
-            )? {
-                return Err(RelRewriteLiftError::ProjectionPreimageAmbiguous);
-            }
-        }
-        remaining.remove(first);
+        let class =
+            GammaPreimageCatalog::class_for_view_row(removed_view, view_type, semantic, registry)?;
+        catalog.remove_requested(&class, &mut removed, view_is_set)?;
     }
+    let remaining = old_owner
+        .rows()
+        .iter()
+        .zip(removed)
+        .filter(|(_, removed)| !*removed)
+        .map(|(row, _)| row.clone())
+        .collect::<Vec<_>>();
     Ok(match &owner_type.semantics {
         kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(remaining),
         kernel_schema::RelationSemantics::Set {
@@ -395,10 +414,12 @@ fn reconstruct_lossy_project_deletion(
 }
 
 struct RuntimeProjectDeterminantContext<'a> {
+    projection: &'a PreparedProjectionPath,
     owner_type: &'a kernel_query::RelType,
     view_type: &'a kernel_query::RelType,
     semantic: &'a kernel_schema::SemanticContext,
     registry: &'a kernel_semantics::SemanticRegistry,
+    preimages: &'a GammaPreimageCatalog,
 }
 
 fn extend_lossy_bag_project_from_runtime_determinant(
@@ -427,19 +448,13 @@ fn extend_lossy_bag_project_from_runtime_determinant(
     let reconstructed_rows = match reconstructed {
         RelationValue::Bag(rows) | RelationValue::Set { rows, .. } => rows,
     };
-    let visible_columns = owner_projection_columns(plan, context.owner_type.columns.len())?;
-    let visible_set = visible_columns
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let hidden_columns = (0..context.owner_type.columns.len())
-        .filter(|column| !visible_set.contains(column))
-        .collect::<Vec<_>>();
+    let visible_columns = context.projection.visible_columns();
+    let hidden_columns = context.projection.hidden_columns();
     let before = coordinates
         .relation_determinant_morphism(
             plan.owner_relation,
             old_owner,
-            &visible_columns,
+            visible_columns,
             &hidden_columns,
             context.semantic,
             context.registry,
@@ -448,22 +463,13 @@ fn extend_lossy_bag_project_from_runtime_determinant(
         .ok_or(RelRewriteLiftError::ProjectionPreimageAmbiguous)?;
     let mut constructed_new_domain = false;
     for inserted_view in inserted_rows {
-        let mut representative = None;
-        for source_row in old_owner.rows() {
-            let projected = project_owner_row(plan, source_row)?;
-            if !rows_equal_for_type(
-                &projected,
-                inserted_view,
-                context.view_type,
-                context.semantic,
-                context.registry,
-            )? {
-                continue;
-            }
-            representative = Some(source_row);
-            break;
-        }
-        if let Some(representative) = representative {
+        let class = GammaPreimageCatalog::class_for_view_row(
+            inserted_view,
+            context.view_type,
+            context.semantic,
+            context.registry,
+        )?;
+        if let Some(representative) = context.preimages.representative(&class, old_owner.rows()) {
             debug_assert!(!before.materialized_mapping().is_empty());
             reconstructed_rows.push(representative.clone());
             continue;
@@ -473,8 +479,8 @@ fn extend_lossy_bag_project_from_runtime_determinant(
         };
         reconstructed_rows.push(construct_project_owner_row(
             plan,
+            context.projection,
             inserted_view,
-            context.owner_type.columns.len(),
             constructor,
         )?);
         constructed_new_domain = true;
@@ -486,7 +492,7 @@ fn extend_lossy_bag_project_from_runtime_determinant(
             old_owner,
             reconstructed,
             RelationDeterminantColumns {
-                source: &visible_columns,
+                source: visible_columns,
                 target: &hidden_columns,
             },
             context.semantic,
@@ -504,8 +510,8 @@ fn extend_lossy_bag_project_from_runtime_determinant(
 
 fn construct_project_owner_row(
     plan: &RelWritableViewPlan,
+    projection: &PreparedProjectionPath,
     projected_row: &[kernel_model::Value],
-    owner_arity: usize,
     constructor: &FixedHiddenProjectInsertConstructor,
 ) -> Result<kernel_query::Row, RelRewriteLiftError> {
     if constructor.owner_relation != plan.owner_relation {
@@ -514,76 +520,52 @@ fn construct_project_owner_row(
     if constructor.rewrite_spec != plan.rewrite_spec {
         return Err(RelRewriteLiftError::ProjectConstructorRewriteSpecMismatch);
     }
-    let visible_columns = owner_projection_columns(plan, owner_arity)?;
-    if projected_row.len() != visible_columns.len() {
-        return Err(RelRewriteLiftError::RequestedViewInadmissible);
-    }
-    let visible_set = visible_columns
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    for &column in constructor.hidden_values.keys() {
-        if column >= owner_arity {
-            return Err(RelRewriteLiftError::ProjectConstructorColumnOutOfBounds {
-                column,
-                arity: owner_arity,
-            });
-        }
-        if visible_set.contains(&column) {
-            return Err(RelRewriteLiftError::ProjectConstructorOverridesVisibleColumn { column });
-        }
-    }
-    let mut owner_row = vec![None; owner_arity];
-    for (&column, value) in visible_columns.iter().zip(projected_row) {
-        owner_row[column] = Some(value.clone());
-    }
-    for (column, slot) in owner_row.iter_mut().enumerate() {
-        if slot.is_some() {
-            continue;
-        }
-        let Some(value) = constructor.hidden_values.get(&column) else {
-            return Err(RelRewriteLiftError::ProjectConstructorMissingHiddenColumn { column });
-        };
-        *slot = Some(value.clone());
-    }
-    Ok(owner_row.into_iter().map(Option::unwrap).collect())
+    projection.inflate_with_hidden(projected_row, &constructor.hidden_values)
 }
 
-struct LossyProjectSynthesisContext<'a> {
+struct PreparedLiftContext<'a> {
     semantic: &'a kernel_schema::SemanticContext,
     registry: &'a kernel_semantics::SemanticRegistry,
     source_spec: &'a kernel_change::RewriteSpec,
     constructor: Option<&'a FixedHiddenProjectInsertConstructor>,
 }
 
-fn owner_projection_columns(
-    plan: &RelWritableViewPlan,
-    owner_arity: usize,
-) -> Result<Vec<usize>, RelRewriteLiftError> {
-    let mut projected = (0..owner_arity).collect::<Vec<_>>();
-    for stage in &plan.stages {
-        let RelRewriteLiftStage::Project { columns } = stage else {
-            return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-        };
-        projected = columns
-            .iter()
-            .map(|&column| {
-                projected
-                    .get(column)
-                    .copied()
-                    .ok_or(RelRewriteLiftError::CandidateGenerationUnsupported)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-    }
-    Ok(projected)
+fn reconstruct_lossy_project_preimage(
+    projection: &PreparedProjectionPath,
+    old_owner: &RelationValue,
+    owner_type: &kernel_query::RelType,
+    view_type: &kernel_query::RelType,
+    removed_rows: &[kernel_query::Row],
+    semantic: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<(RelationValue, GammaPreimageCatalog), RelRewriteLiftError> {
+    let mut preimages = GammaPreimageCatalog::build(
+        old_owner.rows(),
+        owner_type,
+        view_type,
+        semantic,
+        registry,
+        |row| projection.project_row(row),
+    )?;
+    let reconstructed = reconstruct_lossy_project_deletion(
+        old_owner,
+        owner_type,
+        view_type,
+        removed_rows,
+        semantic,
+        registry,
+        &mut preimages,
+    )?;
+    Ok((reconstructed, preimages))
 }
 
 fn synthesize_lossy_project_source_rewrite_with_coordinates<I: Clone>(
     plan: &RelWritableViewPlan,
+    prepared: &PreparedProjectLift,
     source: &kernel_model::FiniteModel,
     requested_view: &PreparedRewrite<RelationValue, I>,
     coordinates: &mut PreparedRelWritableCoordinates,
-    context: &LossyProjectSynthesisContext<'_>,
+    context: &PreparedLiftContext<'_>,
 ) -> Result<kernel_query::PreparedRelationRewrite<I>, RelRewriteLiftError> {
     let semantic = context.semantic;
     let registry = context.registry;
@@ -594,29 +576,16 @@ fn synthesize_lossy_project_source_rewrite_with_coordinates<I: Clone>(
             actual: source_spec.id,
         });
     }
-    if plan.stages.is_empty()
-        || !plan
-            .stages
-            .iter()
-            .all(|stage| matches!(stage, RelRewriteLiftStage::Project { .. }))
-        || plan.required_obligations.iter().any(|obligation| {
-            !matches!(
-                obligation,
-                RelWritableObligation::PreserveHiddenColumnsComplement { .. }
-                    | RelWritableObligation::HiddenColumnConstructorForInsert { .. }
-                    | RelWritableObligation::ProjectionNoSemanticCollapse
-            )
-        })
-    {
-        return Err(RelRewriteLiftError::UnresolvedObligations(
-            plan.required_obligations.clone(),
-        ));
-    }
-    let scan = kernel_query::RelExpr::Scan(plan.owner_relation);
-    let old_owner = scan.evaluate(source, semantic, registry)?;
-    let owner_type = scan.typecheck(semantic, registry)?;
-    let old_view = plan.query.evaluate(source, semantic, registry)?;
-    let view_type = plan.query.typecheck(semantic, registry)?;
+    let old_owner = prepared
+        .base
+        .owner_query
+        .evaluate(source, semantic, registry)?;
+    let owner_type = prepared.base.owner_type();
+    let old_view = prepared
+        .base
+        .view_query
+        .evaluate(source, semantic, registry)?;
+    let view_type = prepared.base.view_type();
     let requested_endpoint = requested_view.apply(&old_view);
     let view_delta = kernel_query::RelationDelta::between_values(
         &old_view,
@@ -625,11 +594,11 @@ fn synthesize_lossy_project_source_rewrite_with_coordinates<I: Clone>(
         semantic,
         registry,
     )?;
-    let mut reconstructed = reconstruct_lossy_project_deletion(
-        plan,
+    let (mut reconstructed, preimages) = reconstruct_lossy_project_preimage(
+        &prepared.projection,
         &old_owner,
-        &owner_type,
-        &view_type,
+        owner_type,
+        view_type,
         &view_delta.removed,
         semantic,
         registry,
@@ -640,47 +609,34 @@ fn synthesize_lossy_project_source_rewrite_with_coordinates<I: Clone>(
         &mut reconstructed,
         &view_delta.inserted,
         &RuntimeProjectDeterminantContext {
-            owner_type: &owner_type,
-            view_type: &view_type,
+            projection: &prepared.projection,
+            owner_type,
+            view_type,
             semantic,
             registry,
+            preimages: &preimages,
         },
         coordinates,
         context.constructor,
     )?;
-    let delta = kernel_query::RelationDelta::between_values(
+    certify_owner_candidate(
+        plan,
+        requested_view,
         &old_owner,
-        &reconstructed,
-        owner_type,
-        semantic,
-        registry,
-    )?;
-    let normalized_endpoint = delta.apply_to_value(old_owner.clone(), semantic, registry)?;
-    let mut candidate_model = source.clone();
-    candidate_model
-        .relations
-        .insert(plan.owner_relation, normalized_endpoint.into_rows());
-    let actual_view = plan.query.evaluate(&candidate_model, semantic, registry)?;
-    if !kernel_query::RelationDelta::between_values(
-        &actual_view,
         &requested_endpoint,
-        view_type,
-        semantic,
-        registry,
-    )?
-    .is_empty()
-    {
-        return Err(RelRewriteLiftError::RequestedViewInadmissible);
-    }
-    Ok(delta.prepare_relation_rewrite(
-        &old_owner,
-        semantic,
-        registry,
-        source_spec,
-        requested_view.explicit_inputs.clone(),
-    )?)
+        &reconstructed,
+        &OwnerCertificationContext {
+            source,
+            semantic,
+            registry,
+            source_spec,
+            owner_type: prepared.base.owner_type(),
+            view_query: &prepared.base.view_query,
+        },
+    )
 }
 
+#[cfg(test)]
 fn synthesize_lossy_project_deletion_source_rewrite_for_commit<I: Clone>(
     plan: &RelWritableViewPlan,
     source: &kernel_model::FiniteModel,
@@ -695,765 +651,20 @@ fn synthesize_lossy_project_deletion_source_rewrite_for_commit<I: Clone>(
     let mut coordinates = prepared
         .writable_coordinates(registry)
         .map_err(|_| RelRewriteLiftError::DeterminantEvidenceUnavailable)?;
+    let project = PreparedProjectLift::prepare(plan, semantic, registry)?;
     synthesize_lossy_project_source_rewrite_with_coordinates(
         plan,
+        &project,
         source,
         requested_view,
         &mut coordinates,
-        &LossyProjectSynthesisContext {
+        &PreparedLiftContext {
             semantic,
             registry,
             source_spec,
             constructor,
         },
     )
-}
-
-#[derive(Clone)]
-struct DirectJoinSection {
-    owner_is_left: bool,
-    owner_query: kernel_query::RelExpr,
-    full_row_owner_query: kernel_query::RelExpr,
-    owner_project_stages: Vec<Vec<usize>>,
-    owner_lift_stages: Vec<RelRewriteLiftStage>,
-    lookup_query: kernel_query::RelExpr,
-    owner_column: usize,
-    lookup_column: usize,
-    equivalence: kernel_types::SemanticId,
-}
-
-#[derive(Clone)]
-struct OwnerJoinPipeline {
-    full_row_query: kernel_query::RelExpr,
-    project_stages: Vec<Vec<usize>>,
-    lift_stages: Vec<RelRewriteLiftStage>,
-}
-
-fn owner_join_pipeline(
-    query: &kernel_query::RelExpr,
-    owner_relation: kernel_types::SemanticId,
-    semantic: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<OwnerJoinPipeline, RelRewriteLiftError> {
-    match query {
-        kernel_query::RelExpr::Scan(relation) if *relation == owner_relation => {
-            Ok(OwnerJoinPipeline {
-                full_row_query: query.clone(),
-                project_stages: Vec::new(),
-                lift_stages: Vec::new(),
-            })
-        }
-        kernel_query::RelExpr::FilterEqConst {
-            input,
-            column,
-            equivalence,
-            ..
-        } => {
-            let mut pipeline = owner_join_pipeline(input, owner_relation, semantic, registry)?;
-            if !pipeline.project_stages.is_empty() {
-                return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-            }
-            pipeline.full_row_query = query.clone();
-            pipeline
-                .lift_stages
-                .push(RelRewriteLiftStage::FilterEqConst {
-                    column: *column,
-                    equivalence: *equivalence,
-                });
-            Ok(pipeline)
-        }
-        kernel_query::RelExpr::FilterEqColumns {
-            input,
-            left_column,
-            right_column,
-            equivalence,
-        } => {
-            let mut pipeline = owner_join_pipeline(input, owner_relation, semantic, registry)?;
-            if !pipeline.project_stages.is_empty() {
-                return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-            }
-            pipeline.full_row_query = query.clone();
-            pipeline
-                .lift_stages
-                .push(RelRewriteLiftStage::FilterEqColumns {
-                    left_column: *left_column,
-                    right_column: *right_column,
-                    equivalence: *equivalence,
-                });
-            Ok(pipeline)
-        }
-        kernel_query::RelExpr::Project { input, columns } => {
-            let mut pipeline = owner_join_pipeline(input, owner_relation, semantic, registry)?;
-            let input_arity = input.typecheck(semantic, registry)?.columns.len();
-            let mut seen = vec![false; input_arity];
-            for &column in columns {
-                if column >= input_arity || seen[column] {
-                    return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-                }
-                seen[column] = true;
-            }
-            pipeline.project_stages.push(columns.clone());
-            pipeline.lift_stages.push(RelRewriteLiftStage::Project {
-                columns: columns.clone(),
-            });
-            Ok(pipeline)
-        }
-        _ => Err(RelRewriteLiftError::CandidateGenerationUnsupported),
-    }
-}
-
-fn direct_join_section(
-    plan: &RelWritableViewPlan,
-    semantic: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<DirectJoinSection, RelRewriteLiftError> {
-    let (left, right, left_column, right_column, equivalence) = match &plan.query {
-        kernel_query::RelExpr::JoinEq {
-            left,
-            right,
-            left_column,
-            right_column,
-            equivalence,
-        } => (
-            left.as_ref(),
-            right.as_ref(),
-            *left_column,
-            *right_column,
-            *equivalence,
-        ),
-        _ => return Err(RelRewriteLiftError::CandidateGenerationUnsupported),
-    };
-    let section = if !right.scan_relations().contains(&plan.owner_relation) {
-        let pipeline = owner_join_pipeline(left, plan.owner_relation, semantic, registry)?;
-        DirectJoinSection {
-            owner_is_left: true,
-            owner_query: left.clone(),
-            full_row_owner_query: pipeline.full_row_query,
-            owner_project_stages: pipeline.project_stages,
-            owner_lift_stages: pipeline.lift_stages,
-            lookup_query: right.clone(),
-            owner_column: left_column,
-            lookup_column: right_column,
-            equivalence,
-        }
-    } else if !left.scan_relations().contains(&plan.owner_relation) {
-        let pipeline = owner_join_pipeline(right, plan.owner_relation, semantic, registry)?;
-        DirectJoinSection {
-            owner_is_left: false,
-            owner_query: right.clone(),
-            full_row_owner_query: pipeline.full_row_query,
-            owner_project_stages: pipeline.project_stages,
-            owner_lift_stages: pipeline.lift_stages,
-            lookup_query: left.clone(),
-            owner_column: right_column,
-            lookup_column: left_column,
-            equivalence,
-        }
-    } else {
-        return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-    };
-    let Some((last, prefix)) = plan.stages.split_last() else {
-        return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-    };
-    if prefix == section.owner_lift_stages.as_slice()
-        && matches!(
-            last,
-            RelRewriteLiftStage::JoinOwnerSide {
-                owner_is_left,
-                owner_column,
-                lookup_column,
-                equivalence,
-            } if *owner_is_left == section.owner_is_left
-                && *owner_column == section.owner_column
-                && *lookup_column == section.lookup_column
-                && *equivalence == section.equivalence
-        )
-    {
-        Ok(section)
-    } else {
-        Err(RelRewriteLiftError::CandidateGenerationUnsupported)
-    }
-}
-
-fn merge_owner_sections(
-    accepted: RelationValue,
-    rejected: &RelationValue,
-    owner_type: &kernel_query::RelType,
-) -> RelationValue {
-    let mut rows = accepted.into_rows();
-    rows.extend(rejected.rows().iter().cloned());
-    match &owner_type.semantics {
-        kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
-        kernel_schema::RelationSemantics::Set {
-            column_equivalences,
-        } => RelationValue::Set {
-            rows,
-            column_equivalences: column_equivalences.clone(),
-        },
-    }
-}
-
-fn direct_join_obligations_supported(plan: &RelWritableViewPlan) -> bool {
-    let mut determinants = 0;
-    plan.required_obligations
-        .iter()
-        .all(|obligation| match obligation {
-            RelWritableObligation::PreserveHiddenColumnsComplement { .. }
-            | RelWritableObligation::HiddenColumnConstructorForInsert { .. }
-            | RelWritableObligation::ProjectionNoSemanticCollapse
-            | RelWritableObligation::PredicateAdmissibility
-            | RelWritableObligation::DtcGuardNoImpact
-            | RelWritableObligation::VmfInvariantClosure => true,
-            RelWritableObligation::JoinLookupDeterminant { .. } => {
-                determinants += 1;
-                determinants <= 1
-            }
-        })
-}
-
-fn validate_direct_lookup_key_uniqueness(
-    lookup_query: &kernel_query::RelExpr,
-    lookup_column: usize,
-    equivalence: kernel_types::SemanticId,
-    source: &kernel_model::FiniteModel,
-    semantic: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-) -> Result<(), RelRewriteLiftError> {
-    let lookup_value = lookup_query.evaluate(source, semantic, registry)?;
-    for row in lookup_value.rows() {
-        let key = row
-            .get(lookup_column)
-            .ok_or(kernel_query::RelQueryError::ColumnOutOfBounds)?;
-        let key_fiber = kernel_query::RelExpr::FilterEqConst {
-            input: Box::new(lookup_query.clone()),
-            column: lookup_column,
-            value: key.clone(),
-            equivalence,
-        }
-        .evaluate(source, semantic, registry)?;
-        if key_fiber.rows().len() != 1 {
-            return Err(RelRewriteLiftError::JoinLookupKeyNotUnique);
-        }
-    }
-    Ok(())
-}
-
-fn direct_join_reconstructed_owner(
-    requested_endpoint: &RelationValue,
-    unmatched: &RelationValue,
-    visible_owner_type: &kernel_query::RelType,
-    lookup_arity: usize,
-    owner_is_left: bool,
-) -> Result<RelationValue, RelRewriteLiftError> {
-    let owner_arity = visible_owner_type.columns.len();
-    let mut rows = Vec::with_capacity(requested_endpoint.rows().len() + unmatched.rows().len());
-    for row in requested_endpoint.rows() {
-        if row.len() != owner_arity + lookup_arity {
-            return Err(RelRewriteLiftError::RequestedViewInadmissible);
-        }
-        rows.push(if owner_is_left {
-            row[..owner_arity].to_vec()
-        } else {
-            row[lookup_arity..].to_vec()
-        });
-    }
-    rows.extend(unmatched.rows().iter().cloned());
-    Ok(match &visible_owner_type.semantics {
-        kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
-        kernel_schema::RelationSemantics::Set {
-            column_equivalences,
-        } => RelationValue::Set {
-            rows,
-            column_equivalences: column_equivalences.clone(),
-        },
-    })
-}
-
-fn invert_bijective_project_stages(
-    value: RelationValue,
-    project_stages: &[Vec<usize>],
-    owner_type: &kernel_query::RelType,
-) -> Result<RelationValue, RelRewriteLiftError> {
-    let mut rows = value.into_rows();
-    for columns in project_stages.iter().rev() {
-        for row in &mut rows {
-            if row.len() != columns.len() {
-                return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-            }
-            let projected = row.clone();
-            for (view_column, &source_column) in columns.iter().enumerate() {
-                row[source_column] = projected[view_column].clone();
-            }
-        }
-    }
-    Ok(match &owner_type.semantics {
-        kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
-        kernel_schema::RelationSemantics::Set {
-            column_equivalences,
-        } => RelationValue::Set {
-            rows,
-            column_equivalences: column_equivalences.clone(),
-        },
-    })
-}
-
-fn projection_columns_from_stages(
-    project_stages: &[Vec<usize>],
-    owner_arity: usize,
-) -> Result<Vec<usize>, RelRewriteLiftError> {
-    let mut projected = (0..owner_arity).collect::<Vec<_>>();
-    for columns in project_stages {
-        projected = columns
-            .iter()
-            .map(|&column| {
-                projected
-                    .get(column)
-                    .copied()
-                    .ok_or(RelRewriteLiftError::CandidateGenerationUnsupported)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-    }
-    Ok(projected)
-}
-
-fn project_row_through_stages(
-    row: &[kernel_model::Value],
-    project_stages: &[Vec<usize>],
-) -> Result<kernel_query::Row, RelRewriteLiftError> {
-    let mut projected = row.to_vec();
-    for columns in project_stages {
-        projected = columns
-            .iter()
-            .map(|&column| {
-                projected
-                    .get(column)
-                    .cloned()
-                    .ok_or(RelRewriteLiftError::CandidateGenerationUnsupported)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-    }
-    Ok(projected)
-}
-
-struct LossyJoinProjectContext<'a> {
-    owner_relation: kernel_types::SemanticId,
-    rewrite_spec: kernel_change::RewriteSpecId,
-    owner_type: &'a kernel_query::RelType,
-    visible_owner_type: &'a kernel_query::RelType,
-    project_stages: &'a [Vec<usize>],
-    semantic: &'a kernel_schema::SemanticContext,
-    registry: &'a kernel_semantics::SemanticRegistry,
-    constructor: Option<&'a FixedHiddenProjectInsertConstructor>,
-}
-
-fn remove_lossy_join_project_rows(
-    rows: &mut Vec<kernel_query::Row>,
-    removed_rows: &[kernel_query::Row],
-    context: &LossyJoinProjectContext<'_>,
-) -> Result<(), RelRewriteLiftError> {
-    let view_is_set = matches!(
-        context.visible_owner_type.semantics,
-        kernel_schema::RelationSemantics::Set { .. }
-    );
-    for removed_view in removed_rows {
-        let mut matching = Vec::new();
-        for (index, source_row) in rows.iter().enumerate() {
-            let projected = project_row_through_stages(source_row, context.project_stages)?;
-            if rows_equal_for_type(
-                &projected,
-                removed_view,
-                context.visible_owner_type,
-                context.semantic,
-                context.registry,
-            )? {
-                matching.push(index);
-            }
-        }
-        let Some(&first) = matching.first() else {
-            return Err(RelRewriteLiftError::RequestedViewInadmissible);
-        };
-        if view_is_set {
-            for index in matching.into_iter().rev() {
-                rows.remove(index);
-            }
-            continue;
-        }
-        for &index in matching.iter().skip(1) {
-            if !rows_equal_for_type(
-                &rows[first],
-                &rows[index],
-                context.owner_type,
-                context.semantic,
-                context.registry,
-            )? {
-                return Err(RelRewriteLiftError::ProjectionPreimageAmbiguous);
-            }
-        }
-        rows.remove(first);
-    }
-    Ok(())
-}
-
-fn extend_lossy_join_project_rows(
-    rows: &mut Vec<kernel_query::Row>,
-    inserted_rows: &[kernel_query::Row],
-    old_full_section: &RelationValue,
-    visible_columns: &[usize],
-    coordinates: &mut PreparedRelWritableCoordinates,
-    context: &LossyJoinProjectContext<'_>,
-) -> Result<bool, RelRewriteLiftError> {
-    let visible_set = visible_columns
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let hidden_columns = (0..context.owner_type.columns.len())
-        .filter(|column| !visible_set.contains(column))
-        .collect::<Vec<_>>();
-    let before = coordinates
-        .relation_determinant_morphism(
-            context.owner_relation,
-            old_full_section,
-            visible_columns,
-            &hidden_columns,
-            context.semantic,
-            context.registry,
-        )
-        .map_err(|_| RelRewriteLiftError::DeterminantEvidenceUnavailable)?
-        .ok_or(RelRewriteLiftError::ProjectionPreimageAmbiguous)?;
-    let mut constructed_new_domain = false;
-    for inserted_view in inserted_rows {
-        let representative = old_full_section.rows().iter().find_map(|source_row| {
-            let projected = project_row_through_stages(source_row, context.project_stages).ok()?;
-            rows_equal_for_type(
-                &projected,
-                inserted_view,
-                context.visible_owner_type,
-                context.semantic,
-                context.registry,
-            )
-            .ok()?
-            .then(|| source_row.clone())
-        });
-        if let Some(representative) = representative {
-            debug_assert!(!before.materialized_mapping().is_empty());
-            rows.push(representative);
-            continue;
-        }
-        let Some(constructor) = context.constructor else {
-            return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
-        };
-        rows.push(construct_owner_row_from_projection(
-            inserted_view,
-            visible_columns,
-            context.owner_type.columns.len(),
-            context.owner_relation,
-            context.rewrite_spec,
-            constructor,
-        )?);
-        constructed_new_domain = true;
-    }
-    Ok(constructed_new_domain)
-}
-
-fn reconstruct_lossy_join_owner_section(
-    old_full_section: &RelationValue,
-    requested_visible_section: &RelationValue,
-    coordinates: &mut PreparedRelWritableCoordinates,
-    context: &LossyJoinProjectContext<'_>,
-) -> Result<RelationValue, RelRewriteLiftError> {
-    let view_delta = kernel_query::RelationDelta::between_values(
-        &project_relation_value(old_full_section, context)?,
-        requested_visible_section,
-        context.visible_owner_type.clone(),
-        context.semantic,
-        context.registry,
-    )?;
-    let mut rows = old_full_section.rows().to_vec();
-    remove_lossy_join_project_rows(&mut rows, &view_delta.removed, context)?;
-    let visible_columns =
-        projection_columns_from_stages(context.project_stages, context.owner_type.columns.len())?;
-    let constructed_new_domain = extend_lossy_join_project_rows(
-        &mut rows,
-        &view_delta.inserted,
-        old_full_section,
-        &visible_columns,
-        coordinates,
-        context,
-    )?;
-    let reconstructed = match &context.owner_type.semantics {
-        kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
-        kernel_schema::RelationSemantics::Set {
-            column_equivalences,
-        } => RelationValue::Set {
-            rows,
-            column_equivalences: column_equivalences.clone(),
-        },
-    };
-    let visible_set = visible_columns
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let hidden_columns = (0..context.owner_type.columns.len())
-        .filter(|column| !visible_set.contains(column))
-        .collect::<Vec<_>>();
-    let revalidated = coordinates
-        .revalidate_relation_determinant(
-            context.owner_relation,
-            old_full_section,
-            &reconstructed,
-            RelationDeterminantColumns {
-                source: &visible_columns,
-                target: &hidden_columns,
-            },
-            context.semantic,
-            context.registry,
-        )
-        .map_err(|_| RelRewriteLiftError::DeterminantEvidenceUnavailable)?
-        .ok_or(RelRewriteLiftError::ProjectionPreimageAmbiguous)?;
-    if !revalidated.shared_domain_images_are_stable()
-        || (!constructed_new_domain && !revalidated.after_domain_is_covered_by_before())
-    {
-        return Err(RelRewriteLiftError::DeterminantEvidenceUnavailable);
-    }
-    Ok(reconstructed)
-}
-
-fn project_relation_value(
-    value: &RelationValue,
-    context: &LossyJoinProjectContext<'_>,
-) -> Result<RelationValue, RelRewriteLiftError> {
-    let rows = value
-        .rows()
-        .iter()
-        .map(|row| project_row_through_stages(row, context.project_stages))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(match &context.visible_owner_type.semantics {
-        kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
-        kernel_schema::RelationSemantics::Set {
-            column_equivalences,
-        } => RelationValue::Set {
-            rows,
-            column_equivalences: column_equivalences.clone(),
-        },
-    })
-}
-
-fn construct_owner_row_from_projection(
-    projected_row: &[kernel_model::Value],
-    visible_columns: &[usize],
-    owner_arity: usize,
-    owner_relation: kernel_types::SemanticId,
-    rewrite_spec: kernel_change::RewriteSpecId,
-    constructor: &FixedHiddenProjectInsertConstructor,
-) -> Result<kernel_query::Row, RelRewriteLiftError> {
-    if constructor.owner_relation != owner_relation {
-        return Err(RelRewriteLiftError::ProjectConstructorOwnerMismatch);
-    }
-    if constructor.rewrite_spec != rewrite_spec {
-        return Err(RelRewriteLiftError::ProjectConstructorRewriteSpecMismatch);
-    }
-    if projected_row.len() != visible_columns.len() {
-        return Err(RelRewriteLiftError::RequestedViewInadmissible);
-    }
-    let visible_set = visible_columns
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    for &column in constructor.hidden_values.keys() {
-        if column >= owner_arity {
-            return Err(RelRewriteLiftError::ProjectConstructorColumnOutOfBounds {
-                column,
-                arity: owner_arity,
-            });
-        }
-        if visible_set.contains(&column) {
-            return Err(RelRewriteLiftError::ProjectConstructorOverridesVisibleColumn { column });
-        }
-    }
-    let mut owner_row = vec![None; owner_arity];
-    for (&column, value) in visible_columns.iter().zip(projected_row) {
-        owner_row[column] = Some(value.clone());
-    }
-    for (column, slot) in owner_row.iter_mut().enumerate() {
-        if slot.is_some() {
-            continue;
-        }
-        let Some(value) = constructor.hidden_values.get(&column) else {
-            return Err(RelRewriteLiftError::ProjectConstructorMissingHiddenColumn { column });
-        };
-        *slot = Some(value.clone());
-    }
-    Ok(owner_row.into_iter().map(Option::unwrap).collect())
-}
-
-#[cfg(test)]
-fn synthesize_direct_scan_join_source_rewrite_for_commit<I: Clone>(
-    plan: &RelWritableViewPlan,
-    source: &kernel_model::FiniteModel,
-    semantic: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-    source_spec: &kernel_change::RewriteSpec,
-    requested_view: &PreparedRewrite<RelationValue, I>,
-) -> Result<kernel_query::PreparedRelationRewrite<I>, RelRewriteLiftError> {
-    synthesize_direct_scan_join_source_rewrite_with_constructor_for_commit(
-        plan,
-        source,
-        semantic,
-        registry,
-        source_spec,
-        requested_view,
-        None,
-    )
-}
-
-fn reconstruct_join_owner_candidate<I: Clone>(
-    plan: &RelWritableViewPlan,
-    source: &kernel_model::FiniteModel,
-    semantic: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-    requested_view: &PreparedRewrite<RelationValue, I>,
-    project_constructor: Option<&FixedHiddenProjectInsertConstructor>,
-) -> Result<(RelationValue, RelationValue, RelationValue), RelRewriteLiftError> {
-    let section = direct_join_section(plan, semantic, registry)?;
-    let owner_scan = kernel_query::RelExpr::Scan(plan.owner_relation);
-    validate_direct_lookup_key_uniqueness(
-        &section.lookup_query,
-        section.lookup_column,
-        section.equivalence,
-        source,
-        semantic,
-        registry,
-    )?;
-    let owner_type = owner_scan.typecheck(semantic, registry)?;
-    let visible_owner_type = section.owner_query.typecheck(semantic, registry)?;
-    let lookup_arity = section
-        .lookup_query
-        .typecheck(semantic, registry)?
-        .columns
-        .len();
-    let old_owner = owner_scan.evaluate(source, semantic, registry)?;
-    let old_view = plan.query.evaluate(source, semantic, registry)?;
-    let requested_endpoint = requested_view.apply(&old_view);
-    let unmatched = kernel_query::RelExpr::AntiJoin {
-        left: Box::new(section.owner_query.clone()),
-        right: Box::new(section.lookup_query.clone()),
-        left_column: section.owner_column,
-        right_column: section.lookup_column,
-        equivalence: section.equivalence,
-    }
-    .evaluate(source, semantic, registry)?;
-    let visible = direct_join_reconstructed_owner(
-        &requested_endpoint,
-        &unmatched,
-        &visible_owner_type,
-        lookup_arity,
-        section.owner_is_left,
-    )?;
-    let accepted = if section
-        .owner_project_stages
-        .iter()
-        .all(|columns| columns.len() == owner_type.columns.len())
-    {
-        invert_bijective_project_stages(visible, &section.owner_project_stages, &owner_type)?
-    } else {
-        let old_full_section = section
-            .full_row_owner_query
-            .evaluate(source, semantic, registry)?;
-        let prepared = kernel_plan::prepare_baseline(plan.query.clone(), semantic, registry)
-            .map_err(|_| RelRewriteLiftError::DeterminantEvidenceUnavailable)?;
-        let mut coordinates = prepared
-            .writable_coordinates(registry)
-            .map_err(|_| RelRewriteLiftError::DeterminantEvidenceUnavailable)?;
-        reconstruct_lossy_join_owner_section(
-            &old_full_section,
-            &visible,
-            &mut coordinates,
-            &LossyJoinProjectContext {
-                owner_relation: plan.owner_relation,
-                rewrite_spec: plan.rewrite_spec,
-                owner_type: &owner_type,
-                visible_owner_type: &visible_owner_type,
-                project_stages: &section.owner_project_stages,
-                semantic,
-                registry,
-                constructor: project_constructor,
-            },
-        )?
-    };
-    let rejected = kernel_query::RelExpr::Difference {
-        left: Box::new(owner_scan),
-        right: Box::new(section.full_row_owner_query),
-    }
-    .evaluate(source, semantic, registry)?;
-    Ok((
-        old_owner,
-        requested_endpoint,
-        merge_owner_sections(accepted, &rejected, &owner_type),
-    ))
-}
-
-fn synthesize_direct_scan_join_source_rewrite_with_constructor_for_commit<I: Clone>(
-    plan: &RelWritableViewPlan,
-    source: &kernel_model::FiniteModel,
-    semantic: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-    source_spec: &kernel_change::RewriteSpec,
-    requested_view: &PreparedRewrite<RelationValue, I>,
-    project_constructor: Option<&FixedHiddenProjectInsertConstructor>,
-) -> Result<kernel_query::PreparedRelationRewrite<I>, RelRewriteLiftError> {
-    if source_spec.id != plan.rewrite_spec {
-        return Err(RelRewriteLiftError::SourceRewriteSpecMismatch {
-            expected: plan.rewrite_spec,
-            actual: source_spec.id,
-        });
-    }
-    if !direct_join_obligations_supported(plan) {
-        return Err(RelRewriteLiftError::UnresolvedObligations(
-            plan.required_obligations.clone(),
-        ));
-    }
-    let (old_owner, requested_endpoint, reconstructed) = reconstruct_join_owner_candidate(
-        plan,
-        source,
-        semantic,
-        registry,
-        requested_view,
-        project_constructor,
-    )?;
-    let owner_type =
-        kernel_query::RelExpr::Scan(plan.owner_relation).typecheck(semantic, registry)?;
-    let delta = kernel_query::RelationDelta::between_values(
-        &old_owner,
-        &reconstructed,
-        owner_type,
-        semantic,
-        registry,
-    )?;
-    let normalized_endpoint = delta.apply_to_value(old_owner.clone(), semantic, registry)?;
-    let mut candidate_model = source.clone();
-    candidate_model
-        .relations
-        .insert(plan.owner_relation, normalized_endpoint.into_rows());
-    let actual_view = plan.query.evaluate(&candidate_model, semantic, registry)?;
-    let view_type = plan.query.typecheck(semantic, registry)?;
-    if !kernel_query::RelationDelta::between_values(
-        &actual_view,
-        &requested_endpoint,
-        view_type,
-        semantic,
-        registry,
-    )?
-    .is_empty()
-    {
-        return Err(RelRewriteLiftError::RequestedViewInadmissible);
-    }
-    Ok(delta.prepare_relation_rewrite(
-        &old_owner,
-        semantic,
-        registry,
-        source_spec,
-        requested_view.explicit_inputs.clone(),
-    )?)
 }
 
 /// Executes the relational writable-view boundary without creating a second
@@ -1465,7 +676,7 @@ pub fn commit_unique_relational_view_rewrite<I: Clone + PartialEq>(
     runtime: &DurableRuntime,
     transaction_id: ClientTransactionId,
     target_revision: RevisionId,
-    plan: &RelWritableViewPlan,
+    prepared: &mut PreparedWritableCompilation,
     source_spec: &kernel_change::RewriteSpec,
     requested_view: &PreparedRewrite<RelationValue, I>,
 ) -> Result<WritableViewCommitOutcome, WritableViewCommitError> {
@@ -1473,7 +684,7 @@ pub fn commit_unique_relational_view_rewrite<I: Clone + PartialEq>(
         runtime,
         transaction_id,
         target_revision,
-        plan,
+        prepared,
         source_spec,
         requested_view,
         None,
@@ -1489,7 +700,7 @@ pub fn commit_unique_relational_view_rewrite_with_project_constructor<I: Clone +
     runtime: &DurableRuntime,
     transaction_id: ClientTransactionId,
     target_revision: RevisionId,
-    plan: &RelWritableViewPlan,
+    prepared: &mut PreparedWritableCompilation,
     source_spec: &kernel_change::RewriteSpec,
     requested_view: &PreparedRewrite<RelationValue, I>,
     constructor: &FixedHiddenProjectInsertConstructor,
@@ -1498,91 +709,190 @@ pub fn commit_unique_relational_view_rewrite_with_project_constructor<I: Clone +
         runtime,
         transaction_id,
         target_revision,
-        plan,
+        prepared,
         source_spec,
         requested_view,
         Some(constructor),
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreparedRelWritableLiftStrategy {
+    ReadOnly,
+    Identity(Box<PreparedIdentityLift>),
+    BijectiveProject(Box<PreparedProjectLift>),
+    LossyProject(Box<PreparedProjectLift>),
+    JoinOwnerSide(Box<PreparedDirectJoinLift>),
+    Filter(Box<PreparedFilterLift>),
+}
+
+fn prepare_rel_writable_lift_strategy(
+    plan: &RelWritableViewPlan,
+    semantic: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<PreparedRelWritableLiftStrategy, RelRewriteLiftError> {
+    if plan.stages.is_empty() {
+        if !plan.required_obligations.is_empty()
+            || !matches!(plan.query, kernel_query::RelExpr::Scan(relation) if relation == plan.owner_relation)
+        {
+            return Err(RelRewriteLiftError::UnresolvedObligations(
+                plan.required_obligations.clone(),
+            ));
+        }
+        return Ok(PreparedRelWritableLiftStrategy::Identity(Box::new(
+            PreparedIdentityLift {
+                base: PreparedLiftBase::prepare(plan, semantic, registry)?,
+            },
+        )));
+    }
+    if plan
+        .stages
+        .iter()
+        .any(|stage| matches!(stage, RelRewriteLiftStage::JoinOwnerSide { .. }))
+    {
+        return Ok(PreparedRelWritableLiftStrategy::JoinOwnerSide(Box::new(
+            PreparedDirectJoinLift::prepare(plan, semantic, registry)?,
+        )));
+    }
+    if plan
+        .stages
+        .iter()
+        .all(|stage| matches!(stage, RelRewriteLiftStage::Project { .. }))
+    {
+        let prepared = Box::new(PreparedProjectLift::prepare(plan, semantic, registry)?);
+        return Ok(if plan.required_obligations.is_empty() {
+            if !prepared.projection.is_bijective() {
+                return Err(RelRewriteLiftError::CandidateGenerationUnsupported);
+            }
+            PreparedRelWritableLiftStrategy::BijectiveProject(prepared)
+        } else {
+            if plan.required_obligations.iter().any(|obligation| {
+                !matches!(
+                    obligation,
+                    RelWritableObligation::PreserveHiddenColumnsComplement { .. }
+                        | RelWritableObligation::HiddenColumnConstructorForInsert { .. }
+                        | RelWritableObligation::ProjectionNoSemanticCollapse
+                )
+            }) {
+                return Err(RelRewriteLiftError::UnresolvedObligations(
+                    plan.required_obligations.clone(),
+                ));
+            }
+            PreparedRelWritableLiftStrategy::LossyProject(prepared)
+        });
+    }
+    if plan.stages.iter().all(|stage| {
+        matches!(
+            stage,
+            RelRewriteLiftStage::FilterEqConst { .. } | RelRewriteLiftStage::FilterEqColumns { .. }
+        )
+    }) {
+        let allowed = BTreeSet::from([
+            RelWritableObligation::PredicateAdmissibility,
+            RelWritableObligation::DtcGuardNoImpact,
+            RelWritableObligation::VmfInvariantClosure,
+        ]);
+        if !plan.required_obligations.is_subset(&allowed) {
+            return Err(RelRewriteLiftError::UnresolvedObligations(
+                plan.required_obligations.clone(),
+            ));
+        }
+        return Ok(PreparedRelWritableLiftStrategy::Filter(Box::new(
+            PreparedFilterLift::prepare(plan, semantic, registry)?,
+        )));
+    }
+    Err(RelRewriteLiftError::CandidateGenerationUnsupported)
+}
+
 fn commit_unique_relational_view_rewrite_inner<I: Clone + PartialEq>(
     runtime: &DurableRuntime,
     transaction_id: ClientTransactionId,
     target_revision: RevisionId,
-    plan: &RelWritableViewPlan,
+    prepared: &mut PreparedWritableCompilation,
     source_spec: &kernel_change::RewriteSpec,
     requested_view: &PreparedRewrite<RelationValue, I>,
     project_constructor: Option<&FixedHiddenProjectInsertConstructor>,
 ) -> Result<WritableViewCommitOutcome, WritableViewCommitError> {
+    let (coordinates, compilation, strategy) = (
+        &mut prepared.coordinates,
+        &prepared.compilation,
+        &prepared.strategy,
+    );
+    let plan = prepared_writable_plan(compilation)?;
     let snapshot = runtime
         .snapshot()
         .map_err(DurableRuntimeCommitError::from)?;
     let source_revision = snapshot.revision().id();
     let registry = runtime.semantic_registry();
-    let unique = match plan.synthesize_identity_source_rewrite(
-        &snapshot.revision().state().model,
-        snapshot.revision().semantic_context(),
-        registry,
-        source_spec,
-        requested_view,
-    ) {
-        Ok(unique) => unique,
-        Err(
-            RelRewriteLiftError::CandidateGenerationUnsupported
-            | RelRewriteLiftError::UnresolvedObligations(_),
-        ) => match synthesize_bijective_project_source_rewrite_for_commit(
-            plan,
-            &snapshot.revision().state().model,
-            snapshot.revision().semantic_context(),
-            registry,
-            source_spec,
-            requested_view,
-        ) {
-            Ok(unique) => unique,
-            Err(
-                RelRewriteLiftError::CandidateGenerationUnsupported
-                | RelRewriteLiftError::UnresolvedObligations(_),
-            ) => match synthesize_lossy_project_deletion_source_rewrite_for_commit(
+    let model = &snapshot.revision().state().model;
+    let semantic = snapshot.revision().semantic_context();
+    let unique = match strategy {
+        PreparedRelWritableLiftStrategy::ReadOnly => {
+            return Err(RelRewriteLiftError::CandidateGenerationUnsupported.into());
+        }
+        PreparedRelWritableLiftStrategy::Identity(identity) => {
+            synthesize_identity_source_rewrite_for_commit(
                 plan,
-                &snapshot.revision().state().model,
-                snapshot.revision().semantic_context(),
+                identity,
+                model,
+                semantic,
                 registry,
                 source_spec,
                 requested_view,
-                project_constructor,
-            ) {
-                Ok(unique) => unique,
-                Err(
-                    RelRewriteLiftError::CandidateGenerationUnsupported
-                    | RelRewriteLiftError::UnresolvedObligations(_),
-                ) => match synthesize_direct_scan_join_source_rewrite_with_constructor_for_commit(
-                    plan,
-                    &snapshot.revision().state().model,
-                    snapshot.revision().semantic_context(),
+            )?
+        }
+        PreparedRelWritableLiftStrategy::BijectiveProject(project) => {
+            synthesize_bijective_project_source_rewrite_for_commit(
+                plan,
+                project,
+                model,
+                semantic,
+                registry,
+                source_spec,
+                requested_view,
+            )?
+        }
+        PreparedRelWritableLiftStrategy::LossyProject(project) => {
+            synthesize_lossy_project_source_rewrite_with_coordinates(
+                plan,
+                project,
+                model,
+                requested_view,
+                coordinates,
+                &PreparedLiftContext {
+                    semantic,
                     registry,
                     source_spec,
-                    requested_view,
-                    project_constructor,
-                ) {
-                    Ok(unique) => unique,
-                    Err(
-                        RelRewriteLiftError::CandidateGenerationUnsupported
-                        | RelRewriteLiftError::UnresolvedObligations(_),
-                    ) => synthesize_filter_source_rewrite_for_commit(
-                        plan,
-                        &snapshot.revision().state().model,
-                        snapshot.revision().semantic_context(),
-                        registry,
-                        source_spec,
-                        requested_view,
-                    )?,
-                    Err(error) => return Err(error.into()),
+                    constructor: project_constructor,
                 },
-                Err(error) => return Err(error.into()),
-            },
-            Err(error) => return Err(error.into()),
-        },
-        Err(error) => return Err(error.into()),
+            )?
+        }
+        PreparedRelWritableLiftStrategy::JoinOwnerSide(join) => {
+            synthesize_direct_scan_join_source_rewrite_with_constructor_for_commit_prepared(
+                plan,
+                join,
+                model,
+                requested_view,
+                coordinates,
+                &PreparedLiftContext {
+                    semantic,
+                    registry,
+                    source_spec,
+                    constructor: project_constructor,
+                },
+            )?
+        }
+        PreparedRelWritableLiftStrategy::Filter(filter) => {
+            synthesize_filter_source_rewrite_for_commit(
+                plan,
+                filter,
+                model,
+                semantic,
+                registry,
+                source_spec,
+                requested_view,
+            )?
+        }
     };
     drop(snapshot);
 
@@ -1982,7 +1292,7 @@ mod tests {
         let spec = kernel_change::RewriteSpec {
             id: kernel_change::RewriteSpecId(SemanticId::new(930)),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(931)),
-            footprint: kernel_change::RewriteFootprint::default(),
+            footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
         };
         let plan = kernel_lens::RelWritableViewPlan {
             query: query.clone(),
@@ -2015,8 +1325,11 @@ mod tests {
             ])),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(941)),
         };
+        let prepared_filter =
+            super::PreparedFilterLift::prepare(&plan, &context, &registry).unwrap();
         let lifted = super::synthesize_filter_source_rewrite_for_commit(
             &plan,
+            &prepared_filter,
             &model,
             &context,
             &registry,
@@ -2024,7 +1337,7 @@ mod tests {
             &keep_alpha,
         )
         .unwrap();
-        assert!(lifted.delta.is_empty());
+        assert!(lifted.delta().is_empty());
 
         let bad_view = kernel_change::PreparedRewrite {
             spec: kernel_change::RewriteSpecId(SemanticId::new(942)),
@@ -2036,7 +1349,13 @@ mod tests {
         };
         assert!(matches!(
             super::synthesize_filter_source_rewrite_for_commit(
-                &plan, &model, &context, &registry, &spec, &bad_view,
+                &plan,
+                &prepared_filter,
+                &model,
+                &context,
+                &registry,
+                &spec,
+                &bad_view,
             ),
             Err(kernel_lens::RelRewriteLiftError::RequestedViewInadmissible)
         ));
@@ -2071,7 +1390,7 @@ mod tests {
         let spec = kernel_change::RewriteSpec {
             id: kernel_change::RewriteSpecId(SemanticId::new(962)),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(963)),
-            footprint: kernel_change::RewriteFootprint::default(),
+            footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
         };
         let query = RelExpr::Project {
             input: Box::new(RelExpr::Scan(relation)),
@@ -2103,15 +1422,26 @@ mod tests {
             ])),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(965)),
         };
+        let prepared_project = super::PreparedProjectLift {
+            base: super::PreparedLiftBase::prepare(&plan, &context, &registry).unwrap(),
+            projection: super::PreparedProjectionPath::from_stage_columns(&[vec![1, 0]], 2)
+                .unwrap(),
+        };
         let lifted = super::synthesize_bijective_project_source_rewrite_for_commit(
-            &plan, &model, &context, &registry, &spec, &requested,
+            &plan,
+            &prepared_project,
+            &model,
+            &context,
+            &registry,
+            &spec,
+            &requested,
         )
         .unwrap();
         let old_owner = RelExpr::Scan(relation)
             .evaluate(&model, &context, &registry)
             .unwrap();
         assert_eq!(
-            lifted.rewrite.apply(&old_owner),
+            lifted.apply_structural(&old_owner, &registry).unwrap(),
             kernel_query::RelationValue::Bag(vec![vec![
                 Value::Text("LEFT2".into()),
                 Value::Text("RIGHT2".into()),
@@ -2147,7 +1477,7 @@ mod tests {
         let spec = kernel_change::RewriteSpec {
             id: kernel_change::RewriteSpecId(SemanticId::new(968)),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(969)),
-            footprint: kernel_change::RewriteFootprint::default(),
+            footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
         };
         let query = RelExpr::Project {
             input: Box::new(RelExpr::Scan(relation)),
@@ -2183,7 +1513,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            lifted.delta.removed,
+            lifted.delta().removed,
             vec![vec![
                 Value::Text("a".into()),
                 Value::Text("hidden-a".into())
@@ -2267,7 +1597,7 @@ mod tests {
         let spec = kernel_change::RewriteSpec {
             id: kernel_change::RewriteSpecId(SemanticId::new(9722)),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(9723)),
-            footprint: kernel_change::RewriteFootprint::default(),
+            footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
         };
         let query = RelExpr::Project {
             input: Box::new(RelExpr::Scan(relation)),
@@ -2301,7 +1631,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            lifted.delta.inserted,
+            lifted.delta().inserted,
             vec![vec![Value::Text("a".into()), Value::Text("hidden".into())]]
         );
 
@@ -2380,7 +1710,7 @@ mod tests {
         let spec = kernel_change::RewriteSpec {
             id: kernel_change::RewriteSpecId(SemanticId::new(9732)),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(9733)),
-            footprint: kernel_change::RewriteFootprint::default(),
+            footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
         };
         let prepared = prepare_baseline(
             RelExpr::Project {
@@ -2447,7 +1777,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            lifted.delta.inserted,
+            lifted.delta().inserted,
             vec![vec![
                 Value::Text("b".into()),
                 Value::Text("hidden-new".into())
@@ -2545,7 +1875,7 @@ mod tests {
         let spec = kernel_change::RewriteSpec {
             id: kernel_change::RewriteSpecId(SemanticId::new(973)),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(974)),
-            footprint: kernel_change::RewriteFootprint::default(),
+            footprint: kernel_change::RewriteFootprint::opaque_relation(owner),
         };
         let plan = kernel_lens::RelWritableViewPlan {
             query: RelExpr::JoinEq {
@@ -2614,7 +1944,9 @@ mod tests {
         let old_owner = RelExpr::Scan(fixture.owner)
             .evaluate(&fixture.model, &fixture.context, &fixture.registry)
             .unwrap();
-        let actual_owner = lifted.rewrite.apply(&old_owner);
+        let actual_owner = lifted
+            .apply_structural(&old_owner, &fixture.registry)
+            .unwrap();
         assert_eq!(actual_owner.rows().len(), 2);
         assert!(
             actual_owner
@@ -2711,7 +2043,9 @@ mod tests {
         let old_owner = RelExpr::Scan(fixture.owner)
             .evaluate(&fixture.model, &fixture.context, &fixture.registry)
             .unwrap();
-        let actual_owner = lifted.rewrite.apply(&old_owner);
+        let actual_owner = lifted
+            .apply_structural(&old_owner, &fixture.registry)
+            .unwrap();
         assert!(
             actual_owner
                 .rows()
@@ -2786,7 +2120,9 @@ mod tests {
         let old_owner = RelExpr::Scan(fixture.owner)
             .evaluate(&fixture.model, &fixture.context, &fixture.registry)
             .unwrap();
-        let actual_owner = lifted.rewrite.apply(&old_owner);
+        let actual_owner = lifted
+            .apply_structural(&old_owner, &fixture.registry)
+            .unwrap();
         assert!(
             actual_owner
                 .rows()
@@ -2881,12 +2217,207 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            lifted.delta.inserted,
+            lifted.delta().inserted,
             vec![vec![
                 Value::Text("b".into()),
                 Value::Text("hidden-new".into())
             ]]
         );
+    }
+
+    #[test]
+    fn lookup_uniqueness_is_checked_once_by_gamma_key_not_raw_value() {
+        let equivalence = SemanticId::new(9_794_001);
+        let relation = SemanticId::new(9_794_002);
+        let mut schema = Schema::new(SchemaRevisionId::new(96));
+        schema
+            .define_relation(RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![equivalence],
+                },
+            })
+            .unwrap();
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(96));
+        environment.pin_module(equivalence, digest);
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            relation,
+            vec![
+                vec![Value::Text("Alpha".into())],
+                vec![Value::Text("alpha".into())],
+            ],
+        );
+        let prepared_lookup = RelExpr::Scan(relation)
+            .prepare(&context, &registry)
+            .unwrap();
+        let error = super::validate_direct_lookup_key_uniqueness(
+            &prepared_lookup,
+            0,
+            equivalence,
+            &model,
+            &context,
+            &registry,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            kernel_lens::RelRewriteLiftError::JoinLookupKeyNotUnique
+        );
+    }
+
+    #[test]
+    fn gamma_preimage_catalog_keys_projected_rows_by_declared_equivalence() {
+        let equivalence = SemanticId::new(9_795_001);
+        let schema = Schema::new(SchemaRevisionId::new(97));
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(97));
+        environment.pin_module(equivalence, digest);
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let owner_type = kernel_query::RelType {
+            columns: vec![
+                TypeExpr::Scalar(ScalarType::Text),
+                TypeExpr::Scalar(ScalarType::Text),
+            ],
+            semantics: RelationSemantics::Bag {
+                column_equivalences: vec![equivalence, equivalence],
+            },
+        };
+        let projected_type = kernel_query::RelType {
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Bag {
+                column_equivalences: vec![equivalence],
+            },
+        };
+        let rows = vec![
+            vec![Value::Text("Alpha".into()), Value::Text("x".into())],
+            vec![Value::Text("alpha".into()), Value::Text("x".into())],
+        ];
+        let catalog = super::GammaPreimageCatalog::build(
+            &rows,
+            &owner_type,
+            &projected_type,
+            &context,
+            &registry,
+            |row| Ok(vec![row[0].clone()]),
+        )
+        .unwrap();
+        let class = super::GammaPreimageCatalog::class_for_view_row(
+            &[Value::Text("ALPHA".into())],
+            &projected_type,
+            &context,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(catalog.representative(&class, &rows), Some(&rows[0]));
+    }
+
+    #[test]
+    fn gamma_preimage_catalog_projects_owner_once_for_reused_delta_lookups() {
+        use std::cell::Cell;
+
+        let fixture = direct_join_fixture();
+        let owner_type = RelExpr::Scan(fixture.owner)
+            .typecheck(&fixture.context, &fixture.registry)
+            .unwrap();
+        let text_eq = match &owner_type.semantics {
+            RelationSemantics::Bag {
+                column_equivalences,
+            }
+            | RelationSemantics::Set {
+                column_equivalences,
+            } => column_equivalences[0],
+        };
+        let projected_type = kernel_query::RelType {
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Bag {
+                column_equivalences: vec![text_eq],
+            },
+        };
+        let owner_rows = fixture.model.relations.get(&fixture.owner).unwrap();
+        let projection_calls = Cell::new(0_usize);
+        let catalog = super::GammaPreimageCatalog::build(
+            owner_rows,
+            &owner_type,
+            &projected_type,
+            &fixture.context,
+            &fixture.registry,
+            |row| {
+                projection_calls.set(projection_calls.get() + 1);
+                Ok(vec![row[0].clone()])
+            },
+        )
+        .unwrap();
+        assert_eq!(projection_calls.get(), owner_rows.len());
+
+        for _ in 0..128 {
+            let class = super::GammaPreimageCatalog::class_for_view_row(
+                &[Value::Text("a".into())],
+                &projected_type,
+                &fixture.context,
+                &fixture.registry,
+            )
+            .unwrap();
+            assert_eq!(
+                catalog.representative(&class, owner_rows),
+                Some(&owner_rows[0])
+            );
+        }
+        assert_eq!(projection_calls.get(), owner_rows.len());
+    }
+
+    #[test]
+    fn lossy_join_project_representative_lookup_propagates_semantic_failure() {
+        let fixture = direct_join_fixture();
+        let owner_type = RelExpr::Scan(fixture.owner)
+            .typecheck(&fixture.context, &fixture.registry)
+            .unwrap();
+        let unavailable_equivalence = SemanticId::new(9_790_001);
+        let visible_owner_type = kernel_query::RelType {
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Bag {
+                column_equivalences: vec![unavailable_equivalence],
+            },
+        };
+        let old_full_section = kernel_query::RelationValue::Bag(
+            fixture.model.relations.get(&fixture.owner).unwrap().clone(),
+        );
+        let rows = old_full_section.rows().to_vec();
+        let project_stages = vec![vec![0]];
+        let projection = super::PreparedProjectionPath::from_stage_columns(
+            &project_stages,
+            owner_type.columns.len(),
+        )
+        .unwrap();
+
+        let error = super::GammaPreimageCatalog::build(
+            old_full_section.rows(),
+            &owner_type,
+            &visible_owner_type,
+            &fixture.context,
+            &fixture.registry,
+            |row| projection.project_row(row),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            kernel_lens::RelRewriteLiftError::Query(kernel_query::RelQueryError::Semantic(
+                kernel_semantics::SemanticError::WrongModuleKind(id)
+            )) if id == unavailable_equivalence
+        ));
+        assert_eq!(rows, old_full_section.rows());
     }
 
     fn filtered_lookup_join_fixture() -> DirectJoinFixture {
@@ -2930,7 +2461,7 @@ mod tests {
         let spec = kernel_change::RewriteSpec {
             id: kernel_change::RewriteSpecId(SemanticId::new(993)),
             law_set: kernel_change::RewriteLawSetId(SemanticId::new(994)),
-            footprint: kernel_change::RewriteFootprint::default(),
+            footprint: kernel_change::RewriteFootprint::opaque_relation(owner),
         };
         let compiled =
             super::compile_prepared_relational_writable_query(&prepared, owner, spec.id, &registry)
@@ -3005,7 +2536,9 @@ mod tests {
         let old_owner = RelExpr::Scan(fixture.owner)
             .evaluate(&fixture.model, &fixture.context, &fixture.registry)
             .unwrap();
-        let actual_owner = lifted.rewrite.apply(&old_owner);
+        let actual_owner = lifted
+            .apply_structural(&old_owner, &fixture.registry)
+            .unwrap();
         assert!(
             actual_owner
                 .rows()

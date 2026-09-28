@@ -415,7 +415,14 @@ fn top_k_typed_batch_selection(
             .map(|position| materialize_typed_batch_row(program, columns, position, stats))
             .collect();
     }
-    select_top_k_semantic_positions(&mut positions, order_column, spec, env, stats)?;
+    let compiled_ordering = env.registry.compile_ordering(env.context, spec.ordering)?;
+    select_top_k_semantic_positions(
+        &mut positions,
+        order_column,
+        spec,
+        &compiled_ordering,
+        stats,
+    )?;
     positions
         .into_iter()
         .map(|position| materialize_typed_batch_row(program, columns, position, stats))
@@ -468,7 +475,7 @@ fn select_top_k_semantic_positions(
     positions: &mut Vec<usize>,
     order_column: &NativeColumn,
     spec: TopKBatchSpec,
-    env: &StatefulBatchEnv<'_>,
+    ordering: &kernel_semantics::CompiledOrdering,
     stats: &mut ExecutionStats,
 ) -> Result<(), PhysicalExecutionError> {
     let mut frontier = BTreeMap::<kernel_semantics::CanonicalOrderClassKey, Vec<usize>>::new();
@@ -476,9 +483,7 @@ fn select_top_k_semantic_positions(
     for position in positions.drain(..) {
         let value = order_column.value_at(position);
         stats.values_read = stats.values_read.saturating_add(1);
-        let key = env
-            .registry
-            .canonical_order_key(env.context, spec.ordering, &value)?;
+        let key = ordering.canonical_key(&value)?;
         frontier.entry(key).or_default().push(position);
         retained = retained.saturating_add(1);
 

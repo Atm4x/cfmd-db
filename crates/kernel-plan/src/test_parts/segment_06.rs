@@ -905,6 +905,51 @@ fn ordered_view_snapshot_compacts_bag_multiplicity_and_seeks_within_run() {
     );
 }
 
+#[test]
+fn prepared_ordered_view_keeps_bound_ordering_after_registry_replacement() {
+    let (mut context, mut registry, relation) = planning_context();
+    let ordering = sid(9_995_111);
+    let ordering_digest = registry.install_ordering(OrderingModule::I64Ascending);
+    context.environment.pin_module(ordering, ordering_digest);
+    let binding = LayoutBinding {
+        id: LayoutId(9_995_111),
+        family: LayoutFamily::RowStore,
+    };
+    let mut catalog = PhysicalCatalog::default();
+    catalog.bind_relation(relation, binding);
+    let prepared =
+        prepare_with_catalog(RelExpr::Scan(relation), &context, &registry, &catalog).unwrap();
+    let view = prepared
+        .ordered_view(
+            OrderedViewSpec {
+                column: 0,
+                ordering,
+                direction: OrderDirection::Ascending,
+            },
+            &registry,
+        )
+        .unwrap();
+    let mut store = PhysicalStore::default();
+    store
+        .install(
+            relation,
+            binding,
+            NativeRelation::row_store(vec![vec![Value::I64(2)], vec![Value::I64(1)]]),
+        )
+        .unwrap();
+    store.bind_revision(RevisionId::new(9_995_111)).unwrap();
+
+    let mut replacement_registry = SemanticRegistry::default();
+    replacement_registry.install_equivalence(EquivalenceModule::I64Exact);
+    let snapshot = view
+        .snapshot_native_pinned(&store, &replacement_registry)
+        .unwrap();
+    assert_eq!(
+        snapshot.page(None, 2).unwrap().rows,
+        vec![vec![Value::I64(1)], vec![Value::I64(2)]]
+    );
+}
+
 fn ordered_materialization_fixture() -> (
     SemanticContext,
     SemanticRegistry,

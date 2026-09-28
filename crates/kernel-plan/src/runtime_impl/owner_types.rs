@@ -13,6 +13,7 @@ pub struct RuntimeRevisionBundle {
     violation_state: RuntimeViolationState,
     physical: PhysicalStore,
     relation_layouts: PersistentOrdMap<SemanticId, LayoutBinding>,
+    relation_bases: PersistentOrdMap<SemanticId, RelationBaseWitness>,
     materialization_specs: PersistentOrdMap<kernel_types::MaterializationId, RelExpr>,
     materializations: PersistentOrdMap<kernel_types::MaterializationId, MaterializedRelPlanState>,
     materialization_dependencies:

@@ -8,6 +8,7 @@ impl RuntimeRevisionBundle {
             violation_state: self.violation_state.clone(),
             physical: self.physical.clone(),
             relation_layouts: self.relation_layouts.clone(),
+            relation_bases: self.relation_bases.clone(),
             materialization_specs: self.materialization_specs.clone(),
             materializations: self.materializations.clone(),
             materialization_dependencies: self.materialization_dependencies.clone(),

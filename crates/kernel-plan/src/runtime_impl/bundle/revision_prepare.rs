@@ -1,3 +1,7 @@
+type CandidateMaterializationMap =
+    PersistentOrdMap<kernel_types::MaterializationId, MaterializedRelPlanState>;
+type MaterializationOutputDeltaMap = BTreeMap<kernel_types::MaterializationId, RelationDelta>;
+
 impl RuntimeRevisionBundle {
     fn durable_artifact_cores(&self) -> Result<Vec<DurableArtifactCore>, PhysicalExecutionError> {
         self.physical.durable_artifact_cores(self.revision.id())
@@ -39,6 +43,45 @@ impl RuntimeRevisionBundle {
             request.registry,
         )?;
         Ok((candidate_store, resolved))
+    }
+
+    fn candidate_materializations_for_revision_transition(
+        &self,
+        resolved: &BTreeMap<SemanticId, StorageResolvedRelationDelta>,
+        target_revision: RevisionId,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<
+        (CandidateMaterializationMap, MaterializationOutputDeltaMap),
+        PhysicalExecutionError,
+    > {
+        let mut candidate_materializations = self.materializations.clone();
+        let mut output_deltas = BTreeMap::new();
+        let affected_materializations = self.affected_materializations(resolved.keys().copied());
+        for &id in &affected_materializations {
+            let dependencies = self
+                .materialization_dependencies
+                .get(&id)
+                .ok_or(PhysicalExecutionError::MaterializationDependencyIndexMismatch)?;
+            let relevant = resolved
+                .iter()
+                .filter(|(relation, _)| dependencies.contains(relation))
+                .map(|(relation, delta)| (*relation, delta.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let source_plan = self
+                .materializations
+                .get(&id)
+                .ok_or(PhysicalExecutionError::MaterializationDependencyIndexMismatch)?;
+            let (candidate_plan, output_delta) = source_plan
+                .candidate_from_storage_resolved_deltas_for_revision(
+                    target_revision,
+                    &relevant,
+                    self.revision.semantic_context(),
+                    registry,
+                )?;
+            candidate_materializations.insert(id, candidate_plan);
+            output_deltas.insert(id, output_delta);
+        }
+        Ok((candidate_materializations, output_deltas))
     }
 
     fn prepare_revision(
@@ -135,29 +178,12 @@ impl RuntimeRevisionBundle {
             self.candidate_physical_store_for_revision(request)?;
         candidate_store.rebind_unpublished_candidate_revision(source_revision, target_revision)?;
 
-        let mut candidate_materializations = self.materializations.clone();
-        let mut output_deltas = BTreeMap::new();
-        let affected_materializations = self.affected_materializations(resolved.keys().copied());
-        for &id in &affected_materializations {
-            let dependencies = self
-                .materialization_dependencies
-                .get(&id)
-                .ok_or(PhysicalExecutionError::MaterializationDependencyIndexMismatch)?;
-            let relevant = resolved
-                .iter()
-                .filter(|(relation, _)| dependencies.contains(relation))
-                .map(|(relation, delta)| (*relation, delta.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let candidate_plan = candidate_materializations
-                .get_mut(&id)
-                .ok_or(PhysicalExecutionError::MaterializationDependencyIndexMismatch)?;
-            let output_delta = candidate_plan.apply_storage_resolved_deltas(
-                &relevant,
-                self.revision.semantic_context(),
+        let (candidate_materializations, output_deltas) = self
+            .candidate_materializations_for_revision_transition(
+                &resolved,
+                target_revision,
                 request.registry,
             )?;
-            output_deltas.insert(id, output_delta);
-        }
 
         let violation_state = self.candidate_violation_state_for_relation_transition(
             request,
@@ -165,6 +191,16 @@ impl RuntimeRevisionBundle {
             replay_claimed_delta,
         )?;
         violation_state.require_zero()?;
+        let mut relation_bases = self.relation_bases.clone();
+        for mutation in request.mutations {
+            let base = self.relation_bases.get(&mutation.relation).ok_or(
+                PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation),
+            )?;
+            relation_bases.insert(
+                mutation.relation,
+                base.advance(target_revision, mutation.delta, request.registry)?,
+            );
+        }
         let candidate = RuntimeRevisionBundle {
             root_identity: RuntimeRootIdentity {
                 root_id: self.root_identity.root_id,
@@ -174,6 +210,7 @@ impl RuntimeRevisionBundle {
             violation_state,
             physical: candidate_store,
             relation_layouts: self.relation_layouts.clone(),
+            relation_bases,
             materialization_specs: self.materialization_specs.clone(),
             materializations: candidate_materializations,
             materialization_dependencies: self.materialization_dependencies.clone(),
@@ -234,47 +271,31 @@ impl RuntimeRevisionBundle {
             }
             mutations.push(RevisionRelationMutation {
                 relation: relation_rewrite.relation,
-                delta: &relation_rewrite.rewrite.delta,
+                delta: relation_rewrite.rewrite.delta(),
             });
             rewrite_intents.insert(
                 relation_rewrite.relation,
                 RuntimeRewriteIntent {
-                    spec: relation_rewrite.rewrite.rewrite.spec,
-                    law_set: relation_rewrite.rewrite.rewrite.law_set,
+                    spec: relation_rewrite.rewrite.rewrite().spec(),
+                    law_set: relation_rewrite.rewrite.rewrite().law_set(),
                 },
             );
         }
 
-        if derived_endpoint.is_some_and(|endpoint| !endpoint.certifies_mutations(&mutations)) {
-            return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
-        }
-
         for relation_rewrite in request.rewrites {
-            let rewrite_endpoint = relation_rewrite.rewrite.rewrite.effect.endpoint();
-            let effect_matches = if let Some(endpoint) = derived_endpoint {
-                relation_value_matches_revision_relation(
-                    rewrite_endpoint,
-                    endpoint.revision(),
-                    relation_rewrite.relation,
-                )
-            } else {
-                let old = RelExpr::Scan(relation_rewrite.relation).evaluate(
-                    &self.revision.state().model,
-                    self.revision.semantic_context(),
-                    request.registry,
-                )?;
-                let delta_endpoint = relation_rewrite.rewrite.delta.apply_to_value(
-                    old,
-                    self.revision.semantic_context(),
-                    request.registry,
-                )?;
-                rewrite_endpoint == &delta_endpoint
-            };
-            if !effect_matches {
+            let base = self.relation_bases.get(&relation_rewrite.relation).ok_or(
+                PhysicalExecutionError::MissingRuntimeRelationBinding(relation_rewrite.relation),
+            )?;
+            let effect = relation_rewrite.rewrite.rewrite().effect();
+            if !effect.certifies_base_witness(base) {
                 return Err(PhysicalExecutionError::RewriteEffectMismatch(
                     relation_rewrite.relation,
                 ));
             }
+        }
+
+        if derived_endpoint.is_some_and(|endpoint| !endpoint.certifies_mutations(&mutations)) {
+            return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
         }
 
         let mut prepared = match derived_endpoint {
@@ -468,6 +489,7 @@ impl RuntimeRevisionBundle {
                 let rows = self.physical.logical_rows_with_handles(relation, layout)?;
                 maintained.attach_storage_rows(relation, &rows)?;
             }
+            maintained.bind_revision(self.revision.id())?;
             materialization_specs.insert(spec.id, spec.query.clone());
             materializations.insert(spec.id, maintained);
         }
@@ -485,6 +507,7 @@ impl RuntimeRevisionBundle {
                 violation_state: self.violation_state.clone(),
                 physical: self.physical.clone(),
                 relation_layouts: self.relation_layouts.clone(),
+                relation_bases: self.relation_bases.clone(),
                 materialization_specs,
                 materializations,
                 materialization_dependencies,

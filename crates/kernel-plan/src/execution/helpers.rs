@@ -32,8 +32,9 @@ pub(super) fn execute_top_k_plan(
     registry: &kernel_semantics::SemanticRegistry,
     stats: &mut ExecutionStats,
 ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
+    let compiled_ordering = registry.compile_ordering(context, ordering)?;
     let rows = input.execute_native_rows(store, context, registry, stats)?;
-    top_k_rows(rows, column, ordering, direction, k, context, registry)
+    top_k_rows(rows, column, &compiled_ordering, direction, k)
 }
 
 // HOSTILE[P161][ACTIVE][GENERIC:P160.N]: canonical grouping fallback; typed maintained paths exist.
@@ -118,11 +119,9 @@ fn group_rows(
 fn top_k_rows(
     rows: Vec<kernel_query::Row>,
     column: usize,
-    ordering: SemanticId,
+    ordering: &kernel_semantics::CompiledOrdering,
     direction: OrderDirection,
     k: usize,
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
     if k == 0 || rows.is_empty() {
         return Ok(Vec::new());
@@ -132,7 +131,7 @@ fn top_k_rows(
     let mut retained = 0_usize;
     for row in rows {
         let value = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
-        let key = registry.canonical_order_key(context, ordering, value)?;
+        let key = ordering.canonical_key(value)?;
         frontier.entry(key).or_default().push(row);
         retained = retained.saturating_add(1);
 

@@ -155,6 +155,7 @@ dependencies = [
  "kernel-schema",
  "kernel-semantics",
  "kernel-types",
+ "sha2",
 ]
 
 [[package]]

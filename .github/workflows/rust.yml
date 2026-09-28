@@ -10,6 +10,7 @@ on:
       - '.cargo/**'
       - 'vendor/**'
       - 'scripts/ci-rust.sh'
+      - 'scripts/verify-repository.sh'
       - '.github/workflows/rust.yml'
   pull_request:
     paths:
@@ -20,6 +21,7 @@ on:
       - '.cargo/**'
       - 'vendor/**'
       - 'scripts/ci-rust.sh'
+      - 'scripts/verify-repository.sh'
       - '.github/workflows/rust.yml'
   workflow_dispatch:
 
@@ -34,11 +36,11 @@ jobs:
       CARGO_NET_OFFLINE: 'true'
     steps:
       - uses: actions/checkout@v4
+      - name: Repository completeness
+        run: bash ./scripts/verify-repository.sh
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
           rustup override set 1.98.1
-      - name: Repository layout
-        run: ./scripts/verify-repository.sh
       - name: Rust gates
         run: bash ./scripts/ci-rust.sh

@@ -24,8 +24,8 @@ use kernel_persistent::{
 };
 use kernel_query::{
     AggregateSpec, Impact, MaterializedRelPlanState, OrderDirection, PreparedRelationRewrite,
-    RelExpr, RelObservationGuard, RelQueryError, RelType, RelationDelta, RelationValue,
-    StorageResolvedRelationDelta,
+    RelExpr, RelObservationGuard, RelQueryError, RelType, RelationBaseWitness, RelationDelta,
+    RelationValue, StorageResolvedRelationDelta,
 };
 pub use kernel_types::StableRowHandle as PhysicalRowId;
 use kernel_types::{ClientTransactionId, EqClassId, RevisionId, RevisionObservableId, SemanticId};

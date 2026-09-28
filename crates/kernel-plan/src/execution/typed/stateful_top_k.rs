@@ -88,7 +88,8 @@ fn retain_top_k_positions(
         select_top_k_i64_positions(positions, values, spec.direction, spec.k, stats);
         return Ok(());
     }
-    select_top_k_semantic_positions(positions, order_column, spec, env, stats)
+    let compiled_ordering = env.registry.compile_ordering(env.context, spec.ordering)?;
+    select_top_k_semantic_positions(positions, order_column, spec, &compiled_ordering, stats)
 }
 
 fn select_logical_columns(
