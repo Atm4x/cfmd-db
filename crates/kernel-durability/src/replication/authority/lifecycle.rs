@@ -30,7 +30,10 @@ impl ReplicationAuthorityJournal {
 
         let mut journal = Self {
             path,
-            file,
+            file: Some(file),
+            single_file_capture: false,
+            pending_single_file_frames: Vec::new(),
+            live_single_file_frames: Vec::new(),
             effects: BTreeMap::new(),
             branches: BTreeMap::new(),
             revision_frontiers: BTreeMap::new(),
@@ -63,11 +66,122 @@ impl ReplicationAuthorityJournal {
         };
         let (last_good, original_len) = journal.replay_file()?;
         if last_good < original_len {
-            journal.file.set_len(last_good)?;
-            journal.file.sync_all()?;
+            let file = journal
+                .file
+                .as_mut()
+                .expect("file-backed replication journal");
+            file.set_len(last_good)?;
+            file.sync_all()?;
         }
-        journal.file.seek(SeekFrom::End(0))?;
+        journal
+            .file
+            .as_mut()
+            .expect("file-backed replication journal")
+            .seek(SeekFrom::End(0))?;
         Ok(journal)
+    }
+
+    pub(crate) fn open_single_file(
+        path: impl AsRef<Path>,
+        archived_frames: &[u8],
+        live_frames: &[Vec<u8>],
+    ) -> Result<Self, DurabilityError> {
+        let mut journal = Self {
+            path: path.as_ref().to_path_buf(),
+            file: None,
+            single_file_capture: true,
+            pending_single_file_frames: Vec::new(),
+            live_single_file_frames: Vec::new(),
+            effects: BTreeMap::new(),
+            branches: BTreeMap::new(),
+            revision_frontiers: BTreeMap::new(),
+            ordered_slots: BTreeMap::new(),
+            sequencer_epochs: BTreeMap::new(),
+            memberships: BTreeMap::new(),
+            current_membership_epoch: None,
+            quorum_certificates: BTreeMap::new(),
+            effect_votes: BTreeMap::new(),
+            membership_votes: BTreeMap::new(),
+            membership_vote_successors: BTreeMap::new(),
+            promised_terms: BTreeMap::new(),
+            highest_promised_terms: BTreeMap::new(),
+            leader_votes: BTreeMap::new(),
+            leader_certificates: BTreeMap::new(),
+            decision_votes: BTreeMap::new(),
+            decision_locks: BTreeMap::new(),
+            highest_decision_lock_term: 0,
+            joint_membership_certificates: BTreeMap::new(),
+            peer_auth_policy: None,
+            authenticated_evidence: BTreeMap::new(),
+            authenticated_evidence_index: BTreeMap::new(),
+            joint_membership_acks: BTreeMap::new(),
+            recovery_acks: BTreeMap::new(),
+            recovery_lock_frontiers: BTreeMap::new(),
+            quorum_availability: None,
+            published_effects: BTreeSet::new(),
+            published_branches: BTreeMap::new(),
+            poisoned: false,
+        };
+        journal.replay_single_file_archive(archived_frames)?;
+        for frame in live_frames {
+            journal.replay_single_file_frame(frame, true)?;
+        }
+        Ok(journal)
+    }
+
+    pub(crate) fn take_pending_single_file_frames(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_single_file_frames)
+    }
+
+    pub(crate) fn commit_single_file_frames(&mut self, frames: Vec<Vec<u8>>) {
+        self.live_single_file_frames.extend(frames);
+    }
+
+    pub(crate) fn single_file_live_archive_bytes(&self) -> Result<Vec<u8>, DurabilityError> {
+        self.single_file_live_archive_prefix(self.live_single_file_frames.len())
+    }
+
+    pub(crate) fn single_file_live_frame_count(&self) -> usize {
+        self.live_single_file_frames.len()
+    }
+
+    pub(crate) fn single_file_live_archive_prefix(
+        &self,
+        count: usize,
+    ) -> Result<Vec<u8>, DurabilityError> {
+        if count > self.live_single_file_frames.len() {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "single-file replication archive prefix exceeds live frame count",
+            });
+        }
+        let len = self
+            .live_single_file_frames
+            .iter()
+            .take(count)
+            .try_fold(0_usize, |total, frame| total.checked_add(frame.len()))
+            .ok_or(DurabilityError::PayloadTooLarge)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| DurabilityError::PayloadTooLarge)?;
+        for frame in self.live_single_file_frames.iter().take(count) {
+            bytes.extend_from_slice(frame);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn advance_single_file_generation_prefix(&mut self, count: usize) {
+        debug_assert!(self.single_file_capture);
+        debug_assert!(self.pending_single_file_frames.is_empty());
+        debug_assert!(count <= self.live_single_file_frames.len());
+        self.live_single_file_frames.drain(..count);
+    }
+
+    pub(crate) fn reset_single_file_generation(&mut self) {
+        debug_assert!(self.single_file_capture);
+        debug_assert!(self.pending_single_file_frames.is_empty());
+        self.live_single_file_frames.clear();
     }
 
     #[must_use]

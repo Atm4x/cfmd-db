@@ -105,20 +105,20 @@ rotate_needles = [
     'self.generation = generation;',
     'self.checkpoint = revision.clone();',
     'self.wal = wal;',
-    'freshness.advance(&self.directory, generation, 0, freshness_digest)',
+    'self.advance_external_freshness_generation_with_digest(generation, 0, freshness_digest)?;',
 ]
 pos = [rotate.find(n) for n in rotate_needles]
 if any(p < 0 for p in pos) or pos != sorted(pos):
     raise SystemExit(f'synchronous publication authority order changed: {pos}')
 
-compact_start = store.find('fn compact_obsolete_generations_with_hook(')
-compact_end = store.find('\nfn bind_prepare_descriptor', compact_start)
+compact_start = store.find('pub(super) fn compact_obsolete_generations(')
+compact_end = store.find('\nfn directory_freshness_material', compact_start)
 compact = store[compact_start:compact_end]
 compact_needles = [
     'hook.hit(StoreFaultPoint::BeforeCompactionRemove)?;',
     'fs::remove_file(entry.path())?;',
     'hook.hit(StoreFaultPoint::AfterCompactionRemove)?;',
-    'sync_directory(&self.directory)?;',
+    'super::file_io::sync_directory(&backend.root)?;',
     'hook.hit(StoreFaultPoint::AfterCompactionDirectorySync)?;',
 ]
 pos = [compact.find(n) for n in compact_needles]
@@ -135,7 +135,7 @@ for needle in [
     'write_metadata_file(',
     'FileRevisionWal::create_at_lsn(',
     'shadow_wal.durability_barrier()?;',
-    'sync_directory(&self.directory)?;',
+    'sync_directory(&directory)?;',
 ]:
     if needle not in start_stream:
         raise SystemExit(f'streaming start prerequisite missing: {needle}')
@@ -143,7 +143,7 @@ for needle in [
 chunks_start = store.find('pub fn write_streaming_checkpoint_chunks(')
 chunks_end = store.find('pub fn finalize_streaming_checkpoint(', chunks_start)
 chunks = store[chunks_start:chunks_end]
-for needle in ['file.sync_all()?;', 'write_chunked_checkpoint_root(', 'sync_directory(&self.directory)?;']:
+for needle in ['file.sync_all()?;', 'write_chunked_checkpoint_root(', 'sync_directory(directory)?;']:
     if needle not in chunks:
         raise SystemExit(f'streaming chunk durability step missing: {needle}')
 
@@ -157,7 +157,7 @@ final_needles = [
     'self.barrier_streaming_shadow();',
     'read_checkpoint_generation(',
     'prepared_capsule_path(',
-    'sync_directory(&self.directory)?;',
+    'sync_directory(&directory)?;',
     'publish_manifest_with_hook(',
 ]
 pos = [finalize.find(n) for n in final_needles]
@@ -165,7 +165,7 @@ if any(p < 0 for p in pos) or pos != sorted(pos):
     raise SystemExit(f'streaming finalize refinement changed: {pos}')
 
 # Generation creation remains monotone by construction through next_generation.
-if store.count('let generation = next_generation(&self.directory)?;') < 2:
+if store.count('let generation = next_generation(&directory)?;') < 2:
     raise SystemExit('generation monotonicity binding changed')
 
 # Immutable generation artifacts must be created as new files rather than

@@ -11,7 +11,8 @@ pub use historical::{
     LocalHistoricalComplementChain,
 };
 pub use transaction::{
-    DurableEffectKind, DurableRelationMutation, DurableRelationResolution,
+    DurableCarrierPatch, DurableEffectKind, DurableFieldPatch, DurableKeepsAlivePatch,
+    DurableModelDelta, DurableRelationMutation, DurableRelationResolution,
     DurableRelationRewriteIntent, DurableRevisionChange, DurableTransactionIntent,
     DurableTransactionKey, IdempotencyEpoch,
 };

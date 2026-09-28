@@ -16,6 +16,14 @@ for required in \
   docs/status/KERNEL_HOSTILE_LEDGER.md docs/status/PROJECT_STATUS.md \
   docs/api/PRODUCT_ROADMAP.md docs/api/CFMD_PYTHON_FACADE_THEORY.md \
   docs/architecture/ARCHITECTURE.md formal/lean/CFMD/Publication.lean \
+  formal/lean/CFMD/Notification.lean \
+  formal/lean/CFMD/SecurityAuthority.lean \
+  formal/lean/CFMD/SessionLifecycle.lean \
+  formal/lean/CFMD/WireProtocol.lean \
+  formal/lean/CFMD/HostedBoundary.lean \
+  formal/lean/CFMD/LocalTransport.lean \
+  formal/lean/CFMD/SingleFile.lean \
+  formal/lean/CFMD/DurabilityBackend.lean \
   formal/lean/CFMD/SurfaceKernel.lean; do
   test -f "$required" || { echo "missing required file: $required" >&2; exit 1; }
 done

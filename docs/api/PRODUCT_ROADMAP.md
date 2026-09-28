@@ -1,169 +1,162 @@
 # CFMD Product Roadmap
 
-## Product thesis
+## Product architecture
 
-CFMD's first practical product surface is a **Python-first embedded/local database facade** over the converged kernel.
+CFMD productization is **Rust-runtime first, language-surface second**.
 
-The read vocabulary should stay familiar; the differentiator is the combination:
+The desired Python/DX theory remains valid, but its semantics are implemented first as a universal Rust product boundary:
 
 ```text
-familiar lazy query
-+ deep domain traversal without manual join plumbing
-+ exact query-result watch
-+ historical contexts
-+ queryable Candidate future state
-+ future query delta / explanation
-+ semantic inverse / undo
-+ one authoritative runtime
-+ live local tooling over the same protocol
+Rust applications      Python / .NET / Studio
+       \                     /
+        \                   /
+             cfmd-runtime
+                  |
+       query / plan / candidate / watch / history
+                  |
+             kernel-* graph
 ```
 
-This roadmap is derived from [`CFMD_PYTHON_FACADE_THEORY.md`](CFMD_PYTHON_FACADE_THEORY.md). That document remains the detailed design source; this file is the implementation sequence.
+No language binding may call the kernel graph directly. This avoids duplicating semantics, leaking internal ownership types, and coupling FFI compatibility to kernel refactors.
 
-## Non-negotiable facade laws
+## Phase 0 — kernel convergence — COMPLETE
 
-1. **Types are types, not databases.** Use `db.users`, not `User[id]`, as the normal database-bound root.
-2. **No hidden I/O on materialized Python objects.** Symbolic query proxies may traverse relationships; ordinary Python attribute access may not silently hit storage.
-3. **Many-valued paths are explicit.** Require `any/all/match/where/count/...`; do not silently flatten ambiguous collections.
-4. **Worlds are explicit.** `db` is current state, `db.at(revision)` is historical state, `db.preview(plan)` is speculative state.
-5. **Shape-changing operations remain lazy.** Terminals such as `all/one/value` execute.
-6. **Exact watch means exact.** If a query has no certified incremental derivative, exact watch fails with a capability reason unless the caller explicitly chooses recomputation.
-7. **Plans precede advanced commits.** A Plan is an inspectable proposed transition; Candidate is a queryable future world.
-8. **One authoritative runtime.** External tools never bypass revision/validation/maintained-state authority by editing database bytes independently.
+Pass280 froze the global kernel hostile/refactor campaign for the declared scope.
 
-## Phase 0 — repository/kernel freeze baseline — COMPLETE
+## Phase 1 — universal Rust runtime facade — ACTIVE
 
-Pass280 closes the global kernel hostile/refactor campaign for the declared scope.
+Pass281 establishes `cfmd-runtime`; Pass282 extends the same vertical slice through creation/schema ownership:
 
-Release-prep requirements before facade implementation:
+- durable open;
+- immutable snapshots;
+- facade-owned IDs and values;
+- facade query IR;
+- prepare-once query execution;
+- atomic relation Plan commits;
+- facade error taxonomy;
+- no public kernel-type leakage;
+- facade-owned schema/type/relation builder;
+- durable create from a fully empty typed database;
+- schema introspection.
 
-- reproducible Rust/Lean CI;
-- complete vendored dependency snapshot;
-- manifest/repository completeness gate;
-- current architecture/status/spec documentation;
-- kernel hostile ledger and evidence-driven reopen policy.
+Next acceptance work:
 
-## Phase 1 — minimal Python pet-project surface
+1. typed relation/domain handles — **implemented P283**;
+2. object-first Rust domain mapping with stable textual keys and operation-produced Plans — **implemented P284**;
+2. explicit reference/cardinality contracts and safe deep-path query DX;
+3. Plan sealing and Candidate preview;
+4. historical contexts/history/inverse;
+5. exact watch protocol.
 
-Goal: a small local application can use CFMD without importing internal kernel crates or learning internal plan/revision ownership.
+Acceptance gate: a Rust application can create/open, query, transact, preview and watch a durable CFMD database using only `cfmd-runtime`.
 
-Deliverables:
+## Phase 2 — idiomatic Rust application surface
 
-- installable CPython wheels;
-- `cfmd.open(...)` / create/open/close lifecycle;
-- typed/generated schema surface with strong IDE/Pyright support;
-- entity sets (`db.users`, `db.messages`, ...);
-- `get` / `require` identity lookup;
-- `match` equality filtering;
-- symbolic `where` predicates;
-- `select`, ordering, limits and basic aggregates;
-- declared relationship navigation in depth;
-- explicit `Ref[T]` loading for materialized objects;
-- atomic immediate CRUD sugar implemented over the same write machinery;
-- stable domain-oriented error taxonomy;
-- executable tutorial and end-to-end local-app tests.
+**P284 direction:** object-first is the primary application DX; relation-first remains the universal/dynamic escape hatch. Read queries stay `Query` values. Write operations over an object collection/query return inspectable `Plan` values; Plans compose and later feed Candidate/commit rather than acting as the primary mutable command bag.
 
-Acceptance gate: a realistic small application can create/open a durable DB, transact and query using only the product facade.
+Build typed/generated builders over the stable runtime IR rather than exposing raw numeric column coordinates as the final DX.
 
-## Phase 2 — Plan / Candidate / history
+Targets:
 
-Goal: expose CFMD's revision/change model as useful application behavior rather than kernel internals.
+- generated/static schema handles;
+- typed `EntitySet<T>` / relation handles;
+- deep relationship paths;
+- typed query/result shaping;
+- ergonomic Plan/Candidate APIs;
+- async watch streams;
+- explainability/capability inspection.
 
-Deliverables:
+## Phase 3 — Python facade
 
-- first-class `Plan` / rewrite construction;
-- typed operation metadata;
-- `db.preview(plan) -> Candidate`;
-- query Candidate state with the same query objects used for current state;
-- `Candidate.delta(query)`;
-- Candidate validation/conflict surface;
-- freshness checks and explicit `StaleCandidate / RebaseRequired`;
-- revision/history browsing;
-- history entry → inverse Plan;
-- undo preview through the normal Candidate pipeline.
+The retained [`CFMD_PYTHON_FACADE_THEORY.md`](CFMD_PYTHON_FACADE_THEORY.md) remains the detailed Python UX source.
 
-Acceptance gate: applications can inspect “what would the database say if I commit this?” before authoritative publication.
+Python bindings must translate to the Rust facade/runtime protocol. They must not:
 
-## Phase 3 — exact watch protocol
+- import internal kernel concepts;
+- evaluate query semantics independently;
+- implement Candidate/watch/history in Python;
+- perform per-row FFI chatter when a batched runtime operation exists.
 
-Goal: make reactive local applications a database capability rather than a second hand-written event architecture.
+Python product targets remain familiar lazy query vocabulary, deep domain traversal, exact watch, Candidate future worlds, history/undo, and strong IDE typing.
 
-Deliverables:
+## Phase 4 — local tooling / Studio
 
-- language-neutral query subscription protocol;
-- revision-tagged atomic transaction batches;
-- collection `QueryDelta` and scalar `ValueChanged`;
-- exact-watch capability reporting;
-- `watch(since=revision)` with explicit `ResetRequired` when exact replay is unavailable;
-- bounded buffers/backpressure policy;
-- explicit optional `mode="recompute"` escape hatch, never mislabeled as exact maintenance;
-- async Python `watch()` / `values()` surface.
+Expose the same Rust runtime protocol over a local authenticated transport for Studio/CLI/tools. External tools submit Plans and observe revisions; they never mutate database bytes behind the authoritative runtime.
 
-Acceptance gate: a committed external change can update a subscribed Python UI through exact query-result deltas without table-level manual event wiring.
+## Phase 5 — additional language surfaces and release hardening
 
-## Phase 4 — local tooling and Studio
+- .NET/WPF;
+- native Rust ergonomic adapters;
+- compatibility/semver CI;
+- backup/restore UX;
+- observability/resource limits;
+- binary-size/performance regression budgets;
+- platform durability certification expansion.
 
-Goal: make CFMD a live state debugger for embedded applications.
+## Non-negotiable laws
 
-Deliverables:
+- one authoritative Rust runtime owns semantics and writes;
+- no hidden degradation from exact watch to polling;
+- current/historical/Candidate worlds are explicit;
+- many-valued traversal is explicit;
+- no internal kernel ownership/layout leaks through public contracts;
+- bindings share one runtime protocol instead of creating parallel database models.
 
-- app-owned local tooling endpoint (Named Pipe on Windows, Unix Domain Socket on Linux/macOS; optional localhost TCP);
-- capability-token protected read-only/read-write modes;
-- schema/query/revision/history/Plan/Candidate/watch protocol;
-- CFMD Studio attach/discovery workflow;
-- active-watch inspector;
-- Candidate direct/derived impact view;
-- query explainability (`logical`, `physical`, capabilities, dependencies);
-- PyQt/PySide adapters over the language-neutral watch stream.
+### P286 — explicit cardinality foundation
 
-Acceptance gate: CFMD Studio can edit through Plan → Candidate → commit, and the running application receives the same revision/watch effects as an in-process write.
+Rust object-first entities now support required refs, optional refs and symbolic reverse-many relationships. Query collections expose explicit `any/all/none/count().eq` semantics and never silently flatten many-valued paths. Materialized objects remain ordinary Rust values with no hidden database I/O.
 
-## Phase 5 — semantic undo, explanation and richer futures
+Next: move identity/reference integrity into durable kernel lifecycle authority (`LiveEntityRef` + carriers), then build richer deep-path/projected aggregate DX on that backend law.
 
-Deliverables:
+### P290–P291 — Candidate product surface
 
-- `why_changed(query)` backed by dependency/proof/change evidence;
-- finer semantic conflict/commutation checks for inverse/undo;
-- partial/dependency-aware undo where justified by the rewrite calculus;
-- predictable schema migration workflow;
-- Candidate support for selected schema/Γ futures where the kernel contracts are strong enough;
-- stronger generated typing for optional and many-valued relationship paths.
+`Plan -> Candidate` is now the authoritative preview workflow. P290 added exact proposed-state object/relation queries, identity `get/require`, and commit of the same Plan intent. P291 adds typed candidate projections, exact effect summaries, certified-target/freshness diagnostics, and immutable preview summaries. Candidate stays queryable after the owning runtime closes; commit requires the bound runtime capability to remain open. Next product work can build history/undo/watch directly on this current/proposed revision vocabulary rather than introducing another state abstraction.
 
-## Phase 6 — additional language surfaces
+### P292 — durable causal history and exact Plan inverse
 
-Once the runtime protocol is stable:
+`Database::history()` is now backed directly by the kernel durable revision-effect ideal. Entries expose transaction identity, source/target revisions, causal prerequisites and exact relation changes. `HistoryEntry::undo_plan()` is available only for a live-head transition whose durable intent is exactly representable by the current Plan calculus; it returns an ordinary Plan, so preview and publication use the existing Candidate/commit path. A committed undo is itself history, making redo the same inverse operation over that compensating entry.
 
-- Rust public application facade;
-- .NET/WPF continuation (`WatchAsync`, collection adapters);
-- Rust/CLI/Studio plugins against the same runtime protocol.
+R&D payer discovered in P292: forward-exact mixed `DurableModelDelta` is not generally invertible because field patches retain target values without a complete source complement. Mixed object changes with no non-relation delta (for example scalar-only row rewrites) are exactly undoable now; lifecycle/reference-changing mixed effects are explicitly `ComplementRequired`. The next history pass should close that algebraic gap rather than add a fallback or a second product-side undo log.
 
-These are additional surfaces over the same semantics, not independent database models.
+### P293 — compact exact mixed-history complement
 
-## Phase 7 — production release hardening
+P293 closes that payer for newly committed mixed transitions. The durable transaction intent now atomically carries the exact source-relative forward model delta and target-relative reverse complement; preparation independently derives and validates both. `Plan` gained an internal explicit model-delta representation so a history inverse can stay an ordinary Plan even when lifecycle/carrier/reference state changes. Consequently `db.history()` / `Database::history()` can derive Candidate-previewable exact undo for entity creation/deletion and strong-reference changes after restart. Undo-of-undo remains redo. WAL codec v11 is backward compatible with v10; legacy v10 mixed entries remain `ComplementRequired` rather than receiving a guessed inverse. Next payer: explicit non-head history rebase/conflict calculus, then exact watch over the same revision/effect vocabulary.
 
-- backup/restore and corruption-recovery UX;
-- stable compatibility/semver policy;
-- API compatibility CI;
-- binary-size tracking;
-- watch memory/resource limits;
-- observability;
-- platform-specific durability certification expansion;
-- upgrade/downgrade story;
-- public benchmark corpus and regression thresholds;
-- security review of local tooling and deployment/auth boundaries.
+## P297 hosting/notification boundary
 
-## Product milestone definitions
+`watch()` delivery is transport-neutral. `PublicationNotifier` is a wake-only provider contract: first-party embedded use can keep the std in-process implementation, while hosted applications, UI event loops or future IPC/network services can explicitly install another provider. Provider notifications never carry authoritative database state and never decide writer compatibility; Revision/history and the kernel semantic conflict/rebase calculus retain those authorities.
 
-### Minimum credible pet-project milestone
+Hosted CFMD should therefore be assembled as an explicit service composition (protocol + authentication + authorization + chosen transport/provider) rather than making `Database::open` start a listener. First-party transports may be shipped as optional modules, and application-defined providers remain an extension point.
 
-The project is usable when it has wheels, durable open/create, typed schema, relationships, identity/query/projection/ordering/aggregates, deep traversal, atomic commit, useful errors, a basic exact-watch subset, Plan + preview, revision/history access, an inspector/CLI and a complete tutorial.
+## P298 watch lifecycle / backpressure foundation
 
-### Compelling pet-project milestone
+The exact watch protocol now has deterministic cancellation and shutdown behavior without an async-runtime dependency. `WatchCancellation` is a wake-only lifecycle capability; it cannot mutate database state. `WatchStatus` exposes exact causal lag, while catch-up consumes durable history one revision transition at a time. There is intentionally no unbounded per-subscription event queue and no silent event dropping/recompute fallback.
 
-The product becomes distinctly attractive when most normal application queries have exact watch, Candidate query/delta works broadly, semantic undo preview exists, PyQt/PySide integration is straightforward, and CFMD Studio can attach live to the same authoritative runtime.
+With watch semantics/lifecycle now mature enough for adapters, the next product boundary is hosted sessions: authenticated principals, capabilities/authorization and protocol ingress above `cfmd-runtime`. Transport implementations (local IPC, TCP/TLS, UI/event-loop adapters) remain optional providers rather than kernel responsibilities.
 
-## Open design questions
 
-The detailed facade theory retains the unresolved questions around `.count()` laziness, `match` naming, boolean expression capture, optional relationship typing, exact-watch v1 coverage, ordered deltas, backpressure, Candidate persistence/rebase, tooling transport/authentication and the boundary between immediate CRUD sugar and explicit Plans.
+## P300 transport-neutral hosted protocol foundation
 
-Those questions should be prototyped and measured; they are not to be settled by aesthetic API preference alone.
+`cfmd-protocol` now sits above `cfmd-runtime` and consumes only restricted `SessionDatabase`. It owns language-neutral protocol DTOs and unary query/history/commit semantics, including base-revision concurrency binding, ingress resource limits and sanitized public errors. No transport/listener/authentication implementation is part of this layer.
+
+## P301 exact hosted watch subscription protocol
+
+Protocol version 2 now exposes exact server-side watch subscriptions: open returns a session-scoped `SubscriptionId` and exact initial result, blocking next returns one revision-tagged exact query-result delta, status exposes P298 lifecycle, and cancel/close/session-close terminate outstanding waits without polling. The protocol stores the existing runtime `QueryWatch` rather than materializing a second event queue or log, and maintained subscription count is bounded per session.
+
+Next protocol work should define an explicit wire codec/framing + version/capability negotiation around the now-complete unary/watch semantic vocabulary. Concrete IPC/TCP/TLS remain optional transport adapters.
+
+
+## P302 canonical hosted wire framing
+
+The hosted protocol now has a canonical binary framing contract without selecting a transport. A fixed header permits magic/version/kind/request-id/payload-length validation before payload allocation. Wire v1 negotiates hosted protocol v2 and explicit capability bits. Payload DTOs are deterministic, bounded and fail closed on unknown/non-canonical encodings.
+
+This keeps transport implementations intentionally thin: local IPC, TCP/TLS, QUIC, Studio and CLI move frames but do not own query/history/watch semantics, authorization or writer resolution. Next transport work can therefore focus on endpoint security/lifecycle rather than inventing another database protocol.
+
+### Hosted composition foundation — P303
+
+The hosted product path now has a transport-neutral `cfmd-host` layer. Future local IPC and network server providers should own only connection I/O/authentication evidence delivery and call this host boundary; they should not receive raw `Database` or implement independent permission/commit/watch semantics.
+
+
+## P313 unified database lifecycle DX
+
+The primary Rust construction model is `Database::builder(path)`. A new path resolves to single-file storage by default; directory storage is an explicit option or an existing directory detected on reopen. Database storage/runtime concerns (storage backend, future encryption, publication notifier) belong to this builder. Hosting is intentionally composed after open: importing `cfmd-host::DatabaseHostingExt` enables `db.host(authenticator, authorizer)` while preserving the crate dependency boundary.

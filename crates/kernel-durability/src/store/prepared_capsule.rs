@@ -165,7 +165,9 @@ pub(super) fn read_prepared_cut_capsule_file(
     Ok(PreparedCutCapsule { entries })
 }
 
-fn encode_prepared_cut_capsule(capsule: &PreparedCutCapsule) -> Result<Vec<u8>, DurabilityError> {
+pub(super) fn encode_prepared_cut_capsule(
+    capsule: &PreparedCutCapsule,
+) -> Result<Vec<u8>, DurabilityError> {
     let mut out = vec![0_u8; PREPARED_CAPSULE_HEADER_LEN];
     for entry in &capsule.entries {
         let encoded = encode_prepare_payload(&entry.descriptor)?;
@@ -188,7 +190,6 @@ fn encode_prepared_cut_capsule(capsule: &PreparedCutCapsule) -> Result<Vec<u8>, 
     Ok(out)
 }
 
-#[cfg(test)]
 pub(super) fn decode_prepared_cut_capsule(
     bytes: &[u8],
 ) -> Result<PreparedCutCapsule, DurabilityError> {

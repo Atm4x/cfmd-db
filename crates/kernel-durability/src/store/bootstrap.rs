@@ -183,8 +183,7 @@ impl DurableRevisionStore {
         let replication =
             ReplicationAuthorityJournal::open_or_create(directory.join("replication.cfre"))?;
         Ok(Self {
-            directory,
-            _directory_lock: directory_lock,
+            backend: super::backend::DurabilityBackend::directory(directory, directory_lock),
             generation,
             checkpoint: base_revision.clone(),
             durable_head: base_revision.id(),

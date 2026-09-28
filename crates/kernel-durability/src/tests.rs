@@ -175,6 +175,89 @@ fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
 }
 
 #[test]
+fn mixed_revision_intent_roundtrips_compactly_and_reconstructs_exact_target() {
+    let registry = SemanticRegistry::default();
+    let context = SemanticContext {
+        schema: Schema::new(SchemaRevisionId::new(170)),
+        environment: SemanticEnvironment::new(SemanticEnvId::new(180)),
+    };
+    let mut source_state = DatabaseState::default();
+    for raw in 1..=5_000_u128 {
+        let entity = EntityId::new(raw);
+        source_state.lifecycle.entities.insert(entity);
+        source_state.lifecycle.roots.insert(entity);
+    }
+    let source =
+        kernel_revision::Revision::build(RevisionId::new(1), &context, &registry, source_state)
+            .unwrap();
+    let mut target_state = source.state().clone();
+    let added = EntityId::new(5_001);
+    target_state.lifecycle.entities.insert(added);
+    target_state.lifecycle.roots.insert(added);
+    let target =
+        kernel_revision::Revision::build(RevisionId::new(2), &context, &registry, target_state)
+            .unwrap();
+
+    let model_delta = DurableModelDelta::between(source.state(), target.state());
+    let model_complement = DurableModelDelta::between(target.state(), source.state());
+    let descriptor = DurableRevisionDescriptor::mixed_revision(
+        ClientTransactionId::new(0x1700),
+        source.id(),
+        &target,
+        target.semantic_revision(),
+        Vec::new(),
+        model_delta.clone(),
+        model_complement,
+        &registry,
+    )
+    .unwrap();
+    let prepare = encode_prepare_payload(&descriptor).unwrap();
+    assert_eq!(
+        decode_prepare_payload(target.id(), &prepare).unwrap(),
+        descriptor
+    );
+
+    let mut reconstructed_state = source.state().clone();
+    model_delta.apply_to(&mut reconstructed_state);
+    let reconstructed = kernel_revision::Revision::build(
+        target.id(),
+        source.semantic_context(),
+        &registry,
+        reconstructed_state,
+    )
+    .unwrap();
+    assert_eq!(reconstructed, target);
+
+    let full_revision = checkpoint::encode_revision(&target).unwrap();
+    assert!(
+        prepare.len() * 50 < full_revision.len(),
+        "mixed prepare={} full revision={}",
+        prepare.len(),
+        full_revision.len()
+    );
+
+    let metadata_value = metadata::DurableStoreMetadata {
+        external_freshness: None,
+        current_idempotency_epoch: IdempotencyEpoch::ZERO,
+        minimum_retry_epoch: IdempotencyEpoch::ZERO,
+        materializations: Vec::new(),
+        physical_artifacts: Vec::new(),
+        artifact_cores: Vec::new(),
+        migration_complements: Vec::new(),
+        committed_transactions: BTreeMap::from([(
+            DurableTransactionKey::new(IdempotencyEpoch::ZERO, descriptor.transaction_id),
+            descriptor.intent.clone(),
+        )]),
+        semantic_modules: Vec::new(),
+        causal_coverage_root: None,
+        revision_effects: BTreeMap::new(),
+        revision_effect_frontiers: BTreeMap::new(),
+    };
+    let encoded_metadata = metadata::encode(&metadata_value).unwrap();
+    assert_eq!(metadata::decode(&encoded_metadata).unwrap(), metadata_value);
+}
+
+#[test]
 fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
     let registry = SemanticRegistry::default();
     let context = SemanticContext {

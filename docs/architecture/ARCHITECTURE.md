@@ -1,101 +1,75 @@
 # CFMD Architecture
 
-## Product/runtime layering
+## Product layering after Pass281
 
 ```text
-Python public facade
-        │
-        │ EntitySet / Query / Plan / Candidate / Watch
-        ▼
-Python binding bridge
-        │
-        │ compact typed IR + runtime operations
-        ▼
-Rust facade / authoritative runtime service
-        │
-        ├── query compile / revision contexts / exact watch
-        ├── Plan / Candidate / history / diagnostics
-        └── local tooling protocol
-        ▼
-internal kernel crates
-        │
-        ├── logical model + schema + semantic Γ
-        ├── query / plan / maintained execution
-        ├── change / rewrite / lens / validation
-        ├── semantic indexes / grounded closure / aggregates
-        ├── durability / recovery / retention
-        ├── transport / replication authority
-        └── authentication / deployment / proof boundaries
-                │
-                ▼
-        physical storage implementations
+Rust applications         Python / .NET / Studio
+       |                         |
+       +-----------+-------------+
+                   |
+              cfmd-runtime
+                   |
+       stable product/runtime IR
+                   |
+       +-----------+------------+
+       |                        |
+ query/change/revision      durable/runtime
+       |                        |
+       +-----------+------------+
+                   |
+             kernel-* graph
 ```
 
-The repository intentionally keeps internal concerns split into small crates. This crate graph is an implementation architecture, **not** the public application API. The Pass280 global kernel hostile/refactor campaign is frozen; future kernel changes are evidence-driven.
+The Pass280 kernel graph is frozen for the declared scope. Pass281 introduces `cfmd-runtime` as an anti-corruption layer: external consumers see facade-owned IDs, values, query/plan/runtime handles and errors, not kernel ownership types.
 
-## Public/runtime architectural laws
+## Authority rules
 
-1. **One authoritative runtime owns writes.** An external Studio/tooling process submits Plans to the same runtime; it does not independently mutate database files.
-2. **Current, historical and Candidate worlds share query semantics.** The same logical query may be evaluated against current state, `db.at(revision)` and `db.preview(plan)`.
-3. **Exact watch is language-neutral.** Python async iteration, .NET adapters and Studio subscriptions sit over a revision-tagged runtime protocol rather than separate callback systems.
-4. **Bindings construct compact typed IR.** Python should not replicate planner/kernel logic or expose Rust crate topology one-to-one.
-5. **Materialized objects do not perform hidden I/O.** Relationship traversal that may touch storage is symbolic in query construction or explicit through references/runtime calls.
+1. **One Rust runtime owns product semantics.** Language bindings project this runtime; they do not reproduce query/write/Candidate/watch/history logic.
+2. **Kernel types do not leak.** `SemanticId`, `RelExpr`, runtime bundle/cell types, physical layouts and durability protocol types are internal.
+3. **Prepared authority stays in Rust.** Immutable query compilation is retained as `PreparedQuery` instead of being reconstructed per FFI invocation.
+4. **Revision worlds are explicit.** Current snapshots, historical contexts and future Candidates are distinct handles.
+5. **Writes cross one authoritative transition path.** Product Plans map to the validated durable kernel transition protocol.
+6. **Exact watch remains language-neutral.** Async Rust/Python/.NET/Studio adapters will share one revision-tagged subscription protocol.
+7. **Bulk boundaries are mandatory.** FFI and tooling transports batch rows/deltas; no one-call-per-cell design.
 
-## Major crate groups
+## Current public/product owner
 
-### Logical and semantic model
+`crates/cfmd-runtime` currently provides the complete Rust-first product foundation: create/open, immutable current and historical `ReadContext` worlds, typed object/relation query surfaces, `Plan -> Candidate -> commit`, durable history/undo/rebase, and exact maintained `watch()` with provider-neutral wake delivery, cancellation and causal catch-up status. Internal kernel ownership/layout remains hidden.
 
-- `kernel-types` — nominal/revision identifiers and shared primitive types.
-- `kernel-exact` — exact coefficient arithmetic for finite measures/signed deltas.
-- `kernel-schema` — type vocabulary, definitions, subtype closure and schema context.
-- `kernel-model` — finite structural values, carriers, relation/COW storage and normalized state.
-- `kernel-semantics` — pinned semantic-context/module execution.
-- `kernel-identity`, `kernel-lifecycle`, `kernel-retention` — identity/lifecycle/history policy.
+Hosted protocol/authentication/authorization/transports and language/UI adapters are next-stage compositions above this runtime; they do not redefine database semantics.
 
-### Query/change/write system
+## Internal architecture
 
-- `kernel-query` — logical relational expressions, preparation and maintained query state.
-- `kernel-plan` — physical plans, checked lowering and physical execution strategies.
-- `kernel-change` — typed changes/rewrites.
-- `kernel-lens` — writable/dependent view calculus.
-- `kernel-aggregate`, `kernel-fixpoint`, `kernel-grounded-closure` — maintained higher-order calculi.
-- `kernel-validation`, `kernel-violation` — validation and violation-query boundaries.
-
-### Physical semantic indexing
-
-- `kernel-semantic-index` — Γ-bound exact semantic index structures/lifecycle.
-- `kernel-persistent` — persistent ordered/radix containers shared by maintained kernels.
-- `storage-memory` — in-memory physical storage implementation and revision graph support.
-
-### Revision, durability and distribution
-
-- `kernel-revision` — revision transition/publication contracts.
-- `kernel-durability` — immutable generations, WAL, recovery, platform assurance/certification.
-- `kernel-transport` — typed/semantic transport authority.
-- `kernel-integration` — sealed cross-layer runtime integration boundary.
-
-### Trust/proof/deployment
-
-- `kernel-auth` — cryptographic identity/authentication/trust-root lifecycle.
-- `kernel-deployment` — authenticated semantic-package/runtime-profile deployment contracts.
-- `kernel-proof` — checked proof/certificate fragments used by runtime layers.
-
-## Kernel/runtime invariants
-
-1. A published runtime revision owns one coherent logical revision, physical store and maintained state.
-2. Pinned `Γ` defines semantic equality/order; physical indexes bind to the same semantic revision.
-3. Prepared/compiled immutable metadata is reused rather than silently reconstructed during transitions.
-4. Recoverable validation/planning/auth/durability failures precede authoritative publication.
-5. Detached Candidates use explicit versioned ownership and cannot mutate authoritative state before commit.
-6. Durable authority is recovered only through the accepted generation/WAL protocol.
-7. Platform durability certification is scoped to exact evidence/fingerprints.
-8. Authentication proves package/evidence authority; it does not substitute for semantic refinement.
-9. Specialized physical implementations and universal correctness implementations must erase to the same logical semantics; error-driven fallback is not an authority model.
+Internal crate responsibilities and dependency edges are documented in [`CRATE_MAP.md`](CRATE_MAP.md). Kernel hostile/freeze state is documented separately in [`../status/KERNEL_HOSTILE_LEDGER.md`](../status/KERNEL_HOSTILE_LEDGER.md).
 
 ## Formal boundary
 
-`formal/lean/CFMD/Publication.lean` and `SurfaceKernel.lean` mechanize selected architectural obligations. Python refinement binders tie theorem artifacts to concrete Rust source vocabulary. CI runs the formal gate when proof-relevant files change.
+`formal/lean/CFMD/Publication.lean`, `Notification.lean` and `SurfaceKernel.lean` mechanize selected architectural obligations. Source-refinement gates bind theorem artifacts to Rust source vocabulary. Notification proofs now explicitly separate publication authority from duplicate/spurious wake, cancellation and runtime-shutdown liveness signals.
 
-## Historical architecture document
+## Hosted composition after Pass303
 
-The previous append-only pass-oriented architecture narrative is retained at [`ARCHITECTURE_LEGACY_CURRENT.md`](ARCHITECTURE_LEGACY_CURRENT.md) for provenance. It is not the primary current architecture entry point.
+```text
+kernel-* -> cfmd-runtime -> cfmd-protocol -> cfmd-host -> transport providers
+```
+
+`cfmd-host` owns server/session composition but no concrete I/O. Authentication maps provider evidence to a principal; authorization maps the principal to grants; only then does the host construct the restricted runtime/session/wire stack. Local IPC and hosted network servers are future adapters of this boundary, not dependencies of the kernel/runtime.
+
+## Hosted lifecycle after Pass304
+
+`kernel-* -> cfmd-runtime(shared session authority) -> cfmd-protocol -> cfmd-host -> transport providers`. Security providers may refresh or revoke authority and issue expiry deadlines; transports provide channel-binding evidence and scheduling, but cannot mint database grants or semantic conflict certificates. Graceful drain is host lifecycle, not database mutation.
+
+## Durability backend boundary after Pass310
+
+`kernel-durability` now separates logical durability authority from physical layout ownership:
+
+```text
+DurableRevisionStore
+  prepare / commit / recovery / retry / causal authority
+                  |
+                  v
+          DurabilityBackend
+           /             \
+  DirectoryBackend   SingleFileBackend
+```
+
+The backend owns physical roots/locks/container state and declares physical capabilities; it does not decide whether a transaction commits or what Revision is authoritative. Replication frame persistence is delegated to the backend while the replication state machine remains common. New layouts must implement this boundary rather than add optional layout fields to `DurableRevisionStore`.

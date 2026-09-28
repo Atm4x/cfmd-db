@@ -446,6 +446,32 @@ impl DurableRevisionStore {
             })
     }
 
+    /// Returns the exact durable effect records in one revision's causal ideal.
+    ///
+    /// This is a projection over the existing causal ledger, not a second history
+    /// authority. Every returned record has already passed the same ideal closure
+    /// validation used by `revision_effect_ideal`.
+    pub fn revision_effect_records_for_revision(
+        &self,
+        revision: RevisionId,
+    ) -> Result<Option<Vec<DurableRevisionEffectRecord>>, DurabilityError> {
+        let Some(ideal) = self.revision_effect_ideal(revision)? else {
+            return Ok(None);
+        };
+        let mut records = Vec::with_capacity(ideal.events().len());
+        for id in ideal.events().keys() {
+            let record = self
+                .revision_effects
+                .get(id)
+                .ok_or(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "durable revision ideal references a missing effect record",
+                })?;
+            records.push(record.clone());
+        }
+        Ok(Some(records))
+    }
+
     pub fn replicated_branch_effect_ideal(
         &self,
         branch: ReplicationBranchId,

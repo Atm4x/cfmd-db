@@ -1,6 +1,6 @@
-use kernel_model::Value;
+use kernel_model::{DatabaseState, Value};
 use kernel_semantics::BuiltinSemanticModuleSpec;
-use kernel_types::{ClientTransactionId, RevisionId, SemanticId, SemanticRevision};
+use kernel_types::{ClientTransactionId, EntityId, RevisionId, SemanticId, SemanticRevision};
 
 use crate::checkpoint;
 use crate::descriptor::DurableMaterializationSpec;
@@ -49,9 +49,211 @@ pub enum DurableEffectKind {
     RelationData,
     RelationRewrite,
     RelationResolution,
+    MixedRevision,
     FullRevision,
     SchemaMigration,
     LegacyTargetOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCarrierPatch {
+    pub carrier: SemanticId,
+    pub target_present: bool,
+    pub inserted: Vec<EntityId>,
+    pub removed: Vec<EntityId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableFieldPatch {
+    pub field: SemanticId,
+    pub owner: EntityId,
+    pub value: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableKeepsAlivePatch {
+    pub parent: EntityId,
+    pub target_present: bool,
+    pub inserted: Vec<EntityId>,
+    pub removed: Vec<EntityId>,
+}
+
+/// Canonical source-relative patch for the non-relation portion of one
+/// `DatabaseState`.  Relation rows remain represented by
+/// `DurableRelationMutation`; this patch covers exactly the orthogonal carrier,
+/// field and lifecycle authorities.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DurableModelDelta {
+    pub carriers: Vec<DurableCarrierPatch>,
+    pub fields: Vec<DurableFieldPatch>,
+    pub lifecycle_entities_inserted: Vec<EntityId>,
+    pub lifecycle_entities_removed: Vec<EntityId>,
+    pub lifecycle_roots_inserted: Vec<EntityId>,
+    pub lifecycle_roots_removed: Vec<EntityId>,
+    pub lifecycle_keeps_alive: Vec<DurableKeepsAlivePatch>,
+}
+
+impl DurableModelDelta {
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // One extensional diff pass; splitting would duplicate state-key traversal.
+    pub fn between(source: &DatabaseState, target: &DatabaseState) -> Self {
+        use std::collections::BTreeSet;
+
+        let carrier_keys = source
+            .model
+            .carriers
+            .keys()
+            .chain(target.model.carriers.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut carriers = Vec::new();
+        for carrier in carrier_keys {
+            let source_set = source.model.carriers.get(&carrier);
+            let target_set = target.model.carriers.get(&carrier);
+            if source_set == target_set {
+                continue;
+            }
+            let empty = BTreeSet::new();
+            let source_values = source_set.unwrap_or(&empty);
+            let target_values = target_set.unwrap_or(&empty);
+            carriers.push(DurableCarrierPatch {
+                carrier,
+                target_present: target_set.is_some(),
+                inserted: target_values.difference(source_values).copied().collect(),
+                removed: source_values.difference(target_values).copied().collect(),
+            });
+        }
+
+        let field_keys = source
+            .model
+            .fields
+            .keys()
+            .chain(target.model.fields.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut fields = Vec::new();
+        for (field, owner) in field_keys {
+            if source.model.fields.get(&(field, owner)) == target.model.fields.get(&(field, owner))
+            {
+                continue;
+            }
+            fields.push(DurableFieldPatch {
+                field,
+                owner,
+                value: target.model.fields.get(&(field, owner)).cloned(),
+            });
+        }
+
+        let lifecycle_entities_inserted = target
+            .lifecycle
+            .entities
+            .difference(&source.lifecycle.entities)
+            .copied()
+            .collect();
+        let lifecycle_entities_removed = source
+            .lifecycle
+            .entities
+            .difference(&target.lifecycle.entities)
+            .copied()
+            .collect();
+        let lifecycle_roots_inserted = target
+            .lifecycle
+            .roots
+            .difference(&source.lifecycle.roots)
+            .copied()
+            .collect();
+        let lifecycle_roots_removed = source
+            .lifecycle
+            .roots
+            .difference(&target.lifecycle.roots)
+            .copied()
+            .collect();
+
+        let keeps_keys = source
+            .lifecycle
+            .keeps_alive
+            .keys()
+            .chain(target.lifecycle.keeps_alive.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut lifecycle_keeps_alive = Vec::new();
+        for parent in keeps_keys {
+            let source_set = source.lifecycle.keeps_alive.get(&parent);
+            let target_set = target.lifecycle.keeps_alive.get(&parent);
+            if source_set == target_set {
+                continue;
+            }
+            let empty = BTreeSet::new();
+            let source_values = source_set.unwrap_or(&empty);
+            let target_values = target_set.unwrap_or(&empty);
+            lifecycle_keeps_alive.push(DurableKeepsAlivePatch {
+                parent,
+                target_present: target_set.is_some(),
+                inserted: target_values.difference(source_values).copied().collect(),
+                removed: source_values.difference(target_values).copied().collect(),
+            });
+        }
+
+        Self {
+            carriers,
+            fields,
+            lifecycle_entities_inserted,
+            lifecycle_entities_removed,
+            lifecycle_roots_inserted,
+            lifecycle_roots_removed,
+            lifecycle_keeps_alive,
+        }
+    }
+
+    pub fn apply_to(&self, state: &mut DatabaseState) {
+        for patch in &self.carriers {
+            let carrier = state.model.carriers.entry(patch.carrier).or_default();
+            for entity in &patch.removed {
+                carrier.remove(entity);
+            }
+            carrier.extend(patch.inserted.iter().copied());
+            if !patch.target_present {
+                state.model.carriers.remove(&patch.carrier);
+            }
+        }
+        for patch in &self.fields {
+            match &patch.value {
+                Some(value) => {
+                    state
+                        .model
+                        .fields
+                        .insert((patch.field, patch.owner), value.clone());
+                }
+                None => {
+                    state.model.fields.remove(&(patch.field, patch.owner));
+                }
+            }
+        }
+        for entity in &self.lifecycle_entities_removed {
+            state.lifecycle.entities.remove(entity);
+        }
+        state
+            .lifecycle
+            .entities
+            .extend(self.lifecycle_entities_inserted.iter().copied());
+        for entity in &self.lifecycle_roots_removed {
+            state.lifecycle.roots.remove(entity);
+        }
+        state
+            .lifecycle
+            .roots
+            .extend(self.lifecycle_roots_inserted.iter().copied());
+        for patch in &self.lifecycle_keeps_alive {
+            let children = state.lifecycle.keeps_alive.entry(patch.parent).or_default();
+            for child in &patch.removed {
+                children.remove(child);
+            }
+            children.extend(patch.inserted.iter().copied());
+            if !patch.target_present {
+                state.lifecycle.keeps_alive.remove(&patch.parent);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +286,11 @@ pub enum DurableRevisionChange {
     RelationData {
         semantic_revision: SemanticRevision,
         relation_mutations: Vec<DurableRelationMutation>,
+    },
+    MixedRevision {
+        semantic_revision: SemanticRevision,
+        relation_mutations: Vec<DurableRelationMutation>,
+        model_delta: DurableModelDelta,
     },
     FullRevision {
         encoded_target_revision: Vec<u8>,
@@ -133,6 +340,17 @@ pub enum DurableTransactionIntent {
         causal_parents: Vec<RevisionId>,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
+    /// Exact mixed revision identity.  The immutable source plus canonical
+    /// relation and non-relation deltas reconstruct the complete target state.
+    MixedRevisionExact {
+        source_revision: RevisionId,
+        target_revision: RevisionId,
+        semantic_revision: SemanticRevision,
+        relation_mutations: Vec<DurableRelationMutation>,
+        model_delta: DurableModelDelta,
+        model_complement: Option<Box<DurableModelDelta>>,
+        semantic_modules: Vec<BuiltinSemanticModuleSpec>,
+    },
     /// Exact full-revision replacement.  Full payload bytes remain necessary
     /// because this transition is not derivable from a smaller typed delta.
     Exact {
@@ -164,6 +382,7 @@ impl DurableTransactionIntent {
             Self::RelationDataExact { .. } => DurableEffectKind::RelationData,
             Self::RelationRewriteExact { .. } => DurableEffectKind::RelationRewrite,
             Self::RelationResolutionExact { .. } => DurableEffectKind::RelationResolution,
+            Self::MixedRevisionExact { .. } => DurableEffectKind::MixedRevision,
             Self::Exact { .. } => DurableEffectKind::FullRevision,
             Self::SchemaMigrationExact { .. } => DurableEffectKind::SchemaMigration,
             Self::LegacyTargetOnly { .. } => DurableEffectKind::LegacyTargetOnly,
@@ -287,6 +506,36 @@ impl DurableTransactionIntent {
         })
     }
 
+    pub fn mixed_revision(
+        source_revision: RevisionId,
+        target: &kernel_revision::Revision,
+        semantic_revision: SemanticRevision,
+        mut relation_mutations: Vec<DurableRelationMutation>,
+        model_delta: DurableModelDelta,
+        model_complement: DurableModelDelta,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, CodecError> {
+        relation_mutations.sort_by_key(|mutation| mutation.relation);
+        if relation_mutations
+            .windows(2)
+            .any(|pair| pair[0].relation == pair[1].relation)
+        {
+            return Err(CodecError::CollectionTooLarge);
+        }
+        let semantic_modules = registry
+            .builtin_modules_for_context(target.semantic_context())
+            .map_err(|_| CodecError::SemanticModuleUnavailable)?;
+        Ok(Self::MixedRevisionExact {
+            source_revision,
+            target_revision: target.id(),
+            semantic_revision,
+            relation_mutations,
+            model_delta,
+            model_complement: Some(Box::new(model_complement)),
+            semantic_modules,
+        })
+    }
+
     pub fn revision(
         target: &kernel_revision::Revision,
         registry: &kernel_semantics::SemanticRegistry,
@@ -362,6 +611,9 @@ impl DurableTransactionIntent {
             | Self::RelationResolutionExact {
                 target_revision, ..
             }
+            | Self::MixedRevisionExact {
+                target_revision, ..
+            }
             | Self::Exact {
                 target_revision, ..
             }
@@ -379,6 +631,7 @@ impl DurableTransactionIntent {
             Self::RelationDataExact { .. }
                 | Self::RelationRewriteExact { .. }
                 | Self::RelationResolutionExact { .. }
+                | Self::MixedRevisionExact { .. }
                 | Self::Exact { .. }
                 | Self::SchemaMigrationExact { .. }
         )
@@ -397,6 +650,9 @@ impl DurableTransactionIntent {
                 source_revision, ..
             }
             | Self::SchemaMigrationExact {
+                source_revision, ..
+            }
+            | Self::MixedRevisionExact {
                 source_revision, ..
             } => Some(*source_revision),
             Self::Exact { .. } | Self::LegacyTargetOnly { .. } => None,

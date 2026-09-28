@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 use crate::binary_codec::{crc32c, read_u32, read_u64};
 use crate::descriptor::DurableRevisionDescriptor;
 use crate::domain::DurableTransactionKey;
-use crate::runtime::{CodecError, CommittedRevision, DurabilityError, RecoveryScan, TailStatus};
+use crate::runtime::{
+    CodecError, CommittedRevision, DurabilityError, RecoveredAuthorityState, RecoveryScan,
+    TailStatus,
+};
 use crate::wal_frame::{
     DecodedFrame, FrameRead, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN, RecordKind, read_frame,
     validate_frame_header,
@@ -39,11 +42,12 @@ enum FileFrameRead {
 fn read_wal_file_frame(
     file: &mut File,
     file_len: u64,
-    offset: u64,
+    absolute_offset: u64,
+    logical_offset: u64,
     expected_lsn: u64,
 ) -> Result<FileFrameRead, DurabilityError> {
-    let remaining = file_len.saturating_sub(offset);
-    let offset_usize = usize::try_from(offset).map_err(|_| CodecError::LengthOverflow)?;
+    let remaining = file_len.saturating_sub(absolute_offset);
+    let offset_usize = usize::try_from(logical_offset).map_err(|_| CodecError::LengthOverflow)?;
     if remaining < u64::try_from(HEADER_LEN).expect("WAL header length fits u64") {
         let tail_len = usize::try_from(remaining).map_err(|_| CodecError::LengthOverflow)?;
         let mut tail = vec![0_u8; tail_len];
@@ -125,14 +129,34 @@ pub(super) fn scan_wal_file_seeded(
     first_lsn: u64,
     seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
 ) -> Result<(RecoveryScan, Sha256, u64), DurabilityError> {
+    let file_len = file.metadata()?.len();
+    let (scan, hasher) =
+        scan_wal_file_region_seeded(file, 0, file_len, base_revision, first_lsn, seeded_prepares)?;
+    Ok((scan, hasher, file_len))
+}
+
+pub(super) fn scan_wal_file_region_seeded(
+    file: &mut File,
+    start_offset: u64,
+    end_offset: u64,
+    base_revision: RevisionId,
+    first_lsn: u64,
+    seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+) -> Result<(RecoveryScan, Sha256), DurabilityError> {
     if first_lsn == 0 {
         return Err(DurabilityError::Protocol {
             offset: 0,
             reason: "WAL first LSN must be nonzero",
         });
     }
-    file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
+    if start_offset > end_offset || end_offset > file_len {
+        return Err(DurabilityError::Corruption {
+            offset: 0,
+            reason: "WAL region range is outside the backing file",
+        });
+    }
+    file.seek(SeekFrom::Start(start_offset))?;
     let mut state = ScanState::new(base_revision);
     for (lsn, descriptor, payload_crc) in seeded_prepares {
         state.seed_prepare(*lsn, descriptor.clone(), *payload_crc)?;
@@ -140,10 +164,15 @@ pub(super) fn scan_wal_file_seeded(
     let mut freshness_hasher = Sha256::new();
     freshness_hasher.update(WAL_FRESHNESS_PREFIX_DOMAIN);
     let mut offset = 0_u64;
+    let region_len = end_offset - start_offset;
     let mut expected_lsn = first_lsn;
 
-    while offset < file_len {
-        match read_wal_file_frame(file, file_len, offset, expected_lsn)? {
+    while offset < region_len {
+        let absolute_offset = start_offset
+            .checked_add(offset)
+            .ok_or(CodecError::LengthOverflow)?;
+        file.seek(SeekFrom::Start(absolute_offset))?;
+        match read_wal_file_frame(file, end_offset, absolute_offset, offset, expected_lsn)? {
             FileFrameRead::Tail(tail_status) => {
                 return Ok((
                     state.finish(
@@ -152,7 +181,6 @@ pub(super) fn scan_wal_file_seeded(
                         tail_status,
                     ),
                     freshness_hasher,
-                    file_len,
                 ));
             }
             FileFrameRead::Complete(frame) => {
@@ -186,7 +214,6 @@ pub(super) fn scan_wal_file_seeded(
             TailStatus::Clean,
         ),
         freshness_hasher,
-        file_len,
     ))
 }
 
@@ -254,6 +281,7 @@ struct ScanState {
     committed_transaction_keys: BTreeSet<DurableTransactionKey>,
     commits: BTreeMap<RevisionId, CommitRecord>,
     committed: Vec<ScanCommittedRevision>,
+    replication_authority_frames: Vec<Vec<u8>>,
 }
 
 impl ScanState {
@@ -268,6 +296,7 @@ impl ScanState {
             committed_transaction_keys: BTreeSet::new(),
             commits: BTreeMap::new(),
             committed: Vec::new(),
+            replication_authority_frames: Vec::new(),
         }
     }
 
@@ -275,6 +304,17 @@ impl ScanState {
         match frame.kind {
             RecordKind::PrepareRevision => self.accept_prepare(frame),
             RecordKind::CommitRevision => self.accept_commit(frame),
+            RecordKind::ReplicationAuthority => {
+                if frame.revision != RevisionId::new(0) {
+                    return Err(DurabilityError::Corruption {
+                        offset: frame.offset,
+                        reason: "replication authority WAL frame carries nonzero revision",
+                    });
+                }
+                self.replication_authority_frames
+                    .push(frame.payload.to_vec());
+                Ok(())
+            }
         }
     }
 
@@ -533,8 +573,11 @@ impl ScanState {
             last_good_offset,
             next_lsn,
             tail_status,
-            committed_transactions,
-            unresolved_prepares,
+            RecoveredAuthorityState {
+                committed_transactions,
+                unresolved_prepares,
+                replication_authority_frames: self.replication_authority_frames,
+            },
         )
     }
 }

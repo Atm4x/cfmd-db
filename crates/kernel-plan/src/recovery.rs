@@ -65,6 +65,44 @@ pub fn replay_durable_revisions(
                 }
                 current = candidate.build(descriptor.target_revision, registry)?;
             }
+            DurableRevisionChange::MixedRevision {
+                semantic_revision,
+                relation_mutations,
+                model_delta,
+            } => {
+                if *semantic_revision != current.semantic_revision() {
+                    return Err(RuntimeRecoveryError::SemanticRevisionMismatch);
+                }
+                let mut state = current.state().clone();
+                for mutation in relation_mutations {
+                    let relation = RelExpr::Scan(mutation.relation);
+                    let result_type = relation
+                        .typecheck(current.semantic_context(), registry)
+                        .map_err(PhysicalExecutionError::from)?;
+                    let old = relation
+                        .evaluate(&state.model, current.semantic_context(), registry)
+                        .map_err(PhysicalExecutionError::from)?;
+                    let delta = RelationDelta {
+                        inserted: mutation.inserted.clone(),
+                        removed: mutation.removed.clone(),
+                        result_type,
+                    };
+                    let next = delta
+                        .apply_to_value(old, current.semantic_context(), registry)
+                        .map_err(PhysicalExecutionError::from)?;
+                    state
+                        .model
+                        .relations
+                        .insert(mutation.relation, next.into_rows());
+                }
+                model_delta.apply_to(&mut state);
+                current = kernel_revision::Revision::build(
+                    descriptor.target_revision,
+                    current.semantic_context(),
+                    registry,
+                    state,
+                )?;
+            }
             DurableRevisionChange::FullRevision { .. }
             | DurableRevisionChange::FullRevisionAndMaterializations { .. } => {
                 current = descriptor.decode_full_revision(registry)?.ok_or(

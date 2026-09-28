@@ -258,6 +258,7 @@ fn validate_relation_rewrite_prepare_intent(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Single protocol validation decision tree over one bound PREPARE intent.
 pub(super) fn validate_bound_prepare_intent(
     store: &DurableRevisionStore,
     registry: &mut SemanticRegistry,
@@ -310,6 +311,40 @@ pub(super) fn validate_bound_prepare_intent(
                 relation_mutations,
                 None,
             )?;
+            install_semantic_module_packages(registry, semantic_modules)?;
+            Ok(())
+        }
+        DurableTransactionIntent::MixedRevisionExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            relation_mutations,
+            model_delta,
+            model_complement: _,
+            semantic_modules,
+        } => {
+            let DurableRevisionChange::MixedRevision {
+                semantic_revision: change_semantics,
+                relation_mutations: change_mutations,
+                model_delta: change_model_delta,
+            } = &descriptor.change
+            else {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "mixed intent is paired with a non-mixed change",
+                });
+            };
+            if *source_revision != descriptor.source_revision
+                || *target_revision != descriptor.target_revision
+                || *semantic_revision != *change_semantics
+                || relation_mutations != change_mutations
+                || model_delta != change_model_delta
+            {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "mixed intent does not match descriptor delta",
+                });
+            }
             install_semantic_module_packages(registry, semantic_modules)?;
             Ok(())
         }

@@ -51,7 +51,10 @@ struct MembershipVoteIndex {
 #[derive(Debug)]
 pub(crate) struct ReplicationAuthorityJournal {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
+    single_file_capture: bool,
+    pending_single_file_frames: Vec<Vec<u8>>,
+    live_single_file_frames: Vec<Vec<u8>>,
     effects: BTreeMap<RevisionEffectId, ReplicatedEffectEnvelope>,
     branches: BTreeMap<ReplicationBranchId, ReplicationBranchHead>,
     revision_frontiers: BTreeMap<RevisionId, BTreeSet<RevisionEffectId>>,

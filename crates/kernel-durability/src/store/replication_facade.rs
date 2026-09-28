@@ -25,6 +25,30 @@ use crate::replication_transport::{
 use crate::runtime::DurabilityError;
 
 impl DurableRevisionStore {
+    fn with_durable_replication_mutation<T>(
+        &mut self,
+        mutation: impl FnOnce(
+            &mut crate::replication::authority::ReplicationAuthorityJournal,
+        ) -> Result<T, DurabilityError>,
+    ) -> Result<T, DurabilityError> {
+        if self.poisoned {
+            return Err(DurabilityError::Poisoned);
+        }
+        let outcome = mutation(&mut self.replication);
+        let frames = self.replication.take_pending_single_file_frames();
+        if let Err(error) = self
+            .backend
+            .persist_replication_frames(&mut self.wal, &frames)
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if !frames.is_empty() {
+            self.replication.commit_single_file_frames(frames);
+        }
+        outcome
+    }
+
     #[must_use]
     pub fn replication_branch_head(
         &self,
@@ -148,10 +172,9 @@ impl DurableRevisionStore {
         policy: ReplicationPeerAuthPolicy,
         trust: &TrustRootSet,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.install_peer_auth_policy(policy, trust)
+        self.with_durable_replication_mutation(|replication| {
+            replication.install_peer_auth_policy(policy, trust)
+        })
     }
 
     /// Verifies and durably records signed peer evidence. For ordinary vote /
@@ -163,11 +186,9 @@ impl DurableRevisionStore {
         trust: &TrustRootSet,
         signed: SignedReplicationPeerEvidence,
     ) -> Result<ReplicationAuthenticationReceipt, DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication
-            .record_authenticated_peer_evidence(trust, signed)
+        self.with_durable_replication_mutation(|replication| {
+            replication.record_authenticated_peer_evidence(trust, signed)
+        })
     }
 
     /// Authenticates one semantic transport frame against the durable peer policy and
@@ -219,26 +240,30 @@ impl DurableRevisionStore {
         trust: &TrustRootSet,
         signed: SignedReplicationTransportFrame,
     ) -> Result<Option<ReplicationAuthenticationReceipt>, DurabilityError> {
-        let current = self
-            .replication
-            .current_membership()
-            .ok_or(DurabilityError::Protocol {
-                offset: 0,
-                reason: "replication transport has no durable membership",
-            })?;
-        if !current.members.contains(&signed.frame.sender) {
-            return Err(DurabilityError::Protocol {
-                offset: 0,
-                reason: "replication transport sender is not in current membership",
-            });
-        }
+        let current_epoch = {
+            let current =
+                self.replication
+                    .current_membership()
+                    .ok_or(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "replication transport has no durable membership",
+                    })?;
+            if !current.members.contains(&signed.frame.sender) {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "replication transport sender is not in current membership",
+                });
+            }
+            current.epoch
+        };
         match signed.frame.payload {
             ReplicationTransportPayload::PeerEvidence(peer) => self
-                .replication
-                .record_authenticated_peer_evidence(trust, peer)
+                .with_durable_replication_mutation(|replication| {
+                    replication.record_authenticated_peer_evidence(trust, peer)
+                })
                 .map(Some),
             ReplicationTransportPayload::AntiEntropySummary(summary) => {
-                if summary.membership_epoch != current.epoch {
+                if summary.membership_epoch != current_epoch {
                     return Err(DurabilityError::Protocol {
                         offset: 0,
                         reason: "replication anti-entropy summary uses stale membership",
@@ -247,7 +272,7 @@ impl DurableRevisionStore {
                 Ok(None)
             }
             ReplicationTransportPayload::AntiEntropyRequest(request) => {
-                if request.membership_epoch != current.epoch {
+                if request.membership_epoch != current_epoch {
                     return Err(DurabilityError::Protocol {
                         offset: 0,
                         reason: "replication anti-entropy request uses stale membership",
@@ -256,7 +281,7 @@ impl DurableRevisionStore {
                 Ok(None)
             }
             ReplicationTransportPayload::AntiEntropyChunk(chunk) => {
-                if chunk.membership_epoch != current.epoch {
+                if chunk.membership_epoch != current_epoch {
                     return Err(DurabilityError::Protocol {
                         offset: 0,
                         reason: "replication anti-entropy chunk uses stale membership",
@@ -266,7 +291,7 @@ impl DurableRevisionStore {
                 Ok(None)
             }
             ReplicationTransportPayload::Heartbeat(heartbeat) => {
-                if heartbeat.membership_epoch != current.epoch {
+                if heartbeat.membership_epoch != current_epoch {
                     return Err(DurabilityError::Protocol {
                         offset: 0,
                         reason: "replication heartbeat uses stale membership",
@@ -295,7 +320,7 @@ impl DurableRevisionStore {
         let Some(loss) = detector.quorum_loss_observation(membership, observed_term) else {
             return Ok(false);
         };
-        self.replication.mark_quorum_lost(loss)?;
+        self.with_durable_replication_mutation(|replication| replication.mark_quorum_lost(loss))?;
         Ok(true)
     }
 
@@ -306,10 +331,7 @@ impl DurableRevisionStore {
         &mut self,
         loss: ReplicationQuorumLoss,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.mark_quorum_lost(loss)
+        self.with_durable_replication_mutation(|replication| replication.mark_quorum_lost(loss))
     }
 
     /// Completes recovery only after an authenticated membership quorum reports
@@ -319,10 +341,9 @@ impl DurableRevisionStore {
         &mut self,
         certificate: &ReplicationRecoveryCertificate,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.recover_quorum(certificate)
+        self.with_durable_replication_mutation(|replication| {
+            replication.recover_quorum(certificate)
+        })
     }
 
     /// Durably ingests one already-ordered remote REIC effect without changing
@@ -371,7 +392,8 @@ impl DurableRevisionStore {
         }
         let mut provisional_registry = self.semantic_registry.clone();
         install_intent_semantic_modules(&mut provisional_registry, &envelope.effect.intent)?;
-        let outcome = self.replication.ingest(envelope)?;
+        let outcome =
+            self.with_durable_replication_mutation(|replication| replication.ingest(envelope))?;
         self.semantic_registry = provisional_registry;
         Ok(outcome)
     }
@@ -381,7 +403,9 @@ impl DurableRevisionStore {
         branch: ReplicationBranchId,
         expected_head: RevisionEffectId,
     ) -> Result<(), DurabilityError> {
-        self.replication.retire_branch(branch, expected_head)
+        self.with_durable_replication_mutation(|replication| {
+            replication.retire_branch(branch, expected_head)
+        })
     }
 
     /// Durably installs a replication membership epoch. The first epoch is an
@@ -392,10 +416,7 @@ impl DurableRevisionStore {
         &mut self,
         change: ReplicationMembershipChange,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.install_membership(change)
+        self.with_durable_replication_mutation(|replication| replication.install_membership(change))
     }
 
     /// Persists one already-authenticated peer vote for a replicated decision
@@ -404,10 +425,7 @@ impl DurableRevisionStore {
         &mut self,
         vote: ReplicationEffectVote,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.record_effect_vote(vote)
+        self.with_durable_replication_mutation(|replication| replication.record_effect_vote(vote))
     }
 
     /// Persists one already-authenticated vote for the successor membership.
@@ -416,10 +434,9 @@ impl DurableRevisionStore {
         &mut self,
         vote: ReplicationMembershipVote,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.record_membership_vote(vote)
+        self.with_durable_replication_mutation(|replication| {
+            replication.record_membership_vote(vote)
+        })
     }
 
     #[must_use]
@@ -449,60 +466,48 @@ impl DurableRevisionStore {
         &mut self,
         promise: ReplicationTermPromise,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.record_term_promise(promise)
+        self.with_durable_replication_mutation(|replication| {
+            replication.record_term_promise(promise)
+        })
     }
 
     pub fn durably_record_replication_leader_vote(
         &mut self,
         vote: ReplicationLeaderVote,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.record_leader_vote(vote)
+        self.with_durable_replication_mutation(|replication| replication.record_leader_vote(vote))
     }
 
     pub fn durably_certify_replication_leader(
         &mut self,
         certificate: ReplicationLeaderCertificate,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.certify_leader(certificate)
+        self.with_durable_replication_mutation(|replication| {
+            replication.certify_leader(certificate)
+        })
     }
 
     pub fn durably_certify_replication_joint_membership(
         &mut self,
         certificate: ReplicationJointMembershipCertificate,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.certify_joint_membership(certificate)
+        self.with_durable_replication_mutation(|replication| {
+            replication.certify_joint_membership(certificate)
+        })
     }
 
     pub fn durably_record_replication_decision_vote(
         &mut self,
         vote: ReplicationDecisionVote,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.record_decision_vote(vote)
+        self.with_durable_replication_mutation(|replication| replication.record_decision_vote(vote))
     }
 
     pub fn durably_lock_replication_decision(
         &mut self,
         lock: ReplicationDecisionLock,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.lock_decision(lock)
+        self.with_durable_replication_mutation(|replication| replication.lock_decision(lock))
     }
 
     /// Advances one replicated effect from `LocalDurable` to `QuorumDurable`.
@@ -510,10 +515,9 @@ impl DurableRevisionStore {
         &mut self,
         certificate: ReplicationQuorumCertificate,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.certify_quorum(certificate)
+        self.with_durable_replication_mutation(|replication| {
+            replication.certify_quorum(certificate)
+        })
     }
 
     /// Marks one quorum-durable effect reader-publishable in branch order.
@@ -522,9 +526,6 @@ impl DurableRevisionStore {
         &mut self,
         effect: RevisionEffectId,
     ) -> Result<(), DurabilityError> {
-        if self.poisoned {
-            return Err(DurabilityError::Poisoned);
-        }
-        self.replication.publish(effect)
+        self.with_durable_replication_mutation(|replication| replication.publish(effect))
     }
 }

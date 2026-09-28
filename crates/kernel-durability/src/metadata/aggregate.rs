@@ -24,7 +24,7 @@ use super::intent_codec::{
     encode_transaction_intent,
 };
 
-const METADATA_CODEC_VERSION: u16 = 13;
+const METADATA_CODEC_VERSION: u16 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct DurableStoreMetadata {

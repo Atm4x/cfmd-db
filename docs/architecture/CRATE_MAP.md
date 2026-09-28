@@ -1,11 +1,14 @@
 # Workspace Crate Map
 
-Workspace crates: **27**.
+Workspace crates: **30**.
 
-This is an internal architecture map. These crates are not individually promised as the stable public application API. The product facade is intentionally designed above this graph.
+This map includes 27 internal kernel/infrastructure crates plus the product/hosting stack `cfmd-runtime`, `cfmd-protocol`, and `cfmd-host`. Kernel crates remain implementation details.
 
 | crate | internal workspace dependencies |
 |---|---|
+| `cfmd-host` | `cfmd-protocol`, `cfmd-runtime` |
+| `cfmd-protocol` | `cfmd-runtime` |
+| `cfmd-runtime` | `kernel-model`, `kernel-plan`, `kernel-query`, `kernel-types` |
 | `kernel-aggregate` | `kernel-exact` |
 | `kernel-auth` | `kernel-semantics` |
 | `kernel-change` | `kernel-types` |
@@ -37,6 +40,9 @@ This is an internal architecture map. These crates are not individually promised
 ## Dependency edges
 
 ```text
+cfmd-host -> cfmd-protocol, cfmd-runtime
+cfmd-protocol -> cfmd-runtime
+cfmd-runtime -> kernel-model, kernel-plan, kernel-query, kernel-types
 kernel-aggregate -> kernel-exact
 kernel-auth -> kernel-semantics
 kernel-change -> kernel-types
@@ -63,4 +69,4 @@ storage-memory -> kernel-identity, kernel-lifecycle, kernel-model, kernel-query,
 
 ## Status
 
-The Pass280 global kernel hostile/refactor campaign is frozen. This map describes implementation dependencies only; audit status is maintained separately in [`../status/KERNEL_HOSTILE_LEDGER.md`](../status/KERNEL_HOSTILE_LEDGER.md).
+The Pass280 global kernel hostile/refactor campaign is frozen. Pass281 adds `cfmd-runtime` above that graph. This map describes implementation dependencies; audit status is maintained separately in [`../status/KERNEL_HOSTILE_LEDGER.md`](../status/KERNEL_HOSTILE_LEDGER.md).

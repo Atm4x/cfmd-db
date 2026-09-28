@@ -2,7 +2,7 @@
 
 The project root is reserved for build/configuration and current entry-point documentation. Historical pass artifacts must not be added back to the root.
 
-- `crates/`: 27 internal Rust workspace crates;
+- `crates/`: 28 Rust workspace crates: 27 internal kernel/infrastructure crates plus the public `cfmd-runtime` product boundary;
 - `formal/lean/`: active Lean proofs and refinement binders;
 - `vendor/`: committed Cargo vendor closure used by offline builds;
 - `artifacts/evidence/`: retained raw historical gate evidence;

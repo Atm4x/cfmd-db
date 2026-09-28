@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use kernel_auth::{
     AuthorityDigest, FreshnessCut, Sha256Digest, SignedFreshnessCut, TrustRootSet,
@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 
 use crate::binary_codec::{crc32c, read_u16, read_u32, read_u64};
 use crate::domain::DurableExternalFreshnessBinding;
-use crate::metadata;
 use crate::runtime::DurabilityError;
 use crate::wal::WAL_FRESHNESS_PREFIX_DOMAIN;
 use crate::wal_frame::{HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN, validate_frame_header};
@@ -22,12 +21,7 @@ use super::checkpoint_storage::{
 use super::format_registry::{DurableFormatRegistry, LEGACY_CHECKPOINT_FORMAT_VERSION};
 use super::generation_layout::{
     checkpoint_chunk_path, checkpoint_path, manifest_path, metadata_path, prepared_capsule_path,
-    wal_path,
 };
-use super::manifest::{
-    ManifestRecord, decode_manifest, read_current_manifest, read_manifest_bytes_bounded,
-};
-use super::metadata_storage::read_published_metadata;
 use super::{DurableGenerationReceipt, DurableRevisionStore};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalFreshnessConfig {
@@ -62,6 +56,40 @@ pub(super) struct ExternalFreshnessState {
     authority: Box<dyn ExternalFreshnessAuthority>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FreshnessGenerationMaterial {
+    pub(super) generation: u64,
+    pub(super) binding: DurableExternalFreshnessBinding,
+    pub(super) generation_digest: AuthorityDigest,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct WalFreshnessSource {
+    pub(super) path: PathBuf,
+    pub(super) start_offset: u64,
+    pub(super) end_offset: u64,
+    pub(super) first_lsn: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct FreshnessRecoveryMaterial {
+    pub(super) generation: FreshnessGenerationMaterial,
+    pub(super) wal: WalFreshnessSource,
+}
+
+impl WalFreshnessSource {
+    fn head(&self) -> Result<(u64, AuthorityDigest), DurabilityError> {
+        wal_freshness_prefix(self, None)
+    }
+
+    fn digest_at_lsn(&self, target_lsn: u64) -> Result<AuthorityDigest, DurabilityError> {
+        if target_lsn < self.first_lsn {
+            return Ok(wal_prefix_digest(&[]));
+        }
+        wal_freshness_prefix(self, Some(target_lsn)).map(|(_, digest)| digest)
+    }
+}
+
 impl ExternalFreshnessState {
     fn unanchored(
         config: ExternalFreshnessConfig,
@@ -87,7 +115,7 @@ impl ExternalFreshnessState {
     }
 
     pub(super) fn recover_preflight(
-        directory: &Path,
+        local: &FreshnessRecoveryMaterial,
         config: ExternalFreshnessConfig,
         mut authority: Box<dyn ExternalFreshnessAuthority>,
     ) -> Result<(Self, Option<PendingExternalFreshnessAdvance>), DurabilityError> {
@@ -111,9 +139,7 @@ impl ExternalFreshnessState {
                 reason: "external freshness policy identity mismatch",
             });
         }
-        let manifest = read_current_manifest(directory)?;
-        let metadata = read_published_metadata(directory, manifest)?;
-        let next = preflight_external_freshness(directory, manifest, &metadata, &config, current)?;
+        let next = preflight_external_freshness(local, &config, current)?;
         let pending = (next != current.cut).then_some(PendingExternalFreshnessAdvance {
             expected_record: current.record_digest,
             next,
@@ -141,12 +167,11 @@ impl ExternalFreshnessState {
 
     pub(super) fn advance(
         &mut self,
-        directory: &Path,
-        generation: u64,
+        material: FreshnessGenerationMaterial,
         wal_lsn: u64,
         wal_digest: AuthorityDigest,
     ) -> Result<(), DurabilityError> {
-        advance_external_freshness_state(directory, generation, wal_lsn, wal_digest, self)
+        advance_external_freshness_state(material, wal_lsn, wal_digest, self)
     }
 
     pub(super) fn metadata_binding(&self) -> DurableExternalFreshnessBinding {
@@ -183,18 +208,12 @@ fn verify_returned_freshness_cut(
 }
 
 fn preflight_external_freshness(
-    directory: &Path,
-    manifest: ManifestRecord,
-    metadata: &metadata::DurableStoreMetadata,
+    local: &FreshnessRecoveryMaterial,
     config: &ExternalFreshnessConfig,
     anchored: VerifiedFreshnessCut,
 ) -> Result<FreshnessCut, DurabilityError> {
-    let binding = metadata
-        .external_freshness
-        .ok_or(DurabilityError::Protocol {
-            offset: 0,
-            reason: "published generation is missing external freshness binding",
-        })?;
+    let generation = local.generation.generation;
+    let binding = local.generation.binding;
     if binding.store_id != config.store_id
         || binding.trust_root_epoch != config.trust_roots.epoch()
         || binding.deployment_policy_epoch != config.deployment_policy_epoch
@@ -204,19 +223,19 @@ fn preflight_external_freshness(
             reason: "published external freshness binding is stale or belongs to another store",
         });
     }
-    if manifest.generation < anchored.cut.generation {
+    if generation < anchored.cut.generation {
         return Err(DurabilityError::Protocol {
             offset: 0,
             reason: "local durable generation was rolled back behind external freshness authority",
         });
     }
-    if manifest.generation > anchored.cut.generation.saturating_add(1) {
+    if generation > anchored.cut.generation.saturating_add(1) {
         return Err(DurabilityError::Protocol {
             offset: 0,
             reason: "local durable generation jumped beyond external freshness authority",
         });
     }
-    if manifest.generation == anchored.cut.generation.saturating_add(1)
+    if generation == anchored.cut.generation.saturating_add(1)
         && binding.previous_generation_digest != Some(anchored.cut.generation_digest)
     {
         return Err(DurabilityError::Protocol {
@@ -224,31 +243,23 @@ fn preflight_external_freshness(
             reason: "local generation does not extend externally anchored predecessor",
         });
     }
-    let generation_digest = generation_material_digest(directory, manifest.generation)?;
-    if manifest.generation == anchored.cut.generation
-        && generation_digest != anchored.cut.generation_digest
+    let generation_digest = local.generation.generation_digest;
+    if generation == anchored.cut.generation && generation_digest != anchored.cut.generation_digest
     {
         return Err(DurabilityError::Protocol {
             offset: 0,
             reason: "same-generation durable store fork detected by external freshness authority",
         });
     }
-    let (wal_lsn, wal_digest) = wal_freshness_head(
-        &wal_path(directory, manifest.generation),
-        manifest.wal_first_lsn,
-    )?;
-    if manifest.generation == anchored.cut.generation {
+    let (wal_lsn, wal_digest) = local.wal.head()?;
+    if generation == anchored.cut.generation {
         if wal_lsn < anchored.cut.wal_lsn {
             return Err(DurabilityError::Protocol {
                 offset: 0,
                 reason: "local WAL was truncated behind external freshness authority",
             });
         }
-        let anchored_prefix = wal_freshness_digest_at_lsn(
-            &wal_path(directory, manifest.generation),
-            manifest.wal_first_lsn,
-            anchored.cut.wal_lsn,
-        )?;
+        let anchored_prefix = local.wal.digest_at_lsn(anchored.cut.wal_lsn)?;
         if anchored_prefix != anchored.cut.wal_digest {
             return Err(DurabilityError::Protocol {
                 offset: 0,
@@ -258,7 +269,7 @@ fn preflight_external_freshness(
     }
     Ok(FreshnessCut {
         store_id: config.store_id,
-        generation: manifest.generation,
+        generation,
         previous_generation: binding.previous_generation_digest,
         generation_digest,
         wal_lsn,
@@ -269,30 +280,20 @@ fn preflight_external_freshness(
 }
 
 fn advance_external_freshness_state(
-    directory: &Path,
-    generation: u64,
+    material: FreshnessGenerationMaterial,
     wal_lsn: u64,
     wal_digest: AuthorityDigest,
     state: &mut ExternalFreshnessState,
 ) -> Result<(), DurabilityError> {
-    let manifest = read_manifest_generation(directory, generation)?;
-    let metadata = read_published_metadata(directory, manifest)?;
-    let binding = metadata
-        .external_freshness
-        .ok_or(DurabilityError::Protocol {
-            offset: 0,
-            reason: "externally anchored generation lost freshness binding",
-        })?;
-    let generation_digest = state.current.map_or_else(
-        || generation_material_digest(directory, generation),
-        |current| {
-            if current.cut.generation == generation {
-                Ok(current.cut.generation_digest)
-            } else {
-                generation_material_digest(directory, generation)
-            }
-        },
-    )?;
+    let generation = material.generation;
+    let binding = material.binding;
+    let generation_digest = state.current.map_or(material.generation_digest, |current| {
+        if current.cut.generation == generation {
+            current.cut.generation_digest
+        } else {
+            material.generation_digest
+        }
+    });
     let cut = FreshnessCut {
         store_id: state.config.store_id,
         generation,
@@ -323,7 +324,7 @@ fn sha256_file(path: &Path) -> Result<Sha256Digest, DurabilityError> {
     Ok(Sha256Digest(hasher.finalize().into()))
 }
 
-fn generation_material_digest(
+pub(super) fn generation_material_digest(
     directory: &Path,
     generation: u64,
 ) -> Result<AuthorityDigest, DurabilityError> {
@@ -401,44 +402,39 @@ fn checkpoint_chunk_ordinals(root: &[u8]) -> Result<std::ops::Range<usize>, Dura
     Ok(0..chunk_count)
 }
 
-fn wal_freshness_head(
-    path: &Path,
-    first_lsn: u64,
-) -> Result<(u64, AuthorityDigest), DurabilityError> {
-    wal_freshness_prefix(path, first_lsn, None)
-}
-
-fn wal_freshness_digest_at_lsn(
-    path: &Path,
-    first_lsn: u64,
-    target_lsn: u64,
-) -> Result<AuthorityDigest, DurabilityError> {
-    if target_lsn < first_lsn {
-        return Ok(wal_prefix_digest(&[]));
-    }
-    wal_freshness_prefix(path, first_lsn, Some(target_lsn)).map(|(_, digest)| digest)
-}
-
 fn wal_freshness_prefix(
-    path: &Path,
-    first_lsn: u64,
+    source: &WalFreshnessSource,
     target_lsn: Option<u64>,
 ) -> Result<(u64, AuthorityDigest), DurabilityError> {
-    if first_lsn == 0 {
+    if source.first_lsn == 0 {
         return Err(DurabilityError::Protocol {
             offset: 0,
             reason: "WAL first LSN must be nonzero",
         });
     }
-    let mut file = File::open(path)?;
+    if source.end_offset < source.start_offset {
+        return Err(DurabilityError::Corruption {
+            offset: 0,
+            reason: "external freshness WAL region is inverted",
+        });
+    }
+    let mut file = File::open(&source.path)?;
     let file_len = file.metadata()?.len();
+    if source.end_offset > file_len {
+        return Err(DurabilityError::Corruption {
+            offset: 0,
+            reason: "external freshness WAL region exceeds file length",
+        });
+    }
+    file.seek(SeekFrom::Start(source.start_offset))?;
     let mut hasher = Sha256::new();
     hasher.update(WAL_FRESHNESS_PREFIX_DOMAIN);
     let mut offset = 0_u64;
-    let mut expected_lsn = first_lsn;
+    let mut expected_lsn = source.first_lsn;
+    let region_len = source.end_offset - source.start_offset;
 
-    while offset < file_len {
-        let remaining = file_len - offset;
+    while offset < region_len {
+        let remaining = region_len - offset;
         if remaining < u64::try_from(HEADER_LEN).expect("WAL header length fits u64") {
             break;
         }
@@ -517,14 +513,6 @@ fn wal_prefix_digest(bytes: &[u8]) -> AuthorityDigest {
     AuthorityDigest(hasher.finalize().into())
 }
 
-fn read_manifest_generation(
-    directory: &Path,
-    generation: u64,
-) -> Result<ManifestRecord, DurabilityError> {
-    let bytes = read_manifest_bytes_bounded(&manifest_path(directory, generation))?;
-    decode_manifest(&bytes)
-}
-
 impl DurableRevisionStore {
     pub(super) fn advance_external_freshness_wal(&mut self) -> Result<(), DurabilityError> {
         self.advance_external_freshness_generation_with_digest(
@@ -543,7 +531,8 @@ impl DurableRevisionStore {
         let Some(mut freshness) = self.external_freshness.take() else {
             return Ok(());
         };
-        let result = freshness.advance(&self.directory, generation, wal_lsn, wal_digest);
+        let material = self.backend.freshness_generation_material(generation);
+        let result = material.and_then(|material| freshness.advance(material, wal_lsn, wal_digest));
         self.external_freshness = Some(freshness);
         if result.is_err() {
             self.poisoned = true;
@@ -555,6 +544,12 @@ impl DurableRevisionStore {
         config: ExternalFreshnessConfig,
         mut authority: Box<dyn ExternalFreshnessAuthority>,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        if !self.backend.capabilities().external_freshness {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "durability backend does not support external freshness",
+            });
+        }
         if self.external_freshness.is_some() {
             return Err(DurabilityError::Protocol {
                 offset: 0,

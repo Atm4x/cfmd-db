@@ -8,6 +8,7 @@ mod platform_assurance;
 mod replication;
 mod replication_transport;
 mod runtime;
+mod single_file;
 mod store;
 mod wal;
 mod wal_frame;
@@ -20,12 +21,14 @@ pub use descriptor::{
     PHYSICAL_ARTIFACT_RECIPE_VERSION,
 };
 pub use domain::{
-    DurableEffectCoordinationClass, DurableEffectKind, DurableExternalFreshnessBinding,
-    DurableMigrationComplement, DurableRelationMutation, DurableRelationResolution,
-    DurableRelationRewriteIntent, DurableRevisionChange, DurableRevisionEffectRecord,
-    DurableTransactionIntent, DurableTransactionKey, HistoricalComplementError,
-    HistoricalLensImplementation, HistoricalLensImplementationKey, HistoricalLensRegistry,
-    HistoricalRestoreError, IdempotencyEpoch, LocalHistoricalComplementChain,
+    DurableCarrierPatch, DurableEffectCoordinationClass, DurableEffectKind,
+    DurableExternalFreshnessBinding, DurableFieldPatch, DurableKeepsAlivePatch,
+    DurableMigrationComplement, DurableModelDelta, DurableRelationMutation,
+    DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
+    DurableRevisionEffectRecord, DurableTransactionIntent, DurableTransactionKey,
+    HistoricalComplementError, HistoricalLensImplementation, HistoricalLensImplementationKey,
+    HistoricalLensRegistry, HistoricalRestoreError, IdempotencyEpoch,
+    LocalHistoricalComplementChain,
 };
 pub use freshness_tcp::{TcpExternalFreshnessAuthority, TcpExternalFreshnessAuthorityServer};
 pub use wal_frame::{FORMAT_VERSION, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN};
@@ -69,6 +72,10 @@ pub use replication_transport::{
 pub use runtime::{
     CodecError, CommittedRevision, DurabilityError, DurableCommitReceipt, DurableFormatComponent,
     DurablePrepareToken, DurableTransactionOutcome, RecoveryScan, RevisionDurability, TailStatus,
+};
+pub use single_file::{
+    SingleFileContainer, SingleFileGenerationView, SingleFileSectionDescriptor,
+    SingleFileSectionInput, SingleFileSectionKind,
 };
 pub use store::{
     DurableBatchEnqueueOutcome, DurableCommitBatchPolicy, DurableCommitBatcher,

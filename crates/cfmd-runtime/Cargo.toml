@@ -1,0 +1,19 @@
+[package]
+name = "cfmd-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-model = { path = "../kernel-model" }
+kernel-plan = { path = "../kernel-plan" }
+kernel-query = { path = "../kernel-query" }
+kernel-revision = { path = "../kernel-revision" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-types = { path = "../kernel-types" }
+
+
+[lints]
+workspace = true

@@ -5,6 +5,14 @@ LEAN_BIN="${LEAN_BIN:-lean}"
 (
   cd "$HERE"
   "$LEAN_BIN" CFMD/Publication.lean
+  "$LEAN_BIN" CFMD/Notification.lean
+  "$LEAN_BIN" CFMD/SecurityAuthority.lean
+  "$LEAN_BIN" CFMD/SessionLifecycle.lean
+  "$LEAN_BIN" CFMD/WireProtocol.lean
+  "$LEAN_BIN" CFMD/HostedBoundary.lean
+  "$LEAN_BIN" CFMD/LocalTransport.lean
+  "$LEAN_BIN" CFMD/SingleFile.lean
+  "$LEAN_BIN" CFMD/DurabilityBackend.lean
   "$LEAN_BIN" CFMD/SurfaceKernel.lean
 )
 python3 "$HERE/check_refinement.py"

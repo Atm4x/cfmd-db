@@ -1314,6 +1314,121 @@ fn create_migration_runtime(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // End-to-end mixed durability scenario kept contiguous as one protocol regression.
+fn durable_mixed_revision_updates_lifecycle_and_relations_incrementally() {
+    let dir = durable_test_dir("mixed-revision-incremental-publication");
+    let relation = sid(7_951);
+    let equivalence = sid(7_952);
+    let entity_type = sid(7_953);
+    let field = sid(7_954);
+    let first = EntityId::new(7951);
+    let second = EntityId::new(7952);
+    let mut registry = SemanticRegistry::default();
+    let digest = registry.install_equivalence_revision(EquivalenceModule::TextExact, 11);
+    let context = migration_context(7951, 7951, relation, equivalence, entity_type, field, digest);
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(7951),
+        &context,
+        &registry,
+        migration_state(entity_type, field, relation, &[(first, 1)], &["A"]),
+    )
+    .unwrap();
+    let runtime = create_migration_runtime(&dir, relation, source.clone(), "A", &registry);
+    let target = kernel_revision::Revision::build(
+        RevisionId::new(7952),
+        &context,
+        &registry,
+        migration_state(
+            entity_type,
+            field,
+            relation,
+            &[(first, 1), (second, 2)],
+            &["A", "B"],
+        ),
+    )
+    .unwrap();
+    let result_type = RelExpr::Scan(relation).typecheck(&context, &registry).unwrap();
+    let delta = RelationDelta {
+        inserted: vec![vec![Value::Text("B".into())]],
+        removed: vec![],
+        result_type,
+    };
+    let mutations = [RevisionRelationMutation { relation, delta: &delta }];
+    let model_delta = DurableModelDelta::between(source.state(), target.state());
+    let model_complement = DurableModelDelta::between(target.state(), source.state());
+    let transaction_id = ClientTransactionId::new(0x7952);
+    let outcome = runtime
+        .commit_mixed_revision(
+            transaction_id,
+            &MixedRevisionTransitionRequest {
+                source_revision: source.id(),
+                target_revision: &target,
+                mutations: &mutations,
+                model_delta: &model_delta,
+                model_complement: &model_complement,
+                registry: &registry,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        DurableRuntimeCommitOutcome::Committed(DurableRuntimeCommitReceipt {
+            publication: RuntimePublicationEffect::Incremental(_),
+            ..
+        })
+    ));
+    let retry = runtime
+        .commit_mixed_revision(
+            transaction_id,
+            &MixedRevisionTransitionRequest {
+                source_revision: source.id(),
+                target_revision: &target,
+                mutations: &mutations,
+                model_delta: &model_delta,
+                model_complement: &model_complement,
+                registry: &registry,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        retry,
+        DurableRuntimeCommitOutcome::AlreadyCommitted {
+            target_revision: target.id()
+        }
+    );
+    assert_eq!(runtime.snapshot().unwrap().revision(), &target);
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    assert_eq!(reopened.snapshot().unwrap().revision(), &target);
+    assert_eq!(
+        reopened.transaction_outcome(transaction_id).unwrap(),
+        DurableTransactionOutcome::Committed { target_revision: target.id() }
+    );
+    let reopened_retry = reopened
+        .commit_mixed_revision(
+            transaction_id,
+            &MixedRevisionTransitionRequest {
+                source_revision: source.id(),
+                target_revision: &target,
+                mutations: &mutations,
+                model_delta: &model_delta,
+                model_complement: &model_complement,
+                registry: &registry,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        reopened_retry,
+        DurableRuntimeCommitOutcome::AlreadyCommitted {
+            target_revision: target.id()
+        }
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn durable_full_revision_replacement_covers_schema_gamma_lifecycle_and_fields() {
     let dir = durable_test_dir("full-revision-replacement");
     let relation = sid(8_001);

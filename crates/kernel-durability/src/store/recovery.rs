@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use kernel_change::RevisionEffectId;
 use kernel_revision::Revision;
@@ -41,7 +40,7 @@ use crate::runtime::{DurabilityError, RecoveryScan};
 use crate::wal::FileRevisionWal;
 
 #[derive(Debug)]
-struct CanonicalDurableState {
+pub(super) struct CanonicalDurableState {
     checkpoint: Revision,
     durable_head: RevisionId,
     semantic_registry: SemanticRegistry,
@@ -60,17 +59,15 @@ struct CanonicalDurableState {
 }
 
 impl CanonicalDurableState {
-    fn into_store(
+    pub(super) fn into_store(
         self,
-        directory: PathBuf,
-        directory_lock: File,
+        backend: super::backend::DurabilityBackend,
         generation: u64,
         wal: FileRevisionWal,
         replication: ReplicationAuthorityJournal,
     ) -> DurableRevisionStore {
         DurableRevisionStore {
-            directory,
-            _directory_lock: directory_lock,
+            backend,
             generation,
             checkpoint: self.checkpoint,
             durable_head: self.durable_head,
@@ -120,7 +117,7 @@ fn merge_wal_migration_complements(
     Ok((complements, index))
 }
 
-fn rebuild_semantic_registry(
+pub(super) fn rebuild_semantic_registry(
     metadata: &metadata::DurableStoreMetadata,
     legacy_registry: Option<&SemanticRegistry>,
 ) -> Result<SemanticRegistry, DurabilityError> {
@@ -245,6 +242,67 @@ fn recover_retry_ledger(
     Ok((committed_transactions, current))
 }
 
+pub(super) fn recover_canonical_state(
+    metadata: metadata::DurableStoreMetadata,
+    checkpoint: Revision,
+    scan: &RecoveryScan,
+    legacy_registry: Option<&SemanticRegistry>,
+) -> Result<CanonicalDurableState, DurabilityError> {
+    let mut registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
+    let minimum_retry_epoch = metadata.minimum_retry_epoch;
+    let (committed_transactions, current_idempotency_epoch) = recover_retry_ledger(
+        metadata.committed_transactions,
+        metadata.current_idempotency_epoch,
+        minimum_retry_epoch,
+        scan,
+        &mut registry,
+    )?;
+    let (migration_complements, migration_complement_index) = merge_wal_migration_complements(
+        metadata.migration_complements,
+        checkpoint.semantic_revision().schema,
+        scan,
+    )?;
+    let (causal_coverage_root, revision_effects, revision_effect_frontiers) =
+        causal_ledger::recover_revision_effect_state(
+            metadata.causal_coverage_root,
+            metadata.revision_effects,
+            metadata.revision_effect_frontiers,
+            scan,
+        )?;
+    causal_ledger::validate_revision_effect_state(
+        causal_coverage_root,
+        &revision_effects,
+        &revision_effect_frontiers,
+    )?;
+    let next_revision_effect_id = revision_effects
+        .keys()
+        .map(|id| id.0)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(DurabilityError::Protocol {
+            offset: 0,
+            reason: "revision effect identity space is exhausted",
+        })?;
+    Ok(CanonicalDurableState {
+        checkpoint,
+        durable_head: scan.durable_revision(),
+        semantic_registry: registry,
+        materialization_specs: metadata.materializations,
+        physical_artifact_specs: metadata.physical_artifacts,
+        artifact_cores: metadata.artifact_cores,
+        migration_complements,
+        migration_complement_index,
+        current_idempotency_epoch,
+        minimum_retry_epoch,
+        committed_transactions,
+        next_revision_effect_id,
+        causal_coverage_root,
+        revision_effects,
+        revision_effect_frontiers,
+    })
+}
+
 fn validate_replicated_authority(
     canonical: &mut CanonicalDurableState,
     replication: &ReplicationAuthorityJournal,
@@ -316,8 +374,9 @@ impl DurableRevisionStore {
         authority: Box<dyn ExternalFreshnessAuthority>,
     ) -> Result<(Self, RecoveryScan), DurabilityError> {
         let directory = directory.as_ref();
+        let material = super::backend::DurabilityBackend::probe_directory_freshness(directory)?;
         let (mut freshness, pending_advance) =
-            ExternalFreshnessState::recover_preflight(directory, config, authority)?;
+            ExternalFreshnessState::recover_preflight(&material, config, authority)?;
         let (mut store, scan) = Self::open_inner(directory, None, true)?;
         freshness.complete_recovery_advance(pending_advance)?;
         store.external_freshness = Some(freshness);
@@ -339,68 +398,16 @@ impl DurableRevisionStore {
                 reason: "externally anchored store requires freshness-aware open",
             });
         }
-        let mut registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
+        let registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
         let (checkpoint, wal, scan) = open_published_generation(&directory, manifest, &registry)?;
-        let minimum_retry_epoch = metadata.minimum_retry_epoch;
-        let (committed_transactions, current_idempotency_epoch) = recover_retry_ledger(
-            metadata.committed_transactions,
-            metadata.current_idempotency_epoch,
-            minimum_retry_epoch,
-            &scan,
-            &mut registry,
-        )?;
-        let (migration_complements, migration_complement_index) = merge_wal_migration_complements(
-            metadata.migration_complements,
-            checkpoint.semantic_revision().schema,
-            &scan,
-        )?;
-        let (causal_coverage_root, revision_effects, revision_effect_frontiers) =
-            causal_ledger::recover_revision_effect_state(
-                metadata.causal_coverage_root,
-                metadata.revision_effects,
-                metadata.revision_effect_frontiers,
-                &scan,
-            )?;
-        causal_ledger::validate_revision_effect_state(
-            causal_coverage_root,
-            &revision_effects,
-            &revision_effect_frontiers,
-        )?;
-        let next_revision_effect_id = revision_effects
-            .keys()
-            .map(|id| id.0)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(DurabilityError::Protocol {
-                offset: 0,
-                reason: "revision effect identity space is exhausted",
-            })?;
-        let mut canonical = CanonicalDurableState {
-            checkpoint,
-            durable_head: scan.durable_revision(),
-            semantic_registry: registry,
-            materialization_specs: metadata.materializations,
-            physical_artifact_specs: metadata.physical_artifacts,
-            artifact_cores: metadata.artifact_cores,
-            migration_complements,
-            migration_complement_index,
-            current_idempotency_epoch,
-            minimum_retry_epoch,
-            committed_transactions,
-            next_revision_effect_id,
-            causal_coverage_root,
-            revision_effects,
-            revision_effect_frontiers,
-        };
+        let mut canonical = recover_canonical_state(metadata, checkpoint, &scan, legacy_registry)?;
         let replication =
             ReplicationAuthorityJournal::open_or_create(directory.join("replication.cfre"))?;
         validate_replicated_authority(&mut canonical, &replication)?;
         let prepared_transactions =
             super::prepared_lifecycle::PreparedTransactionLedger::from_recovery_scan(&scan);
         let mut store = canonical.into_store(
-            directory,
-            directory_lock,
+            super::backend::DurabilityBackend::directory(directory, directory_lock),
             manifest.generation,
             wal,
             replication,

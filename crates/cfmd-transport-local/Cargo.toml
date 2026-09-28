@@ -1,0 +1,16 @@
+[package]
+name = "cfmd-transport-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cfmd-host = { path = "../cfmd-host" }
+cfmd-protocol = { path = "../cfmd-protocol" }
+
+[dev-dependencies]
+cfmd-runtime = { path = "../cfmd-runtime" }
+
+[lints]
+workspace = true

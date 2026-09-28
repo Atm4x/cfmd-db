@@ -1,3 +1,10 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeDurabilityBackend {
+    #[default]
+    SingleFile,
+    Directory,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuntimeRootVersion(u64);
 
@@ -14,8 +21,253 @@ struct RuntimeRootIdentity {
     version: RuntimeRootVersion,
 }
 
-static NEXT_RUNTIME_ROOT_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeHistoryEffectKind {
+    RelationData,
+    RelationRewrite,
+    RelationResolution,
+    MixedRevision,
+    FullRevision,
+    SchemaMigration,
+    LegacyTargetOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeHistoryReversibility {
+    ExactPlanInverse,
+    ComplementRequired,
+    NonPlanTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHistoryRelationMutation {
+    pub relation: SemanticId,
+    pub inserted: Vec<Vec<Value>>,
+    pub removed: Vec<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHistoryEffect {
+    pub effect_id: u128,
+    pub prerequisites: Vec<u128>,
+    pub transaction_id: ClientTransactionId,
+    pub source_revision: RevisionId,
+    pub target_revision: RevisionId,
+    pub kind: RuntimeHistoryEffectKind,
+    pub reversibility: RuntimeHistoryReversibility,
+    pub relation_mutations: Vec<RuntimeHistoryRelationMutation>,
+    pub model_delta: Option<DurableModelDelta>,
+    pub model_complement: Option<DurableModelDelta>,
+}
+
+/// Exact write coordinate used to prove that a historical inverse can be
+/// transported across later committed effects without changing either
+/// transition's meaning. Relation coordinates are Γ-canonical equivalence
+/// classes rather than host hashes; model coordinates name the persisted
+/// carrier/field/lifecycle authorities directly.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RuntimeHistoryCoordinate {
+    RelationClass {
+        relation: SemanticId,
+        canonical_key: Box<[u8]>,
+    },
+    CarrierPresence {
+        carrier: SemanticId,
+    },
+    CarrierMember {
+        carrier: SemanticId,
+        entity: kernel_types::EntityId,
+    },
+    Field {
+        field: SemanticId,
+        owner: kernel_types::EntityId,
+    },
+    LifecycleEntity {
+        entity: kernel_types::EntityId,
+    },
+    LifecycleRoot {
+        entity: kernel_types::EntityId,
+    },
+    KeepsAlivePresence {
+        parent: kernel_types::EntityId,
+    },
+    KeepsAliveEdge {
+        parent: kernel_types::EntityId,
+        child: kernel_types::EntityId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeHistoryFootprint {
+    pub writes: BTreeSet<RuntimeHistoryCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHistoryRebaseCertificate {
+    pub effect_id: u128,
+    pub original_target_revision: RevisionId,
+    pub current_revision: RevisionId,
+    pub intervening_effects: Vec<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHistoryRebaseConflict {
+    pub effect_id: u128,
+    pub current_revision: RevisionId,
+    pub conflicting_effects: Vec<u128>,
+    pub coordinates: Vec<RuntimeHistoryCoordinate>,
+    pub opaque_effects: Vec<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeHistoryRebaseOutcome {
+    Certified(RuntimeHistoryRebaseCertificate),
+    Conflict(RuntimeHistoryRebaseConflict),
+}
+
+fn durable_model_delta_is_empty(delta: &DurableModelDelta) -> bool {
+    delta.carriers.is_empty()
+        && delta.fields.is_empty()
+        && delta.lifecycle_entities_inserted.is_empty()
+        && delta.lifecycle_entities_removed.is_empty()
+        && delta.lifecycle_roots_inserted.is_empty()
+        && delta.lifecycle_roots_removed.is_empty()
+        && delta.lifecycle_keeps_alive.is_empty()
+}
+
+impl RuntimeHistoryEffect {
+    fn from_durable(record: &DurableRevisionEffectRecord) -> Self {
+        let (kind, reversibility, relation_mutations, model_delta, model_complement) =
+            match &record.intent {
+                DurableTransactionIntent::RelationDataExact {
+                    relation_mutations, ..
+                } => (
+                    RuntimeHistoryEffectKind::RelationData,
+                    RuntimeHistoryReversibility::ExactPlanInverse,
+                    relation_mutations.as_slice(),
+                    None,
+                    None,
+                ),
+                DurableTransactionIntent::RelationRewriteExact {
+                    relation_mutations, ..
+                } => (
+                    RuntimeHistoryEffectKind::RelationRewrite,
+                    RuntimeHistoryReversibility::ExactPlanInverse,
+                    relation_mutations.as_slice(),
+                    None,
+                    None,
+                ),
+                DurableTransactionIntent::RelationResolutionExact {
+                    relation_mutations, ..
+                } => (
+                    RuntimeHistoryEffectKind::RelationResolution,
+                    RuntimeHistoryReversibility::ExactPlanInverse,
+                    relation_mutations.as_slice(),
+                    None,
+                    None,
+                ),
+                DurableTransactionIntent::MixedRevisionExact {
+                    relation_mutations,
+                    model_delta,
+                    model_complement,
+                    ..
+                } => (
+                    RuntimeHistoryEffectKind::MixedRevision,
+                    if durable_model_delta_is_empty(model_delta) || model_complement.is_some() {
+                        RuntimeHistoryReversibility::ExactPlanInverse
+                    } else {
+                        RuntimeHistoryReversibility::ComplementRequired
+                    },
+                    relation_mutations.as_slice(),
+                    Some(model_delta.clone()),
+                    model_complement.as_deref().cloned(),
+                ),
+                DurableTransactionIntent::Exact { .. } => (
+                    RuntimeHistoryEffectKind::FullRevision,
+                    RuntimeHistoryReversibility::NonPlanTransition,
+                    &[] as &[DurableRelationMutation],
+                    None,
+                    None,
+                ),
+                DurableTransactionIntent::SchemaMigrationExact { .. } => (
+                    RuntimeHistoryEffectKind::SchemaMigration,
+                    RuntimeHistoryReversibility::NonPlanTransition,
+                    &[] as &[DurableRelationMutation],
+                    None,
+                    None,
+                ),
+                DurableTransactionIntent::LegacyTargetOnly { .. } => (
+                    RuntimeHistoryEffectKind::LegacyTargetOnly,
+                    RuntimeHistoryReversibility::NonPlanTransition,
+                    &[] as &[DurableRelationMutation],
+                    None,
+                    None,
+                ),
+            };
+        debug_assert_eq!(
+            record.kind(),
+            match kind {
+                RuntimeHistoryEffectKind::RelationData => DurableEffectKind::RelationData,
+                RuntimeHistoryEffectKind::RelationRewrite => DurableEffectKind::RelationRewrite,
+                RuntimeHistoryEffectKind::RelationResolution =>
+                    DurableEffectKind::RelationResolution,
+                RuntimeHistoryEffectKind::MixedRevision => DurableEffectKind::MixedRevision,
+                RuntimeHistoryEffectKind::FullRevision => DurableEffectKind::FullRevision,
+                RuntimeHistoryEffectKind::SchemaMigration => DurableEffectKind::SchemaMigration,
+                RuntimeHistoryEffectKind::LegacyTargetOnly => DurableEffectKind::LegacyTargetOnly,
+            }
+        );
+        Self {
+            effect_id: record.id.0,
+            prerequisites: record.prerequisites.iter().map(|id| id.0).collect(),
+            transaction_id: record.transaction_id,
+            source_revision: record.source_revision,
+            target_revision: record.target_revision,
+            kind,
+            reversibility,
+            relation_mutations: relation_mutations
+                .iter()
+                .map(|mutation| RuntimeHistoryRelationMutation {
+                    relation: mutation.relation,
+                    inserted: mutation.inserted.clone(),
+                    removed: mutation.removed.clone(),
+                })
+                .collect(),
+            model_delta,
+            model_complement,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum RuntimeHistoricalSnapshotError {
+    Durability(DurabilityError),
+    Runtime(PhysicalExecutionError),
+    Revision(kernel_revision::RevisionError),
+    Unavailable { revision: RevisionId },
+    EffectUnavailable { effect_id: u128 },
+    EffectNotReversible { effect_id: u128 },
+}
+
+impl From<DurabilityError> for RuntimeHistoricalSnapshotError {
+    fn from(value: DurabilityError) -> Self {
+        Self::Durability(value)
+    }
+}
+
+impl From<PhysicalExecutionError> for RuntimeHistoricalSnapshotError {
+    fn from(value: PhysicalExecutionError) -> Self {
+        Self::Runtime(value)
+    }
+}
+
+impl From<kernel_revision::RevisionError> for RuntimeHistoricalSnapshotError {
+    fn from(value: kernel_revision::RevisionError) -> Self {
+        Self::Revision(value)
+    }
+}
+
+static NEXT_RUNTIME_ROOT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn allocate_runtime_root_id() -> Result<u64, PhysicalExecutionError> {
     NEXT_RUNTIME_ROOT_ID
@@ -33,6 +285,26 @@ fn allocate_runtime_root_id() -> Result<u64, PhysicalExecutionError> {
 pub struct RevisionRelationMutation<'a> {
     pub relation: SemanticId,
     pub delta: &'a RelationDelta,
+}
+
+/// Failure while deriving an exact logical target Revision from one immutable
+/// runtime snapshot plus source-relative relation deltas.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RuntimeRevisionDerivationError {
+    Runtime(PhysicalExecutionError),
+    Revision(kernel_revision::RevisionError),
+}
+
+impl From<PhysicalExecutionError> for RuntimeRevisionDerivationError {
+    fn from(value: PhysicalExecutionError) -> Self {
+        Self::Runtime(value)
+    }
+}
+
+impl From<kernel_revision::RevisionError> for RuntimeRevisionDerivationError {
+    fn from(value: kernel_revision::RevisionError) -> Self {
+        Self::Revision(value)
+    }
 }
 
 /// One intent-bearing relation rewrite participating in a logical revision.
@@ -81,6 +353,15 @@ pub enum RevisionCommitChange {
         semantic_revision: kernel_types::SemanticRevision,
         relation_deltas: BTreeMap<SemanticId, RelationDelta>,
     },
+    /// Full logical revision authority with incremental physical relation
+    /// publication. Durable recovery retains the exact target revision because
+    /// lifecycle/carrier/field changes are not derivable from relation deltas.
+    MixedRevision {
+        semantic_revision: kernel_types::SemanticRevision,
+        relation_deltas: BTreeMap<SemanticId, RelationDelta>,
+        model_delta: DurableModelDelta,
+        model_complement: Box<DurableModelDelta>,
+    },
     FullRevision,
     FullRevisionAndMaterializations {
         materializations: Vec<DurableMaterializationSpec>,
@@ -118,6 +399,9 @@ impl RevisionCommitDescriptor {
         match &self.change {
             RevisionCommitChange::RelationData {
                 semantic_revision, ..
+            }
+            | RevisionCommitChange::MixedRevision {
+                semantic_revision, ..
             } => Some(*semantic_revision),
             RevisionCommitChange::FullRevision
             | RevisionCommitChange::FullRevisionAndMaterializations { .. } => None,
@@ -128,6 +412,9 @@ impl RevisionCommitDescriptor {
     pub fn relation_deltas(&self) -> Option<&BTreeMap<SemanticId, RelationDelta>> {
         match &self.change {
             RevisionCommitChange::RelationData {
+                relation_deltas, ..
+            }
+            | RevisionCommitChange::MixedRevision {
                 relation_deltas, ..
             } => Some(relation_deltas),
             RevisionCommitChange::FullRevision
@@ -182,6 +469,32 @@ impl RevisionCommitDescriptor {
                         registry,
                     )?)
                 }
+            }
+            RevisionCommitChange::MixedRevision {
+                semantic_revision,
+                relation_deltas,
+                model_delta,
+                model_complement,
+            } => {
+                let relation_mutations = relation_deltas
+                    .iter()
+                    .map(|(&relation, delta)| DurableRelationMutation {
+                        relation,
+                        inserted: delta.inserted.clone(),
+                        removed: delta.removed.clone(),
+                    })
+                    .collect();
+                DurableRevisionDescriptor::mixed_revision(
+                    transaction_id,
+                    self.source_revision,
+                    self.target.as_ref(),
+                    *semantic_revision,
+                    relation_mutations,
+                    model_delta.clone(),
+                    model_complement.as_ref().clone(),
+                    registry,
+                )
+                .map_err(DurabilityError::Encode)
             }
             RevisionCommitChange::FullRevision => DurableRevisionDescriptor::full_revision(
                 transaction_id,
@@ -369,6 +682,23 @@ impl From<kernel_revision::RevisionError> for RuntimeRecoveryError {
 pub struct RevisionTransitionRequest<'a> {
     pub target_revision: &'a kernel_revision::Revision,
     pub mutations: &'a [RevisionRelationMutation<'a>],
+    pub registry: &'a kernel_semantics::SemanticRegistry,
+}
+
+/// One validated semantic revision endpoint whose relation component can be
+/// published through the incremental physical delta path while lifecycle,
+/// carrier and field state changes atomically with the same revision.
+///
+/// This is the general mixed-data counterpart of `RevisionTransitionRequest`:
+/// the semantic context must remain pinned, the supplied relation mutations
+/// must exactly explain every changed relation, but non-relation model state
+/// is allowed to differ because it is already certified by `Revision::build`.
+pub struct MixedRevisionTransitionRequest<'a> {
+    pub source_revision: RevisionId,
+    pub target_revision: &'a kernel_revision::Revision,
+    pub mutations: &'a [RevisionRelationMutation<'a>],
+    pub model_delta: &'a DurableModelDelta,
+    pub model_complement: &'a DurableModelDelta,
     pub registry: &'a kernel_semantics::SemanticRegistry,
 }
 
@@ -589,6 +919,7 @@ pub struct RepairSearchReport {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // Rare control-plane result intentionally owns one prepared transition without extra allocation.
 pub enum RepairSearchOutcome {
     NoRepair(RepairSearchReport),
     Prepared {
@@ -887,4 +1218,3 @@ impl RuntimeViolationState {
         }
     }
 }
-

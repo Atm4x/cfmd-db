@@ -12,7 +12,7 @@ This is the current repository-facing inventory after Pass280. It complements hi
 | `kernel-auth` | dedicated P277 security/resource hostile pass; P278 ownership split | FROZEN |
 | `kernel-change` | P256–P267 closure; final hostile inventory; P280 revalidation | COMPLETE / FROZEN |
 | `kernel-deployment` | dedicated P277 bounded/auth-first audit; P278 ownership split | FROZEN |
-| `kernel-durability` | dedicated durability/store closeout line; P280 heavy-kernel revalidation | FROZEN |
+| `kernel-durability` | dedicated durability/store closeout line; P280 heavy-kernel revalidation; P306–P312 single-file backend R&D/parity hostile line | FROZEN / R&D REVALIDATED |
 | `kernel-exact` | grouped small-kernel hostile sweep | FROZEN |
 | `kernel-fixpoint` | P276 incidence/checker/ownership closure | COMPLETE / FROZEN |
 | `kernel-grounded-closure` | P275 unified witness calculus; P279 structural closeout | COMPLETE / FROZEN |

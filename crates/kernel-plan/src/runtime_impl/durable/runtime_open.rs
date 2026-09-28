@@ -60,109 +60,24 @@ impl DurableRuntime {
         target_revision: RevisionId,
         mutations: &[RevisionRelationMutation<'_>],
     ) -> Result<DerivedRelationEndpoint, DurableRuntimeCommitError> {
+        let snapshot = self.cell.snapshot()?;
+        if snapshot.revision() != source {
+            return Err(PhysicalExecutionError::InvalidRevisionTransition.into());
+        }
+        let revision = snapshot
+            .derive_relation_target_revision(target_revision, mutations, &self.registry)
+            .map_err(|error| match error {
+                RuntimeRevisionDerivationError::Runtime(error) => {
+                    DurableRuntimeCommitError::from(error)
+                }
+                RuntimeRevisionDerivationError::Revision(error) => {
+                    DurableRuntimeCommitError::Recovery(RuntimeRecoveryError::Revision(error))
+                }
+            })?;
         let mut exact_deltas = BTreeMap::new();
         for mutation in mutations {
-            if exact_deltas
-                .insert(mutation.relation, mutation.delta.clone())
-                .is_some()
-            {
-                return Err(
-                    PhysicalExecutionError::DuplicateRelationMutation(mutation.relation).into(),
-                );
-            }
+            exact_deltas.insert(mutation.relation, mutation.delta.clone());
         }
-        let append_only_bag_fast_path = mutations.iter().all(|mutation| {
-            mutation.delta.removed.is_empty()
-                && source
-                    .semantic_context()
-                    .schema
-                    .relation(mutation.relation)
-                    .is_some_and(|definition| {
-                        matches!(
-                            definition.semantics,
-                            kernel_schema::RelationSemantics::Bag { .. }
-                        )
-                    })
-                && !source
-                    .live_ref_sensitivity()
-                    .relation_has_live_refs(mutation.relation)
-                && !mutation
-                    .delta
-                    .inserted
-                    .iter()
-                    .flatten()
-                    .any(Value::contains_live_ref)
-        });
-        if append_only_bag_fast_path {
-            let appends = mutations
-                .iter()
-                .map(|mutation| (mutation.relation, mutation.delta.inserted.clone()))
-                .collect::<Vec<_>>();
-            let revision = kernel_revision::Revision::build_append_only_bag_relations(
-                target_revision,
-                source,
-                &self.registry,
-                &appends,
-            )
-            .map_err(|error| {
-                DurableRuntimeCommitError::Recovery(RuntimeRecoveryError::Revision(error))
-            })?;
-            return Ok(DerivedRelationEndpoint {
-                revision,
-                exact_deltas,
-            });
-        }
-
-        let mut candidate = source.relation_update_candidate();
-        let live = &source.state().lifecycle.entities;
-        for mutation in mutations {
-            // RelationUpdateCandidate::build performs one relation-only lifecycle
-            // normalization step: rows containing dangling live references are
-            // removed.  A derived target is allowed to bypass the later full
-            // endpoint replay only when that normalization is provably the
-            // identity.  Because the authoritative source is already normalized,
-            // checking the inserted support is sufficient: removals cannot create
-            // a dangling reference and untouched source rows were valid already.
-            if mutation.delta.inserted.iter().any(|row| {
-                row.iter()
-                    .any(|value| value.first_dangling_live_ref(live).is_some())
-            }) {
-                return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch.into());
-            }
-            let definition = source
-                .semantic_context()
-                .schema
-                .relation(mutation.relation)
-                .ok_or(PhysicalExecutionError::MissingRuntimeRelationBinding(
-                    mutation.relation,
-                ))?;
-            let rows = source
-                .state()
-                .model
-                .relations
-                .get(&mutation.relation)
-                .cloned()
-                .unwrap_or_default();
-            let old = relation_value_from_rows(
-                rows,
-                &RelType {
-                    columns: definition.columns.clone(),
-                    semantics: definition.semantics.clone(),
-                },
-                source.semantic_context(),
-                &self.registry,
-            )?;
-            let next = mutation
-                .delta
-                .apply_to_value(old, source.semantic_context(), &self.registry)
-                .map_err(PhysicalExecutionError::from)?;
-            candidate.replace_relation_rows(mutation.relation, next.into_rows());
-        }
-        let revision = candidate
-            .build(target_revision, &self.registry)
-            .map_err(|error| {
-                DurableRuntimeCommitError::Recovery(RuntimeRecoveryError::Revision(error))
-            })?;
         Ok(DerivedRelationEndpoint {
             revision,
             exact_deltas,
@@ -171,8 +86,48 @@ impl DurableRuntime {
 
     pub fn create(
         root: RuntimeRevisionBundle,
-        directory: impl AsRef<std::path::Path>,
+        path: impl AsRef<std::path::Path>,
         registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, DurabilityError> {
+        Self::create_with_backend(root, path, registry, RuntimeDurabilityBackend::Directory)
+    }
+
+    pub fn create_with_backend(
+        root: RuntimeRevisionBundle,
+        path: impl AsRef<std::path::Path>,
+        registry: &kernel_semantics::SemanticRegistry,
+        backend: RuntimeDurabilityBackend,
+    ) -> Result<Self, DurabilityError> {
+        Self::create_with_backend_and_revision_publication_notifier(
+            root,
+            path,
+            registry,
+            backend,
+            Arc::new(InProcessRevisionPublicationNotifier::default()),
+        )
+    }
+
+    pub fn create_with_revision_publication_notifier(
+        root: RuntimeRevisionBundle,
+        path: impl AsRef<std::path::Path>,
+        registry: &kernel_semantics::SemanticRegistry,
+        revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
+    ) -> Result<Self, DurabilityError> {
+        Self::create_with_backend_and_revision_publication_notifier(
+            root,
+            path,
+            registry,
+            RuntimeDurabilityBackend::Directory,
+            revision_publication,
+        )
+    }
+
+    pub fn create_with_backend_and_revision_publication_notifier(
+        root: RuntimeRevisionBundle,
+        path: impl AsRef<std::path::Path>,
+        registry: &kernel_semantics::SemanticRegistry,
+        backend: RuntimeDurabilityBackend,
+        revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
     ) -> Result<Self, DurabilityError> {
         let materialization_specs = root.durable_materialization_specs();
         let physical_artifact_specs = root.durable_physical_artifact_specs();
@@ -182,32 +137,97 @@ impl DurableRuntime {
                     offset: 0,
                     reason: "failed to derive durable artifact core",
                 })?;
-        let durability =
-            DurableRevisionStore::create_with_materializations_physical_artifacts_and_cores(
-                directory,
-                root.revision(),
-                &materialization_specs,
-                &physical_artifact_specs,
-                &artifact_cores,
-                registry,
-            )?;
+        let durability = match backend {
+            RuntimeDurabilityBackend::SingleFile =>
+                DurableRevisionStore::create_single_file_with_materializations_physical_artifacts_and_cores(
+                    path,
+                    root.revision(),
+                    &materialization_specs,
+                    &physical_artifact_specs,
+                    &artifact_cores,
+                    registry,
+                )?,
+            RuntimeDurabilityBackend::Directory =>
+                DurableRevisionStore::create_with_materializations_physical_artifacts_and_cores(
+                    path,
+                    root.revision(),
+                    &materialization_specs,
+                    &physical_artifact_specs,
+                    &artifact_cores,
+                    registry,
+                )?,
+        };
         Ok(Self {
             cell: RuntimeRevisionCell::new(root),
             durability: Mutex::new(durability),
             registry: registry.clone(),
+            revision_publication,
         })
     }
 
-    pub fn open(directory: impl AsRef<std::path::Path>) -> Result<Self, RuntimeRecoveryError> {
-        Self::open_with_recovery_policy(directory, PhysicalRecoveryPolicy::default())
-            .map(|(runtime, _)| runtime)
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, RuntimeRecoveryError> {
+        Self::open_with_backend(path, RuntimeDurabilityBackend::Directory)
+    }
+
+    pub fn open_with_backend(
+        path: impl AsRef<std::path::Path>,
+        backend: RuntimeDurabilityBackend,
+    ) -> Result<Self, RuntimeRecoveryError> {
+        Self::open_with_backend_recovery_policy_and_revision_publication_notifier(
+            path,
+            backend,
+            PhysicalRecoveryPolicy::default(),
+            Arc::new(InProcessRevisionPublicationNotifier::default()),
+        )
+        .map(|(runtime, _)| runtime)
+    }
+
+    pub fn open_with_revision_publication_notifier(
+        directory: impl AsRef<std::path::Path>,
+        revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
+    ) -> Result<Self, RuntimeRecoveryError> {
+        Self::open_with_recovery_policy_and_revision_publication_notifier(
+            directory,
+            PhysicalRecoveryPolicy::default(),
+            revision_publication,
+        )
+        .map(|(runtime, _)| runtime)
     }
 
     pub fn open_with_recovery_policy(
         directory: impl AsRef<std::path::Path>,
         physical_recovery_policy: PhysicalRecoveryPolicy,
     ) -> Result<(Self, PhysicalRecoveryReport), RuntimeRecoveryError> {
-        let (durability, scan) = DurableRevisionStore::open(directory)?;
+        Self::open_with_recovery_policy_and_revision_publication_notifier(
+            directory,
+            physical_recovery_policy,
+            Arc::new(InProcessRevisionPublicationNotifier::default()),
+        )
+    }
+
+    pub fn open_with_recovery_policy_and_revision_publication_notifier(
+        path: impl AsRef<std::path::Path>,
+        physical_recovery_policy: PhysicalRecoveryPolicy,
+        revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
+    ) -> Result<(Self, PhysicalRecoveryReport), RuntimeRecoveryError> {
+        Self::open_with_backend_recovery_policy_and_revision_publication_notifier(
+            path,
+            RuntimeDurabilityBackend::Directory,
+            physical_recovery_policy,
+            revision_publication,
+        )
+    }
+
+    pub fn open_with_backend_recovery_policy_and_revision_publication_notifier(
+        path: impl AsRef<std::path::Path>,
+        backend: RuntimeDurabilityBackend,
+        physical_recovery_policy: PhysicalRecoveryPolicy,
+        revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
+    ) -> Result<(Self, PhysicalRecoveryReport), RuntimeRecoveryError> {
+        let (durability, scan) = match backend {
+            RuntimeDurabilityBackend::SingleFile => DurableRevisionStore::open_single_file(path)?,
+            RuntimeDurabilityBackend::Directory => DurableRevisionStore::open(path)?,
+        };
         let registry = durability.semantic_registry().clone();
         let materialization_specs = durability
             .materialization_specs()
@@ -236,6 +256,7 @@ impl DurableRuntime {
                 cell: RuntimeRevisionCell::new(root),
                 durability: Mutex::new(durability),
                 registry,
+                revision_publication,
             },
             recovery_report,
         ))
@@ -277,5 +298,4 @@ impl DurableRuntime {
             &self.registry,
         )
     }
-
 }

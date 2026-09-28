@@ -12,7 +12,7 @@ use crate::descriptor::{
 impl DurableRevisionStore {
     #[must_use]
     pub fn directory(&self) -> &Path {
-        &self.directory
+        self.backend.path()
     }
 
     #[must_use]

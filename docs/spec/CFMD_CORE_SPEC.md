@@ -2529,9 +2529,9 @@ Historical #18 remains OPEN until this state machine and its production refineme
 **[GLOBAL STATUS] The kernel hostile/global refactor campaign is COMPLETE / FROZEN after P280.** Every kernel has either a dedicated hostile closure pass or a grouped hostile audit proportional to its size, and the historically closed heavy kernels were revalidated against the current workspace after the later cross-kernel changes. Frozen means “do not continue cleanup by inertia”: any future reopen requires a concrete correctness counterexample, proof/authority seam, measured asymptotic/performance regression, new R&D requirement, or API/DX requirement. It is not a claim that undiscovered bugs are impossible.
 
 
-## Productization handoff after Pass280 — Python-first facade roadmap
+## Productization handoff after Pass280 — universal external facade roadmap
 
-**[CURRENT PRODUCT PHASE]** После global kernel freeze проект переходит от kernel-cleanup к productization. Первичная application surface — Python-first embedded/local facade; Rust остаётся authoritative runtime/facade layer и binding boundary, а не причиной задерживать Python до завершения отдельного большого Rust application API.
+**[CURRENT PRODUCT PHASE]** После global kernel freeze проект переходит от kernel-cleanup к productization. Authoritative product surface строится Rust-first в `cfmd-runtime`; Python/.NET/Studio являются последующими adapters над тем же protocol и не обращаются к kernel graph напрямую.
 
 **[DX LAWS]** Материализованные Python objects не выполняют hidden I/O; deep relationship traversal разрешён внутри symbolic query construction; many-valued paths требуют явной `any/all/match/aggregate` семантики; current (`db`), historical (`db.at(revision)`) и speculative (`db.preview(plan)`) worlds различаются типом контекста.
 
@@ -2542,3 +2542,143 @@ Historical #18 remains OPEN until this state machine and its production refineme
 **[ONE RUNTIME]** Embedded application и external CFMD Studio/tooling не являются независимыми writers файла. App-owned/runtime service остаётся единственным authoritative writer; local tooling подключается через capability-protected language-neutral protocol (query/watch/revision/history/Plan/Candidate).
 
 **[ROADMAP AUTHORITY]** Подробная facade theory хранится в `docs/api/CFMD_PYTHON_FACADE_THEORY.md`; active sequencing — в `docs/api/PRODUCT_ROADMAP.md`; supporting Rust runtime boundary — в `docs/api/RUST_API_ROADMAP.md`. Эти документы определяют следующий development phase, а не продолжают kernel cleanup без нового evidence.
+
+
+## Pass281 product boundary — Rust-runtime-first facade
+
+**[CURRENT PRODUCT AUTHORITY]** Product sequencing is now Rust-runtime first. The Python facade theory remains a UX target, but no Python/.NET/Studio binding may call `kernel-*` crates directly. The stable semantic/runtime boundary is the new `crates/cfmd-runtime` crate.
+
+**[P281 IMPLEMENTED]** `cfmd-runtime` owns public IDs, recursive values, relation query IR, immutable read snapshots, prepared query authority, relation Plans, durable transaction identity and product error categories. Internal `SemanticId`, `RelExpr`, `RuntimeRevisionSnapshot`, `RelationDelta`, durability errors and crate topology stay private.
+
+**[END-TO-END GATE]** A real durable runtime is created in the test fixture and closed; all subsequent open → snapshot → prepare → execute → Plan commit → new-revision query operations are performed only through `cfmd-runtime`.
+
+**[NEXT]** P282 should add facade-owned schema/type/relation builders and `Database::create`, then Candidate/history/watch on the same Rust boundary before language bindings.
+
+
+## Pass282 product boundary — create/schema authority
+
+**[RUST PRODUCT AUTHORITY]** `cfmd-runtime` now owns database creation inputs as well as open/query/write operations. External Rust applications and future language bindings do not construct `kernel_schema::Schema`, `SemanticEnvironment`, `SemanticRegistry`, `PhysicalStore`, `RuntimeRevisionBundle`, or revision objects directly.
+
+**[P282 IMPLEMENTED]** The facade provides recursive product `Type`, primitive equivalence/ordering contracts, `RelationSchema`, `SchemaBuilder`, `Database::create`, and `ReadContext::schema`. Creation compiles facade schema authority into the kernel graph once and persists the resulting semantic registry through the existing durable runtime.
+
+**[EMPTY DATABASE LAW]** Empty relations are physically instantiated through typed empty native columns derived from declared relation types. Product creation does not use sentinel rows, delayed first-write typing, or type-specific fallback routing.
+
+**[BOUNDARY LAW]** The universal low-level Rust facade remains data-oriented and binding-friendly. Future generated/typed Rust DX is layered above it and must lower to the same facade IR rather than bypassing it or duplicating semantics.
+
+**[REPOSITORY RECONCILIATION]** GitHub CI exposed that `.gitignore` pattern `core.*` also ignored Rust files named `core.rs`. Repository policy now uses `core.[0-9]*` for numbered crash dumps, preserving source files while retaining crash-artifact filtering.
+
+
+## Product boundary addendum — Pass283
+
+The frozen kernel graph remains behind `cfmd-runtime`. Pass283 adds an idiomatic typed Rust adapter without creating a second query/write semantics: typed relation/field handles lower to the existing facade `Query`, `PreparedQuery`, `Plan`, `Value` and `Row` protocol. Equality authority is inherited from relation schema. `ValueCodec`/`RowCodec` are extension points for generated domain types. Deep relationship navigation is not authorized by a plain join alone; a future product-schema reference contract must state target identity and cardinality before object-like paths can be exposed.
+
+
+## Pass284 object-first Rust product model
+
+**[PRODUCT DX AUTHORITY]** Object-first is the primary native Rust application model. Relation-first remains the universal low-level/dynamic/tooling surface and the lowering target; there is still only one query/write semantics.
+
+**[P284 IMPLEMENTED]** `cfmd_object!` maps a Rust domain object with one stable textual key and Rust fields to deterministic product semantic identifiers, field equivalences and one typed CFMD relation. `SchemaBuilder::object::<T>()` therefore requires no application-visible relation IDs or column indices. Snapshot-bound `ObjectSet<T>` exposes symbolic field accessors, typed filters/projections and whole-object materialization.
+
+**[PLAN LAW]** Read construction returns Query values. Write operations over object sets/queries (`insert`, exact-query `update`, `delete`) return proposed `Plan` values. `Plan` is therefore an inspectable/composable transition value rather than the primary mutable command surface. The low-level mutable builder remains an escape hatch for dynamic tooling. Plans are bound to one open database instance and exact source snapshot; cross-database commit/composition fails closed.
+
+**[IDENTITY ROADMAP]** P284 deliberately does not pretend that a plain relation column is an entity identity/reference. P285 must add first-class object identity, `Ref<T>` / optional/many cardinality authority and lifecycle-safe write semantics before exposing deep paths such as `u.passport().country().code()`.
+
+
+### Pass285 product-layer entity contract
+
+The external Rust product layer may declare identity-bearing entities independently of kernel lifecycle carriers. `Id<T>` and `Ref<T>` are encoded through the existing typed historical-entity identity domain; they do not create hidden object I/O or a second storage model. Entity plans carry a product-level contract: identity values are unique and every strong reference resolves in the final composed plan state. Validation is identity-indexed (`BTreeMap`/`BTreeSet`), not reference-by-target scanning. Deep reference predicates lower to existing equality joins, then project and semantically distinct the root shape, giving existential path semantics without multiplicity leakage. Kernel relation/query semantics remain unchanged.
+
+## Pass286 product-layer addendum — explicit object cardinality
+
+The Rust product facade now distinguishes required references, optional references and reverse-many relationships without introducing ORM-style hidden loading. `Option<Ref<T>>` is a real algebraic option value backed by the kernel structural-equivalence calculus. Reverse-many members are symbolic query relationships only and are not fields of materialized Rust objects.
+
+Collection predicates lower to the existing relational algebra: `any` uses join/project/distinct, `none` uses anti-join, `all` uses anti-join against the difference between the target domain and the matching target subset, and `count().eq(n)` uses grouped exact count (`n = 0` is the anti-join law). No threshold routing or recompute fallback is introduced.
+
+Open product/backend obligation: current strong-reference metadata is owned by `cfmd-runtime`; it is sufficient for mutations whose source object contract is present in the Plan, but it is not yet the durable global incoming-reference authority after reopen. The next lifecycle pass must unify object identity/reference with kernel carrier + `LiveEntityRef` semantics rather than add further facade-side scans.
+
+## Pass287 lifecycle-backed object identity/reference authority
+
+**[P287 IMPLEMENTED]** `cfmd-runtime` no longer treats strong-reference existence checking as a facade-only scan. Object relation rows remain the canonical product/query representation, but identity-bearing object writes derive a kernel semantic projection consisting of carrier membership, lifecycle roots/entities, and schema-declared reference fields.
+
+**[IDENTITY SEPARATION]** Public `Id<T>` is type-local and remains represented in relation/query space as typed historical identity. Kernel lifecycle requires a global `EntityId`; the product runtime derives a stable internal surrogate from `(TypeId, external id)` and collision-checks it. This permits `Id<User>(7)` and `Id<Passport>(7)` without lifecycle aliasing.
+
+**[REFERENCE LAW]** Required and optional object references are mirrored into kernel fields as `LiveEntityRef<T>` / `Option<LiveEntityRef<T>>`. Target Revision construction goes through `kernel_revision::Revision::build`; surviving references to deleted targets are rejected by kernel-model dangling-reference validation. This authority is durable and survives reopen.
+
+**[PUBLICATION]** Because an entity mutation changes lifecycle/carriers/fields in addition to relation rows, P287 uses the existing correctness-first durable full-revision publication path for entity Plans. Dynamic relation-only Plans continue to use the compact derived-relation path. No error-driven fallback or threshold routing is introduced.
+
+## Pass288 — mixed semantic revision, incremental physical publication
+
+**[KERNEL-PLAN AUTHORITY]** `MixedRevisionTransitionRequest` is the general transition surface for a pinned semantic context when a revision changes both relation data and non-relation model state (lifecycle, carriers, fields). The target `Revision` remains the already-validated logical authority; supplied `RevisionRelationMutation`s must exactly explain all touched relation endpoints and untouched relations must remain identical.
+
+**[PHYSICAL LAW]** Mixed publication clones and incrementally mutates the existing `PhysicalStore`, advances only touched relation witnesses, and maintains only affected materializations. It must not reconstruct the complete physical store merely because lifecycle/carrier/field state changed.
+
+**[VALIDATION LAW]** Relation-delta endpoint equality is checked independently of non-relation state. Because lifecycle/carrier/field changes can affect global invariants, the mixed path rebuilds the runtime violation measure from the exact target Revision instead of transporting a relation-only violation certificate.
+
+**[DURABILITY LAW]** P288 keeps the exact full target Revision in the durable transaction intent/change payload. Live publication is incremental; recovery can therefore reconstruct the exact target without a new WAL codec. Compact durable encoding of the non-relation delta remains an optimization payer and must be extensionally identical to the P288 target Revision before replacing this representation.
+
+## Pass292 — product history as a durable causal projection
+
+**[VERIFIED]** Product history no longer requires a prospective parallel journal. `kernel-durability` exposes the exact committed records already contained in the validated revision-effect ideal, `kernel-plan` normalizes those records into a runtime history bridge, and `cfmd-runtime::Database::history()` maps the bridge to product-owned identifiers/values. Causal prerequisites are retained explicitly; history listing is therefore a deterministic topological view of the same Γ-REIC authority rather than an invented linear log.
+
+**[VERIFIED]** Exact relation-representable history inversion is an ordinary Plan. For the live head entry, inserted/removed relation rows are swapped against a fresh current snapshot, then the resulting Plan uses the existing `Plan -> Candidate -> durable commit` path. No undo publication primitive exists. A committed inverse is itself a normal effect, so repeating inversion over that head gives redo. Stale historical entries fail closed and require a future rebase calculus.
+
+**[R&D PAYER / OPEN]** `DurableModelDelta` is forward-exact but not generally involutive: target-only field patches do not carry enough source information to reconstruct every prior model/lifecycle endpoint after checkpoint rotation. P292 therefore classifies mixed effects with non-empty model delta as `ComplementRequired`; it does not route them through relation-only reconstruction. The next history R&D block should define an exact compact mixed-transition complement/involution and preserve it in the same durable transaction authority.
+
+## Pass295 — exact non-head history inverse rebase
+
+**[PRODUCT DX]** `HistoryEntry::undo_plan()` is no longer restricted to the live-head transition. When the entry is older than HEAD, the runtime asks the kernel for an exact rebase certificate. If every intervening committed effect is semantically independent, the historical inverse is rebuilt as an ordinary Plan bound to the current snapshot and continues through the existing `Plan -> Candidate -> durable commit` pipeline. `HistoryEntry::undo_readiness()` exposes `Ready`, certified `Rebased`, structured `Conflict`, `RuntimeClosed`, `NonReversible`, or `Unavailable` state before Plan construction.
+
+**[KERNEL R&D]** `kernel-plan` now owns `RuntimeHistoryFootprint` and the non-head inverse transport certificate. Relation coordinates are exact Γ-canonical relation classes produced by the pinned semantic relation-delta calculus; they are not Rust hashes, physical row positions, or relation-wide SQL locks. Mixed/model coordinates name carrier presence/membership, field owner, lifecycle entity/root, and keeps-alive presence/edges. This permits strong commutation proofs for independent writes even inside one relation or object family.
+
+**[FAIL-CLOSED LAW]** A historical inverse is transported only when its exact write footprint is disjoint from every intervening exact effect. Overlapping semantic coordinates return `HistoryRebaseConflict`. Full/schema/legacy or otherwise opaque intervening effects are conflicts rather than optimistic replay. Candidate/Revision validation remains the final invariant authority after transport; no generic three-way merge, last-write-wins rule, snapshot diff fallback, or error-driven routing exists.
+
+**[DURABILITY]** Rebase is derived entirely from the retained durable causal effect ideal plus P293 forward/reverse complements and P294 historical reconstruction. No extra rebase journal, undo stack, historical snapshot cache, or duplicated state authority is persisted. Regression coverage includes reopen followed by non-head undo, disjoint Γ-classes in the same relation, same-class conflict, and independent object/entity coordinates.
+
+## Pass296 — exact product watch over maintained differential state
+
+**[PRODUCT DX]** Live snapshot queries now expose exact subscriptions: raw `ReadContext::watch(&Query)`, `ObjectQuery::watch()`, and typed projected-object `.watch()`. A watch returns its initial result once and then revision-tagged delta events `(source_revision, target_revision, inserted, removed)`. `try_recv()` is non-blocking; `recv()` blocks without requiring Tokio. `db.at(revision)` remains immutable historical state and cannot open a live subscription.
+
+**[KERNEL QUERY AUTHORITY]** Watch does not derive change by evaluating the query twice. Subscription creation builds the existing `kernel-query::MaterializedRelPlanState`; every relevant committed `RelationDelta` is then propagated through the already-certified differential/ExecGraph machinery. Unrelated committed relation changes advance the watch revision but produce an empty result delta when the maintained query is unaffected.
+
+**[WAKE LAW]** `DurableRuntime` owns an in-process monotone publication generation plus `Condvar`. This is explicitly wake-only reconstructible state, not a second history/event authority. After wake the watch reads the durable causal effect chain and derives the next exact transition from the authoritative committed effect. A missed/spurious wake cannot invent data and backlog is consumed from causal history in revision order.
+
+**[FAIL-CLOSED LAW]** Watch refuses historical contexts, unavailable exact causal paths, and opaque/full/schema/legacy transitions that cannot be transported by the current exact relational delta contract. There is no polling, whole-result recomputation fallback, filesystem timestamp heuristic, or error-driven routing.
+
+**[OPEN TRANSPORT]** P296 wake-up is in-process for one `DurableRuntime`. Cross-process Studio/WPF/PyQt/external-tool reactivity remains an explicit transport payer: an OS/service notification layer must wake readers, after which the same durable effect + maintained-query protocol is used. Polling is not accepted as the exact-watch implementation.
+
+## Pass297 — wake-provider and hosted-ingress boundary
+
+**[VERIFIED]** Exact watch wake-up is no longer coupled to one concrete `Condvar`. `kernel-plan::RuntimeRevisionPublicationNotifier` is a wake-only provider interface and the standard in-process implementation retains the cheap monotone-generation + condition-variable behavior. `cfmd-runtime` owns the public `PublicationNotifier` vocabulary and bridges providers without leaking kernel types.
+
+**[AUTHORITY LAW]** Notification is not mutation, history, or writer-resolution authority. A provider may duplicate/coalesce/spuriously emit wakes; a subscriber must recover the authoritative committed transition from Revision + durable causal history. The corresponding Lean model proves finite arbitrary wake repetition preserves authoritative Revision. Runtime E2E independently injects a spurious wake and observes no fabricated watch event.
+
+**[HOSTING BOUNDARY]** Hosted/local-tool transports are adapters above the database runtime. Opening/creating a database does not bind IPC/TCP, trust localhost, or authenticate external principals. Optional first-party providers and third-party/application providers may implement wake/delivery integration, but semantic multi-writer commute/rebase/conflict certification remains kernel authority and cannot be asserted by a transport provider.
+
+**[HOSTED WATCH PROTOCOL]** A hosted watch subscription is session-scoped protocol state over the ordinary exact runtime watch, not a second event authority. Open/next/status/cancel/close/session-close operations cannot manufacture database revisions; event source/target revisions and result deltas come only from committed durable causal effects. Hosted implementations must bound maintained subscriptions and must make session termination capable of cancelling blocked consumers. Concrete wire framing and transport remain outside the kernel/runtime authority.
+
+
+## Pass302 — hosted wire/framing boundary
+
+**[WIRE FRAMING LAW]** Hosted wire framing is transport metadata above `cfmd-protocol`, not database authority. Wire v1 has a fixed-size header containing magic, framing version, frame kind, reserved flags, request identity and bounded payload length. A conforming transport must validate the fixed header and payload bound before allocating/reading the announced payload. Request identity is correlation metadata only.
+
+**[NEGOTIATION LAW]** A wire session must negotiate a hosted protocol version before ordinary requests. The selected version must lie in the client-offered range and be server-supported; capability negotiation is an intersection, never a permission grant. Current wire v1 selects hosted protocol v2 when compatible.
+
+**[CANONICAL DECODE LAW]** Wire payloads are deterministic big-endian tagged encodings. Collection/string sizes, recursive depth and total decoded nodes are bounded. Unknown tags, invalid canonical discriminants, duplicate product fields, truncated payloads and trailing bytes fail closed. The protocol does not silently skip unknown mutation/security fields; evolution is explicit through version/capability negotiation.
+
+**[AUTHORITY LAW]** `WireHostedSession` may dispatch only through an already-authorized `HostedSession`. Framing and negotiation cannot authenticate a peer, expand P299 grants, mutate Revision, certify multi-writer commutation, or create event authority. IPC/TCP/TLS/QUIC remain optional adapters above this boundary.
+
+## Pass303 — hosted server composition authority
+
+**[VERIFIED]** `cfmd-host` composes `Database -> SessionDatabase -> HostedSession -> WireHostedSession` without exposing unrestricted `Database` to transport adapters. Authentication and authorization are distinct provider boundaries: evidence establishes identity; grants come exactly from the configured authorizer.
+
+**[SECURITY LAW]** Transport/locality metadata carries no implicit authority. Hosted connection identity is correlation/lifecycle metadata only. Writer conflict/rebase certificates remain kernel-owned and cannot be asserted by host/transport providers.
+
+**[RESOURCE/LIFECYCLE LAW]** Active connections and per-connection in-flight requests are bounded. Connection/server close releases admission capacity once and closes the hosted session, thereby cancelling blocked exact-watch consumers without polling. Closing a connection cannot manufacture a database Revision.
+
+## Pass304 — hosted security lifecycle authority
+
+**[VERIFIED]** Hosted session authorization is a shared runtime authority, not copied endpoint metadata. All derived restricted product values retain the same session identity and consult its current grants at authority transitions. Grant refresh therefore reaches existing values; terminal revocation cannot be undone by later refresh.
+
+**[SECURITY LAW]** Channel binding is explicit authentication evidence (`Bound` or `Unbound`), never an implicit grant. Authorizers may issue expiring grants. Host expiry scheduling is external/event-loop friendly (`next_expiration` + `expire_due`) and requires no polling or hidden server thread; expiration revokes the session and wakes blocking watch work.
+
+**[LIFECYCLE LAW]** Graceful drain rejects new connections but does not revoke already-admitted sessions. Immediate close/revoke is distinct. Security lifecycle transitions preserve authoritative database Revision and do not certify writer commutation/conflicts.

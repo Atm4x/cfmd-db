@@ -1,11 +1,12 @@
 use super::{
     Arc, BTreeMap, BTreeSet, ClientTransactionId, DurabilityError, DurableArtifactCore,
-    DurableCommitReceipt, DurableGenerationReceipt, DurableMaterializationSpec,
-    DurableMigrationComplement, DurablePhysicalArtifactSpec, DurableRelationLayoutKind,
-    DurableRelationMutation, DurableRelationResolution, DurableRelationRewriteIntent,
-    DurableRevisionDescriptor, DurableRevisionStore, DurableTransactionIntent,
-    DurableTransactionOutcome, I64IndexAdvisorReport, I64IndexBinding, IdempotencyEpoch, Impact,
-    LayoutBinding, MaterializedRelPlanState, Mutex, MutexGuard, NativeRelation, OrderedViewError,
+    DurableCommitReceipt, DurableEffectKind, DurableGenerationReceipt, DurableMaterializationSpec,
+    DurableMigrationComplement, DurableModelDelta, DurablePhysicalArtifactSpec,
+    DurableRelationLayoutKind, DurableRelationMutation, DurableRelationResolution,
+    DurableRelationRewriteIntent, DurableRevisionDescriptor, DurableRevisionEffectRecord,
+    DurableRevisionStore, DurableTransactionIntent, DurableTransactionOutcome,
+    I64IndexAdvisorReport, I64IndexBinding, IdempotencyEpoch, Impact, LayoutBinding,
+    MaterializedRelPlanState, Mutex, MutexGuard, NativeRelation, OrderedViewError,
     OrderedViewSnapshot, PersistentOrdMap, PersistentOrdSet, PhysicalArtifactAdvisorPolicy,
     PhysicalExecutionError, PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy,
     PhysicalRecoveryReport, PhysicalStore, PreparedRelationRewrite, RelExpr, RelObservationGuard,
@@ -17,7 +18,7 @@ use super::{
     SemanticIndexAdvisorPolicy, SemanticIndexAdvisorReport, SemanticIndexBinding,
     SemanticIndexWorkloadSample, SemanticKeyStatistics, SemanticStatisticsAdvisorReport,
     StorageResolvedRelationDelta, UnifiedAdvisorPolicy, UnifiedAdvisorTelemetry,
-    UnifiedObservableAdvisorReport, Value,
+    UnifiedObservableAdvisorReport, Value, VecDeque,
 };
 use crate::native_relation::materialize_native_row;
 use crate::recovery::{

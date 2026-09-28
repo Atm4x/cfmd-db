@@ -56,6 +56,147 @@ pub struct DurableRuntime {
     cell: RuntimeRevisionCell,
     durability: Mutex<DurableRevisionStore>,
     registry: kernel_semantics::SemanticRegistry,
+    revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
+}
+
+/// Wake-only backend for reader-visible Revision publication.
+///
+/// This is deliberately not a state authority. Implementations may emit
+/// duplicate or spurious wakes; subscribers recover the real transition from
+/// durable causal history. A notifier therefore cannot publish database state
+/// or certify concurrent-writer compatibility.
+pub trait RuntimeRevisionPublicationNotifier: std::fmt::Debug + Send + Sync {
+    #[must_use]
+    fn generation(&self) -> u64;
+
+    #[must_use]
+    fn wait_after(&self, observed: u64) -> u64;
+
+    /// Wakes publication waiters without asserting that database state changed.
+    ///
+    /// Providers may use the same primitive for real publication, cancellation,
+    /// runtime shutdown, duplicate wakes and spurious wakes. Callers must always
+    /// re-read authoritative Revision/history state after wake-up.
+    fn notify_waiters(&self);
+
+    fn notify_revision_published(&self) {
+        self.notify_waiters();
+    }
+}
+
+/// Per-subscription cancellation + wait capability for Revision publication.
+///
+/// This handle owns only the wake backend, never the runtime or database state,
+/// so a blocking waiter cannot keep `DurableRuntime` alive. Cancellation is a
+/// liveness event only and cannot fabricate a Revision transition.
+#[derive(Debug, Clone)]
+pub struct RuntimeRevisionPublicationWaitHandle {
+    inner: Arc<RuntimeRevisionPublicationWaitState>,
+}
+
+#[derive(Debug)]
+struct RuntimeRevisionPublicationWaitState {
+    cancelled: std::sync::atomic::AtomicBool,
+    notifier: Arc<dyn RuntimeRevisionPublicationNotifier>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRevisionPublicationWaitOutcome {
+    Woken(u64),
+    Cancelled,
+}
+
+impl RuntimeRevisionPublicationWaitHandle {
+    fn new(notifier: Arc<dyn RuntimeRevisionPublicationNotifier>) -> Self {
+        Self {
+            inner: Arc::new(RuntimeRevisionPublicationWaitState {
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+                notifier,
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.inner.notifier.generation()
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.inner
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn cancel(&self) {
+        if !self
+            .inner
+            .cancelled
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.inner.notifier.notify_waiters();
+        }
+    }
+
+    #[must_use]
+    pub fn wait_after(&self, observed: u64) -> RuntimeRevisionPublicationWaitOutcome {
+        if self.is_cancelled() {
+            return RuntimeRevisionPublicationWaitOutcome::Cancelled;
+        }
+        let generation = self.inner.notifier.wait_after(observed);
+        if self.is_cancelled() {
+            RuntimeRevisionPublicationWaitOutcome::Cancelled
+        } else {
+            RuntimeRevisionPublicationWaitOutcome::Woken(generation)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InProcessRevisionPublicationNotifier {
+    generation: Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+
+impl RuntimeRevisionPublicationNotifier for InProcessRevisionPublicationNotifier {
+    fn generation(&self) -> u64 {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait_after(&self, observed: u64) -> u64 {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *generation <= observed {
+            generation = self
+                .changed
+                .wait(generation)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *generation
+    }
+
+    fn notify_waiters(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.saturating_add(1);
+        self.changed.notify_all();
+    }
+}
+
+impl Drop for DurableRuntime {
+    fn drop(&mut self) {
+        let notifier = Arc::clone(&self.revision_publication);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            notifier.notify_waiters();
+        }));
+    }
 }
 
 /// Process-level owner that can discard a fail-stopped runtime, reopen the
@@ -119,4 +260,3 @@ pub enum DurableMaterializationConfigOutcome {
     Applied(DurableGenerationReceipt),
     AlreadyApplied,
 }
-

@@ -2428,7 +2428,7 @@ fn crash_worker_compaction() {
     }
     let dir = PathBuf::from(std::env::var_os(CRASH_DIR_ENV).unwrap());
     let point = parse_crash_point(&std::env::var(CRASH_POINT_ENV).unwrap());
-    let (store, _) = DurableRevisionStore::open(&dir).unwrap();
+    let (mut store, _) = DurableRevisionStore::open(&dir).unwrap();
     let mut hook = BlockingKillFault {
         target: point,
         directory: dir.clone(),
@@ -5270,5 +5270,290 @@ fn recovered_prepare_identity_is_tombstone_not_commit_authority() {
 
     let (_reopened_again, scan_again) = DurableRevisionStore::open(&dir).unwrap();
     assert_eq!(scan_again.durable_revision(), base.id());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_store_commits_reopens_rotates_and_reopens_without_sidecars() {
+    let dir = test_dir("single-file-store-live-roundtrip");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(40_000, &[1]);
+    let (revision_two, _, _) = setup_revision(40_001, &[1, 2]);
+    let descriptor_two = DurableRevisionDescriptor::full_revision(
+        ClientTransactionId::new(40_001),
+        base.id(),
+        &revision_two,
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor_two).unwrap();
+    store.durably_commit(prepared).unwrap();
+    assert_eq!(store.durable_head(), revision_two.id());
+    drop(store);
+
+    let (mut store, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), revision_two.id());
+    assert_eq!(store.durable_head(), revision_two.id());
+    store.rotate_checkpoint(&revision_two).unwrap();
+    assert_eq!(store.generation(), 2);
+
+    let (revision_three, _, _) = setup_revision(40_002, &[1, 2, 3]);
+    let descriptor_three = DurableRevisionDescriptor::full_revision(
+        ClientTransactionId::new(40_002),
+        revision_two.id(),
+        &revision_three,
+        &registry,
+    )
+    .unwrap();
+    let prepared = store.durably_prepare(&descriptor_three).unwrap();
+    store.durably_commit(prepared).unwrap();
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), revision_three.id());
+    assert_eq!(reopened.checkpoint_revision().id(), revision_two.id());
+    assert_eq!(reopened.durable_head(), revision_three.id());
+    assert_eq!(reopened.generation(), 2);
+    let names = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["database.cfmd"]);
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_replication_authority_replays_live_wal_and_survives_rotation() {
+    let dir = test_dir("single-file-replication-authority-roundtrip");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(40_100, &[1]);
+
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    store
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+    assert_eq!(store.current_replication_membership().unwrap().epoch, 1);
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
+    reopened.rotate_checkpoint(&base).unwrap();
+    drop(reopened);
+
+    let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
+    assert_eq!(reopened.generation(), 2);
+    let names = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["database.cfmd"]);
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_external_freshness_survives_commit_rotation_and_rejects_rollback() {
+    let dir = test_dir("single-file-external-freshness");
+    let path = dir.join("database.cfmd");
+    let rollback = dir.join("rollback.cfmd");
+    let (base, registry, relation) = setup_revision(40_200, &[1]);
+    let (next, descriptor) = transition_from(&base, &registry, relation, 40_201, 201);
+    let (config, authority) = external_freshness_fixture([41; 32]);
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+
+    let adopted = store
+        .adopt_external_freshness(config.clone(), authority.boxed())
+        .unwrap();
+    assert_eq!(adopted.generation, 2);
+    assert!(store.external_freshness.is_some());
+    fs::copy(&path, &rollback).unwrap();
+
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    assert_eq!(store.durable_head(), next.id());
+    drop(store);
+
+    assert!(matches!(
+        DurableRevisionStore::open_single_file(&path),
+        Err(DurabilityError::Protocol {
+            reason: "externally anchored store requires freshness-aware open",
+            ..
+        })
+    ));
+
+    let (mut reopened, scan) = DurableRevisionStore::open_single_file_with_external_freshness(
+        &path,
+        config.clone(),
+        authority.boxed(),
+    )
+    .unwrap();
+    assert_eq!(scan.durable_revision(), next.id());
+    assert_eq!(reopened.durable_head(), next.id());
+    reopened.rotate_checkpoint(&next).unwrap();
+    assert_eq!(reopened.generation(), 3);
+    drop(reopened);
+
+    let (mut reopened, scan) = DurableRevisionStore::open_single_file_with_external_freshness(
+        &path,
+        config.clone(),
+        authority.boxed(),
+    )
+    .unwrap();
+    assert_eq!(scan.durable_revision(), next.id());
+    assert_eq!(reopened.generation(), 3);
+    let size_before_compaction = fs::metadata(&path).unwrap().len();
+    reopened.compact_obsolete_generations().unwrap();
+    assert!(fs::metadata(&path).unwrap().len() <= size_before_compaction);
+    drop(reopened);
+
+    let (reopened, scan) = DurableRevisionStore::open_single_file_with_external_freshness(
+        &path,
+        config.clone(),
+        authority.boxed(),
+    )
+    .unwrap();
+    assert_eq!(scan.durable_revision(), next.id());
+    assert_eq!(reopened.generation(), 3);
+    drop(reopened);
+
+    fs::copy(&rollback, &path).unwrap();
+    assert!(matches!(
+        DurableRevisionStore::open_single_file_with_external_freshness(
+            &path,
+            config,
+            authority.boxed(),
+        ),
+        Err(DurabilityError::Protocol {
+            reason: "local durable generation was rolled back behind external freshness authority",
+            ..
+        } | DurabilityError::Protocol {
+            reason: "local WAL was truncated behind external freshness authority",
+            ..
+        })
+    ));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_compaction_relocates_authority_without_losing_live_prepare_or_wal() {
+    let dir = test_dir("single-file-in-place-compaction");
+    let path = dir.join("database.cfmd");
+    let (base, registry, relation) = setup_revision(40_250, &[1]);
+    let (target, descriptor) = transition_from(&base, &registry, relation, 40_251, 251);
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+
+    store.rotate_checkpoint(&base).unwrap();
+    store.rotate_checkpoint(&base).unwrap();
+    let generation_before = store.generation();
+    let token = store.durably_prepare(&descriptor).unwrap();
+    let size_before = fs::metadata(&path).unwrap().len();
+
+    store.compact_obsolete_generations().unwrap();
+    let size_after = fs::metadata(&path).unwrap().len();
+    assert!(size_after < size_before);
+    assert_eq!(store.generation(), generation_before);
+    assert_eq!(store.durable_head(), base.id());
+
+    store.durably_commit(token).unwrap();
+    assert_eq!(store.durable_head(), target.id());
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(reopened.generation(), generation_before);
+    assert_eq!(reopened.durable_head(), target.id());
+    assert_eq!(scan.durable_revision(), target.id());
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_external_freshness_tracks_streaming_carry_forward() {
+    let dir = test_dir("single-file-freshness-streaming");
+    let path = dir.join("database.cfmd");
+    let (base, registry, relation) = setup_revision(40_260, &[1]);
+    let (target, descriptor) = transition_from(&base, &registry, relation, 40_261, 261);
+    let (config, authority) = external_freshness_fixture([42; 32]);
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    store
+        .adopt_external_freshness(config.clone(), authority.boxed())
+        .unwrap();
+
+    store
+        .begin_streaming_checkpoint_with_chunk_size(&base, 16)
+        .unwrap();
+    store.write_streaming_checkpoint_chunks(1).unwrap();
+    let token = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(token).unwrap();
+    store.write_streaming_checkpoint_chunks(usize::MAX).unwrap();
+    let receipt = store.finalize_streaming_checkpoint().unwrap();
+    assert_eq!(receipt.base_revision, base.id());
+    assert_eq!(store.durable_head(), target.id());
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open_single_file_with_external_freshness(
+        &path,
+        config,
+        authority.boxed(),
+    )
+    .unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(reopened.durable_head(), target.id());
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_streaming_checkpoint_carries_exact_wal_and_replication_suffix() {
+    let dir = test_dir("single-file-streaming-carry-forward");
+    let path = dir.join("database.cfmd");
+    let (base, registry, relation) = setup_revision(40_300, &[1]);
+    let (r1, d1) = transition_from(&base, &registry, relation, 40_301, 301);
+    let (r2, d2) = transition_from(&r1, &registry, relation, 40_302, 302);
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+
+    store
+        .begin_streaming_checkpoint_with_chunk_size(&base, 16)
+        .unwrap();
+    store.write_streaming_checkpoint_chunks(1).unwrap();
+    let p1 = store.durably_prepare(&d1).unwrap();
+    store.durably_commit(p1).unwrap();
+    store
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+    store.write_streaming_checkpoint_chunks(1).unwrap();
+    let p2 = store.durably_prepare(&d2).unwrap();
+    store.durably_commit(p2).unwrap();
+    store.write_streaming_checkpoint_chunks(usize::MAX).unwrap();
+    let receipt = store.finalize_streaming_checkpoint().unwrap();
+
+    assert_eq!(receipt.base_revision, base.id());
+    assert_eq!(store.durable_head(), r2.id());
+    assert_eq!(store.current_replication_membership().unwrap().epoch, 1);
+    assert_eq!(store.generation(), 2);
+
+    // A subsequent ordinary rotation must archive only the post-cut live
+    // replication suffix once, while preserving the same semantic endpoint.
+    store.rotate_checkpoint(&r2).unwrap();
+    assert_eq!(store.generation(), 3);
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(reopened.checkpoint_revision().id(), r2.id());
+    assert_eq!(reopened.durable_head(), r2.id());
+    assert_eq!(scan.durable_revision(), r2.id());
+    assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
+    let names = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["database.cfmd"]);
+    drop(reopened);
     fs::remove_dir_all(dir).unwrap();
 }

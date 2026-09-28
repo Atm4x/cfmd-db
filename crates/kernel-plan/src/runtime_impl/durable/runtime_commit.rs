@@ -35,7 +35,64 @@ impl DurableRuntime {
                 &authorized_request,
                 &mut *durability,
             )
-            .map(DurableRuntimeCommitOutcome::Committed)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
+    }
+
+    /// Atomically commits a validated mixed logical revision while applying
+    /// only its declared relation deltas to the physical store. Lifecycle,
+    /// carrier and field state come from the exact target Revision. Durable
+    /// identity retains the full target bytes until a compact non-relation WAL
+    /// delta format is introduced, so crash/retry semantics remain exact.
+    pub fn commit_mixed_revision(
+        &self,
+        transaction_id: ClientTransactionId,
+        request: &MixedRevisionTransitionRequest<'_>,
+    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+        let durable_mutations = Self::canonical_durable_relation_mutations(request.mutations)?;
+        let requested_intent = DurableTransactionIntent::mixed_revision(
+            request.source_revision,
+            request.target_revision,
+            request.target_revision.semantic_revision(),
+            durable_mutations,
+            request.model_delta.clone(),
+            request.model_complement.clone(),
+            &self.registry,
+        )
+        .map_err(DurabilityError::Encode)
+        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let mut durability = self.durability.lock().map_err(|_| {
+            let _ = self.cell.force_recovery_required();
+            DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
+        })?;
+        if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
+            if committed_intent == &requested_intent {
+                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
+                    target_revision: requested_intent.target_revision(),
+                });
+            }
+            return Err(DurableRuntimeCommitError::TransactionIdConflict {
+                transaction_id,
+                committed_target: committed_intent.target_revision(),
+                requested_target: requested_intent.target_revision(),
+            });
+        }
+        let authorized_request = MixedRevisionTransitionRequest {
+            source_revision: request.source_revision,
+            target_revision: request.target_revision,
+            mutations: request.mutations,
+            model_delta: request.model_delta,
+            model_complement: request.model_complement,
+            registry: &self.registry,
+        };
+        self.cell
+            .commit_mixed_revision_durable(transaction_id, &authorized_request, &mut *durability)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
     }
 
     /// Delta-authoritative compact durability path. The caller names source
@@ -92,7 +149,10 @@ impl DurableRuntime {
         drop(snapshot);
         self.cell
             .commit_prepared_durable(transaction_id, prepared, &self.registry, &mut *durability)
-            .map(DurableRuntimeCommitOutcome::Committed)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
     }
 
     /// Delta-authoritative durable Rewrite path. Exact transaction identity
@@ -155,7 +215,10 @@ impl DurableRuntime {
                 .prepare_rewrites_derived(&target, request.rewrites, &self.registry)?;
         self.cell
             .commit_prepared_durable(transaction_id, prepared, &self.registry, &mut *durability)
-            .map(DurableRuntimeCommitOutcome::Committed)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
     }
 
     /// Durable single-relation resolution publication. The target is still
@@ -230,7 +293,10 @@ impl DurableRuntime {
                 &self.registry,
                 &mut *durability,
             )
-            .map(DurableRuntimeCommitOutcome::Committed)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
     }
 
     /// Durable coherent resolution whose causal authority explicitly joins
@@ -454,7 +520,10 @@ impl DurableRuntime {
                 &self.registry,
                 &mut *durability,
             )
-            .map(DurableRuntimeCommitOutcome::Committed)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
     }
 
 }

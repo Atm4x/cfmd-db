@@ -41,6 +41,13 @@ impl RuntimeRevisionCell {
             .prepare_rewrites_derived(endpoint, rewrites, registry)
     }
 
+    pub fn prepare_mixed_revision(
+        &self,
+        request: &MixedRevisionTransitionRequest<'_>,
+    ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
+        self.snapshot()?.prepare_mixed_revision(request)
+    }
+
     pub fn prepare_full_revision(
         &self,
         request: &FullRevisionTransitionRequest<'_>,

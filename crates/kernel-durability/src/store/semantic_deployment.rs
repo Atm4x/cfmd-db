@@ -57,6 +57,9 @@ pub(super) fn install_intent_semantic_modules(
         | DurableTransactionIntent::RelationResolutionExact {
             semantic_modules, ..
         }
+        | DurableTransactionIntent::MixedRevisionExact {
+            semantic_modules, ..
+        }
         | DurableTransactionIntent::Exact {
             semantic_modules, ..
         }

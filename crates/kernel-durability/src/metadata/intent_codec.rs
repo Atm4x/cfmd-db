@@ -14,6 +14,7 @@ use super::artifact_codec::{
     encode_migration_complements,
 };
 
+#[allow(clippy::too_many_lines)] // Canonical wire-order encoder; kept linear so field order remains auditable.
 pub(crate) fn encode_transaction_intent(
     out: &mut Vec<u8>,
     intent: &DurableTransactionIntent,
@@ -73,6 +74,27 @@ pub(crate) fn encode_transaction_intent(
             encode_relation_mutations(out, relation_mutations)?;
             encode_semantic_module_specs(out, semantic_modules)?;
         }
+        DurableTransactionIntent::MixedRevisionExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            relation_mutations,
+            model_delta,
+            model_complement,
+            semantic_modules,
+        } => {
+            out.push(if model_complement.is_some() { 7 } else { 6 });
+            push_u64(out, source_revision.raw());
+            push_u64(out, target_revision.raw());
+            push_u64(out, semantic_revision.schema.raw());
+            push_u64(out, semantic_revision.environment.raw());
+            encode_relation_mutations(out, relation_mutations)?;
+            super::model_delta_codec::encode_model_delta(out, model_delta)?;
+            if let Some(complement) = model_complement {
+                super::model_delta_codec::encode_model_delta(out, complement)?;
+            }
+            encode_semantic_module_specs(out, semantic_modules)?;
+        }
         DurableTransactionIntent::Exact {
             target_revision,
             encoded_target_revision,
@@ -116,7 +138,8 @@ pub(crate) fn encode_transaction_intent(
 pub(crate) fn decode_transaction_intent(
     cursor: &mut Cursor<'_>,
 ) -> Result<DurableTransactionIntent, &'static str> {
-    match cursor.u8()? {
+    let tag = cursor.u8()?;
+    match tag {
         0 => Ok(DurableTransactionIntent::LegacyTargetOnly {
             target_revision: RevisionId::new(cursor.u64()?),
         }),
@@ -191,8 +214,39 @@ pub(crate) fn decode_transaction_intent(
             })
         }
         5 => decode_relation_resolution_intent(cursor),
+        6 | 7 => decode_mixed_revision_intent(cursor, tag == 7),
         _ => Err("invalid transaction intent tag"),
     }
+}
+
+fn decode_mixed_revision_intent(
+    cursor: &mut Cursor<'_>,
+    has_complement: bool,
+) -> Result<DurableTransactionIntent, &'static str> {
+    let source_revision = RevisionId::new(cursor.u64()?);
+    let target_revision = RevisionId::new(cursor.u64()?);
+    let semantic_revision = SemanticRevision::new(
+        kernel_types::SchemaRevisionId::new(cursor.u64()?),
+        kernel_types::SemanticEnvId::new(cursor.u64()?),
+    );
+    let relation_mutations = decode_relation_mutations(cursor)?;
+    let model_delta = super::model_delta_codec::decode_model_delta(cursor)?;
+    let model_complement = if has_complement {
+        Some(Box::new(super::model_delta_codec::decode_model_delta(
+            cursor,
+        )?))
+    } else {
+        None
+    };
+    Ok(DurableTransactionIntent::MixedRevisionExact {
+        source_revision,
+        target_revision,
+        semantic_revision,
+        relation_mutations,
+        model_delta,
+        model_complement,
+        semantic_modules: decode_semantic_module_specs(cursor)?,
+    })
 }
 
 fn decode_relation_resolution_intent(

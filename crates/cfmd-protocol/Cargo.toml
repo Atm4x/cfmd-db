@@ -1,0 +1,12 @@
+[package]
+name = "cfmd-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cfmd-runtime = { path = "../cfmd-runtime" }
+
+[lints]
+workspace = true

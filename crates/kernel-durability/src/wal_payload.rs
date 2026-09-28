@@ -7,8 +7,8 @@ use crate::binary_codec::{
 };
 use crate::descriptor::DurableRevisionDescriptor;
 use crate::domain::{
-    DurableMigrationComplement, DurableRelationMutation, DurableRelationResolution,
-    DurableRevisionChange, DurableTransactionIntent, IdempotencyEpoch,
+    DurableMigrationComplement, DurableModelDelta, DurableRelationMutation,
+    DurableRelationResolution, DurableRevisionChange, DurableTransactionIntent, IdempotencyEpoch,
 };
 use crate::metadata::{
     self, decode_relation_mutations, decode_relation_rewrite_intents, encode_relation_mutations,
@@ -16,7 +16,7 @@ use crate::metadata::{
 };
 use crate::runtime::CodecError;
 
-pub const MUTATION_CODEC_VERSION: u16 = 9;
+pub const MUTATION_CODEC_VERSION: u16 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitRecord {
@@ -73,6 +73,46 @@ fn encode_schema_migration_prepare(
     push_bytes(out, encoded_target_revision)?;
     metadata::encode_migration_complements(out, std::slice::from_ref(migration_complement))?;
     metadata::encode_semantic_module_specs(out, semantic_modules)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // Mirrors the canonical mixed PREPARE wire fields explicitly.
+fn encode_mixed_revision_prepare(
+    out: &mut Vec<u8>,
+    descriptor: &DurableRevisionDescriptor,
+    source_revision: RevisionId,
+    target_revision: RevisionId,
+    semantic_revision: SemanticRevision,
+    relation_mutations: &[DurableRelationMutation],
+    model_delta: &DurableModelDelta,
+    model_complement: Option<&DurableModelDelta>,
+    semantic_modules: &[BuiltinSemanticModuleSpec],
+) -> Result<(), CodecError> {
+    let DurableRevisionChange::MixedRevision {
+        semantic_revision: change_semantics,
+        relation_mutations: change_mutations,
+        model_delta: change_model_delta,
+    } = &descriptor.change
+    else {
+        return Err(CodecError::CollectionTooLarge);
+    };
+    if source_revision != descriptor.source_revision
+        || target_revision != descriptor.target_revision
+        || semantic_revision != *change_semantics
+        || relation_mutations != change_mutations
+        || model_delta != change_model_delta
+    {
+        return Err(CodecError::CollectionTooLarge);
+    }
+    out.push(if model_complement.is_some() { 7 } else { 6 });
+    metadata::encode_semantic_module_specs(out, semantic_modules)?;
+    push_u64(out, semantic_revision.schema.raw());
+    push_u64(out, semantic_revision.environment.raw());
+    encode_relation_mutations(out, relation_mutations)?;
+    metadata::encode_model_delta(out, model_delta)?;
+    if let Some(complement) = model_complement {
+        metadata::encode_model_delta(out, complement)?;
+    }
     Ok(())
 }
 
@@ -185,16 +225,21 @@ fn encode_relation_rewrite_prepare(
 fn encode_prepare_identity_prefix(out: &mut Vec<u8>, descriptor: &DurableRevisionDescriptor) {
     let identity_bound = descriptor.idempotency_epoch != IdempotencyEpoch::ZERO
         || descriptor.revision_effect_id.is_some();
+    let requires_current_codec = matches!(
+        descriptor.intent,
+        DurableTransactionIntent::MixedRevisionExact { .. }
+    );
+    let uses_identity_fields = identity_bound || requires_current_codec;
     push_u16(
         out,
-        if identity_bound {
+        if uses_identity_fields {
             MUTATION_CODEC_VERSION
         } else {
             8
         },
     );
     push_u128(out, descriptor.transaction_id.raw());
-    if identity_bound {
+    if uses_identity_fields {
         push_u64(out, descriptor.idempotency_epoch.raw());
         match descriptor.revision_effect_id {
             Some(id) => {
@@ -207,6 +252,7 @@ fn encode_prepare_identity_prefix(out: &mut Vec<u8>, descriptor: &DurableRevisio
     push_u64(out, descriptor.source_revision.raw());
 }
 
+#[allow(clippy::too_many_lines)] // Versioned wire encoder; linear layout is intentional protocol documentation.
 pub(crate) fn encode_prepare_payload(
     descriptor: &DurableRevisionDescriptor,
 ) -> Result<Vec<u8>, CodecError> {
@@ -252,6 +298,25 @@ pub(crate) fn encode_prepare_payload(
             },
             semantic_modules,
         )?,
+        DurableTransactionIntent::MixedRevisionExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            relation_mutations,
+            model_delta,
+            model_complement,
+            semantic_modules,
+        } => encode_mixed_revision_prepare(
+            &mut out,
+            descriptor,
+            *source_revision,
+            *target_revision,
+            *semantic_revision,
+            relation_mutations,
+            model_delta,
+            model_complement.as_deref(),
+            semantic_modules,
+        )?,
         DurableTransactionIntent::Exact {
             target_revision,
             encoded_target_revision,
@@ -274,7 +339,8 @@ pub(crate) fn encode_prepare_payload(
             match &descriptor.change {
                 DurableRevisionChange::FullRevision { .. } => out.push(1),
                 DurableRevisionChange::FullRevisionAndMaterializations { .. } => out.push(2),
-                DurableRevisionChange::RelationData { .. } => {
+                DurableRevisionChange::RelationData { .. }
+                | DurableRevisionChange::MixedRevision { .. } => {
                     return Err(CodecError::CollectionTooLarge);
                 }
             }
@@ -358,6 +424,7 @@ pub(crate) fn decode_prepare_payload(
                     semantic_modules: Vec::new(),
                 },
                 DurableRevisionChange::RelationData { .. }
+                | DurableRevisionChange::MixedRevision { .. }
                 | DurableRevisionChange::FullRevisionAndMaterializations { .. } => {
                     DurableTransactionIntent::LegacyTargetOnly { target_revision }
                 }
@@ -365,7 +432,7 @@ pub(crate) fn decode_prepare_payload(
             (intent, change)
         }
         4 => decode_v4_prepare_payload(&mut cursor, target_revision)?,
-        5 | 6 | 7 | 8 | MUTATION_CODEC_VERSION => {
+        5 | 6 | 7 | 8 | 9 | 10 | MUTATION_CODEC_VERSION => {
             decode_current_prepare_payload(&mut cursor, source_revision, target_revision)?
         }
         _ => return Err("unsupported mutation codec version"),
@@ -431,12 +498,43 @@ fn decode_v4_prepare_payload(
     Ok((intent, change))
 }
 
+#[allow(clippy::too_many_lines)] // Versioned wire decoder; linear order must mirror the encoded payload.
 fn decode_current_prepare_payload(
     cursor: &mut Cursor<'_>,
     source_revision: RevisionId,
     target_revision: RevisionId,
 ) -> Result<(DurableTransactionIntent, DurableRevisionChange), &'static str> {
-    match cursor.u8()? {
+    let tag = cursor.u8()?;
+    match tag {
+        6 | 7 => {
+            let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
+            let semantic_revision = SemanticRevision::new(
+                kernel_types::SchemaRevisionId::new(cursor.u64()?),
+                kernel_types::SemanticEnvId::new(cursor.u64()?),
+            );
+            let relation_mutations = decode_relation_mutations(cursor)?;
+            let model_delta = metadata::decode_model_delta(cursor)?;
+            let model_complement = if tag == 7 {
+                Some(Box::new(metadata::decode_model_delta(cursor)?))
+            } else {
+                None
+            };
+            let intent = DurableTransactionIntent::MixedRevisionExact {
+                source_revision,
+                target_revision,
+                semantic_revision,
+                relation_mutations: relation_mutations.clone(),
+                model_delta: model_delta.clone(),
+                model_complement,
+                semantic_modules,
+            };
+            let change = DurableRevisionChange::MixedRevision {
+                semantic_revision,
+                relation_mutations,
+                model_delta,
+            };
+            Ok((intent, change))
+        }
         5 => decode_relation_resolution_prepare(cursor, source_revision, target_revision),
         4 => decode_schema_migration_prepare(cursor, source_revision, target_revision),
         3 => {

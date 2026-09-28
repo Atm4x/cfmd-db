@@ -5,6 +5,8 @@
 **Target:** Python-first facade for embedded/local CFMD applications  
 **Repository changes:** none
 
+> **Implementation-order note (Pass281):** this document remains the Python UX/design target. Its semantics are now implemented **Rust-runtime first** in `cfmd-runtime`; Python will bind to that stable product boundary and will not call `kernel-*` crates directly.
+
 ---
 
 # 1. Thesis

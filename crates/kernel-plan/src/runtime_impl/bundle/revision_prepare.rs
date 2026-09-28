@@ -7,9 +7,10 @@ impl RuntimeRevisionBundle {
         self.physical.durable_artifact_cores(self.revision.id())
     }
 
-    fn candidate_physical_store_for_revision(
+    fn candidate_physical_store_for_mutations(
         &self,
-        request: &RevisionTransitionRequest<'_>,
+        mutations: &[RevisionRelationMutation<'_>],
+        registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<
         (
             PhysicalStore,
@@ -19,8 +20,8 @@ impl RuntimeRevisionBundle {
     > {
         let mut candidate_store = self.physical.clone();
         let mut resolved = BTreeMap::new();
-        let mut physical_changes = Vec::with_capacity(request.mutations.len());
-        for mutation in request.mutations {
+        let mut physical_changes = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
             let layout = self.relation_layouts[&mutation.relation];
             let (delta, physical_delta) = candidate_store
                 .apply_relation_delta_resolved_in_place_deferred_support(
@@ -28,7 +29,7 @@ impl RuntimeRevisionBundle {
                     layout,
                     mutation.delta,
                     self.revision.semantic_context(),
-                    request.registry,
+                    registry,
                 )?;
             physical_changes.push((mutation.relation, layout, physical_delta));
             resolved.insert(mutation.relation, delta);
@@ -40,7 +41,7 @@ impl RuntimeRevisionBundle {
         candidate_store.maintain_semantic_quotient_supports_for_changes(
             &support_changes,
             self.revision.semantic_context(),
-            request.registry,
+            registry,
         )?;
         Ok((candidate_store, resolved))
     }
@@ -171,11 +172,16 @@ impl RuntimeRevisionBundle {
         }
 
         if replay_claimed_delta {
-            self.validate_target_logical_state(request)?;
+            self.validate_target_logical_state(
+                request.target_revision,
+                request.mutations,
+                request.registry,
+                false,
+            )?;
         }
 
         let (mut candidate_store, resolved) =
-            self.candidate_physical_store_for_revision(request)?;
+            self.candidate_physical_store_for_mutations(request.mutations, request.registry)?;
         candidate_store.rebind_unpublished_candidate_revision(source_revision, target_revision)?;
 
         let (candidate_materializations, output_deltas) = self
@@ -310,6 +316,133 @@ impl RuntimeRevisionBundle {
         };
         prepared.descriptor.rewrite_intents = rewrite_intents;
         Ok(prepared)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prepare_mixed_revision(
+        &self,
+        request: &MixedRevisionTransitionRequest<'_>,
+    ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
+        let source_revision = self.revision.id();
+        if request.source_revision != source_revision {
+            return Err(PhysicalExecutionError::InvalidRevisionTransition);
+        }
+        let target_revision = request.target_revision.id();
+        if target_revision == source_revision {
+            return Err(PhysicalExecutionError::InvalidRevisionTransition);
+        }
+        if request.target_revision.semantic_context() != self.revision.semantic_context() {
+            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+        }
+        if self.physical.revision() != Some(source_revision) {
+            return Err(PhysicalExecutionError::RevisionBindingMismatch);
+        }
+
+        let mut seen_relations = BTreeSet::new();
+        let mut relation_deltas = BTreeMap::new();
+        for mutation in request.mutations {
+            if !seen_relations.insert(mutation.relation) {
+                return Err(PhysicalExecutionError::DuplicateRelationMutation(
+                    mutation.relation,
+                ));
+            }
+            if !self.relation_layouts.contains_key(&mutation.relation) {
+                return Err(PhysicalExecutionError::MissingRuntimeRelationBinding(
+                    mutation.relation,
+                ));
+            }
+            relation_deltas.insert(mutation.relation, mutation.delta.clone());
+        }
+
+        self.validate_target_logical_state(
+            request.target_revision,
+            request.mutations,
+            request.registry,
+            true,
+        )?;
+
+        let exact_model_delta = DurableModelDelta::between(
+            self.revision.state(),
+            request.target_revision.state(),
+        );
+        if &exact_model_delta != request.model_delta {
+            return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
+        }
+        let exact_model_complement = DurableModelDelta::between(
+            request.target_revision.state(),
+            self.revision.state(),
+        );
+        if &exact_model_complement != request.model_complement {
+            return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
+        }
+
+        let candidate_version = self
+            .root_identity
+            .version
+            .0
+            .checked_add(1)
+            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
+        let (mut candidate_store, resolved) = self
+            .candidate_physical_store_for_mutations(request.mutations, request.registry)?;
+        candidate_store.rebind_unpublished_candidate_revision(source_revision, target_revision)?;
+
+        let (candidate_materializations, output_deltas) = self
+            .candidate_materializations_for_revision_transition(
+                &resolved,
+                target_revision,
+                request.registry,
+            )?;
+
+        // Non-relation model state changed, so the relation-only transported
+        // violation measure is not authoritative. Rebuild the logical measure
+        // from the already validated target Revision, while preserving the
+        // incremental physical/materialization publication path.
+        let violation_state = RuntimeViolationState::build(request.target_revision, request.registry)?;
+        violation_state.require_zero()?;
+
+        let mut relation_bases = self.relation_bases.clone();
+        for mutation in request.mutations {
+            let base = self.relation_bases.get(&mutation.relation).ok_or(
+                PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation),
+            )?;
+            relation_bases.insert(
+                mutation.relation,
+                base.advance(target_revision, mutation.delta, request.registry)?,
+            );
+        }
+
+        let candidate = RuntimeRevisionBundle {
+            root_identity: RuntimeRootIdentity {
+                root_id: self.root_identity.root_id,
+                version: RuntimeRootVersion(candidate_version),
+            },
+            revision: request.target_revision.clone(),
+            violation_state,
+            physical: candidate_store,
+            relation_layouts: self.relation_layouts.clone(),
+            relation_bases,
+            materialization_specs: self.materialization_specs.clone(),
+            materializations: candidate_materializations,
+            materialization_dependencies: self.materialization_dependencies.clone(),
+            materializations_by_relation: self.materializations_by_relation.clone(),
+        };
+
+        Ok(PreparedRuntimeRevisionTransition {
+            descriptor: RevisionCommitDescriptor {
+                source_revision,
+                target: Box::new(request.target_revision.clone()),
+                change: RevisionCommitChange::MixedRevision {
+                    semantic_revision: self.revision.semantic_revision(),
+                    relation_deltas,
+                    model_delta: request.model_delta.clone(),
+                    model_complement: Box::new(request.model_complement.clone()),
+                },
+                rewrite_intents: BTreeMap::new(),
+            },
+            source_identity: self.root_identity,
+            candidate: Box::new(candidate),
+            output_deltas,
+        })
     }
 
     fn prepare_full_revision(
@@ -518,24 +651,24 @@ impl RuntimeRevisionBundle {
 
     fn validate_target_logical_state(
         &self,
-        request: &RevisionTransitionRequest<'_>,
+        target_revision: &kernel_revision::Revision,
+        mutations: &[RevisionRelationMutation<'_>],
+        registry: &kernel_semantics::SemanticRegistry,
+        allow_non_relation_changes: bool,
     ) -> Result<(), PhysicalExecutionError> {
         let source = self.revision.state();
-        let target = request.target_revision.state();
+        let target = target_revision.state();
 
-        let mutated_relations: BTreeSet<_> = request
-            .mutations
+        let mutated_relations: BTreeSet<_> = mutations
             .iter()
             .map(|mutation| mutation.relation)
             .collect();
 
-        if !request
-            .target_revision
-            .certifies_relation_only_from(&self.revision, &mutated_relations)
-        {
-            if source.lifecycle != target.lifecycle
-                || source.model.carriers != target.model.carriers
-                || source.model.fields != target.model.fields
+        if !target_revision.certifies_relation_only_from(&self.revision, &mutated_relations) {
+            if !allow_non_relation_changes
+                && (source.lifecycle != target.lifecycle
+                    || source.model.carriers != target.model.carriers
+                    || source.model.fields != target.model.fields)
             {
                 return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
             }
@@ -556,19 +689,19 @@ impl RuntimeRevisionBundle {
         }
 
         let mut affected = BTreeMap::<SemanticId, RelationValue>::new();
-        for mutation in request.mutations {
+        for mutation in mutations {
             let old = match affected.remove(&mutation.relation) {
                 Some(value) => value,
                 None => RelExpr::Scan(mutation.relation).evaluate(
                     &source.model,
                     self.revision.semantic_context(),
-                    request.registry,
+                    registry,
                 )?,
             };
             let next = mutation.delta.apply_to_value(
                 old,
                 self.revision.semantic_context(),
-                request.registry,
+                registry,
             )?;
             affected.insert(mutation.relation, next);
         }
@@ -587,4 +720,5 @@ impl RuntimeRevisionBundle {
 
         Ok(())
     }
+
 }

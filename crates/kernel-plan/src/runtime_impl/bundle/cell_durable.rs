@@ -61,6 +61,16 @@ impl RuntimeRevisionCell {
         })
     }
 
+    pub(crate) fn commit_mixed_revision_durable<D: RevisionDurability>(
+        &self,
+        transaction_id: ClientTransactionId,
+        request: &MixedRevisionTransitionRequest<'_>,
+        durability: &mut D,
+    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+        let prepared = self.prepare_mixed_revision(request)?;
+        self.commit_prepared_durable(transaction_id, prepared, request.registry, durability)
+    }
+
     pub(crate) fn commit_full_revision_durable<D: RevisionDurability>(
         &self,
         transaction_id: ClientTransactionId,

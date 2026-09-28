@@ -3,6 +3,7 @@ mod recovery;
 mod simulated;
 
 pub use file::FileRevisionWal;
+pub(crate) use file::WalRegionRecovery;
 pub use recovery::scan_wal;
 pub use simulated::SimulatedRevisionWal;
 

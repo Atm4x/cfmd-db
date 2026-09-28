@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/cfmd-runtime",
+  "crates/cfmd-protocol",
+  "crates/cfmd-host",
+  "crates/cfmd-transport-local",
   "crates/kernel-persistent",
   "crates/kernel-types",
   "crates/kernel-schema",

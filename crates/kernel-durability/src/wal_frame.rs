@@ -13,6 +13,7 @@ pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) enum RecordKind {
     PrepareRevision = 1,
     CommitRevision = 2,
+    ReplicationAuthority = 3,
 }
 
 impl TryFrom<u8> for RecordKind {
@@ -22,6 +23,7 @@ impl TryFrom<u8> for RecordKind {
         match value {
             1 => Ok(Self::PrepareRevision),
             2 => Ok(Self::CommitRevision),
+            3 => Ok(Self::ReplicationAuthority),
             _ => Err(()),
         }
     }

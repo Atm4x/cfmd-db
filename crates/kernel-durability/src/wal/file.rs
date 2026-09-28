@@ -15,15 +15,27 @@ use crate::wal_frame::{EncodedFrame, RecordKind, encode_frame};
 use crate::wal_payload::{CommitRecord, encode_commit_payload, encode_prepare_payload};
 
 use super::WAL_FRESHNESS_PREFIX_DOMAIN;
-use super::recovery::scan_wal_file_seeded;
+use super::recovery::{scan_wal_file_region_seeded, scan_wal_file_seeded};
 
 #[derive(Debug)]
 pub struct FileRevisionWal {
     path: PathBuf,
     file: File,
+    start_offset: u64,
     next_lsn: u64,
     freshness_hasher: Sha256,
     poisoned: bool,
+}
+
+pub(crate) struct WalRegionRecovery<'a> {
+    pub path: PathBuf,
+    pub file: File,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub base_revision: RevisionId,
+    pub first_lsn: u64,
+    pub seeded_prepares: &'a [(u64, DurableRevisionDescriptor, u32)],
+    pub writable: bool,
 }
 
 impl FileRevisionWal {
@@ -53,6 +65,7 @@ impl FileRevisionWal {
         Ok(Self {
             path,
             file,
+            start_offset: 0,
             next_lsn,
             freshness_hasher,
             poisoned: false,
@@ -95,6 +108,7 @@ impl FileRevisionWal {
             Self {
                 path,
                 file,
+                start_offset: 0,
                 next_lsn: scan.next_lsn(),
                 freshness_hasher,
                 poisoned: false,
@@ -109,8 +123,43 @@ impl FileRevisionWal {
     }
 
     #[must_use]
+    pub(crate) const fn start_offset(&self) -> u64 {
+        self.start_offset
+    }
+
+    #[must_use]
     pub(crate) const fn next_lsn(&self) -> u64 {
         self.next_lsn
+    }
+
+    pub(crate) fn current_end_offset(&mut self) -> Result<u64, DurabilityError> {
+        self.file.stream_position().map_err(DurabilityError::Io)
+    }
+
+    pub(crate) fn scan_subregion_seeded(
+        &self,
+        start_offset: u64,
+        end_offset: u64,
+        base_revision: RevisionId,
+        first_lsn: u64,
+        seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+    ) -> Result<RecoveryScan, DurabilityError> {
+        let mut file = self.file.try_clone()?;
+        let (scan, _) = scan_wal_file_region_seeded(
+            &mut file,
+            start_offset,
+            end_offset,
+            base_revision,
+            first_lsn,
+            seeded_prepares,
+        )?;
+        Ok(scan)
+    }
+
+    pub(crate) fn seal_for_generation_rotation(&mut self) -> Result<u64, DurabilityError> {
+        self.durability_barrier()?;
+        self.poisoned = true;
+        Ok(self.next_lsn)
     }
 
     #[must_use]
@@ -129,9 +178,51 @@ impl FileRevisionWal {
         first_lsn: u64,
         seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
     ) -> Result<(RecoveryScan, u64), DurabilityError> {
-        let (scan, _, file_len) =
-            scan_wal_file_seeded(&mut self.file, base_revision, first_lsn, seeded_prepares)?;
-        Ok((scan, file_len))
+        let file_len = self.file.metadata()?.len();
+        let (scan, _) = scan_wal_file_region_seeded(
+            &mut self.file,
+            self.start_offset,
+            file_len,
+            base_revision,
+            first_lsn,
+            seeded_prepares,
+        )?;
+        Ok((scan, file_len - self.start_offset))
+    }
+
+    pub(crate) fn open_region_recovered(
+        mut region: WalRegionRecovery<'_>,
+    ) -> Result<(Self, RecoveryScan), DurabilityError> {
+        let (scan, freshness_hasher) = scan_wal_file_region_seeded(
+            &mut region.file,
+            region.start_offset,
+            region.end_offset,
+            region.base_revision,
+            region.first_lsn,
+            region.seeded_prepares,
+        )?;
+        let logical_good =
+            u64::try_from(scan.last_good_offset()).map_err(|_| CodecError::LengthOverflow)?;
+        let good_end = region
+            .start_offset
+            .checked_add(logical_good)
+            .ok_or(CodecError::LengthOverflow)?;
+        if region.writable && good_end < region.end_offset {
+            region.file.set_len(good_end)?;
+            region.file.sync_all()?;
+        }
+        region.file.seek(SeekFrom::Start(good_end))?;
+        Ok((
+            Self {
+                path: region.path,
+                file: region.file,
+                start_offset: region.start_offset,
+                next_lsn: scan.next_lsn(),
+                freshness_hasher,
+                poisoned: false,
+            },
+            scan,
+        ))
     }
 
     fn append_frame(
@@ -180,6 +271,17 @@ impl FileRevisionWal {
         Ok(())
     }
 
+    pub(crate) fn append_replication_authority_frame(
+        &mut self,
+        encoded_replication_frame: &[u8],
+    ) -> Result<(), DurabilityError> {
+        self.append_frame(
+            RecordKind::ReplicationAuthority,
+            RevisionId::new(0),
+            encoded_replication_frame,
+        )?;
+        Ok(())
+    }
     fn barrier(&mut self) -> Result<(), DurabilityError> {
         if self.poisoned {
             return Err(DurabilityError::Poisoned);

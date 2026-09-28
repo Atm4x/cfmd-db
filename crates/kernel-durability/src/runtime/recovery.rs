@@ -22,6 +22,13 @@ pub enum TailStatus {
     Garbage { offset: usize },
 }
 
+#[derive(Debug)]
+pub(crate) struct RecoveredAuthorityState {
+    pub committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+    pub unresolved_prepares: Vec<(u64, DurableRevisionDescriptor, u32)>,
+    pub replication_authority_frames: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryScan {
     base_revision: RevisionId,
@@ -31,6 +38,7 @@ pub struct RecoveryScan {
     tail_status: TailStatus,
     committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
     unresolved_prepares: Vec<(u64, DurableRevisionDescriptor, u32)>,
+    replication_authority_frames: Vec<Vec<u8>>,
 }
 
 impl RecoveryScan {
@@ -40,8 +48,7 @@ impl RecoveryScan {
         last_good_offset: usize,
         next_lsn: u64,
         tail_status: TailStatus,
-        committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
-        unresolved_prepares: Vec<(u64, DurableRevisionDescriptor, u32)>,
+        authority: RecoveredAuthorityState,
     ) -> Self {
         Self {
             base_revision,
@@ -49,8 +56,9 @@ impl RecoveryScan {
             last_good_offset,
             next_lsn,
             tail_status,
-            committed_transactions,
-            unresolved_prepares,
+            committed_transactions: authority.committed_transactions,
+            unresolved_prepares: authority.unresolved_prepares,
+            replication_authority_frames: authority.replication_authority_frames,
         }
     }
 
@@ -128,6 +136,10 @@ impl RecoveryScan {
 
     pub(crate) fn unresolved_prepares(&self) -> &[(u64, DurableRevisionDescriptor, u32)] {
         &self.unresolved_prepares
+    }
+
+    pub(crate) fn replication_authority_frames(&self) -> &[Vec<u8>] {
+        &self.replication_authority_frames
     }
 
     #[must_use]

@@ -3,9 +3,9 @@ use kernel_types::{ClientTransactionId, RevisionId, SemanticRevision};
 
 use crate::checkpoint;
 use crate::domain::{
-    DurableMigrationComplement, DurableRelationMutation, DurableRelationResolution,
-    DurableRelationRewriteIntent, DurableRevisionChange, DurableTransactionIntent,
-    IdempotencyEpoch,
+    DurableMigrationComplement, DurableModelDelta, DurableRelationMutation,
+    DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
+    DurableTransactionIntent, IdempotencyEpoch,
 };
 use crate::runtime::{CodecError, DurabilityError};
 
@@ -110,6 +110,40 @@ impl DurableRevisionDescriptor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn mixed_revision(
+        transaction_id: ClientTransactionId,
+        source_revision: RevisionId,
+        target: &kernel_revision::Revision,
+        semantic_revision: SemanticRevision,
+        relation_mutations: Vec<DurableRelationMutation>,
+        model_delta: DurableModelDelta,
+        model_complement: DurableModelDelta,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
+            idempotency_epoch: IdempotencyEpoch::ZERO,
+            revision_effect_id: None,
+            transaction_id,
+            source_revision,
+            target_revision: target.id(),
+            intent: DurableTransactionIntent::mixed_revision(
+                source_revision,
+                target,
+                semantic_revision,
+                relation_mutations.clone(),
+                model_delta.clone(),
+                model_complement,
+                registry,
+            )?,
+            change: DurableRevisionChange::MixedRevision {
+                semantic_revision,
+                relation_mutations,
+                model_delta,
+            },
+        })
+    }
+
     pub fn full_revision(
         transaction_id: ClientTransactionId,
         source_revision: RevisionId,
@@ -202,7 +236,8 @@ impl DurableRevisionDescriptor {
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Option<kernel_revision::Revision>, DurabilityError> {
         match &self.change {
-            DurableRevisionChange::RelationData { .. } => Ok(None),
+            DurableRevisionChange::RelationData { .. }
+            | DurableRevisionChange::MixedRevision { .. } => Ok(None),
             DurableRevisionChange::FullRevision {
                 encoded_target_revision,
             }

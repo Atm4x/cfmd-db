@@ -1,10 +1,7 @@
 use super::checkpoint_storage::write_checkpoint_file;
 use super::file_io::sync_directory;
 use super::freshness::ExternalFreshnessState;
-use super::generation_layout::{
-    checkpoint_path, metadata_path, next_generation, parse_checkpoint_chunk_generation,
-    parse_generation_name, wal_path,
-};
+use super::generation_layout::{checkpoint_path, metadata_path, next_generation, wal_path};
 use super::manifest::{ManifestRecord, publish_manifest_with_hook};
 use super::metadata_storage::write_metadata_file;
 use super::publication_protocol::{
@@ -19,7 +16,6 @@ use crate::metadata;
 use crate::runtime::DurabilityError;
 use crate::wal::FileRevisionWal;
 use kernel_revision::Revision;
-use std::fs;
 
 impl DurableRevisionStore {
     pub fn rotate_checkpoint(
@@ -147,6 +143,14 @@ impl DurableRevisionStore {
         artifact_cores: &[DurableArtifactCore],
         hook: &mut impl StoreFaultHook,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        if self.backend.is_single_file() {
+            return self.rotate_single_file_checkpoint(
+                revision,
+                materialization_specs,
+                physical_artifact_specs,
+                artifact_cores,
+            );
+        }
         let mut publication = PublicationAttempt::default();
         let result = self.rotate_checkpoint_with_hook(
             revision,
@@ -171,11 +175,12 @@ impl DurableRevisionStore {
         hook: &mut impl StoreFaultHook,
         publication: &mut PublicationAttempt,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
-        let generation = next_generation(&self.directory)?;
-        let checkpoint_file = checkpoint_path(&self.directory, generation);
+        let directory = self.backend.directory_root()?.to_path_buf();
+        let generation = next_generation(&directory)?;
+        let checkpoint_file = checkpoint_path(&directory, generation);
         let checkpoint_crc32c = write_checkpoint_file(&checkpoint_file, revision)?;
         hook.hit(StoreFaultPoint::AfterCheckpointSync)?;
-        let wal_file = wal_path(&self.directory, generation);
+        let wal_file = wal_path(&directory, generation);
         let mut wal = FileRevisionWal::create(&wal_file)?;
         wal.durability_barrier()?;
         hook.hit(StoreFaultPoint::AfterWalSync)?;
@@ -203,13 +208,13 @@ impl DurableRevisionStore {
             revision_effects: self.revision_effects.clone(),
             revision_effect_frontiers: self.revision_effect_frontiers.clone(),
         };
-        let metadata_file = metadata_path(&self.directory, generation);
+        let metadata_file = metadata_path(&directory, generation);
         let metadata_crc32c = write_metadata_file(&metadata_file, &metadata_record)?;
         hook.hit(StoreFaultPoint::AfterMetadataSync)?;
-        sync_directory(&self.directory)?;
+        sync_directory(&directory)?;
         hook.hit(StoreFaultPoint::AfterPrerequisiteDirectorySync)?;
         publish_manifest_with_hook(
-            &self.directory,
+            &directory,
             ManifestRecord {
                 generation,
                 base_revision: revision.id(),
@@ -231,18 +236,14 @@ impl DurableRevisionStore {
         self.physical_artifact_specs = physical_artifact_specs;
         self.artifact_cores = artifact_cores.to_vec();
         self.prepared_transactions.clear();
-        if let Some(mut freshness) = self.external_freshness.take() {
-            let result = freshness.advance(&self.directory, generation, 0, freshness_digest);
-            self.external_freshness = Some(freshness);
-            result?;
-        }
+        self.advance_external_freshness_generation_with_digest(generation, 0, freshness_digest)?;
         Ok(DurableGenerationReceipt {
             generation,
             base_revision: revision.id(),
         })
     }
 
-    pub fn compact_obsolete_generations(&self) -> Result<(), DurabilityError> {
+    pub fn compact_obsolete_generations(&mut self) -> Result<(), DurabilityError> {
         if self.poisoned {
             return Err(DurabilityError::Poisoned);
         }
@@ -256,31 +257,22 @@ impl DurableRevisionStore {
     }
 
     fn compact_obsolete_generations_with_hook(
-        &self,
+        &mut self,
         hook: &mut impl StoreFaultHook,
     ) -> Result<(), DurabilityError> {
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let generation = parse_generation_name(name, "manifest-", ".cfmf")
-                .or_else(|| parse_generation_name(name, "checkpoint-", ".cfcp"))
-                .or_else(|| parse_generation_name(name, "wal-", ".cfmw"))
-                .or_else(|| parse_generation_name(name, "metadata-", ".cfdm"))
-                .or_else(|| parse_generation_name(name, "prepared-", ".cfpc"))
-                .or_else(|| parse_checkpoint_chunk_generation(name));
-            let is_pending = parse_generation_name(name, "pending-manifest-", ".tmp").is_some();
-            if is_pending || generation.is_some_and(|generation| generation != self.generation) {
-                hook.hit(StoreFaultPoint::BeforeCompactionRemove)?;
-                fs::remove_file(entry.path())?;
-                hook.hit(StoreFaultPoint::AfterCompactionRemove)?;
-            }
+        if !self.backend.capabilities().physical_compaction {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "durability backend does not support physical compaction",
+            });
         }
-        sync_directory(&self.directory)?;
-        hook.hit(StoreFaultPoint::AfterCompactionDirectorySync)?;
-        Ok(())
+        self.backend.compact_obsolete_generations(
+            &mut self.wal,
+            self.generation,
+            self.checkpoint.id(),
+            self.durable_head,
+            hook,
+        )
     }
 }
 
@@ -304,7 +296,7 @@ impl DurableRevisionStore {
     }
 
     pub(super) fn test_compact_obsolete_generations_with_hook(
-        &self,
+        &mut self,
         hook: &mut impl StoreFaultHook,
     ) -> Result<(), DurabilityError> {
         self.compact_obsolete_generations_with_hook(hook)

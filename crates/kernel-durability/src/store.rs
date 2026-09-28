@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::fs::File;
 #[cfg(test)]
 use std::fs::OpenOptions;
@@ -8,6 +9,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 #[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -54,8 +56,7 @@ pub struct StreamingCheckpointProgress {
 
 #[derive(Debug)]
 pub struct DurableRevisionStore {
-    directory: PathBuf,
-    _directory_lock: File,
+    backend: backend::DurabilityBackend,
     generation: u64,
     checkpoint: Revision,
     durable_head: RevisionId,
@@ -80,6 +81,7 @@ pub struct DurableRevisionStore {
     poisoned: bool,
 }
 
+mod backend;
 mod bootstrap;
 mod causal_ledger;
 mod checkpoint_publication;
@@ -102,6 +104,7 @@ mod recovery;
 mod replication_facade;
 mod retry_history;
 mod semantic_deployment;
+mod single_file_backend;
 mod streaming_checkpoint;
 mod transition;
 

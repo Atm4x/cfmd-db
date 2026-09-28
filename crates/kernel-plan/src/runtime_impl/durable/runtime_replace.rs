@@ -30,7 +30,10 @@ impl DurableRuntime {
         };
         self.cell
             .commit_full_revision_durable(transaction_id, &authorized_request, &mut *durability)
-            .map(DurableRuntimeCommitOutcome::Committed)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
     }
 
     /// Atomically publishes one validated full revision and the complement
@@ -78,7 +81,10 @@ impl DurableRuntime {
                 migration_complement,
                 &mut *durability,
             )
-            .map(DurableRuntimeCommitOutcome::Committed)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
     }
 
     pub fn replace_revision_and_materializations(
@@ -132,7 +138,10 @@ impl DurableRuntime {
                 &authorized_request,
                 &mut *durability,
             )
-            .map(DurableRuntimeCommitOutcome::Committed)
+            .map(|receipt| {
+                self.signal_revision_publication();
+                DurableRuntimeCommitOutcome::Committed(receipt)
+            })
     }
 
     pub fn reconfigure_materializations(

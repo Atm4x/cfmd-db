@@ -9,13 +9,15 @@ use kernel_change::{
     RevisionEffectResidualSquareChainCertificate, RevisionEffectResidualSquareLayerCertificate,
     RewriteLawSetId, RewriteResidualCubeCertificate, RewriteSpecId,
 };
+pub use kernel_durability::DurableModelDelta;
 use kernel_durability::{
-    DurabilityError, DurableArtifactCore, DurableCommitReceipt, DurableGenerationReceipt,
-    DurableMaterializationSpec, DurableMigrationComplement, DurablePhysicalArtifactSpec,
-    DurableRelationLayoutKind, DurableRelationMutation, DurableRelationResolution,
-    DurableRelationRewriteIntent, DurableRevisionChange, DurableRevisionDescriptor,
-    DurableRevisionStore, DurableSemanticKeyPart, DurableTransactionIntent,
-    DurableTransactionOutcome, IdempotencyEpoch, RecoveryScan, RevisionDurability,
+    DurabilityError, DurableArtifactCore, DurableCommitReceipt, DurableEffectKind,
+    DurableGenerationReceipt, DurableMaterializationSpec, DurableMigrationComplement,
+    DurablePhysicalArtifactSpec, DurableRelationLayoutKind, DurableRelationMutation,
+    DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
+    DurableRevisionDescriptor, DurableRevisionEffectRecord, DurableRevisionStore,
+    DurableSemanticKeyPart, DurableTransactionIntent, DurableTransactionOutcome, IdempotencyEpoch,
+    RecoveryScan, RevisionDurability,
 };
 use kernel_identity::{DenseEntityIds, LocalEntityId};
 use kernel_model::Value;
@@ -76,15 +78,22 @@ pub use runtime_impl::{
     DurableMaterializationConfigOutcome, DurableRuntime, DurableRuntimeCheckpointError,
     DurableRuntimeCommitError, DurableRuntimeCommitOutcome, DurableRuntimeCommitReceipt,
     DurableRuntimeHistoricalError, DurableRuntimeSupervisor, FullRevisionTransitionRequest,
+    InProcessRevisionPublicationNotifier, MixedRevisionTransitionRequest,
     PreparedCoherentResolutionTransition, PreparedRuntimeRevisionTransition,
     RepairCandidateProvider, RepairSearchOutcome, RepairSearchPolicy, RepairSearchReport,
     RevisionAndMaterializationsTransitionRequest, RevisionCommitChange, RevisionCommitDescriptor,
     RevisionRelationMutation, RevisionRelationRewrite, RevisionRewriteTransitionRequest,
-    RevisionTransitionRequest, RuntimeInvariantClosureCertificate, RuntimeMaterializationSpec,
-    RuntimeObservationGuard, RuntimePublicationEffect, RuntimeRecoveryError,
-    RuntimeRepairCandidate, RuntimeRepairObservationTransport, RuntimeRepairRelationMutation,
-    RuntimeRevisionBundle, RuntimeRevisionCell, RuntimeRevisionSnapshot, RuntimeRewriteIntent,
-    RuntimeRootVersion, RuntimeViolationState, SealedRuntimeRevisionTransition,
+    RevisionTransitionRequest, RuntimeDurabilityBackend, RuntimeHistoricalSnapshotError,
+    RuntimeHistoryCoordinate, RuntimeHistoryEffect, RuntimeHistoryEffectKind,
+    RuntimeHistoryFootprint, RuntimeHistoryRebaseCertificate, RuntimeHistoryRebaseConflict,
+    RuntimeHistoryRebaseOutcome, RuntimeHistoryRelationMutation, RuntimeHistoryReversibility,
+    RuntimeInvariantClosureCertificate, RuntimeMaterializationSpec, RuntimeObservationGuard,
+    RuntimePublicationEffect, RuntimeRecoveryError, RuntimeRepairCandidate,
+    RuntimeRepairObservationTransport, RuntimeRepairRelationMutation, RuntimeRevisionBundle,
+    RuntimeRevisionCell, RuntimeRevisionDerivationError, RuntimeRevisionPublicationNotifier,
+    RuntimeRevisionPublicationWaitHandle, RuntimeRevisionPublicationWaitOutcome,
+    RuntimeRevisionSnapshot, RuntimeRewriteIntent, RuntimeRootVersion, RuntimeViolationState,
+    SealedRuntimeRevisionTransition,
 };
 
 mod recovery;
