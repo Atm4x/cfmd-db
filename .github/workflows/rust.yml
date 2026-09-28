@@ -42,6 +42,11 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
           rustup override set 1.98.1
+      - name: Allow user namespaces on CI runner
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Check Linux namespace support
         run: |
           if ! /usr/bin/unshare --user --map-root-user --mount --pid --fork --kill-child --net --ipc --uts --propagation private /bin/true; then

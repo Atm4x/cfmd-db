@@ -3,7 +3,7 @@
 dc55f4a8a35342ff8fea942aedeb9033ace8223ad148e28527222264075b0d29  ./.gitattributes
 f301333cf7734ca85a679d8948063b18ba174f2768a7bf30fa95ed2a1a8c425d  ./.github/pull_request_template.md
 3cb19cd7f3c7c6065976dde935fa63d01c7af82062716eacc9c1264517c25a2e  ./.github/workflows/lean.yml
-da9aac611b8f3b80c51a8e4f0f3e15dab34a18391fc9700e9a19ddc0b952102a  ./.github/workflows/rust.yml
+c040c207ba7dea92b5f168ad522ff0ae465801b31810f12987ed55fce3e8c77c  ./.github/workflows/rust.yml
 a9866414fb50193fc9f7c4af8b0898508db6fabd3c9c935c4f10144aa24367a8  ./.gitignore
 17db72af0251b41bbdec465cea66dcc9e4382aaee0406b4b61bc17587b671927  ./CHANGELOG.md
 2eec174c7994184800b57bb8921ccb1302e48caa5b564282368121dbdf02704d  ./CONTRIBUTING.md
