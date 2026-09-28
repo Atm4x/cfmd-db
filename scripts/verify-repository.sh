@@ -86,6 +86,32 @@ if failures:
     raise SystemExit(1)
 PY
 
+python3 - <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+tracked = {
+    path.decode('utf-8')
+    for path in subprocess.check_output(['git', 'ls-files', '-z']).split(b'\0')
+    if path
+}
+tracked.discard('REPOSITORY_MANIFEST.sha256')
+manifest = {
+    line.split('  ./', 1)[1]
+    for line in Path('REPOSITORY_MANIFEST.sha256').read_text(encoding='utf-8').splitlines()
+    if '  ./' in line
+}
+unlisted = sorted(tracked - manifest)
+untracked = sorted(manifest - tracked)
+if unlisted or untracked:
+    for path in unlisted:
+        print(f'tracked file absent from repository manifest: {path}', file=sys.stderr)
+    for path in untracked:
+        print(f'repository manifest target absent from Git: {path}', file=sys.stderr)
+    raise SystemExit(1)
+PY
+
 # Snapshot manifest is deliberately repository-wide. Keeping it verified makes
 # incomplete GitHub uploads fail at the repository gate rather than later in CI.
 sha256sum -c --quiet REPOSITORY_MANIFEST.sha256
