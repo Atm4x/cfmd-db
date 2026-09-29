@@ -1,19 +1,22 @@
 # Workspace Crate Map
 
-Workspace crates: **30**.
+Workspace crates: **34**.
 
-This map includes 27 internal kernel/infrastructure crates plus the product/hosting stack `cfmd-runtime`, `cfmd-protocol`, and `cfmd-host`. Kernel crates remain implementation details.
+This map includes 28 internal kernel/infrastructure crates plus public SDK crates `cfmd`/`cfmd-derive` and the product/hosting stack `cfmd-runtime`, `cfmd-protocol`, `cfmd-host`, and `cfmd-transport-local`. Kernel crates remain implementation details.
 
 | crate | internal workspace dependencies |
 |---|---|
+| `cfmd` | `cfmd-derive`, `cfmd-runtime` |
+| `cfmd-derive` | — |
 | `cfmd-host` | `cfmd-protocol`, `cfmd-runtime` |
 | `cfmd-protocol` | `cfmd-runtime` |
-| `cfmd-runtime` | `kernel-model`, `kernel-plan`, `kernel-query`, `kernel-types` |
+| `cfmd-runtime` | `kernel-model`, `kernel-plan`, `kernel-query`, `kernel-revision`, `kernel-schema`, `kernel-semantics`, `kernel-types` |
+| `cfmd-secure-memory` | — |
 | `kernel-aggregate` | `kernel-exact` |
 | `kernel-auth` | `kernel-semantics` |
 | `kernel-change` | `kernel-types` |
 | `kernel-deployment` | `kernel-auth`, `kernel-semantics` |
-| `kernel-durability` | `kernel-auth`, `kernel-change`, `kernel-lens`, `kernel-model`, `kernel-query`, `kernel-revision`, `kernel-schema`, `kernel-semantics`, `kernel-types` |
+| `kernel-durability` | `cfmd-secure-memory`, `kernel-auth`, `kernel-change`, `kernel-lens`, `kernel-model`, `kernel-query`, `kernel-revision`, `kernel-schema`, `kernel-semantics`, `kernel-types` |
 | `kernel-exact` | — |
 | `kernel-fixpoint` | `kernel-exact`, `kernel-grounded-closure`, `kernel-proof`, `kernel-types` |
 | `kernel-grounded-closure` | `kernel-persistent` |
@@ -40,14 +43,17 @@ This map includes 27 internal kernel/infrastructure crates plus the product/host
 ## Dependency edges
 
 ```text
+cfmd -> cfmd-derive, cfmd-runtime
+cfmd-derive -> (proc-macro tooling only)
 cfmd-host -> cfmd-protocol, cfmd-runtime
 cfmd-protocol -> cfmd-runtime
-cfmd-runtime -> kernel-model, kernel-plan, kernel-query, kernel-types
+cfmd-runtime -> kernel-model, kernel-plan, kernel-query, kernel-revision, kernel-schema, kernel-semantics, kernel-types
+cfmd-secure-memory -> (platform memory primitives only)
 kernel-aggregate -> kernel-exact
 kernel-auth -> kernel-semantics
 kernel-change -> kernel-types
 kernel-deployment -> kernel-auth, kernel-semantics
-kernel-durability -> kernel-auth, kernel-change, kernel-lens, kernel-model, kernel-query, kernel-revision, kernel-schema, kernel-semantics, kernel-types
+kernel-durability -> cfmd-secure-memory, kernel-auth, kernel-change, kernel-lens, kernel-model, kernel-query, kernel-revision, kernel-schema, kernel-semantics, kernel-types
 kernel-fixpoint -> kernel-exact, kernel-grounded-closure, kernel-proof, kernel-types
 kernel-grounded-closure -> kernel-persistent
 kernel-identity -> kernel-types
@@ -69,4 +75,4 @@ storage-memory -> kernel-identity, kernel-lifecycle, kernel-model, kernel-query,
 
 ## Status
 
-The Pass280 global kernel hostile/refactor campaign is frozen. Pass281 adds `cfmd-runtime` above that graph. This map describes implementation dependencies; audit status is maintained separately in [`../status/KERNEL_HOSTILE_LEDGER.md`](../status/KERNEL_HOSTILE_LEDGER.md).
+The Pass280 global kernel hostile/refactor campaign is frozen. Pass281 adds `cfmd-runtime` above that graph; Pass337 adds public `cfmd` above the runtime boundary; Pass338 adds the compile-time `cfmd-derive` SDK generator without changing runtime semantics. This map describes implementation dependencies; audit status is maintained separately in [`../status/KERNEL_HOSTILE_LEDGER.md`](../status/KERNEL_HOSTILE_LEDGER.md).

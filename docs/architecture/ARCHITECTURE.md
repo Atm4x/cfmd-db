@@ -5,6 +5,8 @@
 ```text
 Rust applications         Python / .NET / Studio
        |                         |
+      cfmd                       |
+       |                         |
        +-----------+-------------+
                    |
               cfmd-runtime
@@ -34,9 +36,9 @@ The Pass280 kernel graph is frozen for the declared scope. Pass281 introduces `c
 
 ## Current public/product owner
 
-`crates/cfmd-runtime` currently provides the complete Rust-first product foundation: create/open, immutable current and historical `ReadContext` worlds, typed object/relation query surfaces, `Plan -> Candidate -> commit`, durable history/undo/rebase, and exact maintained `watch()` with provider-neutral wake delivery, cancellation and causal catch-up status. Internal kernel ownership/layout remains hidden.
+`crates/cfmd` is the user-facing Rust application crate. `crates/cfmd-runtime` remains the universal runtime/binding anti-corruption layer and provides the complete Rust-first semantic foundation: create/open, immutable current and historical `ReadContext` worlds, typed object/relation query surfaces, `Plan -> Candidate -> commit`, durable history/undo/rebase, and exact maintained `watch()` with provider-neutral wake delivery, cancellation and causal catch-up status. Internal kernel ownership/layout remains hidden.
 
-Hosted protocol/authentication/authorization/transports and language/UI adapters are next-stage compositions above this runtime; they do not redefine database semantics.
+The `cfmd` crate intentionally keeps object-first application vocabulary at the root and places relation/value/query primitives under `cfmd::dynamic`. Hosted protocol/authentication/authorization/transports and language/UI adapters are compositions above `cfmd-runtime`; they do not redefine database semantics.
 
 ## Internal architecture
 
@@ -73,3 +75,22 @@ DurableRevisionStore
 ```
 
 The backend owns physical roots/locks/container state and declares physical capabilities; it does not decide whether a transaction commits or what Revision is authoritative. Replication frame persistence is delegated to the backend while the replication state machine remains common. New layouts must implement this boundary rather than add optional layout fields to `DurableRevisionStore`.
+
+## Single-file encrypted generation writer after Pass319
+
+The single-file backend no longer stages whole encrypted sections before publication. Generation layout is planned from plaintext lengths and fixed AEAD overhead, then written in one forward physical pass:
+
+```text
+generation header
+  -> page padding
+  -> section 0 payload (64 KiB AEAD chunks when encrypted)
+  -> alignment
+  -> ...
+  -> section N payload
+  -> descriptor-table footer
+  -> final page padding
+```
+
+Section ciphertext digests are accumulated while each final byte is written. The descriptor table is therefore a footer, not a prefix requiring ciphertext materialization. The generation SHA-256 is accumulated over the exact physical byte stream during publication; no post-write whole-generation reread is required. Root authority remains unchanged and is published only after the complete generation is synced.
+
+This closes payload-proportional *additional* encryption memory in the physical writer. Higher codecs may still own caller-side plaintext buffers (for example checkpoint/metadata encoding); eliminating those buffers is a separate upstream streaming-codec concern rather than a reason to reintroduce ciphertext staging.

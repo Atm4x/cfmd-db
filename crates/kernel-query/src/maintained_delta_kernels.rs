@@ -5,6 +5,14 @@ use super::{
 };
 use crate::MaintainedDelta;
 
+#[derive(Clone, Copy)]
+pub(super) struct OrderFilterSpec<'a> {
+    pub(super) column: usize,
+    pub(super) value: &'a Value,
+    pub(super) ordering: kernel_types::SemanticId,
+    pub(super) comparison: crate::OrderComparison,
+}
+
 pub(super) fn filter_delta_view(
     input_delta: &impl ExactDeltaView<Row>,
     input_type: &RelType,
@@ -40,6 +48,59 @@ pub(super) fn filter_delta_view(
         match registry.equivalent(context, equivalence, candidate, value) {
             Ok(true) => output.push_exact(weight.clone(), row.clone()),
             Ok(false) => {}
+            Err(cause) => error = Some(cause.into()),
+        }
+    });
+    error.map_or(Ok(output), Err)
+}
+
+pub(super) fn filter_order_delta_view(
+    input_delta: &impl ExactDeltaView<Row>,
+    input_type: &RelType,
+    spec: OrderFilterSpec<'_>,
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<MaintainedDelta, RelQueryError> {
+    let column_type = input_type
+        .columns
+        .get(spec.column)
+        .ok_or(RelQueryError::ColumnOutOfBounds)?;
+    let ordering_domain = registry.ordering_domain(context, spec.ordering)?;
+    let expected = kernel_semantics::domain_for_type(column_type)
+        .map(kernel_semantics::OrderingDomain::from)
+        .ok_or(RelQueryError::TypeMismatch)?;
+    if ordering_domain != expected {
+        return Err(RelQueryError::TypeMismatch);
+    }
+    let equivalence = relation_column_equivalence(input_type, spec.column)?;
+    if !registry.ordering_congruent_with_equivalence(context, spec.ordering, equivalence)? {
+        return Err(RelQueryError::OrderingNotCongruentWithEquality);
+    }
+    if !value_shape_matches_type(spec.value, column_type) {
+        return Err(RelQueryError::TypeMismatch);
+    }
+    let mut output = MaintainedDelta::default();
+    let mut error = None;
+    input_delta.visit_exact(|weight, row| {
+        if weight.is_zero() || error.is_some() {
+            return;
+        }
+        let Some(candidate) = row.get(spec.column) else {
+            error = Some(RelQueryError::ColumnOutOfBounds);
+            return;
+        };
+        match registry.compare(context, spec.ordering, candidate, spec.value) {
+            Ok(order) => {
+                let passes = match spec.comparison {
+                    crate::OrderComparison::Less => order.is_lt(),
+                    crate::OrderComparison::LessOrEqual => order.is_le(),
+                    crate::OrderComparison::Greater => order.is_gt(),
+                    crate::OrderComparison::GreaterOrEqual => order.is_ge(),
+                };
+                if passes {
+                    output.push_exact(weight.clone(), row.clone());
+                }
+            }
             Err(cause) => error = Some(cause.into()),
         }
     });

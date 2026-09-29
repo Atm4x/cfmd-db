@@ -8,25 +8,21 @@ The historical kernel backlog (#1–#22) is closed for the declared support scop
 
 `FROZEN` does not mean “bug-free forever”. It means kernel cleanup is no longer continued by inertia: reopen a frozen area only for a concrete correctness counterexample, proof/authority seam, measured complexity/performance regression, new R&D requirement, or public API/DX requirement.
 
-The active project phase is now **productization through a universal Rust runtime facade**. Pass281 introduced `cfmd-runtime`; the product line now includes object-first typed Rust DX, Plan/Candidate preview, durable history with exact mixed undo/redo, historical worlds through `db.at(revision)`, certified non-head undo/rebase, exact query-result watch, provider-neutral wake delivery, deterministic watch lifecycle/catch-up, and P299 hosted session/permission authority, P300 transport-neutral hosted protocol ingress, P301 exact hosted watch subscriptions, and P302 canonical transport-neutral wire framing/negotiation, P303 hosted server composition, P304 dynamic hosted security lifecycle, and P313 unified database construction/opening with parity-complete single-file storage as the default new-store path. Python/.NET/Studio will bind to this stable Rust product boundary rather than calling `kernel-*` crates directly.
+The active project phase is now **productization through a public Rust application facade over the universal runtime boundary**. Pass281 introduced `cfmd-runtime`; Pass337 adds the user-facing `cfmd` crate; the product line now includes object-first typed Rust DX, Plan/Candidate preview, durable history with exact mixed undo/redo, historical worlds through `db.at(revision)`, certified non-head undo/rebase, exact query-result watch, provider-neutral wake delivery, deterministic watch lifecycle/catch-up, and P299 hosted session/permission authority, P300 transport-neutral hosted protocol ingress, P301 exact hosted watch subscriptions, and P302 canonical transport-neutral wire framing/negotiation, P303 hosted server composition, P304 dynamic hosted security lifecycle, and P313 unified database construction/opening with parity-complete single-file storage as the default new-store path. Rust applications depend on `cfmd`; Python/.NET/Studio bind to the stable runtime protocol. None call `kernel-*` crates directly.
 
 ## Product direction
 
-The implementation order is Rust-runtime first. The low-level universal Rust surface already supports create/open/query/plan/commit without importing kernel crates:
+The implementation order is Rust-first. Rust applications depend on the public `cfmd` crate; `cfmd-runtime` remains the universal runtime/binding anti-corruption layer below it. The normal Rust path is object-first:
 
 ```rust
-let schema = Schema::builder()
-    .equivalence(eq, PrimitiveEquivalence::I64Exact)
-    .relation(RelationSchema::bag(events, [Type::i64()], [eq]))
-    .build()?;
+use cfmd::prelude::*;
 
-let db = Database::builder("app.cfmd")
-    .schema(schema)
-    .create()?;
-let rows = db.snapshot()?.execute(&Query::scan(events))?;
+let schema = Schema::builder().object::<Todo>().build()?;
+let db = Database::builder("app.cfmd").schema(schema).create()?;
+let todos = db.snapshot()?.objects::<Todo>()?;
 ```
 
-Object-first Rust DX is layered over this stable IR rather than replacing it. P284 lets a domain object declare a stable textual key and Rust fields once, derive relation/equality metadata deterministically, query through generated symbolic field accessors, and produce `Plan` values directly from insert/update/delete operations. The relation-first API remains the universal dynamic/tooling escape hatch.
+Object-first Rust DX uses stable textual domain keys and symbolic field/reference accessors. The relation/value/query IR remains available explicitly through `cfmd::dynamic` for generated bindings, tooling and genuinely dynamic applications; it is not the default application vocabulary.
 
 Typed/generated Rust DX will be layered over this stable IR rather than replacing it. The intended higher-level application experience remains familiar lazy querying over deep domain paths, with CFMD-specific capabilities around the query:
 
@@ -54,6 +50,8 @@ The facade rules are stricter than a conventional ORM:
 - Plans/Candidates/history use the same authoritative transition pipeline;
 - one authoritative runtime owns writes; external Studio/tooling attaches to it rather than editing files independently.
 
+Public Rust API compatibility/provenance policy: [`docs/api/PUBLIC_RUST_API_COMPATIBILITY.md`](docs/api/PUBLIC_RUST_API_COMPATIBILITY.md).
+
 See [`docs/api/PRODUCT_ROADMAP.md`](docs/api/PRODUCT_ROADMAP.md) and the retained design source [`docs/api/CFMD_PYTHON_FACADE_THEORY.md`](docs/api/CFMD_PYTHON_FACADE_THEORY.md).
 
 ## Documentation map
@@ -62,6 +60,7 @@ See [`docs/api/PRODUCT_ROADMAP.md`](docs/api/PRODUCT_ROADMAP.md) and the retaine
 - [`docs/spec/CFMD_CORE_SPEC.md`](docs/spec/CFMD_CORE_SPEC.md) — full normative core specification and append-only implementation record;
 - [`docs/status/PROJECT_STATUS.md`](docs/status/PROJECT_STATUS.md) — current phase and release boundary;
 - [`docs/status/KERNEL_HOSTILE_LEDGER.md`](docs/status/KERNEL_HOSTILE_LEDGER.md) — current kernel audit/freeze inventory;
+- [`docs/status/PRODUCTIZATION_LEDGER.md`](docs/status/PRODUCTIZATION_LEDGER.md) — active public-product closure ledger;
 - [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) — current runtime/product layering;
 - [`docs/architecture/CRATE_MAP.md`](docs/architecture/CRATE_MAP.md) — internal workspace crate graph;
 - [`docs/api/RUST_API_ROADMAP.md`](docs/api/RUST_API_ROADMAP.md) — primary Rust product/runtime roadmap;
@@ -102,7 +101,7 @@ The repository verifier checks required project files, the repository manifest, 
 ## Layout
 
 ```text
-crates/                 30 Rust workspace crates (27 internal kernels/infrastructure + `cfmd-runtime` + `cfmd-protocol` + `cfmd-host`)
+crates/                 34 Rust workspace crates (28 internal kernels/infrastructure + public `cfmd`/`cfmd-derive` SDK + runtime/protocol/host/transport stack)
 formal/lean/            Lean proofs + source-refinement binders
 vendor/                 vendored Rust dependency closure
 artifacts/              retained diagnostics/evidence/certification records
@@ -134,7 +133,7 @@ Workspace crates declare `MIT OR Apache-2.0`. See `LICENSE-MIT` and `LICENSE-APA
 
 ## Object-first entity references (Pass285)
 
-The Rust product layer now distinguishes value objects from identity-bearing entities. `cfmd_entity!` declares a typed `Id<T>` and strong `Ref<T>` fields. Materialized references are inert Rust values and never perform hidden I/O. Deep traversal exists only in symbolic query construction and lowers to the existing relation/Γ query IR. Strong references are validated against the final composed `Plan` state, and entity identities are unique within their object relation.
+The Rust product layer distinguishes value objects from identity-bearing entities. The normal P338 surface is `#[derive(CfmdEntity)]` with a stable `#[cfmd(key = "...")]` and explicit typed `#[cfmd(id)] Id<T>`; the older `cfmd_entity!` macro remains a transparent compatibility/advanced declaration path. `Ref<T>` fields generate symbolic deep-path accessors. Materialized references are inert Rust values and never perform hidden I/O; traversal lowers to the existing relation/Γ query IR. Strong references are validated against the final composed `Plan` state, and entity identities are unique within their object relation.
 
 ```rust
 let people = snapshot.objects::<Person>()?;
@@ -145,11 +144,18 @@ let russian = people.where_(|person| {
 });
 ```
 
-The current `Ref<T>` cardinality is exactly one. Optional references and many-valued reverse/edge paths remain explicit follow-up work; they are not silently flattened.
+`Ref<T>` is required-one, `Option<Ref<T>>` is optional-one, and `Many<T>` is a first-class zero-to-many object relationship value. The object declaration is the public schema authority: `children: Many<Child>` does not require `Child` to carry an artificial backlink. `cfmd-runtime` lowers that object relationship into an internal typed edge relation used by query/Γ execution and lifecycle normalization.
 
-### Rust object cardinality (P286)
+### Rust object cardinality and materialization (P342)
 
-The Rust-first facade supports required `Ref<T>`, optional `Option<Ref<T>>`, and symbolic reverse-many relationships. Many-valued paths are explicit: use `any`, `all`, `none`, or `count().eq(...)`; CFMD never silently flattens a collection path or performs hidden I/O on a materialized object.
+Materialized objects keep `Ref<T>` / `Many<T>` as real Rust fields, but field access itself never performs I/O. A materialized relationship is snapshot-bound and exposes explicit object-first operations: `ref.load()`, `many.all()`, `many.where_(...)`, `many.count()`, `many.one()`, and the lower-level composable `query()`. Normal application code does not name joins, foreign keys, `include`, or internal edge relations.
+
+Relationship selections stay first-class. `many.where_(...)` can `detach_all()` or `move_to(...)` directly; these operations project target identities and mutate edge facts without constructing target Rust objects. `move_ids_to(...)` is fail-closed when an ID is not attached to the source owner. `CandidatePreview::derived()` separates policy/lifecycle consequences (for example orphan deletion) from explicit Plan row mutations.
+
+
+Ordered object predicates are also Γ-native rather than Rust/SQL comparisons. Canonically ordered fields expose `greater_than`, `greater_than_or_equal`, `less_than`, `less_than_or_equal`, and inclusive `between`; object schema generation installs a stable per-field ordering identity and the matching semantic ordering module. The relational IR carries `FilterOrderConst`, query preparation pins/compiles that ordering, and maintained watches filter exact deltas directly. Optional/structural fields receive no ordering API until an explicit structural ordering contract exists.
+
+Detached construction is graph-first. `Many::new([Child { ... }, ...])` is accepted by generated `cfmd_new(...)`; insertion lowers the complete object graph into one `Plan` containing entity rows and internal edge facts. On update, a bound `Many<T>` returned unchanged means preserve that relationship, while assigning `Many::new(...)` / `Many::empty()` replaces it atomically. Endpoint deletion is lifecycle-safe: internal edge rows carry live endpoint witnesses, so kernel revision normalization removes dangling edge facts without SDK cascade scans.
 
 ### Kernel-backed entity lifecycle (P287)
 
@@ -206,6 +212,8 @@ This is also the hosted-CFMD security boundary: database open/create never start
 Exact watch now has an explicit lifecycle contract. Every watch exposes a cloneable `WatchCancellation`; `close()`/`cancel()` wake a blocked `recv()` without timeout polling and subsequent receive attempts fail with `ErrorKind::WatchClosed`. The kernel wait handle owns only the notifier, not `DurableRuntime`, so a blocked receiver cannot keep the database runtime alive; final runtime drop emits a wake-only shutdown signal and the waiter terminates deterministically.
 
 `WatchStatus` distinguishes `Current`, `Lagging`, `Cancelled`, `RuntimeClosed` and `Unavailable`. Lag is measured as the exact count of committed causal transitions between the watch anchor and current HEAD. A watcher has no in-memory event backlog: it stores one maintained query state plus its anchor and consumes at most one durable `HistoryEffect` per receive. Catch-up is therefore sequential and bounded by the durable history authority rather than by an unbounded RAM queue; if exact causal coverage is unavailable, watch fails closed instead of dropping transitions or recomputing the whole query.
+
+P345 freezes the runtime-neutral readiness/drain boundary. P346/P347 establish race-free standard-library `Waker` registration with no polling, helper thread, executor-owned cursor, or mandatory Tokio dependency. P348 removes the transitional `cfmd-async` wrapper entirely: raw/object/projection watches are directly awaitable through `watch.next().await`, while the same object still exposes blocking `recv()`, nonblocking `try_recv()`, and bounded `drain_ready(max_events)`. Dependency-frontier readiness indexes pending wakers by exact scanned relations, so a relation publication wakes only subscriptions whose maintained dependency frontier intersects the effect; opaque/full/schema signals still broadcast. Output-equivalent causal transitions are quotiented from the public stream instead of producing empty events. Durable causal history and maintained query state remain the sole event authority; Tokio 1.53.1 remains dev-only compatibility coverage.
 
 ### Hosted session/security authority (P299)
 
@@ -301,3 +309,18 @@ Single-file physical compaction is also first-class. The backend relocates the c
 ## Pass313 — unified database product construction
 
 `DatabaseBuilder` is now the canonical product entry point. `Storage::Auto` resolves an existing file as single-file, an existing directory as directory-backed, and a new path as single-file; `Storage::Directory`/`SingleFile` remain explicit overrides. `Database::create/open` are thin sugar over this same builder path rather than separate construction semantics. Publication notification is a builder concern because it belongs to the opened runtime, while authentication/authorization remain hosted-service concerns. `cfmd-host` therefore exposes `DatabaseHostingExt`, allowing `db.host(authenticator, authorizer)` without adding a dependency from `cfmd-runtime` back to hosting.
+
+## Snapshot-bound Rust transactions (Pass351)
+
+Multi-operation writes no longer require application code to manually coordinate an aggregate `Plan`, Candidate and transaction ID:
+
+```rust
+let mut tx = db.transaction(TransactionId::new(42))?;
+let todos = tx.objects::<Todo>()?;
+tx.apply(todos.insert(first)?)?;
+tx.apply(todos.insert(second)?)?;
+let preview = tx.preview()?;
+tx.commit()?;
+```
+
+This is an exact optimistic transaction surface, not SQL-style lock emulation. Every operation is still an ordinary CFMD `Plan` and the transaction only composes plans from its pinned snapshot. Cross-snapshot plans fail `InvalidPlan`; a HEAD that advanced before publication fails `StaleRevision`. There is no hidden retry or rebase fallback.

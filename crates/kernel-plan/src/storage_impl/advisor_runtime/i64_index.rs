@@ -194,6 +194,7 @@ fn collect_i64_join_advice_observations(
     }
     match plan {
         Plan::FilterEqConst { input, .. }
+        | Plan::FilterOrderConst { input, .. }
         | Plan::FilterEqColumns { input, .. }
         | Plan::Project { input, .. }
         | Plan::Distinct { input, .. }

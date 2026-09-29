@@ -2648,7 +2648,7 @@ Open product/backend obligation: current strong-reference metadata is owned by `
 
 ## Pass297 — wake-provider and hosted-ingress boundary
 
-**[VERIFIED]** Exact watch wake-up is no longer coupled to one concrete `Condvar`. `kernel-plan::RuntimeRevisionPublicationNotifier` is a wake-only provider interface and the standard in-process implementation retains the cheap monotone-generation + condition-variable behavior. `cfmd-runtime` owns the public `PublicationNotifier` vocabulary and bridges providers without leaking kernel types.
+**[VERIFIED]** Exact watch wake-up is no longer coupled to one concrete `Condvar`. `kernel-plan::RuntimeRevisionPublicationNotifier` is a wake-only provider interface and the standard in-process implementation retains the cheap monotone-generation + condition-variable behavior. `cfmd-runtime` owns the public `PublicationNotifier` vocabulary and bridges providers without leaking kernel types. P347 strengthens this boundary: executor `Waker` registration is owned by `PublicationNotifier` itself rather than by a bridge-local sidecar, so direct provider liveness/spurious signals wake blocking and async subscribers through one notification authority.
 
 **[AUTHORITY LAW]** Notification is not mutation, history, or writer-resolution authority. A provider may duplicate/coalesce/spuriously emit wakes; a subscriber must recover the authoritative committed transition from Revision + durable causal history. The corresponding Lean model proves finite arbitrary wake repetition preserves authoritative Revision. Runtime E2E independently injects a spurious wake and observes no fabricated watch event.
 
@@ -2682,3 +2682,126 @@ Open product/backend obligation: current strong-reference metadata is owned by `
 **[SECURITY LAW]** Channel binding is explicit authentication evidence (`Bound` or `Unbound`), never an implicit grant. Authorizers may issue expiring grants. Host expiry scheduling is external/event-loop friendly (`next_expiration` + `expire_due`) and requires no polling or hidden server thread; expiration revokes the session and wakes blocking watch work.
 
 **[LIFECYCLE LAW]** Graceful drain rejects new connections but does not revoke already-admitted sessions. Immediate close/revoke is distinct. Security lifecycle transitions preserve authoritative database Revision and do not certify writer commutation/conflicts.
+
+## Pass314 — CFMD AE v1 / AES-256-GCM-SIV storage encryption
+
+**[PRODUCT ENCRYPTION]** The default single-file product path may be created/opened with `DatabaseBuilder::encryption(Encryption::aes256_gcm_siv(key))`. Encryption is a storage concern, not hosted-user authentication. `Database::create/open` remain plaintext sugar unless an encryption policy is explicitly supplied through the builder.
+
+**[PRIMITIVE]** CFMD AE v1 uses AES-256-GCM-SIV (RFC 8452) through the pure-Rust RustCrypto implementation. The format records an algorithm identifier and random per-database salt, never the master key. HKDF-SHA256 derives independent section and WAL keys. Key bytes are held behind zeroizing shared storage and are redacted from `Debug`.
+
+**[PHYSICAL BINDING]** Immutable generation sections authenticate `(generation, section kind, ordinal)` as AEAD associated data. WAL payloads authenticate `(record kind, LSN, revision)` as associated data. Ciphertext envelopes carry a random 96-bit nonce and 128-bit authentication tag; payload CRC/digests remain corruption/local-integrity framing over stored ciphertext, while AEAD is the cryptographic authority over payload contents and physical identity.
+
+**[CRASH LAW]** WAL frames remain independently appendable and recoverable. Torn-tail truncation, exact-frame shadow/carry-forward and single-file compaction preserve ciphertext bytes; recovery decrypts only complete CRC-valid frames and fails closed on AEAD authentication failure. AES-GCM-SIV misuse resistance is defense-in-depth for accidental nonce reuse, not permission to deliberately reuse nonces.
+
+**[ROLLBACK SEPARATION]** AEAD does not make an old complete database snapshot invalid. Whole-file rollback remains the external-freshness obligation already owned by the durability layer. Cryptographic authentication failure is corruption and never authorizes fallback to an older root.
+
+**[CRYPTO AGILITY]** `StorageAeadAlgorithm` is versioned format vocabulary rather than a routing heuristic. AE v1 implements one production primitive, AES-256-GCM-SIV. Future primitives may receive new algorithm identifiers while preserving the same storage-encryption contract; no error-driven primitive fallback is allowed.
+
+**[CURRENT SCOPE]** P314 product encryption is implemented for the default `SingleFile` backend. Supplying encryption with explicit `Storage::Directory` fails closed until the directory backend is given the same codec contract; it never silently creates plaintext storage.
+
+## Pass315 — CFMD AE v1 bounded sections / nonce namespace / key-provider boundary
+
+**[BOUNDED AUTHENTICATED SECTIONS]** New encrypted generation sections are encoded as a versioned `CFSC` chunk stream with fixed 64 KiB plaintext chunks. Each chunk is an independent CFMD AE v1 envelope and its AAD binds `(generation, section kind, ordinal, chunk index, total plaintext length, chunk plaintext length)`. `copy_section_to` authenticates a chunk before releasing that chunk and uses bounded ciphertext/plaintext memory independent of total section length. Pre-release P314 whole-section section envelopes are not retained as a compatibility surface; the chunked layout is the sole current encrypted-section representation and unknown layouts fail closed.
+
+**[NONCE NAMESPACE]** WAL and generation writers no longer call the OS CSPRNG for every AEAD message. A writer obtains an 80-bit random namespace and emits a 16-bit counter in the remaining nonce bits, then obtains a fresh namespace after 65,536 messages. Nonces are therefore exact and unique inside one namespace; cross-namespace collision remains probabilistic and AES-256-GCM-SIV misuse resistance is retained as defense in depth. This is not a replacement for future key-epoch/usage-limit policy.
+
+**[KEY PROVIDER]** `cfmd-runtime` exposes `EncryptionKeyProvider` and `EncryptionKeyOperation::{Create,Open}`. `DatabaseBuilder` resolves provider key material only at the lifecycle boundary, then passes the same typed storage-encryption contract into the kernel. The raw 256-bit key constructor remains the minimal adapter. P315 does not yet claim wrapped random database-master-key/password-KDF lifecycle; that remains a separate key-management obligation.
+
+**[FRESHNESS PARITY]** Low-level single-file create and external-freshness-aware open now accept the same `StorageEncryption` configuration. Freshness preflight opens/authenticates encrypted metadata with the supplied key before deriving external freshness material. There is no plaintext probe/fallback for an encrypted externally anchored store.
+
+
+## Pass316 — wrapped database-master-key lifecycle / crash-safe rewrap
+
+**[WRAPPED DMK]** Provider-backed AES-256-GCM-SIV databases no longer use provider material as the database encryption key. Creation generates a random 256-bit Database Master Key (DMK). The provider supplies a Key Encryption Key (KEK); CFMD derives a dedicated DMK-wrap key with HKDF-SHA256, wraps the DMK with AES-256-GCM-SIV, and persists only wrapped DMK material plus provider identity/epoch. Section/WAL keys continue to derive from the DMK and per-database salt, so KEK rotation does not change data ciphertext.
+
+**[KEY IDENTITY]** `EncryptionKeyProvider` now resolves one atomic `EncryptionProviderKey` snapshot for `Create`, `Open`, or `Rewrap`: KEK bytes, a non-zero 128-bit `EncryptionKeyId`, and a non-zero provider key epoch. Wrapped-key AAD binds database salt, provider key ID, provider key epoch, database key epoch and wrapped-key publication sequence. Wrong KEK bytes or substituted provider/epoch/publication metadata therefore fail authentication.
+
+**[DUAL-SLOT PUBLICATION]** The current pre-release single-file header reserves two independently checksummed wrapped-key slots. A rewrap writes the inactive slot with strictly incremented publication sequence and database key epoch, then durably syncs it. Recovery selects the highest valid sequence; a torn/incomplete new slot leaves the prior valid slot recoverable, while a fully valid newer slot is authoritative and is never error-fallback-routed to the older slot. The data generation/WAL region is not rewritten by rewrap.
+
+**[ROTATION DX]** An opened product database may call `Database::rewrap_encryption(...)`. Provider-backed rotation resolves the new KEK at `EncryptionKeyOperation::Rewrap`, wraps the already-unlocked DMK, publishes the next wrapped-key slot, and returns the new database key epoch. Raw direct-key encryption remains a minimal adapter and is intentionally not advertised as rotatable wrapped-key management. Internal pre-release pass layouts are not retained as an on-disk compatibility promise.
+
+**[ROLLBACK BOUNDARY]** Dual-slot publication closes local torn-write/crash recovery for key metadata. It does not by itself prove anti-rollback against an attacker restoring an older complete header/file image. Provider revocation/epoch policy and the existing external-freshness authority remain the mechanisms that can reject obsolete external key state or whole-file rollback.
+
+## Pass317 — provider key-authority floor / pre-release layout cleanup
+
+**[PRE-RELEASE FORMAT POLICY]** CFMD has not declared a released on-disk compatibility boundary. The P316 header-only `v4` split and its synthetic P314/P315 header compatibility branch were therefore removed. Header/root/generation records use the one current single-file format version. Version markers remain fail-closed format identifiers for future released evolution; they are not a reason to carry R&D-pass migration code today.
+
+**[DATABASE-KEY EPOCH FLOOR]** `EncryptionProviderKey` may carry a non-zero minimum accepted database-key epoch. The provider is queried outside the database file and therefore acts as external key authority. Wrapped-key open rejects an otherwise valid authoritative slot when its database-key epoch is below that floor, before DMK unwrap. This closes complete-header rollback once the external provider has durably advanced its floor, even if the old KEK bytes remain available. The default constructor admits epoch 1 for simple providers; security-sensitive providers can raise the floor with `with_minimum_database_key_epoch(...)`.
+
+**[ROTATION HANDOFF]** `Database::rewrap_encryption(...)` returns the newly published database-key epoch. A provider may durably raise its external floor to that returned epoch after successful rewrap. A requested floor above the epoch being created/rewrapped fails closed; create requires admission of epoch 1. This separates crash-safe in-file dual-slot publication from anti-rollback authority without trusting a minimum epoch stored in attacker-controlled database bytes.
+
+
+## Pass318 — acknowledged provider handoff / recoverable key-authority transition
+
+**[ACKNOWLEDGED HANDOFF]** Provider-backed rewrap is an explicit three-stage authority transition: publish and fsync the successor wrapped-DMK slot; durably acknowledge the resulting database-key epoch through `EncryptionKeyProvider::acknowledge_database_key_epoch(...)`; only then retire the predecessor slot. The acknowledgement binds provider key ID, provider key epoch and database-key epoch. Failure of external acknowledgement is surfaced after local publication and the operation is retryable rather than silently reported as fully committed.
+
+**[PENDING AUTHORITY RECOVERY]** A physically newer wrapped-key slot is not by itself external authority. Open selects the newest admissible slot matching the provider snapshot and its minimum database-key epoch. Therefore a crash after local successor publication but before external acknowledgement can still reopen under the previously acknowledged provider, while the successor provider can adopt the already-durable pending slot. Rewrap retry detects that exact consecutive pending slot and reuses it without publishing a new wrap or incrementing the database-key epoch.
+
+**[CONSECUTIVE TRANSITION LAW]** Recovery may adopt a pending successor only when both wrapped-key publication sequence and database-key epoch are exactly one greater than the currently admitted predecessor. A non-consecutive matching slot is corruption, not a routing hint. This keeps retry/recovery deterministic and prevents hidden jumps in key authority.
+
+**[PREDECESSOR RETIREMENT]** After external acknowledgement succeeds, CFMD zeroes the obsolete wrapped-key slot and durably syncs the header. A crash before retirement is safe because the external minimum database-key epoch already rejects rollback to the predecessor; a crash after retirement leaves only the acknowledged successor. Retirement is idempotent for the acknowledged active epoch and cannot be applied to a different active epoch.
+
+**[FAILURE ORDERING]** The supported ordering is `local successor durable -> external acknowledgement durable -> local predecessor retirement`. Advancing external authority before local successor durability is forbidden because it could make the only recoverable local key inadmissible. Retiring the predecessor before external acknowledgement is forbidden because a crash could strand the database between independent durability domains.
+
+## Pass319 — bounded-memory encrypted generation publication / footer descriptor table
+
+**[STREAMING PUBLICATION]** Generation publication MUST NOT materialize ciphertext for an entire section or generation before file publication. The writer reserves the exact generation extent, emits the fixed generation header, then streams each section directly to its final physical offset. Encrypted sections are sealed one 64 KiB AEAD chunk at a time; the only ciphertext allocation proportional to payload is one bounded chunk envelope. Unencrypted sections are written directly from the caller-provided slice. Section digests and the generation digest are updated while bytes are emitted.
+
+**[FOOTER DESCRIPTORS]** Section descriptors are a footer after all section payloads rather than a prefix that would require ciphertext digests before payload emission. The fixed header records `data_start`, `section_table_offset`, `section_table_len` and `total_len`. Section offsets remain page-aligned and MUST end at or before `section_table_offset`; the descriptor table is emitted only after all section digests are known. The generation tail is padded to the next page before WAL begins.
+
+**[ONE-PASS PHYSICAL DIGEST]** The published generation digest is computed in physical byte order during the same write that creates the generation: header, deterministic zero padding, section bytes, alignment padding, footer descriptor table and final padding. Publication does not reread the generation merely to calculate its digest. Root publication still occurs only after the complete generation has been written and durably synced, so a crash during streamed generation construction leaves only non-authoritative orphan bytes.
+
+**[BOUNDED MEMORY LAW]** Generation publication memory is independent of section payload size. It is bounded by one AEAD chunk envelope plus metadata proportional only to the explicitly bounded section count (`MAX_SECTION_COUNT`). The removed `StoredSection`/whole-section staging path is not a fallback and is not retained as pre-release compatibility code.
+
+## Pass320–Pass323 — end-to-end bounded canonical storage streams
+
+**[CANONICAL STREAM LAW]** Checkpoint and metadata serialization have one canonical grammar shared by buffered, exact-length and streaming sinks. Generation publication consumes `SingleFileSectionSource` values with an exact plaintext length; a byte-slice is only an adapter to that maintained path. Large checkpoint/metadata payloads are not required to exist as one contiguous plaintext or ciphertext allocation.
+
+**[RESUMABLE CHECKPOINT LAW]** Directory resumable checkpointing may use a generation-scoped canonical spool because publication spans multiple calls, but the spool is never recovery authority. It is produced once, consumed monotonically, integrity-bound to the original canonical stream, and deleted/ignored as orphan scratch after failure or recovery. Restarting canonical encoding from byte zero for every chunk is forbidden.
+
+**[BOUNDED RECOVERY LAW]** SingleFile checkpoint/metadata recovery consumes a pull-based `BinarySource`. Plaintext sections use bounded read windows; encrypted sections authenticate each complete CFSC chunk before any bytes from that chunk are exposed to the canonical decoder. The same decoder grammar serves slice and streaming sources; trailing, truncated or unauthenticated bytes fail closed.
+
+**[REPLICATION ARCHIVE COMPOSITION]** Replication-authority rotation is a composite stream, not a concatenated archive buffer. The new generation's replication section is the exact sequence `previous authoritative archive || frozen live-frame prefix`. The previous section is read through an independent bounded snapshot reader and live frames are emitted individually. Streaming-checkpoint cuts freeze the prefix by frame count; frames appended after the cut remain the live suffix and are not duplicated into the checkpoint generation. Whole-archive materialization is not a fallback path.
+
+**[REPLICATION COPY-AMPLIFICATION OPEN OBLIGATION]** Bounded streaming removes archive-sized memory but does not certify asymptotically bounded rotation cost. P323 still rewrites the retained replication-authority prefix into each successor generation because that prefix is current recovery authority. A future compaction/snapshot calculus must prove which replication authority state is sufficient to replace historical frames before this repeated-history cost may be removed; silently dropping frames or error-routing to a generic fallback is forbidden.
+
+## Pass327 — authenticated immutable replication-authority objects
+
+**[IMMUTABLE OBJECT AE DOMAIN]** External immutable durability objects are storage payloads and MUST remain inside CFMD AE v1 whenever database encryption is enabled. AE v1 derives an HKDF-separated `immutable-object` key distinct from section and WAL keys. Error-driven fallback between those domains is forbidden.
+
+**[CFAO AUTHORITY OBJECT]** A replication-authority segment stored outside a generation is wrapped by the versioned `CFAO` object grammar. Its public header binds object kind, canonical plaintext `ReplicationAuthoritySegmentId`, parent segment ID, canonical plaintext length, fixed chunk size and chunk count. Encrypted payload is emitted in bounded 64 KiB independent AE v1 chunks; each chunk AAD contains the complete `CFAO` header plus chunk index and chunk plaintext length. No unauthenticated replication frame bytes may appear outside the encrypted generation/WAL/object boundary of an encrypted database.
+
+**[PLAINTEXT IDENTITY LAW]** `ReplicationAuthoritySegmentId` remains the P325 digest of canonical plaintext segment semantics. AEAD nonce, ciphertext bytes, physical file offset, locator offset and generation number MUST NOT participate in segment identity. Re-encrypting the same canonical segment or relocating its authenticated object therefore preserves logical identity.
+
+**[RELOCATION LAW]** `CFAO` AAD intentionally excludes physical address. Compaction of an already-authenticated immutable authority object is `copy exact stored object bytes -> rebuild physical locator -> publish relocated root`; decrypt/re-encrypt solely for relocation is forbidden. Recovery must authenticate/decrypt the object and then run the existing P325 complete-segment verification before mutating replication authority state.
+
+**[MODE LAW]** Plaintext and encrypted databases share the same object semantics but not an error fallback path. Object encryption mode must agree with the opened database encryption mode; mismatch is corruption/protocol failure. An encrypted database cannot downgrade an unreadable encrypted object to plaintext replay.
+
+**[ACTIVATION BOUNDARY]** P327 defines and verifies the object layer but does not make external segments current SingleFile authority. P323's generation-contained replication archive remains the maintained product representation until linked locator/root publication, crash recovery and segment-aware compaction are activated and verified for both plaintext and encrypted stores.
+
+
+## Pass342 — object-first relationship authority
+
+**[PUBLIC MODEL LAW]** The application object schema is the public authority. `Ref<T>`, `Option<Ref<T>>`, and `Many<T>` are first-class object relationship values. Users are not required to declare foreign keys, joins, `include`, target-side backlinks, or internal relation IDs. `cfmd-runtime` compiles object relationships into relation/Γ structures as an internal lowering.
+
+**[NO HIDDEN I/O LAW]** Materialized relationship values are bound to the exact snapshot that produced their owner, but ordinary Rust field access performs no I/O. Evaluation is explicit through relationship operations such as `Ref::load/query` and `Many::all/load/where_/query/count/one`. The lower-level query remains composable and can batch/optimize relationship traversal without introducing ORM-style lazy-loading/N+1 semantics.
+
+**[GRAPH WRITE LAW]** Detached `Many::new(...)` values are object-graph input. Insertion recursively lowers new target objects plus relationship facts into the same source-bound Plan and commits them atomically. For update, a bound Many value from the source snapshot means preserve the existing relationship; a detached Many value means replace that relationship. Scalar-only rewrites therefore require no relationship boilerplate.
+
+**[EDGE LIFECYCLE LAW]** Internal many-edge relations store historical object identities for query equality and kernel-live endpoint witnesses for lifecycle authority. Kernel revision normalization removes rows whose source or target endpoint is no longer live. Durable mutation descriptors are derived from the exact normalized object target, so implicit lifecycle edge removal and physical relation publication remain the same certified transition rather than a hidden cascade side channel.
+
+## Pass345 — executor-neutral exact-watch readiness/drain boundary
+
+**[ONE WATCH SEMANTICS]** Async integration is an adapter over the existing exact-watch engine. It MUST NOT introduce a second result queue, full-query recomputation path, polling fallback, or executor-owned revision cursor. Durable causal history plus the maintained query differential state remain the only event authority.
+
+**[MULTIPLEXED READINESS LAW]** Every watch has a stable `WatchSubscriptionId`, while every watch created from one live runtime shares the same `WatchReadinessSourceId`. Readiness is wake-only and generation-based. Adapters may therefore deduplicate subscriptions by source and maintain one blocking/native readiness registration per runtime source rather than one blocked worker per watch. Cancellation of an adapter readiness handle is independent from cancellation of the underlying watch subscription.
+
+**[BOUNDED DRAIN LAW]** `drain_ready(max_events)` performs no wait for future publication and advances at most the requested number of already-certified causal transitions. It returns the exact post-drain `WatchStatus`, allowing an adapter to apply an explicit fairness budget while preserving sequential durable catch-up. A zero event budget performs no transition work. Missing exact causal coverage continues to fail closed as unavailable rather than silently resetting or recomputing.
+
+**[EXECUTOR BOUNDARY]** `cfmd-runtime` has no Tokio dependency. P346/P347 add race-free `WatchReadiness::poll_after` standard-library `Waker` registration and hostile validation. P348 makes the watch itself the executor-neutral async surface: `watch.next().await` requires no adapter crate or mode conversion, while blocking `recv`, `try_recv`, and bounded `drain_ready` remain on the same object. Relation dependency frontiers index pending wakers so unrelated relation publication does not wake the task; output-equivalent causal effects emit no empty public event. Tokio is dev-only compatibility coverage. Python asyncio and .NET bindings MUST preserve the same exact readiness/drain authority. Executor/OS-specific adapters are optional optimizations, not semantic layers.
+
+## Productization delta — Pass351
+
+Pass351 adds a snapshot-bound Rust `Transaction` product composer over the existing Plan/Candidate/commit authority. A transaction owns one exact live base view and accepts only mutation Plans from that same database snapshot and authority; stale publication and cross-snapshot composition fail closed. Publication is retryable with the same durable transaction identity and preserves the existing idempotent `AlreadyCommitted` outcome. No second mutation engine, implicit rebase, retry loop, lock model or SQL transaction semantics are introduced.
+
+P351 hostile R&D also fixes the next query-surface direction: ordered predicates are to be expressed as a native Γ-ordering relational primitive, prepared and maintained in `kernel-query`, then surfaced through typed Fields. Generic callback/post-filter fallbacks are explicitly rejected for this path.

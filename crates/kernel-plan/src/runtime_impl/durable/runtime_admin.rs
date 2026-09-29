@@ -1,4 +1,26 @@
 impl DurableRuntime {
+    pub fn rewrap_storage_encryption(
+        &self,
+        next: &kernel_durability::StorageEncryption,
+    ) -> Result<u64, DurabilityError> {
+        let mut durability = self
+            .durability
+            .lock()
+            .map_err(|_| DurabilityError::Poisoned)?;
+        durability.rewrap_single_file_database_master_key(next)
+    }
+
+    pub fn retire_previous_storage_encryption_key(
+        &self,
+        acknowledged_key_epoch: u64,
+    ) -> Result<(), DurabilityError> {
+        let mut durability = self
+            .durability
+            .lock()
+            .map_err(|_| DurabilityError::Poisoned)?;
+        durability.retire_previous_single_file_wrapped_key(acknowledged_key_epoch)
+    }
+
     /// Monotone in-process wake generation for reader-visible Revision publication.
     ///
     /// The generation is deliberately not a state authority: durable history and
@@ -16,11 +38,32 @@ impl DurableRuntime {
     /// subscriber cannot keep the database runtime alive during shutdown.
     #[must_use]
     pub fn revision_publication_wait_handle(&self) -> RuntimeRevisionPublicationWaitHandle {
-        RuntimeRevisionPublicationWaitHandle::new(Arc::clone(&self.revision_publication))
+        RuntimeRevisionPublicationWaitHandle::new(
+            Arc::clone(&self.revision_publication),
+            Box::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn revision_publication_wait_handle_for_relations(
+        &self,
+        dependencies: impl IntoIterator<Item = SemanticId>,
+    ) -> RuntimeRevisionPublicationWaitHandle {
+        let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        RuntimeRevisionPublicationWaitHandle::new(
+            Arc::clone(&self.revision_publication),
+            dependencies.into_boxed_slice(),
+        )
     }
 
     pub(crate) fn signal_revision_publication(&self) {
         self.revision_publication.notify_revision_published();
+    }
+
+    pub(crate) fn signal_relation_publication(&self, relations: &[SemanticId]) {
+        self.revision_publication.notify_relations_published(relations);
     }
 
     /// Reconstructs an exact committed logical revision reachable from the

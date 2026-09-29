@@ -14,6 +14,7 @@ pub struct Plan {
     pub(crate) base_revision: RevisionId,
     pub(crate) mutations: BTreeMap<RelationId, PendingRelationMutation>,
     pub(crate) object_contracts: BTreeMap<RelationId, ObjectContract>,
+    pub(crate) owned_relations: BTreeMap<RelationId, OwnedRelationContract>,
     pub(crate) model_delta: Option<kernel_plan::DurableModelDelta>,
     pub(crate) authority: crate::security::RuntimeAuthority,
 }
@@ -26,6 +27,20 @@ pub(crate) struct ReferenceContract {
     pub(crate) target_relation: RelationId,
     pub(crate) target_identity_column: usize,
     pub(crate) optional: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPolicy {
+    Keep,
+    DeleteIfUnowned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedRelationContract {
+    pub(crate) relation: RelationId,
+    pub(crate) target_relation: RelationId,
+    pub(crate) target_identity_column: usize,
+    pub(crate) orphan_policy: OrphanPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +74,7 @@ impl Plan {
             base_revision,
             mutations: BTreeMap::new(),
             object_contracts: BTreeMap::new(),
+            owned_relations: BTreeMap::new(),
             model_delta: None,
             authority,
         }
@@ -109,8 +125,15 @@ impl Plan {
         self.object_contracts.insert(contract.relation, contract);
     }
 
-    /// Composes two proposed transitions that were built from the exact same database snapshot.
-    pub fn and(mut self, other: Self) -> crate::Result<Self> {
+    pub(crate) fn register_owned_relation(&mut self, contract: OwnedRelationContract) {
+        self.owned_relations.insert(contract.relation, contract);
+    }
+
+    /// Adds another proposed transition built from the exact same database snapshot.
+    ///
+    /// Composition is structural: no hidden retry, rebase, or read of a newer HEAD occurs.
+    /// A plan from any other snapshot fails closed.
+    pub fn extend(&mut self, other: Self) -> crate::Result<&mut Self> {
         if self.database_identity != other.database_identity
             || self.source != other.source
             || self.authority != other.authority
@@ -133,11 +156,20 @@ impl Plan {
         for (relation, contract) in other.object_contracts {
             self.object_contracts.insert(relation, contract);
         }
+        for (relation, contract) in other.owned_relations {
+            self.owned_relations.insert(relation, contract);
+        }
         for (relation, mutation) in other.mutations {
             let target = self.mutations.entry(relation).or_default();
             target.inserted.extend(mutation.inserted);
             target.removed.extend(mutation.removed);
         }
+        Ok(self)
+    }
+
+    /// Composes two proposed transitions that were built from the exact same database snapshot.
+    pub fn and(mut self, other: Self) -> crate::Result<Self> {
+        self.extend(other)?;
         Ok(self)
     }
 

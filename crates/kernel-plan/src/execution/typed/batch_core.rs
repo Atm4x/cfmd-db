@@ -447,7 +447,8 @@ fn build_typed_batch_program<'a>(
             Ok(Some(program))
         }
         Plan::PromoteToBag(input) => build_typed_batch_program(input, store, context, registry),
-        Plan::FilterEqColumns { .. }
+        Plan::FilterOrderConst { .. }
+        | Plan::FilterEqColumns { .. }
         | Plan::JoinEq { .. }
         | Plan::Difference { .. }
         | Plan::AntiJoin { .. }

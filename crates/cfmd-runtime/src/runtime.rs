@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,7 +10,7 @@ use std::{
 use crate::{
     CommitOutcome, Error, ErrorKind, Plan, PreparedQuery, Query, RelationResult, Result,
     RevisionId, Schema, SchemaView, TransactionId,
-    query::query_error,
+    query::{query_error, query_error_at},
     schema::{
         PrimitiveEquivalence, PrimitiveOrdering, RelationSemantics, StructuralEquivalence,
         type_to_kernel,
@@ -21,6 +21,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Database {
     runtime: Arc<kernel_plan::DurableRuntime>,
+    path: Arc<PathBuf>,
     identity: u64,
 }
 
@@ -33,10 +34,249 @@ pub enum Storage {
 }
 
 #[derive(Clone)]
+pub struct EncryptionKey(kernel_plan::StorageEncryptionKey);
+
+impl EncryptionKey {
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self> {
+        kernel_plan::StorageEncryptionKey::try_new(bytes)
+            .map(Self)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::ResourceLimit,
+                    format!("secure encryption-key memory unavailable: {error:?}"),
+                )
+            })
+    }
+}
+
+impl std::fmt::Debug for EncryptionKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EncryptionKey(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EncryptionKeyId([u8; 16]);
+
+impl EncryptionKeyId {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionKeyOperation {
+    Create,
+    Open,
+    Rewrap,
+}
+
+pub struct EncryptionKeyDestination<'a> {
+    bytes: &'a mut [u8; 32],
+    initialized: bool,
+}
+
+impl EncryptionKeyDestination<'_> {
+    pub fn write(&mut self, bytes: &[u8; 32]) {
+        self.bytes.copy_from_slice(bytes);
+        self.initialized = true;
+    }
+
+    pub fn fill_with<E>(
+        &mut self,
+        fill: impl FnOnce(&mut [u8; 32]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        fill(self.bytes)?;
+        self.initialized = true;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for EncryptionKeyDestination<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EncryptionKeyDestination")
+            .field("initialized", &self.initialized)
+            .field("contents", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EncryptionProviderKeyMetadata {
+    key_id: EncryptionKeyId,
+    key_epoch: u64,
+    minimum_database_key_epoch: u64,
+}
+
+impl EncryptionProviderKeyMetadata {
+    #[must_use]
+    pub const fn new(key_id: EncryptionKeyId, key_epoch: u64) -> Self {
+        Self {
+            key_id,
+            key_epoch,
+            minimum_database_key_epoch: 1,
+        }
+    }
+
+    /// Sets the minimum database-key epoch this external key authority accepts.
+    /// Opening a complete but older wrapped-key header below this floor fails closed.
+    #[must_use]
+    pub const fn with_minimum_database_key_epoch(
+        mut self,
+        minimum_database_key_epoch: u64,
+    ) -> Self {
+        self.minimum_database_key_epoch = minimum_database_key_epoch;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionKeyAcknowledgement {
+    provider_key_id: EncryptionKeyId,
+    provider_key_epoch: u64,
+    database_key_epoch: u64,
+}
+
+impl EncryptionKeyAcknowledgement {
+    #[must_use]
+    pub const fn provider_key_id(self) -> EncryptionKeyId {
+        self.provider_key_id
+    }
+
+    #[must_use]
+    pub const fn provider_key_epoch(self) -> u64 {
+        self.provider_key_epoch
+    }
+
+    #[must_use]
+    pub const fn database_key_epoch(self) -> u64 {
+        self.database_key_epoch
+    }
+}
+
+pub trait EncryptionKeyProvider: std::fmt::Debug + Send + Sync {
+    fn provide_key(
+        &self,
+        path: &Path,
+        operation: EncryptionKeyOperation,
+        destination: &mut EncryptionKeyDestination<'_>,
+    ) -> Result<EncryptionProviderKeyMetadata>;
+
+    fn acknowledge_database_key_epoch(
+        &self,
+        _path: &Path,
+        _acknowledgement: EncryptionKeyAcknowledgement,
+    ) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::Recovery,
+            "encryption key provider does not support durable database-key acknowledgement",
+        ))
+    }
+}
+
+fn resolve_provider_key(
+    provider: &dyn EncryptionKeyProvider,
+    path: &Path,
+    operation: EncryptionKeyOperation,
+) -> Result<(
+    kernel_plan::StorageEncryptionKey,
+    EncryptionProviderKeyMetadata,
+)> {
+    let initialized = kernel_plan::StorageEncryptionKey::try_initialize(|bytes| {
+        let mut destination = EncryptionKeyDestination {
+            bytes,
+            initialized: false,
+        };
+        let metadata = provider.provide_key(path, operation, &mut destination)?;
+        if !destination.initialized {
+            return Err(Error::new(
+                ErrorKind::Recovery,
+                "encryption key provider returned success without initializing the secure key destination",
+            ));
+        }
+        validate_provider_metadata(metadata)?;
+        Ok(metadata)
+    });
+
+    match initialized {
+        Ok(result) => Ok(result),
+        Err(kernel_plan::StorageEncryptionKeyInitError::Memory(error)) => Err(Error::new(
+            ErrorKind::ResourceLimit,
+            format!("secure encryption-key memory unavailable: {error:?}"),
+        )),
+        Err(kernel_plan::StorageEncryptionKeyInitError::Initializer(error)) => Err(error),
+    }
+}
+
+fn validate_provider_metadata(metadata: EncryptionProviderKeyMetadata) -> Result<()> {
+    if metadata.key_id.0.iter().all(|byte| *byte == 0)
+        || metadata.key_epoch == 0
+        || metadata.minimum_database_key_epoch == 0
+    {
+        return Err(Error::new(
+            ErrorKind::Recovery,
+            "encryption provider key id, provider epoch, and database-key floor must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum Encryption {
+    #[default]
+    None,
+    Aes256GcmSiv {
+        key: EncryptionKey,
+    },
+    Aes256GcmSivProvider {
+        provider: Arc<dyn EncryptionKeyProvider>,
+    },
+}
+
+impl Encryption {
+    #[must_use]
+    pub fn aes256_gcm_siv(key: EncryptionKey) -> Self {
+        Self::Aes256GcmSiv { key }
+    }
+
+    #[must_use]
+    pub fn aes256_gcm_siv_with_provider(provider: Arc<dyn EncryptionKeyProvider>) -> Self {
+        Self::Aes256GcmSivProvider { provider }
+    }
+
+    fn resolve_kernel(
+        &self,
+        path: &Path,
+        operation: EncryptionKeyOperation,
+    ) -> Result<kernel_plan::StorageEncryption> {
+        match self {
+            Self::None => Ok(kernel_plan::StorageEncryption::None),
+            Self::Aes256GcmSiv { key } => Ok(kernel_plan::StorageEncryption::aes256_gcm_siv(
+                key.0.clone(),
+            )),
+            Self::Aes256GcmSivProvider { provider } => {
+                let (key, metadata) = resolve_provider_key(provider.as_ref(), path, operation)?;
+                Ok(
+                    kernel_plan::StorageEncryption::aes256_gcm_siv_wrapped_with_minimum_database_key_epoch(
+                        key,
+                        metadata.key_id.0,
+                        metadata.key_epoch,
+                        metadata.minimum_database_key_epoch,
+                    ),
+                )
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct DatabaseBuilder {
     path: PathBuf,
     storage: Storage,
     schema: Option<Schema>,
+    encryption: Encryption,
     publication_notifier: Option<Arc<dyn crate::PublicationNotifier>>,
 }
 
@@ -47,6 +287,7 @@ impl std::fmt::Debug for DatabaseBuilder {
             .field("path", &self.path)
             .field("storage", &self.storage)
             .field("schema", &self.schema.as_ref().map(|_| "<schema>"))
+            .field("encryption", &self.encryption)
             .field(
                 "publication_notifier",
                 &self.publication_notifier.as_ref().map(|_| "<notifier>"),
@@ -65,6 +306,12 @@ impl DatabaseBuilder {
     #[must_use]
     pub fn schema(mut self, schema: Schema) -> Self {
         self.schema = Some(schema);
+        self
+    }
+
+    #[must_use]
+    pub fn encryption(mut self, encryption: Encryption) -> Self {
+        self.encryption = encryption;
         self
     }
 
@@ -104,6 +351,9 @@ impl DatabaseBuilder {
 
     pub fn create(self) -> Result<Database> {
         let storage = self.resolved_storage_for_create();
+        let encryption = self
+            .encryption
+            .resolve_kernel(&self.path, EncryptionKeyOperation::Create)?;
         let definition = self.schema.ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidSchema,
@@ -113,18 +363,25 @@ impl DatabaseBuilder {
         let (context, registry, relations) = compile_schema(definition)?;
         let root = build_empty_root(&context, &registry, &relations)?;
         let backend = Self::kernel_backend(storage);
+        let storage_options =
+            kernel_plan::RuntimeStorageOptions::new(backend).with_encryption(encryption);
         let runtime = if let Some(notifier) = self.publication_notifier {
             let bridge = Arc::new(crate::notification::KernelPublicationNotifierBridge::new(
                 notifier,
             ));
-            kernel_plan::DurableRuntime::create_with_backend_and_revision_publication_notifier(
-                root, &self.path, &registry, backend, bridge,
+            kernel_plan::DurableRuntime::create_with_storage_options_and_revision_publication_notifier(
+                root, &self.path, &registry, &storage_options, bridge,
             )
         } else {
-            kernel_plan::DurableRuntime::create_with_backend(root, &self.path, &registry, backend)
+            kernel_plan::DurableRuntime::create_with_storage_options(
+                root,
+                &self.path,
+                &registry,
+                &storage_options,
+            )
         }
         .map_err(|error| Error::new(ErrorKind::Recovery, format!("create failed: {error:?}")))?;
-        Ok(Database::from_runtime(runtime))
+        Ok(Database::from_runtime(runtime, self.path))
     }
 
     pub fn open(self) -> Result<Database> {
@@ -135,21 +392,26 @@ impl DatabaseBuilder {
             ));
         }
         let storage = self.resolved_storage_for_open()?;
+        let encryption = self
+            .encryption
+            .resolve_kernel(&self.path, EncryptionKeyOperation::Open)?;
         let backend = Self::kernel_backend(storage);
+        let storage_options =
+            kernel_plan::RuntimeStorageOptions::new(backend).with_encryption(encryption);
         let runtime = if let Some(notifier) = self.publication_notifier {
             let bridge = Arc::new(crate::notification::KernelPublicationNotifierBridge::new(notifier));
-            kernel_plan::DurableRuntime::open_with_backend_recovery_policy_and_revision_publication_notifier(
+            kernel_plan::DurableRuntime::open_with_storage_options_recovery_policy_and_revision_publication_notifier(
                 &self.path,
-                backend,
+                &storage_options,
                 kernel_plan::PhysicalRecoveryPolicy::default(),
                 bridge,
             )
             .map(|(runtime, _)| runtime)
         } else {
-            kernel_plan::DurableRuntime::open_with_backend(&self.path, backend)
+            kernel_plan::DurableRuntime::open_with_storage_options(&self.path, &storage_options)
         }
         .map_err(|error| Error::new(ErrorKind::Recovery, format!("open failed: {error:?}")))?;
-        Ok(Database::from_runtime(runtime))
+        Ok(Database::from_runtime(runtime, self.path))
     }
 }
 
@@ -387,7 +649,7 @@ fn entity_hash_bytes(mut hash: u128, bytes: &[u8]) -> u128 {
     hash
 }
 
-fn lifecycle_entity_id(entity_type: crate::TypeId, raw: u128) -> kernel_types::EntityId {
+pub(crate) fn lifecycle_entity_id(entity_type: crate::TypeId, raw: u128) -> kernel_types::EntityId {
     let hash = entity_hash_bytes(ENTITY_FNV128_OFFSET, b"cfmd.object.lifecycle-id.v1\0");
     let hash = entity_hash_bytes(hash, &entity_type.raw().to_le_bytes());
     let hash = entity_hash_bytes(hash, &raw.to_le_bytes());
@@ -567,24 +829,143 @@ fn refresh_entity_projection(plan: &Plan, state: &mut kernel_model::DatabaseStat
     Ok(())
 }
 
+fn owned_target_id(value: &kernel_model::Value) -> Result<kernel_types::EntityId> {
+    match value {
+        kernel_model::Value::HistoricalEntityId { id, .. } => Ok(*id),
+        _ => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "owned relationship edge target is not a historical entity identity",
+        )),
+    }
+}
+
+fn apply_owned_relationship_policies(
+    plan: &Plan,
+    state: &mut kernel_model::DatabaseState,
+) -> Result<bool> {
+    let mut removed_object_rows = false;
+    for contract in plan.owned_relations.values() {
+        let final_edges = state
+            .model
+            .relations
+            .get(&contract.relation.into())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvariantViolation,
+                    "owned relationship relation is missing",
+                )
+            })?;
+        let mut owners_by_target = BTreeMap::new();
+        let mut final_targets = BTreeSet::new();
+        for row in final_edges {
+            let target = owned_target_id(row.get(1).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvariantViolation,
+                    "owned relationship edge is missing target column",
+                )
+            })?)?;
+            let owner = row.first().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvariantViolation,
+                    "owned relationship edge is missing owner column",
+                )
+            })?;
+            if let Some(previous) = owners_by_target.insert(target, owner.clone())
+                && previous != *owner
+            {
+                return Err(Error::new(
+                    ErrorKind::Cardinality,
+                    format!(
+                        "exclusive ownership violation: target {} already has another owner",
+                        target.raw()
+                    ),
+                ));
+            }
+            final_targets.insert(target);
+        }
+
+        if contract.orphan_policy != crate::plan::OrphanPolicy::DeleteIfUnowned {
+            continue;
+        }
+        let previous_edges = plan
+            .source
+            .revision()
+            .state()
+            .model
+            .relations
+            .get(&contract.relation.into())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvariantViolation,
+                    "owned relationship source relation is missing",
+                )
+            })?;
+        let mut previous_targets = BTreeSet::new();
+        for row in previous_edges {
+            previous_targets.insert(owned_target_id(row.get(1).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvariantViolation,
+                    "owned relationship source edge is missing target column",
+                )
+            })?)?);
+        }
+        let orphaned = previous_targets
+            .difference(&final_targets)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if orphaned.is_empty() {
+            continue;
+        }
+        let target_rows = state
+            .model
+            .relations
+            .get_mut(&contract.target_relation.into())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvariantViolation,
+                    "owned target object relation is missing",
+                )
+            })?;
+        let before = target_rows.len();
+        target_rows.retain(|row| {
+            row.get(contract.target_identity_column)
+                .and_then(|value| match value {
+                    kernel_model::Value::HistoricalEntityId { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .is_none_or(|id| !orphaned.contains(&id))
+        });
+        removed_object_rows |= target_rows.len() != before;
+    }
+    Ok(removed_object_rows)
+}
+
 pub(crate) fn build_object_target(
     plan: &Plan,
     target_revision: kernel_types::RevisionId,
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<kernel_revision::Revision> {
+    let context = plan.source.revision().semantic_context();
     let mut state = plan.source.revision().state().clone();
     apply_relation_mutations_to_state(plan, &mut state)?;
     refresh_entity_projection(plan, &mut state)?;
-    kernel_revision::Revision::build(
-        target_revision,
-        plan.source.revision().semantic_context(),
-        registry,
-        state,
-    )
-    .map_err(|error| {
+    let normalized = kernel_revision::Revision::build(target_revision, context, registry, state)
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::InvariantViolation,
+                format!("object lifecycle transition rejected by kernel: {error:?}"),
+            )
+        })?;
+    let mut state = normalized.state().clone();
+    let removed_orphans = apply_owned_relationship_policies(plan, &mut state)?;
+    if plan.owned_relations.is_empty() && !removed_orphans {
+        return Ok(normalized);
+    }
+    refresh_entity_projection(plan, &mut state)?;
+    kernel_revision::Revision::build(target_revision, context, registry, state).map_err(|error| {
         Error::new(
             ErrorKind::InvariantViolation,
-            format!("object lifecycle transition rejected by kernel: {error:?}"),
+            format!("owned relationship transition rejected by kernel: {error:?}"),
         )
     })
 }
@@ -627,6 +1008,68 @@ pub(crate) fn plan_relation_deltas(
                 result_type,
             },
         ));
+    }
+    Ok(deltas)
+}
+
+fn revision_relation_deltas(
+    source: &kernel_revision::Revision,
+    target: &kernel_revision::Revision,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<Vec<(kernel_types::SemanticId, kernel_query::RelationDelta)>> {
+    let context = source.semantic_context();
+    let relation_ids = source
+        .state()
+        .model
+        .relations
+        .keys()
+        .chain(target.state().model.relations.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut deltas = Vec::new();
+    for relation in relation_ids {
+        let expression = kernel_query::RelExpr::Scan(relation);
+        let result_type = expression
+            .typecheck(context, registry)
+            .map_err(|error| query_error(&error))?;
+        let relation_value = |rows: Vec<Vec<kernel_model::Value>>| match &result_type.semantics {
+            kernel_schema::RelationSemantics::Bag { .. } => kernel_query::RelationValue::Bag(rows),
+            kernel_schema::RelationSemantics::Set {
+                column_equivalences,
+            } => kernel_query::RelationValue::Set {
+                rows,
+                column_equivalences: column_equivalences.clone(),
+            },
+        };
+        let old = relation_value(
+            source
+                .state()
+                .model
+                .relations
+                .get(&relation)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let next = relation_value(
+            target
+                .state()
+                .model
+                .relations
+                .get(&relation)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let delta = kernel_query::RelationDelta::between_values(
+            &old,
+            &next,
+            result_type,
+            context,
+            registry,
+        )
+        .map_err(|error| query_error(&error))?;
+        if !delta.is_empty() {
+            deltas.push((relation, delta));
+        }
     }
     Ok(deltas)
 }
@@ -690,13 +1133,15 @@ impl Database {
             path: path.into(),
             storage: Storage::Auto,
             schema: None,
+            encryption: Encryption::None,
             publication_notifier: None,
         }
     }
 
-    fn from_runtime(runtime: kernel_plan::DurableRuntime) -> Self {
+    fn from_runtime(runtime: kernel_plan::DurableRuntime, path: PathBuf) -> Self {
         Self {
             runtime: Arc::new(runtime),
+            path: Arc::new(path),
             identity: next_database_identity(),
         }
     }
@@ -725,6 +1170,62 @@ impl Database {
         notifier: Arc<dyn crate::PublicationNotifier>,
     ) -> Result<Self> {
         Self::builder(path).publication_notifier(notifier).open()
+    }
+
+    pub fn rewrap_encryption(&self, next: &Encryption) -> Result<u64> {
+        let Encryption::Aes256GcmSivProvider { provider } = next else {
+            return Err(Error::new(
+                ErrorKind::Recovery,
+                "database master key rewrap requires a provider-backed encryption policy",
+            ));
+        };
+        let (key, metadata) = resolve_provider_key(
+            provider.as_ref(),
+            &self.path,
+            EncryptionKeyOperation::Rewrap,
+        )?;
+        let kernel =
+            kernel_plan::StorageEncryption::aes256_gcm_siv_wrapped_with_minimum_database_key_epoch(
+                key,
+                metadata.key_id.0,
+                metadata.key_epoch,
+                metadata.minimum_database_key_epoch,
+            );
+        let database_key_epoch =
+            self.runtime
+                .rewrap_storage_encryption(&kernel)
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Recovery,
+                        format!("database master key rewrap failed: {error:?}"),
+                    )
+                })?;
+        provider
+            .acknowledge_database_key_epoch(
+                &self.path,
+                EncryptionKeyAcknowledgement {
+                    provider_key_id: metadata.key_id,
+                    provider_key_epoch: metadata.key_epoch,
+                    database_key_epoch,
+                },
+            )
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Recovery,
+                    format!(
+                        "external database-key acknowledgement failed after local durable handoff; retry is idempotent: {error}"
+                    ),
+                )
+            })?;
+        self.runtime
+            .retire_previous_storage_encryption_key(database_key_epoch)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Recovery,
+                    format!("database master key predecessor retirement failed: {error:?}"),
+                )
+            })?;
+        Ok(database_key_epoch)
     }
 
     pub fn snapshot(&self) -> Result<ReadContext> {
@@ -778,6 +1279,11 @@ impl Database {
 
     pub fn history(&self) -> Result<crate::History> {
         self.snapshot()?.history()
+    }
+
+    /// Starts one write intent pinned to the current exact live snapshot.
+    pub fn transaction(&self, transaction: TransactionId) -> Result<crate::Transaction> {
+        crate::Transaction::new(self.snapshot()?, transaction)
     }
 
     pub fn plan(&self) -> Result<Plan> {
@@ -878,17 +1384,16 @@ pub(crate) fn commit_bound_plan(
     }
     let source_revision = plan.source.revision().id();
     let target_revision = plan_target_revision_id(plan)?;
-    let deltas = plan_relation_deltas(plan, runtime.semantic_registry())?;
-    let mutation_refs = deltas
-        .iter()
-        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
-            relation: *relation,
-            delta,
-        })
-        .collect::<Vec<_>>();
-
     let transaction_id = kernel_types::ClientTransactionId::new(transaction.raw());
     let outcome = if let Some(model_delta) = &plan.model_delta {
+        let deltas = plan_relation_deltas(plan, runtime.semantic_registry())?;
+        let mutation_refs = deltas
+            .iter()
+            .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+                relation: *relation,
+                delta,
+            })
+            .collect::<Vec<_>>();
         let target =
             build_explicit_model_target(plan, target_revision, runtime.semantic_registry())?;
         let model_complement =
@@ -903,6 +1408,14 @@ pub(crate) fn commit_bound_plan(
         };
         runtime.commit_mixed_revision(transaction_id, &request)
     } else if plan.object_contracts.is_empty() {
+        let deltas = plan_relation_deltas(plan, runtime.semantic_registry())?;
+        let mutation_refs = deltas
+            .iter()
+            .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+                relation: *relation,
+                delta,
+            })
+            .collect::<Vec<_>>();
         let request = kernel_plan::DerivedRelationTransitionRequest {
             source_revision,
             target_revision,
@@ -911,6 +1424,15 @@ pub(crate) fn commit_bound_plan(
         runtime.commit_derived_relation_data(transaction_id, &request)
     } else {
         let target = build_object_target(plan, target_revision, runtime.semantic_registry())?;
+        let deltas =
+            revision_relation_deltas(plan.source.revision(), &target, runtime.semantic_registry())?;
+        let mutation_refs = deltas
+            .iter()
+            .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+                relation: *relation,
+                delta,
+            })
+            .collect::<Vec<_>>();
         let model_delta =
             kernel_plan::DurableModelDelta::between(plan.source.revision().state(), target.state());
         let model_complement =
@@ -965,6 +1487,14 @@ pub struct ReadContext {
 }
 
 impl ReadContext {
+    pub(crate) const fn database_identity(&self) -> u64 {
+        self.database_identity
+    }
+
+    pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
+        self.database_identity == other.database_identity && self.revision() == other.revision()
+    }
+
     pub(crate) const fn is_live(&self) -> bool {
         self.live_snapshot.is_some()
     }
@@ -1030,8 +1560,12 @@ impl ReadContext {
                 self.revision.semantic_context(),
                 self.runtime.semantic_registry(),
             )
-            .map(|inner| PreparedQuery { inner })
-            .map_err(|error| query_error(&error))
+            .map(|inner| PreparedQuery {
+                inner,
+                node: query.node_id(),
+                source: query.source(),
+            })
+            .map_err(|error| query_error_at(query, &error))
     }
 
     pub fn execute(&self, query: &Query) -> Result<RelationResult> {
@@ -1059,6 +1593,6 @@ impl PreparedQuery {
                 context.runtime.semantic_registry(),
             )
             .map(Into::into)
-            .map_err(|error| query_error(&error))
+            .map_err(|error| query_error(&error).with_query(self.node, self.source))
     }
 }

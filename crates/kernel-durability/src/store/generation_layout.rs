@@ -20,6 +20,10 @@ pub(super) fn checkpoint_path(directory: &Path, generation: u64) -> PathBuf {
     directory.join(format!("checkpoint-{generation:020}.cfcp"))
 }
 
+pub(super) fn checkpoint_stream_spool_path(directory: &Path, generation: u64) -> PathBuf {
+    directory.join(format!("checkpoint-{generation:020}-stream.tmp"))
+}
+
 pub(super) fn checkpoint_chunk_path(directory: &Path, generation: u64, ordinal: usize) -> PathBuf {
     directory.join(format!(
         "checkpoint-{generation:020}-chunk-{ordinal:08}.cfck"
@@ -60,6 +64,22 @@ pub(super) fn parse_checkpoint_chunk_generation(name: &str) -> Option<u64> {
     generation.parse().ok()
 }
 
+pub(super) fn remove_orphan_checkpoint_stream_spools(
+    directory: &Path,
+) -> Result<(), DurabilityError> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if parse_generation_name(name, "checkpoint-", "-stream.tmp").is_some() {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn next_generation(directory: &Path) -> Result<u64, DurabilityError> {
     let mut highest = 0_u64;
     for entry in fs::read_dir(directory)? {
@@ -74,6 +94,7 @@ pub(super) fn next_generation(directory: &Path) -> Result<u64, DurabilityError> 
             .or_else(|| parse_generation_name(name, "metadata-", ".cfdm"))
             .or_else(|| parse_generation_name(name, "prepared-", ".cfpc"))
             .or_else(|| parse_checkpoint_chunk_generation(name))
+            .or_else(|| parse_generation_name(name, "checkpoint-", "-stream.tmp"))
             .or_else(|| parse_generation_name(name, "pending-manifest-", ".tmp"));
         if let Some(generation) = generation {
             highest = highest.max(generation);

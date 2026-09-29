@@ -2,7 +2,7 @@ use kernel_lens::{ArchiveProofId, ComplementRetention, LensSpecId, SemanticManif
 use kernel_types::{MaterializationId, RevisionId, SemanticId};
 
 use crate::binary_codec::{
-    Cursor, encode_value, push_bytes, push_len, push_u32, push_u64, push_u128,
+    BinarySource, encode_value, push_bytes, push_len, push_u32, push_u64, push_u128,
 };
 use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
@@ -15,7 +15,7 @@ use crate::runtime::CodecError;
 use super::query_codec::{decode_rel_expr, encode_rel_expr};
 
 pub(crate) fn encode_migration_complements(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     complements: &[DurableMigrationComplement],
 ) -> Result<(), CodecError> {
     push_len(out, complements.len())?;
@@ -62,7 +62,7 @@ pub(crate) fn encode_migration_complements(
 }
 
 pub(crate) fn decode_migration_complements(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<DurableMigrationComplement>, &'static str> {
     let count = cursor.len()?;
     let mut complements = Vec::with_capacity(cursor.bounded_capacity(count));
@@ -114,7 +114,7 @@ pub(crate) fn decode_migration_complements(
 }
 
 pub(crate) fn encode_materialization_specs(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     specs: &[DurableMaterializationSpec],
 ) -> Result<(), CodecError> {
     push_len(out, specs.len())?;
@@ -131,7 +131,7 @@ pub(crate) fn encode_materialization_specs(
 }
 
 pub(crate) fn decode_materialization_specs(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<DurableMaterializationSpec>, &'static str> {
     let materialization_count = cursor.len()?;
     let mut materializations = Vec::with_capacity(cursor.bounded_capacity(materialization_count));
@@ -151,7 +151,7 @@ pub(crate) fn decode_materialization_specs(
 }
 
 pub(super) fn encode_artifact_cores(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     cores: &[DurableArtifactCore],
 ) -> Result<(), CodecError> {
     let mut cores = cores.to_vec();
@@ -187,7 +187,7 @@ pub(super) fn encode_artifact_cores(
 }
 
 pub(super) fn decode_artifact_cores(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<DurableArtifactCore>, &'static str> {
     let count = cursor.len()?;
     let mut cores = Vec::with_capacity(cursor.bounded_capacity(count));
@@ -210,7 +210,7 @@ pub(super) fn decode_artifact_cores(
                     Vec::with_capacity(cursor.bounded_capacity(row_count));
                 for _ in 0..row_count {
                     let len = cursor.len()?;
-                    let tuple = cursor.take(len)?.to_vec();
+                    let tuple = cursor.take_owned(len)?;
                     let keys = kernel_semantics::decode_canonical_eq_key_tuple(&tuple)
                         .map_err(|_| "invalid canonical observable artifact core")?;
                     if keys.len() != key_parts.len() {
@@ -237,7 +237,7 @@ pub(super) fn decode_artifact_cores(
 }
 
 pub(super) fn encode_physical_artifact_specs(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     specs: &[DurablePhysicalArtifactSpec],
 ) -> Result<(), CodecError> {
     out.extend_from_slice(&PHYSICAL_ARTIFACT_RECIPE_VERSION.to_le_bytes());
@@ -313,7 +313,7 @@ pub(super) fn encode_physical_artifact_specs(
 }
 
 pub(super) fn encode_semantic_artifact_key(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     relation: SemanticId,
     key_parts: &[DurableSemanticKeyPart],
     advisor_managed: bool,
@@ -332,7 +332,7 @@ pub(super) fn encode_semantic_artifact_key(
 }
 
 pub(super) fn decode_physical_artifact_specs(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<DurablePhysicalArtifactSpec>, &'static str> {
     let recipe_version = cursor.u16()?;
     if !(1..=PHYSICAL_ARTIFACT_RECIPE_VERSION).contains(&recipe_version) {
@@ -419,7 +419,7 @@ pub(super) fn decode_physical_artifact_specs(
 }
 
 fn decode_semantic_artifact_key(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<(SemanticId, Vec<DurableSemanticKeyPart>, bool), &'static str> {
     let relation = SemanticId::new(cursor.u128()?);
     let count = cursor.len()?;

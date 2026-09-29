@@ -69,8 +69,56 @@ pub trait RuntimeRevisionPublicationNotifier: std::fmt::Debug + Send + Sync {
     #[must_use]
     fn generation(&self) -> u64;
 
+    /// Latest wake generation relevant to the supplied relation dependency set.
+    ///
+    /// An empty dependency set is a wildcard and observes every publication.
+    /// Providers that do not implement dependency-aware wake filtering may
+    /// conservatively return the global generation.
+    #[must_use]
+    fn generation_for(&self, _dependencies: &[SemanticId]) -> u64 {
+        self.generation()
+    }
+
     #[must_use]
     fn wait_after(&self, observed: u64) -> u64;
+
+    /// Blocking wait for a publication relevant to `dependencies`.
+    #[must_use]
+    fn wait_after_relations(&self, observed: u64, _dependencies: &[SemanticId]) -> u64 {
+        self.wait_after(observed)
+    }
+
+    /// Registers or refreshes one executor waker for a waiter generation.
+    ///
+    /// The returned generation is sampled after registration. If it is greater
+    /// than `observed`, the caller must treat the source as already ready and
+    /// must not rely on a future wake. Implementations must make registration
+    /// race-free with `notify_waiters`.
+    #[must_use]
+    fn register_waker_after(
+        &self,
+        waiter_id: u64,
+        observed: u64,
+        waker: &std::task::Waker,
+    ) -> u64;
+
+    /// Dependency-aware counterpart of [`Self::register_waker_after`].
+    ///
+    /// The returned generation is the latest generation relevant to the
+    /// dependency set, not necessarily the runtime-global generation.
+    #[must_use]
+    fn register_waker_after_relations(
+        &self,
+        waiter_id: u64,
+        observed: u64,
+        _dependencies: &[SemanticId],
+        waker: &std::task::Waker,
+    ) -> u64 {
+        self.register_waker_after(waiter_id, observed, waker)
+    }
+
+    /// Removes a previously registered executor waker.
+    fn unregister_waker(&self, waiter_id: u64);
 
     /// Wakes publication waiters without asserting that database state changed.
     ///
@@ -81,6 +129,13 @@ pub trait RuntimeRevisionPublicationNotifier: std::fmt::Debug + Send + Sync {
 
     fn notify_revision_published(&self) {
         self.notify_waiters();
+    }
+
+    /// Signals one exact relation-data publication. Implementations may use
+    /// the relation frontier to avoid waking subscriptions whose maintained
+    /// program cannot observe the transition.
+    fn notify_relations_published(&self, _relations: &[SemanticId]) {
+        self.notify_revision_published();
     }
 }
 
@@ -94,10 +149,21 @@ pub struct RuntimeRevisionPublicationWaitHandle {
     inner: Arc<RuntimeRevisionPublicationWaitState>,
 }
 
+static NEXT_RUNTIME_PUBLICATION_WAITER_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Debug)]
 struct RuntimeRevisionPublicationWaitState {
+    waiter_id: u64,
     cancelled: std::sync::atomic::AtomicBool,
     notifier: Arc<dyn RuntimeRevisionPublicationNotifier>,
+    dependencies: Box<[SemanticId]>,
+}
+
+impl Drop for RuntimeRevisionPublicationWaitState {
+    fn drop(&mut self) {
+        self.notifier.unregister_waker(self.waiter_id);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,18 +173,26 @@ pub enum RuntimeRevisionPublicationWaitOutcome {
 }
 
 impl RuntimeRevisionPublicationWaitHandle {
-    fn new(notifier: Arc<dyn RuntimeRevisionPublicationNotifier>) -> Self {
+    fn new(
+        notifier: Arc<dyn RuntimeRevisionPublicationNotifier>,
+        dependencies: Box<[SemanticId]>,
+    ) -> Self {
         Self {
             inner: Arc::new(RuntimeRevisionPublicationWaitState {
+                waiter_id: NEXT_RUNTIME_PUBLICATION_WAITER_ID
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 cancelled: std::sync::atomic::AtomicBool::new(false),
                 notifier,
+                dependencies,
             }),
         }
     }
 
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.inner.notifier.generation()
+        self.inner
+            .notifier
+            .generation_for(&self.inner.dependencies)
     }
 
     #[must_use]
@@ -143,50 +217,263 @@ impl RuntimeRevisionPublicationWaitHandle {
         if self.is_cancelled() {
             return RuntimeRevisionPublicationWaitOutcome::Cancelled;
         }
-        let generation = self.inner.notifier.wait_after(observed);
+        let generation = self
+            .inner
+            .notifier
+            .wait_after_relations(observed, &self.inner.dependencies);
         if self.is_cancelled() {
             RuntimeRevisionPublicationWaitOutcome::Cancelled
         } else {
             RuntimeRevisionPublicationWaitOutcome::Woken(generation)
         }
     }
+
+    pub fn clear_waker(&self) {
+        self.inner.notifier.unregister_waker(self.inner.waiter_id);
+    }
+
+    pub fn poll_after(
+        &self,
+        observed: u64,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<RuntimeRevisionPublicationWaitOutcome> {
+        if self.is_cancelled() {
+            return std::task::Poll::Ready(RuntimeRevisionPublicationWaitOutcome::Cancelled);
+        }
+        let generation = self.inner.notifier.register_waker_after_relations(
+            self.inner.waiter_id,
+            observed,
+            &self.inner.dependencies,
+            context.waker(),
+        );
+        if self.is_cancelled() {
+            self.inner.notifier.unregister_waker(self.inner.waiter_id);
+            std::task::Poll::Ready(RuntimeRevisionPublicationWaitOutcome::Cancelled)
+        } else if generation > observed {
+            self.inner.notifier.unregister_waker(self.inner.waiter_id);
+            std::task::Poll::Ready(RuntimeRevisionPublicationWaitOutcome::Woken(generation))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RegisteredPublicationWaker {
+    waker: std::task::Waker,
+    dependencies: Box<[SemanticId]>,
+}
+
+#[derive(Debug, Default)]
+struct InProcessRevisionPublicationState {
+    generation: u64,
+    opaque_generation: u64,
+    relation_generation: BTreeMap<SemanticId, u64>,
+    wakers: BTreeMap<u64, RegisteredPublicationWaker>,
+    waiters_by_relation: BTreeMap<SemanticId, BTreeSet<u64>>,
+    wildcard_waiters: BTreeSet<u64>,
+}
+
+impl InProcessRevisionPublicationState {
+    fn relevant_generation(&self, dependencies: &[SemanticId]) -> u64 {
+        if dependencies.is_empty() {
+            return self.generation;
+        }
+        dependencies.iter().fold(self.opaque_generation, |generation, relation| {
+            generation.max(self.relation_generation.get(relation).copied().unwrap_or(0))
+        })
+    }
+
+    fn remove_waiter(&mut self, waiter_id: u64) -> Option<std::task::Waker> {
+        let registered = self.wakers.remove(&waiter_id)?;
+        if registered.dependencies.is_empty() {
+            self.wildcard_waiters.remove(&waiter_id);
+        } else {
+            for relation in &registered.dependencies {
+                let remove_relation = self
+                    .waiters_by_relation
+                    .get_mut(relation)
+                    .is_some_and(|waiters| {
+                        waiters.remove(&waiter_id);
+                        waiters.is_empty()
+                    });
+                if remove_relation {
+                    self.waiters_by_relation.remove(relation);
+                }
+            }
+        }
+        Some(registered.waker)
+    }
+
+    fn register_waiter(
+        &mut self,
+        waiter_id: u64,
+        dependencies: &[SemanticId],
+        waker: &std::task::Waker,
+    ) {
+        let unchanged = self.wakers.get(&waiter_id).is_some_and(|registered| {
+            registered.dependencies.as_ref() == dependencies && registered.waker.will_wake(waker)
+        });
+        if unchanged {
+            return;
+        }
+        self.remove_waiter(waiter_id);
+        let dependencies: Box<[SemanticId]> = dependencies.into();
+        if dependencies.is_empty() {
+            self.wildcard_waiters.insert(waiter_id);
+        } else {
+            for relation in dependencies.iter().copied() {
+                self.waiters_by_relation
+                    .entry(relation)
+                    .or_default()
+                    .insert(waiter_id);
+            }
+        }
+        self.wakers.insert(
+            waiter_id,
+            RegisteredPublicationWaker {
+                waker: waker.clone(),
+                dependencies,
+            },
+        );
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct InProcessRevisionPublicationNotifier {
-    generation: Mutex<u64>,
+    state: Mutex<InProcessRevisionPublicationState>,
     changed: std::sync::Condvar,
 }
 
 impl RuntimeRevisionPublicationNotifier for InProcessRevisionPublicationNotifier {
     fn generation(&self) -> u64 {
-        *self
-            .generation
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    fn generation_for(&self, dependencies: &[SemanticId]) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .relevant_generation(dependencies)
     }
 
     fn wait_after(&self, observed: u64) -> u64 {
-        let mut generation = self
-            .generation
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *generation <= observed {
-            generation = self
+        while state.generation <= observed {
+            state = self
                 .changed
-                .wait(generation)
+                .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        *generation
+        state.generation
+    }
+
+    fn wait_after_relations(&self, observed: u64, dependencies: &[SemanticId]) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.relevant_generation(dependencies) <= observed {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.relevant_generation(dependencies)
+    }
+
+    fn register_waker_after(
+        &self,
+        waiter_id: u64,
+        observed: u64,
+        waker: &std::task::Waker,
+    ) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation <= observed {
+            state.register_waiter(waiter_id, &[], waker);
+        }
+        state.generation
+    }
+
+    fn register_waker_after_relations(
+        &self,
+        waiter_id: u64,
+        observed: u64,
+        dependencies: &[SemanticId],
+        waker: &std::task::Waker,
+    ) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = state.relevant_generation(dependencies);
+        if generation <= observed {
+            state.register_waiter(waiter_id, dependencies, waker);
+        }
+        generation
+    }
+
+    fn unregister_waker(&self, waiter_id: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_waiter(waiter_id);
     }
 
     fn notify_waiters(&self) {
-        let mut generation = self
-            .generation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *generation = generation.saturating_add(1);
-        self.changed.notify_all();
+        let wakers = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.generation = state.generation.saturating_add(1);
+            state.opaque_generation = state.generation;
+            self.changed.notify_all();
+            state.waiters_by_relation.clear();
+            state.wildcard_waiters.clear();
+            std::mem::take(&mut state.wakers)
+        };
+        for registered in wakers.into_values() {
+            registered.waker.wake();
+        }
+    }
+
+    fn notify_relations_published(&self, relations: &[SemanticId]) {
+        let wakers = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.generation = state.generation.saturating_add(1);
+            let generation = state.generation;
+            for relation in relations.iter().copied() {
+                state.relation_generation.insert(relation, generation);
+            }
+            self.changed.notify_all();
+
+            let mut ready = state.wildcard_waiters.clone();
+            for relation in relations {
+                if let Some(waiters) = state.waiters_by_relation.get(relation) {
+                    ready.extend(waiters.iter().copied());
+                }
+            }
+            ready
+                .into_iter()
+                .filter_map(|waiter_id| state.remove_waiter(waiter_id))
+                .collect::<Vec<_>>()
+        };
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 

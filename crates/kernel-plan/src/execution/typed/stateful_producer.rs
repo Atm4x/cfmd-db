@@ -93,6 +93,7 @@ fn try_execute_typed_stateful_producer_chain(
         plan,
         Plan::Project { .. }
             | Plan::FilterEqConst { .. }
+            | Plan::FilterOrderConst { .. }
             | Plan::FilterEqColumns { .. }
             | Plan::Difference { .. }
             | Plan::AntiJoin { .. }
@@ -194,7 +195,7 @@ fn try_produce_typed_stateful_batch(
             store,
             env,
         ),
-        Plan::Scan { .. } | Plan::Distinct { .. } | Plan::JoinEq { .. } => Ok(None),
+        Plan::Scan { .. } | Plan::FilterOrderConst { .. } | Plan::Distinct { .. } | Plan::JoinEq { .. } => Ok(None),
     }
 }
 

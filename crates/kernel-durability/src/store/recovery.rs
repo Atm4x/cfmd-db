@@ -13,7 +13,9 @@ use super::checkpoint_storage::read_checkpoint_generation;
 use super::freshness::{
     ExternalFreshnessAuthority, ExternalFreshnessConfig, ExternalFreshnessState,
 };
-use super::generation_layout::{lock_directory, prepared_capsule_path, wal_path};
+use super::generation_layout::{
+    lock_directory, prepared_capsule_path, remove_orphan_checkpoint_stream_spools, wal_path,
+};
 use super::manifest::{ManifestRecord, read_current_manifest};
 use super::metadata_storage::read_published_metadata;
 use super::migration_history::{
@@ -390,6 +392,7 @@ impl DurableRevisionStore {
     ) -> Result<(Self, RecoveryScan), DurabilityError> {
         let directory = directory.to_path_buf();
         let directory_lock = lock_directory(&directory)?;
+        remove_orphan_checkpoint_stream_spools(&directory)?;
         let manifest = read_current_manifest(&directory)?;
         let metadata = read_published_metadata(&directory, manifest)?;
         if metadata.external_freshness.is_some() && !allow_external_freshness {

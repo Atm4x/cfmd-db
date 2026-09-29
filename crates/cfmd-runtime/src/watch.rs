@@ -1,10 +1,150 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    future::Future,
     marker::PhantomData,
-    sync::{Arc, Weak},
+    pin::Pin,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
 };
 
 use crate::{Error, ErrorKind, Query, RelationResult, Result, RevisionId, Row};
+
+static NEXT_WATCH_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WatchSubscriptionId(u64);
+
+impl WatchSubscriptionId {
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WatchReadinessSourceId(u64);
+
+impl WatchReadinessSourceId {
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchWake {
+    Woken { generation: u64 },
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchReadiness {
+    source_id: WatchReadinessSourceId,
+    inner: kernel_plan::RuntimeRevisionPublicationWaitHandle,
+}
+
+impl WatchReadiness {
+    #[must_use]
+    pub const fn source_id(&self) -> WatchReadinessSourceId {
+        self.source_id
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.inner.generation()
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    #[must_use]
+    pub fn wait_after(&self, observed: u64) -> WatchWake {
+        match self.inner.wait_after(observed) {
+            kernel_plan::RuntimeRevisionPublicationWaitOutcome::Woken(generation) => {
+                WatchWake::Woken { generation }
+            }
+            kernel_plan::RuntimeRevisionPublicationWaitOutcome::Cancelled => WatchWake::Cancelled,
+        }
+    }
+
+    /// Removes any executor waker registered by [`Self::poll_after`].
+    ///
+    /// Async adapters should call this when a pending future is dropped so a
+    /// quiet database cannot retain an abandoned executor task indefinitely.
+    pub fn clear_waker(&self) {
+        self.inner.clear_waker();
+    }
+
+    pub fn poll_after(
+        &self,
+        observed: u64,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<WatchWake> {
+        match self.inner.poll_after(observed, context) {
+            std::task::Poll::Ready(kernel_plan::RuntimeRevisionPublicationWaitOutcome::Woken(
+                generation,
+            )) => std::task::Poll::Ready(WatchWake::Woken { generation }),
+            std::task::Poll::Ready(
+                kernel_plan::RuntimeRevisionPublicationWaitOutcome::Cancelled,
+            ) => std::task::Poll::Ready(WatchWake::Cancelled),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchDrain<T> {
+    events: Vec<T>,
+    status: WatchStatus,
+}
+
+impl<T> WatchDrain<T> {
+    #[must_use]
+    pub fn events(&self) -> &[T] {
+        &self.events
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> WatchStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub fn into_events(self) -> Vec<T> {
+        self.events
+    }
+
+    #[must_use]
+    pub fn has_more(&self) -> bool {
+        matches!(
+            self.status,
+            WatchStatus::Lagging {
+                pending_transitions: 1..,
+                ..
+            }
+        )
+    }
+
+    fn try_map<U>(self, mut map: impl FnMut(T) -> Result<U>) -> Result<WatchDrain<U>> {
+        Ok(WatchDrain {
+            events: self
+                .events
+                .into_iter()
+                .map(&mut map)
+                .collect::<Result<Vec<_>>>()?,
+            status: self.status,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchEvent {
@@ -83,9 +223,12 @@ pub enum WatchStatus {
 pub struct QueryWatch {
     runtime: Weak<kernel_plan::DurableRuntime>,
     state: kernel_query::MaterializedRelPlanState,
-    anchor_revision: RevisionId,
+    subscription_id: WatchSubscriptionId,
+    cursor_revision: RevisionId,
+    observable_revision: RevisionId,
     publication_generation: u64,
     cancellation: WatchCancellation,
+    readiness: WatchReadiness,
     initial: RelationResult,
 }
 
@@ -113,21 +256,50 @@ impl QueryWatch {
             )
         })?;
         let initial = context.execute(query)?;
-        let wait_handle = runtime.revision_publication_wait_handle();
+        let dependencies = state.scan_relations();
+        let wait_handle =
+            runtime.revision_publication_wait_handle_for_relations(dependencies.iter().copied());
         let publication_generation = wait_handle.generation();
+        let readiness = WatchReadiness {
+            source_id: WatchReadinessSourceId(context.database_identity()),
+            inner: runtime
+                .revision_publication_wait_handle_for_relations(dependencies.iter().copied()),
+        };
+        let revision = context.revision();
         Ok(Self {
             runtime: Arc::downgrade(runtime),
             state,
-            anchor_revision: context.revision(),
+            subscription_id: WatchSubscriptionId(
+                NEXT_WATCH_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            cursor_revision: revision,
+            observable_revision: revision,
             publication_generation,
             cancellation: WatchCancellation { inner: wait_handle },
+            readiness,
             initial,
         })
     }
 
     #[must_use]
+    pub const fn subscription_id(&self) -> WatchSubscriptionId {
+        self.subscription_id
+    }
+
+    /// Returns an executor-neutral wake source shared by every watch created
+    /// from the same live database runtime.
+    ///
+    /// The returned handle has independent cancellation state. Async adapters
+    /// can therefore deduplicate watches by `source_id()` and keep one blocking
+    /// waiter or OS registration per runtime instead of one waiter per watch.
+    #[must_use]
+    pub fn readiness(&self) -> WatchReadiness {
+        self.readiness.clone()
+    }
+
+    #[must_use]
     pub const fn revision(&self) -> RevisionId {
-        self.anchor_revision
+        self.cursor_revision
     }
 
     #[must_use]
@@ -152,12 +324,12 @@ impl QueryWatch {
     pub fn status(&self) -> Result<WatchStatus> {
         if self.cancellation.is_cancelled() {
             return Ok(WatchStatus::Cancelled {
-                revision: self.anchor_revision,
+                revision: self.cursor_revision,
             });
         }
         let Some(runtime) = self.runtime.upgrade() else {
             return Ok(WatchStatus::RuntimeClosed {
-                revision: self.anchor_revision,
+                revision: self.cursor_revision,
             });
         };
         let head = runtime
@@ -171,9 +343,9 @@ impl QueryWatch {
             .revision()
             .id();
         let head_revision = RevisionId::from(head);
-        if head_revision == self.anchor_revision {
+        if head_revision == self.cursor_revision {
             return Ok(WatchStatus::Current {
-                revision: self.anchor_revision,
+                revision: self.cursor_revision,
             });
         }
         let Some(effects) = runtime.revision_history(head).map_err(|error| {
@@ -184,19 +356,19 @@ impl QueryWatch {
         })?
         else {
             return Ok(WatchStatus::Unavailable {
-                anchor_revision: self.anchor_revision,
+                anchor_revision: self.cursor_revision,
                 head_revision,
             });
         };
-        let source = kernel_types::RevisionId::new(self.anchor_revision.raw());
+        let source = kernel_types::RevisionId::new(self.cursor_revision.raw());
         let Some(path) = effect_path(source, head, &effects) else {
             return Ok(WatchStatus::Unavailable {
-                anchor_revision: self.anchor_revision,
+                anchor_revision: self.cursor_revision,
                 head_revision,
             });
         };
         Ok(WatchStatus::Lagging {
-            anchor_revision: self.anchor_revision,
+            anchor_revision: self.cursor_revision,
             head_revision,
             pending_transitions: path.len(),
         })
@@ -220,10 +392,38 @@ impl QueryWatch {
             })?
             .revision()
             .id();
-        if head == kernel_types::RevisionId::new(self.anchor_revision.raw()) {
-            return Ok(None);
+        while head != kernel_types::RevisionId::new(self.cursor_revision.raw()) {
+            if let Some(event) = self.advance_one(&runtime, head)? {
+                return Ok(Some(event));
+            }
         }
-        self.advance_one(&runtime, head).map(Some)
+        Ok(None)
+    }
+
+    /// Drains at most `max_events` already-certified causal transitions without
+    /// blocking for future publication. Durable history remains the event
+    /// authority; this does not introduce a second in-memory event queue.
+    pub fn drain_ready(&mut self, max_events: usize) -> Result<WatchDrain<WatchEvent>> {
+        let mut events = Vec::with_capacity(max_events.min(64));
+        while events.len() < max_events {
+            let Some(event) = self.try_recv()? else {
+                break;
+            };
+            events.push(event);
+        }
+        Ok(WatchDrain {
+            events,
+            status: self.status()?,
+        })
+    }
+
+    /// Waits asynchronously for the next observable exact delta.
+    ///
+    /// This is an ordinary standard-library [`Future`]; no executor-specific
+    /// adapter or conversion step is required.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> WatchNext<'_, Self> {
+        WatchNext::new(self)
     }
 
     pub fn recv(&mut self) -> Result<WatchEvent> {
@@ -250,8 +450,8 @@ impl QueryWatch {
         &mut self,
         runtime: &kernel_plan::DurableRuntime,
         head: kernel_types::RevisionId,
-    ) -> Result<WatchEvent> {
-        let effect = next_effect(runtime, self.anchor_revision, head)?;
+    ) -> Result<Option<WatchEvent>> {
+        let effect = next_effect(runtime, self.cursor_revision, head)?;
         let source = historical_revision(runtime, effect.source_revision, "source")?;
         let target = historical_revision(runtime, effect.target_revision, "target")?;
         if source.semantic_context() != target.semantic_context() {
@@ -279,18 +479,22 @@ impl QueryWatch {
                     })?,
             )
         };
-        let event = WatchEvent {
-            source_revision: effect.source_revision.into(),
-            target_revision: effect.target_revision.into(),
-            inserted: output
-                .as_ref()
-                .map_or_else(Vec::new, |delta| convert_rows(&delta.inserted)),
-            removed: output
-                .as_ref()
-                .map_or_else(Vec::new, |delta| convert_rows(&delta.removed)),
+        self.cursor_revision = effect.target_revision.into();
+        let Some(output) = output else {
+            return Ok(None);
         };
-        self.anchor_revision = effect.target_revision.into();
-        Ok(event)
+        if output.inserted.is_empty() && output.removed.is_empty() {
+            return Ok(None);
+        }
+        let target_revision = effect.target_revision.into();
+        let event = WatchEvent {
+            source_revision: self.observable_revision,
+            target_revision,
+            inserted: convert_rows(&output.inserted),
+            removed: convert_rows(&output.removed),
+        };
+        self.observable_revision = target_revision;
+        Ok(Some(event))
     }
 }
 
@@ -501,6 +705,28 @@ impl<E: crate::Object> ObjectWatch<E> {
             .transpose()
     }
 
+    #[must_use]
+    pub const fn subscription_id(&self) -> WatchSubscriptionId {
+        self.inner.subscription_id()
+    }
+
+    #[must_use]
+    pub fn readiness(&self) -> WatchReadiness {
+        self.inner.readiness()
+    }
+
+    pub fn drain_ready(&mut self, max_events: usize) -> Result<WatchDrain<ObjectWatchEvent<E>>> {
+        self.inner
+            .drain_ready(max_events)?
+            .try_map(|event| decode_object_event::<E>(&event))
+    }
+
+    /// Waits asynchronously for the next observable exact object delta.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> WatchNext<'_, Self> {
+        WatchNext::new(self)
+    }
+
     pub fn recv(&mut self) -> Result<ObjectWatchEvent<E>> {
         decode_object_event(&self.inner.recv()?)
     }
@@ -585,6 +811,31 @@ impl<R, P: crate::Projection<R>> ProjectionWatch<R, P> {
             .transpose()
     }
 
+    #[must_use]
+    pub const fn subscription_id(&self) -> WatchSubscriptionId {
+        self.inner.subscription_id()
+    }
+
+    #[must_use]
+    pub fn readiness(&self) -> WatchReadiness {
+        self.inner.readiness()
+    }
+
+    pub fn drain_ready(
+        &mut self,
+        max_events: usize,
+    ) -> Result<WatchDrain<ProjectionWatchEvent<P::Output>>> {
+        self.inner
+            .drain_ready(max_events)?
+            .try_map(|event| decode_projection_event::<R, P>(&self.projection, &event))
+    }
+
+    /// Waits asynchronously for the next observable exact projection delta.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> WatchNext<'_, Self> {
+        WatchNext::new(self)
+    }
+
     pub fn recv(&mut self) -> Result<ProjectionWatchEvent<P::Output>> {
         decode_projection_event::<R, P>(&self.projection, &self.inner.recv()?)
     }
@@ -605,6 +856,103 @@ impl<R, P: crate::Projection<R>> ProjectionWatch<R, P> {
 
     pub fn status(&self) -> Result<WatchStatus> {
         self.inner.status()
+    }
+}
+
+mod watch_receiver_sealed {
+    pub trait Sealed {}
+}
+
+/// Internal shape contract shared by the three public watch types.
+///
+/// It is public only because [`WatchNext`] is a public concrete Future type;
+/// implementations are sealed to CFMD.
+#[doc(hidden)]
+pub trait WatchReceiver: watch_receiver_sealed::Sealed {
+    type Event;
+
+    fn readiness(&self) -> WatchReadiness;
+    fn try_recv(&mut self) -> Result<Option<Self::Event>>;
+}
+
+impl watch_receiver_sealed::Sealed for QueryWatch {}
+impl WatchReceiver for QueryWatch {
+    type Event = WatchEvent;
+
+    fn readiness(&self) -> WatchReadiness {
+        QueryWatch::readiness(self)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<Self::Event>> {
+        QueryWatch::try_recv(self)
+    }
+}
+
+impl<E: crate::Object> watch_receiver_sealed::Sealed for ObjectWatch<E> {}
+impl<E: crate::Object> WatchReceiver for ObjectWatch<E> {
+    type Event = ObjectWatchEvent<E>;
+
+    fn readiness(&self) -> WatchReadiness {
+        ObjectWatch::readiness(self)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<Self::Event>> {
+        ObjectWatch::try_recv(self)
+    }
+}
+
+impl<R, P: crate::Projection<R>> watch_receiver_sealed::Sealed for ProjectionWatch<R, P> {}
+impl<R, P: crate::Projection<R>> WatchReceiver for ProjectionWatch<R, P> {
+    type Event = ProjectionWatchEvent<P::Output>;
+
+    fn readiness(&self) -> WatchReadiness {
+        ProjectionWatch::readiness(self)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<Self::Event>> {
+        ProjectionWatch::try_recv(self)
+    }
+}
+
+/// Executor-neutral Future returned directly by `watch.next()`.
+pub struct WatchNext<'a, W: WatchReceiver> {
+    watch: &'a mut W,
+    readiness: WatchReadiness,
+}
+
+impl<'a, W: WatchReceiver> WatchNext<'a, W> {
+    fn new(watch: &'a mut W) -> Self {
+        let readiness = watch.readiness();
+        Self { watch, readiness }
+    }
+}
+
+impl<W: WatchReceiver> Drop for WatchNext<'_, W> {
+    fn drop(&mut self) {
+        self.readiness.clear_waker();
+    }
+}
+
+impl<W: WatchReceiver> Future for WatchNext<'_, W> {
+    type Output = Result<W::Event>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            let observed = this.readiness.generation();
+            match this.watch.try_recv() {
+                Ok(Some(event)) => return Poll::Ready(Ok(event)),
+                Ok(None) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+            match this.readiness.poll_after(observed, context) {
+                Poll::Ready(WatchWake::Woken { .. }) => {}
+                Poll::Ready(WatchWake::Cancelled) => {
+                    return Poll::Ready(Err(watch_closed("watch was cancelled")));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 

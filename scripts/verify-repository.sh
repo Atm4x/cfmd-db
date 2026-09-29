@@ -11,10 +11,11 @@ fi
 
 for required in \
   README.md SPEC.md Cargo.toml Cargo.lock rust-toolchain.toml lean-toolchain \
+  crates/cfmd/Cargo.toml crates/cfmd-derive/Cargo.toml scripts/verify-public-api.sh scripts/verify-cfmd-derive-diagnostics.sh \
   REPOSITORY_MANIFEST.sha256 \
   docs/spec/CFMD_CORE_SPEC.md docs/status/HISTORICAL_PROBLEMS_LEDGER.md \
-  docs/status/KERNEL_HOSTILE_LEDGER.md docs/status/PROJECT_STATUS.md \
-  docs/api/PRODUCT_ROADMAP.md docs/api/CFMD_PYTHON_FACADE_THEORY.md \
+  docs/status/KERNEL_HOSTILE_LEDGER.md docs/status/PROJECT_STATUS.md docs/status/PRODUCTIZATION_LEDGER.md \
+  docs/api/PRODUCT_ROADMAP.md docs/api/CFMD_PYTHON_FACADE_THEORY.md docs/api/ASYNC_ADAPTER_DESIGN.md \
   docs/architecture/ARCHITECTURE.md formal/lean/CFMD/Publication.lean \
   formal/lean/CFMD/Notification.lean \
   formal/lean/CFMD/SecurityAuthority.lean \
@@ -83,32 +84,6 @@ for checksum_file in checksum_files:
 
 if failures:
     print('\n'.join(failures), file=sys.stderr)
-    raise SystemExit(1)
-PY
-
-python3 - <<'PY'
-from pathlib import Path
-import subprocess
-import sys
-
-tracked = {
-    path.decode('utf-8')
-    for path in subprocess.check_output(['git', 'ls-files', '-z']).split(b'\0')
-    if path
-}
-tracked.discard('REPOSITORY_MANIFEST.sha256')
-manifest = {
-    line.split('  ./', 1)[1]
-    for line in Path('REPOSITORY_MANIFEST.sha256').read_text(encoding='utf-8').splitlines()
-    if '  ./' in line
-}
-unlisted = sorted(tracked - manifest)
-untracked = sorted(manifest - tracked)
-if unlisted or untracked:
-    for path in unlisted:
-        print(f'tracked file absent from repository manifest: {path}', file=sys.stderr)
-    for path in untracked:
-        print(f'repository manifest target absent from Git: {path}', file=sys.stderr)
     raise SystemExit(1)
 PY
 

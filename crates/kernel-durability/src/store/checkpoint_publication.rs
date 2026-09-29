@@ -14,6 +14,7 @@ use crate::descriptor::{
 };
 use crate::metadata;
 use crate::runtime::DurabilityError;
+use crate::single_file::compaction_io::{OsSingleFileCompactionIo, SingleFileCompactionIo};
 use crate::wal::FileRevisionWal;
 use kernel_revision::Revision;
 
@@ -260,19 +261,34 @@ impl DurableRevisionStore {
         &mut self,
         hook: &mut impl StoreFaultHook,
     ) -> Result<(), DurabilityError> {
+        let mut compaction_io = OsSingleFileCompactionIo;
+        self.compact_obsolete_generations_with_hook_and_io(hook, &mut compaction_io)
+    }
+
+    fn compact_obsolete_generations_with_hook_and_io(
+        &mut self,
+        hook: &mut impl StoreFaultHook,
+        compaction_io: &mut impl SingleFileCompactionIo,
+    ) -> Result<(), DurabilityError> {
         if !self.backend.capabilities().physical_compaction {
             return Err(DurabilityError::Protocol {
                 offset: 0,
                 reason: "durability backend does not support physical compaction",
             });
         }
-        self.backend.compact_obsolete_generations(
+        let poison_on_error = self.backend.is_single_file();
+        let result = self.backend.compact_obsolete_generations(
             &mut self.wal,
             self.generation,
             self.checkpoint.id(),
             self.durable_head,
             hook,
-        )
+            compaction_io,
+        );
+        if poison_on_error && result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 }
 
@@ -300,5 +316,12 @@ impl DurableRevisionStore {
         hook: &mut impl StoreFaultHook,
     ) -> Result<(), DurabilityError> {
         self.compact_obsolete_generations_with_hook(hook)
+    }
+
+    pub(super) fn test_compact_obsolete_generations_with_io(
+        &mut self,
+        compaction_io: &mut impl SingleFileCompactionIo,
+    ) -> Result<(), DurabilityError> {
+        self.compact_obsolete_generations_with_hook_and_io(&mut NoStoreFault, compaction_io)
     }
 }

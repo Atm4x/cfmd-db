@@ -8,8 +8,9 @@ The desired Python/DX theory remains valid, but its semantics are implemented fi
 
 ```text
 Rust applications      Python / .NET / Studio
-       \                     /
-        \                   /
+       |                     /
+      cfmd                  /
+       \                   /
              cfmd-runtime
                   |
        query / plan / candidate / watch / history
@@ -23,9 +24,9 @@ No language binding may call the kernel graph directly. This avoids duplicating 
 
 Pass280 froze the global kernel hostile/refactor campaign for the declared scope.
 
-## Phase 1 — universal Rust runtime facade — ACTIVE
+## Phase 1 — universal Rust runtime + public Rust facade — ACTIVE
 
-Pass281 establishes `cfmd-runtime`; Pass282 extends the same vertical slice through creation/schema ownership:
+Pass281 establishes `cfmd-runtime`; Pass282 extends the same vertical slice through creation/schema ownership; Pass337 adds the public application crate `cfmd` above that runtime boundary:
 
 - durable open;
 - immutable snapshots;
@@ -43,12 +44,13 @@ Next acceptance work:
 
 1. typed relation/domain handles — **implemented P283**;
 2. object-first Rust domain mapping with stable textual keys and operation-produced Plans — **implemented P284**;
-2. explicit reference/cardinality contracts and safe deep-path query DX;
-3. Plan sealing and Candidate preview;
-4. historical contexts/history/inverse;
-5. exact watch protocol.
+3. explicit reference/cardinality contracts and safe deep-path query DX — **implemented P285–P287**;
+4. Plan sealing and Candidate preview — **implemented P290–P291**;
+5. historical contexts/history/inverse — **implemented P292–P295**;
+6. exact watch protocol — **implemented foundation P296–P298**;
+7. public application crate — **implemented foundation P337**.
 
-Acceptance gate: a Rust application can create/open, query, transact, preview and watch a durable CFMD database using only `cfmd-runtime`.
+Acceptance gate: a Rust application can create/open, query, transact, preview and watch a durable CFMD database with one direct dependency: `cfmd`. `cfmd-runtime` remains the stable binding/runtime layer rather than the user-facing crate.
 
 ## Phase 2 — idiomatic Rust application surface
 
@@ -63,7 +65,7 @@ Targets:
 - deep relationship paths;
 - typed query/result shaping;
 - ergonomic Plan/Candidate APIs;
-- async watch streams;
+- executor-neutral async watch receive directly via `watch.next().await`, with executor-specific integration added only when it provides a measured capability beyond the standard Future/Waker contract;
 - explainability/capability inspection.
 
 ## Phase 3 — Python facade
@@ -104,9 +106,9 @@ Expose the same Rust runtime protocol over a local authenticated transport for S
 
 ### P286 — explicit cardinality foundation
 
-Rust object-first entities now support required refs, optional refs and symbolic reverse-many relationships. Query collections expose explicit `any/all/none/count().eq` semantics and never silently flatten many-valued paths. Materialized objects remain ordinary Rust values with no hidden database I/O.
+Rust object-first entities support required refs, optional refs and explicit many-valued traversal. P342 supersedes the earlier reverse-backlink interpretation: `Many<T>` is now a first-class object relationship value and the object declaration is the public schema authority. The runtime lowers it into an internal typed edge relation; a target-side `Ref<Source>` is not required merely to make the relationship exist.
 
-Next: move identity/reference integrity into durable kernel lifecycle authority (`LiveEntityRef` + carriers), then build richer deep-path/projected aggregate DX on that backend law.
+Materialized `Ref/Many` values are snapshot-bound and I/O-free until an explicit `load/all/where_/query/count/...` call. Detached `Many::new(...)` participates in graph insertion; bound Many values preserve relationships during scalar updates and detached replacements replace them atomically. Normal DX never exposes join/include/foreign-key concepts.
 
 ### P290–P291 — Candidate product surface
 
@@ -124,13 +126,13 @@ P293 closes that payer for newly committed mixed transitions. The durable transa
 
 ## P297 hosting/notification boundary
 
-`watch()` delivery is transport-neutral. `PublicationNotifier` is a wake-only provider contract: first-party embedded use can keep the std in-process implementation, while hosted applications, UI event loops or future IPC/network services can explicitly install another provider. Provider notifications never carry authoritative database state and never decide writer compatibility; Revision/history and the kernel semantic conflict/rebase calculus retain those authorities.
+`watch()` delivery is transport-neutral. `PublicationNotifier` is a wake-only provider contract: first-party embedded use can keep the std in-process implementation, while hosted applications, UI event loops or future IPC/network services can explicitly install another provider. Provider notifications never carry authoritative database state and never decide writer compatibility; Revision/history and the kernel semantic conflict/rebase calculus retain those authorities. P347 also makes that provider the executor-waker authority: direct host `notify_waiters()` signals and runtime publication now reach blocking and async waiters through the same provider contract rather than through a bridge-local Waker registry.
 
 Hosted CFMD should therefore be assembled as an explicit service composition (protocol + authentication + authorization + chosen transport/provider) rather than making `Database::open` start a listener. First-party transports may be shipped as optional modules, and application-defined providers remain an extension point.
 
 ## P298 watch lifecycle / backpressure foundation
 
-The exact watch protocol now has deterministic cancellation and shutdown behavior without an async-runtime dependency. `WatchCancellation` is a wake-only lifecycle capability; it cannot mutate database state. `WatchStatus` exposes exact causal lag, while catch-up consumes durable history one revision transition at a time. There is intentionally no unbounded per-subscription event queue and no silent event dropping/recompute fallback.
+The exact watch protocol now has deterministic cancellation and shutdown behavior without an async-runtime dependency. `WatchCancellation` is a wake-only lifecycle capability; it cannot mutate database state. `WatchStatus` exposes exact causal lag, while catch-up consumes durable history one revision transition at a time. There is intentionally no unbounded per-subscription event queue and no silent event dropping/recompute fallback. P347 hostile-tests cancellation/task migration/spurious-wake behavior plus 2,000 pending subscriptions. P348 removes the wrapper object entirely, keeps bounded catch-up on the same watch, and adds dependency-frontier wake filtering plus exact suppression of output-equivalent public events.
 
 With watch semantics/lifecycle now mature enough for adapters, the next product boundary is hosted sessions: authenticated principals, capabilities/authorization and protocol ingress above `cfmd-runtime`. Transport implementations (local IPC, TCP/TLS, UI/event-loop adapters) remain optional providers rather than kernel responsibilities.
 

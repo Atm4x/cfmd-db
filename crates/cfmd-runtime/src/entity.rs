@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{hash::Hash, marker::PhantomData};
 
 use crate::{
     EqPredicate, EquivalenceId, Object, ObjectEquivalence, ObjectPredicate, PrimitiveEquivalence,
@@ -33,29 +33,110 @@ impl<E: Object> Id<E> {
     }
     #[must_use]
     pub const fn reference(self) -> Ref<E> {
-        Ref { id: self }
+        Ref {
+            id: self,
+            context: None,
+        }
     }
 }
 
-/// Strong object-first reference. It never performs I/O when materialized.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Strong object-first relationship value for exactly one target object.
+///
+/// A detached `Ref<T>` contains only identity. When its owner is materialized by CFMD the
+/// reference is bound to that exact snapshot. Merely reading the field performs no I/O;
+/// [`Ref::query`] and [`Ref::load`] make relationship traversal explicit.
+#[derive(Clone)]
 pub struct Ref<E: Object> {
     id: Id<E>,
+    context: Option<crate::ReadContext>,
 }
-impl<E: Object> Copy for Ref<E> {}
-impl<E: Object> Clone for Ref<E> {
-    fn clone(&self) -> Self {
-        *self
+
+impl<E: Object> std::fmt::Debug for Ref<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Ref")
+            .field("id", &self.id.raw())
+            .field("bound", &self.context.is_some())
+            .finish()
     }
 }
+
+impl<E: Object> PartialEq for Ref<E> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id.raw() == other.id.raw()
+    }
+}
+
+impl<E: Object> Eq for Ref<E> {}
+
+impl<E: Object> PartialOrd for Ref<E> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<E: Object> Ord for Ref<E> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.raw().cmp(&other.id.raw())
+    }
+}
+
+impl<E: Object> Hash for Ref<E> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.raw().hash(state);
+    }
+}
+
 impl<E: Object> Ref<E> {
     #[must_use]
     pub const fn new(id: Id<E>) -> Self {
-        Self { id }
+        Self { id, context: None }
     }
+
     #[must_use]
-    pub const fn id(self) -> Id<E> {
+    pub const fn id(&self) -> Id<E> {
         self.id
+    }
+
+    #[must_use]
+    pub const fn is_bound(&self) -> bool {
+        self.context.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn __bind(&mut self, context: crate::ReadContext) {
+        self.context = Some(context);
+    }
+
+    /// Builds a query for this exact relationship target without performing I/O yet.
+    pub fn query(&self) -> Result<crate::ObjectQuery<E>> {
+        let context = self.context.as_ref().ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "Ref<T> is not bound to a database snapshot; materialize its owner through CFMD before traversing the relationship",
+            )
+        })?;
+        let set = context.objects::<E>()?;
+        let column = E::identity_column().ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::InvalidSchema,
+                format!("relationship target {} has no identity", E::KEY),
+            )
+        })?;
+        let equivalence = set.relation().equivalence_at(column).ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::InvalidSchema,
+                format!("relationship target {} identity has no equivalence", E::KEY),
+            )
+        })?;
+        let field =
+            crate::Field::<E, Id<E>>::__from_parts(set.relation().id(), column, equivalence);
+        Ok(set.query().where_(|_| field.eq(self.id)))
+    }
+
+    /// Explicitly materializes this relationship target at the owner's snapshot.
+    pub fn load(&self) -> Result<E> {
+        self.query()?.one()
     }
 }
 
@@ -107,6 +188,11 @@ impl<E: Object> crate::ObjectValue for Id<E> {
     fn equivalence() -> ObjectEquivalence {
         ObjectEquivalence::Primitive(PrimitiveEquivalence::HistoricalEntityIdExact(E::type_id()))
     }
+    fn ordering() -> Option<crate::PrimitiveOrdering> {
+        Some(crate::PrimitiveOrdering::HistoricalEntityIdAscending(
+            E::type_id(),
+        ))
+    }
     fn role() -> crate::ObjectFieldRole {
         crate::ObjectFieldRole::Identity(E::type_id())
     }
@@ -119,6 +205,11 @@ impl<E: Object> crate::ObjectValue for Ref<E> {
     fn equivalence() -> ObjectEquivalence {
         ObjectEquivalence::Primitive(PrimitiveEquivalence::HistoricalEntityIdExact(E::type_id()))
     }
+    fn ordering() -> Option<crate::PrimitiveOrdering> {
+        Some(crate::PrimitiveOrdering::HistoricalEntityIdAscending(
+            E::type_id(),
+        ))
+    }
     fn role() -> crate::ObjectFieldRole {
         crate::ObjectFieldRole::Reference {
             target_type: E::type_id(),
@@ -128,6 +219,9 @@ impl<E: Object> crate::ObjectValue for Ref<E> {
         }
     }
 }
+
+impl<E: Object> crate::OrderedObjectValue for Id<E> {}
+impl<E: Object> crate::OrderedObjectValue for Ref<E> {}
 
 impl<E: Object> ValueCodec for Option<Ref<E>> {
     fn into_value(self) -> Value {
@@ -231,6 +325,7 @@ pub struct RefPredicate<S: Object, T: Object, P: ObjectPredicate<T>> {
 }
 
 impl<S: Object, T: Object, P: ObjectPredicate<T>> ObjectPredicate<S> for RefPredicate<S, T, P> {
+    #[track_caller]
     fn apply(self, input: Query, root: &Relation<S>) -> Result<Query> {
         if root.width() != self.source_width {
             return Err(crate::Error::new(
@@ -306,6 +401,7 @@ pub struct OptionalRefIsSome<S: Object, T: Object> {
 }
 
 impl<S: Object, T: Object> ObjectPredicate<S> for OptionalRefIsSome<S, T> {
+    #[track_caller]
     fn apply(self, input: Query, root: &Relation<S>) -> Result<Query> {
         let none = crate::Field::<S, Option<Ref<T>>>::__from_parts(
             self.field.source_relation,
@@ -318,67 +414,51 @@ impl<S: Object, T: Object> ObjectPredicate<S> for OptionalRefIsSome<S, T> {
     }
 }
 
-/// Symbolic reverse-many relationship. It is not stored inside materialized objects.
+/// Symbolic zero-to-many object relationship. The public object model owns the relationship;
+/// query lowering follows the internal edge relation created by the schema compiler.
 #[derive(Debug, Clone)]
 pub struct ManyField<S: Object, T: Object> {
     source_width: usize,
     source_identity_column: usize,
-    target_reference_column: usize,
-    join_equivalence: EquivalenceId,
+    target_identity_column: usize,
+    relation: crate::RelationId,
+    source_equivalence: EquivalenceId,
+    target_equivalence: EquivalenceId,
     error: Option<crate::Error>,
     marker: PhantomData<fn() -> (S, T)>,
 }
 
 impl<S: Object, T: Object> ManyField<S, T> {
-    pub(crate) fn new(source: &Relation<S>, target_reference_name: &str) -> Self {
-        let mut error = None;
-        let source_identity_column = S::identity_column().unwrap_or_else(|| {
-            error = Some(crate::Error::new(
-                crate::ErrorKind::InvalidSchema,
-                format!("many relationship source {} has no identity", S::KEY),
-            ));
-            0
-        });
-        let target_fields = T::fields();
-        let target_reference_column = target_fields
-            .iter()
-            .position(|field| field.name() == target_reference_name)
-            .unwrap_or_else(|| {
-                error = Some(crate::Error::new(
+    pub(crate) fn new(source: &Relation<S>, name: &str) -> Self {
+        let source_identity_column = S::identity_column();
+        let target_identity_column = T::identity_column();
+        let source_equivalence = crate::object::__identity_equivalence_id::<S>();
+        let target_equivalence = crate::object::__identity_equivalence_id::<T>();
+        let error = source_identity_column
+            .is_none()
+            .then(|| {
+                crate::Error::new(
                     crate::ErrorKind::InvalidSchema,
-                    format!(
-                        "many relationship {} -> {} names unknown reference {target_reference_name}",
-                        S::KEY,
-                        T::KEY
-                    ),
-                ));
-                0
-            });
-        if error.is_none() {
-            match target_fields[target_reference_column].role() {
-                crate::ObjectFieldRole::Reference { target_type, .. }
-                    if target_type == S::type_id() => {}
-                _ => {
-                    error = Some(crate::Error::new(
+                    format!("relationship source {} has no identity", S::KEY),
+                )
+            })
+            .or_else(|| {
+                target_identity_column.is_none().then(|| {
+                    crate::Error::new(
                         crate::ErrorKind::InvalidSchema,
-                        format!(
-                            "many relationship {} -> {} must point through a required Ref<{}>",
-                            S::KEY,
-                            T::KEY,
-                            S::KEY
-                        ),
-                    ));
-                }
-            }
-        }
-        let join_equivalence = source
-            .equivalence_at(source_identity_column)
-            .unwrap_or_else(|| crate::EquivalenceId::new(0));
+                        format!("relationship target {} has no identity", T::KEY),
+                    )
+                })
+            })
+            .or_else(|| source_equivalence.as_ref().err().cloned())
+            .or_else(|| target_equivalence.as_ref().err().cloned());
         Self {
             source_width: source.width(),
-            source_identity_column,
-            target_reference_column,
-            join_equivalence,
+            source_identity_column: source_identity_column.unwrap_or(0),
+            target_identity_column: target_identity_column.unwrap_or(0),
+            relation: crate::object::__many_relation_id::<S>(name),
+            source_equivalence: source_equivalence.unwrap_or_else(|_| crate::EquivalenceId::new(0)),
+            target_equivalence: target_equivalence.unwrap_or_else(|_| crate::EquivalenceId::new(0)),
             error,
             marker: PhantomData,
         }
@@ -429,6 +509,25 @@ impl<S: Object, T: Object> ManyField<S, T> {
     pub fn count(self) -> ManyCount<S, T> {
         ManyCount { field: self }
     }
+
+    fn matching_sources<P: ObjectPredicate<T>>(&self, target: P, matching: bool) -> Result<Query> {
+        let target_relation = crate::object::symbolic_relation::<T>();
+        let all_targets = Query::scan(T::relation_id());
+        let selected = target.apply(all_targets.clone(), &target_relation)?;
+        let selected = if matching {
+            selected
+        } else {
+            all_targets.difference(selected)
+        };
+        Ok(Query::scan(self.relation)
+            .join_eq(
+                selected,
+                1,
+                self.target_identity_column,
+                self.target_equivalence,
+            )
+            .project(vec![0]))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -446,40 +545,35 @@ pub struct ManyPredicate<S: Object, T: Object, P: ObjectPredicate<T>> {
 }
 
 impl<S: Object, T: Object, P: ObjectPredicate<T>> ObjectPredicate<S> for ManyPredicate<S, T, P> {
+    #[track_caller]
     fn apply(self, input: Query, root: &Relation<S>) -> Result<Query> {
-        if let Some(error) = self.field.error {
+        if let Some(error) = self.field.error.clone() {
             return Err(error);
         }
         if root.width() != self.field.source_width {
             return Err(crate::Error::new(
                 crate::ErrorKind::InvalidPlan,
-                "many predicate root shape does not match its relation handle",
+                "many predicate root shape does not match its relationship handle",
             ));
         }
-        let target_relation = crate::object::symbolic_relation::<T>();
-        let all_targets = Query::scan(T::relation_id());
-        let matching = self.target.apply(all_targets.clone(), &target_relation)?;
+        let sources = self
+            .field
+            .matching_sources(self.target, !matches!(self.mode, ManyMode::All))?;
         let query = match self.mode {
             ManyMode::Any => input
                 .join_eq(
-                    matching,
+                    sources,
                     self.field.source_identity_column,
-                    self.field.target_reference_column,
-                    self.field.join_equivalence,
+                    0,
+                    self.field.source_equivalence,
                 )
                 .project((0..self.field.source_width).collect::<Vec<_>>())
                 .distinct(root.equivalences().to_vec()),
-            ManyMode::None => input.anti_join(
-                matching,
+            ManyMode::None | ManyMode::All => input.anti_join(
+                sources,
                 self.field.source_identity_column,
-                self.field.target_reference_column,
-                self.field.join_equivalence,
-            ),
-            ManyMode::All => input.anti_join(
-                all_targets.difference(matching),
-                self.field.source_identity_column,
-                self.field.target_reference_column,
-                self.field.join_equivalence,
+                0,
+                self.field.source_equivalence,
             ),
         };
         Ok(query)
@@ -508,6 +602,7 @@ pub struct ManyCountEq<S: Object, T: Object> {
 }
 
 impl<S: Object, T: Object> ObjectPredicate<S> for ManyCountEq<S, T> {
+    #[track_caller]
     fn apply(self, input: Query, root: &Relation<S>) -> Result<Query> {
         if let Some(error) = self.field.error {
             return Err(error);
@@ -515,19 +610,19 @@ impl<S: Object, T: Object> ObjectPredicate<S> for ManyCountEq<S, T> {
         if self.expected < 0 {
             return Ok(input.clone().difference(input));
         }
-        let all_targets = Query::scan(T::relation_id());
+        let edges = Query::scan(self.field.relation);
         if self.expected == 0 {
             return Ok(input.anti_join(
-                all_targets,
+                edges,
                 self.field.source_identity_column,
-                self.field.target_reference_column,
-                self.field.join_equivalence,
+                0,
+                self.field.source_equivalence,
             ));
         }
-        let grouped = all_targets
+        let grouped = edges
             .group_count(
-                self.field.target_reference_column,
-                self.field.join_equivalence,
+                0,
+                self.field.source_equivalence,
                 crate::object::count_equivalence_id(),
             )
             .filter_eq(
@@ -540,7 +635,7 @@ impl<S: Object, T: Object> ObjectPredicate<S> for ManyCountEq<S, T> {
                 grouped,
                 self.field.source_identity_column,
                 0,
-                self.field.join_equivalence,
+                self.field.source_equivalence,
             )
             .project((0..self.field.source_width).collect::<Vec<_>>())
             .distinct(root.equivalences().to_vec()))

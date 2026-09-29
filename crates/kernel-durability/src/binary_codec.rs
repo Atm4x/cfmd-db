@@ -1,14 +1,140 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 
 use kernel_model::Value;
 use kernel_types::{EntityId, SemanticId};
 
-use crate::runtime::CodecError;
+use crate::runtime::{CodecError, DurabilityError};
 
 pub(crate) const MAX_COLLECTION_LEN: usize = 1_000_000;
 pub(crate) const MAX_VALUE_DEPTH: usize = 128;
 
-pub(crate) fn encode_rows(out: &mut Vec<u8>, rows: &[Vec<Value>]) -> Result<(), CodecError> {
+pub(crate) trait BinarySink {
+    fn push(&mut self, byte: u8);
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+}
+
+impl BinarySink for Vec<u8> {
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte);
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        Vec::extend_from_slice(self, bytes);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CountingBinarySink {
+    len: u64,
+    overflowed: bool,
+}
+
+impl CountingBinarySink {
+    pub(crate) fn len(self) -> Result<u64, CodecError> {
+        if self.overflowed {
+            Err(CodecError::LengthOverflow)
+        } else {
+            Ok(self.len)
+        }
+    }
+}
+
+impl BinarySink for CountingBinarySink {
+    fn push(&mut self, _byte: u8) {
+        self.len = self.len.checked_add(1).unwrap_or_else(|| {
+            self.overflowed = true;
+            u64::MAX
+        });
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        if let Some(len) = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|len| self.len.checked_add(len))
+        {
+            self.len = len;
+        } else {
+            self.overflowed = true;
+            self.len = u64::MAX;
+        }
+    }
+}
+
+pub(crate) struct StreamingBinarySink<'a> {
+    emit: &'a mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+    buffer: Vec<u8>,
+    failure: Option<DurabilityError>,
+}
+
+impl<'a> StreamingBinarySink<'a> {
+    const BUFFER_LEN: usize = 64 * 1024;
+
+    pub(crate) fn new(emit: &'a mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>) -> Self {
+        Self {
+            emit,
+            buffer: Vec::with_capacity(Self::BUFFER_LEN),
+            failure: None,
+        }
+    }
+
+    fn flush_buffer(&mut self) {
+        if self.buffer.is_empty() || self.failure.is_some() {
+            self.buffer.clear();
+            return;
+        }
+        if let Err(error) = (self.emit)(&self.buffer) {
+            self.failure = Some(error);
+        }
+        self.buffer.clear();
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), DurabilityError> {
+        self.flush_buffer();
+        match self.failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl BinarySink for StreamingBinarySink<'_> {
+    fn push(&mut self, byte: u8) {
+        if self.failure.is_some() {
+            return;
+        }
+        if self.buffer.len() == Self::BUFFER_LEN {
+            self.flush_buffer();
+            if self.failure.is_some() {
+                return;
+            }
+        }
+        self.buffer.push(byte);
+    }
+
+    fn extend_from_slice(&mut self, mut bytes: &[u8]) {
+        if self.failure.is_some() {
+            return;
+        }
+        while !bytes.is_empty() {
+            let remaining = Self::BUFFER_LEN - self.buffer.len();
+            let take = remaining.min(bytes.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buffer.len() == Self::BUFFER_LEN {
+                self.flush_buffer();
+                if self.failure.is_some() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn encode_rows(
+    out: &mut impl BinarySink,
+    rows: &[Vec<Value>],
+) -> Result<(), CodecError> {
     push_len(out, rows.len())?;
     for row in rows {
         push_len(out, row.len())?;
@@ -20,7 +146,7 @@ pub(crate) fn encode_rows(out: &mut Vec<u8>, rows: &[Vec<Value>]) -> Result<(), 
 }
 
 pub(crate) fn encode_value(
-    out: &mut Vec<u8>,
+    out: &mut impl BinarySink,
     value: &Value,
     depth: usize,
 ) -> Result<(), CodecError> {
@@ -180,15 +306,80 @@ impl<'a> Cursor<'a> {
         count.min(self.bytes.len().saturating_sub(self.position))
     }
 
-    pub(crate) fn string(&mut self) -> Result<String, &'static str> {
+    pub(crate) fn finish(self) -> Result<(), &'static str> {
+        if self.position == self.bytes.len() {
+            Ok(())
+        } else {
+            Err("trailing bytes in mutation payload")
+        }
+    }
+}
+
+pub(crate) trait BinarySource {
+    fn read_exact_into(&mut self, out: &mut [u8]) -> Result<(), &'static str>;
+    fn remaining(&self) -> u64;
+
+    fn take_owned(&mut self, len: usize) -> Result<Vec<u8>, &'static str> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| "codec allocation failed")?;
+        bytes.resize(len, 0);
+        self.read_exact_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn u8(&mut self) -> Result<u8, &'static str> {
+        let mut bytes = [0_u8; 1];
+        self.read_exact_into(&mut bytes)?;
+        Ok(bytes[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, &'static str> {
+        let mut bytes = [0_u8; 2];
+        self.read_exact_into(&mut bytes)?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn u32(&mut self) -> Result<u32, &'static str> {
+        let mut bytes = [0_u8; 4];
+        self.read_exact_into(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, &'static str> {
+        let mut bytes = [0_u8; 8];
+        self.read_exact_into(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn u128(&mut self) -> Result<u128, &'static str> {
+        let mut bytes = [0_u8; 16];
+        self.read_exact_into(&mut bytes)?;
+        Ok(u128::from_le_bytes(bytes))
+    }
+
+    fn len(&mut self) -> Result<usize, &'static str> {
+        let value = usize::try_from(self.u32()?).map_err(|_| "collection length overflow")?;
+        if value > MAX_COLLECTION_LEN {
+            return Err("collection length exceeds hard limit");
+        }
+        Ok(value)
+    }
+
+    fn bounded_capacity(&self, count: usize) -> usize {
+        count.min(usize::try_from(self.remaining()).unwrap_or(usize::MAX))
+    }
+
+    fn string(&mut self) -> Result<String, &'static str> {
         let len = self.len()?;
-        let bytes = self.take(len)?;
-        std::str::from_utf8(bytes)
+        let bytes = self.take_owned(len)?;
+        std::str::from_utf8(&bytes)
             .map(str::to_owned)
             .map_err(|_| "invalid utf-8 string")
     }
 
-    pub(crate) fn rows(&mut self, depth: usize) -> Result<Vec<Vec<Value>>, &'static str> {
+    fn rows(&mut self, depth: usize) -> Result<Vec<Vec<Value>>, &'static str> {
         let count = self.len()?;
         let mut rows = Vec::with_capacity(self.bounded_capacity(count));
         for _ in 0..count {
@@ -202,7 +393,7 @@ impl<'a> Cursor<'a> {
         Ok(rows)
     }
 
-    pub(crate) fn value(&mut self, depth: usize) -> Result<Value, &'static str> {
+    fn value(&mut self, depth: usize) -> Result<Value, &'static str> {
         if depth > MAX_VALUE_DEPTH {
             return Err("value nesting exceeds hard limit");
         }
@@ -213,14 +404,16 @@ impl<'a> Cursor<'a> {
                 1 => Ok(Value::Bool(true)),
                 _ => Err("invalid bool encoding"),
             },
-            2 => Ok(Value::I64(i64::from_le_bytes(
-                self.take(8)?.try_into().map_err(|_| "i64 decode")?,
-            ))),
+            2 => {
+                let mut bytes = [0_u8; 8];
+                self.read_exact_into(&mut bytes)?;
+                Ok(Value::I64(i64::from_le_bytes(bytes)))
+            }
             3 => Ok(Value::F64Bits(self.u64()?)),
             4 => {
                 let len = self.len()?;
-                let bytes = self.take(len)?;
-                let text = std::str::from_utf8(bytes).map_err(|_| "invalid utf-8 text")?;
+                let bytes = self.take_owned(len)?;
+                let text = std::str::from_utf8(&bytes).map_err(|_| "invalid utf-8 text")?;
                 Ok(Value::Text(text.to_owned()))
             }
             5 => Ok(Value::LiveEntityRef {
@@ -302,8 +495,8 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    pub(crate) fn finish(self) -> Result<(), &'static str> {
-        if self.position == self.bytes.len() {
+    fn finish(&self) -> Result<(), &'static str> {
+        if self.remaining() == 0 {
             Ok(())
         } else {
             Err("trailing bytes in mutation payload")
@@ -311,13 +504,56 @@ impl<'a> Cursor<'a> {
     }
 }
 
-pub(crate) fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CodecError> {
+impl BinarySource for Cursor<'_> {
+    fn read_exact_into(&mut self, out: &mut [u8]) -> Result<(), &'static str> {
+        out.copy_from_slice(self.take(out.len())?);
+        Ok(())
+    }
+
+    fn remaining(&self) -> u64 {
+        u64::try_from(self.bytes.len().saturating_sub(self.position)).unwrap_or(u64::MAX)
+    }
+}
+
+pub(crate) struct ReadBinarySource<'a> {
+    reader: &'a mut dyn Read,
+    remaining: u64,
+}
+
+impl<'a> ReadBinarySource<'a> {
+    pub(crate) const fn new(reader: &'a mut dyn Read, len: u64) -> Self {
+        Self {
+            reader,
+            remaining: len,
+        }
+    }
+}
+
+impl BinarySource for ReadBinarySource<'_> {
+    fn read_exact_into(&mut self, out: &mut [u8]) -> Result<(), &'static str> {
+        let len = u64::try_from(out.len()).map_err(|_| "codec length overflow")?;
+        if len > self.remaining {
+            return Err("truncated mutation payload");
+        }
+        self.reader
+            .read_exact(out)
+            .map_err(|_| "binary source read failed")?;
+        self.remaining -= len;
+        Ok(())
+    }
+
+    fn remaining(&self) -> u64 {
+        self.remaining
+    }
+}
+
+pub(crate) fn push_bytes(out: &mut impl BinarySink, bytes: &[u8]) -> Result<(), CodecError> {
     push_len(out, bytes.len())?;
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-pub(crate) fn push_len(out: &mut Vec<u8>, value: usize) -> Result<(), CodecError> {
+pub(crate) fn push_len(out: &mut impl BinarySink, value: usize) -> Result<(), CodecError> {
     if value > MAX_COLLECTION_LEN {
         return Err(CodecError::CollectionTooLarge);
     }
@@ -328,19 +564,19 @@ pub(crate) fn push_len(out: &mut Vec<u8>, value: usize) -> Result<(), CodecError
     Ok(())
 }
 
-pub(crate) fn push_u16(out: &mut Vec<u8>, value: u16) {
+pub(crate) fn push_u16(out: &mut impl BinarySink, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn push_u32(out: &mut Vec<u8>, value: u32) {
+pub(crate) fn push_u32(out: &mut impl BinarySink, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn push_u64(out: &mut Vec<u8>, value: u64) {
+pub(crate) fn push_u64(out: &mut impl BinarySink, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn push_u128(out: &mut Vec<u8>, value: u128) {
+pub(crate) fn push_u128(out: &mut impl BinarySink, value: u128) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 

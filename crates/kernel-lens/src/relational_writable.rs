@@ -450,7 +450,8 @@ fn analyze_writable_rel(
             *equivalence,
             context,
         ),
-        RelExpr::Difference { .. }
+        RelExpr::FilterOrderConst { .. }
+        | RelExpr::Difference { .. }
         | RelExpr::AntiJoin { .. }
         | RelExpr::Distinct { .. }
         | RelExpr::Group { .. }

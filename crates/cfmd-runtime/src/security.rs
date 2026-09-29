@@ -251,6 +251,12 @@ impl SessionDatabase {
         self.snapshot()?.history()
     }
 
+    /// Starts one restricted write intent pinned to the current exact live snapshot.
+    pub fn transaction(&self, transaction: TransactionId) -> Result<crate::Transaction> {
+        self.authority.require(Permission::Write)?;
+        crate::Transaction::new(self.snapshot()?, transaction)
+    }
+
     pub fn plan(&self) -> Result<Plan> {
         self.authority.require(Permission::Write)?;
         self.database.plan_with_authority(self.authority.clone())

@@ -5,7 +5,8 @@ use super::checkpoint_storage::{
 use super::file_io::sync_directory;
 use super::freshness::ExternalFreshnessState;
 use super::generation_layout::{
-    checkpoint_chunk_path, metadata_path, next_generation, prepared_capsule_path, wal_path,
+    checkpoint_chunk_path, checkpoint_stream_spool_path, metadata_path, next_generation,
+    prepared_capsule_path, wal_path,
 };
 use super::manifest::{ManifestRecord, publish_manifest_with_hook};
 use super::metadata_storage::{read_metadata_bytes_bounded, write_metadata_file};
@@ -14,40 +15,83 @@ use super::prepared_capsule::{
     write_prepared_cut_capsule,
 };
 use super::publication_protocol::{NoStoreFault, PublicationAttempt};
+use super::single_file_backend::{MetadataSectionSource, RevisionSectionSource};
 use super::{DurableGenerationReceipt, DurableRevisionStore, StreamingCheckpointProgress};
-use crate::binary_codec::crc32c;
+use crate::binary_codec::{crc32c, crc32c_update};
 use crate::runtime::{CodecError, DurabilityError, TailStatus};
 use crate::single_file::{CarriedWalPublication, SingleFileSectionInput, SingleFileSectionKind};
 use crate::wal::FileRevisionWal;
 use crate::wal_frame::EncodedFrame;
 use crate::{checkpoint, metadata};
 use kernel_revision::Revision;
-use std::fs::OpenOptions;
-use std::io::Write;
+use sha2::{Digest, Sha256};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 enum StreamingCheckpointPhysical {
     Directory {
         metadata_crc32c: u32,
         capsule_crc32c: u32,
-        shadow_wal: FileRevisionWal,
+        shadow_wal: Box<FileRevisionWal>,
     },
     SingleFile {
         carry_start_offset: u64,
-        metadata_bytes: Vec<u8>,
+        metadata_record: Box<metadata::DurableStoreMetadata>,
         prepared_bytes: Vec<u8>,
-        replication_archive: Vec<u8>,
         replication_cut_frames: usize,
     },
+}
+
+#[derive(Debug)]
+struct CheckpointSpool {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl CheckpointSpool {
+    fn file_mut(&mut self) -> Result<&mut File, DurabilityError> {
+        self.file.as_mut().ok_or(DurabilityError::Protocol {
+            offset: 0,
+            reason: "checkpoint canonical spool is already closed",
+        })
+    }
+}
+
+impl Drop for CheckpointSpool {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct PreparedCheckpointEncoding {
+    spool: Option<CheckpointSpool>,
+    spool_digest: Option<[u8; 32]>,
+    encoded_len: usize,
+    chunk_crcs: Vec<u32>,
+    precomputed_checkpoint_crc32c: Option<u32>,
+}
+
+fn replication_prefix(
+    replication: &crate::replication::authority::ReplicationAuthorityJournal,
+    count: usize,
+) -> Result<&[Vec<u8>], DurabilityError> {
+    replication.single_file_live_frames_prefix(count)
 }
 
 #[derive(Debug)]
 pub(super) struct StreamingCheckpointJob {
     generation: u64,
     cut_revision: Revision,
-    payload: Vec<u8>,
+    spool: Option<CheckpointSpool>,
+    expected_spool_digest: Option<[u8; 32]>,
+    spool_hasher: Option<Sha256>,
+    encoded_len: usize,
     chunk_size: usize,
     chunk_crcs: Vec<u32>,
+    precomputed_checkpoint_crc32c: Option<u32>,
     next_chunk: usize,
     checkpoint_crc32c: Option<u32>,
     prepared_capsule: PreparedCutCapsule,
@@ -56,6 +100,180 @@ pub(super) struct StreamingCheckpointJob {
     mirrored_lsn: u64,
     durable_shadow_lsn: u64,
     failed: bool,
+}
+
+fn checkpoint_stream_summary(revision: &Revision) -> Result<(usize, u32), DurabilityError> {
+    let mut encoded_len = 0_usize;
+    let mut full_crc = !0_u32;
+    checkpoint::stream_revision(revision, &mut |bytes| {
+        encoded_len = encoded_len
+            .checked_add(bytes.len())
+            .ok_or(DurabilityError::PayloadTooLarge)?;
+        full_crc = crc32c_update(full_crc, bytes);
+        Ok(())
+    })?;
+    Ok((encoded_len, !full_crc))
+}
+
+fn prepare_checkpoint_encoding(
+    revision: &Revision,
+    chunk_size: usize,
+    directory_spool: Option<(PathBuf, u64)>,
+) -> Result<PreparedCheckpointEncoding, DurabilityError> {
+    if directory_spool.is_none() {
+        let (encoded_len, checkpoint_crc32c) = checkpoint_stream_summary(revision)?;
+        if encoded_len > MAX_CHECKPOINT_LEN {
+            return Err(DurabilityError::PayloadTooLarge);
+        }
+        checkpoint_chunk_count(encoded_len, chunk_size)?;
+        return Ok(PreparedCheckpointEncoding {
+            spool: None,
+            spool_digest: None,
+            encoded_len,
+            chunk_crcs: Vec::new(),
+            precomputed_checkpoint_crc32c: Some(checkpoint_crc32c),
+        });
+    }
+
+    let encoded_len = usize::try_from(checkpoint::encoded_revision_len(revision)?)
+        .map_err(|_| DurabilityError::PayloadTooLarge)?;
+    if encoded_len > MAX_CHECKPOINT_LEN {
+        return Err(DurabilityError::PayloadTooLarge);
+    }
+    checkpoint_chunk_count(encoded_len, chunk_size)?;
+
+    let Some((directory, generation)) = directory_spool else {
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "directory checkpoint encoding requires a canonical spool location",
+        });
+    };
+    let path = checkpoint_stream_spool_path(&directory, generation);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    let mut emitted = 0_usize;
+    let mut hasher = Sha256::new();
+    let stream_result = checkpoint::stream_revision(revision, &mut |bytes| {
+        emitted = emitted
+            .checked_add(bytes.len())
+            .ok_or(DurabilityError::PayloadTooLarge)?;
+        if emitted > encoded_len {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "checkpoint canonical stream exceeded counted length",
+            });
+        }
+        file.write_all(bytes)?;
+        hasher.update(bytes);
+        Ok(())
+    });
+    if let Err(error) = stream_result {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    if emitted != encoded_len {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "checkpoint canonical stream disagrees with counted length",
+        });
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(PreparedCheckpointEncoding {
+        spool: Some(CheckpointSpool {
+            file: Some(file),
+            path,
+        }),
+        spool_digest: Some(hasher.finalize().into()),
+        encoded_len,
+        chunk_crcs: Vec::new(),
+        precomputed_checkpoint_crc32c: None,
+    })
+}
+
+fn write_spooled_checkpoint_chunk(
+    spool: &mut File,
+    output: &mut File,
+    start: u64,
+    len: usize,
+    stream_hasher: &mut Sha256,
+) -> Result<u32, DurabilityError> {
+    spool.seek(SeekFrom::Start(start))?;
+    let mut remaining = len;
+    let mut crc = !0_u32;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining != 0 {
+        let take = remaining.min(buffer.len());
+        spool.read_exact(&mut buffer[..take])?;
+        output.write_all(&buffer[..take])?;
+        crc = crc32c_update(crc, &buffer[..take]);
+        stream_hasher.update(&buffer[..take]);
+        remaining -= take;
+    }
+    Ok(!crc)
+}
+
+fn prepare_store_checkpoint_encoding(
+    store: &DurableRevisionStore,
+    revision: &Revision,
+    chunk_size: usize,
+) -> Result<(u64, PreparedCheckpointEncoding), DurabilityError> {
+    let generation = if store.backend.is_single_file() {
+        store
+            .generation
+            .checked_add(1)
+            .ok_or(DurabilityError::LsnExhausted)?
+    } else {
+        next_generation(store.backend.directory_root()?)?
+    };
+    let directory_spool = if store.backend.is_single_file() {
+        None
+    } else {
+        Some((store.backend.directory_root()?.to_path_buf(), generation))
+    };
+    let encoding = prepare_checkpoint_encoding(revision, chunk_size, directory_spool)?;
+    Ok((generation, encoding))
+}
+
+fn write_next_directory_checkpoint_chunk(
+    job: &mut StreamingCheckpointJob,
+    directory: &Path,
+) -> Result<u32, DurabilityError> {
+    let ordinal = job.next_chunk;
+    let start = ordinal
+        .checked_mul(job.chunk_size)
+        .ok_or(DurabilityError::PayloadTooLarge)?;
+    let end = job.encoded_len.min(
+        start
+            .checked_add(job.chunk_size)
+            .ok_or(DurabilityError::PayloadTooLarge)?,
+    );
+    let spool = job.spool.as_mut().ok_or(DurabilityError::Protocol {
+        offset: 0,
+        reason: "directory streaming checkpoint lost its canonical spool",
+    })?;
+    let stream_hasher = job.spool_hasher.as_mut().ok_or(DurabilityError::Protocol {
+        offset: 0,
+        reason: "directory streaming checkpoint lost its spool digest state",
+    })?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(checkpoint_chunk_path(directory, job.generation, ordinal))?;
+    let crc = write_spooled_checkpoint_chunk(
+        spool.file_mut()?,
+        &mut file,
+        u64::try_from(start).map_err(|_| DurabilityError::PayloadTooLarge)?,
+        end - start,
+        stream_hasher,
+    )?;
+    file.sync_all()?;
+    Ok(crc)
 }
 
 impl DurableRevisionStore {
@@ -99,40 +317,37 @@ impl DurableRevisionStore {
             .durability_barrier()
             .inspect_err(|_| self.poisoned = true)?;
         let wal_first_lsn = self.wal.next_lsn();
-        let payload = checkpoint::encode_revision(revision)?;
-        if payload.len() > MAX_CHECKPOINT_LEN {
-            return Err(DurabilityError::PayloadTooLarge);
-        }
-        checkpoint_chunk_count(payload.len(), chunk_size)?;
+        let (planned_generation, encoding) =
+            prepare_store_checkpoint_encoding(self, revision, chunk_size)?;
+        let PreparedCheckpointEncoding {
+            spool,
+            spool_digest,
+            encoded_len,
+            chunk_crcs,
+            precomputed_checkpoint_crc32c,
+        } = encoding;
         let prepared_capsule = PreparedCutCapsule::from_prepared_transactions(
             &self.prepared_transactions,
             self.durable_head,
         );
         let metadata_record = self.streaming_metadata_record(revision)?;
         let (generation, physical) = if self.backend.is_single_file() {
-            let generation = self
-                .generation
-                .checked_add(1)
-                .ok_or(DurabilityError::LsnExhausted)?;
+            let generation = planned_generation;
             let carry_start_offset = self.wal.current_end_offset()?;
-            let metadata_bytes = metadata::encode(&metadata_record)?;
             let prepared_bytes = encode_prepared_cut_capsule(&prepared_capsule)?;
             let replication_cut_frames = self.replication.single_file_live_frame_count();
-            let replication_archive =
-                self.single_file_replication_archive_prefix(replication_cut_frames)?;
             (
                 generation,
                 StreamingCheckpointPhysical::SingleFile {
                     carry_start_offset,
-                    metadata_bytes,
+                    metadata_record: Box::new(metadata_record),
                     prepared_bytes,
-                    replication_archive,
                     replication_cut_frames,
                 },
             )
         } else {
             let directory = self.backend.directory_root()?.to_path_buf();
-            let generation = next_generation(&directory)?;
+            let generation = planned_generation;
             let capsule_crc32c = write_prepared_cut_capsule(
                 &prepared_capsule_path(&directory, generation),
                 &prepared_capsule,
@@ -148,16 +363,20 @@ impl DurableRevisionStore {
                 StreamingCheckpointPhysical::Directory {
                     metadata_crc32c,
                     capsule_crc32c,
-                    shadow_wal,
+                    shadow_wal: Box::new(shadow_wal),
                 },
             )
         };
         self.streaming_checkpoint = Some(StreamingCheckpointJob {
             generation,
             cut_revision: revision.clone(),
-            payload,
+            spool,
+            expected_spool_digest: spool_digest,
+            spool_hasher: spool_digest.map(|_| Sha256::new()),
+            encoded_len,
             chunk_size,
-            chunk_crcs: Vec::new(),
+            chunk_crcs,
+            precomputed_checkpoint_crc32c,
             next_chunk: 0,
             checkpoint_crc32c: None,
             prepared_capsule,
@@ -227,37 +446,55 @@ impl DurableRevisionStore {
                 reason: "streaming checkpoint job has failed",
             });
         }
-        let total = job.payload.len().div_ceil(job.chunk_size);
+        let total = job.encoded_len.div_ceil(job.chunk_size);
         let end_chunk = total.min(job.next_chunk.saturating_add(max_chunks));
-        while job.next_chunk < end_chunk {
-            let ordinal = job.next_chunk;
-            let start = ordinal * job.chunk_size;
-            let end = job.payload.len().min(start + job.chunk_size);
-            let chunk = &job.payload[start..end];
-            if let Some(directory) = &directory {
-                let mut file = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(checkpoint_chunk_path(directory, job.generation, ordinal))?;
-                file.write_all(chunk)?;
-                file.sync_all()?;
+        if let Some(directory) = &directory {
+            while job.next_chunk < end_chunk {
+                let crc = match write_next_directory_checkpoint_chunk(job, directory) {
+                    Ok(crc) => crc,
+                    Err(error) => {
+                        job.failed = true;
+                        return Err(error);
+                    }
+                };
+                job.chunk_crcs.push(crc);
+                job.next_chunk += 1;
             }
-            job.chunk_crcs.push(crc32c(chunk));
-            job.next_chunk += 1;
+        } else {
+            job.next_chunk = end_chunk;
         }
         if job.next_chunk == total && job.checkpoint_crc32c.is_none() {
+            if let Some(expected) = job.expected_spool_digest {
+                let actual: [u8; 32] = job
+                    .spool_hasher
+                    .as_ref()
+                    .ok_or(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "directory streaming checkpoint lost its spool digest state",
+                    })?
+                    .clone()
+                    .finalize()
+                    .into();
+                if actual != expected {
+                    job.failed = true;
+                    return Err(DurabilityError::Corruption {
+                        offset: 0,
+                        reason: "checkpoint canonical spool changed during resumable publication",
+                    });
+                }
+            }
             if let Some(directory) = &directory {
                 job.checkpoint_crc32c = Some(write_chunked_checkpoint_root(
                     directory,
                     job.generation,
                     job.cut_revision.id(),
-                    job.payload.len(),
+                    job.encoded_len,
                     &job.chunk_crcs,
                     job.chunk_size,
                 )?);
                 sync_directory(directory)?;
             } else {
-                job.checkpoint_crc32c = Some(crc32c(&job.payload));
+                job.checkpoint_crc32c = job.precomputed_checkpoint_crc32c;
             }
         }
         self.streaming_checkpoint_progress()
@@ -292,20 +529,18 @@ impl DurableRevisionStore {
                 checkpoint_crc32c,
                 metadata_crc32c,
                 capsule_crc32c,
-                shadow_wal,
+                *shadow_wal,
             ),
             StreamingCheckpointPhysical::SingleFile {
                 carry_start_offset,
-                metadata_bytes,
+                metadata_record,
                 prepared_bytes,
-                replication_archive,
                 replication_cut_frames,
             } => self.finalize_single_file_streaming_checkpoint(
                 job,
                 carry_start_offset,
-                &metadata_bytes,
+                &metadata_record,
                 &prepared_bytes,
-                &replication_archive,
                 replication_cut_frames,
             ),
         }
@@ -402,9 +637,8 @@ impl DurableRevisionStore {
         &mut self,
         job: StreamingCheckpointJob,
         carry_start_offset: u64,
-        metadata_bytes: &[u8],
+        metadata_record: &metadata::DurableStoreMetadata,
         prepared_bytes: &[u8],
-        replication_archive: &[u8],
         replication_cut_frames: usize,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
         let seeds = job.prepared_capsule.scan_seeds();
@@ -431,34 +665,21 @@ impl DurableRevisionStore {
                 reason: "checkpoint cut plus carried WAL does not recover exact publish endpoint",
             });
         }
-        let verified_cut = checkpoint::decode_revision(&job.payload, &self.semantic_registry)?;
-        if verified_cut.id() != job.cut_revision.id() {
-            return Err(DurabilityError::Protocol {
-                offset: 0,
-                reason: "single-file streaming checkpoint does not decode to pinned cut",
-            });
-        }
+        let checkpoint_source = RevisionSectionSource(&job.cut_revision);
+        let metadata_source = MetadataSectionSource(metadata_record);
+        let replication_frames = replication_prefix(&self.replication, replication_cut_frames)?;
         let sections = [
-            SingleFileSectionInput {
-                kind: SingleFileSectionKind::Checkpoint,
-                ordinal: 0,
-                bytes: &job.payload,
-            },
-            SingleFileSectionInput {
-                kind: SingleFileSectionKind::Metadata,
-                ordinal: 0,
-                bytes: metadata_bytes,
-            },
-            SingleFileSectionInput {
-                kind: SingleFileSectionKind::PreparedCapsule,
-                ordinal: 0,
-                bytes: prepared_bytes,
-            },
-            SingleFileSectionInput {
-                kind: SingleFileSectionKind::ReplicationAuthority,
-                ordinal: 0,
-                bytes: replication_archive,
-            },
+            SingleFileSectionInput::streaming(
+                SingleFileSectionKind::Checkpoint,
+                0,
+                &checkpoint_source,
+            ),
+            SingleFileSectionInput::streaming(SingleFileSectionKind::Metadata, 0, &metadata_source),
+            SingleFileSectionInput::bytes(
+                SingleFileSectionKind::PreparedCapsule,
+                0,
+                prepared_bytes,
+            ),
         ];
         let (backend, wal) = (&mut self.backend, &mut self.wal);
         let container = backend.single_file_container()?;
@@ -473,6 +694,7 @@ impl DurableRevisionStore {
                     seeded_prepares: &seeds,
                 },
                 &sections,
+                replication_frames,
             )
             .inspect_err(|_| self.poisoned = true)?;
         let (wal, reopened_scan) = container
@@ -546,7 +768,7 @@ impl DurableRevisionStore {
                 offset: 0,
                 reason: "no streaming checkpoint job is active",
             })?;
-        let total = job.payload.len().div_ceil(job.chunk_size);
+        let total = job.encoded_len.div_ceil(job.chunk_size);
         Ok(StreamingCheckpointProgress {
             generation: job.generation,
             chunks_written: u32::try_from(job.next_chunk)

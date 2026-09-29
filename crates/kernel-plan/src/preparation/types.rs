@@ -16,6 +16,7 @@ pub fn logical_node_count(expr: &RelExpr) -> usize {
     match expr {
         RelExpr::Scan(_) => 1,
         RelExpr::FilterEqConst { input, .. }
+        | RelExpr::FilterOrderConst { input, .. }
         | RelExpr::FilterEqColumns { input, .. }
         | RelExpr::Project { input, .. }
         | RelExpr::Distinct { input, .. }

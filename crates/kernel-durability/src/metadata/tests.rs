@@ -406,3 +406,13 @@ fn physical_artifact_recipe_version_is_fail_closed() {
         Err("unsupported physical artifact recipe version")
     );
 }
+
+#[test]
+fn metadata_decoder_accepts_bounded_reader_source_without_slice_materialization() {
+    let metadata = DurableStoreMetadata::default();
+    let bytes = encode(&metadata).unwrap();
+    let mut reader = std::io::Cursor::new(bytes.as_slice());
+    let decoded = decode_from_reader(&mut reader, bytes.len() as u64).unwrap();
+    assert_eq!(decoded, metadata);
+    assert_eq!(reader.position(), bytes.len() as u64);
+}

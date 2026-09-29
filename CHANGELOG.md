@@ -1,4 +1,49 @@
+- P353: replaced abbreviated public ordered-predicate methods with `greater_than/greater_than_or_equal/less_than/less_than_or_equal`, removed the pre-release aliases, and mechanically split P352 ordered-query dispatch paths to restore strict Clippy without semantic changes.
+## Pass350 — Python hostile/product validation
+- P352: added Γ-native ordered/range predicates (`greater_than/greater_than_or_equal/less_than/less_than_or_equal/between`) with exact maintained-watch deltas and stable per-field ordering identities.
+
+- moved the Python validation harness onto the public `cfmd` facade rather than a direct `cfmd-runtime` dependency;
+- closed a public-facade leak by exporting low-level `QueryWatch` / `WatchEvent` through `cfmd::dynamic`, with compile-contract coverage;
+- expanded CPython 3.13 black-box coverage across typed CRUD/query/update/delete, deep `Ref` traversal, `OwnedMany` move/orphan preview, history undo, persistence reopen, typed object watches, cancellation, GC churn, 512 relevant watches and 256 unrelated watches;
+- found an asyncio loop-shutdown lifetime hole: a bare PyO3 Future is not part of `asyncio.all_tasks()` and can survive loop close while retaining an in-flight Rust receive; the validation bridge now taskifies each receive so loop shutdown cancels it and cancellation reaches the Rust wait registration;
+- retained P349 replay reservation so cancellation/commit races remain lossless; no second CFMD event authority or Python-side recompute path was introduced.
+
+## Pass349 — Python asyncio proof
+
+- proved CPython 3.13 `await watch.next()` and `async for` over the executor-neutral Rust watch law through PyO3/maturin;
+- reproduced and closed the Python cancellation/ready race with replayable delivery reservation at the FFI boundary;
+- kept Python as a validation consumer rather than a semantic authority or second watch implementation.
+
+## Pass348 — direct watch async + dependency frontier
+
+- removed the transitional `into_async()`/wrapper layer: sync, nonblocking and async consumption now live on one watch object;
+- indexed pending readiness by exact maintained-query relation dependencies, avoiding executor wakes for unrelated relation publication;
+- quotiented output-equivalent causal revisions out of the public event stream while retaining exact durable causal catch-up.
+
+## Pass347 — hostile async notification closure
+
+- moved executor Waker registration from the kernel bridge sidecar into `PublicationNotifier`, unifying direct host wake signals with blocking and async waiters;
+- added executor-task migration/Waker replacement, cancellation, repeated-spurious-wake and 2,000-pending-watch hostile coverage;
+- exposed `AsyncWatch::try_recv` and bounded `AsyncWatch::drain_ready` so executor integrations can slice durable catch-up without reaching through the wrapped watch;
+- identified the next scaling target as dependency-frontier wake filtering: O(K) delivery to K relevant subscribers is unavoidable, while unrelated subscriptions sharing one runtime should remain asleep.
+
 ## Pass305 — first-party local IPC transport conformance
+
+## Pass339 — generated reverse-many/cardinality SDK
+
+- `CfmdEntity` supports symbolic reverse-many declarations without collection fields in materialized structs.
+- Public relationship metadata distinguishes required-one, optional-one and many cardinality.
+- Reverse-many `via` type/target and target registration now fail during schema construction.
+- Expanded derive compile-fail diagnostics; async remains deferred to the multiplexed adapter design.
+
+## Pass337 — public Rust application facade
+
+- added the public `cfmd` crate as the only direct dependency required by ordinary Rust applications;
+- kept object-first application vocabulary at the root/prelude and moved the relation-first protocol behind explicit `cfmd::dynamic`;
+- added facade-owned diagnostic codes and a public-surface CI gate forbidding direct `kernel-*` dependencies;
+- added end-to-end `cfmd`-only product tests and a TODO example;
+- intentionally deferred Tokio/async watch to an adapter over the existing exact-watch semantics.
+
 
 - added separate `cfmd-transport-local` crate above `cfmd-host`;
 - added a real Unix-domain-socket provider with private `0600` endpoint permissions and no implicit locality trust;

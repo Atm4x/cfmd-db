@@ -9,6 +9,7 @@ mod replication;
 mod replication_transport;
 mod runtime;
 mod single_file;
+mod storage_encryption;
 mod store;
 mod wal;
 mod wal_frame;
@@ -76,6 +77,11 @@ pub use runtime::{
 pub use single_file::{
     SingleFileContainer, SingleFileGenerationView, SingleFileSectionDescriptor,
     SingleFileSectionInput, SingleFileSectionKind,
+};
+pub use storage_encryption::{
+    PersistentSecretStateProtection, SecretStateInitializationProtection, StorageAeadAlgorithm,
+    StorageAeadBackendCapabilities, StorageAeadCodec, StorageEncryption, StorageEncryptionDomain,
+    StorageEncryptionKey, StorageEncryptionKeyInitError,
 };
 pub use store::{
     DurableBatchEnqueueOutcome, DurableCommitBatchPolicy, DurableCommitBatcher,

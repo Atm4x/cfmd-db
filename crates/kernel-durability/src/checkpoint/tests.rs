@@ -8,6 +8,7 @@ use kernel_schema::{
 use kernel_semantics::{EquivalenceModule, OrderingModule, SemanticRegistry};
 use kernel_types::{EntityId, RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 
 use super::*;
 
@@ -150,4 +151,55 @@ fn full_revision_checkpoint_codec_roundtrips_schema_semantics_lifecycle_and_mode
     let bytes = encode_revision(&revision).unwrap();
     let decoded = decode_revision(&bytes, &registry).unwrap();
     assert_eq!(decoded, revision);
+}
+
+#[test]
+fn streaming_checkpoint_encoding_is_byte_exact_and_length_exact() {
+    let (revision, _) = complex_revision();
+    let buffered = encode_revision(&revision).unwrap();
+    assert_eq!(
+        encoded_revision_len(&revision).unwrap(),
+        buffered.len() as u64
+    );
+
+    let mut streamed = Vec::new();
+    stream_revision(&revision, &mut |chunk| {
+        streamed.extend_from_slice(chunk);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(streamed, buffered);
+}
+
+#[test]
+fn checkpoint_decoder_is_pull_based_and_exact_over_fragmented_reader() {
+    struct FragmentedReader<'a> {
+        bytes: &'a [u8],
+        position: usize,
+    }
+
+    impl Read for FragmentedReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.position == self.bytes.len() {
+                return Ok(0);
+            }
+            let take = out
+                .len()
+                .min(3)
+                .min(self.bytes.len().saturating_sub(self.position));
+            out[..take].copy_from_slice(&self.bytes[self.position..self.position + take]);
+            self.position += take;
+            Ok(take)
+        }
+    }
+
+    let (revision, registry) = complex_revision();
+    let bytes = encode_revision(&revision).unwrap();
+    let mut reader = FragmentedReader {
+        bytes: &bytes,
+        position: 0,
+    };
+    let decoded = decode_revision_from_reader(&mut reader, bytes.len() as u64, &registry).unwrap();
+    assert_eq!(decoded, revision);
+    assert_eq!(reader.position, bytes.len());
 }

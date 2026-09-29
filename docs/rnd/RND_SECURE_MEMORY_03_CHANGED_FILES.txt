@@ -1,0 +1,16 @@
+Cargo.lock
+crates/cfmd-secure-memory/examples/core_dump_probe.rs
+crates/cfmd-secure-memory/src/lib.rs
+crates/cfmd-secure-memory/src/platform/linux.rs
+crates/cfmd-secure-memory/src/platform/mod.rs
+crates/cfmd-secure-memory/tests/linux_resource_limits.rs
+crates/kernel-durability/Cargo.toml
+crates/kernel-durability/examples/secure_cipher_microbench.rs
+crates/kernel-durability/src/storage_encryption.rs
+crates/kernel-durability/src/storage_encryption/secure_hkdf.rs
+scripts/security/verify-secure-memory-core-dump.sh
+docs/rnd/SECURE_MEMORY_RND_LEDGER.md
+docs/rnd/RND_SECURE_MEMORY_03_REPORT.md
+docs/rnd/IMPLEMENTATION_REPORT_secure_memory_rnd03.md
+docs/rnd/RND_SECURE_MEMORY_03_CHANGED_FILES.txt
+docs/rnd/RND_SECURE_MEMORY_03_ARCHIVE_MANIFEST.sha256

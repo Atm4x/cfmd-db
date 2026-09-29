@@ -95,3 +95,14 @@ mod journal_io;
 mod lifecycle;
 mod membership;
 mod replay;
+#[cfg_attr(not(test), allow(dead_code))]
+mod segments;
+#[cfg(test)]
+mod semantic_snapshot;
+
+pub(crate) use segments::{
+    ReplicationAuthorityLocatorRoot, ReplicationAuthoritySegmentExtent,
+    ReplicationAuthoritySegmentId, ReplicationAuthoritySegmentPlan, locator_stored_len,
+    recover_locator_chain, replay_indexed_segment_object_chain, write_locator_node,
+    write_segment_object,
+};

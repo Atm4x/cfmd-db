@@ -1,5 +1,5 @@
 use super::{
-    AdvisorTelemetry, AggregateSpec, ArtifactTelemetry, BTreeMap, BTreeSet, DurableRuntime, ExecutionStats, I64IndexBinding, LayoutBinding, LayoutId, OrderDirection, PhysicalCapability, PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy, PhysicalRecoveryReport, PhysicalStore, PreparedPlan, RelExpr, RelQueryError, RelType, RelationValue, SemanticId, SemanticIndexBinding, TelemetryDecayPolicy, UnifiedAdvisorPolicy, UnifiedArtifactId, Value,
+    AdvisorTelemetry, AggregateSpec, ArtifactTelemetry, BTreeMap, BTreeSet, DurableRuntime, ExecutionStats, I64IndexBinding, LayoutBinding, LayoutId, OrderComparison, OrderDirection, PhysicalCapability, PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy, PhysicalRecoveryReport, PhysicalStore, PreparedPlan, RelExpr, RelQueryError, RelType, RelationValue, SemanticId, SemanticIndexBinding, TelemetryDecayPolicy, UnifiedAdvisorPolicy, UnifiedArtifactId, Value,
 };
 use crate::native_relation::{native_column_count};
 use crate::semantic_rows::relation_value_from_rows;
@@ -9,9 +9,8 @@ use crate::multiway::{
     try_execute_multiway_join, try_execute_nway_order_preserving_join,
 };
 use crate::execution::{
-    execute_anti_join_plan, execute_difference_plan, execute_distinct_plan, execute_filter_columns,
-    execute_filter_const, execute_group_plan, execute_join_plan, execute_project_plan,
-    execute_top_k_plan, scan_rows, try_execute_native_fast_path,
+    execute_anti_join_plan, execute_difference_plan, execute_distinct_plan, execute_filter_columns, execute_filter_const, execute_filter_order, execute_group_plan, execute_join_plan, execute_project_plan,
+    execute_top_k_plan, scan_rows, try_execute_native_fast_path, OrderFilterSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +172,13 @@ pub enum Plan {
         column: usize,
         value: Value,
         equivalence: SemanticId,
+    },
+    FilterOrderConst {
+        input: Box<Self>,
+        column: usize,
+        value: Value,
+        ordering: SemanticId,
+        comparison: OrderComparison,
     },
     FilterEqColumns {
         input: Box<Self>,

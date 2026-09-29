@@ -767,6 +767,41 @@ fn matches_bound_or_resolved(
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct OrderFilterSpec<'a> {
+    pub(super) column: usize,
+    pub(super) value: &'a Value,
+    pub(super) ordering: SemanticId,
+    pub(super) comparison: OrderComparison,
+}
+
+pub(super) fn filter_order_rows(
+    rows: Vec<kernel_query::Row>,
+    spec: OrderFilterSpec<'_>,
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+    stats: &mut ExecutionStats,
+) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
+    let compiled = registry.compile_ordering(context, spec.ordering)?;
+    let threshold = compiled.canonical_key(spec.value)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let candidate = row
+            .get(spec.column)
+            .ok_or(RelQueryError::ColumnOutOfBounds)?;
+        stats.values_read = stats.values_read.saturating_add(1);
+        let order = compiled.canonical_key(candidate)?.cmp(&threshold);
+        let passes = match spec.comparison {
+            OrderComparison::Less => order.is_lt(),
+            OrderComparison::LessOrEqual => order.is_le(),
+            OrderComparison::Greater => order.is_gt(),
+            OrderComparison::GreaterOrEqual => order.is_ge(),
+        };
+        if passes { out.push(row); }
+    }
+    Ok(out)
+}
+
 pub(super) fn filter_rows_columns(
     rows: Vec<kernel_query::Row>,
     left_column: usize,

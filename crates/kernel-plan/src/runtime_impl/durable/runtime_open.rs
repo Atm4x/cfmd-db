@@ -107,6 +107,21 @@ impl DurableRuntime {
         )
     }
 
+    pub fn create_with_storage_options(
+        root: RuntimeRevisionBundle,
+        path: impl AsRef<std::path::Path>,
+        registry: &kernel_semantics::SemanticRegistry,
+        storage: &RuntimeStorageOptions,
+    ) -> Result<Self, DurabilityError> {
+        Self::create_with_storage_options_and_revision_publication_notifier(
+            root,
+            path,
+            registry,
+            storage,
+            Arc::new(InProcessRevisionPublicationNotifier::default()),
+        )
+    }
+
     pub fn create_with_revision_publication_notifier(
         root: RuntimeRevisionBundle,
         path: impl AsRef<std::path::Path>,
@@ -129,6 +144,22 @@ impl DurableRuntime {
         backend: RuntimeDurabilityBackend,
         revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
     ) -> Result<Self, DurabilityError> {
+        Self::create_with_storage_options_and_revision_publication_notifier(
+            root,
+            path,
+            registry,
+            &RuntimeStorageOptions::new(backend),
+            revision_publication,
+        )
+    }
+
+    pub fn create_with_storage_options_and_revision_publication_notifier(
+        root: RuntimeRevisionBundle,
+        path: impl AsRef<std::path::Path>,
+        registry: &kernel_semantics::SemanticRegistry,
+        storage: &RuntimeStorageOptions,
+        revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
+    ) -> Result<Self, DurabilityError> {
         let materialization_specs = root.durable_materialization_specs();
         let physical_artifact_specs = root.durable_physical_artifact_specs();
         let artifact_cores =
@@ -137,17 +168,24 @@ impl DurableRuntime {
                     offset: 0,
                     reason: "failed to derive durable artifact core",
                 })?;
-        let durability = match backend {
+        let durability = match storage.backend {
             RuntimeDurabilityBackend::SingleFile =>
-                DurableRevisionStore::create_single_file_with_materializations_physical_artifacts_and_cores(
+                DurableRevisionStore::create_single_file_with_encryption_and_materializations_physical_artifacts_and_cores(
                     path,
+                    &storage.encryption,
                     root.revision(),
                     &materialization_specs,
                     &physical_artifact_specs,
                     &artifact_cores,
                     registry,
                 )?,
-            RuntimeDurabilityBackend::Directory =>
+            RuntimeDurabilityBackend::Directory => {
+                if storage.encryption.algorithm().is_some() {
+                    return Err(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "directory storage encryption is not implemented",
+                    });
+                }
                 DurableRevisionStore::create_with_materializations_physical_artifacts_and_cores(
                     path,
                     root.revision(),
@@ -155,7 +193,8 @@ impl DurableRuntime {
                     &physical_artifact_specs,
                     &artifact_cores,
                     registry,
-                )?,
+                )?
+            }
         };
         Ok(Self {
             cell: RuntimeRevisionCell::new(root),
@@ -173,9 +212,22 @@ impl DurableRuntime {
         path: impl AsRef<std::path::Path>,
         backend: RuntimeDurabilityBackend,
     ) -> Result<Self, RuntimeRecoveryError> {
-        Self::open_with_backend_recovery_policy_and_revision_publication_notifier(
+        Self::open_with_storage_options_recovery_policy_and_revision_publication_notifier(
             path,
-            backend,
+            &RuntimeStorageOptions::new(backend),
+            PhysicalRecoveryPolicy::default(),
+            Arc::new(InProcessRevisionPublicationNotifier::default()),
+        )
+        .map(|(runtime, _)| runtime)
+    }
+
+    pub fn open_with_storage_options(
+        path: impl AsRef<std::path::Path>,
+        storage: &RuntimeStorageOptions,
+    ) -> Result<Self, RuntimeRecoveryError> {
+        Self::open_with_storage_options_recovery_policy_and_revision_publication_notifier(
+            path,
+            storage,
             PhysicalRecoveryPolicy::default(),
             Arc::new(InProcessRevisionPublicationNotifier::default()),
         )
@@ -224,9 +276,33 @@ impl DurableRuntime {
         physical_recovery_policy: PhysicalRecoveryPolicy,
         revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
     ) -> Result<(Self, PhysicalRecoveryReport), RuntimeRecoveryError> {
-        let (durability, scan) = match backend {
-            RuntimeDurabilityBackend::SingleFile => DurableRevisionStore::open_single_file(path)?,
-            RuntimeDurabilityBackend::Directory => DurableRevisionStore::open(path)?,
+        Self::open_with_storage_options_recovery_policy_and_revision_publication_notifier(
+            path,
+            &RuntimeStorageOptions::new(backend),
+            physical_recovery_policy,
+            revision_publication,
+        )
+    }
+
+    pub fn open_with_storage_options_recovery_policy_and_revision_publication_notifier(
+        path: impl AsRef<std::path::Path>,
+        storage: &RuntimeStorageOptions,
+        physical_recovery_policy: PhysicalRecoveryPolicy,
+        revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
+    ) -> Result<(Self, PhysicalRecoveryReport), RuntimeRecoveryError> {
+        let (durability, scan) = match storage.backend {
+            RuntimeDurabilityBackend::SingleFile => {
+                DurableRevisionStore::open_single_file_with_encryption(path, &storage.encryption)?
+            }
+            RuntimeDurabilityBackend::Directory => {
+                if storage.encryption.algorithm().is_some() {
+                    return Err(RuntimeRecoveryError::Durability(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "directory storage encryption is not implemented",
+                    }));
+                }
+                DurableRevisionStore::open(path)?
+            }
         };
         let registry = durability.semantic_registry().clone();
         let materialization_specs = durability

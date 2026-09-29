@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 
 use kernel_change::RevisionEffectId;
 use kernel_semantics::BuiltinSemanticModuleSpec;
 use kernel_types::{ClientTransactionId, RevisionId};
 
-use crate::binary_codec::{Cursor, push_len, push_u64, push_u128};
+use crate::binary_codec::{
+    BinarySink, BinarySource, CountingBinarySink, Cursor, ReadBinarySource, StreamingBinarySink,
+    push_len, push_u64, push_u128,
+};
 use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
 };
@@ -12,7 +16,7 @@ use crate::domain::{
     DurableExternalFreshnessBinding, DurableMigrationComplement, DurableRevisionEffectRecord,
     DurableTransactionIntent, DurableTransactionKey, IdempotencyEpoch,
 };
-use crate::runtime::CodecError;
+use crate::runtime::{CodecError, DurabilityError};
 
 use super::artifact_codec::{
     decode_artifact_cores, decode_materialization_specs, decode_migration_complements,
@@ -48,48 +52,72 @@ type DecodedRevisionEffectState = (
     BTreeMap<RevisionId, BTreeSet<RevisionEffectId>>,
 );
 
+#[cfg(test)]
 pub(crate) fn encode(metadata: &DurableStoreMetadata) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::new();
+    encode_into(&mut out, metadata)?;
+    Ok(out)
+}
+
+pub(crate) fn encoded_len(metadata: &DurableStoreMetadata) -> Result<u64, CodecError> {
+    let mut sink = CountingBinarySink::default();
+    encode_into(&mut sink, metadata)?;
+    sink.len()
+}
+
+pub(crate) fn stream(
+    metadata: &DurableStoreMetadata,
+    emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+) -> Result<(), DurabilityError> {
+    let mut sink = StreamingBinarySink::new(emit);
+    encode_into(&mut sink, metadata)?;
+    sink.finish()
+}
+
+pub(crate) fn encode_into(
+    out: &mut impl BinarySink,
+    metadata: &DurableStoreMetadata,
+) -> Result<(), CodecError> {
     out.extend_from_slice(&METADATA_CODEC_VERSION.to_le_bytes());
     if metadata.minimum_retry_epoch > metadata.current_idempotency_epoch {
         return Err(CodecError::CollectionTooLarge);
     }
-    push_u64(&mut out, metadata.current_idempotency_epoch.raw());
-    push_u64(&mut out, metadata.minimum_retry_epoch.raw());
-    encode_materialization_specs(&mut out, &metadata.materializations)?;
-    encode_physical_artifact_specs(&mut out, &metadata.physical_artifacts)?;
-    encode_artifact_cores(&mut out, &metadata.artifact_cores)?;
-    encode_migration_complements(&mut out, &metadata.migration_complements)?;
-    push_len(&mut out, metadata.committed_transactions.len())?;
+    push_u64(out, metadata.current_idempotency_epoch.raw());
+    push_u64(out, metadata.minimum_retry_epoch.raw());
+    encode_materialization_specs(out, &metadata.materializations)?;
+    encode_physical_artifact_specs(out, &metadata.physical_artifacts)?;
+    encode_artifact_cores(out, &metadata.artifact_cores)?;
+    encode_migration_complements(out, &metadata.migration_complements)?;
+    push_len(out, metadata.committed_transactions.len())?;
     for (key, intent) in &metadata.committed_transactions {
         if key.epoch < metadata.minimum_retry_epoch
             || key.epoch > metadata.current_idempotency_epoch
         {
             return Err(CodecError::CollectionTooLarge);
         }
-        push_u64(&mut out, key.epoch.raw());
-        push_u128(&mut out, key.transaction_id.raw());
-        encode_transaction_intent(&mut out, intent)?;
+        push_u64(out, key.epoch.raw());
+        push_u128(out, key.transaction_id.raw());
+        encode_transaction_intent(out, intent)?;
     }
     let mut modules = metadata.semantic_modules.clone();
     modules.sort_by_key(|spec| spec.digest());
     modules.dedup_by_key(|spec| spec.digest());
-    push_len(&mut out, modules.len())?;
+    push_len(out, modules.len())?;
     for spec in modules {
-        encode_semantic_module_spec(&mut out, spec);
+        encode_semantic_module_spec(out, spec);
     }
     encode_revision_effect_state(
-        &mut out,
+        out,
         metadata.causal_coverage_root,
         &metadata.revision_effects,
         &metadata.revision_effect_frontiers,
     )?;
-    encode_external_freshness(&mut out, metadata.external_freshness);
-    Ok(out)
+    encode_external_freshness(out, metadata.external_freshness);
+    Ok(())
 }
 
 fn decode_metadata_header(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<(u16, IdempotencyEpoch, IdempotencyEpoch), &'static str> {
     let version = cursor.u16()?;
     if !matches!(version, 1..=9 | 11..=METADATA_CODEC_VERSION) {
@@ -111,21 +139,34 @@ fn decode_metadata_header(
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str> {
     let mut cursor = Cursor::new(bytes);
-    let (version, current_idempotency_epoch, minimum_retry_epoch) =
-        decode_metadata_header(&mut cursor)?;
-    let materializations = decode_materialization_specs(&mut cursor)?;
+    decode_from_cursor(&mut cursor)
+}
+
+pub(crate) fn decode_from_reader(
+    reader: &mut dyn Read,
+    len: u64,
+) -> Result<DurableStoreMetadata, &'static str> {
+    let mut cursor = ReadBinarySource::new(reader, len);
+    decode_from_cursor(&mut cursor)
+}
+
+fn decode_from_cursor(
+    cursor: &mut impl BinarySource,
+) -> Result<DurableStoreMetadata, &'static str> {
+    let (version, current_idempotency_epoch, minimum_retry_epoch) = decode_metadata_header(cursor)?;
+    let materializations = decode_materialization_specs(cursor)?;
     let physical_artifacts = if version >= 5 {
-        decode_physical_artifact_specs(&mut cursor)?
+        decode_physical_artifact_specs(cursor)?
     } else {
         Vec::new()
     };
     let artifact_cores = if version >= 11 {
-        decode_artifact_cores(&mut cursor)?
+        decode_artifact_cores(cursor)?
     } else {
         Vec::new()
     };
     let migration_complements = if version >= 7 {
-        decode_migration_complements(&mut cursor)?
+        decode_migration_complements(cursor)?
     } else {
         Vec::new()
     };
@@ -153,7 +194,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str>
                 target_revision: RevisionId::new(cursor.u64()?),
             }
         } else {
-            decode_transaction_intent(&mut cursor)?
+            decode_transaction_intent(cursor)?
         };
         committed_transactions.insert(key, intent);
     }
@@ -164,7 +205,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str>
         let mut modules = Vec::with_capacity(cursor.bounded_capacity(count));
         let mut previous = None;
         for _ in 0..count {
-            let spec = decode_semantic_module_spec(&mut cursor)?;
+            let spec = decode_semantic_module_spec(cursor)?;
             let digest = spec.digest();
             if previous.is_some_and(|prior| prior >= digest) {
                 return Err("semantic module digests are not strictly sorted and unique");
@@ -175,12 +216,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str>
         modules
     };
     let (causal_coverage_root, revision_effects, revision_effect_frontiers) = if version >= 9 {
-        decode_revision_effect_state(&mut cursor, version, &committed_transactions)?
+        decode_revision_effect_state(cursor, version, &committed_transactions)?
     } else {
         (None, BTreeMap::new(), BTreeMap::new())
     };
     let external_freshness = if version >= 13 {
-        decode_external_freshness(&mut cursor)?
+        decode_external_freshness(cursor)?
     } else {
         None
     };
@@ -201,7 +242,10 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str>
     })
 }
 
-fn encode_external_freshness(out: &mut Vec<u8>, binding: Option<DurableExternalFreshnessBinding>) {
+fn encode_external_freshness(
+    out: &mut impl crate::binary_codec::BinarySink,
+    binding: Option<DurableExternalFreshnessBinding>,
+) {
     let Some(binding) = binding else {
         out.push(0);
         return;
@@ -220,22 +264,22 @@ fn encode_external_freshness(out: &mut Vec<u8>, binding: Option<DurableExternalF
 }
 
 fn decode_external_freshness(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Option<DurableExternalFreshnessBinding>, &'static str> {
     if cursor.u8()? == 0 {
         return Ok(None);
     }
     let mut store_id = [0_u8; 32];
-    store_id.copy_from_slice(cursor.take(32)?);
+    store_id.copy_from_slice(&cursor.take_owned(32)?);
     let previous_generation_digest = if cursor.u8()? == 0 {
-        let zero = cursor.take(32)?;
+        let zero = cursor.take_owned(32)?;
         if zero.iter().any(|byte| *byte != 0) {
             return Err("external freshness none digest is nonzero");
         }
         None
     } else {
         let mut digest = [0_u8; 32];
-        digest.copy_from_slice(cursor.take(32)?);
+        digest.copy_from_slice(&cursor.take_owned(32)?);
         Some(kernel_auth::AuthorityDigest(digest))
     };
     Ok(Some(DurableExternalFreshnessBinding {
@@ -247,7 +291,7 @@ fn decode_external_freshness(
 }
 
 fn encode_revision_effect_state(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     causal_coverage_root: Option<RevisionId>,
     effects: &BTreeMap<RevisionEffectId, DurableRevisionEffectRecord>,
     frontiers: &BTreeMap<RevisionId, BTreeSet<RevisionEffectId>>,
@@ -290,7 +334,7 @@ fn encode_revision_effect_state(
 }
 
 fn decode_revision_effect_state(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     metadata_version: u16,
     transactions: &BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
 ) -> Result<DecodedRevisionEffectState, &'static str> {

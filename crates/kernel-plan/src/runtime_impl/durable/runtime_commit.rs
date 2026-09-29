@@ -36,7 +36,12 @@ impl DurableRuntime {
                 &mut *durability,
             )
             .map(|receipt| {
-                self.signal_revision_publication();
+                let relations = request
+                    .mutations
+                    .iter()
+                    .map(|mutation| mutation.relation)
+                    .collect::<Vec<_>>();
+                self.signal_relation_publication(&relations);
                 DurableRuntimeCommitOutcome::Committed(receipt)
             })
     }
@@ -90,7 +95,12 @@ impl DurableRuntime {
         self.cell
             .commit_mixed_revision_durable(transaction_id, &authorized_request, &mut *durability)
             .map(|receipt| {
-                self.signal_revision_publication();
+                let relations = request
+                    .mutations
+                    .iter()
+                    .map(|mutation| mutation.relation)
+                    .collect::<Vec<_>>();
+                self.signal_relation_publication(&relations);
                 DurableRuntimeCommitOutcome::Committed(receipt)
             })
     }
@@ -150,7 +160,12 @@ impl DurableRuntime {
         self.cell
             .commit_prepared_durable(transaction_id, prepared, &self.registry, &mut *durability)
             .map(|receipt| {
-                self.signal_revision_publication();
+                let relations = request
+                    .mutations
+                    .iter()
+                    .map(|mutation| mutation.relation)
+                    .collect::<Vec<_>>();
+                self.signal_relation_publication(&relations);
                 DurableRuntimeCommitOutcome::Committed(receipt)
             })
     }
@@ -216,7 +231,12 @@ impl DurableRuntime {
         self.cell
             .commit_prepared_durable(transaction_id, prepared, &self.registry, &mut *durability)
             .map(|receipt| {
-                self.signal_revision_publication();
+                let relations = request
+                    .rewrites
+                    .iter()
+                    .map(|rewrite| rewrite.relation)
+                    .collect::<Vec<_>>();
+                self.signal_relation_publication(&relations);
                 DurableRuntimeCommitOutcome::Committed(receipt)
             })
     }
@@ -294,7 +314,7 @@ impl DurableRuntime {
                 &mut *durability,
             )
             .map(|receipt| {
-                self.signal_revision_publication();
+                self.signal_relation_publication(&[relation]);
                 DurableRuntimeCommitOutcome::Committed(receipt)
             })
     }
@@ -521,7 +541,7 @@ impl DurableRuntime {
                 &mut *durability,
             )
             .map(|receipt| {
-                self.signal_revision_publication();
+                self.signal_relation_publication(&[relation]);
                 DurableRuntimeCommitOutcome::Committed(receipt)
             })
     }

@@ -1,6 +1,6 @@
 use super::{
-    Change, MaterializedSetSupportState, RelExpr, RelQueryError, RelType, RelationDelta, Row,
-    Value, project_rows, query_types_compatible, relation_column_equivalence,
+    Change, MaterializedSetSupportState, OrderComparison, RelExpr, RelQueryError, RelType,
+    RelationDelta, Row, Value, project_rows, query_types_compatible, relation_column_equivalence,
     relation_column_equivalences, unmatched_semantic_rows, validate_query_equivalence,
     value_shape_matches_type,
 };
@@ -80,6 +80,64 @@ pub(super) fn rel_delta_filter(
                 match registry.equivalent(context, equivalence, candidate, value) {
                     Ok(true) => Some(Ok(row)),
                     Ok(false) => None,
+                    Err(error) => Some(Err(error.into())),
+                }
+            })
+            .collect()
+    };
+
+    Ok(RelationDelta {
+        inserted: filter_rows(input_delta.inserted)?,
+        removed: filter_rows(input_delta.removed)?,
+        result_type: input_delta.result_type,
+    })
+}
+
+pub(super) fn rel_delta_filter_order_const(
+    input_delta: RelationDelta,
+    column: usize,
+    value: &Value,
+    ordering: kernel_types::SemanticId,
+    comparison: OrderComparison,
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<RelationDelta, RelQueryError> {
+    let column_type = input_delta
+        .result_type
+        .columns
+        .get(column)
+        .ok_or(RelQueryError::ColumnOutOfBounds)?;
+    let ordering_domain = registry.ordering_domain(context, ordering)?;
+    let expected = kernel_semantics::domain_for_type(column_type)
+        .map(kernel_semantics::OrderingDomain::from)
+        .ok_or(RelQueryError::TypeMismatch)?;
+    if ordering_domain != expected {
+        return Err(RelQueryError::TypeMismatch);
+    }
+    let equivalence = relation_column_equivalence(&input_delta.result_type, column)?;
+    if !registry.ordering_congruent_with_equivalence(context, ordering, equivalence)? {
+        return Err(RelQueryError::OrderingNotCongruentWithEquality);
+    }
+    if !value_shape_matches_type(value, column_type) {
+        return Err(RelQueryError::TypeMismatch);
+    }
+
+    let filter_rows = |rows: Vec<Row>| -> Result<Vec<Row>, RelQueryError> {
+        rows.into_iter()
+            .filter_map(|row| {
+                let Some(candidate) = row.get(column) else {
+                    return Some(Err(RelQueryError::ColumnOutOfBounds));
+                };
+                match registry.compare(context, ordering, candidate, value) {
+                    Ok(order) => {
+                        let passes = match comparison {
+                            OrderComparison::Less => order.is_lt(),
+                            OrderComparison::LessOrEqual => order.is_le(),
+                            OrderComparison::Greater => order.is_gt(),
+                            OrderComparison::GreaterOrEqual => order.is_ge(),
+                        };
+                        passes.then_some(Ok(row))
+                    }
                     Err(error) => Some(Err(error.into())),
                 }
             })

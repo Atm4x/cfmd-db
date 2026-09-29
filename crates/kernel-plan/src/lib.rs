@@ -9,7 +9,6 @@ use kernel_change::{
     RevisionEffectResidualSquareChainCertificate, RevisionEffectResidualSquareLayerCertificate,
     RewriteLawSetId, RewriteResidualCubeCertificate, RewriteSpecId,
 };
-pub use kernel_durability::DurableModelDelta;
 use kernel_durability::{
     DurabilityError, DurableArtifactCore, DurableCommitReceipt, DurableEffectKind,
     DurableGenerationReceipt, DurableMaterializationSpec, DurableMigrationComplement,
@@ -19,15 +18,19 @@ use kernel_durability::{
     DurableSemanticKeyPart, DurableTransactionIntent, DurableTransactionOutcome, IdempotencyEpoch,
     RecoveryScan, RevisionDurability,
 };
+pub use kernel_durability::{
+    DurableModelDelta, StorageAeadAlgorithm, StorageEncryption, StorageEncryptionKey,
+    StorageEncryptionKeyInitError,
+};
 use kernel_identity::{DenseEntityIds, LocalEntityId};
 use kernel_model::Value;
 use kernel_persistent::{
     PersistentOrdMap, PersistentOrdSet, PersistentVec as PersistentPhysicalVec,
 };
 use kernel_query::{
-    AggregateSpec, Impact, MaterializedRelPlanState, OrderDirection, PreparedRelationRewrite,
-    RelExpr, RelObservationGuard, RelQueryError, RelType, RelationBaseWitness, RelationDelta,
-    RelationValue, StorageResolvedRelationDelta,
+    AggregateSpec, Impact, MaterializedRelPlanState, OrderComparison, OrderDirection,
+    PreparedRelationRewrite, RelExpr, RelObservationGuard, RelQueryError, RelType,
+    RelationBaseWitness, RelationDelta, RelationValue, StorageResolvedRelationDelta,
 };
 pub use kernel_types::StableRowHandle as PhysicalRowId;
 use kernel_types::{ClientTransactionId, EqClassId, RevisionId, RevisionObservableId, SemanticId};
@@ -92,8 +95,8 @@ pub use runtime_impl::{
     RuntimeRepairObservationTransport, RuntimeRepairRelationMutation, RuntimeRevisionBundle,
     RuntimeRevisionCell, RuntimeRevisionDerivationError, RuntimeRevisionPublicationNotifier,
     RuntimeRevisionPublicationWaitHandle, RuntimeRevisionPublicationWaitOutcome,
-    RuntimeRevisionSnapshot, RuntimeRewriteIntent, RuntimeRootVersion, RuntimeViolationState,
-    SealedRuntimeRevisionTransition,
+    RuntimeRevisionSnapshot, RuntimeRewriteIntent, RuntimeRootVersion, RuntimeStorageOptions,
+    RuntimeViolationState, SealedRuntimeRevisionTransition,
 };
 
 mod recovery;

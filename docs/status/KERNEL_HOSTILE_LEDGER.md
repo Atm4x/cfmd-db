@@ -53,3 +53,15 @@ Production source is intentionally not spammed with `// CLEAR` markers, which be
 - `SPECIALIZE` — specialized implementation of a shared semantic principle.
 
 Any future `PAYER`/`RESIDUE` must be reflected in this ledger before a kernel can remain marked frozen.
+
+## P324 — replication authority copy amplification
+
+**OPEN — architectural replacement identified.** P323 removed whole-archive RAM duplication but each checkpoint still physically recopies the retained replication-authority byte history. P324 proved that simply replacing the log with one semantic snapshot does not close the worst case because replicated effects/frontiers are history-bearing causal semantics. The accepted direction is a persistent content-addressed authority-segment chain/tree with bounded delta publication and relocatable physical indexing. No generic "compact frames and fall back to old journal" path is accepted. See `docs/architecture/REPLICATION_AUTHORITY_COMPACTION.md`.
+
+## P325 — executable replication authority segment foundation
+
+**OPEN — identity/index/replay law executable; physical authority integration remains.** `CFAS` segments now bind exact existing replication frames to a parent `ReplicationAuthoritySegmentId`; `CFAI` provides a canonical relocatable index and rejects missing/unreachable parents, cycles, overlapping extents and conflicting duplicate IDs. Segment-chain replay is frame-bounded and feeds the maintained `ReplicationAuthorityJournal` replay semantics. Executable tests establish flat-history semantic equivalence, relocation invariance, exact-byte tamper rejection and parent-sensitive identity. The P323 product checkpoint path still recopies the historical authority section because SingleFile root/generation authority does not yet publish immutable external segment extents. P326 must integrate that physical authority with persistent O(new-delta) locator metadata and compaction closure before this payer can close. Rewriting the complete relocatable index each checkpoint is explicitly rejected because that would itself accumulate O(N²) index-entry writes.
+
+## P327 — authenticated immutable replication-authority objects
+
+**OPEN — P326 security blocker closed at the object layer; physical activation remains.** The rejected P326 candidate demonstrated O(new-delta) `CFAS` + linked locator publication but would have placed external authority payloads outside AE v1. P327 adds a dedicated HKDF-separated `ImmutableObject` AE domain and bounded 64 KiB `CFAO` object stream. AAD binds object kind, plaintext `SegmentId`, parent `SegmentId`, plaintext length and chunk identity while excluding physical location, so compaction can relocate exact authenticated bytes without decrypt/re-encrypt. Encrypted/plaintext object modes are fail-closed rather than fallback routes. `ReplicationAuthoritySegmentId` remains nonce/relocation invariant and object replay still feeds the maintained two-pass segment verifier/evaluator. The P323 archive-copy product path remains authoritative until P328 restores linked locator/root publication and segment-aware compaction on top of this boundary.

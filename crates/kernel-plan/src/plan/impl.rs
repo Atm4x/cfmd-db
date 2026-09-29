@@ -16,23 +16,20 @@ impl Plan {
                 column,
                 value,
                 equivalence,
-            } => Self::FilterEqConst {
-                input: Box::new(Self::lower_with_catalog(input, catalog)),
-                column: *column,
-                value: value.clone(),
-                equivalence: *equivalence,
-            },
+            } => Self::lower_eq_filter(input, *column, value, *equivalence, catalog),
+            RelExpr::FilterOrderConst { .. } => Self::lower_order_filter(expr, catalog),
             RelExpr::FilterEqColumns {
                 input,
                 left_column,
                 right_column,
                 equivalence,
-            } => Self::FilterEqColumns {
-                input: Box::new(Self::lower_with_catalog(input, catalog)),
-                left_column: *left_column,
-                right_column: *right_column,
-                equivalence: *equivalence,
-            },
+            } => Self::lower_column_filter(
+                input,
+                *left_column,
+                *right_column,
+                *equivalence,
+                catalog,
+            ),
             RelExpr::Project { input, columns } => Self::Project {
                 input: Box::new(Self::lower_with_catalog(input, catalog)),
                 columns: columns.clone(),
@@ -61,13 +58,14 @@ impl Plan {
                 left_column,
                 right_column,
                 equivalence,
-            } => Self::AntiJoin {
-                left: Box::new(Self::lower_with_catalog(left, catalog)),
-                right: Box::new(Self::lower_with_catalog(right, catalog)),
-                left_column: *left_column,
-                right_column: *right_column,
-                equivalence: *equivalence,
-            },
+            } => Self::lower_anti_join(
+                left,
+                right,
+                *left_column,
+                *right_column,
+                *equivalence,
+                catalog,
+            ),
             RelExpr::Distinct {
                 input,
                 column_equivalences,
@@ -80,25 +78,27 @@ impl Plan {
                 group_columns,
                 group_equivalences,
                 aggregate,
-            } => Self::Group {
-                input: Box::new(Self::lower_with_catalog(input, catalog)),
-                group_columns: group_columns.clone(),
-                group_equivalences: group_equivalences.clone(),
-                aggregate: aggregate.clone(),
-            },
+            } => Self::lower_group(
+                input,
+                group_columns,
+                group_equivalences,
+                aggregate,
+                catalog,
+            ),
             RelExpr::TopKWithTies {
                 input,
                 column,
                 ordering,
                 direction,
                 k,
-            } => Self::TopKWithTies {
-                input: Box::new(Self::lower_with_catalog(input, catalog)),
-                column: *column,
-                ordering: *ordering,
-                direction: *direction,
-                k: *k,
-            },
+            } => Self::lower_top_k(
+                input,
+                *column,
+                *ordering,
+                *direction,
+                *k,
+                catalog,
+            ),
             RelExpr::PromoteToBag(input) => {
                 Self::PromoteToBag(Box::new(Self::lower_with_catalog(input, catalog)))
             }
@@ -124,6 +124,105 @@ impl Plan {
         }
     }
 
+    fn lower_eq_filter(
+        input: &RelExpr,
+        column: usize,
+        value: &Value,
+        equivalence: SemanticId,
+        catalog: &PhysicalCatalog,
+    ) -> Self {
+        Self::FilterEqConst {
+            input: Box::new(Self::lower_with_catalog(input, catalog)),
+            column,
+            value: value.clone(),
+            equivalence,
+        }
+    }
+
+    fn lower_column_filter(
+        input: &RelExpr,
+        left_column: usize,
+        right_column: usize,
+        equivalence: SemanticId,
+        catalog: &PhysicalCatalog,
+    ) -> Self {
+        Self::FilterEqColumns {
+            input: Box::new(Self::lower_with_catalog(input, catalog)),
+            left_column,
+            right_column,
+            equivalence,
+        }
+    }
+
+    fn lower_anti_join(
+        left: &RelExpr,
+        right: &RelExpr,
+        left_column: usize,
+        right_column: usize,
+        equivalence: SemanticId,
+        catalog: &PhysicalCatalog,
+    ) -> Self {
+        Self::AntiJoin {
+            left: Box::new(Self::lower_with_catalog(left, catalog)),
+            right: Box::new(Self::lower_with_catalog(right, catalog)),
+            left_column,
+            right_column,
+            equivalence,
+        }
+    }
+
+    fn lower_top_k(
+        input: &RelExpr,
+        column: usize,
+        ordering: SemanticId,
+        direction: OrderDirection,
+        k: usize,
+        catalog: &PhysicalCatalog,
+    ) -> Self {
+        Self::TopKWithTies {
+            input: Box::new(Self::lower_with_catalog(input, catalog)),
+            column,
+            ordering,
+            direction,
+            k,
+        }
+    }
+
+    fn lower_order_filter(expr: &RelExpr, catalog: &PhysicalCatalog) -> Self {
+        let RelExpr::FilterOrderConst {
+            input,
+            column,
+            value,
+            ordering,
+            comparison,
+        } = expr
+        else {
+            unreachable!("lower_order_filter requires FilterOrderConst");
+        };
+        Self::FilterOrderConst {
+            input: Box::new(Self::lower_with_catalog(input, catalog)),
+            column: *column,
+            value: value.clone(),
+            ordering: *ordering,
+            comparison: *comparison,
+        }
+    }
+
+    fn lower_group(
+        input: &RelExpr,
+        group_columns: &[usize],
+        group_equivalences: &[SemanticId],
+        aggregate: &AggregateSpec,
+        catalog: &PhysicalCatalog,
+    ) -> Self {
+        Self::Group {
+            input: Box::new(Self::lower_with_catalog(input, catalog)),
+            group_columns: group_columns.to_vec(),
+            group_equivalences: group_equivalences.to_vec(),
+            aggregate: aggregate.clone(),
+        }
+    }
+
     #[must_use]
     pub fn to_logical_expr(&self) -> RelExpr {
         match self {
@@ -139,6 +238,13 @@ impl Plan {
                 value: value.clone(),
                 equivalence: *equivalence,
             },
+            Self::FilterOrderConst {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => Self::order_filter_to_logical(input, *column, value, *ordering, *comparison),
             Self::FilterEqColumns {
                 input,
                 left_column,
@@ -198,12 +304,7 @@ impl Plan {
                 group_equivalences,
                 aggregate,
                 ..
-            } => RelExpr::Group {
-                input: Box::new(input.to_logical_expr()),
-                group_columns: group_columns.clone(),
-                group_equivalences: group_equivalences.clone(),
-                aggregate: aggregate.clone(),
-            },
+            } => Self::group_to_logical(input, group_columns, group_equivalences, aggregate),
             Self::TopKWithTies {
                 input,
                 column,
@@ -222,6 +323,36 @@ impl Plan {
         }
     }
 
+    fn order_filter_to_logical(
+        input: &Self,
+        column: usize,
+        value: &Value,
+        ordering: SemanticId,
+        comparison: OrderComparison,
+    ) -> RelExpr {
+        RelExpr::FilterOrderConst {
+            input: Box::new(input.to_logical_expr()),
+            column,
+            value: value.clone(),
+            ordering,
+            comparison,
+        }
+    }
+
+    fn group_to_logical(
+        input: &Self,
+        group_columns: &[usize],
+        group_equivalences: &[SemanticId],
+        aggregate: &AggregateSpec,
+    ) -> RelExpr {
+        RelExpr::Group {
+            input: Box::new(input.to_logical_expr()),
+            group_columns: group_columns.to_vec(),
+            group_equivalences: group_equivalences.to_vec(),
+            aggregate: aggregate.clone(),
+        }
+    }
+
     #[must_use]
     pub fn shape(&self) -> PlanShape {
         let mut shape = PlanShape::default();
@@ -233,7 +364,7 @@ impl Plan {
         shape.nodes += 1;
         match self {
             Self::Scan { .. } => shape.scans += 1,
-            Self::FilterEqConst { input, .. } | Self::FilterEqColumns { input, .. } => {
+            Self::FilterEqConst { input, .. } | Self::FilterOrderConst { input, .. } | Self::FilterEqColumns { input, .. } => {
                 shape.filters += 1;
                 input.accumulate_shape(shape);
             }
@@ -292,6 +423,7 @@ impl Plan {
         match self {
             Self::Distinct { .. } | Self::Group { .. } => true,
             Self::FilterEqConst { input, .. }
+            | Self::FilterOrderConst { input, .. }
             | Self::FilterEqColumns { input, .. }
             | Self::TopKWithTies { input, .. } => input.guarantees_set_uniqueness(),
             Self::Scan { .. }
@@ -456,6 +588,24 @@ impl Plan {
                 (context, registry),
                 stats,
             ),
+            Self::FilterOrderConst {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => execute_filter_order(
+                input,
+                OrderFilterSpec {
+                    column: *column,
+                    value,
+                    ordering: *ordering,
+                    comparison: *comparison,
+                },
+                store,
+                (context, registry),
+                stats,
+            ),
             Self::FilterEqColumns {
                 input,
                 left_column,
@@ -549,6 +699,7 @@ impl Plan {
             ),
             Self::Project { .. }
             | Self::FilterEqConst { .. }
+            | Self::FilterOrderConst { .. }
             | Self::FilterEqColumns { .. }
             | Self::Scan { .. }
             | Self::PromoteToBag(_) => unreachable!("simple plan delegated to complex executor"),

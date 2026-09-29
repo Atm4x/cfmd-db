@@ -1,4 +1,5 @@
 use crate::runtime::DurabilityError;
+use crate::single_file::compaction_io::SingleFileCompactionIoStep;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StoreFaultPoint {
@@ -12,6 +13,7 @@ pub(super) enum StoreFaultPoint {
     BeforeCompactionRemove,
     AfterCompactionRemove,
     AfterCompactionDirectorySync,
+    SingleFileCompaction(SingleFileCompactionIoStep),
 }
 
 pub(super) trait StoreFaultHook {

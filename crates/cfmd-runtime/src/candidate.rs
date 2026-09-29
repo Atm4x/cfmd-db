@@ -84,11 +84,37 @@ impl CandidateDiagnostics {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CandidateDerivedEffects {
+    normalized_rows_removed: usize,
+    orphan_entities_deleted: usize,
+}
+
+impl CandidateDerivedEffects {
+    /// Rows removed by lifecycle/normalization beyond the Plan's explicit row removals.
+    #[must_use]
+    pub const fn normalized_rows_removed(self) -> usize {
+        self.normalized_rows_removed
+    }
+
+    /// Owned target objects deleted only because their final owner set became empty.
+    #[must_use]
+    pub const fn orphan_entities_deleted(self) -> usize {
+        self.orphan_entities_deleted
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.normalized_rows_removed == 0 && self.orphan_entities_deleted == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidatePreview {
     source_revision: RevisionId,
     target_revision: RevisionId,
     effects: CandidateEffects,
+    derived: CandidateDerivedEffects,
     diagnostics: CandidateDiagnostics,
 }
 
@@ -106,6 +132,10 @@ impl CandidatePreview {
         self.effects
     }
     #[must_use]
+    pub const fn derived(self) -> CandidateDerivedEffects {
+        self.derived
+    }
+    #[must_use]
     pub const fn diagnostics(self) -> CandidateDiagnostics {
         self.diagnostics
     }
@@ -121,6 +151,61 @@ pub struct Candidate {
     plan: Plan,
     target: Arc<kernel_revision::Revision>,
     changes: Vec<RelationChange>,
+}
+
+fn relation_len(
+    relations: &kernel_model::RelationStore,
+    relation: kernel_types::SemanticId,
+) -> usize {
+    relations.get(&relation).map_or(0, Vec::len)
+}
+
+fn expected_relation_len(plan: &Plan, relation: RelationId) -> usize {
+    let source = relation_len(
+        &plan.source.revision().state().model.relations,
+        relation.into(),
+    );
+    let Some(mutation) = plan.mutations.get(&relation) else {
+        return source;
+    };
+    source
+        .saturating_add(mutation.inserted.len())
+        .saturating_sub(mutation.removed.len())
+}
+
+fn derived_effects(plan: &Plan, target: &kernel_revision::Revision) -> CandidateDerivedEffects {
+    let source_relations = &plan.source.revision().state().model.relations;
+    let target_relations = &target.state().model.relations;
+    let mut normalized_rows_removed = 0usize;
+
+    let relation_ids = source_relations
+        .keys()
+        .chain(target_relations.keys())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    for relation in relation_ids {
+        let public = RelationId::new(relation.raw());
+        let expected = expected_relation_len(plan, public);
+        let actual = relation_len(target_relations, relation);
+        normalized_rows_removed =
+            normalized_rows_removed.saturating_add(expected.saturating_sub(actual));
+    }
+
+    let mut orphan_entities_deleted = 0usize;
+    for contract in plan.owned_relations.values() {
+        if contract.orphan_policy != crate::OrphanPolicy::DeleteIfUnowned {
+            continue;
+        }
+        let expected = expected_relation_len(plan, contract.target_relation);
+        let actual = relation_len(target_relations, contract.target_relation.into());
+        orphan_entities_deleted =
+            orphan_entities_deleted.saturating_add(expected.saturating_sub(actual));
+    }
+
+    CandidateDerivedEffects {
+        normalized_rows_removed,
+        orphan_entities_deleted,
+    }
 }
 
 impl Candidate {
@@ -210,6 +295,7 @@ impl Candidate {
             source_revision: self.source_revision(),
             target_revision: self.revision(),
             effects: self.effects(),
+            derived: derived_effects(&self.plan, &self.target),
             diagnostics: self.diagnostics(),
         }
     }
@@ -219,7 +305,7 @@ impl Candidate {
         let prepared = query
             .inner
             .prepare(self.target.semantic_context(), &self.plan.registry)
-            .map_err(|error| crate::query::query_error(&error))?;
+            .map_err(|error| crate::query::query_error_at(query, &error))?;
         prepared
             .evaluate(
                 &self.target.state().model,
@@ -227,7 +313,7 @@ impl Candidate {
                 &self.plan.registry,
             )
             .map(Into::into)
-            .map_err(|error| crate::query::query_error(&error))
+            .map_err(|error| crate::query::query_error_at(query, &error))
     }
 
     pub fn objects<E: Object>(&self) -> Result<CandidateObjectSet<E>> {

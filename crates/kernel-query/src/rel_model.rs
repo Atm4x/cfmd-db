@@ -114,6 +114,14 @@ pub enum AggregateSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderComparison {
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderDirection {
     Ascending,
     Descending,
@@ -127,6 +135,13 @@ pub enum RelExpr {
         column: usize,
         value: Value,
         equivalence: kernel_types::SemanticId,
+    },
+    FilterOrderConst {
+        input: Box<Self>,
+        column: usize,
+        value: Value,
+        ordering: kernel_types::SemanticId,
+        comparison: OrderComparison,
     },
     FilterEqColumns {
         input: Box<Self>,

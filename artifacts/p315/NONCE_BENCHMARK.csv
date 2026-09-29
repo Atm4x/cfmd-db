@@ -1,0 +1,3 @@
+method,total_ns,ns_per_nonce
+getrandom_per_record,167261969,33.4523938
+80bit_namespace_u16_counter,3060836,0.6121672

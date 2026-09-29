@@ -5,7 +5,7 @@ use kernel_schema::{ScalarType, TypeExpr, TypeVar};
 use kernel_types::{EntityId, SemanticId};
 
 use crate::binary_codec::{
-    Cursor, MAX_VALUE_DEPTH, encode_rows, encode_value, push_len, push_u32, push_u128,
+    BinarySource, MAX_VALUE_DEPTH, encode_rows, encode_value, push_len, push_u32, push_u128,
 };
 use crate::runtime::{CodecError, DurabilityError};
 
@@ -15,7 +15,10 @@ fn corrupt(reason: &'static str) -> DurabilityError {
     DurabilityError::Corruption { offset: 0, reason }
 }
 
-pub(super) fn encode_state(out: &mut Vec<u8>, state: &DatabaseState) -> Result<(), CodecError> {
+pub(super) fn encode_state(
+    out: &mut impl crate::binary_codec::BinarySink,
+    state: &DatabaseState,
+) -> Result<(), CodecError> {
     push_len(out, state.lifecycle.entities.len())?;
     for entity in &state.lifecycle.entities {
         push_u128(out, entity.raw());
@@ -57,7 +60,9 @@ pub(super) fn encode_state(out: &mut Vec<u8>, state: &DatabaseState) -> Result<(
     Ok(())
 }
 
-pub(super) fn decode_state(cursor: &mut Cursor<'_>) -> Result<DatabaseState, DurabilityError> {
+pub(super) fn decode_state(
+    cursor: &mut impl BinarySource,
+) -> Result<DatabaseState, DurabilityError> {
     let mut state = DatabaseState::default();
 
     let count = cursor.len().map_err(corrupt)?;
@@ -149,7 +154,7 @@ pub(super) fn decode_state(cursor: &mut Cursor<'_>) -> Result<DatabaseState, Dur
 }
 
 pub(super) fn encode_type_expr(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     ty: &TypeExpr,
     depth: usize,
 ) -> Result<(), CodecError> {
@@ -217,7 +222,7 @@ pub(super) fn encode_type_expr(
 }
 
 pub(super) fn decode_type_expr(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     depth: usize,
 ) -> Result<TypeExpr, DurabilityError> {
     if depth > MAX_VALUE_DEPTH {
@@ -258,7 +263,7 @@ pub(super) fn decode_type_expr(
 }
 
 fn encode_type_map(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     fields: &BTreeMap<SemanticId, TypeExpr>,
     depth: usize,
 ) -> Result<(), CodecError> {
@@ -271,7 +276,7 @@ fn encode_type_map(
 }
 
 fn decode_type_map(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     depth: usize,
 ) -> Result<BTreeMap<SemanticId, TypeExpr>, DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
@@ -284,7 +289,7 @@ fn decode_type_map(
     Ok(fields)
 }
 
-fn encode_scalar(out: &mut Vec<u8>, scalar: &ScalarType) {
+fn encode_scalar(out: &mut impl crate::binary_codec::BinarySink, scalar: &ScalarType) {
     match scalar {
         ScalarType::Unit => out.push(0),
         ScalarType::Bool => out.push(1),
@@ -302,7 +307,7 @@ fn encode_scalar(out: &mut Vec<u8>, scalar: &ScalarType) {
     }
 }
 
-fn decode_scalar(cursor: &mut Cursor<'_>) -> Result<ScalarType, DurabilityError> {
+fn decode_scalar(cursor: &mut impl BinarySource) -> Result<ScalarType, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(ScalarType::Unit),
         1 => Ok(ScalarType::Bool),

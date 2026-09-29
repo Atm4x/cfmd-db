@@ -15,7 +15,10 @@ use super::prepared_capsule::{PreparedCutCapsule, decode_prepared_cut_capsule};
 use super::publication_protocol::{StoreFaultHook, StoreFaultPoint};
 use crate::metadata;
 use crate::runtime::DurabilityError;
-use crate::single_file::{SingleFileContainer, SingleFileSectionKind};
+use crate::single_file::{
+    SingleFileContainer, SingleFileSectionKind, compaction_io::SingleFileCompactionIo,
+};
+use crate::storage_encryption::StorageEncryption;
 use crate::wal::FileRevisionWal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +45,7 @@ pub(super) struct SingleFileDurabilityBackend {
 #[derive(Debug)]
 pub(super) enum DurabilityBackend {
     Directory(DirectoryDurabilityBackend),
-    SingleFile(SingleFileDurabilityBackend),
+    SingleFile(Box<SingleFileDurabilityBackend>),
 }
 
 impl DurabilityBackend {
@@ -51,7 +54,7 @@ impl DurabilityBackend {
     }
 
     pub(super) fn single_file(container: SingleFileContainer) -> Self {
-        Self::SingleFile(SingleFileDurabilityBackend { container })
+        Self::SingleFile(Box::new(SingleFileDurabilityBackend { container }))
     }
 
     pub(super) const fn capabilities(&self) -> DurabilityBackendCapabilities {
@@ -149,10 +152,11 @@ impl DurabilityBackend {
         directory_freshness_material(root)
     }
 
-    pub(super) fn probe_single_file_freshness(
+    pub(super) fn probe_single_file_freshness_with_encryption(
         path: &Path,
+        encryption: &StorageEncryption,
     ) -> Result<FreshnessRecoveryMaterial, DurabilityError> {
-        let mut container = SingleFileContainer::open(path)?;
+        let mut container = SingleFileContainer::open_with_encryption(path, encryption)?;
         single_file_freshness_material(&mut container)
     }
 
@@ -163,6 +167,7 @@ impl DurabilityBackend {
         checkpoint_revision: RevisionId,
         durable_head: RevisionId,
         hook: &mut impl StoreFaultHook,
+        compaction_io: &mut impl SingleFileCompactionIo,
     ) -> Result<(), DurabilityError> {
         match self {
             Self::Directory(backend) => {
@@ -202,6 +207,13 @@ impl DurabilityBackend {
                             })
                             .or_else(|| {
                                 super::generation_layout::parse_checkpoint_chunk_generation(name)
+                            })
+                            .or_else(|| {
+                                super::generation_layout::parse_generation_name(
+                                    name,
+                                    "checkpoint-",
+                                    "-stream.tmp",
+                                )
                             });
                     let is_pending = super::generation_layout::parse_generation_name(
                         name,
@@ -236,11 +248,15 @@ impl DurabilityBackend {
                         |bytes| decode_prepared_cut_capsule(&bytes),
                     )?;
                 let seeds = prepared.scan_seeds();
+                let mut single_file_fault =
+                    |step| hook.hit(StoreFaultPoint::SingleFileCompaction(step));
                 let _ = backend.container.compact_active_generation(
                     wal,
                     checkpoint_revision,
                     &seeds,
                     durable_head,
+                    &mut single_file_fault,
+                    compaction_io,
                 )?;
                 Ok(())
             }
@@ -277,14 +293,15 @@ fn directory_freshness_material(root: &Path) -> Result<FreshnessRecoveryMaterial
 fn single_file_freshness_material(
     container: &mut SingleFileContainer,
 ) -> Result<FreshnessRecoveryMaterial, DurabilityError> {
-    let metadata_bytes = container
-        .read_section(SingleFileSectionKind::Metadata, 0)?
+    let metadata = container
+        .with_section_reader(SingleFileSectionKind::Metadata, 0, |reader, len| {
+            metadata::decode_from_reader(reader, len)
+                .map_err(|reason| DurabilityError::Corruption { offset: 0, reason })
+        })?
         .ok_or(DurabilityError::Corruption {
             offset: 0,
             reason: "single-file durable metadata section is missing",
         })?;
-    let metadata = metadata::decode(&metadata_bytes)
-        .map_err(|reason| DurabilityError::Corruption { offset: 0, reason })?;
     let binding = metadata
         .external_freshness
         .ok_or(DurabilityError::Protocol {

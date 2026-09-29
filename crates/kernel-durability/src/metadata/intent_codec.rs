@@ -3,7 +3,7 @@ use kernel_semantics::{
 };
 use kernel_types::{RevisionId, SemanticId, SemanticRevision};
 
-use crate::binary_codec::{Cursor, encode_rows, push_bytes, push_len, push_u64, push_u128};
+use crate::binary_codec::{BinarySource, encode_rows, push_bytes, push_len, push_u64, push_u128};
 use crate::domain::{
     DurableRelationMutation, DurableRelationRewriteIntent, DurableTransactionIntent,
 };
@@ -16,7 +16,7 @@ use super::artifact_codec::{
 
 #[allow(clippy::too_many_lines)] // Canonical wire-order encoder; kept linear so field order remains auditable.
 pub(crate) fn encode_transaction_intent(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     intent: &DurableTransactionIntent,
 ) -> Result<(), CodecError> {
     match intent {
@@ -136,7 +136,7 @@ pub(crate) fn encode_transaction_intent(
 }
 
 pub(crate) fn decode_transaction_intent(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<DurableTransactionIntent, &'static str> {
     let tag = cursor.u8()?;
     match tag {
@@ -146,7 +146,7 @@ pub(crate) fn decode_transaction_intent(
         1 => {
             let target_revision = RevisionId::new(cursor.u64()?);
             let len = cursor.len()?;
-            let encoded_target_revision = cursor.take(len)?.to_vec();
+            let encoded_target_revision = cursor.take_owned(len)?;
             let materializations = match cursor.u8()? {
                 0 => None,
                 1 => Some(decode_materialization_specs(cursor)?),
@@ -200,7 +200,7 @@ pub(crate) fn decode_transaction_intent(
             let source_revision = RevisionId::new(cursor.u64()?);
             let target_revision = RevisionId::new(cursor.u64()?);
             let len = cursor.len()?;
-            let encoded_target_revision = cursor.take(len)?.to_vec();
+            let encoded_target_revision = cursor.take_owned(len)?;
             let mut complements = decode_migration_complements(cursor)?;
             if complements.len() != 1 {
                 return Err("schema migration intent must carry exactly one complement");
@@ -220,7 +220,7 @@ pub(crate) fn decode_transaction_intent(
 }
 
 fn decode_mixed_revision_intent(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     has_complement: bool,
 ) -> Result<DurableTransactionIntent, &'static str> {
     let source_revision = RevisionId::new(cursor.u64()?);
@@ -250,7 +250,7 @@ fn decode_mixed_revision_intent(
 }
 
 fn decode_relation_resolution_intent(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<DurableTransactionIntent, &'static str> {
     let source_revision = RevisionId::new(cursor.u64()?);
     let target_revision = RevisionId::new(cursor.u64()?);
@@ -297,7 +297,7 @@ fn decode_relation_resolution_intent(
 }
 
 pub(crate) fn encode_semantic_module_specs(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     specs: &[BuiltinSemanticModuleSpec],
 ) -> Result<(), CodecError> {
     let mut specs = specs.to_vec();
@@ -311,7 +311,7 @@ pub(crate) fn encode_semantic_module_specs(
 }
 
 pub(crate) fn decode_semantic_module_specs(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<BuiltinSemanticModuleSpec>, &'static str> {
     let count = cursor.len()?;
     let mut modules = Vec::with_capacity(cursor.bounded_capacity(count));
@@ -328,7 +328,10 @@ pub(crate) fn decode_semantic_module_specs(
     Ok(modules)
 }
 
-pub(super) fn encode_semantic_module_spec(out: &mut Vec<u8>, spec: BuiltinSemanticModuleSpec) {
+pub(super) fn encode_semantic_module_spec(
+    out: &mut impl crate::binary_codec::BinarySink,
+    spec: BuiltinSemanticModuleSpec,
+) {
     match spec {
         BuiltinSemanticModuleSpec::Equivalence {
             module,
@@ -361,7 +364,7 @@ pub(super) fn encode_semantic_module_spec(out: &mut Vec<u8>, spec: BuiltinSemant
 }
 
 pub(super) fn decode_semantic_module_spec(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<BuiltinSemanticModuleSpec, &'static str> {
     match cursor.u8()? {
         0 => Ok(BuiltinSemanticModuleSpec::Equivalence {
@@ -384,7 +387,7 @@ pub(super) fn decode_semantic_module_spec(
     }
 }
 
-fn encode_ordering_module(out: &mut Vec<u8>, module: OrderingModule) {
+fn encode_ordering_module(out: &mut impl crate::binary_codec::BinarySink, module: OrderingModule) {
     match module {
         OrderingModule::I64Ascending => out.push(0),
         OrderingModule::F64Total => out.push(1),
@@ -404,7 +407,7 @@ fn encode_ordering_module(out: &mut Vec<u8>, module: OrderingModule) {
     }
 }
 
-fn decode_ordering_module(cursor: &mut Cursor<'_>) -> Result<OrderingModule, &'static str> {
+fn decode_ordering_module(cursor: &mut impl BinarySource) -> Result<OrderingModule, &'static str> {
     match cursor.u8()? {
         0 => Ok(OrderingModule::I64Ascending),
         1 => Ok(OrderingModule::F64Total),
@@ -423,7 +426,10 @@ fn decode_ordering_module(cursor: &mut Cursor<'_>) -> Result<OrderingModule, &'s
     }
 }
 
-fn encode_equivalence_module(out: &mut Vec<u8>, module: EquivalenceModule) {
+fn encode_equivalence_module(
+    out: &mut impl crate::binary_codec::BinarySink,
+    module: EquivalenceModule,
+) {
     match module {
         EquivalenceModule::UnitExact => out.push(0),
         EquivalenceModule::BoolExact => out.push(1),
@@ -442,7 +448,9 @@ fn encode_equivalence_module(out: &mut Vec<u8>, module: EquivalenceModule) {
     }
 }
 
-fn decode_equivalence_module(cursor: &mut Cursor<'_>) -> Result<EquivalenceModule, &'static str> {
+fn decode_equivalence_module(
+    cursor: &mut impl BinarySource,
+) -> Result<EquivalenceModule, &'static str> {
     match cursor.u8()? {
         0 => Ok(EquivalenceModule::UnitExact),
         1 => Ok(EquivalenceModule::BoolExact),
@@ -461,7 +469,7 @@ fn decode_equivalence_module(cursor: &mut Cursor<'_>) -> Result<EquivalenceModul
 }
 
 pub(crate) fn encode_relation_mutations(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     relation_mutations: &[DurableRelationMutation],
 ) -> Result<(), CodecError> {
     push_len(out, relation_mutations.len())?;
@@ -479,7 +487,7 @@ pub(crate) fn encode_relation_mutations(
 }
 
 pub(crate) fn encode_relation_rewrite_intents(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     rewrite_intents: &[DurableRelationRewriteIntent],
 ) -> Result<(), CodecError> {
     push_len(out, rewrite_intents.len())?;
@@ -497,7 +505,7 @@ pub(crate) fn encode_relation_rewrite_intents(
 }
 
 pub(crate) fn decode_relation_rewrite_intents(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<DurableRelationRewriteIntent>, &'static str> {
     let count = cursor.len()?;
     let mut rewrite_intents = Vec::with_capacity(cursor.bounded_capacity(count));
@@ -518,7 +526,7 @@ pub(crate) fn decode_relation_rewrite_intents(
 }
 
 pub(crate) fn decode_relation_mutations(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<DurableRelationMutation>, &'static str> {
     let count = cursor.len()?;
     let mut relation_mutations = Vec::with_capacity(cursor.bounded_capacity(count));

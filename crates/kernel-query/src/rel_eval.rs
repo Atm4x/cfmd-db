@@ -1,8 +1,9 @@
 use super::{
-    AggregateSpec, BTreeMap, BTreeSet, OrderDirection, PreparedRelExpr, RelExpr, RelQueryError,
-    RelType, RelationValue, Row, Value, anti_join_relation_values, difference_relation_values,
-    distinct_rows, group_relation_value, query_types_compatible, relation_column_equivalence,
-    relation_column_equivalences, validate_query_equivalence, value_shape_matches_type,
+    AggregateSpec, BTreeMap, BTreeSet, OrderComparison, OrderDirection, PreparedRelExpr, RelExpr,
+    RelQueryError, RelType, RelationValue, Row, Value, anti_join_relation_values,
+    difference_relation_values, distinct_rows, group_relation_value, query_types_compatible,
+    relation_column_equivalence, relation_column_equivalences, validate_query_equivalence,
+    value_shape_matches_type,
 };
 
 pub(super) fn collect_rel_source_relations(
@@ -14,6 +15,7 @@ pub(super) fn collect_rel_source_relations(
             out.insert(*relation);
         }
         RelExpr::FilterEqConst { input, .. }
+        | RelExpr::FilterOrderConst { input, .. }
         | RelExpr::FilterEqColumns { input, .. }
         | RelExpr::Project { input, .. }
         | RelExpr::Distinct { input, .. }
@@ -31,7 +33,10 @@ pub(super) fn collect_rel_source_relations(
 
 fn collect_rel_orderings(query: &RelExpr, out: &mut BTreeSet<kernel_types::SemanticId>) {
     match query {
-        RelExpr::TopKWithTies {
+        RelExpr::FilterOrderConst {
+            input, ordering, ..
+        }
+        | RelExpr::TopKWithTies {
             input, ordering, ..
         } => {
             out.insert(*ordering);
@@ -122,6 +127,15 @@ impl RelExpr {
                 value,
                 equivalence,
             } => Self::typecheck_filter(input, *column, value, *equivalence, context, registry),
+            Self::FilterOrderConst {
+                input,
+                column,
+                value,
+                ordering,
+                ..
+            } => Self::typecheck_filter_order_const(
+                input, *column, value, *ordering, context, registry,
+            ),
             Self::FilterEqColumns {
                 input,
                 left_column,
@@ -194,24 +208,30 @@ impl RelExpr {
                 ordering,
                 ..
             } => Self::typecheck_top_k_with_ties(input, *column, *ordering, context, registry),
-            Self::PromoteToBag(input) => {
-                let input_type = input.typecheck(context, registry)?;
-                let column_equivalences = match input_type.semantics {
-                    kernel_schema::RelationSemantics::Set {
-                        column_equivalences,
-                    }
-                    | kernel_schema::RelationSemantics::Bag {
-                        column_equivalences,
-                    } => column_equivalences,
-                };
-                Ok(RelType {
-                    columns: input_type.columns,
-                    semantics: kernel_schema::RelationSemantics::Bag {
-                        column_equivalences,
-                    },
-                })
-            }
+            Self::PromoteToBag(input) => Self::typecheck_promote_to_bag(input, context, registry),
         }
+    }
+
+    fn typecheck_promote_to_bag(
+        input: &Self,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelType, RelQueryError> {
+        let input_type = input.typecheck(context, registry)?;
+        let column_equivalences = match input_type.semantics {
+            kernel_schema::RelationSemantics::Set {
+                column_equivalences,
+            }
+            | kernel_schema::RelationSemantics::Bag {
+                column_equivalences,
+            } => column_equivalences,
+        };
+        Ok(RelType {
+            columns: input_type.columns,
+            semantics: kernel_schema::RelationSemantics::Bag {
+                column_equivalences,
+            },
+        })
     }
 
     fn typecheck_difference(
@@ -281,6 +301,36 @@ impl RelExpr {
         let input_equivalence = relation_column_equivalence(&input_type, column)?;
         if !registry.equivalence_refines(context, input_equivalence, equivalence)? {
             return Err(RelQueryError::EquivalenceNotCongruentWithInputEquality);
+        }
+        if !value_shape_matches_type(value, column_type) {
+            return Err(RelQueryError::TypeMismatch);
+        }
+        Ok(input_type)
+    }
+
+    fn typecheck_filter_order_const(
+        input: &Self,
+        column: usize,
+        value: &Value,
+        ordering: kernel_types::SemanticId,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelType, RelQueryError> {
+        let input_type = input.typecheck(context, registry)?;
+        let column_type = input_type
+            .columns
+            .get(column)
+            .ok_or(RelQueryError::ColumnOutOfBounds)?;
+        let ordering_domain = registry.ordering_domain(context, ordering)?;
+        let expected = kernel_semantics::domain_for_type(column_type)
+            .map(kernel_semantics::OrderingDomain::from)
+            .ok_or(RelQueryError::TypeMismatch)?;
+        if ordering_domain != expected {
+            return Err(RelQueryError::TypeMismatch);
+        }
+        let equivalence = relation_column_equivalence(&input_type, column)?;
+        if !registry.ordering_congruent_with_equivalence(context, ordering, equivalence)? {
+            return Err(RelQueryError::OrderingNotCongruentWithEquality);
         }
         if !value_shape_matches_type(value, column_type) {
             return Err(RelQueryError::TypeMismatch);
@@ -588,6 +638,13 @@ impl RelExpr {
                 value,
                 equivalence,
             } => Self::eval_filter(input, *column, value, *equivalence, eval),
+            Self::FilterOrderConst {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => Self::eval_filter_order_const(input, *column, value, *ordering, *comparison, eval),
             Self::FilterEqColumns {
                 input,
                 left_column,
@@ -697,6 +754,53 @@ impl RelExpr {
                 .registry
                 .equivalent(eval.semantic, equivalence, candidate, value)?
             {
+                out.push(row);
+            }
+        }
+        Ok(match set_equivalences {
+            Some(column_equivalences) => RelationValue::Set {
+                rows: out,
+                column_equivalences,
+            },
+            None => RelationValue::Bag(out),
+        })
+    }
+
+    fn eval_filter_order_const(
+        input: &Self,
+        column: usize,
+        value: &Value,
+        ordering: kernel_types::SemanticId,
+        comparison: OrderComparison,
+        eval: &RelEvalContext<'_>,
+    ) -> Result<RelationValue, RelQueryError> {
+        let input_value = input.evaluate_unchecked(eval)?;
+        let set_equivalences = match &input_value {
+            RelationValue::Set {
+                column_equivalences,
+                ..
+            } => Some(column_equivalences.clone()),
+            RelationValue::Bag(_) => None,
+        };
+        let compiled = eval
+            .compiled_orderings
+            .get(&ordering)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let threshold = compiled.canonical_key(value).map_err(RelQueryError::from)?;
+        let mut out = Vec::new();
+        for row in input_value.into_rows() {
+            let candidate = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
+            let order = compiled
+                .canonical_key(candidate)
+                .map_err(RelQueryError::from)?
+                .cmp(&threshold);
+            let passes = match comparison {
+                OrderComparison::Less => order.is_lt(),
+                OrderComparison::LessOrEqual => order.is_le(),
+                OrderComparison::Greater => order.is_gt(),
+                OrderComparison::GreaterOrEqual => order.is_ge(),
+            };
+            if passes {
                 out.push(row);
             }
         }

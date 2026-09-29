@@ -15,6 +15,12 @@ pub enum LinearIslandPredicate {
         value: Value,
         equivalence: kernel_types::SemanticId,
     },
+    OrderConst {
+        source_column: usize,
+        value: Value,
+        ordering: kernel_types::SemanticId,
+        comparison: crate::OrderComparison,
+    },
     EqColumns {
         left_source_column: usize,
         right_source_column: usize,
@@ -87,6 +93,23 @@ impl LinearIslandNormalForm {
                         .ok_or(RelQueryError::ColumnOutOfBounds)?;
                     registry.equivalent(context, *equivalence, source, value)?
                 }
+                LinearIslandPredicate::OrderConst {
+                    source_column,
+                    value,
+                    ordering,
+                    comparison,
+                } => {
+                    let source = row
+                        .get(*source_column)
+                        .ok_or(RelQueryError::ColumnOutOfBounds)?;
+                    let order = registry.compare(context, *ordering, source, value)?;
+                    match comparison {
+                        crate::OrderComparison::Less => order.is_lt(),
+                        crate::OrderComparison::LessOrEqual => order.is_le(),
+                        crate::OrderComparison::Greater => order.is_gt(),
+                        crate::OrderComparison::GreaterOrEqual => order.is_ge(),
+                    }
+                }
                 LinearIslandPredicate::EqColumns {
                     left_source_column,
                     right_source_column,
@@ -123,6 +146,12 @@ enum LinearStep {
         column: usize,
         value: Value,
         equivalence: kernel_types::SemanticId,
+    },
+    FilterOrderConst {
+        column: usize,
+        value: Value,
+        ordering: kernel_types::SemanticId,
+        comparison: crate::OrderComparison,
     },
     FilterEqColumns {
         left_column: usize,
@@ -204,6 +233,7 @@ fn collect_barriers(
     match query {
         RelExpr::Scan(_) => Ok(()),
         RelExpr::FilterEqConst { input, .. }
+        | RelExpr::FilterOrderConst { input, .. }
         | RelExpr::FilterEqColumns { input, .. }
         | RelExpr::PromoteToBag(input) => {
             let child = graph
@@ -316,6 +346,7 @@ fn collect_barrier_children(
     match query {
         RelExpr::Scan(_) => Ok(()),
         RelExpr::FilterEqConst { .. }
+        | RelExpr::FilterOrderConst { .. }
         | RelExpr::FilterEqColumns { .. }
         | RelExpr::PromoteToBag(_) => collect_islands(query, node, graph, out),
         RelExpr::Project { input, .. }
@@ -362,6 +393,22 @@ fn linear_step<'a>(
                 column: *column,
                 value: value.clone(),
                 equivalence: *equivalence,
+            },
+        )),
+        RelExpr::FilterOrderConst {
+            input,
+            column,
+            value,
+            ordering,
+            comparison,
+        } => Some((
+            input.as_ref(),
+            unary()?,
+            LinearStep::FilterOrderConst {
+                column: *column,
+                value: value.clone(),
+                ordering: *ordering,
+                comparison: *comparison,
             },
         )),
         RelExpr::FilterEqColumns {
@@ -422,6 +469,19 @@ fn compile_normal_form(
                     .ok_or(RelQueryError::ColumnOutOfBounds)?,
                 value: value.clone(),
                 equivalence: *equivalence,
+            }),
+            LinearStep::FilterOrderConst {
+                column,
+                value,
+                ordering,
+                comparison,
+            } => predicates.push(LinearIslandPredicate::OrderConst {
+                source_column: *mapping
+                    .get(*column)
+                    .ok_or(RelQueryError::ColumnOutOfBounds)?,
+                value: value.clone(),
+                ordering: *ordering,
+                comparison: *comparison,
             }),
             LinearStep::FilterEqColumns {
                 left_column,

@@ -96,12 +96,20 @@ pub(super) fn write_metadata_file(
     path: &Path,
     metadata: &metadata::DurableStoreMetadata,
 ) -> Result<u32, DurabilityError> {
-    let payload = metadata::encode(metadata)?;
-    if payload.len() > MAX_METADATA_LEN {
+    let mut payload_len = 0_u64;
+    let mut payload_crc_state = !0_u32;
+    metadata::stream(metadata, &mut |bytes| {
+        let len = u64::try_from(bytes.len()).map_err(|_| DurabilityError::PayloadTooLarge)?;
+        payload_len = payload_len
+            .checked_add(len)
+            .ok_or(DurabilityError::PayloadTooLarge)?;
+        payload_crc_state = crc32c_update(payload_crc_state, bytes);
+        Ok(())
+    })?;
+    if payload_len > MAX_METADATA_LEN as u64 {
         return Err(DurabilityError::PayloadTooLarge);
     }
-    let payload_len = u64::try_from(payload.len()).map_err(|_| DurabilityError::PayloadTooLarge)?;
-    let payload_crc = crc32c(&payload);
+    let payload_crc = !payload_crc_state;
     let mut header = [0_u8; METADATA_HEADER_LEN];
     header[0..4].copy_from_slice(&METADATA_MAGIC);
     header[4..6].copy_from_slice(&METADATA_FILE_VERSION.to_le_bytes());
@@ -110,10 +118,14 @@ pub(super) fn write_metadata_file(
     header[16..20].copy_from_slice(&payload_crc.to_le_bytes());
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(&header)?;
-    file.write_all(&payload)?;
+    let mut file_crc = crc32c_update(!0_u32, &header);
+    metadata::stream(metadata, &mut |bytes| {
+        file.write_all(bytes)?;
+        file_crc = crc32c_update(file_crc, bytes);
+        Ok(())
+    })?;
     file.sync_all()?;
-    let crc = crc32c_update(!0_u32, &header);
-    Ok(!crc32c_update(crc, &payload))
+    Ok(!file_crc)
 }
 
 fn decode_metadata_file(bytes: &[u8]) -> Result<metadata::DurableStoreMetadata, DurabilityError> {

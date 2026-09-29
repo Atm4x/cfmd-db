@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
 use super::StoreFaultPoint;
+use crate::single_file::compaction_io::{
+    SingleFileCompactionIoStep, SingleFileCompactionPublicationBoundary,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Prerequisite {
@@ -51,6 +54,7 @@ enum ModelBoundary {
     BeforeGcRemove,
     AfterGcRemoveUncertain,
     GcDirectorySynced,
+    SingleFileCompaction(SingleFileCompactionPublicationBoundary),
 }
 
 fn production_boundary(point: StoreFaultPoint) -> ModelBoundary {
@@ -67,6 +71,10 @@ fn production_boundary(point: StoreFaultPoint) -> ModelBoundary {
         StoreFaultPoint::BeforeCompactionRemove => ModelBoundary::BeforeGcRemove,
         StoreFaultPoint::AfterCompactionRemove => ModelBoundary::AfterGcRemoveUncertain,
         StoreFaultPoint::AfterCompactionDirectorySync => ModelBoundary::GcDirectorySynced,
+        StoreFaultPoint::SingleFileCompaction(step) => ModelBoundary::SingleFileCompaction(
+            step.publication_boundary()
+                .expect("non-publication compaction step has no publication-model boundary"),
+        ),
     }
 }
 
@@ -362,5 +370,13 @@ fn production_fault_points_cover_every_model_publication_and_gc_boundary() {
     ];
     for (point, expected) in mapped {
         assert_eq!(production_boundary(point), expected);
+    }
+    for &step in SingleFileCompactionIoStep::ALL {
+        if let Some(boundary) = step.publication_boundary() {
+            assert_eq!(
+                production_boundary(StoreFaultPoint::SingleFileCompaction(step)),
+                ModelBoundary::SingleFileCompaction(boundary),
+            );
+        }
     }
 }

@@ -348,6 +348,7 @@ fn compile_postorder(query: &RelExpr, nodes: &mut Vec<PreparedGraphNode>) -> Nod
     let inputs = match query {
         RelExpr::Scan(relation) => PreparedNodeInputs::Source(*relation),
         RelExpr::FilterEqConst { input, .. }
+        | RelExpr::FilterOrderConst { input, .. }
         | RelExpr::FilterEqColumns { input, .. }
         | RelExpr::Project { input, .. }
         | RelExpr::Distinct { input, .. }
@@ -380,6 +381,7 @@ fn compile_postorder_typed(
             RelExpr::typecheck_scan(*relation, context)?,
         ),
         RelExpr::FilterEqConst { input, .. }
+        | RelExpr::FilterOrderConst { input, .. }
         | RelExpr::FilterEqColumns { input, .. }
         | RelExpr::TopKWithTies { input, .. } => {
             let input_id = compile_postorder_typed(input, context, nodes, result_types)?;

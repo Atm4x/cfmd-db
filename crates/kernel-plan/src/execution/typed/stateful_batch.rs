@@ -44,6 +44,7 @@ fn try_execute_typed_stateful_batch(
         ),
         Plan::Scan { .. }
         | Plan::FilterEqConst { .. }
+            | Plan::FilterOrderConst { .. }
         | Plan::FilterEqColumns { .. }
         | Plan::Project { .. }
         | Plan::JoinEq { .. }

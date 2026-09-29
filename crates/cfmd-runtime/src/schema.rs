@@ -189,6 +189,8 @@ pub struct SchemaBuilder {
     entity_types: BTreeSet<TypeId>,
     entity_fields: BTreeMap<FieldId, (TypeId, Type)>,
     duplicates: BTreeSet<u128>,
+    invalid_schema: Vec<String>,
+    required_relations: BTreeMap<RelationId, String>,
 }
 
 impl Default for SchemaBuilder {
@@ -213,6 +215,8 @@ impl SchemaBuilder {
             entity_types: BTreeSet::new(),
             entity_fields: BTreeMap::new(),
             duplicates: BTreeSet::new(),
+            invalid_schema: Vec::new(),
+            required_relations: BTreeMap::new(),
         }
     }
 
@@ -287,7 +291,35 @@ impl SchemaBuilder {
         self
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __invalid_schema(mut self, message: String) -> Self {
+        self.invalid_schema.push(message);
+        self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __require_relation(mut self, relation: RelationId, message: String) -> Self {
+        self.required_relations.entry(relation).or_insert(message);
+        self
+    }
+
     pub fn build(self) -> crate::Result<Schema> {
+        if let Some(message) = self.invalid_schema.first() {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidSchema,
+                message.clone(),
+            ));
+        }
+        for (relation, message) in &self.required_relations {
+            if !self.relations.contains_key(relation) {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::InvalidSchema,
+                    message.clone(),
+                ));
+            }
+        }
         if let Some(id) = self.duplicates.first() {
             return Err(crate::Error::new(
                 crate::ErrorKind::InvalidSchema,

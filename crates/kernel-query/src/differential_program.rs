@@ -4,8 +4,9 @@ use super::{
     MaterializedJoinDeltaState, MaterializedTopKDeltaState, NodeId, PreparedRelGraph, RelExpr,
     RelQueryError, RelType, RelationDelta, Value, canonical_row_multiset_counts,
     collect_rel_source_relations, materialize_exact_quotient_delta_view, rel_delta_distinct,
-    rel_delta_filter, rel_delta_filter_columns, rel_delta_project_bag, rel_delta_project_set,
-    rel_delta_scan, rel_impact_by_recompute, relation_column_equivalences,
+    rel_delta_filter, rel_delta_filter_columns, rel_delta_filter_order_const,
+    rel_delta_project_bag, rel_delta_project_set, rel_delta_scan, rel_impact_by_recompute,
+    relation_column_equivalences,
 };
 
 /// Exact differential class of a relational operator.
@@ -44,6 +45,13 @@ enum RelDifferentialNode {
         column: usize,
         value: Value,
         equivalence: kernel_types::SemanticId,
+    },
+    FilterOrderConst {
+        input: Box<Self>,
+        column: usize,
+        value: Value,
+        ordering: kernel_types::SemanticId,
+        comparison: crate::OrderComparison,
     },
     FilterEqColumns {
         input: Box<Self>,
@@ -121,6 +129,23 @@ impl RelDifferentialNode {
                 column: *column,
                 value: value.clone(),
                 equivalence: *equivalence,
+            }),
+            RelExpr::FilterOrderConst {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => Ok(Self::FilterOrderConst {
+                input: Box::new(Self::compile(
+                    input,
+                    Self::unary_child(node, graph)?,
+                    graph,
+                )?),
+                column: *column,
+                value: value.clone(),
+                ordering: *ordering,
+                comparison: *comparison,
             }),
             RelExpr::FilterEqColumns {
                 input,
@@ -251,6 +276,7 @@ impl RelDifferentialNode {
         match self {
             Self::Scan { .. } => RelDifferentialClass::Source,
             Self::FilterEqConst { .. }
+            | Self::FilterOrderConst { .. }
             | Self::FilterEqColumns { .. }
             | Self::PromoteToBag { .. }
             | Self::Project {
@@ -306,6 +332,7 @@ impl RelDifferentialNode {
                 out.insert(RelDifferentialStateRequirement::OrderedCut);
             }
             Self::FilterEqConst { input, .. }
+            | Self::FilterOrderConst { input, .. }
             | Self::FilterEqColumns { input, .. }
             | Self::PromoteToBag { input, .. } => input.collect_state_requirements(out),
             Self::Scan { .. } => {}
@@ -331,6 +358,21 @@ impl RelDifferentialNode {
                 *column,
                 value,
                 *equivalence,
+                context,
+                registry,
+            ),
+            Self::FilterOrderConst {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => rel_delta_filter_order_const(
+                input.apply(old, change, context, registry)?,
+                *column,
+                value,
+                *ordering,
+                *comparison,
                 context,
                 registry,
             ),

@@ -291,6 +291,7 @@ fn build_indexed_join_batch_program<'a>(
             registry,
         ),
         Plan::Scan { .. }
+        | Plan::FilterOrderConst { .. }
         | Plan::FilterEqColumns { .. }
         | Plan::Difference { .. }
         | Plan::AntiJoin { .. }

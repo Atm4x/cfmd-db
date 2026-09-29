@@ -4,7 +4,9 @@ mod intent_codec;
 mod model_delta_codec;
 mod query_codec;
 
-pub(crate) use aggregate::{DurableStoreMetadata, decode, encode};
+#[cfg(test)]
+pub(crate) use aggregate::encode;
+pub(crate) use aggregate::{DurableStoreMetadata, decode, decode_from_reader, encoded_len, stream};
 pub(crate) use artifact_codec::{
     decode_materialization_specs, decode_migration_complements, encode_materialization_specs,
     encode_migration_complements,

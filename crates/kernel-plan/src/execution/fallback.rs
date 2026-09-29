@@ -40,6 +40,18 @@ pub(super) fn execute_filter_const(
 
 // HOSTILE[P164][ACTIVE][FALLBACK][CLEAN-ASYMPTOTIC]: row fallback is linear; typed storage
 // uses canonical native-column comparison without reconstructing the input relation.
+pub(super) fn execute_filter_order(
+    input: &Plan,
+    spec: OrderFilterSpec<'_>,
+    store: &PhysicalStore,
+    semantics: (&kernel_schema::SemanticContext, &kernel_semantics::SemanticRegistry),
+    stats: &mut ExecutionStats,
+) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
+    let (context, registry) = semantics;
+    let input_rows = input.execute_native_rows(store, context, registry, stats)?;
+    filter_order_rows(input_rows, spec, context, registry, stats)
+}
+
 pub(super) fn execute_filter_columns(
     input: &Plan,
     left_column: usize,

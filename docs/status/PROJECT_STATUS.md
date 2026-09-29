@@ -6,53 +6,46 @@ The CFMD global kernel hostile/refactor campaign is **COMPLETE / FROZEN after Pa
 
 The historical problem ledger is closed for the declared scope; the current audit inventory is in [`KERNEL_HOSTILE_LEDGER.md`](KERNEL_HOSTILE_LEDGER.md).
 
-## Active phase — Rust product runtime
+## Active phase — Rust productization
 
-Pass281 began the external product layer with `crates/cfmd-runtime`; Pass282 extended it through database creation/schema authority; Pass283 added typed relation/query handles; Pass284 adds the first object-first Rust domain mapping and makes application writes produce `Plan` values directly.
-
-The architecture is intentionally Rust-first:
+The architecture is Rust-first and now has two deliberate product layers:
 
 ```text
-Rust application API / Python / .NET / Studio
-                    |
+Rust applications        Python / .NET / Studio
+       |                         |
+      cfmd                       |
+       \                       /
                 cfmd-runtime
                     |
               kernel-* crates
 ```
 
-`cfmd-runtime` owns stable identifiers, values, query IR, snapshots, Plans and product errors. Internal kernel types remain private implementation details.
+`cfmd` is the public Rust application crate. `cfmd-runtime` owns the universal semantic/runtime protocol used beneath it and by future bindings. Internal kernel types remain private implementation details.
 
-### Implemented through P284
+### Implemented foundation
 
-- `Database::open`;
-- immutable revision snapshots;
-- facade-owned ID/value vocabulary;
-- scan/filter/project/join/distinct/TopK query IR;
-- `PreparedQuery` compile-once execution;
-- Bag/Set result semantics;
-- relation insert/remove `Plan`;
-- durable atomic commit with explicit transaction identity and stale-plan rejection;
-- end-to-end durable facade regression;
-- facade-owned recursive `Type`, primitive equivalence/ordering contracts and relation schema builder;
-- `Database::create` without kernel construction types;
-- typed-empty physical relation bootstrap (no sentinel seed rows);
-- read-context schema introspection;
-- semantic-ID collision rejection across facade namespaces;
-- schema-checked typed relation/field handles;
-- equality predicates that inherit declared relation equivalence semantics;
-- typed scalar/tuple projections and typed cardinality terminals;
-- extensible `ValueCodec`/`RowCodec` with typed Plan insert/remove helpers.
+- create/open through one `Database::builder` lifecycle;
+- object-first schema/query/write DX with explicit reference/cardinality semantics;
+- low-level relation/value/query protocol retained as an explicit dynamic escape hatch;
+- `Plan -> Candidate -> commit`;
+- durable history, exact inverse/redo, historical worlds and certified non-head rebase;
+- exact revision-tagged watch with cancellation, lag/catch-up and provider-neutral wake delivery;
+- P345-P348 executor-neutral async watch foundation: shared readiness identity + bounded durable drains, race-free `Waker` registration owned by `PublicationNotifier`, direct `watch.next().await` Futures on the runtime watch itself, dependency-frontier wake filtering, observable-event quotienting, and hostile coverage through 2,000 simultaneous pending subscriptions;
+- hosted session/protocol/wire/local-transport foundation;
+- parity-complete single-file durability with encrypted secure-memory-backed operation on Linux;
+- P337 public `cfmd` facade, diagnostic categories and no-kernel-dependency CI gate.
+- P338 `CfmdEntity` derive foundation with typed identity/reference inference and consumer compile-fail diagnostics.
+- P339 generated many/cardinality declarations with explicit many-valued query operators.
+- P342 promotes `Ref<T>` / `Many<T>` to first-class snapshot-bound object relation values, removes backlink ownership from the normal model, lowers object relationships to internal lifecycle-safe edge relations, and supports graph insert plus preserve/replace update semantics.
 
 ### Immediate roadmap
 
-1. identity/reference/cardinality contracts on top of the P284 object model, then safe deep-path Rust query DX;
-2. generated/static domain modules over the typed handles;
-3. Plan sealing + Candidate preview/query/commit;
-4. historical contexts/history/inverse;
-5. exact watch protocol;
-6. language bindings and local tooling over the same `cfmd-runtime` authority.
+1. P348 dependency-frontier readiness and observable quotient: **complete**; unrelated subscriptions remain asleep while O(K) delivery is retained for K relevant consumers.
+2. P349/P350 CPython asyncio hostile validation: **foundation proven** through PyO3 over the public `cfmd` facade, including cancellation/commit replay reservation and event-loop-shutdown cancellation.
+3. continue Python as a black-box product consumer: broaden concurrent/multi-handle/process lifecycle, transaction/conflict/error, relation/lifecycle and watch stress before freezing the final Python facade.
+4. add executor-specific crates only where they expose a measured platform capability ordinary Rust `Future` cannot express; Studio/CLI, backup/recovery UX and release hardening follow incrementally.
 
-The detailed roadmap is [`../api/RUST_API_ROADMAP.md`](../api/RUST_API_ROADMAP.md) and [`../api/PRODUCT_ROADMAP.md`](../api/PRODUCT_ROADMAP.md). Python UX remains specified by [`../api/CFMD_PYTHON_FACADE_THEORY.md`](../api/CFMD_PYTHON_FACADE_THEORY.md), but Python does not own database semantics.
+The active task inventory is [`PRODUCTIZATION_LEDGER.md`](PRODUCTIZATION_LEDGER.md). The detailed API roadmap is [`../api/RUST_API_ROADMAP.md`](../api/RUST_API_ROADMAP.md) and [`../api/PRODUCT_ROADMAP.md`](../api/PRODUCT_ROADMAP.md).
 
 ## Pass293 product status
 
@@ -195,3 +188,96 @@ NEXT: transport-provider conformance can now begin without changing security sem
 - `Database::create/open` are thin sugar over the builder rather than an independent legacy path.
 - Hosting remains lifecycle composition over an opened database; `DatabaseHostingExt` supplies `db.host(...)` from `cfmd-host` without moving authentication/authorization into `cfmd-runtime`.
 - NEXT: AEAD encryption-at-rest/key hierarchy as an orthogonal storage codec, not a new durability protocol.
+
+## Pass315 encryption productization status
+
+- Encrypted section read/copy path: bounded 64 KiB authenticated chunks; pre-release whole-section section envelopes are intentionally not retained as a compatibility path.
+- WAL/section nonce generation: one random 80-bit namespace per 65,536 messages plus a 16-bit counter; retained microbenchmark evidence is `artifacts/p315/NONCE_BENCHMARK.csv`.
+- Product key acquisition: `EncryptionKeyProvider` supports create/open without leaking provider semantics into durability.
+- External freshness + encryption low-level parity: COMPLETE for keyed single-file reopen/preflight.
+- Remaining key-management payer: wrapped random database master key, provider key IDs, key epochs/rotation and password-KDF adapters.
+- Remaining write-path payer: section publication still constructs stored section bytes before generation-table publication; bounded streaming copy/read is closed, fully streaming encrypted publication remains future work if large-section creation requires it.
+
+
+## Pass316 encryption key-management status
+
+- Provider-backed create now generates a random per-database DMK; provider material is a KEK used only to wrap/unwrap that DMK.
+- Provider identity is explicit: 128-bit key ID + non-zero provider epoch; operations are `Create | Open | Rewrap`.
+- The current pre-release single-file header owns two authenticated/checksummed wrapped-key slots with monotone publication sequence and database key epoch; internal pass layouts are not treated as released compatibility versions.
+- `Database::rewrap_encryption(...)` rotates provider KEK metadata without rewriting generation/WAL ciphertext.
+- Direct raw-key mode remains supported as a minimal adapter; synthetic pass-to-pass header compatibility was removed before release.
+- Provider snapshots can impose a minimum accepted database-key epoch, giving external key authority a fail-closed complete-header rollback fence after rotation.
+- NEXT: make provider-floor advancement transactional/acknowledged with external authority where needed, then close fully streaming encrypted generation publication and directory-encryption parity.
+
+## Pass317 encryption key-authority status
+
+- Pre-release internal header revisions are no longer treated as compatibility versions: the P316 header-only v4/legacy-v3 branch was removed and the single-file header uses the same current `FORMAT_VERSION` as root/generation records.
+- Pre-release P314 whole-section encrypted-section compatibility was also removed; the bounded chunked encrypted-section layout is the sole current representation and unknown layouts fail closed.
+- `EncryptionProviderKey` now carries an external minimum accepted database-key epoch; wrapped-key open rejects a complete but rolled-back header below that floor before DMK unwrap.
+- `Database::rewrap_encryption(...)` returns the newly durable database-key epoch so an external provider can advance its floor only after successful rewrap publication.
+- Strict Clippy surfaced and P317 removed several incidental ownership/size issues: large single-file backend/shadow-WAL enum variants are boxed and storage/runtime option helpers no longer copy non-consumed configuration values.
+- NEXT: define an acknowledged provider-floor advancement protocol for remote/KMS authorities, then attack fully streaming encrypted generation publication and directory-encryption parity.
+
+## Pass318 acknowledged encryption-authority status
+
+- `EncryptionKeyProvider` now has an explicit durable database-key acknowledgement callback carrying provider key ID, provider epoch and database-key epoch.
+- Rewrap authority is ordered as local successor-slot fsync -> external acknowledgement -> predecessor-slot retirement.
+- A locally durable but externally unacknowledged successor is a recoverable pending handoff, not unconditional authority: open may still admit the previous provider snapshot, and retry adopts the already-written consecutive successor without another rewrap.
+- After acknowledgement, the predecessor `CFKW` slot is zeroed and synced; whole-header rollback remains fenced by the provider's minimum accepted database-key epoch.
+- Full regressions cover acknowledgement failure, restart under old authority, idempotent retry, predecessor retirement and complete-header rollback fencing.
+- NEXT: close fully streaming encrypted generation publication, then directory-encryption parity through the same AE v1 codec/key hierarchy. Password-to-KEK adapters remain separate product work.
+
+## Pass319 encrypted generation publication status
+
+- Whole-section `StoredSection` staging has been removed from the production single-file writer; encrypted publication allocates at most one 64 KiB AEAD chunk envelope at a time.
+- The pre-release generation layout now places the descriptor table after section payloads, allowing ciphertext section digests to be computed during direct-to-file streaming rather than before publication.
+- Generation SHA-256 is accumulated in physical write order; publication no longer rereads the entire new generation to calculate its root digest.
+- Crash/publication authority is unchanged: partially written generations remain orphan bytes until generation sync and root publication complete.
+- Reader validation now binds the footer table offset/length and rejects descriptors crossing into the footer.
+- Physical-writer additional memory is now payload-independent, but higher canonical codecs still materialize caller-owned plaintext `Vec<u8>` values (notably checkpoint/metadata encoding).
+- NEXT: introduce a one-pass exact-length section-source/canonical streaming encoder so generation publication is end-to-end payload-bounded, then apply the same AE v1/key hierarchy to directory storage. Password-to-KEK adapters remain separate product work.
+
+## Pass320–Pass323 bounded streaming status
+
+- P320: canonical checkpoint/metadata encoding is sink-based and exact-length; SingleFile generation publication no longer requires payload-sized plaintext `Vec<u8>`, and Directory one-shot checkpoint/metadata writes use the same canonical stream.
+- P321: Directory resumable checkpointing uses one generation-scoped bounded canonical spool with integrity binding, avoiding restart-from-zero/O(n²) encoding while keeping the spool non-authoritative.
+- P322: SingleFile recovery decodes checkpoint/metadata through a bounded `BinarySource`; encrypted sections authenticate one 64 KiB chunk before exposing plaintext, plaintext sections use a 64 KiB read window, and replication-archive replay is frame-streamed.
+- P323: SingleFile replication rotation no longer concatenates the old authoritative archive and live prefix into a whole-archive `Vec<u8>`. A composite section source streams the old section plus the exact frozen live-frame prefix directly into the generation writer; streaming-checkpoint cuts retain only the prefix count, not duplicate archive bytes.
+- Current remaining payload-sized durability payer: prepared-cut capsule encoding/SingleFile recovery still materializes the complete capsule. Directory AE v1 parity remains blocked until the shared bounded source/sink path covers that final durability payload class.
+- Hostile follow-up: P323 removes whole-archive RAM duplication but does not remove historical copy amplification: each rotation still streams the complete retained replication-authority archive into the successor generation. Repeated checkpoints can therefore pay O(retained authority history) per rotation. The next R&D target is a compact canonical replication-authority snapshot/delta law, not another buffering optimization.
+
+## Pass324 replication-authority compaction R&D status
+
+- P324 made the exact replay-produced replication semantic state explicit in executable tests and proved capture/restore equivalence for exercised authority state.
+- R&D result: a monolithic semantic snapshot is **not** sufficient to remove the asymptotic copy-amplification class. Replicated effects and revision frontiers are retained causal semantics and establish an `Ω(retained replicated history)` lower bound for an exact snapshot in the worst case.
+- Therefore the next production architecture is not "rewrite one smaller archive" and not a generic fallback to the historical journal. It is immutable, content-addressed replication-authority segments: each checkpoint publishes only the new canonical delta plus a stable parent identity.
+- Parent identity must be digest/logical-id based rather than raw file offset because single-file physical compaction relocates bytes.
+- Required equivalence law for the implementation is `replay(flat historical frames) == replay(flatten(authority segment chain))`, with bounded frame/chunk replay and exact streaming-checkpoint cuts.
+- The detailed derivation is in `docs/architecture/REPLICATION_AUTHORITY_COMPACTION.md`.
+- NEXT: introduce `ReplicationAuthoritySegmentId`, canonical bounded segment envelopes, and a relocatable segment index; only after executable replay equivalence is established should the P323 monolithic archive-copy path be deleted.
+
+## Pass325 replication-authority segment foundation status
+
+- `ReplicationAuthoritySegmentId` now implements the P324 content/parent-bound SHA-256 identity law.
+- `CFAS` is a bounded canonical segment envelope over the existing replication frame grammar; segment replay does not introduce a second authority evaluator.
+- `ReplicationAuthoritySegmentIndex` canonically maps stable IDs/parents to relocatable physical extents and rejects cycles, missing/unreachable entries, overlapping extents and conflicting duplicate identities.
+- Executable equivalence covers a two-segment authority chain and verifies the same semantic snapshot before and after physical relocation of both segments.
+- Parent binding is executable: identical delta bytes attached to a different parent produce a different segment identity.
+- Honest remaining payer: P323's active SingleFile checkpoint path still republishes the historical replication archive because the root/generation physical authority does not yet reference immutable external segment extents. The segment layer is executable but not yet the product persistence authority.
+- NEXT: P326 should publish immutable segment extents as first-class SingleFile authority using persistent O(new-delta) locator metadata (not a rewritten full index), bind only the current segment/locator root into the generation, recover through the P325 chain, and teach physical compaction to rebuild/relocate the reachable closure before deleting the old monolithic archive-copy path.
+
+## Pass327 authenticated immutable authority-object status
+
+- P326's physical segment prototype remains rejected; no plaintext external replication authority is active in the product path.
+- CFMD AE v1 now has an HKDF-separated immutable-object domain in addition to section and WAL domains.
+- `CFAO` is a bounded external object envelope for `CFAS`: object kind, plaintext segment identity, parent identity, plaintext length and chunk geometry are authenticated; payload is encrypted one 64 KiB chunk at a time when database encryption is enabled.
+- Segment identity is still derived exclusively from canonical plaintext semantics. Nonce choice and physical relocation do not change `ReplicationAuthoritySegmentId`.
+- Object AAD excludes physical offset/generation, establishing the compaction law `relocate = exact authenticated byte copy + locator rebuild`, not decrypt/re-encrypt.
+- Plaintext/encrypted object modes are explicit and fail closed; there is no downgrade/error fallback.
+- The maintained P323 replication archive section is still product recovery authority. P327 intentionally closes the encryption prerequisite before reactivating the P326 locator/root architecture.
+- NEXT: reintroduce persistent O(1)-per-delta linked locators/root binding using `CFAO`, recover through the P325 two-pass segment chain, and make compaction copy exactly the reachable authenticated objects before deleting P323 historical archive copying.
+
+## Pass351 product status
+
+Rust product writes now have a first-class exact-snapshot `Transaction` composer (`Database::transaction` / `SessionDatabase::transaction`) while retaining one Plan/Candidate/commit authority. Multi-plan writes can be previewed and published without manual aggregate-plan/transaction-id plumbing; cross-snapshot composition and stale publication remain fail-closed, and unchanged publication can be retried idempotently. Python remains an external regression consumer and passes after the Rust change. Next product target: Γ-native ordered/range predicate algebra, not a generic SQL/post-filter fallback.
+- P351 also closes the `Session::new`/`PrincipalId` public-facade leak; hosted/session application code no longer needs to import `cfmd-runtime` merely to construct public session authority.

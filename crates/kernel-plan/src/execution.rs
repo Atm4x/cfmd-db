@@ -1,8 +1,9 @@
 use super::{
     AggregateSpec, BTreeMap, BTreeSet, ExecutionStats, I64IndexBinding, InstalledRelation,
-    LayoutBinding, NativeColumn, NativeRelation, OrderDirection, PersistentPhysicalVec,
-    PhysicalExecutionError, PhysicalStore, Plan, RelQueryError, SemanticAccessCostModel,
-    SemanticAccessPath, SemanticId, SemanticIndexBinding, Value, algebraic_native,
+    LayoutBinding, NativeColumn, NativeRelation, OrderComparison, OrderDirection,
+    PersistentPhysicalVec, PhysicalExecutionError, PhysicalStore, Plan, RelQueryError,
+    SemanticAccessCostModel, SemanticAccessPath, SemanticId, SemanticIndexBinding, Value,
+    algebraic_native,
 };
 use crate::filter_shape::collect_direct_filter_chain;
 use crate::join_access::{

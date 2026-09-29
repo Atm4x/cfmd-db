@@ -1,7 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/cfmd",
+  "crates/cfmd-derive",
   "crates/cfmd-runtime",
+  "crates/cfmd-python-probe",
+  "crates/cfmd-secure-memory",
   "crates/cfmd-protocol",
   "crates/cfmd-host",
   "crates/cfmd-transport-local",

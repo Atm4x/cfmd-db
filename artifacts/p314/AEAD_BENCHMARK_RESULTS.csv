@@ -1,0 +1,96 @@
+build,algo,size,enc_ns,enc_GiBs,dec_ns,dec_GiBs
+native (-C target-cpu=native),AES-256-GCM-SIV,64,487.98,0.1221,496.28,0.1201
+native (-C target-cpu=native),AES-256-GCM-SIV,128,643.59,0.1852,611.54,0.1949
+native (-C target-cpu=native),AES-256-GCM-SIV,256,850.02,0.2805,845.24,0.2821
+native (-C target-cpu=native),AES-256-GCM-SIV,512,1432.57,0.3329,1351.94,0.3527
+native (-C target-cpu=native),AES-256-GCM-SIV,1024,632.64,1.5074,632.47,1.5079
+native (-C target-cpu=native),AES-256-GCM-SIV,4096,1504.94,2.5348,1538.23,2.4799
+native (-C target-cpu=native),AES-256-GCM-SIV,16384,5054.91,3.0186,5248.97,2.9070
+native (-C target-cpu=native),AES-256-GCM-SIV,65536,19596.50,3.1146,19893.47,3.0681
+native (-C target-cpu=native),AES-256-GCM-SIV,262144,75968.32,3.2137,76329.49,3.1985
+native (-C target-cpu=native),AES-256-GCM-SIV,1048576,295977.62,3.2994,300215.00,3.2529
+native (-C target-cpu=native),XChaCha20-Poly1305,64,492.50,0.1210,503.01,0.1185
+native (-C target-cpu=native),XChaCha20-Poly1305,128,588.04,0.2027,601.74,0.1981
+native (-C target-cpu=native),XChaCha20-Poly1305,256,560.60,0.4253,573.14,0.4160
+native (-C target-cpu=native),XChaCha20-Poly1305,512,723.41,0.6592,729.66,0.6535
+native (-C target-cpu=native),XChaCha20-Poly1305,1024,1047.51,0.9104,1061.85,0.8981
+native (-C target-cpu=native),XChaCha20-Poly1305,4096,3046.07,1.2523,3129.67,1.2189
+native (-C target-cpu=native),XChaCha20-Poly1305,16384,10686.75,1.4278,10936.98,1.3952
+native (-C target-cpu=native),XChaCha20-Poly1305,65536,40998.79,1.4887,41278.45,1.4786
+native (-C target-cpu=native),XChaCha20-Poly1305,262144,166590.09,1.4655,166086.05,1.4700
+native (-C target-cpu=native),XChaCha20-Poly1305,1048576,676871.78,1.4428,663445.31,1.4720
+native (-C target-cpu=native),AEGIS-256-C,64,53.52,1.1138,51.54,1.1565
+native (-C target-cpu=native),AEGIS-256-C,128,60.36,1.9750,57.88,2.0596
+native (-C target-cpu=native),AEGIS-256-C,256,72.90,3.2704,70.96,3.3601
+native (-C target-cpu=native),AEGIS-256-C,512,98.81,4.8258,96.70,4.9312
+native (-C target-cpu=native),AEGIS-256-C,1024,150.59,6.3331,148.92,6.4041
+native (-C target-cpu=native),AEGIS-256-C,4096,432.26,8.8249,447.25,8.5293
+native (-C target-cpu=native),AEGIS-256-C,16384,1591.49,9.5877,1701.38,8.9685
+native (-C target-cpu=native),AEGIS-256-C,65536,6525.52,9.3533,6704.13,9.1041
+native (-C target-cpu=native),AEGIS-256-C,262144,25214.43,9.6826,26692.28,9.1465
+native (-C target-cpu=native),AEGIS-256-C,1048576,99978.56,9.7677,107586.28,9.0770
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,64,435.25,0.1369,425.63,0.1400
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,128,523.42,0.2277,507.19,0.2350
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,256,478.75,0.4980,459.51,0.5188
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,512,615.49,0.7747,616.00,0.7741
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,1024,929.78,1.0257,930.80,1.0246
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,4096,2828.46,1.3487,2831.43,1.3473
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,16384,10414.36,1.4652,10472.45,1.4570
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,65536,40888.09,1.4927,40919.29,1.4916
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,262144,162626.07,1.5012,162910.01,1.4986
+native (-C target-cpu=native),ChaCha20-Poly1305-RFC8439,1048576,659448.94,1.4809,650195.97,1.5020
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,64,55.97,1.0649,58.05,1.0268
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,128,62.84,1.8971,66.33,1.7972
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,256,77.87,3.0618,85.93,2.7746
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,512,101.06,4.7181,121.18,3.9349
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,1024,156.85,6.0804,199.39,4.7829
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,4096,437.83,8.7127,648.72,5.8804
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,16384,1583.84,9.6340,2368.93,6.4412
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,65536,6527.95,9.3498,9693.28,6.2966
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,262144,24792.70,9.8473,37641.57,6.4859
+native pure-rust (-C target-cpu=native),AEGIS-256-pure-rust,1048576,100838.00,9.6845,159879.34,6.1081
+portable generic,AES-256-GCM-SIV,64,951.81,0.0626,968.66,0.0615
+portable generic,AES-256-GCM-SIV,128,1071.93,0.1112,1062.42,0.1122
+portable generic,AES-256-GCM-SIV,256,1317.10,0.1810,1351.29,0.1764
+portable generic,AES-256-GCM-SIV,512,1790.35,0.2663,1814.68,0.2628
+portable generic,AES-256-GCM-SIV,1024,1297.71,0.7349,1204.22,0.7919
+portable generic,AES-256-GCM-SIV,4096,2364.34,1.6134,2400.44,1.5892
+portable generic,AES-256-GCM-SIV,16384,7102.07,2.1485,7134.82,2.1386
+portable generic,AES-256-GCM-SIV,65536,25850.39,2.3611,27159.70,2.2473
+portable generic,AES-256-GCM-SIV,262144,99296.78,2.4587,104563.00,2.3349
+portable generic,AES-256-GCM-SIV,1048576,389190.06,2.5092,405601.06,2.4077
+portable generic,XChaCha20-Poly1305,64,1784.38,0.0334,1780.00,0.0335
+portable generic,XChaCha20-Poly1305,128,1870.44,0.0637,1868.86,0.0638
+portable generic,XChaCha20-Poly1305,256,1846.94,0.1291,1890.28,0.1261
+portable generic,XChaCha20-Poly1305,512,2045.69,0.2331,2024.52,0.2355
+portable generic,XChaCha20-Poly1305,1024,2403.14,0.3968,2411.96,0.3954
+portable generic,XChaCha20-Poly1305,4096,4929.49,0.7739,4751.96,0.8028
+portable generic,XChaCha20-Poly1305,16384,14041.95,1.0867,14449.85,1.0560
+portable generic,XChaCha20-Poly1305,65536,49357.88,1.2366,50378.13,1.2115
+portable generic,XChaCha20-Poly1305,262144,198380.94,1.2307,202954.53,1.2029
+portable generic,XChaCha20-Poly1305,1048576,821269.25,1.1891,810959.94,1.2042
+portable generic,AEGIS-256-C,64,55.91,1.0660,53.09,1.1228
+portable generic,AEGIS-256-C,128,70.77,1.6845,67.33,1.7705
+portable generic,AEGIS-256-C,256,80.54,2.9603,77.26,3.0858
+portable generic,AEGIS-256-C,512,105.90,4.5025,99.60,4.7874
+portable generic,AEGIS-256-C,1024,158.87,6.0030,149.33,6.3863
+portable generic,AEGIS-256-C,4096,456.12,8.3634,452.45,8.4313
+portable generic,AEGIS-256-C,16384,1783.23,8.5568,1866.25,8.1762
+portable generic,AEGIS-256-C,65536,6510.31,9.3752,6691.44,9.1214
+portable generic,AEGIS-256-C,262144,25945.61,9.4097,29845.23,8.1802
+portable generic,AEGIS-256-C,1048576,107411.06,9.0918,109167.44,8.9455
+portable generic,ChaCha20-Poly1305-RFC8439,64,1813.69,0.0329,1779.53,0.0335
+portable generic,ChaCha20-Poly1305-RFC8439,128,1801.49,0.0662,1818.21,0.0656
+portable generic,ChaCha20-Poly1305-RFC8439,256,1786.04,0.1335,1803.37,0.1322
+portable generic,ChaCha20-Poly1305-RFC8439,512,1949.74,0.2446,1959.81,0.2433
+portable generic,ChaCha20-Poly1305-RFC8439,1024,2463.71,0.3871,2393.57,0.3984
+portable generic,ChaCha20-Poly1305-RFC8439,4096,5108.07,0.7468,4963.51,0.7685
+portable generic,ChaCha20-Poly1305-RFC8439,16384,13577.84,1.1238,13689.38,1.1146
+portable generic,ChaCha20-Poly1305-RFC8439,65536,53042.50,1.1507,58675.40,1.0402
+portable generic,ChaCha20-Poly1305-RFC8439,262144,200571.75,1.2172,203874.22,1.1975
+portable generic,ChaCha20-Poly1305-RFC8439,1048576,855674.31,1.1413,839762.81,1.1629
+portable generic,AEGIS-256-pure-rust,64,3861.81,0.0154,4840.47,0.0123
+portable generic,AEGIS-256-pure-rust,1024,11151.63,0.0855,11152.68,0.0855
+portable generic,AEGIS-256-pure-rust,4096,35583.58,0.1072,32161.52,0.1186
+portable generic,AEGIS-256-pure-rust,65536,478797.46,0.1275,471508.91,0.1294
+portable generic,AEGIS-256-pure-rust,1048576,7620533.12,0.1281,7432379.94,0.1314

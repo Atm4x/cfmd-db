@@ -1,4 +1,8 @@
 use crate::binary_codec::{push_len, read_u16};
+use crate::single_file::compaction_io::{
+    SingleFileCompactionIo, SingleFileCompactionIoStep, SingleFileCompactionPrimitive,
+};
+use std::io::Read;
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,14 +33,16 @@ use crate::{
     ReplicationQuorumCertificate, ReplicationQuorumLoss, ReplicationRecoveryAck,
     ReplicationRecoveryCertificate, ReplicationTermPromise, ReplicationTransportFrame,
     ReplicationTransportIngress, ReplicationTransportPayload, SignedReplicationPeerEvidence,
-    SignedReplicationTransportFrame, replicated_effect_id, replication_membership_digest,
-    replication_peer_evidence_signing_message, replication_transport_signing_message,
+    SignedReplicationTransportFrame, SingleFileSectionKind, replicated_effect_id,
+    replication_membership_digest, replication_peer_evidence_signing_message,
+    replication_transport_signing_message,
 };
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
 const CRASH_WORKER_ENV: &str = "CFMD_CRASH_WORKER";
 const CRASH_DIR_ENV: &str = "CFMD_CRASH_DIR";
 const CRASH_POINT_ENV: &str = "CFMD_CRASH_POINT";
+const CRASH_SINGLE_FILE_ENCRYPTED_ENV: &str = "CFMD_CRASH_SINGLE_FILE_ENCRYPTED";
 const CRASH_READY_FILE: &str = ".cfmd-crash-ready";
 
 #[derive(Debug)]
@@ -182,6 +188,226 @@ impl StoreFaultHook for ErrorFault {
         if point == self.target {
             return Err(DurabilityError::Io(std::io::Error::other(
                 "injected checkpoint publication failure",
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimitiveIoFaultMode {
+    Fail,
+    ShortThenFail,
+    ShortOnce,
+    ZeroProgress,
+    InterruptedOnce,
+}
+
+struct FaultingSingleFileCompactionIo {
+    target: SingleFileCompactionIoStep,
+    mode: PrimitiveIoFaultMode,
+    target_calls: u8,
+}
+
+impl FaultingSingleFileCompactionIo {
+    const fn new(target: SingleFileCompactionIoStep, mode: PrimitiveIoFaultMode) -> Self {
+        Self {
+            target,
+            mode,
+            target_calls: 0,
+        }
+    }
+
+    fn fail_now(&mut self, op: SingleFileCompactionIoStep) -> bool {
+        if op != self.target {
+            return false;
+        }
+        match self.mode {
+            PrimitiveIoFaultMode::Fail if self.target_calls == 0 => {
+                self.target_calls = 1;
+                true
+            }
+            PrimitiveIoFaultMode::ShortThenFail if self.target_calls == 1 => {
+                self.target_calls = 2;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn short_len(&mut self, op: SingleFileCompactionIoStep, len: usize) -> Option<usize> {
+        if op != self.target || len <= 1 || self.target_calls != 0 {
+            return None;
+        }
+        if matches!(
+            self.mode,
+            PrimitiveIoFaultMode::ShortThenFail | PrimitiveIoFaultMode::ShortOnce
+        ) {
+            self.target_calls = 1;
+            Some((len / 2).max(1))
+        } else {
+            None
+        }
+    }
+
+    fn inject_zero_progress(&mut self, op: SingleFileCompactionIoStep) -> bool {
+        if op == self.target
+            && self.mode == PrimitiveIoFaultMode::ZeroProgress
+            && self.target_calls == 0
+        {
+            self.target_calls = 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn inject_interrupted(&mut self, op: SingleFileCompactionIoStep) -> bool {
+        if op == self.target
+            && self.mode == PrimitiveIoFaultMode::InterruptedOnce
+            && self.target_calls == 0
+        {
+            self.target_calls = 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn injected_error() -> std::io::Error {
+        std::io::Error::other("injected single-file compaction primitive I/O failure")
+    }
+}
+
+impl SingleFileCompactionIo for FaultingSingleFileCompactionIo {
+    fn open_read(
+        &mut self,
+        step: SingleFileCompactionIoStep,
+        path: &std::path::Path,
+    ) -> std::io::Result<File> {
+        if self.fail_now(step) {
+            return Err(Self::injected_error());
+        }
+        File::open(path)
+    }
+
+    fn open_read_write(
+        &mut self,
+        step: SingleFileCompactionIoStep,
+        path: &std::path::Path,
+    ) -> std::io::Result<File> {
+        if self.fail_now(step) {
+            return Err(Self::injected_error());
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+    }
+
+    fn metadata_len(
+        &mut self,
+        step: SingleFileCompactionIoStep,
+        file: &File,
+    ) -> std::io::Result<u64> {
+        if self.fail_now(step) {
+            return Err(Self::injected_error());
+        }
+        Ok(file.metadata()?.len())
+    }
+
+    fn seek(
+        &mut self,
+        step: SingleFileCompactionIoStep,
+        file: &mut File,
+        position: std::io::SeekFrom,
+    ) -> std::io::Result<u64> {
+        if self.fail_now(step) {
+            return Err(Self::injected_error());
+        }
+        std::io::Seek::seek(file, position)
+    }
+
+    fn read(
+        &mut self,
+        op: SingleFileCompactionIoStep,
+        file: &mut File,
+        bytes: &mut [u8],
+    ) -> std::io::Result<usize> {
+        if self.inject_interrupted(op) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        if self.fail_now(op) {
+            return Err(Self::injected_error());
+        }
+        if self.inject_zero_progress(op) {
+            return Ok(0);
+        }
+        if let Some(len) = self.short_len(op, bytes.len()) {
+            return file.read(&mut bytes[..len]);
+        }
+        file.read(bytes)
+    }
+
+    fn write(
+        &mut self,
+        op: SingleFileCompactionIoStep,
+        file: &mut File,
+        bytes: &[u8],
+    ) -> std::io::Result<usize> {
+        if self.inject_interrupted(op) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        if self.fail_now(op) {
+            return Err(Self::injected_error());
+        }
+        if self.inject_zero_progress(op) {
+            return Ok(0);
+        }
+        if let Some(len) = self.short_len(op, bytes.len()) {
+            return file.write(&bytes[..len]);
+        }
+        file.write(bytes)
+    }
+
+    fn sync_data(&mut self, op: SingleFileCompactionIoStep, file: &File) -> std::io::Result<()> {
+        if self.fail_now(op) {
+            return Err(Self::injected_error());
+        }
+        file.sync_data()
+    }
+
+    fn sync_all(&mut self, op: SingleFileCompactionIoStep, file: &File) -> std::io::Result<()> {
+        if self.fail_now(op) {
+            return Err(Self::injected_error());
+        }
+        file.sync_all()
+    }
+
+    fn set_len(
+        &mut self,
+        op: SingleFileCompactionIoStep,
+        file: &File,
+        len: u64,
+    ) -> std::io::Result<()> {
+        if self.fail_now(op) {
+            return Err(Self::injected_error());
+        }
+        file.set_len(len)
+    }
+}
+
+struct TornSingleFileRootFault {
+    target: StoreFaultPoint,
+    path: PathBuf,
+}
+
+impl StoreFaultHook for TornSingleFileRootFault {
+    fn hit(&mut self, point: StoreFaultPoint) -> Result<(), DurabilityError> {
+        if point == self.target {
+            crate::single_file::test_corrupt_newest_root_slot(&self.path)?;
+            return Err(DurabilityError::Io(std::io::Error::other(
+                "injected torn single-file root publication",
             )));
         }
         Ok(())
@@ -1115,11 +1341,14 @@ fn crash_point_name(point: StoreFaultPoint) -> &'static str {
         StoreFaultPoint::BeforeCompactionRemove => "before-compaction-remove",
         StoreFaultPoint::AfterCompactionRemove => "after-compaction-remove",
         StoreFaultPoint::AfterCompactionDirectorySync => "after-compaction-directory-sync",
+        StoreFaultPoint::SingleFileCompaction(step) => step
+            .crash_name()
+            .expect("non-publication compaction step has no crash-point name"),
     }
 }
 
 fn parse_crash_point(raw: &str) -> StoreFaultPoint {
-    [
+    let mut points = vec![
         StoreFaultPoint::AfterCheckpointSync,
         StoreFaultPoint::AfterWalSync,
         StoreFaultPoint::AfterMetadataSync,
@@ -1130,10 +1359,18 @@ fn parse_crash_point(raw: &str) -> StoreFaultPoint {
         StoreFaultPoint::BeforeCompactionRemove,
         StoreFaultPoint::AfterCompactionRemove,
         StoreFaultPoint::AfterCompactionDirectorySync,
-    ]
-    .into_iter()
-    .find(|point| crash_point_name(*point) == raw)
-    .unwrap_or_else(|| panic!("unknown crash point {raw}"))
+    ];
+    points.extend(
+        SingleFileCompactionIoStep::ALL
+            .iter()
+            .copied()
+            .filter(|step| step.crash_name().is_some())
+            .map(StoreFaultPoint::SingleFileCompaction),
+    );
+    points
+        .into_iter()
+        .find(|point| crash_point_name(*point) == raw)
+        .unwrap_or_else(|| panic!("unknown crash point {raw}"))
 }
 
 fn signal_crash_ready(dir: &Path) -> ! {
@@ -1171,6 +1408,94 @@ fn run_crash_worker(test_name: &str, dir: &Path, point: &str) {
     child.kill().unwrap();
     let _ = child.wait().unwrap();
     let _ = fs::remove_file(marker);
+}
+
+fn run_single_file_compaction_crash_worker(dir: &Path, point: StoreFaultPoint, encrypted: bool) {
+    let marker = dir.join(CRASH_READY_FILE);
+    let _ = fs::remove_file(&marker);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("store::tests::crash_worker_single_file_compaction")
+        .arg("--nocapture")
+        .env(CRASH_WORKER_ENV, "1")
+        .env(CRASH_DIR_ENV, dir)
+        .env(CRASH_POINT_ENV, crash_point_name(point))
+        .env(
+            CRASH_SINGLE_FILE_ENCRYPTED_ENV,
+            if encrypted { "1" } else { "0" },
+        )
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.is_file() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("single-file compaction crash worker exited before killpoint: {status}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "single-file compaction crash worker did not reach killpoint {point:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    child.kill().unwrap();
+    let _ = child.wait().unwrap();
+    let _ = fs::remove_file(marker);
+}
+
+fn single_file_compaction_fault_points() -> Vec<StoreFaultPoint> {
+    SingleFileCompactionIoStep::ALL
+        .iter()
+        .copied()
+        .filter(|step| step.is_publication_sync_boundary())
+        .map(StoreFaultPoint::SingleFileCompaction)
+        .collect()
+}
+
+fn single_file_compaction_uncertain_root_points() -> Vec<StoreFaultPoint> {
+    SingleFileCompactionIoStep::ALL
+        .iter()
+        .copied()
+        .filter(|step| step.is_uncertain_root_write())
+        .map(StoreFaultPoint::SingleFileCompaction)
+        .collect()
+}
+
+fn single_file_compaction_primitive_failure_cases()
+-> Vec<(SingleFileCompactionIoStep, PrimitiveIoFaultMode)> {
+    let mut cases = Vec::new();
+    for &step in SingleFileCompactionIoStep::ALL {
+        match step.primitive() {
+            SingleFileCompactionPrimitive::Read => {
+                cases.push((step, PrimitiveIoFaultMode::Fail));
+                cases.push((step, PrimitiveIoFaultMode::ShortThenFail));
+            }
+            SingleFileCompactionPrimitive::Write => {
+                cases.push((step, PrimitiveIoFaultMode::Fail));
+                cases.push((step, PrimitiveIoFaultMode::ShortThenFail));
+                if step.supports_zero_progress() {
+                    cases.push((step, PrimitiveIoFaultMode::ZeroProgress));
+                }
+            }
+            SingleFileCompactionPrimitive::OpenRead
+            | SingleFileCompactionPrimitive::OpenReadWrite
+            | SingleFileCompactionPrimitive::MetadataLen
+            | SingleFileCompactionPrimitive::Seek
+            | SingleFileCompactionPrimitive::SyncData
+            | SingleFileCompactionPrimitive::SyncAll
+            | SingleFileCompactionPrimitive::SetLen => {
+                cases.push((step, PrimitiveIoFaultMode::Fail));
+            }
+        }
+    }
+    cases
+}
+
+fn single_file_compaction_short_progress_cases() -> Vec<SingleFileCompactionIoStep> {
+    SingleFileCompactionIoStep::ALL
+        .iter()
+        .copied()
+        .filter(|step| step.supports_short_progress())
+        .collect()
 }
 
 fn committed_descriptor(
@@ -1345,6 +1670,83 @@ fn streaming_checkpoint_rejects_unencodable_chunk_count_before_sidecar_publicati
     assert!(!wal_path(&dir, 2).exists());
 
     drop(store);
+    let (_reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn directory_streaming_checkpoint_uses_bounded_canonical_spool_and_cleans_it() {
+    let dir = test_dir("streaming-canonical-spool");
+    let values: Vec<i64> = (0..50_000).map(i64::from).collect();
+    let (base, registry, _) = setup_revision(1, &values);
+    let encoded_len = checkpoint::encoded_revision_len(&base).unwrap();
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+
+    let started = store
+        .begin_streaming_checkpoint_with_chunk_size(&base, 64 * 1024)
+        .unwrap();
+    let spool = super::generation_layout::checkpoint_stream_spool_path(&dir, started.generation);
+    assert!(spool.exists());
+    assert_eq!(fs::metadata(&spool).unwrap().len(), encoded_len);
+    assert!(!checkpoint_chunk_path(&dir, started.generation, 0).exists());
+
+    let progress = store.write_streaming_checkpoint_chunks(1).unwrap();
+    assert_eq!(progress.chunks_written, 1);
+    assert!(checkpoint_chunk_path(&dir, started.generation, 0).exists());
+    store.write_streaming_checkpoint_chunks(usize::MAX).unwrap();
+    store.finalize_streaming_checkpoint().unwrap();
+    assert!(!spool.exists());
+
+    drop(store);
+    let (_reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn directory_recovery_removes_orphan_checkpoint_stream_spool() {
+    let dir = test_dir("streaming-orphan-spool-recovery");
+    let (base, registry, _) = setup_revision(1, &[1, 2, 3]);
+    let store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    drop(store);
+
+    let spool = super::generation_layout::checkpoint_stream_spool_path(&dir, 2);
+    fs::write(&spool, b"unpublished scratch").unwrap();
+    assert!(spool.exists());
+
+    let (_reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    assert!(!spool.exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn directory_streaming_checkpoint_rejects_canonical_spool_tamper() {
+    let dir = test_dir("streaming-canonical-spool-tamper");
+    let values: Vec<i64> = (0..20_000).map(i64::from).collect();
+    let (base, registry, _) = setup_revision(1, &values);
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    let started = store
+        .begin_streaming_checkpoint_with_chunk_size(&base, 64 * 1024)
+        .unwrap();
+    let spool = super::generation_layout::checkpoint_stream_spool_path(&dir, started.generation);
+
+    let mut bytes = fs::read(&spool).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x80;
+    fs::write(&spool, bytes).unwrap();
+
+    assert!(matches!(
+        store.write_streaming_checkpoint_chunks(usize::MAX),
+        Err(DurabilityError::Corruption {
+            reason: "checkpoint canonical spool changed during resumable publication",
+            ..
+        })
+    ));
+    drop(store);
+    assert!(!spool.exists());
+
     let (_reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
     assert_eq!(scan.durable_revision(), base.id());
     fs::remove_dir_all(dir).unwrap();
@@ -2381,6 +2783,359 @@ fn subprocess_kill_during_compaction_never_removes_active_generation() {
 }
 
 #[test]
+fn single_file_compaction_primitive_io_failure_matrix_reopens_plaintext_and_encrypted() {
+    for encrypted in [false, true] {
+        for (op, mode) in single_file_compaction_primitive_failure_cases() {
+            let dir = test_dir(&format!("primitive-{op:?}-{encrypted}"));
+            let path = dir.join("database.cfmd");
+            let (base, registry, relation) = setup_revision(40_180, &[1]);
+            let (_, descriptor) = transition_from(&base, &registry, relation, 40_182, 182);
+            let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+                crate::storage_encryption::StorageEncryptionKey::try_new([0x62; 32]).unwrap(),
+            );
+            let mut store = if encrypted {
+                DurableRevisionStore::create_single_file_with_encryption(
+                    &path,
+                    &encryption,
+                    &base,
+                    &registry,
+                )
+                .unwrap()
+            } else {
+                DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap()
+            };
+            store
+                .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+                .unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+            store.durably_prepare(&descriptor).unwrap();
+
+            let mut io = FaultingSingleFileCompactionIo::new(op, mode);
+            let result = store.test_compact_obsolete_generations_with_io(&mut io);
+            assert!(
+                matches!(result, Err(DurabilityError::Io(_))),
+                "{op:?} encrypted={encrypted}: {result:?}"
+            );
+            assert_ne!(io.target_calls, 0, "fault was not injected for {op:?}");
+            assert!(store.poisoned, "{op:?} encrypted={encrypted}");
+            assert_eq!(
+                store.compact_obsolete_generations(),
+                Err(DurabilityError::Poisoned),
+                "{op:?} encrypted={encrypted}"
+            );
+            drop(store);
+
+            let (reopened, scan) = if encrypted {
+                DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap()
+            } else {
+                DurableRevisionStore::open_single_file(&path).unwrap()
+            };
+            assert_eq!(scan.durable_revision(), base.id(), "{op:?}");
+            assert_eq!(reopened.generation(), 3, "{op:?}");
+            assert_eq!(
+                reopened.current_replication_membership().unwrap().epoch,
+                1,
+                "{op:?} encrypted={encrypted}"
+            );
+            drop(reopened);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn single_file_compaction_short_and_interrupted_io_make_forward_progress_plaintext_and_encrypted() {
+    for encrypted in [false, true] {
+        for op in single_file_compaction_short_progress_cases() {
+            for mode in [
+                PrimitiveIoFaultMode::ShortOnce,
+                PrimitiveIoFaultMode::InterruptedOnce,
+            ] {
+                let dir = test_dir(&format!("progress-{op:?}-{mode:?}-{encrypted}"));
+                let path = dir.join("database.cfmd");
+                let (base, registry, relation) = setup_revision(40_181, &[1]);
+                let (_, descriptor) = transition_from(&base, &registry, relation, 40_183, 183);
+                let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+                    crate::storage_encryption::StorageEncryptionKey::try_new([0x63; 32]).unwrap(),
+                );
+                let mut store = if encrypted {
+                    DurableRevisionStore::create_single_file_with_encryption(
+                        &path,
+                        &encryption,
+                        &base,
+                        &registry,
+                    )
+                    .unwrap()
+                } else {
+                    DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap()
+                };
+                store
+                    .durably_install_replication_membership(membership_change(
+                        1,
+                        &[1, 2, 3],
+                        2,
+                        &[],
+                    ))
+                    .unwrap();
+                store.rotate_checkpoint(&base).unwrap();
+                store.rotate_checkpoint(&base).unwrap();
+                store.durably_prepare(&descriptor).unwrap();
+
+                let mut io = FaultingSingleFileCompactionIo::new(op, mode);
+                store
+                    .test_compact_obsolete_generations_with_io(&mut io)
+                    .unwrap();
+                assert_ne!(
+                    io.target_calls, 0,
+                    "I/O perturbation was not injected for {op:?}"
+                );
+                assert!(!store.poisoned, "{op:?} encrypted={encrypted}");
+                drop(store);
+
+                let (reopened, scan) = if encrypted {
+                    DurableRevisionStore::open_single_file_with_encryption(&path, &encryption)
+                        .unwrap()
+                } else {
+                    DurableRevisionStore::open_single_file(&path).unwrap()
+                };
+                assert_eq!(scan.durable_revision(), base.id(), "{op:?}");
+                assert_eq!(reopened.generation(), 3, "{op:?}");
+                assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
+                drop(reopened);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn single_file_compaction_wal_premature_eof_is_structural_corruption_plaintext_and_encrypted() {
+    let wal_reads = [
+        SingleFileCompactionIoStep::StagingWalRead,
+        SingleFileCompactionIoStep::FrontWalRead,
+        SingleFileCompactionIoStep::JournalReopenWalRead,
+    ];
+    for encrypted in [false, true] {
+        for op in wal_reads {
+            let dir = test_dir(&format!("wal-eof-{op:?}-{encrypted}"));
+            let path = dir.join("database.cfmd");
+            let (base, registry, relation) = setup_revision(40_184, &[1]);
+            let (_, descriptor) = transition_from(&base, &registry, relation, 40_185, 185);
+            let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+                crate::storage_encryption::StorageEncryptionKey::try_new([0x64; 32]).unwrap(),
+            );
+            let mut store = if encrypted {
+                DurableRevisionStore::create_single_file_with_encryption(
+                    &path,
+                    &encryption,
+                    &base,
+                    &registry,
+                )
+                .unwrap()
+            } else {
+                DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap()
+            };
+            store
+                .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+                .unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+            store.durably_prepare(&descriptor).unwrap();
+
+            let mut io =
+                FaultingSingleFileCompactionIo::new(op, PrimitiveIoFaultMode::ZeroProgress);
+            assert!(matches!(
+                store.test_compact_obsolete_generations_with_io(&mut io),
+                Err(DurabilityError::Corruption { .. })
+            ));
+            assert_ne!(
+                io.target_calls, 0,
+                "premature EOF was not injected for {op:?}"
+            );
+            assert!(store.poisoned, "{op:?} encrypted={encrypted}");
+            drop(store);
+
+            let (reopened, scan) = if encrypted {
+                DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap()
+            } else {
+                DurableRevisionStore::open_single_file(&path).unwrap()
+            };
+            assert_eq!(scan.durable_revision(), base.id(), "{op:?}");
+            assert_eq!(reopened.generation(), 3, "{op:?}");
+            assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
+            drop(reopened);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn single_file_compaction_error_fault_matrix_reopens_plaintext_and_encrypted() {
+    for encrypted in [false, true] {
+        for point in single_file_compaction_fault_points() {
+            let dir = test_dir(crash_point_name(point));
+            let path = dir.join("database.cfmd");
+            let (base, registry, _) = setup_revision(40_176, &[1]);
+            let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+                crate::storage_encryption::StorageEncryptionKey::try_new([0x61; 32]).unwrap(),
+            );
+            let mut store = if encrypted {
+                DurableRevisionStore::create_single_file_with_encryption(
+                    &path,
+                    &encryption,
+                    &base,
+                    &registry,
+                )
+                .unwrap()
+            } else {
+                DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap()
+            };
+            store
+                .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+                .unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+
+            let mut hook = ErrorFault { target: point };
+            assert!(matches!(
+                store.test_compact_obsolete_generations_with_hook(&mut hook),
+                Err(DurabilityError::Io(_))
+            ));
+            assert!(store.poisoned, "{point:?} encrypted={encrypted}");
+            assert_eq!(
+                store.compact_obsolete_generations(),
+                Err(DurabilityError::Poisoned),
+                "{point:?} encrypted={encrypted}"
+            );
+            drop(store);
+
+            let (reopened, scan) = if encrypted {
+                DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap()
+            } else {
+                DurableRevisionStore::open_single_file(&path).unwrap()
+            };
+            assert_eq!(scan.durable_revision(), base.id(), "{point:?}");
+            assert_eq!(reopened.generation(), 3, "{point:?}");
+            assert_eq!(
+                reopened.current_replication_membership().unwrap().epoch,
+                1,
+                "{point:?} encrypted={encrypted}"
+            );
+            drop(reopened);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn single_file_compaction_torn_root_matrix_falls_back_plaintext_and_encrypted() {
+    for encrypted in [false, true] {
+        for point in single_file_compaction_uncertain_root_points() {
+            let dir = test_dir(crash_point_name(point));
+            let path = dir.join("database.cfmd");
+            let (base, registry, _) = setup_revision(40_178, &[1]);
+            let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+                crate::storage_encryption::StorageEncryptionKey::try_new([0x61; 32]).unwrap(),
+            );
+            let mut store = if encrypted {
+                DurableRevisionStore::create_single_file_with_encryption(
+                    &path,
+                    &encryption,
+                    &base,
+                    &registry,
+                )
+                .unwrap()
+            } else {
+                DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap()
+            };
+            store
+                .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+                .unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+
+            let mut hook = TornSingleFileRootFault {
+                target: point,
+                path: path.clone(),
+            };
+            assert!(matches!(
+                store.test_compact_obsolete_generations_with_hook(&mut hook),
+                Err(DurabilityError::Io(_))
+            ));
+            assert!(store.poisoned, "{point:?} encrypted={encrypted}");
+            drop(store);
+
+            let (reopened, scan) = if encrypted {
+                DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap()
+            } else {
+                DurableRevisionStore::open_single_file(&path).unwrap()
+            };
+            assert_eq!(scan.durable_revision(), base.id(), "{point:?}");
+            assert_eq!(reopened.generation(), 3, "{point:?}");
+            assert_eq!(
+                reopened.current_replication_membership().unwrap().epoch,
+                1,
+                "{point:?} encrypted={encrypted}"
+            );
+            drop(reopened);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn subprocess_kill_at_every_single_file_compaction_boundary_reopens_plaintext_and_encrypted() {
+    for encrypted in [false, true] {
+        for point in single_file_compaction_fault_points()
+            .into_iter()
+            .chain(single_file_compaction_uncertain_root_points())
+        {
+            let dir = test_dir(crash_point_name(point));
+            let path = dir.join("database.cfmd");
+            let (base, registry, _) = setup_revision(40_177, &[1]);
+            let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+                crate::storage_encryption::StorageEncryptionKey::try_new([0x61; 32]).unwrap(),
+            );
+            let mut store = if encrypted {
+                DurableRevisionStore::create_single_file_with_encryption(
+                    &path,
+                    &encryption,
+                    &base,
+                    &registry,
+                )
+                .unwrap()
+            } else {
+                DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap()
+            };
+            store
+                .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+                .unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+            store.rotate_checkpoint(&base).unwrap();
+            drop(store);
+
+            run_single_file_compaction_crash_worker(&dir, point, encrypted);
+
+            let (reopened, scan) = if encrypted {
+                DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap()
+            } else {
+                DurableRevisionStore::open_single_file(&path).unwrap()
+            };
+            assert_eq!(scan.durable_revision(), base.id(), "{point:?}");
+            assert_eq!(reopened.generation(), 3, "{point:?}");
+            assert_eq!(
+                reopened.current_replication_membership().unwrap().epoch,
+                1,
+                "{point:?} encrypted={encrypted}"
+            );
+            drop(reopened);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn crash_worker_wal_boundary() {
     if std::env::var_os(CRASH_WORKER_ENV).is_none() {
         return;
@@ -2437,6 +3192,33 @@ fn crash_worker_compaction() {
         .test_compact_obsolete_generations_with_hook(&mut hook)
         .unwrap();
     panic!("compaction crash point was not reached: {point:?}");
+}
+
+#[test]
+fn crash_worker_single_file_compaction() {
+    if std::env::var_os(CRASH_WORKER_ENV).is_none() {
+        return;
+    }
+    let dir = PathBuf::from(std::env::var_os(CRASH_DIR_ENV).unwrap());
+    let path = dir.join("database.cfmd");
+    let point = parse_crash_point(&std::env::var(CRASH_POINT_ENV).unwrap());
+    let encrypted = std::env::var(CRASH_SINGLE_FILE_ENCRYPTED_ENV).as_deref() == Ok("1");
+    let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+        crate::storage_encryption::StorageEncryptionKey::try_new([0x61; 32]).unwrap(),
+    );
+    let (mut store, _) = if encrypted {
+        DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap()
+    } else {
+        DurableRevisionStore::open_single_file(&path).unwrap()
+    };
+    let mut hook = BlockingKillFault {
+        target: point,
+        directory: dir.clone(),
+    };
+    store
+        .test_compact_obsolete_generations_with_hook(&mut hook)
+        .unwrap();
+    panic!("single-file compaction crash point was not reached: {point:?}");
 }
 
 fn assert_committed_at(
@@ -3770,6 +4552,17 @@ fn replication_effect_lifecycle_requires_quorum_before_publication_and_survives_
         RevisionId::new(546)
     );
     assert_eq!(store.durable_head(), base.id());
+
+    store
+        .replication
+        .test_semantic_snapshot_roundtrip()
+        .unwrap();
+    assert_eq!(
+        store
+            .replication
+            .test_semantic_snapshot_retained_history_shape(),
+        (1, 1, 0, 1),
+    );
 
     drop(store);
     let (reopened, _) = DurableRevisionStore::open(&dir).unwrap();
@@ -5342,6 +6135,15 @@ fn single_file_replication_authority_replays_live_wal_and_survives_rotation() {
     assert_eq!(scan.durable_revision(), base.id());
     assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
     reopened.rotate_checkpoint(&base).unwrap();
+    assert!(
+        reopened
+            .backend
+            .single_file_container()
+            .unwrap()
+            .read_section(SingleFileSectionKind::ReplicationAuthority, 0)
+            .unwrap()
+            .is_none()
+    );
     drop(reopened);
 
     let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
@@ -5353,6 +6155,76 @@ fn single_file_replication_authority_replays_live_wal_and_survives_rotation() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["database.cfmd"]);
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn encrypted_single_file_replication_segment_chain_survives_rotations() {
+    let dir = test_dir("encrypted-single-file-replication-streaming-rotation");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(40_150, &[1]);
+    let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+        crate::storage_encryption::StorageEncryptionKey::try_new([0x51; 32]).unwrap(),
+    );
+
+    let mut store = DurableRevisionStore::create_single_file_with_encryption(
+        &path,
+        &encryption,
+        &base,
+        &registry,
+    )
+    .unwrap();
+    store
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+    store.rotate_checkpoint(&base).unwrap();
+    store.rotate_checkpoint(&base).unwrap();
+    drop(store);
+
+    let (reopened, scan) =
+        DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    assert_eq!(reopened.generation(), 3);
+    assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn encrypted_single_file_compaction_relocates_authenticated_authority_closure() {
+    let dir = test_dir("encrypted-single-file-authority-compaction");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(40_175, &[1]);
+    let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+        crate::storage_encryption::StorageEncryptionKey::try_new([0x52; 32]).unwrap(),
+    );
+
+    let mut store = DurableRevisionStore::create_single_file_with_encryption(
+        &path,
+        &encryption,
+        &base,
+        &registry,
+    )
+    .unwrap();
+    store
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+    store.rotate_checkpoint(&base).unwrap();
+    store.rotate_checkpoint(&base).unwrap();
+    let size_before = fs::metadata(&path).unwrap().len();
+
+    store.compact_obsolete_generations().unwrap();
+    let size_after = fs::metadata(&path).unwrap().len();
+    assert!(size_after < size_before);
+    assert_eq!(store.current_replication_membership().unwrap().epoch, 1);
+    drop(store);
+
+    let (reopened, scan) =
+        DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    assert_eq!(reopened.generation(), 3);
+    assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -5442,6 +6314,57 @@ fn single_file_external_freshness_survives_commit_rotation_and_rejects_rollback(
 }
 
 #[test]
+fn encrypted_single_file_external_freshness_uses_the_same_keyed_open_boundary() {
+    let dir = test_dir("encrypted-single-file-external-freshness");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(40_240, &[1]);
+    let (config, authority) = external_freshness_fixture([42; 32]);
+    let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+        crate::storage_encryption::StorageEncryptionKey::try_new([0x44; 32]).unwrap(),
+    );
+    let mut store = DurableRevisionStore::create_single_file_with_encryption(
+        &path,
+        &encryption,
+        &base,
+        &registry,
+    )
+    .unwrap();
+    store
+        .adopt_external_freshness(config.clone(), authority.boxed())
+        .unwrap();
+    drop(store);
+
+    assert!(
+        DurableRevisionStore::open_single_file_with_external_freshness(
+            &path,
+            config.clone(),
+            authority.boxed(),
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        DurableRevisionStore::open_single_file_with_encryption(&path, &encryption),
+        Err(DurabilityError::Protocol {
+            reason: "externally anchored store requires freshness-aware open",
+            ..
+        })
+    ));
+
+    let (reopened, scan) =
+        DurableRevisionStore::open_single_file_with_external_freshness_and_encryption(
+            &path,
+            config,
+            authority.boxed(),
+            &encryption,
+        )
+        .unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    assert!(reopened.external_freshness.is_some());
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn single_file_compaction_relocates_authority_without_losing_live_prepare_or_wal() {
     let dir = test_dir("single-file-in-place-compaction");
     let path = dir.join("database.cfmd");
@@ -5449,6 +6372,9 @@ fn single_file_compaction_relocates_authority_without_losing_live_prepare_or_wal
     let (target, descriptor) = transition_from(&base, &registry, relation, 40_251, 251);
     let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
 
+    store
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
     store.rotate_checkpoint(&base).unwrap();
     store.rotate_checkpoint(&base).unwrap();
     let generation_before = store.generation();
@@ -5469,6 +6395,7 @@ fn single_file_compaction_relocates_authority_without_losing_live_prepare_or_wal
     assert_eq!(reopened.generation(), generation_before);
     assert_eq!(reopened.durable_head(), target.id());
     assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -5537,8 +6464,17 @@ fn single_file_streaming_checkpoint_carries_exact_wal_and_replication_suffix() {
     assert_eq!(store.durable_head(), r2.id());
     assert_eq!(store.current_replication_membership().unwrap().epoch, 1);
     assert_eq!(store.generation(), 2);
+    assert!(
+        store
+            .backend
+            .single_file_container()
+            .unwrap()
+            .read_section(SingleFileSectionKind::ReplicationAuthority, 0)
+            .unwrap()
+            .is_none()
+    );
 
-    // A subsequent ordinary rotation must archive only the post-cut live
+    // A subsequent ordinary rotation must segment only the post-cut live
     // replication suffix once, while preserving the same semantic endpoint.
     store.rotate_checkpoint(&r2).unwrap();
     assert_eq!(store.generation(), 3);

@@ -180,13 +180,13 @@ impl SubscriptionRegistry {
 
     fn cancel_all(&self) -> Result<()> {
         let subscriptions = {
-            let mut state = self.state.lock().map_err(|_| protocol_internal())?;
+            let state = self.state.lock().map_err(|_| protocol_internal())?;
             if state.closed {
                 return Err(session_closed());
             }
-            std::mem::take(&mut state.subscriptions)
+            state.subscriptions.values().cloned().collect::<Vec<_>>()
         };
-        for subscription in subscriptions.into_values() {
+        for subscription in subscriptions {
             subscription.cancellation.cancel();
         }
         Ok(())

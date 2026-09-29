@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use kernel_auth::AuthorityDigest;
@@ -11,11 +11,14 @@ use crate::runtime::{
     CodecError, DurabilityError, DurableCommitReceipt, DurablePrepareToken, RecoveryScan,
     RevisionDurability,
 };
+use crate::storage_encryption::{StorageAeadCodec, StorageEncryptionDomain, StorageNonceSequence};
 use crate::wal_frame::{EncodedFrame, RecordKind, encode_frame};
 use crate::wal_payload::{CommitRecord, encode_commit_payload, encode_prepare_payload};
 
-use super::WAL_FRESHNESS_PREFIX_DOMAIN;
-use super::recovery::{scan_wal_file_region_seeded, scan_wal_file_seeded};
+use super::recovery::{
+    scan_wal_file_region_seeded, scan_wal_file_seeded, scan_wal_reader_region_seeded,
+};
+use super::{WAL_FRESHNESS_PREFIX_DOMAIN, WalRegionScanSpec, wal_aad_context};
 
 #[derive(Debug)]
 pub struct FileRevisionWal {
@@ -25,6 +28,8 @@ pub struct FileRevisionWal {
     next_lsn: u64,
     freshness_hasher: Sha256,
     poisoned: bool,
+    crypto: Option<StorageAeadCodec>,
+    nonce_sequence: Option<StorageNonceSequence>,
 }
 
 pub(crate) struct WalRegionRecovery<'a> {
@@ -36,6 +41,20 @@ pub(crate) struct WalRegionRecovery<'a> {
     pub first_lsn: u64,
     pub seeded_prepares: &'a [(u64, DurableRevisionDescriptor, u32)],
     pub writable: bool,
+    pub crypto: Option<StorageAeadCodec>,
+}
+
+pub(crate) struct WalRegionScan {
+    scan: RecoveryScan,
+    freshness_hasher: Sha256,
+    good_end: u64,
+}
+
+impl WalRegionScan {
+    #[must_use]
+    pub(crate) const fn good_end(&self) -> u64 {
+        self.good_end
+    }
 }
 
 impl FileRevisionWal {
@@ -69,6 +88,8 @@ impl FileRevisionWal {
             next_lsn,
             freshness_hasher,
             poisoned: false,
+            crypto: None,
+            nonce_sequence: None,
         })
     }
 
@@ -94,7 +115,7 @@ impl FileRevisionWal {
             .open(&path)?;
         file.lock()?;
         let (scan, freshness_hasher, original_len) =
-            scan_wal_file_seeded(&mut file, base_revision, first_lsn, seeded_prepares)?;
+            scan_wal_file_seeded(&mut file, base_revision, first_lsn, seeded_prepares, None)?;
         if u64::try_from(scan.last_good_offset()).map_err(|_| CodecError::LengthOverflow)?
             < original_len
         {
@@ -112,6 +133,8 @@ impl FileRevisionWal {
                 next_lsn: scan.next_lsn(),
                 freshness_hasher,
                 poisoned: false,
+                crypto: None,
+                nonce_sequence: None,
             },
             scan,
         ))
@@ -152,12 +175,26 @@ impl FileRevisionWal {
             base_revision,
             first_lsn,
             seeded_prepares,
+            self.crypto.as_ref(),
         )?;
         Ok(scan)
     }
 
     pub(crate) fn seal_for_generation_rotation(&mut self) -> Result<u64, DurabilityError> {
-        self.durability_barrier()?;
+        self.seal_for_generation_rotation_with(File::sync_data)
+    }
+
+    pub(crate) fn seal_for_generation_rotation_with(
+        &mut self,
+        sync: impl FnOnce(&File) -> std::io::Result<()>,
+    ) -> Result<u64, DurabilityError> {
+        if self.poisoned {
+            return Err(DurabilityError::Poisoned);
+        }
+        if let Err(error) = sync(&self.file) {
+            self.poisoned = true;
+            return Err(DurabilityError::Io(error));
+        }
         self.poisoned = true;
         Ok(self.next_lsn)
     }
@@ -186,6 +223,7 @@ impl FileRevisionWal {
             base_revision,
             first_lsn,
             seeded_prepares,
+            self.crypto.as_ref(),
         )?;
         Ok((scan, file_len - self.start_offset))
     }
@@ -193,35 +231,64 @@ impl FileRevisionWal {
     pub(crate) fn open_region_recovered(
         mut region: WalRegionRecovery<'_>,
     ) -> Result<(Self, RecoveryScan), DurabilityError> {
-        let (scan, freshness_hasher) = scan_wal_file_region_seeded(
-            &mut region.file,
-            region.start_offset,
-            region.end_offset,
-            region.base_revision,
-            region.first_lsn,
-            region.seeded_prepares,
-        )?;
+        let backing_len = region.file.metadata()?.len();
+        let spec = WalRegionScanSpec {
+            start_offset: region.start_offset,
+            end_offset: region.end_offset,
+            base_revision: region.base_revision,
+            first_lsn: region.first_lsn,
+            seeded_prepares: region.seeded_prepares,
+            crypto: region.crypto.as_ref(),
+        };
+        let scanned = Self::scan_region_recovery(&spec, &mut region.file, backing_len)?;
+        if region.writable && scanned.good_end < region.end_offset {
+            region.file.set_len(scanned.good_end)?;
+            region.file.sync_all()?;
+        }
+        region.file.seek(SeekFrom::Start(scanned.good_end))?;
+        Self::from_region_scan(region, scanned)
+    }
+
+    pub(crate) fn scan_region_recovery(
+        spec: &WalRegionScanSpec<'_>,
+        reader: &mut (impl Read + Seek),
+        backing_len: u64,
+    ) -> Result<WalRegionScan, DurabilityError> {
+        let (scan, freshness_hasher) = scan_wal_reader_region_seeded(reader, backing_len, spec)?;
         let logical_good =
             u64::try_from(scan.last_good_offset()).map_err(|_| CodecError::LengthOverflow)?;
-        let good_end = region
+        let good_end = spec
             .start_offset
             .checked_add(logical_good)
             .ok_or(CodecError::LengthOverflow)?;
-        if region.writable && good_end < region.end_offset {
-            region.file.set_len(good_end)?;
-            region.file.sync_all()?;
-        }
-        region.file.seek(SeekFrom::Start(good_end))?;
+        Ok(WalRegionScan {
+            scan,
+            freshness_hasher,
+            good_end,
+        })
+    }
+
+    pub(crate) fn from_region_scan(
+        region: WalRegionRecovery<'_>,
+        scanned: WalRegionScan,
+    ) -> Result<(Self, RecoveryScan), DurabilityError> {
+        let nonce_sequence = region
+            .crypto
+            .as_ref()
+            .map(|_| StorageNonceSequence::random())
+            .transpose()?;
         Ok((
             Self {
                 path: region.path,
                 file: region.file,
                 start_offset: region.start_offset,
-                next_lsn: scan.next_lsn(),
-                freshness_hasher,
+                next_lsn: scanned.scan.next_lsn(),
+                freshness_hasher: scanned.freshness_hasher,
                 poisoned: false,
+                crypto: region.crypto,
+                nonce_sequence,
             },
-            scan,
+            scanned.scan,
         ))
     }
 
@@ -236,7 +303,25 @@ impl FileRevisionWal {
         }
         let lsn = self.next_lsn;
         let next_lsn = lsn.checked_add(1).ok_or(DurabilityError::LsnExhausted)?;
-        let frame = encode_frame(lsn, kind, revision, payload)?;
+        let stored_payload = if let Some(crypto) = &self.crypto {
+            let nonce = self
+                .nonce_sequence
+                .as_mut()
+                .ok_or(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "encrypted WAL writer is missing its nonce sequence",
+                })?
+                .next_nonce()?;
+            crypto.seal(
+                StorageEncryptionDomain::Wal,
+                nonce,
+                &wal_aad_context(kind, lsn, revision),
+                payload,
+            )?
+        } else {
+            payload.to_vec()
+        };
+        let frame = encode_frame(lsn, kind, revision, &stored_payload)?;
         if let Err(error) = self.file.write_all(&frame.bytes) {
             self.poisoned = true;
             return Err(DurabilityError::Io(error));

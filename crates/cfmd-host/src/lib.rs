@@ -739,7 +739,7 @@ fn session_closed() -> ProtocolError {
 /// a hosting/networking dependency or trust policy.
 pub trait DatabaseHostingExt {
     #[must_use]
-    fn host<Evidence, A, Z>(self, authenticator: A, authorizer: Z) -> HostedServer<Evidence, A, Z>
+    fn host<Evidence, A, Z>(&self, authenticator: A, authorizer: Z) -> HostedServer<Evidence, A, Z>
     where
         A: Authenticator<Evidence>,
         Z: Authorizer;
@@ -757,7 +757,7 @@ pub trait DatabaseHostingExt {
 }
 
 impl DatabaseHostingExt for Database {
-    fn host<Evidence, A, Z>(self, authenticator: A, authorizer: Z) -> HostedServer<Evidence, A, Z>
+    fn host<Evidence, A, Z>(&self, authenticator: A, authorizer: Z) -> HostedServer<Evidence, A, Z>
     where
         A: Authenticator<Evidence>,
         Z: Authorizer,

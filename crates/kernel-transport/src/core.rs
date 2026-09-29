@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_identity::IdentityTransport;
-use kernel_model::{DatabaseState, FiniteModel};
+use kernel_model::{DatabaseState, FiniteModel, Value};
 use kernel_query::{AggregateSpec, RelExpr};
 use kernel_schema::SemanticContext;
 use kernel_semantics::SemanticRegistry;
@@ -245,6 +245,13 @@ pub fn transport_rel_expr(
             value: transport_value(identity, value)?,
             equivalence: *equivalence,
         },
+        RelExpr::FilterOrderConst {
+            input,
+            column,
+            value,
+            ordering,
+            comparison,
+        } => transport_order_filter(identity, input, *column, value, *ordering, *comparison)?,
         RelExpr::FilterEqColumns {
             input,
             left_column,
@@ -322,9 +329,33 @@ pub fn transport_rel_expr(
             direction: *direction,
             k: *k,
         },
-        RelExpr::PromoteToBag(input) => {
-            RelExpr::PromoteToBag(Box::new(transport_rel_expr(identity, input)?))
-        }
+        RelExpr::PromoteToBag(input) => transport_promote_to_bag(identity, input)?,
+    })
+}
+
+fn transport_promote_to_bag(
+    identity: &IdentityTransport,
+    input: &RelExpr,
+) -> Result<RelExpr, TransportError> {
+    Ok(RelExpr::PromoteToBag(Box::new(transport_rel_expr(
+        identity, input,
+    )?)))
+}
+
+fn transport_order_filter(
+    identity: &IdentityTransport,
+    input: &RelExpr,
+    column: usize,
+    value: &Value,
+    ordering: kernel_types::SemanticId,
+    comparison: kernel_query::OrderComparison,
+) -> Result<RelExpr, TransportError> {
+    Ok(RelExpr::FilterOrderConst {
+        input: Box::new(transport_rel_expr(identity, input)?),
+        column,
+        value: transport_value(identity, value)?,
+        ordering,
+        comparison,
     })
 }
 

@@ -1,13 +1,13 @@
-use kernel_query::{AggregateSpec, OrderDirection, RelExpr};
+use kernel_query::{AggregateSpec, OrderComparison, OrderDirection, RelExpr};
 use kernel_types::SemanticId;
 
-use crate::binary_codec::{Cursor, encode_value, push_len, push_u64, push_u128};
+use crate::binary_codec::{BinarySource, encode_value, push_len, push_u64, push_u128};
 use crate::runtime::CodecError;
 
 const MAX_QUERY_DEPTH: usize = 128;
 
 pub(super) fn encode_rel_expr(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     expr: &RelExpr,
     depth: usize,
 ) -> Result<(), CodecError> {
@@ -24,13 +24,14 @@ pub(super) fn encode_rel_expr(
             column,
             value,
             equivalence,
-        } => {
-            out.push(1);
-            encode_rel_expr(out, input, depth + 1)?;
-            push_usize(out, *column)?;
-            encode_value(out, value, 0)?;
-            push_u128(out, equivalence.raw());
-        }
+        } => encode_eq_filter(out, input, *column, value, *equivalence, depth)?,
+        RelExpr::FilterOrderConst {
+            input,
+            column,
+            value,
+            ordering,
+            comparison,
+        } => encode_order_filter(out, input, *column, value, *ordering, *comparison, depth)?,
         RelExpr::FilterEqColumns {
             input,
             left_column,
@@ -111,8 +112,47 @@ pub(super) fn encode_rel_expr(
     Ok(())
 }
 
+fn encode_eq_filter(
+    out: &mut impl crate::binary_codec::BinarySink,
+    input: &RelExpr,
+    column: usize,
+    value: &kernel_model::Value,
+    equivalence: SemanticId,
+    depth: usize,
+) -> Result<(), CodecError> {
+    out.push(1);
+    encode_rel_expr(out, input, depth + 1)?;
+    push_usize(out, column)?;
+    encode_value(out, value, 0)?;
+    push_u128(out, equivalence.raw());
+    Ok(())
+}
+
+fn encode_order_filter(
+    out: &mut impl crate::binary_codec::BinarySink,
+    input: &RelExpr,
+    column: usize,
+    value: &kernel_model::Value,
+    ordering: SemanticId,
+    comparison: OrderComparison,
+    depth: usize,
+) -> Result<(), CodecError> {
+    out.push(11);
+    encode_rel_expr(out, input, depth + 1)?;
+    push_usize(out, column)?;
+    encode_value(out, value, 0)?;
+    push_u128(out, ordering.raw());
+    out.push(match comparison {
+        OrderComparison::Less => 0,
+        OrderComparison::LessOrEqual => 1,
+        OrderComparison::Greater => 2,
+        OrderComparison::GreaterOrEqual => 3,
+    });
+    Ok(())
+}
+
 fn encode_promote_to_bag(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     input: &RelExpr,
     depth: usize,
 ) -> Result<(), CodecError> {
@@ -121,7 +161,7 @@ fn encode_promote_to_bag(
 }
 
 fn encode_filter_columns(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     input: &RelExpr,
     left_column: usize,
     right_column: usize,
@@ -137,7 +177,7 @@ fn encode_filter_columns(
 }
 
 fn encode_rel_group(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     input: &RelExpr,
     group_columns: &[usize],
     group_equivalences: &[SemanticId],
@@ -155,7 +195,7 @@ fn encode_rel_group(
 }
 
 fn encode_rel_top_k(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     input: &RelExpr,
     column: usize,
     ordering: SemanticId,
@@ -175,7 +215,7 @@ fn encode_rel_top_k(
 }
 
 pub(super) fn decode_rel_expr(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     depth: usize,
 ) -> Result<RelExpr, &'static str> {
     if depth > MAX_QUERY_DEPTH {
@@ -262,11 +302,39 @@ pub(super) fn decode_rel_expr(
             right_column: decode_usize(cursor)?,
             equivalence: SemanticId::new(cursor.u128()?),
         }),
+        11 => decode_order_filter(cursor, depth),
         _ => Err("unknown durable relation expression tag"),
     }
 }
 
-fn encode_aggregate(out: &mut Vec<u8>, aggregate: &AggregateSpec) -> Result<(), CodecError> {
+fn decode_order_filter(
+    cursor: &mut impl BinarySource,
+    depth: usize,
+) -> Result<RelExpr, &'static str> {
+    let input = Box::new(decode_rel_expr(cursor, depth + 1)?);
+    let column = decode_usize(cursor)?;
+    let value = cursor.value(0)?;
+    let ordering = SemanticId::new(cursor.u128()?);
+    let comparison = match cursor.u8()? {
+        0 => OrderComparison::Less,
+        1 => OrderComparison::LessOrEqual,
+        2 => OrderComparison::Greater,
+        3 => OrderComparison::GreaterOrEqual,
+        _ => return Err("invalid order comparison"),
+    };
+    Ok(RelExpr::FilterOrderConst {
+        input,
+        column,
+        value,
+        ordering,
+        comparison,
+    })
+}
+
+fn encode_aggregate(
+    out: &mut impl crate::binary_codec::BinarySink,
+    aggregate: &AggregateSpec,
+) -> Result<(), CodecError> {
     match aggregate {
         AggregateSpec::Count { result_equivalence } => {
             out.push(0);
@@ -284,7 +352,7 @@ fn encode_aggregate(out: &mut Vec<u8>, aggregate: &AggregateSpec) -> Result<(), 
     Ok(())
 }
 
-fn decode_aggregate(cursor: &mut Cursor<'_>) -> Result<AggregateSpec, &'static str> {
+fn decode_aggregate(cursor: &mut impl BinarySource) -> Result<AggregateSpec, &'static str> {
     match cursor.u8()? {
         0 => Ok(AggregateSpec::Count {
             result_equivalence: SemanticId::new(cursor.u128()?),
@@ -297,7 +365,10 @@ fn decode_aggregate(cursor: &mut Cursor<'_>) -> Result<AggregateSpec, &'static s
     }
 }
 
-fn encode_semantic_ids(out: &mut Vec<u8>, ids: &[SemanticId]) -> Result<(), CodecError> {
+fn encode_semantic_ids(
+    out: &mut impl crate::binary_codec::BinarySink,
+    ids: &[SemanticId],
+) -> Result<(), CodecError> {
     push_len(out, ids.len())?;
     for id in ids {
         push_u128(out, id.raw());
@@ -305,7 +376,7 @@ fn encode_semantic_ids(out: &mut Vec<u8>, ids: &[SemanticId]) -> Result<(), Code
     Ok(())
 }
 
-fn decode_semantic_ids(cursor: &mut Cursor<'_>) -> Result<Vec<SemanticId>, &'static str> {
+fn decode_semantic_ids(cursor: &mut impl BinarySource) -> Result<Vec<SemanticId>, &'static str> {
     let count = cursor.len()?;
     let mut ids = Vec::with_capacity(cursor.bounded_capacity(count));
     for _ in 0..count {
@@ -314,12 +385,15 @@ fn decode_semantic_ids(cursor: &mut Cursor<'_>) -> Result<Vec<SemanticId>, &'sta
     Ok(ids)
 }
 
-fn push_usize(out: &mut Vec<u8>, value: usize) -> Result<(), CodecError> {
+fn push_usize(
+    out: &mut impl crate::binary_codec::BinarySink,
+    value: usize,
+) -> Result<(), CodecError> {
     let value = u64::try_from(value).map_err(|_| CodecError::LengthOverflow)?;
     push_u64(out, value);
     Ok(())
 }
 
-fn decode_usize(cursor: &mut Cursor<'_>) -> Result<usize, &'static str> {
+fn decode_usize(cursor: &mut impl BinarySource) -> Result<usize, &'static str> {
     usize::try_from(cursor.u64()?).map_err(|_| "usize value overflow")
 }

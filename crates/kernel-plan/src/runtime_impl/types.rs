@@ -5,6 +5,28 @@ pub enum RuntimeDurabilityBackend {
     Directory,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeStorageOptions {
+    pub backend: RuntimeDurabilityBackend,
+    pub encryption: kernel_durability::StorageEncryption,
+}
+
+impl RuntimeStorageOptions {
+    #[must_use]
+    pub const fn new(backend: RuntimeDurabilityBackend) -> Self {
+        Self {
+            backend,
+            encryption: kernel_durability::StorageEncryption::None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_encryption(mut self, encryption: kernel_durability::StorageEncryption) -> Self {
+        self.encryption = encryption;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuntimeRootVersion(u64);
 

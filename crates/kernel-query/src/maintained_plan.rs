@@ -12,7 +12,7 @@ use crate::{
         BlockerBuildSpec, BlockerDeltaPatch, MaintainedBlockerKind, MaterializedBlockerDeltaState,
     },
     delta_abi::{CompiledDeltaEdgeIdentity, ExactDeltaView, ValidatedTransitionFrame},
-    delta_kernels::{rel_delta_filter, rel_delta_filter_columns},
+    delta_kernels::{rel_delta_filter, rel_delta_filter_columns, rel_delta_filter_order_const},
     delta_materialization::{
         maintained_delta_from_relation_delta, materialize_exact_delta_view,
         materialize_exact_delta_view_uncounted,
@@ -23,7 +23,8 @@ use crate::{
     group::{GroupCommitPatch, MaterializedGroupDeltaState},
     join::{JoinDeltaPatch, MaterializedJoinDeltaState},
     maintained_delta_kernels::{
-        filter_columns_delta_view, filter_delta_view, project_bag_delta_view, project_delta_view,
+        OrderFilterSpec, filter_columns_delta_view, filter_delta_view, filter_order_delta_view,
+        project_bag_delta_view, project_delta_view,
     },
     projection::project_rows,
     quotient::{CanonicalRowPositionIndex, canonical_row_key, canonical_row_position_index},
@@ -54,6 +55,13 @@ enum MaintainedRelPlanNode {
         column: usize,
         value: Value,
         equivalence: kernel_types::SemanticId,
+    },
+    FilterOrder {
+        input: Box<MaterializedRelPlanState>,
+        column: usize,
+        value: Value,
+        ordering: kernel_types::SemanticId,
+        comparison: crate::OrderComparison,
     },
     FilterColumns {
         input: Box<MaterializedRelPlanState>,
@@ -121,6 +129,13 @@ enum FlatMaintainedRelPlanNodeKind {
         column: usize,
         value: Value,
         equivalence: kernel_types::SemanticId,
+    },
+    FilterOrder {
+        input: NodeId,
+        column: usize,
+        value: Value,
+        ordering: kernel_types::SemanticId,
+        comparison: crate::OrderComparison,
     },
     FilterColumns {
         input: NodeId,
@@ -392,6 +407,7 @@ fn collect_flat_maintained_state_requirements(
         match node.kind {
             FlatMaintainedRelPlanNodeKind::Scan { .. }
             | FlatMaintainedRelPlanNodeKind::Filter { .. }
+            | FlatMaintainedRelPlanNodeKind::FilterOrder { .. }
             | FlatMaintainedRelPlanNodeKind::FilterColumns { .. }
             | FlatMaintainedRelPlanNodeKind::ProjectBag { .. }
             | FlatMaintainedRelPlanNodeKind::PromoteToBag { .. } => {}
@@ -585,6 +601,47 @@ impl MaterializedRelPlanState {
                         column: *column,
                         value: value.clone(),
                         equivalence: *equivalence,
+                    },
+                    relation_value_from_rows(filtered.inserted, result_type),
+                )
+            }
+            RelExpr::FilterOrderConst {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => {
+                let input =
+                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                let input_type = graph
+                    .result_type(input.id)
+                    .cloned()
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                let filtered = rel_delta_filter_order_const(
+                    RelationDelta {
+                        inserted: input.output.into_rows(),
+                        removed: Vec::new(),
+                        result_type: input_type,
+                    },
+                    *column,
+                    value,
+                    *ordering,
+                    *comparison,
+                    context,
+                    registry,
+                )?;
+                let id = out.len();
+                let result_type = graph
+                    .result_type(id)
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                (
+                    FlatMaintainedRelPlanNodeKind::FilterOrder {
+                        input: input.id,
+                        column: *column,
+                        value: value.clone(),
+                        ordering: *ordering,
+                        comparison: *comparison,
                     },
                     relation_value_from_rows(filtered.inserted, result_type),
                 )
@@ -920,6 +977,22 @@ impl MaterializedRelPlanState {
                 equivalence: *equivalence,
             },
             (
+                RelExpr::FilterOrderConst {
+                    input,
+                    column,
+                    value,
+                    ordering,
+                    comparison,
+                },
+                FlatMaintainedRelPlanNodeKind::FilterOrder { input: id, .. },
+            ) => MaintainedRelPlanNode::FilterOrder {
+                input: child_state(input, *id)?,
+                column: *column,
+                value: value.clone(),
+                ordering: *ordering,
+                comparison: *comparison,
+            },
+            (
                 RelExpr::FilterEqColumns {
                     input,
                     left_column,
@@ -1092,53 +1165,59 @@ impl MaterializedRelPlanState {
                 column,
                 value,
                 equivalence,
-            } => {
-                let input_node = self
-                    .arena
-                    .get(*input)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                let input_value = self.output_value_from_arena(*input, context, registry)?;
-                let input_delta = RelationDelta {
-                    inserted: input_value.into_rows(),
-                    removed: Vec::new(),
-                    result_type: input_node.result_type.clone(),
-                };
-                let filtered =
-                    rel_delta_filter(input_delta, *column, value, *equivalence, context, registry)?;
-                Ok(relation_value_from_rows(
-                    filtered.inserted,
-                    &node.result_type,
-                ))
-            }
+            } => self.output_unary_filter_from_arena(
+                *input,
+                &node.result_type,
+                context,
+                registry,
+                |input_delta| {
+                    rel_delta_filter(input_delta, *column, value, *equivalence, context, registry)
+                },
+            ),
+            FlatMaintainedRelPlanNodeKind::FilterOrder {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => self.output_unary_filter_from_arena(
+                *input,
+                &node.result_type,
+                context,
+                registry,
+                |input_delta| {
+                    rel_delta_filter_order_const(
+                        input_delta,
+                        *column,
+                        value,
+                        *ordering,
+                        *comparison,
+                        context,
+                        registry,
+                    )
+                },
+            ),
             FlatMaintainedRelPlanNodeKind::FilterColumns {
                 input,
                 left_column,
                 right_column,
                 equivalence,
-            } => {
-                let input_node = self
-                    .arena
-                    .get(*input)
-                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-                let input_value = self.output_value_from_arena(*input, context, registry)?;
-                let input_delta = RelationDelta {
-                    inserted: input_value.into_rows(),
-                    removed: Vec::new(),
-                    result_type: input_node.result_type.clone(),
-                };
-                let filtered = rel_delta_filter_columns(
-                    input_delta,
-                    *left_column,
-                    *right_column,
-                    *equivalence,
-                    context,
-                    registry,
-                )?;
-                Ok(relation_value_from_rows(
-                    filtered.inserted,
-                    &node.result_type,
-                ))
-            }
+            } => self.output_unary_filter_from_arena(
+                *input,
+                &node.result_type,
+                context,
+                registry,
+                |input_delta| {
+                    rel_delta_filter_columns(
+                        input_delta,
+                        *left_column,
+                        *right_column,
+                        *equivalence,
+                        context,
+                        registry,
+                    )
+                },
+            ),
             FlatMaintainedRelPlanNodeKind::ProjectBag { input, columns } => {
                 let rows = project_rows(
                     self.output_value_from_arena(*input, context, registry)?
@@ -1162,6 +1241,39 @@ impl MaterializedRelPlanState {
             FlatMaintainedRelPlanNodeKind::Group { state, .. } => state.output_value(),
             FlatMaintainedRelPlanNodeKind::TopK { state, .. } => state.output_value(),
         }
+    }
+
+    fn arena_unary_input_delta(
+        &self,
+        input: NodeId,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelationDelta, RelQueryError> {
+        let input_node = self
+            .arena
+            .get(input)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let input_value = self.output_value_from_arena(input, context, registry)?;
+        Ok(RelationDelta {
+            inserted: input_value.into_rows(),
+            removed: Vec::new(),
+            result_type: input_node.result_type.clone(),
+        })
+    }
+
+    fn output_unary_filter_from_arena<F>(
+        &self,
+        input: NodeId,
+        result_type: &RelType,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+        filter: F,
+    ) -> Result<RelationValue, RelQueryError>
+    where
+        F: FnOnce(RelationDelta) -> Result<RelationDelta, RelQueryError>,
+    {
+        let filtered = filter(self.arena_unary_input_delta(input, context, registry)?)?;
+        Ok(relation_value_from_rows(filtered.inserted, result_type))
     }
 
     #[cfg(debug_assertions)]
@@ -1197,6 +1309,32 @@ impl MaterializedRelPlanState {
                 };
                 let filtered =
                     rel_delta_filter(input_delta, *column, value, *equivalence, context, registry)?;
+                Ok(relation_value_from_rows(
+                    filtered.inserted,
+                    &self.result_type,
+                ))
+            }
+            MaintainedRelPlanNode::FilterOrder {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => {
+                let input_value = input.output_value_recursive(context, registry)?;
+                let filtered = rel_delta_filter_order_const(
+                    RelationDelta {
+                        inserted: input_value.into_rows(),
+                        removed: Vec::new(),
+                        result_type: input.result_type.clone(),
+                    },
+                    *column,
+                    value,
+                    *ordering,
+                    *comparison,
+                    context,
+                    registry,
+                )?;
                 Ok(relation_value_from_rows(
                     filtered.inserted,
                     &self.result_type,
@@ -1441,6 +1579,7 @@ impl MaterializedRelPlanState {
                 Ok(())
             }
             MaintainedRelPlanNode::Filter { input, .. }
+            | MaintainedRelPlanNode::FilterOrder { input, .. }
             | MaintainedRelPlanNode::FilterColumns { input, .. }
             | MaintainedRelPlanNode::ProjectBag { input, .. }
             | MaintainedRelPlanNode::ProjectSet { input, .. }
@@ -2058,6 +2197,27 @@ impl MaterializedRelPlanState {
                     registry,
                 )?,
             }),
+            FlatMaintainedRelPlanNodeKind::FilterOrder {
+                input: _,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => {
+                let input = inbox.take_unary().unwrap_or_else(empty);
+                Self::plan_execgraph_filter_order(
+                    state,
+                    &input,
+                    OrderFilterSpec {
+                        column: *column,
+                        value,
+                        ordering: *ordering,
+                        comparison: *comparison,
+                    },
+                    context,
+                    registry,
+                )
+            }
             FlatMaintainedRelPlanNodeKind::FilterColumns {
                 input: _,
                 left_column,
@@ -2089,15 +2249,13 @@ impl MaterializedRelPlanState {
             }
             FlatMaintainedRelPlanNodeKind::ProjectSet {
                 columns, supports, ..
-            } => {
-                let input = inbox.take_unary().unwrap_or_else(empty);
-                let projected = project_delta_view(&input, columns)?;
-                let planned = supports.plan_delta_view(&projected, context, registry)?;
-                Ok(PlannedGraphNodeTransition {
-                    patch: Some(GraphNodePatch::SetSupport(planned.patch)),
-                    effect: planned.effect,
-                })
-            }
+            } => Self::plan_execgraph_project_set(
+                supports,
+                columns,
+                &inbox.take_unary().unwrap_or_else(empty),
+                context,
+                registry,
+            ),
             FlatMaintainedRelPlanNodeKind::Distinct { supports, .. } => {
                 let input = inbox.take_unary().unwrap_or_else(empty);
                 let planned = supports.plan_delta_view(&input, context, registry)?;
@@ -2117,6 +2275,34 @@ impl MaterializedRelPlanState {
                 Self::plan_execgraph_stateful_node(state, inbox, context, registry)
             }
         }
+    }
+
+    fn plan_execgraph_filter_order(
+        state: &FlatMaintainedRelPlanNode,
+        input: &MaintainedDelta,
+        spec: OrderFilterSpec<'_>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedGraphNodeTransition, RelQueryError> {
+        Ok(PlannedGraphNodeTransition {
+            patch: None,
+            effect: filter_order_delta_view(input, &state.result_type, spec, context, registry)?,
+        })
+    }
+
+    fn plan_execgraph_project_set(
+        supports: &MaterializedSetSupportState,
+        columns: &[usize],
+        input: &MaintainedDelta,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedGraphNodeTransition, RelQueryError> {
+        let projected = project_delta_view(input, columns)?;
+        let planned = supports.plan_delta_view(&projected, context, registry)?;
+        Ok(PlannedGraphNodeTransition {
+            patch: Some(GraphNodePatch::SetSupport(planned.patch)),
+            effect: planned.effect,
+        })
     }
 
     fn plan_execgraph_stateful_node(
@@ -2263,43 +2449,33 @@ impl MaterializedRelPlanState {
                 column,
                 value,
                 equivalence,
-            } => {
-                let child = input.plan_relation_deltas_inner(plan)?;
-                let effect = filter_delta_view(
-                    &child.effect,
-                    &input.result_type,
-                    *column,
-                    value,
-                    *equivalence,
-                    plan.context,
-                    plan.registry,
-                )?;
-                Ok(PlannedMaintainedRelPlanTransition {
-                    patch: MaintainedRelPlanPatch::Unary(Box::new(child.patch)),
-                    effect,
-                })
-            }
+            } => Self::plan_filter_transition(input, *column, value, *equivalence, plan),
+            MaintainedRelPlanNode::FilterOrder {
+                input,
+                column,
+                value,
+                ordering,
+                comparison,
+            } => Self::plan_filter_order_transition(
+                input,
+                *column,
+                value,
+                *ordering,
+                *comparison,
+                plan,
+            ),
             MaintainedRelPlanNode::FilterColumns {
                 input,
                 left_column,
                 right_column,
                 equivalence,
-            } => {
-                let child = input.plan_relation_deltas_inner(plan)?;
-                let effect = filter_columns_delta_view(
-                    &child.effect,
-                    &input.result_type,
-                    *left_column,
-                    *right_column,
-                    *equivalence,
-                    plan.context,
-                    plan.registry,
-                )?;
-                Ok(PlannedMaintainedRelPlanTransition {
-                    patch: MaintainedRelPlanPatch::Unary(Box::new(child.patch)),
-                    effect,
-                })
-            }
+            } => Self::plan_filter_columns_transition(
+                input,
+                *left_column,
+                *right_column,
+                *equivalence,
+                plan,
+            ),
             MaintainedRelPlanNode::ProjectBag { input, columns } => {
                 let child = input.plan_relation_deltas_inner(plan)?;
                 let effect = project_bag_delta_view(
@@ -2342,6 +2518,82 @@ impl MaterializedRelPlanState {
                 Self::plan_top_k_transition(input, state, plan)
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn plan_filter_transition(
+        input: &MaterializedRelPlanState,
+        column: usize,
+        value: &Value,
+        equivalence: kernel_types::SemanticId,
+        plan: &mut RelationDeltaPlanContext<'_>,
+    ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
+        let child = input.plan_relation_deltas_inner(plan)?;
+        let effect = filter_delta_view(
+            &child.effect,
+            &input.result_type,
+            column,
+            value,
+            equivalence,
+            plan.context,
+            plan.registry,
+        )?;
+        Ok(PlannedMaintainedRelPlanTransition {
+            patch: MaintainedRelPlanPatch::Unary(Box::new(child.patch)),
+            effect,
+        })
+    }
+
+    #[cfg(debug_assertions)]
+    fn plan_filter_order_transition(
+        input: &MaterializedRelPlanState,
+        column: usize,
+        value: &Value,
+        ordering: kernel_types::SemanticId,
+        comparison: crate::OrderComparison,
+        plan: &mut RelationDeltaPlanContext<'_>,
+    ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
+        let child = input.plan_relation_deltas_inner(plan)?;
+        let effect = filter_order_delta_view(
+            &child.effect,
+            &input.result_type,
+            OrderFilterSpec {
+                column,
+                value,
+                ordering,
+                comparison,
+            },
+            plan.context,
+            plan.registry,
+        )?;
+        Ok(PlannedMaintainedRelPlanTransition {
+            patch: MaintainedRelPlanPatch::Unary(Box::new(child.patch)),
+            effect,
+        })
+    }
+
+    #[cfg(debug_assertions)]
+    fn plan_filter_columns_transition(
+        input: &MaterializedRelPlanState,
+        left_column: usize,
+        right_column: usize,
+        equivalence: kernel_types::SemanticId,
+        plan: &mut RelationDeltaPlanContext<'_>,
+    ) -> Result<PlannedMaintainedRelPlanTransition, RelQueryError> {
+        let child = input.plan_relation_deltas_inner(plan)?;
+        let effect = filter_columns_delta_view(
+            &child.effect,
+            &input.result_type,
+            left_column,
+            right_column,
+            equivalence,
+            plan.context,
+            plan.registry,
+        )?;
+        Ok(PlannedMaintainedRelPlanTransition {
+            patch: MaintainedRelPlanPatch::Unary(Box::new(child.patch)),
+            effect,
+        })
     }
 
     #[cfg(debug_assertions)]
@@ -2504,6 +2756,7 @@ impl MaterializedRelPlanState {
             (MaintainedRelPlanNode::Scan { .. }, MaintainedRelPlanPatch::Scan(None)) => {}
             (
                 MaintainedRelPlanNode::Filter { input, .. }
+                | MaintainedRelPlanNode::FilterOrder { input, .. }
                 | MaintainedRelPlanNode::FilterColumns { input, .. }
                 | MaintainedRelPlanNode::ProjectBag { input, .. }
                 | MaintainedRelPlanNode::PromoteToBag { input },

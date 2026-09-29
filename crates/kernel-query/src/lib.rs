@@ -33,8 +33,8 @@ pub use delta_abi::{
 // Crate-internal exact row carrier shared by maintained execution owners.
 type MaintainedDelta = ExactDelta<Row>;
 use delta_kernels::{
-    rel_delta_distinct, rel_delta_filter, rel_delta_filter_columns, rel_delta_project_bag,
-    rel_delta_project_set, rel_delta_scan,
+    rel_delta_distinct, rel_delta_filter, rel_delta_filter_columns, rel_delta_filter_order_const,
+    rel_delta_project_bag, rel_delta_project_set, rel_delta_scan,
 };
 #[cfg(test)]
 use delta_materialization::{
@@ -103,8 +103,8 @@ pub use recursive_query::{
 };
 use rel_eval::collect_rel_source_relations;
 pub use rel_model::{
-    AggregateSpec, OrderDirection, RelExpr, RelQueryError, RelQueryResult, RelType, RelationValue,
-    Row,
+    AggregateSpec, OrderComparison, OrderDirection, RelExpr, RelQueryError, RelQueryResult,
+    RelType, RelationValue, Row,
 };
 use rel_model::{relation_column_equivalences, relation_value_from_rows};
 #[cfg(test)]

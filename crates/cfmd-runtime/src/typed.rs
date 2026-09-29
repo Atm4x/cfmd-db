@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use crate::{
-    EquivalenceId, Error, ErrorKind, PreparedQuery, Query, ReadContext, RelationId, RelationResult,
-    Result, Row, Type, Value,
+    EquivalenceId, Error, ErrorKind, OrderComparison, OrderingId, PreparedQuery, Query,
+    ReadContext, RelationId, RelationResult, Result, Row, Type, Value,
 };
 
 /// Converts one scalar product value between Rust and the stable CFMD value protocol.
@@ -269,6 +269,7 @@ impl<R> Relation<R> {
             relation: self.id,
             column,
             equivalence,
+            ordering: None,
             marker: PhantomData,
         })
     }
@@ -287,6 +288,7 @@ impl<R> Relation<R> {
         Ok(row.into_row())
     }
 
+    #[track_caller]
     #[must_use]
     pub fn query(&self) -> RelationQuery<R> {
         RelationQuery {
@@ -304,6 +306,7 @@ pub struct Field<R, V> {
     relation: RelationId,
     column: usize,
     equivalence: EquivalenceId,
+    ordering: Option<OrderingId>,
     marker: PhantomData<fn() -> (R, V)>,
 }
 
@@ -325,6 +328,22 @@ impl<R, V> Field<R, V> {
             relation,
             column,
             equivalence,
+            ordering: None,
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) const fn __from_semantics(
+        relation: RelationId,
+        column: usize,
+        equivalence: EquivalenceId,
+        ordering: Option<OrderingId>,
+    ) -> Self {
+        Self {
+            relation,
+            column,
+            equivalence,
+            ordering,
             marker: PhantomData,
         }
     }
@@ -363,10 +382,12 @@ pub struct EqPredicate<R> {
 
 /// Predicate that can transform a root object query while preserving its root row shape.
 pub trait ObjectPredicate<R> {
+    #[track_caller]
     fn apply(self, input: Query, root: &Relation<R>) -> Result<Query>;
 }
 
 impl<R> ObjectPredicate<R> for EqPredicate<R> {
+    #[track_caller]
     fn apply(self, input: Query, root: &Relation<R>) -> Result<Query> {
         if self.relation != root.id() {
             return Err(Error::new(
@@ -375,6 +396,122 @@ impl<R> ObjectPredicate<R> for EqPredicate<R> {
             ));
         }
         Ok(input.filter_eq(self.column, self.value, self.equivalence))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderPredicate<R> {
+    relation: RelationId,
+    column: usize,
+    ordering: Option<OrderingId>,
+    value: Value,
+    comparison: OrderComparison,
+    marker: PhantomData<fn() -> R>,
+}
+
+impl<R> ObjectPredicate<R> for OrderPredicate<R> {
+    #[track_caller]
+    fn apply(self, input: Query, root: &Relation<R>) -> Result<Query> {
+        if self.relation != root.id() {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "predicate belongs to a different relation handle",
+            ));
+        }
+        let ordering = self.ordering.ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                "field has no declared canonical ordering",
+            )
+        })?;
+        Ok(input.filter_order(self.column, self.value, ordering, self.comparison))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BetweenPredicate<R> {
+    relation: RelationId,
+    column: usize,
+    ordering: Option<OrderingId>,
+    lower: Value,
+    upper: Value,
+    marker: PhantomData<fn() -> R>,
+}
+
+impl<R> ObjectPredicate<R> for BetweenPredicate<R> {
+    #[track_caller]
+    fn apply(self, input: Query, root: &Relation<R>) -> Result<Query> {
+        if self.relation != root.id() {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "predicate belongs to a different relation handle",
+            ));
+        }
+        let ordering = self.ordering.ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                "field has no declared canonical ordering",
+            )
+        })?;
+        Ok(input
+            .filter_order(
+                self.column,
+                self.lower,
+                ordering,
+                OrderComparison::GreaterOrEqual,
+            )
+            .filter_order(
+                self.column,
+                self.upper,
+                ordering,
+                OrderComparison::LessOrEqual,
+            ))
+    }
+}
+
+impl<R, V: crate::OrderedObjectValue> Field<R, V> {
+    fn order_predicate(self, value: V, comparison: OrderComparison) -> OrderPredicate<R> {
+        OrderPredicate {
+            relation: self.relation,
+            column: self.column,
+            ordering: self.ordering,
+            value: value.into_value(),
+            comparison,
+            marker: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub fn greater_than(self, value: V) -> OrderPredicate<R> {
+        self.order_predicate(value, OrderComparison::Greater)
+    }
+
+    #[must_use]
+    pub fn greater_than_or_equal(self, value: V) -> OrderPredicate<R> {
+        self.order_predicate(value, OrderComparison::GreaterOrEqual)
+    }
+
+    #[must_use]
+    pub fn less_than(self, value: V) -> OrderPredicate<R> {
+        self.order_predicate(value, OrderComparison::Less)
+    }
+
+    #[must_use]
+    pub fn less_than_or_equal(self, value: V) -> OrderPredicate<R> {
+        self.order_predicate(value, OrderComparison::LessOrEqual)
+    }
+
+    /// Inclusive canonical-order range: `lower <= field <= upper`.
+    #[must_use]
+    pub fn between(self, lower: V, upper: V) -> BetweenPredicate<R> {
+        BetweenPredicate {
+            relation: self.relation,
+            column: self.column,
+            ordering: self.ordering,
+            lower: lower.into_value(),
+            upper: upper.into_value(),
+            marker: PhantomData,
+        }
     }
 }
 
@@ -399,6 +536,18 @@ impl<R> Clone for RelationQuery<R> {
 }
 
 impl<R> RelationQuery<R> {
+    #[doc(hidden)]
+    #[must_use]
+    pub(crate) fn __from_raw(relation: Relation<R>, inner: Query) -> Self {
+        Self {
+            relation,
+            inner,
+            error: None,
+            marker: PhantomData,
+        }
+    }
+
+    #[track_caller]
     #[must_use]
     pub fn filter<P: ObjectPredicate<R>>(mut self, predicate: P) -> Self {
         if self.error.is_some() {
@@ -411,6 +560,7 @@ impl<R> RelationQuery<R> {
         self
     }
 
+    #[track_caller]
     #[must_use]
     pub fn select<P: Projection<R>>(self, projection: P) -> TypedQuery<R, P> {
         let mut error = self.error;
@@ -427,6 +577,16 @@ impl<R> RelationQuery<R> {
             error,
             marker: PhantomData,
         }
+    }
+
+    #[must_use]
+    pub const fn node_id(&self) -> crate::QueryNodeId {
+        self.inner.node_id()
+    }
+
+    #[must_use]
+    pub fn source(&self) -> crate::QuerySource {
+        self.inner.source()
     }
 
     #[must_use]
@@ -564,6 +724,16 @@ impl<R, P: Projection<R>> TypedQuery<R, P> {
 
     pub fn one_or_none(&self, context: &ReadContext) -> Result<Option<P::Output>> {
         self.prepare(context)?.one_or_none(context)
+    }
+
+    #[must_use]
+    pub const fn node_id(&self) -> crate::QueryNodeId {
+        self.inner.node_id()
+    }
+
+    #[must_use]
+    pub fn source(&self) -> crate::QuerySource {
+        self.inner.source()
     }
 
     #[must_use]

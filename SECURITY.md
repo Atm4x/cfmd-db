@@ -50,9 +50,15 @@ The local Unix transport does not trust localhost, Unix-socket reachability, end
 
 The authentication prelude has a fixed header and an evidence-length cap checked before evidence-body allocation. Request execution uses a bounded worker set capped by host in-flight limits and a bounded response queue. Socket EOF closes the hosted connection and therefore revokes/cancels session-scoped work, including blocked watch consumers. The transport never receives raw unrestricted database authority and cannot certify semantic writer compatibility.
 
-### Single-file storage boundary
+### Single-file storage and encrypted-secret boundary
 
-Single-file mode does not weaken the trust boundary by emitting hidden recovery sidecars. The published `*.cfmd` file is the only durability authority for the supported P308 path. Unsupported mutable authorities fail closed rather than redirecting to directory files. Encryption-at-rest remains a future orthogonal AEAD/key-management layer and is not treated as a substitute for host/session security.
+Single-file mode does not weaken the trust boundary by emitting hidden recovery sidecars. The published `*.cfmd` file is the only durability authority for the supported path. Unsupported mutable authorities fail closed rather than redirecting to directory files.
+
+AE v1 protects generation sections, WAL records, and immutable replication-authority objects with domain-separated AES-256-GCM-SIV keys. Encryption-at-rest is independent of host/session authorization and is never treated as a substitute for it. The plaintext identity of immutable authority segments remains stable across nonce choice and physical relocation, while their stored object bytes remain authenticated and encrypted when database encryption is enabled.
+
+On Linux, CFMD-owned long-lived storage keys, derived-key workspace, key-commitment digest state, and AEAD backend contexts are placed in guarded page-backed memory owned by `cfmd-secure-memory`. Successful allocation requires page locking and native core-dump exclusion (`mlock` + `MADV_DONTDUMP`); failure is propagated rather than falling back to ordinary heap memory. Long-lived backend state is shared through opaque `SecretHandle` ownership; backend capability metadata distinguishes hardened persistent state from constructor-time transient guarantees instead of overclaiming strict in-place initialization. Provider-backed key loading supports direct fill into CFMD-allocated protected storage, so the provider need not return an owned raw key array. Protected objects are scrubbed before unlock/unmap.
+
+This is a software hardening boundary, not protection from a root/kernel/hypervisor live-memory adversary. Non-Linux hardened-memory backends are not yet implemented, so encrypted-key initialization on those platforms fails closed rather than silently weakening protection. RustCrypto cipher construction can still create short-lived constructor temporaries before the final cipher state is emplaced into protected memory; eliminating that residual requires an in-place construction API or controlled crypto backend.
 
 ### Single-file freshness / compaction integrity (P312)
 

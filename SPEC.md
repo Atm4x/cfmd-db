@@ -24,7 +24,7 @@ Object/document/relational forms are surface views over one typed kernel, not in
 
 ## 3. Semantic environment Γ
 
-Meaning is revisioned data. Operations depending on semantic equality, ordering or canonicalization are evaluated against pinned `Γ`. Kernel code must not substitute incidental Rust `Eq`/`Hash`/`Ord` when a certified semantic operation is authoritative.
+Meaning is revisioned data. Operations depending on semantic equality, ordering or canonicalization are evaluated against pinned `Γ`. Kernel code must not substitute incidental Rust `Eq`/`Hash`/`Ord` when a certified semantic operation is authoritative. Ordered constant filters are first-class relational operators: their ordering ID is pinned during preparation, must be domain-compatible and congruent with the input column equivalence, and is applied directly to exact maintained deltas. Product object fields derive stable per-field ordering identities only for value types with declared canonical ordering; no implicit order is invented for optional/structural values.
 
 Authentication/deployment of semantic modules and semantic correctness are separate obligations.
 
@@ -78,7 +78,7 @@ Current inventory: [`docs/status/KERNEL_HOSTILE_LEDGER.md`](docs/status/KERNEL_H
 
 ## 12. Product boundary
 
-The active product direction is **Rust-runtime first**. `cfmd-runtime` is the stable product boundary; through Pass282 it owns create/open, schema/type/relation construction, snapshots, query IR and relation Plans. Python/.NET/Studio bind to it later and never call `kernel-*` crates directly.
+The active product direction is **Rust-first**. `cfmd` is the public Rust application crate; `cfmd-runtime` is the stable semantic/runtime boundary used beneath it and by future bindings; through Pass282 it owns create/open, schema/type/relation construction, snapshots, query IR and relation Plans. Python/.NET/Studio bind to it later and never call `kernel-*` crates directly.
 
 Primary surface goals:
 
@@ -97,7 +97,7 @@ Detailed design: [`docs/api/CFMD_PYTHON_FACADE_THEORY.md`](docs/api/CFMD_PYTHON_
 
 ## Current product surface (P284)
 
-Rust-first productization now has an object-first domain layer over the universal `cfmd-runtime` relation/query protocol. Application writes produce `Plan` values; relation-first APIs remain available for dynamic/tooling consumers. Next: explicit identity/reference/cardinality contracts and safe deep paths.
+Rust-first productization now has an object-first domain layer over the universal `cfmd-runtime` relation/query protocol. Application writes produce `Plan` values; relation-first APIs remain available for dynamic/tooling consumers. P342 supersedes the earlier reverse-backlink model: `Ref<T>`, `Many<T>`, and `OwnedMany<T>` are first-class object relationship values, while typed edge relations are internal runtime lowering. A many-valued relationship does not require a target-side backlink. P343 adds relation-local exclusive ownership plus explicit orphan policy, P344 keeps filtered relationship selections mutable without target-object materialization, P345 freezes executor-neutral exact-watch readiness/drain, P346/P347 establish and hostile-close the zero-runtime-dependency Future/Waker path, P348 makes async direct on the watch with dependency-frontier wake filtering and observable quotienting, and P349/P350 validate the same law from CPython asyncio while preserving cancellation/loop-shutdown delivery correctness at the FFI boundary.
 
 
 ### Pass285 product-layer entity contract
@@ -126,7 +126,7 @@ Durability deliberately remains exact-full-target in P288. The WAL/idempotency i
 
 ## Candidate diagnostics status (Pass291)
 
-Candidate is a certified proposed Revision, not an advisory simulation. Construction succeeds only after the target revision has passed the same kernel revision/model validation used by publication. Product diagnostics therefore expose facts that are actually knowable before commit: invariant certification and runtime freshness (`Ready`, `Stale`, `RuntimeClosed`). Transaction-ID conflicts remain commit-time facts unless a concrete transaction identity is supplied. Candidate object queries support the same typed projection codecs as current snapshots, and `CandidatePreview` is an immutable presentation summary of source/target revisions, exact relation effects and diagnostics.
+Candidate is a certified proposed Revision, not an advisory simulation. Construction succeeds only after the target revision has passed the same kernel revision/model validation used by publication. Product diagnostics therefore expose facts that are actually knowable before commit: invariant certification and runtime freshness (`Ready`, `Stale`, `RuntimeClosed`). Transaction-ID conflicts remain commit-time facts unless a concrete transaction identity is supplied. Candidate object queries support the same typed projection codecs as current snapshots. `CandidatePreview` is an immutable presentation summary of source/target revisions, explicit Plan effects, derived lifecycle/policy effects, and diagnostics; derived orphan deletion is visible before commit.
 
 ## History inverse status (Pass292–P293)
 
@@ -150,7 +150,7 @@ The proof boundary is an exact semantic write footprint. Relation writes use Γ-
 
 Exact watch is now implemented in the Rust product runtime for queries accepted by the maintained relational differential program. A subscription is anchored to one live Revision, materializes the query's existing `MaterializedRelPlanState` once, and thereafter advances only through exact committed relation deltas recovered from the durable causal effect chain. Each delivered event names source/target revisions and exact inserted/removed query-result rows.
 
-The runtime publication signal is a non-authoritative wake primitive only. Durable history plus the immutable Revision remain the source of truth after wake. No polling, result recomputation, state-diff fallback, Tokio dependency, or second event log is part of exact watch. Opaque/full/schema historical transitions and unavailable causal coverage fail explicitly. Cross-process wake transport remains open and must preserve the same exact causal-delta protocol.
+The runtime publication signal is a non-authoritative wake primitive only. Durable history plus the immutable Revision remain the source of truth after wake. P346/P347 add race-free standard-library `Waker` registration owned by `PublicationNotifier`. P348 moves the Future directly onto every exact watch (`watch.next().await`) and removes the transitional `cfmd-async` wrapper crate. Pending wakers are indexed by exact relation dependencies and relation-data publication wakes only intersecting subscriptions; opaque/full/schema/liveness signals may broadcast. Output-equivalent effects advance the causal cursor without fabricating empty public events. There is still no polling, result recomputation, state-diff fallback, mandatory Tokio dependency, helper thread, or second event log. Opaque/full/schema historical transitions and unavailable causal coverage fail explicitly. Cross-process wake transport remains open and must preserve the same exact causal-delta protocol.
 
 ## Pass297 — host-provided publication notification boundary
 
@@ -286,3 +286,29 @@ Single-file compaction is a physical relocation, not a logical checkpoint or new
 ## P313 unified product construction law
 
 Product database construction MUST resolve physical storage before entering `kernel-plan`, then use the same `DurableRuntime` create/open/recovery semantics independent of backend. `Storage::Auto` resolves a new path to the parity-complete single-file backend, an existing regular file to single-file, and an existing directory to the directory backend; explicit storage selection overrides this resolution. `Database::create/open` and `DatabaseBuilder::{create,open}` MUST converge on the same implementation path. Runtime publication notification may be configured during database construction/open because it is a database-runtime wake capability; authentication, authorization and transport hosting MUST remain above the opened `Database` and MUST NOT become file-creation semantics.
+
+### P314 storage encryption
+
+Single-file product databases can opt into CFMD AE v1 using AES-256-GCM-SIV. Encryption mode (`Direct` versus provider-backed `Wrapped`) is orthogonal to the selected AEAD algorithm; AES-256-GCM-SIV is the current backend, while the storage API and persisted algorithm identifier do not encode key-acquisition mode. HKDF-SHA256 separates WAL and immutable-section keys from an external 256-bit master key; per-database salt and the algorithm identifier are public format metadata. Section/WAL physical identities are AEAD-associated data, encrypted stores require the exact key on open, rewrap cannot change the persisted AEAD algorithm, and authentication failure is corruption rather than rollback/fallback. Directory encryption remains fail-closed until parity is implemented.
+
+### P315 AE v1 productization law
+
+Encrypted single-file sections use a versioned 64 KiB authenticated-chunk envelope. Every chunk is independently AES-256-GCM-SIV authenticated before plaintext from that chunk is released; chunk AAD binds generation, section kind/ordinal, chunk index, total plaintext length and chunk length. `copy_section_to` decrypts with bounded chunk memory. Pre-release P314 whole-section section envelopes are not retained as a compatibility surface; unsupported encrypted section layouts fail closed. WAL nonce allocation uses a random 80-bit namespace plus a 16-bit in-namespace counter, rotating the namespace after 65,536 messages; this removes per-frame CSPRNG calls while retaining AES-GCM-SIV misuse resistance as defense in depth. Product key acquisition may be delegated to `EncryptionKeyProvider` at create/open, and external-freshness-aware single-file open uses the same encryption configuration rather than a plaintext-only probe.
+
+
+### P316 wrapped-DMK / key-rotation law
+
+Provider-backed encrypted single-file databases MUST generate a random per-database 256-bit DMK and MUST treat provider key material as a KEK, not as the data-encryption master key. The persisted key envelope binds provider key ID/epoch, database key epoch and publication sequence under authenticated wrapping. The current pre-release single-file header publishes wrapped-key metadata through two fixed slots: the inactive slot is written and durably synced before it can become authoritative, and recovery chooses the highest valid publication sequence. Rewrapping MUST preserve the DMK and MUST NOT rewrite generation/WAL ciphertext. A valid newer key slot is authoritative; authentication/provider mismatch MUST fail closed rather than fall back to an older valid slot. Pre-release pass-to-pass layouts are not a compatibility surface.
+
+### P317 key-authority / pre-release format law
+
+Until CFMD declares a released on-disk compatibility boundary, internal pass layouts MUST NOT create legacy-reader branches merely because an R&D pass changed the header. The single-file header/root/generation records use one current `FORMAT_VERSION`; incompatible pre-release snapshots may fail closed. Provider-backed key authority additionally carries a non-zero minimum accepted database-key epoch. Opening a fully valid wrapped-key header below that external floor MUST fail closed before DMK unwrap, so a provider that durably advances the floor can reject complete-header rollback even when the old KEK still exists. The floor is external authority, not bytes trusted from the database file itself.
+
+
+### P319 bounded-memory generation publication law
+
+Single-file generation publication MUST stream section bytes directly to their final offsets and MUST NOT construct whole encrypted sections or generations in memory. Encrypted payloads are sealed one 64 KiB AEAD chunk at a time. Because ciphertext section digests are known only after payload emission, the current pre-release generation layout stores the section descriptor table as a footer after all section data. The generation header records the footer offset/length and total generation length. The generation digest is accumulated in physical byte order during the same write; no whole-generation reread is required. Root authority remains unchanged: the streamed generation is non-authoritative until fully written, synced and referenced by a durably published root.
+
+### Pass351 snapshot-bound transaction composition
+
+Rust product code may group several object mutations with `Database::transaction(TransactionId)`. The transaction is pinned to one exact live snapshot; `objects()` reads that snapshot, `apply(Plan)` admits only plans derived from that same snapshot/authority, and `preview/candidate/commit` delegate to the existing Plan/Candidate publication pipeline. CFMD does not silently refresh, retry, merge or rebase a stale transaction.

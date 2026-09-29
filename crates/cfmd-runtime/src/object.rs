@@ -1,6 +1,7 @@
 use crate::{
-    Error, ErrorKind, Field, Plan, PrimitiveEquivalence, Projection, ReadContext, Relation,
-    RelationId, RelationQuery, Result, RowCodec, SchemaBuilder, Type, TypedQuery, ValueCodec,
+    Error, ErrorKind, Field, Plan, PrimitiveEquivalence, PrimitiveOrdering, Projection, Query,
+    ReadContext, Relation, RelationId, RelationQuery, Result, RowCodec, SchemaBuilder, Type,
+    TypedQuery, Value, ValueCodec,
 };
 
 const FNV128_OFFSET: u128 = 144_066_263_297_769_815_596_495_629_667_062_367_629;
@@ -46,13 +47,19 @@ pub trait ObjectValue: ValueCodec {
     fn object_type() -> Type;
     fn equivalence() -> ObjectEquivalence;
     #[must_use]
+    fn ordering() -> Option<PrimitiveOrdering> {
+        None
+    }
+    #[must_use]
     fn role() -> ObjectFieldRole {
         ObjectFieldRole::Value
     }
 }
 
+pub trait OrderedObjectValue: ObjectValue {}
+
 macro_rules! scalar_object_value {
-    ($rust:ty, $type_expr:expr, $equivalence:expr) => {
+    ($rust:ty, $type_expr:expr, $equivalence:expr, $ordering:expr) => {
         impl ObjectValue for $rust {
             fn object_type() -> Type {
                 $type_expr
@@ -61,15 +68,655 @@ macro_rules! scalar_object_value {
             fn equivalence() -> ObjectEquivalence {
                 ObjectEquivalence::Primitive($equivalence)
             }
+            fn ordering() -> Option<PrimitiveOrdering> {
+                Some($ordering)
+            }
         }
+        impl OrderedObjectValue for $rust {}
     };
 }
 
-scalar_object_value!((), Type::unit(), PrimitiveEquivalence::UnitExact);
-scalar_object_value!(bool, Type::bool(), PrimitiveEquivalence::BoolExact);
-scalar_object_value!(i64, Type::i64(), PrimitiveEquivalence::I64Exact);
-scalar_object_value!(f64, Type::f64(), PrimitiveEquivalence::F64Bitwise);
-scalar_object_value!(String, Type::text(), PrimitiveEquivalence::TextExact);
+scalar_object_value!(
+    (),
+    Type::unit(),
+    PrimitiveEquivalence::UnitExact,
+    PrimitiveOrdering::UnitExact
+);
+scalar_object_value!(
+    bool,
+    Type::bool(),
+    PrimitiveEquivalence::BoolExact,
+    PrimitiveOrdering::BoolAscending
+);
+scalar_object_value!(
+    i64,
+    Type::i64(),
+    PrimitiveEquivalence::I64Exact,
+    PrimitiveOrdering::I64Ascending
+);
+scalar_object_value!(
+    f64,
+    Type::f64(),
+    PrimitiveEquivalence::F64Bitwise,
+    PrimitiveOrdering::F64Total
+);
+scalar_object_value!(
+    String,
+    Type::text(),
+    PrimitiveEquivalence::TextExact,
+    PrimitiveOrdering::TextBinary
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectRelationshipCardinality {
+    RequiredOne,
+    OptionalOne,
+    Many,
+}
+
+/// First-class object relationship value for a zero-to-many edge.
+///
+/// The relationship itself is stored by CFMD as an internal edge relation, not as an embedded
+/// collection column. A materialized `Many<T>` is bound to the snapshot that produced its owner.
+/// Merely accessing the field performs no I/O; [`Many::query`] and [`Many::load`] make reads
+/// explicit and therefore keep accidental N+1 behavior visible in application code.
+pub struct Many<T> {
+    binding: Option<ManyBinding>,
+    pending: Option<Vec<T>>,
+}
+
+#[derive(Clone)]
+struct ManyBinding {
+    context: ReadContext,
+    relation: RelationId,
+    source_id: u128,
+    source_type: crate::TypeId,
+    source_equivalence: crate::EquivalenceId,
+    target_equivalence: crate::EquivalenceId,
+}
+
+impl<T> std::fmt::Debug for Many<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Many")
+            .field("bound", &self.binding.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Clone> Clone for Many<T> {
+    fn clone(&self) -> Self {
+        Self {
+            binding: self.binding.clone(),
+            pending: self.pending.clone(),
+        }
+    }
+}
+
+impl<T> Default for Many<T> {
+    fn default() -> Self {
+        Self::__new()
+    }
+}
+
+impl<T: PartialEq> PartialEq for Many<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.pending == other.pending
+            && match (&self.binding, &other.binding) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    left.relation == right.relation
+                        && left.source_id == right.source_id
+                        && left.context.revision() == right.context.revision()
+                }
+                _ => false,
+            }
+    }
+}
+
+impl<T: Eq> Eq for Many<T> {}
+
+impl<T> Many<T> {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __new() -> Self {
+        Self {
+            binding: None,
+            pending: None,
+        }
+    }
+
+    /// Creates an explicit detached relationship value for a new object graph.
+    #[must_use]
+    pub fn new(values: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            binding: None,
+            pending: Some(values.into_iter().collect()),
+        }
+    }
+
+    /// Creates an explicit empty relationship for a new object graph.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(std::iter::empty())
+    }
+
+    #[doc(hidden)]
+    pub fn __into_pending(self) -> Result<Vec<T>> {
+        if self.binding.is_some() {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "cannot insert a snapshot-bound Many<T> as a detached object graph",
+            ));
+        }
+        Ok(self.pending.unwrap_or_default())
+    }
+
+    #[doc(hidden)]
+    pub fn __bind(
+        &mut self,
+        context: ReadContext,
+        relation: RelationId,
+        source_id: u128,
+        source_type: crate::TypeId,
+        source_equivalence: crate::EquivalenceId,
+        target_equivalence: crate::EquivalenceId,
+    ) {
+        self.binding = Some(ManyBinding {
+            context,
+            relation,
+            source_id,
+            source_type,
+            source_equivalence,
+            target_equivalence,
+        });
+        self.pending = None;
+    }
+
+    #[doc(hidden)]
+    pub fn __preserves_binding(
+        &self,
+        context: &ReadContext,
+        relation: RelationId,
+        source_id: u128,
+    ) -> Result<bool> {
+        let Some(binding) = &self.binding else {
+            return Ok(false);
+        };
+        if binding.relation != relation
+            || binding.source_id != source_id
+            || !binding.context.same_snapshot(context)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "cannot reuse a Many<T> relationship value from a different owner or snapshot",
+            ));
+        }
+        Ok(true)
+    }
+
+    #[must_use]
+    pub fn is_bound(&self) -> bool {
+        self.binding.is_some()
+    }
+}
+
+impl<T: Object> Many<T> {
+    /// Builds an object query for this concrete relationship value. No I/O occurs until the
+    /// returned query is evaluated.
+    pub fn query(&self) -> Result<ObjectQuery<T>> {
+        let binding = self.binding.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidPlan,
+                "Many<T> is not bound to a database snapshot; materialize its owner through CFMD before querying the relationship",
+            )
+        })?;
+        let set = binding.context.objects::<T>()?;
+        let target_identity = T::identity_column().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                format!("relationship target {} has no identity", T::KEY),
+            )
+        })?;
+        let edges = Query::scan(binding.relation).filter_eq(
+            0,
+            Value::HistoricalEntityRef(crate::EntityRef {
+                entity_type: binding.source_type,
+                id: binding.source_id,
+            }),
+            binding.source_equivalence,
+        );
+        let target = Query::scan(T::relation_id())
+            .join_eq(edges, target_identity, 1, binding.target_equivalence)
+            .project((0..set.relation.width()).collect::<Vec<_>>());
+        Ok(ObjectQuery {
+            context: binding.context.clone(),
+            relation: set.relation.clone(),
+            inner: RelationQuery::__from_raw(set.relation.clone(), target),
+        })
+    }
+
+    /// Narrows this concrete relationship using ordinary object-first predicates. The returned
+    /// selection remains a relationship value: it can be read or mutated without materializing
+    /// target objects merely to discover their identities.
+    pub fn where_<F, P>(&self, predicate: F) -> Result<ManySelection<T>>
+    where
+        F: FnOnce(&T::Proxy) -> P,
+        P: crate::ObjectPredicate<T>,
+    {
+        let binding = many_binding(self)?.clone();
+        Ok(ManySelection {
+            binding,
+            query: self.query()?.where_(predicate),
+        })
+    }
+
+    /// Explicitly materializes this relationship at the owner's snapshot.
+    pub fn load(&self) -> Result<Vec<T>> {
+        self.query()?.all()
+    }
+
+    /// Object-first alias for explicit full relationship materialization.
+    pub fn all(&self) -> Result<Vec<T>> {
+        self.load()
+    }
+
+    pub fn first_or_none(&self) -> Result<Option<T>> {
+        self.query()?.first_or_none()
+    }
+
+    pub fn one_or_none(&self) -> Result<Option<T>> {
+        self.query()?.one_or_none()
+    }
+
+    pub fn one(&self) -> Result<T> {
+        self.query()?.one()
+    }
+
+    /// Counts relationship edges without materializing target objects.
+    pub fn count(&self) -> Result<usize> {
+        let binding = self.binding.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidPlan,
+                "Many<T> is not bound to a database snapshot",
+            )
+        })?;
+        let query = Query::scan(binding.relation).filter_eq(
+            0,
+            Value::HistoricalEntityRef(crate::EntityRef {
+                entity_type: binding.source_type,
+                id: binding.source_id,
+            }),
+            binding.source_equivalence,
+        );
+        Ok(binding.context.execute(&query)?.rows().len())
+    }
+}
+
+/// A snapshot-bound subset of one concrete `Many<T>` relationship.
+///
+/// Selection evaluation is identity-first: edge mutation methods project only target identities
+/// and never construct target Rust objects. Object materialization remains explicit through
+/// [`ManySelection::all`] or [`ManySelection::load`].
+pub struct ManySelection<T: Object> {
+    binding: ManyBinding,
+    query: ObjectQuery<T>,
+}
+
+impl<T: Object> std::fmt::Debug for ManySelection<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManySelection")
+            .field("relation", &self.binding.relation)
+            .field("source_id", &self.binding.source_id)
+            .field("node_id", &self.query.node_id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Object> ManySelection<T> {
+    #[must_use]
+    pub fn query(&self) -> ObjectQuery<T> {
+        ObjectQuery {
+            context: self.query.context.clone(),
+            relation: self.query.relation.clone(),
+            inner: self.query.inner.clone(),
+        }
+    }
+
+    /// Returns selected identities without decoding/materializing target objects.
+    pub fn ids(&self) -> Result<Vec<crate::Id<T>>> {
+        self.query.identity_ids()
+    }
+
+    pub fn count(&self) -> Result<usize> {
+        Ok(self.ids()?.len())
+    }
+
+    pub fn load(&self) -> Result<Vec<T>> {
+        self.query.all()
+    }
+
+    pub fn all(&self) -> Result<Vec<T>> {
+        self.load()
+    }
+
+    pub fn first_or_none(&self) -> Result<Option<T>> {
+        self.query.first_or_none()
+    }
+
+    pub fn one_or_none(&self) -> Result<Option<T>> {
+        self.query.one_or_none()
+    }
+
+    pub fn one(&self) -> Result<T> {
+        self.query.one()
+    }
+
+    /// Removes all selected relationship edges while leaving target objects alive.
+    pub fn detach_all(&self) -> Result<Plan> {
+        plan_detach_ids::<T>(&self.binding, self.ids()?)
+    }
+
+    /// Atomically moves all selected edges to another owner of the same relationship.
+    pub fn move_to(&self, destination: &Many<T>) -> Result<Plan> {
+        let dest = many_binding(destination)?;
+        plan_move_ids::<T>(&self.binding, dest, self.ids()?)
+    }
+
+    /// Deletes selected target objects. CFMD reads exact stored rows but does not materialize
+    /// Rust target objects; lifecycle normalization removes every now-dangling relationship edge.
+    pub fn delete_all(&self) -> Result<Plan> {
+        let rows = self
+            .binding
+            .context
+            .execute(&self.query.inner.clone().raw())?
+            .rows()
+            .to_vec();
+        let mut plan = self.binding.context.plan()?;
+        if let Some(contract) = object_contract::<T>()? {
+            plan.register_object_contract(contract);
+        }
+        register_object_relationship_contracts::<T>(&mut plan)?;
+        for row in rows {
+            plan.remove(T::relation_id(), row);
+        }
+        Ok(plan)
+    }
+}
+
+/// Ownership-preserving counterpart of [`ManySelection`].
+pub struct OwnedManySelection<T: Object> {
+    inner: ManySelection<T>,
+    orphan_policy: crate::plan::OrphanPolicy,
+}
+
+impl<T: Object> std::fmt::Debug for OwnedManySelection<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedManySelection")
+            .field("selection", &self.inner)
+            .field("orphan_policy", &self.orphan_policy)
+            .finish()
+    }
+}
+
+impl<T: Object> OwnedManySelection<T> {
+    #[must_use]
+    pub fn query(&self) -> ObjectQuery<T> {
+        self.inner.query()
+    }
+    pub fn ids(&self) -> Result<Vec<crate::Id<T>>> {
+        self.inner.ids()
+    }
+    pub fn count(&self) -> Result<usize> {
+        self.inner.count()
+    }
+    pub fn load(&self) -> Result<Vec<T>> {
+        self.inner.load()
+    }
+    pub fn all(&self) -> Result<Vec<T>> {
+        self.inner.all()
+    }
+    pub fn first_or_none(&self) -> Result<Option<T>> {
+        self.inner.first_or_none()
+    }
+    pub fn one_or_none(&self) -> Result<Option<T>> {
+        self.inner.one_or_none()
+    }
+    pub fn one(&self) -> Result<T> {
+        self.inner.one()
+    }
+    pub fn detach_all(&self) -> Result<Plan> {
+        let mut plan = self.inner.detach_all()?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&self.inner.binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+    pub fn move_to(&self, destination: &OwnedMany<T>) -> Result<Plan> {
+        let mut plan = plan_move_ids::<T>(
+            &self.inner.binding,
+            many_binding(&destination.inner)?,
+            self.inner.ids()?,
+        )?;
+        __register_owned_contract::<T>(&destination.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+    pub fn delete_all(&self) -> Result<Plan> {
+        let mut plan = self.inner.delete_all()?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&self.inner.binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+}
+
+fn many_from_binding<T>(binding: &ManyBinding) -> Many<T> {
+    Many {
+        binding: Some(binding.clone()),
+        pending: None,
+    }
+}
+
+/// Exclusive object-first zero-to-many ownership relation.
+///
+/// Unlike [`Many<T>`], a target may have at most one owner in this relationship. Moving ownership
+/// is an atomic edge rewrite; the target object itself is not rewritten. Orphan handling is a
+/// schema policy and defaults to [`crate::OrphanPolicy::Keep`].
+pub struct OwnedMany<T> {
+    inner: Many<T>,
+    orphan_policy: crate::plan::OrphanPolicy,
+}
+
+impl<T> std::fmt::Debug for OwnedMany<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedMany")
+            .field("bound", &self.inner.is_bound())
+            .field("orphan_policy", &self.orphan_policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Clone> Clone for OwnedMany<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            orphan_policy: self.orphan_policy,
+        }
+    }
+}
+
+impl<T> Default for OwnedMany<T> {
+    fn default() -> Self {
+        Self::__new()
+    }
+}
+
+impl<T: PartialEq> PartialEq for OwnedMany<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner && self.orphan_policy == other.orphan_policy
+    }
+}
+
+impl<T: Eq> Eq for OwnedMany<T> {}
+
+impl<T> OwnedMany<T> {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __new() -> Self {
+        Self {
+            inner: Many::__new(),
+            orphan_policy: crate::plan::OrphanPolicy::Keep,
+        }
+    }
+
+    #[must_use]
+    pub fn new(values: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            inner: Many::new(values),
+            orphan_policy: crate::plan::OrphanPolicy::Keep,
+        }
+    }
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(std::iter::empty())
+    }
+
+    #[must_use]
+    pub fn is_bound(&self) -> bool {
+        self.inner.is_bound()
+    }
+
+    #[doc(hidden)]
+    pub fn __into_pending(self) -> Result<Vec<T>> {
+        self.inner.__into_pending()
+    }
+
+    #[doc(hidden)]
+    pub fn __bind(
+        &mut self,
+        context: ReadContext,
+        relation: RelationId,
+        source_id: u128,
+        source_type: crate::TypeId,
+        source_equivalence: crate::EquivalenceId,
+        target_equivalence: crate::EquivalenceId,
+    ) {
+        self.inner.__bind(
+            context,
+            relation,
+            source_id,
+            source_type,
+            source_equivalence,
+            target_equivalence,
+        );
+    }
+
+    #[doc(hidden)]
+    pub fn __set_orphan_policy(&mut self, orphan_policy: crate::plan::OrphanPolicy) {
+        self.orphan_policy = orphan_policy;
+    }
+
+    #[doc(hidden)]
+    pub fn __preserves_binding(
+        &self,
+        context: &ReadContext,
+        relation: RelationId,
+        source_id: u128,
+    ) -> Result<bool> {
+        self.inner.__preserves_binding(context, relation, source_id)
+    }
+}
+
+impl<T: Object> OwnedMany<T> {
+    pub fn query(&self) -> Result<ObjectQuery<T>> {
+        self.inner.query()
+    }
+    pub fn where_<F, P>(&self, predicate: F) -> Result<OwnedManySelection<T>>
+    where
+        F: FnOnce(&T::Proxy) -> P,
+        P: crate::ObjectPredicate<T>,
+    {
+        Ok(OwnedManySelection {
+            inner: self.inner.where_(predicate)?,
+            orphan_policy: self.orphan_policy,
+        })
+    }
+    pub fn load(&self) -> Result<Vec<T>> {
+        self.inner.load()
+    }
+    pub fn all(&self) -> Result<Vec<T>> {
+        self.inner.all()
+    }
+    pub fn first_or_none(&self) -> Result<Option<T>> {
+        self.inner.first_or_none()
+    }
+    pub fn one_or_none(&self) -> Result<Option<T>> {
+        self.inner.one_or_none()
+    }
+    pub fn one(&self) -> Result<T> {
+        self.inner.one()
+    }
+    pub fn count(&self) -> Result<usize> {
+        self.inner.count()
+    }
+
+    /// Proposes attaching an existing target. Fails during candidate construction/commit if that
+    /// target already has a different owner in this ownership relation.
+    pub fn attach(&self, target: crate::Id<T>) -> Result<Plan> {
+        let mut plan = self.inner.__attach(target)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    pub fn detach(&self, target: crate::Id<T>) -> Result<Plan> {
+        let mut plan = self.inner.__detach(target)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    /// Atomically transfers one target from this owner to `destination` without rewriting the
+    /// target object row.
+    pub fn move_to(&self, target: crate::Id<T>, destination: &Self) -> Result<Plan> {
+        let mut plan = self.inner.__move_to(target, &destination.inner)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    /// Atomically transfers every edge owned by this object. Only edge rows are read; target
+    /// objects are not materialized into Rust.
+    pub fn move_all_to(&self, destination: &Self) -> Result<Plan> {
+        let mut plan = self.inner.__move_all_to(&destination.inner)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+    pub fn detach_all(&self) -> Result<Plan> {
+        let mut plan = self.inner.detach_all()?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+    pub fn detach_ids(&self, ids: impl IntoIterator<Item = crate::Id<T>>) -> Result<Plan> {
+        let mut plan = self.inner.detach_ids(ids)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+    pub fn move_ids_to(
+        &self,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let mut plan = self.inner.move_ids_to(ids, &destination.inner)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectFieldRole {
@@ -87,11 +734,223 @@ pub enum ObjectFieldRole {
     },
 }
 
+impl ObjectFieldRole {
+    #[must_use]
+    pub const fn relationship_cardinality(self) -> Option<ObjectRelationshipCardinality> {
+        match self {
+            Self::Reference { .. } => Some(ObjectRelationshipCardinality::RequiredOne),
+            Self::OptionalReference { .. } => Some(ObjectRelationshipCardinality::OptionalOne),
+            Self::Value | Self::Identity(_) => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ObjectManyFieldSchema {
+    name: &'static str,
+    target_type: crate::TypeId,
+    target_relation: RelationId,
+    relation: RelationId,
+    source_equivalence: crate::EquivalenceId,
+    target_equivalence: crate::EquivalenceId,
+    source_live_equivalence: crate::EquivalenceId,
+    target_live_equivalence: crate::EquivalenceId,
+    // Retained only as a pre-1.0 compatibility hint while old declarations migrate. The edge
+    // relation no longer depends on a target-side Ref backlink.
+    via_field: Option<&'static str>,
+    ownership: Option<crate::plan::OrphanPolicy>,
+    register_owned: Option<fn(&ObjectManyFieldSchema, &mut Plan) -> Result<()>>,
+    validate: fn() -> Result<()>,
+}
+
+impl std::fmt::Debug for ObjectManyFieldSchema {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectManyFieldSchema")
+            .field("name", &self.name)
+            .field("target_type", &self.target_type)
+            .field("target_relation", &self.target_relation)
+            .field("relation", &self.relation)
+            .field("via_field", &self.via_field)
+            .field("ownership", &self.ownership)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectManyFieldSchema {
+    #[must_use]
+    pub fn of<S: Object, T: Object>(name: &'static str, via_field: &'static str) -> Self {
+        Self::new::<S, T>(name, Some(via_field))
+    }
+
+    #[must_use]
+    pub fn inferred<S: Object, T: Object>(name: &'static str) -> Self {
+        Self::new::<S, T>(name, None)
+    }
+
+    fn new<S: Object, T: Object>(name: &'static str, via_field: Option<&'static str>) -> Self {
+        Self {
+            name,
+            target_type: T::type_id(),
+            target_relation: T::relation_id(),
+            relation: __many_relation_id::<S>(name),
+            source_equivalence: __identity_equivalence_id::<S>()
+                .unwrap_or_else(|_| crate::EquivalenceId::new(0)),
+            target_equivalence: __identity_equivalence_id::<T>()
+                .unwrap_or_else(|_| crate::EquivalenceId::new(0)),
+            source_live_equivalence: crate::EquivalenceId::new(__semantic_id(
+                "cfmd.object.many-live-equivalence.v1",
+                S::KEY,
+                name,
+            )),
+            target_live_equivalence: crate::EquivalenceId::new(__semantic_id(
+                "cfmd.object.many-live-target-equivalence.v1",
+                S::KEY,
+                name,
+            )),
+            via_field,
+            ownership: None,
+            register_owned: None,
+            validate: validate_many_field::<S, T>,
+        }
+    }
+
+    #[must_use]
+    pub fn owned<S: Object, T: Object>(
+        name: &'static str,
+        orphan_policy: crate::plan::OrphanPolicy,
+    ) -> Self {
+        let mut value = Self::new::<S, T>(name, None);
+        value.ownership = Some(orphan_policy);
+        value.register_owned = Some(register_owned_schema::<S, T>);
+        value
+    }
+
+    #[must_use]
+    pub const fn orphan_policy(&self) -> Option<crate::plan::OrphanPolicy> {
+        self.ownership
+    }
+
+    #[must_use]
+    pub const fn is_owned(&self) -> bool {
+        self.ownership.is_some()
+    }
+
+    pub(crate) fn register_contract(&self, plan: &mut Plan) -> Result<()> {
+        if let Some(register) = self.register_owned {
+            register(self, plan)?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn target_type(&self) -> crate::TypeId {
+        self.target_type
+    }
+
+    #[must_use]
+    pub const fn target_relation(&self) -> RelationId {
+        self.target_relation
+    }
+
+    /// Internal relation created by the object-schema compiler for this object relationship.
+    #[must_use]
+    pub const fn relation(&self) -> RelationId {
+        self.relation
+    }
+
+    #[must_use]
+    pub const fn via_field(&self) -> Option<&'static str> {
+        self.via_field
+    }
+
+    #[must_use]
+    pub const fn cardinality(&self) -> ObjectRelationshipCardinality {
+        ObjectRelationshipCardinality::Many
+    }
+
+    pub(crate) fn source_equivalence(&self) -> crate::EquivalenceId {
+        self.source_equivalence
+    }
+
+    pub(crate) fn target_equivalence(&self) -> crate::EquivalenceId {
+        self.target_equivalence
+    }
+
+    pub(crate) fn source_live_equivalence(&self) -> crate::EquivalenceId {
+        self.source_live_equivalence
+    }
+
+    pub(crate) fn target_live_equivalence(&self) -> crate::EquivalenceId {
+        self.target_live_equivalence
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        (self.validate)()
+    }
+}
+
+#[must_use]
+#[doc(hidden)]
+pub fn __many_relation_id<S: Object>(name: &str) -> RelationId {
+    RelationId::new(__semantic_id("cfmd.object.many-relation.v1", S::KEY, name))
+}
+
+#[doc(hidden)]
+pub fn __identity_equivalence_id<E: Object>() -> Result<crate::EquivalenceId> {
+    let field = E::fields()
+        .into_iter()
+        .find(|field| field.role() == ObjectFieldRole::Identity(E::type_id()))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                format!("object relationship endpoint {} has no identity", E::KEY),
+            )
+        })?;
+    Ok(crate::EquivalenceId::new(__semantic_id(
+        "cfmd.object.field-equivalence.v1",
+        E::KEY,
+        field.name(),
+    )))
+}
+
+fn register_owned_schema<S: Object, T: Object>(
+    schema: &ObjectManyFieldSchema,
+    plan: &mut Plan,
+) -> Result<()> {
+    let policy = schema.ownership.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Internal,
+            "owned relationship registration lost its policy",
+        )
+    })?;
+    __register_owned_many::<S, T>(plan, schema.name, policy)
+}
+
+pub(crate) fn register_object_relationship_contracts<E: Object>(plan: &mut Plan) -> Result<()> {
+    for relationship in E::many_fields() {
+        relationship.register_contract(plan)?;
+    }
+    Ok(())
+}
+
+fn validate_many_field<S: Object, T: Object>() -> Result<()> {
+    __identity_equivalence_id::<S>()?;
+    __identity_equivalence_id::<T>()?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectFieldSchema {
     name: &'static str,
     ty: Type,
     equivalence: ObjectEquivalence,
+    ordering: Option<PrimitiveOrdering>,
     role: ObjectFieldRole,
 }
 
@@ -102,6 +961,7 @@ impl ObjectFieldSchema {
             name,
             ty: V::object_type(),
             equivalence: V::equivalence(),
+            ordering: V::ordering(),
             role: V::role(),
         }
     }
@@ -121,6 +981,10 @@ impl ObjectFieldSchema {
         self.equivalence
     }
     #[must_use]
+    pub const fn ordering(&self) -> Option<PrimitiveOrdering> {
+        self.ordering
+    }
+    #[must_use]
     pub const fn role(&self) -> ObjectFieldRole {
         self.role
     }
@@ -136,6 +1000,48 @@ pub trait Object: RowCodec + Sized + 'static {
     const KEY: &'static str;
 
     fn fields() -> Vec<ObjectFieldSchema>;
+
+    #[must_use]
+    fn many_fields() -> Vec<ObjectManyFieldSchema> {
+        Vec::new()
+    }
+
+    #[doc(hidden)]
+    fn __bind_relations(&mut self, _context: &ReadContext) -> Result<()> {
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    fn __identity_raw(&self) -> Result<u128> {
+        Err(Error::new(
+            ErrorKind::InvalidSchema,
+            format!(
+                "object {} does not expose a generated identity accessor",
+                Self::KEY
+            ),
+        ))
+    }
+
+    #[doc(hidden)]
+    fn __append_relationships(&mut self, _context: &ReadContext, _plan: &mut Plan) -> Result<()> {
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    fn __append_update_relationships(
+        &mut self,
+        _context: &ReadContext,
+        _plan: &mut Plan,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    fn __append_insert(mut self, context: &ReadContext, plan: &mut Plan) -> Result<()> {
+        self.__append_relationships(context, plan)?;
+        __append_flat_insert(context, plan, self)
+    }
+
     fn proxy(relation: Relation<Self>) -> Self::Proxy;
 
     #[must_use]
@@ -162,30 +1068,8 @@ pub trait Object: RowCodec + Sized + 'static {
 
 pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBuilder {
     let fields = E::fields();
-    let mut types = Vec::with_capacity(fields.len());
-    let mut equivalences = Vec::with_capacity(fields.len());
-    for field in &fields {
-        let id = crate::EquivalenceId::new(__semantic_id(
-            "cfmd.object.field-equivalence.v1",
-            E::KEY,
-            field.name(),
-        ));
-        builder = match field.equivalence() {
-            ObjectEquivalence::Primitive(module) => builder.equivalence(id, module),
-            ObjectEquivalence::OptionOf(inner_module) => {
-                let inner = crate::EquivalenceId::new(__semantic_id(
-                    "cfmd.object.field-equivalence-inner.v1",
-                    E::KEY,
-                    field.name(),
-                ));
-                builder
-                    .equivalence(inner, inner_module)
-                    .structural_equivalence(id, crate::StructuralEquivalence::Option { inner })
-            }
-        };
-        equivalences.push(id);
-        types.push(field.ty().clone());
-    }
+    let (registered, types, equivalences) = register_object_field_semantics::<E>(builder, &fields);
+    builder = registered;
     builder = builder
         .relation(crate::RelationSchema::set(
             E::relation_id(),
@@ -218,7 +1102,447 @@ pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBu
             );
         }
     }
+    for many in E::many_fields() {
+        if let Err(error) = many.validate() {
+            builder = builder.__invalid_schema(error.to_string());
+        }
+        builder = builder
+            .equivalence(
+                many.source_live_equivalence(),
+                PrimitiveEquivalence::LiveEntityIdExact(E::type_id()),
+            )
+            .equivalence(
+                many.target_live_equivalence(),
+                PrimitiveEquivalence::LiveEntityIdExact(many.target_type()),
+            )
+            .relation(crate::RelationSchema::set(
+                many.relation(),
+                vec![
+                    Type::Scalar(crate::ScalarType::HistoricalEntityRef(E::type_id())),
+                    Type::Scalar(crate::ScalarType::HistoricalEntityRef(many.target_type())),
+                    Type::Scalar(crate::ScalarType::LiveEntityRef(E::type_id())),
+                    Type::Scalar(crate::ScalarType::LiveEntityRef(many.target_type())),
+                ],
+                vec![
+                    many.source_equivalence(),
+                    many.target_equivalence(),
+                    many.source_live_equivalence(),
+                    many.target_live_equivalence(),
+                ],
+            ));
+        builder = builder.__require_relation(
+            many.target_relation(),
+            format!(
+                "object relationship {}.{} requires target object relation {} to be registered",
+                E::KEY,
+                many.name(),
+                many.target_relation().raw()
+            ),
+        );
+    }
     builder
+}
+
+fn register_object_field_semantics<E: Object>(
+    mut builder: SchemaBuilder,
+    fields: &[ObjectFieldSchema],
+) -> (SchemaBuilder, Vec<Type>, Vec<crate::EquivalenceId>) {
+    let mut types = Vec::with_capacity(fields.len());
+    let mut equivalences = Vec::with_capacity(fields.len());
+    for field in fields {
+        let id = crate::EquivalenceId::new(__semantic_id(
+            "cfmd.object.field-equivalence.v1",
+            E::KEY,
+            field.name(),
+        ));
+        builder = match field.equivalence() {
+            ObjectEquivalence::Primitive(module) => builder.equivalence(id, module),
+            ObjectEquivalence::OptionOf(inner_module) => {
+                let inner = crate::EquivalenceId::new(__semantic_id(
+                    "cfmd.object.field-equivalence-inner.v1",
+                    E::KEY,
+                    field.name(),
+                ));
+                builder
+                    .equivalence(inner, inner_module)
+                    .structural_equivalence(id, crate::StructuralEquivalence::Option { inner })
+            }
+        };
+        if let Some(ordering) = field.ordering() {
+            builder = builder.ordering(
+                crate::OrderingId::new(__semantic_id(
+                    "cfmd.object.field-ordering.v1",
+                    E::KEY,
+                    field.name(),
+                )),
+                ordering,
+            );
+        }
+        equivalences.push(id);
+        types.push(field.ty().clone());
+    }
+    (builder, types, equivalences)
+}
+
+#[doc(hidden)]
+pub fn __append_flat_insert<E: Object>(
+    context: &ReadContext,
+    plan: &mut Plan,
+    value: E,
+) -> Result<()> {
+    let relation = context.relation::<E>(E::relation_id())?;
+    if let Some(contract) = object_contract::<E>()? {
+        plan.register_object_contract(contract);
+    }
+    register_object_relationship_contracts::<E>(plan)?;
+    plan.insert_typed(&relation, value)?;
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn __append_many_edge<S: Object, T: Object>(
+    plan: &mut Plan,
+    name: &str,
+    source_id: u128,
+    target_id: u128,
+) -> Result<()> {
+    __identity_equivalence_id::<S>()?;
+    __identity_equivalence_id::<T>()?;
+    plan.insert(
+        __many_relation_id::<S>(name),
+        vec![
+            Value::HistoricalEntityRef(crate::EntityRef {
+                entity_type: S::type_id(),
+                id: source_id,
+            }),
+            Value::HistoricalEntityRef(crate::EntityRef {
+                entity_type: T::type_id(),
+                id: target_id,
+            }),
+            Value::LiveEntityRef(crate::EntityRef {
+                entity_type: S::type_id(),
+                id: crate::runtime::lifecycle_entity_id(S::type_id(), source_id).raw(),
+            }),
+            Value::LiveEntityRef(crate::EntityRef {
+                entity_type: T::type_id(),
+                id: crate::runtime::lifecycle_entity_id(T::type_id(), target_id).raw(),
+            }),
+        ],
+    );
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn __append_remove_many_edges<E: Object>(
+    context: &ReadContext,
+    plan: &mut Plan,
+    name: &str,
+    source_id: u128,
+) -> Result<()> {
+    let many = E::many_fields()
+        .into_iter()
+        .find(|field| field.name() == name)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                format!("object {} has no Many field {name}", E::KEY),
+            )
+        })?;
+    let query = Query::scan(many.relation()).filter_eq(
+        0,
+        Value::HistoricalEntityRef(crate::EntityRef {
+            entity_type: E::type_id(),
+            id: source_id,
+        }),
+        many.source_equivalence(),
+    );
+    for row in context.execute(&query)?.rows() {
+        plan.remove(many.relation(), row.clone());
+    }
+    Ok(())
+}
+
+fn many_binding<T>(many: &Many<T>) -> Result<&ManyBinding> {
+    many.binding.as_ref().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidPlan,
+            "relationship value is not bound to a database snapshot",
+        )
+    })
+}
+
+fn edge_row<T: Object>(binding: &ManyBinding, target: crate::Id<T>) -> crate::Row {
+    vec![
+        Value::HistoricalEntityRef(crate::EntityRef {
+            entity_type: binding.source_type,
+            id: binding.source_id,
+        }),
+        Value::HistoricalEntityRef(crate::EntityRef {
+            entity_type: T::type_id(),
+            id: target.raw(),
+        }),
+        Value::LiveEntityRef(crate::EntityRef {
+            entity_type: binding.source_type,
+            id: crate::runtime::lifecycle_entity_id(binding.source_type, binding.source_id).raw(),
+        }),
+        Value::LiveEntityRef(crate::EntityRef {
+            entity_type: T::type_id(),
+            id: crate::runtime::lifecycle_entity_id(T::type_id(), target.raw()).raw(),
+        }),
+    ]
+}
+
+fn same_relationship(source: &ManyBinding, destination: &ManyBinding) -> Result<()> {
+    if source.relation != destination.relation
+        || !source.context.same_snapshot(&destination.context)
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidPlan,
+            "relationship mutation requires the same relationship and snapshot",
+        ));
+    }
+    Ok(())
+}
+
+fn bound_target_ids<T: Object>(binding: &ManyBinding) -> Result<std::collections::BTreeSet<u128>> {
+    let query = Query::scan(binding.relation).filter_eq(
+        0,
+        Value::HistoricalEntityRef(crate::EntityRef {
+            entity_type: binding.source_type,
+            id: binding.source_id,
+        }),
+        binding.source_equivalence,
+    );
+    binding
+        .context
+        .execute(&query)?
+        .rows()
+        .iter()
+        .map(|row| match row.get(1) {
+            Some(Value::HistoricalEntityRef(reference))
+                if reference.entity_type == T::type_id() =>
+            {
+                Ok(reference.id)
+            }
+            _ => Err(Error::new(
+                ErrorKind::InvariantViolation,
+                "relationship edge target has invalid shape",
+            )),
+        })
+        .collect()
+}
+
+fn plan_detach_ids<T: Object>(
+    binding: &ManyBinding,
+    ids: impl IntoIterator<Item = crate::Id<T>>,
+) -> Result<Plan> {
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    let existing = bound_target_ids::<T>(binding)?;
+    if let Some(missing) = ids.iter().find(|id| !existing.contains(&id.raw())) {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "relationship target {} is not attached to this owner",
+                missing.raw()
+            ),
+        ));
+    }
+    let mut plan = binding.context.plan()?;
+    for id in ids {
+        plan.remove(binding.relation, edge_row(binding, id));
+    }
+    Ok(plan)
+}
+
+fn plan_move_ids<T: Object>(
+    source: &ManyBinding,
+    destination: &ManyBinding,
+    ids: impl IntoIterator<Item = crate::Id<T>>,
+) -> Result<Plan> {
+    same_relationship(source, destination)?;
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    let existing = bound_target_ids::<T>(source)?;
+    if let Some(missing) = ids.iter().find(|id| !existing.contains(&id.raw())) {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "relationship target {} is not attached to the source owner",
+                missing.raw()
+            ),
+        ));
+    }
+    let mut plan = source.context.plan()?;
+    for id in ids {
+        plan.remove(source.relation, edge_row(source, id));
+        plan.insert(destination.relation, edge_row(destination, id));
+    }
+    Ok(plan)
+}
+
+impl<T: Object> Many<T> {
+    #[doc(hidden)]
+    pub fn __attach(&self, target: crate::Id<T>) -> Result<Plan> {
+        let binding = many_binding(self)?;
+        let mut plan = binding.context.plan()?;
+        plan.insert(binding.relation, edge_row(binding, target));
+        Ok(plan)
+    }
+
+    #[doc(hidden)]
+    pub fn __detach(&self, target: crate::Id<T>) -> Result<Plan> {
+        let binding = many_binding(self)?;
+        let mut plan = binding.context.plan()?;
+        let row = edge_row(binding, target);
+        let exists = binding
+            .context
+            .execute(&Query::scan(binding.relation))?
+            .rows()
+            .contains(&row);
+        if !exists {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "relationship edge is not present",
+            ));
+        }
+        plan.remove(binding.relation, row);
+        Ok(plan)
+    }
+
+    #[doc(hidden)]
+    pub fn __move_to(&self, target: crate::Id<T>, destination: &Self) -> Result<Plan> {
+        let source = many_binding(self)?;
+        let dest = many_binding(destination)?;
+        if source.relation != dest.relation || !source.context.same_snapshot(&dest.context) {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "relationship move requires the same relationship and snapshot",
+            ));
+        }
+        let mut plan = self.__detach(target)?;
+        plan.insert(dest.relation, edge_row(dest, target));
+        Ok(plan)
+    }
+
+    #[doc(hidden)]
+    pub fn __move_all_to(&self, destination: &Self) -> Result<Plan> {
+        let source = many_binding(self)?;
+        let dest = many_binding(destination)?;
+        if source.relation != dest.relation || !source.context.same_snapshot(&dest.context) {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "relationship move requires the same relationship and snapshot",
+            ));
+        }
+        let query = Query::scan(source.relation).filter_eq(
+            0,
+            Value::HistoricalEntityRef(crate::EntityRef {
+                entity_type: source.source_type,
+                id: source.source_id,
+            }),
+            source.source_equivalence,
+        );
+        let rows = source.context.execute(&query)?.rows().to_vec();
+        let mut plan = source.context.plan()?;
+        for row in rows {
+            let target_id = match row.get(1) {
+                Some(Value::HistoricalEntityRef(reference))
+                    if reference.entity_type == T::type_id() =>
+                {
+                    reference.id
+                }
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvariantViolation,
+                        "relationship edge target has invalid shape",
+                    ));
+                }
+            };
+            plan.remove(source.relation, row);
+            plan.insert(
+                dest.relation,
+                edge_row(dest, crate::Id::<T>::new(target_id)),
+            );
+        }
+        Ok(plan)
+    }
+
+    pub fn attach(&self, target: crate::Id<T>) -> Result<Plan> {
+        self.__attach(target)
+    }
+    pub fn detach(&self, target: crate::Id<T>) -> Result<Plan> {
+        self.__detach(target)
+    }
+    pub fn move_to(&self, target: crate::Id<T>, destination: &Self) -> Result<Plan> {
+        self.__move_to(target, destination)
+    }
+    pub fn move_all_to(&self, destination: &Self) -> Result<Plan> {
+        self.__move_all_to(destination)
+    }
+    pub fn detach_all(&self) -> Result<Plan> {
+        let binding = many_binding(self)?;
+        let ids = bound_target_ids::<T>(binding)?
+            .into_iter()
+            .map(crate::Id::<T>::new);
+        plan_detach_ids::<T>(binding, ids)
+    }
+    pub fn detach_ids(&self, ids: impl IntoIterator<Item = crate::Id<T>>) -> Result<Plan> {
+        plan_detach_ids::<T>(many_binding(self)?, ids)
+    }
+    pub fn move_ids_to(
+        &self,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        plan_move_ids::<T>(many_binding(self)?, many_binding(destination)?, ids)
+    }
+}
+
+fn __register_owned_contract<T: Object>(
+    many: &Many<T>,
+    plan: &mut Plan,
+    orphan_policy: crate::plan::OrphanPolicy,
+) -> Result<()> {
+    let binding = many_binding(many)?;
+    let identity = T::identity_column().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidSchema,
+            format!("owned target {} has no identity", T::KEY),
+        )
+    })?;
+    if let Some(contract) = object_contract::<T>()? {
+        plan.register_object_contract(contract);
+    }
+    plan.register_owned_relation(crate::plan::OwnedRelationContract {
+        relation: binding.relation,
+        target_relation: T::relation_id(),
+        target_identity_column: identity,
+        orphan_policy,
+    });
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn __register_owned_many<S: Object, T: Object>(
+    plan: &mut Plan,
+    name: &str,
+    orphan_policy: crate::plan::OrphanPolicy,
+) -> Result<()> {
+    let identity = T::identity_column().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidSchema,
+            format!("owned target {} has no identity", T::KEY),
+        )
+    })?;
+    if let Some(contract) = object_contract::<T>()? {
+        plan.register_object_contract(contract);
+    }
+    plan.register_owned_relation(crate::plan::OwnedRelationContract {
+        relation: __many_relation_id::<S>(name),
+        target_relation: T::relation_id(),
+        target_identity_column: identity,
+        orphan_policy,
+    });
+    Ok(())
 }
 
 pub(crate) fn object_contract<E: Object>() -> Result<Option<crate::plan::ObjectContract>> {
@@ -325,9 +1649,14 @@ impl<E: Object> ObjectProxy<E> {
             .iter()
             .position(|field| field.name() == name)
             .expect("generated CFMD object field must exist in its descriptor");
-        self.relation
-            .field::<V>(column)
-            .expect("CFMD object relation is validated before its proxy is exposed")
+        let equivalence = self
+            .relation
+            .equivalence_at(column)
+            .expect("validated CFMD object field has equivalence semantics");
+        let ordering = E::fields()[column].ordering().map(|_| {
+            crate::OrderingId::new(__semantic_id("cfmd.object.field-ordering.v1", E::KEY, name))
+        });
+        Field::__from_semantics(self.relation.id(), column, equivalence, ordering)
     }
 
     #[doc(hidden)]
@@ -360,8 +1689,8 @@ impl<E: Object> ObjectProxy<E> {
 
     #[doc(hidden)]
     #[must_use]
-    pub fn __many<T: Object>(&self, target_reference_name: &str) -> crate::ManyField<E, T> {
-        crate::ManyField::new(&self.relation, target_reference_name)
+    pub fn __many<T: Object>(&self, name: &str) -> crate::ManyField<E, T> {
+        crate::ManyField::new(&self.relation, name)
     }
 }
 
@@ -408,6 +1737,7 @@ impl<E: Object> ObjectSet<E> {
         &self.relation
     }
 
+    #[track_caller]
     #[must_use]
     pub fn query(&self) -> ObjectQuery<E> {
         ObjectQuery {
@@ -417,6 +1747,7 @@ impl<E: Object> ObjectSet<E> {
         }
     }
 
+    #[track_caller]
     #[must_use]
     pub fn where_<F, P>(&self, predicate: F) -> ObjectQuery<E>
     where
@@ -461,10 +1792,7 @@ impl<E: Object> ObjectSet<E> {
     /// Returns a proposed transition; it does not mutate the database.
     pub fn insert(&self, value: E) -> Result<Plan> {
         let mut plan = self.context.plan()?;
-        if let Some(contract) = crate::object::object_contract::<E>()? {
-            plan.register_object_contract(contract);
-        }
-        plan.insert_typed(&self.relation, value)?;
+        E::__append_insert(value, &self.context, &mut plan)?;
         Ok(plan)
     }
 
@@ -474,6 +1802,7 @@ impl<E: Object> ObjectSet<E> {
         if let Some(contract) = crate::object::object_contract::<E>()? {
             plan.register_object_contract(contract);
         }
+        crate::object::register_object_relationship_contracts::<E>(&mut plan)?;
         plan.remove_typed(&self.relation, value)?;
         Ok(plan)
     }
@@ -491,6 +1820,7 @@ impl<E: Object> ObjectQuery<E> {
         crate::ObjectWatch::new(self)
     }
 
+    #[track_caller]
     #[must_use]
     pub fn where_<F, P>(mut self, predicate: F) -> Self
     where
@@ -502,6 +1832,7 @@ impl<E: Object> ObjectQuery<E> {
         self
     }
 
+    #[track_caller]
     #[must_use]
     pub fn select<F, P>(self, projection: F) -> ObjectProjectionQuery<E, P>
     where
@@ -515,9 +1846,51 @@ impl<E: Object> ObjectQuery<E> {
         }
     }
 
+    #[must_use]
+    pub const fn node_id(&self) -> crate::QueryNodeId {
+        self.inner.node_id()
+    }
+
+    #[must_use]
+    pub fn source(&self) -> crate::QuerySource {
+        self.inner.source()
+    }
+
+    pub(crate) fn identity_ids(&self) -> Result<Vec<crate::Id<E>>> {
+        let identity = E::identity_column().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                format!("object {} has no identity field", E::KEY),
+            )
+        })?;
+        let query = self.inner.clone().raw().project(vec![identity]);
+        self.context
+            .execute(&query)?
+            .rows()
+            .iter()
+            .map(|row| {
+                let value = row.first().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvariantViolation,
+                        "identity projection returned an empty row",
+                    )
+                })?;
+                crate::Id::<E>::from_value(value)
+            })
+            .collect()
+    }
+
     pub fn all(&self) -> Result<Vec<E>> {
         let result = self.context.execute(&self.inner.clone().raw())?;
-        result.rows().iter().map(E::from_row).collect()
+        result
+            .rows()
+            .iter()
+            .map(|row| {
+                let mut value = E::from_row(row)?;
+                value.__bind_relations(&self.context)?;
+                Ok(value)
+            })
+            .collect()
     }
 
     pub fn first_or_none(&self) -> Result<Option<E>> {
@@ -553,6 +1926,7 @@ impl<E: Object> ObjectQuery<E> {
         if let Some(contract) = crate::object::object_contract::<E>()? {
             plan.register_object_contract(contract);
         }
+        crate::object::register_object_relationship_contracts::<E>(&mut plan)?;
         for value in values {
             plan.remove_typed(&self.relation, value)?;
         }
@@ -571,9 +1945,17 @@ impl<E: Object> ObjectQuery<E> {
             plan.register_object_contract(contract);
         }
         for old in values {
-            let new = rewrite(old.clone());
-            plan.remove_typed(&self.relation, old)?;
-            plan.insert_typed(&self.relation, new)?;
+            let mut new = rewrite(old.clone());
+            let old_row = self.relation.encode_row(old)?;
+            let new_row = self.relation.encode_row(new.clone())?;
+            let stored_changed = old_row != new_row;
+            if stored_changed {
+                plan.remove(self.relation.id(), old_row);
+            }
+            new.__append_update_relationships(&self.context, &mut plan)?;
+            if stored_changed {
+                plan.insert(self.relation.id(), new_row);
+            }
         }
         Ok(plan)
     }
@@ -586,6 +1968,16 @@ pub struct ObjectProjectionQuery<E: Object, P: Projection<E>> {
 }
 
 impl<E: Object, P: Projection<E>> ObjectProjectionQuery<E, P> {
+    #[must_use]
+    pub const fn node_id(&self) -> crate::QueryNodeId {
+        self.inner.node_id()
+    }
+
+    #[must_use]
+    pub fn source(&self) -> crate::QuerySource {
+        self.inner.source()
+    }
+
     pub fn watch(&self) -> Result<crate::ProjectionWatch<E, P>> {
         crate::ProjectionWatch::new(&self.context, &self.inner)
     }
@@ -812,7 +2204,7 @@ macro_rules! cfmd_entity {
             $(
                 #[must_use]
                 $many_vis fn $many_field(&self) -> $crate::ManyField<$name, $many_target> {
-                    self.inner.__many::<$many_target>(stringify!($via_field))
+                    self.inner.__many::<$many_target>(stringify!($many_field))
                 }
             )*
         }
@@ -826,6 +2218,14 @@ macro_rules! cfmd_entity {
                     $( $crate::ObjectFieldSchema::of::<$ty>(stringify!($field)), )*
                     $( $crate::ObjectFieldSchema::of::<$crate::Ref<$target>>(stringify!($ref_field)), )*
                     $( $crate::ObjectFieldSchema::of::<Option<$crate::Ref<$opt_target>>>(stringify!($opt_field)), )*
+                ]
+            }
+            fn many_fields() -> Vec<$crate::ObjectManyFieldSchema> {
+                vec![
+                    $( $crate::ObjectManyFieldSchema::of::<$name, $many_target>(
+                        stringify!($many_field),
+                        stringify!($via_field),
+                    ), )*
                 ]
             }
             fn proxy(relation: $crate::Relation<Self>) -> Self::Proxy {

@@ -1,0 +1,16 @@
+Cargo.lock
+crates/cfmd-runtime/src/lib.rs
+crates/cfmd-runtime/src/runtime.rs
+crates/cfmd-runtime/tests/end_to_end.rs
+crates/cfmd-secure-memory/examples/microbench.rs
+crates/cfmd-secure-memory/src/lib.rs
+crates/cfmd-secure-memory/src/platform/linux.rs
+crates/kernel-durability/Cargo.toml
+crates/kernel-durability/src/lib.rs
+crates/kernel-durability/src/storage_encryption.rs
+crates/kernel-plan/src/lib.rs
+docs/rnd/SECURE_MEMORY_RND_LEDGER.md
+docs/rnd/RND_SECURE_MEMORY_02_REPORT.md
+docs/rnd/IMPLEMENTATION_REPORT_secure_memory_rnd02.md
+docs/rnd/RND_SECURE_MEMORY_02_CHANGED_FILES.txt
+docs/rnd/RND_SECURE_MEMORY_02_ARCHIVE_MANIFEST.sha256

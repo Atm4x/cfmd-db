@@ -129,6 +129,16 @@ impl ReplicationAuthorityJournal {
         Ok(journal)
     }
 
+    pub(crate) fn replay_single_file_live_frames(
+        &mut self,
+        live_frames: &[Vec<u8>],
+    ) -> Result<(), DurabilityError> {
+        for frame in live_frames {
+            self.replay_single_file_frame(frame, true)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn take_pending_single_file_frames(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_single_file_frames)
     }
@@ -137,38 +147,20 @@ impl ReplicationAuthorityJournal {
         self.live_single_file_frames.extend(frames);
     }
 
-    pub(crate) fn single_file_live_archive_bytes(&self) -> Result<Vec<u8>, DurabilityError> {
-        self.single_file_live_archive_prefix(self.live_single_file_frames.len())
-    }
-
     pub(crate) fn single_file_live_frame_count(&self) -> usize {
         self.live_single_file_frames.len()
     }
 
-    pub(crate) fn single_file_live_archive_prefix(
+    pub(crate) fn single_file_live_frames_prefix(
         &self,
         count: usize,
-    ) -> Result<Vec<u8>, DurabilityError> {
-        if count > self.live_single_file_frames.len() {
-            return Err(DurabilityError::Protocol {
+    ) -> Result<&[Vec<u8>], DurabilityError> {
+        self.live_single_file_frames
+            .get(..count)
+            .ok_or(DurabilityError::Protocol {
                 offset: 0,
-                reason: "single-file replication archive prefix exceeds live frame count",
-            });
-        }
-        let len = self
-            .live_single_file_frames
-            .iter()
-            .take(count)
-            .try_fold(0_usize, |total, frame| total.checked_add(frame.len()))
-            .ok_or(DurabilityError::PayloadTooLarge)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
-            .map_err(|_| DurabilityError::PayloadTooLarge)?;
-        for frame in self.live_single_file_frames.iter().take(count) {
-            bytes.extend_from_slice(frame);
-        }
-        Ok(bytes)
+                reason: "single-file replication frame prefix exceeds live frame count",
+            })
     }
 
     pub(crate) fn advance_single_file_generation_prefix(&mut self, count: usize) {

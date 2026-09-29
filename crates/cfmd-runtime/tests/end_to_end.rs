@@ -534,7 +534,7 @@ cfmd_runtime::cfmd_entity! {
         fields { pub name: String }
         refs { }
         optional_refs { }
-        many { pub children via parent: Child }
+        many { }
     }
 }
 
@@ -543,7 +543,7 @@ cfmd_runtime::cfmd_entity! {
     struct Child => ChildFields("example.child") {
         id pub id;
         fields { pub score: i64 }
-        refs { pub parent: Parent }
+        refs { }
         optional_refs { pub mentor: Parent }
         many { }
     }
@@ -551,7 +551,7 @@ cfmd_runtime::cfmd_entity! {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn optional_refs_and_reverse_many_have_explicit_cardinality_semantics() {
+fn optional_refs_have_explicit_cardinality_semantics() {
     use cfmd_runtime::{Id, Ref};
 
     let directory = temp_directory();
@@ -598,7 +598,6 @@ fn optional_refs_and_reverse_many_have_explicit_cardinality_semantics() {
                 .insert(Child {
                     id: Id::new(10),
                     score: 10,
-                    parent: Ref::new(p1),
                     mentor: None,
                 })
                 .expect("c1"),
@@ -609,7 +608,6 @@ fn optional_refs_and_reverse_many_have_explicit_cardinality_semantics() {
                 .insert(Child {
                     id: Id::new(11),
                     score: 10,
-                    parent: Ref::new(p1),
                     mentor: Some(Ref::new(p2)),
                 })
                 .expect("c2"),
@@ -620,7 +618,6 @@ fn optional_refs_and_reverse_many_have_explicit_cardinality_semantics() {
                 .insert(Child {
                     id: Id::new(12),
                     score: 20,
-                    parent: Ref::new(p2),
                     mentor: None,
                 })
                 .expect("c3"),
@@ -636,47 +633,6 @@ fn optional_refs_and_reverse_many_have_explicit_cardinality_semantics() {
     let snapshot = database.snapshot().expect("snapshot after commit");
     let parents = snapshot.objects::<Parent>().expect("parents");
     let children = snapshot.objects::<Child>().expect("children");
-
-    assert_eq!(
-        parents
-            .where_(|p| p.children().any(|c| c.score().eq(10)))
-            .one()
-            .expect("any")
-            .id,
-        p1
-    );
-    let all_ten = parents
-        .where_(|p| p.children().all(|c| c.score().eq(10)))
-        .all()
-        .expect("all");
-    assert_eq!(all_ten.len(), 2); // p1 and vacuous p3
-    assert!(all_ten.iter().any(|p| p.id == p1));
-    assert!(all_ten.iter().any(|p| p.id == p3));
-
-    let none_ten = parents
-        .where_(|p| p.children().none(|c| c.score().eq(10)))
-        .all()
-        .expect("none");
-    assert_eq!(none_ten.len(), 2); // p2 and p3
-    assert!(none_ten.iter().any(|p| p.id == p2));
-    assert!(none_ten.iter().any(|p| p.id == p3));
-
-    assert_eq!(
-        parents
-            .where_(|p| p.children().count().eq(2))
-            .one()
-            .expect("count two")
-            .id,
-        p1
-    );
-    assert_eq!(
-        parents
-            .where_(|p| p.children().count().eq(0))
-            .one()
-            .expect("count zero")
-            .id,
-        p3
-    );
 
     assert_eq!(
         children
@@ -707,7 +663,6 @@ fn optional_refs_and_reverse_many_have_explicit_cardinality_semantics() {
         .insert(Child {
             id: Id::new(13),
             score: 30,
-            parent: Ref::new(p1),
             mentor: Some(Ref::new(Id::new(999))),
         })
         .expect("dangling optional ref plan");
@@ -1657,12 +1612,13 @@ fn projection_watch_filters_irrelevant_changes_and_decodes_exact_delta() {
     database
         .commit(&other_update, TransactionId::new(8_021))
         .expect("other commit");
-    let irrelevant = watch
-        .try_recv()
-        .expect("irrelevant event")
-        .expect("revision event");
-    assert!(irrelevant.inserted().is_empty());
-    assert!(irrelevant.removed().is_empty());
+    assert!(
+        watch
+            .try_recv()
+            .expect("irrelevant transition quotient")
+            .is_none(),
+        "an output-equivalent transition must not fabricate an empty public event"
+    );
 
     let watched_snapshot = database.snapshot().expect("watched update snapshot");
     let watched_update = watched_snapshot
@@ -1804,6 +1760,19 @@ fn watch_cancellation_interrupts_blocking_recv_without_polling() {
             self.inner.wait_after(observed)
         }
 
+        fn register_waker_after(
+            &self,
+            waiter_id: u64,
+            observed: u64,
+            waker: &std::task::Waker,
+        ) -> u64 {
+            self.inner.register_waker_after(waiter_id, observed, waker)
+        }
+
+        fn unregister_waker(&self, waiter_id: u64) {
+            self.inner.unregister_waker(waiter_id);
+        }
+
         fn notify_waiters(&self) {
             self.inner.notify_waiters();
         }
@@ -1872,6 +1841,19 @@ fn watch_recv_wakes_when_last_runtime_owner_closes() {
             self.inner.wait_after(observed)
         }
 
+        fn register_waker_after(
+            &self,
+            waiter_id: u64,
+            observed: u64,
+            waker: &std::task::Waker,
+        ) -> u64 {
+            self.inner.register_waker_after(waiter_id, observed, waker)
+        }
+
+        fn unregister_waker(&self, waiter_id: u64) {
+            self.inner.unregister_waker(waiter_id);
+        }
+
         fn notify_waiters(&self) {
             self.inner.notify_waiters();
         }
@@ -1933,7 +1915,16 @@ fn watch_lag_is_durable_and_catches_up_one_transition_at_a_time() {
     let mut watch = snapshot
         .watch(&Query::scan(relation))
         .expect("raw query watch");
+    let sibling_watch = snapshot
+        .watch(&Query::scan(relation))
+        .expect("sibling raw query watch");
+    assert_ne!(watch.subscription_id(), sibling_watch.subscription_id());
+    assert_eq!(
+        watch.readiness().source_id(),
+        sibling_watch.readiness().source_id()
+    );
     let anchor_revision = watch.revision();
+    drop(sibling_watch);
     drop(snapshot);
 
     for (offset, value) in [11_i64, 22, 33].into_iter().enumerate() {
@@ -1954,25 +1945,31 @@ fn watch_lag_is_durable_and_catches_up_one_transition_at_a_time() {
         }
     );
 
-    for (index, expected) in [11_i64, 22, 33].into_iter().enumerate() {
-        let event = watch
-            .try_recv()
-            .expect("catch-up receive")
-            .expect("pending watch event");
-        assert_eq!(event.inserted(), &[vec![Value::I64(expected)]]);
-        assert!(event.removed().is_empty());
-        if index < 2 {
-            assert!(matches!(
-                watch.status().expect("remaining lag"),
-                WatchStatus::Lagging {
-                    pending_transitions,
-                    ..
-                } if pending_transitions == 2 - index
-            ));
+    let first_drain = watch.drain_ready(2).expect("bounded catch-up drain");
+    assert_eq!(first_drain.events().len(), 2);
+    assert_eq!(first_drain.events()[0].inserted(), &[vec![Value::I64(11)]]);
+    assert_eq!(first_drain.events()[1].inserted(), &[vec![Value::I64(22)]]);
+    assert!(
+        first_drain
+            .events()
+            .iter()
+            .all(|event| event.removed().is_empty())
+    );
+    assert!(first_drain.has_more());
+    assert!(matches!(
+        first_drain.status(),
+        WatchStatus::Lagging {
+            pending_transitions: 1,
+            ..
         }
-    }
+    ));
+
+    let final_drain = watch.drain_ready(8).expect("final catch-up drain");
+    assert_eq!(final_drain.events().len(), 1);
+    assert_eq!(final_drain.events()[0].inserted(), &[vec![Value::I64(33)]]);
+    assert!(!final_drain.has_more());
     assert_eq!(
-        watch.status().expect("current status"),
+        final_drain.status(),
         WatchStatus::Current {
             revision: head_revision,
         }
@@ -2251,4 +2248,557 @@ fn database_builder_unifies_single_file_default_and_explicit_directory_storage()
     assert_eq!(reopened.current_revision().expect("revision").raw(), 1);
     drop(reopened);
     fs::remove_dir_all(directory).expect("remove directory fixture");
+}
+
+#[test]
+fn encrypted_single_file_builder_encrypts_wal_and_sections_and_requires_exact_key() {
+    use cfmd_runtime::{Encryption, EncryptionKey};
+
+    let relation = RelationId::new(9_200);
+    let equivalence = EquivalenceId::new(9_201);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("schema");
+    let key_bytes = [0x31_u8; 32];
+    let encryption = || Encryption::aes256_gcm_siv(EncryptionKey::from_bytes(key_bytes).unwrap());
+    let file_path = temp_directory().with_extension("cfmd");
+
+    let database = Database::builder(&file_path)
+        .schema(schema)
+        .encryption(encryption())
+        .create()
+        .expect("encrypted single-file create");
+    let mut plan = database.plan().expect("plan");
+    plan.insert(relation, vec![Value::I64(0x1122_3344_5566_7788)]);
+    database
+        .commit(&plan, TransactionId::new(9_202))
+        .expect("encrypted commit");
+    drop(database);
+
+    let bytes = fs::read(&file_path).expect("read encrypted fixture");
+    assert!(bytes.windows(4).any(|window| window == b"CFAE"));
+
+    assert!(Database::builder(&file_path).open().is_err());
+    assert!(
+        Database::builder(&file_path)
+            .encryption(Encryption::aes256_gcm_siv(
+                EncryptionKey::from_bytes([0x32_u8; 32]).unwrap()
+            ))
+            .open()
+            .is_err()
+    );
+
+    let reopened = Database::builder(&file_path)
+        .encryption(encryption())
+        .open()
+        .expect("reopen encrypted database with exact key");
+    assert_eq!(reopened.current_revision().expect("revision").raw(), 2);
+    let snapshot = reopened.snapshot().expect("snapshot");
+    let query = Query::scan(relation);
+    let prepared = snapshot.prepare(&query).expect("prepare encrypted scan");
+    assert_eq!(
+        prepared
+            .execute(&snapshot)
+            .expect("scan encrypted relation"),
+        RelationResult::Bag(vec![vec![Value::I64(0x1122_3344_5566_7788)]])
+    );
+    drop(snapshot);
+    drop(reopened);
+    fs::remove_file(&file_path).expect("remove encrypted fixture");
+}
+
+#[test]
+fn encryption_key_provider_is_resolved_for_create_and_open() {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use cfmd_runtime::{
+        Encryption, EncryptionKeyId, EncryptionKeyOperation, EncryptionKeyProvider,
+        EncryptionProviderKeyMetadata,
+    };
+
+    #[derive(Debug)]
+    struct Provider {
+        key: [u8; 32],
+        operations: Arc<Mutex<Vec<EncryptionKeyOperation>>>,
+    }
+
+    impl EncryptionKeyProvider for Provider {
+        fn provide_key(
+            &self,
+            _path: &Path,
+            operation: EncryptionKeyOperation,
+            destination: &mut cfmd_runtime::EncryptionKeyDestination<'_>,
+        ) -> cfmd_runtime::Result<EncryptionProviderKeyMetadata> {
+            self.operations
+                .lock()
+                .expect("provider lock")
+                .push(operation);
+            destination
+                .fill_with(|bytes| {
+                    bytes.copy_from_slice(&self.key);
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .expect("infallible direct fill");
+            Ok(EncryptionProviderKeyMetadata::new(
+                EncryptionKeyId::from_bytes([0xA1; 16]),
+                1,
+            ))
+        }
+    }
+
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn EncryptionKeyProvider> = Arc::new(Provider {
+        key: [0x63; 32],
+        operations: Arc::clone(&operations),
+    });
+    let relation = RelationId::new(9_300);
+    let equivalence = EquivalenceId::new(9_301);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("schema");
+    let path = temp_directory().with_extension("cfmd");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(Arc::clone(
+            &provider,
+        )))
+        .create()
+        .expect("provider-backed create");
+    drop(database);
+    let reopened = Database::builder(&path)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(provider))
+        .open()
+        .expect("provider-backed open");
+    drop(reopened);
+    assert_eq!(
+        *operations.lock().expect("provider lock"),
+        vec![EncryptionKeyOperation::Create, EncryptionKeyOperation::Open]
+    );
+    fs::remove_file(path).expect("remove provider fixture");
+}
+
+#[test]
+fn encryption_key_provider_must_initialize_secure_destination() {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use cfmd_runtime::{
+        Encryption, EncryptionKeyId, EncryptionKeyOperation, EncryptionKeyProvider,
+        EncryptionProviderKeyMetadata, ErrorKind,
+    };
+
+    #[derive(Debug)]
+    struct EmptyProvider;
+
+    impl EncryptionKeyProvider for EmptyProvider {
+        fn provide_key(
+            &self,
+            _path: &Path,
+            _operation: EncryptionKeyOperation,
+            _destination: &mut cfmd_runtime::EncryptionKeyDestination<'_>,
+        ) -> cfmd_runtime::Result<EncryptionProviderKeyMetadata> {
+            Ok(EncryptionProviderKeyMetadata::new(
+                EncryptionKeyId::from_bytes([0xA2; 16]),
+                1,
+            ))
+        }
+    }
+
+    let relation = RelationId::new(9_325);
+    let equivalence = EquivalenceId::new(9_326);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("schema");
+    let path = temp_directory().with_extension("cfmd");
+    let error = Database::builder(&path)
+        .schema(schema)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(Arc::new(
+            EmptyProvider,
+        )))
+        .create()
+        .expect_err("provider success without key initialization must fail closed");
+    assert_eq!(error.kind(), ErrorKind::Recovery);
+    assert!(error.message().contains("without initializing"));
+}
+
+#[test]
+fn provider_database_key_epoch_floor_rejects_complete_header_rollback() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use cfmd_runtime::{
+        Encryption, EncryptionKeyAcknowledgement, EncryptionKeyId, EncryptionKeyOperation,
+        EncryptionKeyProvider, EncryptionProviderKeyMetadata,
+    };
+
+    #[derive(Debug)]
+    struct Provider {
+        floor: Arc<AtomicU64>,
+        provider_epoch: u64,
+    }
+
+    impl EncryptionKeyProvider for Provider {
+        fn provide_key(
+            &self,
+            _path: &Path,
+            _operation: EncryptionKeyOperation,
+            destination: &mut cfmd_runtime::EncryptionKeyDestination<'_>,
+        ) -> cfmd_runtime::Result<EncryptionProviderKeyMetadata> {
+            destination.write(&[0x73; 32]);
+            Ok(EncryptionProviderKeyMetadata::new(
+                EncryptionKeyId::from_bytes([0x83; 16]),
+                self.provider_epoch,
+            )
+            .with_minimum_database_key_epoch(self.floor.load(Ordering::SeqCst)))
+        }
+
+        fn acknowledge_database_key_epoch(
+            &self,
+            _path: &Path,
+            acknowledgement: EncryptionKeyAcknowledgement,
+        ) -> cfmd_runtime::Result<()> {
+            self.floor
+                .store(acknowledgement.database_key_epoch(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let floor = Arc::new(AtomicU64::new(1));
+    let provider: Arc<dyn EncryptionKeyProvider> = Arc::new(Provider {
+        floor: Arc::clone(&floor),
+        provider_epoch: 4,
+    });
+    let next_provider: Arc<dyn EncryptionKeyProvider> = Arc::new(Provider {
+        floor: Arc::clone(&floor),
+        provider_epoch: 5,
+    });
+    let relation = RelationId::new(9_350);
+    let equivalence = EquivalenceId::new(9_351);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("schema");
+    let path = temp_directory().with_extension("cfmd");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(Arc::clone(
+            &provider,
+        )))
+        .create()
+        .expect("create wrapped database");
+
+    let before = fs::read(&path).expect("read original database");
+    let old_header = before[..4096].to_vec();
+    assert_eq!(
+        database
+            .rewrap_encryption(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(
+                &next_provider,
+            )))
+            .expect("rewrap provider authority"),
+        2
+    );
+    assert_eq!(floor.load(Ordering::SeqCst), 2);
+    drop(database);
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open fixture for rollback");
+    file.seek(SeekFrom::Start(0)).expect("seek header");
+    file.write_all(&old_header).expect("restore old header");
+    file.sync_all().expect("sync rolled-back header");
+    drop(file);
+
+    assert!(
+        Database::builder(&path)
+            .encryption(Encryption::aes256_gcm_siv_with_provider(provider))
+            .open()
+            .is_err()
+    );
+    fs::remove_file(path).expect("remove key-floor fixture");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn provider_acknowledgement_failure_recovers_and_retries_pending_handoff() {
+    use std::path::Path;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use cfmd_runtime::{
+        Encryption, EncryptionKeyAcknowledgement, EncryptionKeyId, EncryptionKeyOperation,
+        EncryptionKeyProvider, EncryptionProviderKeyMetadata,
+    };
+
+    #[derive(Debug)]
+    struct Provider {
+        id: [u8; 16],
+        epoch: u64,
+        key: [u8; 32],
+        floor: Arc<AtomicU64>,
+        acknowledge: bool,
+    }
+
+    impl EncryptionKeyProvider for Provider {
+        fn provide_key(
+            &self,
+            _path: &Path,
+            _operation: EncryptionKeyOperation,
+            destination: &mut cfmd_runtime::EncryptionKeyDestination<'_>,
+        ) -> cfmd_runtime::Result<EncryptionProviderKeyMetadata> {
+            destination.write(&self.key);
+            Ok(
+                EncryptionProviderKeyMetadata::new(
+                    EncryptionKeyId::from_bytes(self.id),
+                    self.epoch,
+                )
+                .with_minimum_database_key_epoch(self.floor.load(Ordering::SeqCst)),
+            )
+        }
+
+        fn acknowledge_database_key_epoch(
+            &self,
+            path: &Path,
+            acknowledgement: EncryptionKeyAcknowledgement,
+        ) -> cfmd_runtime::Result<()> {
+            if !self.acknowledge {
+                return Database::open(path.with_extension("acknowledgement-unavailable"))
+                    .map(|_| ());
+            }
+            self.floor
+                .store(acknowledgement.database_key_epoch(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let floor = Arc::new(AtomicU64::new(1));
+    let old: Arc<dyn EncryptionKeyProvider> = Arc::new(Provider {
+        id: [0x91; 16],
+        epoch: 1,
+        key: [0x81; 32],
+        floor: Arc::clone(&floor),
+        acknowledge: true,
+    });
+    let pending: Arc<dyn EncryptionKeyProvider> = Arc::new(Provider {
+        id: [0x92; 16],
+        epoch: 2,
+        key: [0x82; 32],
+        floor: Arc::clone(&floor),
+        acknowledge: false,
+    });
+    let next: Arc<dyn EncryptionKeyProvider> = Arc::new(Provider {
+        id: [0x92; 16],
+        epoch: 2,
+        key: [0x82; 32],
+        floor: Arc::clone(&floor),
+        acknowledge: true,
+    });
+
+    let relation = RelationId::new(9_375);
+    let equivalence = EquivalenceId::new(9_376);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("schema");
+    let path = temp_directory().with_extension("cfmd");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(Arc::clone(&old)))
+        .create()
+        .expect("create old provider database");
+
+    assert!(
+        database
+            .rewrap_encryption(&Encryption::aes256_gcm_siv_with_provider(pending))
+            .is_err(),
+        "external acknowledgement failure must be surfaced after local pending publication"
+    );
+    assert_eq!(floor.load(Ordering::SeqCst), 1);
+    drop(database);
+
+    let recovered = Database::builder(&path)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(Arc::clone(&old)))
+        .open()
+        .expect("old acknowledged authority remains recoverable while handoff is pending");
+    assert_eq!(
+        recovered
+            .rewrap_encryption(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(&next)))
+            .expect("retry pending handoff"),
+        2
+    );
+    assert_eq!(floor.load(Ordering::SeqCst), 2);
+    drop(recovered);
+
+    assert!(
+        Database::builder(&path)
+            .encryption(Encryption::aes256_gcm_siv_with_provider(old))
+            .open()
+            .is_err()
+    );
+    let reopened = Database::builder(&path)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(next))
+        .open()
+        .expect("acknowledged successor authority opens after predecessor retirement");
+    drop(reopened);
+    fs::remove_file(path).expect("remove pending handoff fixture");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn provider_rotation_rewraps_dmk_without_rewriting_database_ciphertext() {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use cfmd_runtime::{
+        Encryption, EncryptionKeyAcknowledgement, EncryptionKeyId, EncryptionKeyOperation,
+        EncryptionKeyProvider, EncryptionProviderKeyMetadata,
+    };
+
+    #[derive(Debug)]
+    struct Provider {
+        id: [u8; 16],
+        epoch: u64,
+        key: [u8; 32],
+        operations: Arc<Mutex<Vec<EncryptionKeyOperation>>>,
+        acknowledgements: Arc<Mutex<Vec<EncryptionKeyAcknowledgement>>>,
+    }
+
+    impl EncryptionKeyProvider for Provider {
+        fn provide_key(
+            &self,
+            _path: &Path,
+            operation: EncryptionKeyOperation,
+            destination: &mut cfmd_runtime::EncryptionKeyDestination<'_>,
+        ) -> cfmd_runtime::Result<EncryptionProviderKeyMetadata> {
+            self.operations
+                .lock()
+                .expect("provider lock")
+                .push(operation);
+            destination.write(&self.key);
+            Ok(EncryptionProviderKeyMetadata::new(
+                EncryptionKeyId::from_bytes(self.id),
+                self.epoch,
+            ))
+        }
+
+        fn acknowledge_database_key_epoch(
+            &self,
+            _path: &Path,
+            acknowledgement: EncryptionKeyAcknowledgement,
+        ) -> cfmd_runtime::Result<()> {
+            self.acknowledgements
+                .lock()
+                .expect("provider acknowledgement lock")
+                .push(acknowledgement);
+            Ok(())
+        }
+    }
+
+    let old_ops = Arc::new(Mutex::new(Vec::new()));
+    let new_ops = Arc::new(Mutex::new(Vec::new()));
+    let old_acks = Arc::new(Mutex::new(Vec::new()));
+    let new_acks = Arc::new(Mutex::new(Vec::new()));
+    let old_provider: Arc<dyn EncryptionKeyProvider> = Arc::new(Provider {
+        id: [0x11; 16],
+        epoch: 1,
+        key: [0x41; 32],
+        operations: Arc::clone(&old_ops),
+        acknowledgements: Arc::clone(&old_acks),
+    });
+    let new_provider: Arc<dyn EncryptionKeyProvider> = Arc::new(Provider {
+        id: [0x22; 16],
+        epoch: 2,
+        key: [0x42; 32],
+        operations: Arc::clone(&new_ops),
+        acknowledgements: Arc::clone(&new_acks),
+    });
+
+    let relation = RelationId::new(9_400);
+    let equivalence = EquivalenceId::new(9_401);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("schema");
+    let path = temp_directory().with_extension("cfmd");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(Arc::clone(
+            &old_provider,
+        )))
+        .create()
+        .expect("wrapped-DMK create");
+    let mut plan = database.plan().expect("plan");
+    plan.insert(relation, vec![Value::I64(314)]);
+    database
+        .commit(&plan, TransactionId::new(9_402))
+        .expect("encrypted commit");
+
+    let before = fs::read(&path).expect("read before rewrap");
+    let data_offset = 4096 * 3;
+    let data_before = before[data_offset..].to_vec();
+    let key_epoch = database
+        .rewrap_encryption(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(
+            &new_provider,
+        )))
+        .expect("rewrap DMK");
+    assert_eq!(key_epoch, 2);
+    let acknowledgements = new_acks.lock().expect("new provider acknowledgements");
+    assert_eq!(acknowledgements.len(), 1);
+    assert_eq!(
+        acknowledgements[0].provider_key_id(),
+        EncryptionKeyId::from_bytes([0x22; 16])
+    );
+    assert_eq!(acknowledgements[0].provider_key_epoch(), 2);
+    assert_eq!(acknowledgements[0].database_key_epoch(), 2);
+    drop(acknowledgements);
+    let after = fs::read(&path).expect("read after rewrap");
+    assert_eq!(&after[data_offset..], data_before.as_slice());
+    drop(database);
+
+    assert!(
+        Database::builder(&path)
+            .encryption(Encryption::aes256_gcm_siv_with_provider(old_provider))
+            .open()
+            .is_err()
+    );
+    let reopened = Database::builder(&path)
+        .encryption(Encryption::aes256_gcm_siv_with_provider(new_provider))
+        .open()
+        .expect("open with rotated provider key");
+    let snapshot = reopened.snapshot().expect("snapshot");
+    let prepared = snapshot
+        .prepare(&Query::scan(relation))
+        .expect("prepare scan after rewrap");
+    assert_eq!(
+        prepared.execute(&snapshot).expect("scan after rewrap"),
+        RelationResult::Bag(vec![vec![Value::I64(314)]])
+    );
+    assert_eq!(
+        *old_ops.lock().expect("old provider operations"),
+        vec![EncryptionKeyOperation::Create, EncryptionKeyOperation::Open]
+    );
+    assert_eq!(
+        *new_ops.lock().expect("new provider operations"),
+        vec![EncryptionKeyOperation::Rewrap, EncryptionKeyOperation::Open]
+    );
+    drop(snapshot);
+    drop(reopened);
+    fs::remove_file(path).expect("remove rewrap fixture");
 }

@@ -1,12 +1,15 @@
 use kernel_types::{EntityId, SemanticId};
 
-use crate::binary_codec::{Cursor, encode_value, push_len, push_u128};
+use crate::binary_codec::{BinarySource, encode_value, push_len, push_u128};
 use crate::domain::{
     DurableCarrierPatch, DurableFieldPatch, DurableKeepsAlivePatch, DurableModelDelta,
 };
 use crate::runtime::CodecError;
 
-fn encode_entities(out: &mut Vec<u8>, entities: &[EntityId]) -> Result<(), CodecError> {
+fn encode_entities(
+    out: &mut impl crate::binary_codec::BinarySink,
+    entities: &[EntityId],
+) -> Result<(), CodecError> {
     push_len(out, entities.len())?;
     for entity in entities {
         push_u128(out, entity.raw());
@@ -14,7 +17,7 @@ fn encode_entities(out: &mut Vec<u8>, entities: &[EntityId]) -> Result<(), Codec
     Ok(())
 }
 
-fn decode_entities(cursor: &mut Cursor<'_>) -> Result<Vec<EntityId>, &'static str> {
+fn decode_entities(cursor: &mut impl BinarySource) -> Result<Vec<EntityId>, &'static str> {
     let count = cursor.len()?;
     let mut entities = Vec::with_capacity(cursor.bounded_capacity(count));
     let mut previous = None;
@@ -29,11 +32,11 @@ fn decode_entities(cursor: &mut Cursor<'_>) -> Result<Vec<EntityId>, &'static st
     Ok(entities)
 }
 
-fn encode_bool(out: &mut Vec<u8>, value: bool) {
+fn encode_bool(out: &mut impl crate::binary_codec::BinarySink, value: bool) {
     out.push(u8::from(value));
 }
 
-fn decode_bool(cursor: &mut Cursor<'_>) -> Result<bool, &'static str> {
+fn decode_bool(cursor: &mut impl BinarySource) -> Result<bool, &'static str> {
     match cursor.u8()? {
         0 => Ok(false),
         1 => Ok(true),
@@ -42,7 +45,7 @@ fn decode_bool(cursor: &mut Cursor<'_>) -> Result<bool, &'static str> {
 }
 
 pub(crate) fn encode_model_delta(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     delta: &DurableModelDelta,
 ) -> Result<(), CodecError> {
     push_len(out, delta.carriers.len())?;
@@ -82,7 +85,7 @@ pub(crate) fn encode_model_delta(
 }
 
 pub(crate) fn decode_model_delta(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<DurableModelDelta, &'static str> {
     let carrier_count = cursor.len()?;
     let mut carriers = Vec::with_capacity(cursor.bounded_capacity(carrier_count));

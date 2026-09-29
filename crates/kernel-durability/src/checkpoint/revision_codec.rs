@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 
 use kernel_revision::Revision;
 use kernel_schema::{
@@ -8,7 +9,10 @@ use kernel_schema::{
 use kernel_semantics::SemanticRegistry;
 use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
 
-use crate::binary_codec::{Cursor, push_bytes, push_len, push_u16, push_u64, push_u128};
+use crate::binary_codec::{
+    BinarySink, BinarySource, CountingBinarySink, Cursor, ReadBinarySource, StreamingBinarySink,
+    push_bytes, push_len, push_u16, push_u64, push_u128,
+};
 use crate::runtime::{CodecError, DurabilityError};
 
 use super::semantic_codec::{
@@ -22,11 +26,34 @@ pub(crate) const CHECKPOINT_CODEC_VERSION: u16 = 2;
 
 pub(crate) fn encode_revision(revision: &Revision) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::new();
-    push_u16(&mut out, CHECKPOINT_CODEC_VERSION);
-    push_u64(&mut out, revision.id().raw());
-    encode_context(&mut out, revision.semantic_context())?;
-    encode_state(&mut out, revision.state())?;
+    encode_revision_into(&mut out, revision)?;
     Ok(out)
+}
+
+pub(crate) fn encoded_revision_len(revision: &Revision) -> Result<u64, CodecError> {
+    let mut sink = CountingBinarySink::default();
+    encode_revision_into(&mut sink, revision)?;
+    sink.len()
+}
+
+pub(crate) fn stream_revision(
+    revision: &Revision,
+    emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+) -> Result<(), DurabilityError> {
+    let mut sink = StreamingBinarySink::new(emit);
+    encode_revision_into(&mut sink, revision)?;
+    sink.finish()
+}
+
+pub(crate) fn encode_revision_into(
+    out: &mut impl BinarySink,
+    revision: &Revision,
+) -> Result<(), CodecError> {
+    push_u16(out, CHECKPOINT_CODEC_VERSION);
+    push_u64(out, revision.id().raw());
+    encode_context(out, revision.semantic_context())?;
+    encode_state(out, revision.state())?;
+    Ok(())
 }
 
 pub(crate) fn decode_revision(
@@ -34,13 +61,29 @@ pub(crate) fn decode_revision(
     registry: &SemanticRegistry,
 ) -> Result<Revision, DurabilityError> {
     let mut cursor = Cursor::new(bytes);
+    decode_revision_from_cursor(&mut cursor, registry)
+}
+
+pub(crate) fn decode_revision_from_reader(
+    reader: &mut dyn Read,
+    len: u64,
+    registry: &SemanticRegistry,
+) -> Result<Revision, DurabilityError> {
+    let mut cursor = ReadBinarySource::new(reader, len);
+    decode_revision_from_cursor(&mut cursor, registry)
+}
+
+fn decode_revision_from_cursor(
+    cursor: &mut impl BinarySource,
+    registry: &SemanticRegistry,
+) -> Result<Revision, DurabilityError> {
     let version = cursor.u16().map_err(corrupt)?;
     if !matches!(version, 1 | CHECKPOINT_CODEC_VERSION) {
         return Err(corrupt("unsupported checkpoint codec version"));
     }
     let revision_id = RevisionId::new(cursor.u64().map_err(corrupt)?);
-    let context = decode_context(&mut cursor, version)?;
-    let state = decode_state(&mut cursor)?;
+    let context = decode_context(cursor, version)?;
+    let state = decode_state(cursor)?;
     cursor.finish().map_err(corrupt)?;
     Revision::build(revision_id, &context, registry, state)
         .map_err(|_| corrupt("checkpoint revision validation failed"))
@@ -50,7 +93,10 @@ fn corrupt(reason: &'static str) -> DurabilityError {
     DurabilityError::Corruption { offset: 0, reason }
 }
 
-fn encode_context(out: &mut Vec<u8>, context: &SemanticContext) -> Result<(), CodecError> {
+fn encode_context(
+    out: &mut impl crate::binary_codec::BinarySink,
+    context: &SemanticContext,
+) -> Result<(), CodecError> {
     let schema = &context.schema;
     push_u64(out, schema.revision.raw());
 
@@ -144,7 +190,7 @@ fn encode_context(out: &mut Vec<u8>, context: &SemanticContext) -> Result<(), Co
 }
 
 fn decode_context(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     version: u16,
 ) -> Result<SemanticContext, DurabilityError> {
     let mut schema = Schema::new(SchemaRevisionId::new(cursor.u64().map_err(corrupt)?));
@@ -165,7 +211,10 @@ fn decode_context(
     })
 }
 
-fn decode_symbols(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), DurabilityError> {
+fn decode_symbols(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     let mut previous = None;
     for _ in 0..count {
@@ -183,7 +232,10 @@ fn decode_symbols(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), Du
     Ok(())
 }
 
-fn decode_types(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), DurabilityError> {
+fn decode_types(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     let mut previous = None;
     for _ in 0..count {
@@ -196,7 +248,7 @@ fn decode_types(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), Dura
 }
 
 fn decode_capabilities(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     schema: &mut Schema,
 ) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
@@ -224,7 +276,10 @@ fn decode_capabilities(
     Ok(())
 }
 
-fn decode_fields(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), DurabilityError> {
+fn decode_fields(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     let mut previous = None;
     for _ in 0..count {
@@ -238,7 +293,10 @@ fn decode_fields(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), Dur
     Ok(())
 }
 
-fn decode_relations(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), DurabilityError> {
+fn decode_relations(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     let mut previous = None;
     for _ in 0..count {
@@ -271,7 +329,7 @@ fn decode_relations(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), 
 }
 
 fn decode_structural_equivalences(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     schema: &mut Schema,
 ) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
@@ -290,7 +348,7 @@ fn decode_structural_equivalences(
 }
 
 fn decode_structural_orderings(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     schema: &mut Schema,
 ) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
@@ -308,7 +366,10 @@ fn decode_structural_orderings(
     Ok(())
 }
 
-fn decode_inclusions(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(), DurabilityError> {
+fn decode_inclusions(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     let mut previous = None;
     for _ in 0..count {
@@ -327,7 +388,9 @@ fn decode_inclusions(cursor: &mut Cursor<'_>, schema: &mut Schema) -> Result<(),
     Ok(())
 }
 
-fn decode_environment(cursor: &mut Cursor<'_>) -> Result<SemanticEnvironment, DurabilityError> {
+fn decode_environment(
+    cursor: &mut impl BinarySource,
+) -> Result<SemanticEnvironment, DurabilityError> {
     let mut environment =
         SemanticEnvironment::new(SemanticEnvId::new(cursor.u64().map_err(corrupt)?));
     let count = cursor.len().map_err(corrupt)?;
@@ -335,7 +398,7 @@ fn decode_environment(cursor: &mut Cursor<'_>) -> Result<SemanticEnvironment, Du
     for _ in 0..count {
         let id = ordered_semantic_id(cursor, &mut previous, "modules not strictly sorted")?;
         let digest: [u8; 32] = cursor
-            .take(32)
+            .take_owned(32)
             .map_err(corrupt)?
             .try_into()
             .map_err(|_| corrupt("module digest length"))?;

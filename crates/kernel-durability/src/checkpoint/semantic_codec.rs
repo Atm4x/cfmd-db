@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use kernel_schema::{StructuralEquivalenceDef, StructuralOrderingDef, SymbolKind};
 use kernel_types::{EntityId, SemanticId};
 
-use crate::binary_codec::{Cursor, push_len, push_u128};
+use crate::binary_codec::{BinarySource, push_len, push_u128};
 use crate::runtime::{CodecError, DurabilityError};
 
 fn corrupt(reason: &'static str) -> DurabilityError {
@@ -11,7 +11,7 @@ fn corrupt(reason: &'static str) -> DurabilityError {
 }
 
 pub(super) fn encode_structural_equivalence(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     definition: &StructuralEquivalenceDef,
 ) -> Result<(), CodecError> {
     match definition {
@@ -57,7 +57,7 @@ pub(super) fn encode_structural_equivalence(
 }
 
 pub(super) fn decode_structural_equivalence(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<StructuralEquivalenceDef, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(StructuralEquivalenceDef::Mu {
@@ -93,7 +93,7 @@ pub(super) fn decode_structural_equivalence(
 }
 
 pub(super) fn encode_structural_ordering(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     definition: &StructuralOrderingDef,
 ) -> Result<(), CodecError> {
     match definition {
@@ -140,7 +140,7 @@ pub(super) fn encode_structural_ordering(
 }
 
 pub(super) fn decode_structural_ordering(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<StructuralOrderingDef, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(StructuralOrderingDef::Mu {
@@ -182,7 +182,7 @@ pub(super) fn decode_structural_ordering(
 }
 
 fn encode_semantic_pairs(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     pairs: &[(SemanticId, SemanticId)],
 ) -> Result<(), CodecError> {
     push_len(out, pairs.len())?;
@@ -194,7 +194,7 @@ fn encode_semantic_pairs(
 }
 
 fn decode_semantic_pairs(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<(SemanticId, SemanticId)>, DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     (0..count)
@@ -208,7 +208,7 @@ fn decode_semantic_pairs(
 }
 
 fn encode_semantic_map(
-    out: &mut Vec<u8>,
+    out: &mut impl crate::binary_codec::BinarySink,
     map: &BTreeMap<SemanticId, SemanticId>,
 ) -> Result<(), CodecError> {
     push_len(out, map.len())?;
@@ -220,7 +220,7 @@ fn encode_semantic_map(
 }
 
 fn decode_semantic_map(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<BTreeMap<SemanticId, SemanticId>, DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     let mut map = BTreeMap::new();
@@ -232,7 +232,10 @@ fn decode_semantic_map(
     Ok(map)
 }
 
-pub(super) fn encode_semantic_ids(out: &mut Vec<u8>, ids: &[SemanticId]) -> Result<(), CodecError> {
+pub(super) fn encode_semantic_ids(
+    out: &mut impl crate::binary_codec::BinarySink,
+    ids: &[SemanticId],
+) -> Result<(), CodecError> {
     push_len(out, ids.len())?;
     for id in ids {
         push_u128(out, id.raw());
@@ -241,7 +244,7 @@ pub(super) fn encode_semantic_ids(out: &mut Vec<u8>, ids: &[SemanticId]) -> Resu
 }
 
 pub(super) fn decode_semantic_ids(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
 ) -> Result<Vec<SemanticId>, DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     let mut ids = Vec::with_capacity(cursor.bounded_capacity(count));
@@ -252,7 +255,7 @@ pub(super) fn decode_semantic_ids(
 }
 
 pub(super) fn ordered_semantic_id(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     previous: &mut Option<SemanticId>,
     reason: &'static str,
 ) -> Result<SemanticId, DurabilityError> {
@@ -265,7 +268,7 @@ pub(super) fn ordered_semantic_id(
 }
 
 pub(super) fn ordered_entity_id(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut impl BinarySource,
     previous: &mut Option<EntityId>,
     reason: &'static str,
 ) -> Result<EntityId, DurabilityError> {

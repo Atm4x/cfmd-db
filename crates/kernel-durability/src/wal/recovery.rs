@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use kernel_types::RevisionId;
 use sha2::{Digest, Sha256};
@@ -12,13 +11,14 @@ use crate::runtime::{
     CodecError, CommittedRevision, DurabilityError, RecoveredAuthorityState, RecoveryScan,
     TailStatus,
 };
+use crate::storage_encryption::{StorageAeadCodec, StorageEncryptionDomain};
 use crate::wal_frame::{
     DecodedFrame, FrameRead, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN, RecordKind, read_frame,
     validate_frame_header,
 };
 use crate::wal_payload::{CommitRecord, decode_commit_payload, decode_prepare_payload};
 
-use super::WAL_FRESHNESS_PREFIX_DOMAIN;
+use super::{WAL_FRESHNESS_PREFIX_DOMAIN, wal_aad_context};
 
 pub fn scan_wal(bytes: &[u8], base_revision: RevisionId) -> Result<RecoveryScan, DurabilityError> {
     scan_wal_seeded(bytes, base_revision, 1, &[])
@@ -31,30 +31,58 @@ struct OwnedWalFrame {
     revision: RevisionId,
     payload_crc: u32,
     payload: Vec<u8>,
+    stored_payload: Vec<u8>,
     frame_len: usize,
 }
 
-enum FileFrameRead {
+enum ReaderFrameRead {
     Complete(OwnedWalFrame),
     Tail(TailStatus),
 }
 
-fn read_wal_file_frame(
-    file: &mut File,
-    file_len: u64,
+fn read_declared_region_exact(
+    reader: &mut impl Read,
+    bytes: &mut [u8],
+    logical_offset: usize,
+) -> Result<(), DurabilityError> {
+    match reader.read_exact(bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(DurabilityError::Corruption {
+                offset: logical_offset,
+                reason: "WAL backing data ends before its declared region boundary",
+            })
+        }
+        Err(error) => Err(DurabilityError::Io(error)),
+    }
+}
+
+pub(crate) struct WalRegionScanSpec<'a> {
+    pub(crate) start_offset: u64,
+    pub(crate) end_offset: u64,
+    pub(crate) base_revision: RevisionId,
+    pub(crate) first_lsn: u64,
+    pub(crate) seeded_prepares: &'a [(u64, DurableRevisionDescriptor, u32)],
+    pub(crate) crypto: Option<&'a StorageAeadCodec>,
+}
+
+fn read_wal_reader_frame(
+    reader: &mut impl Read,
+    region_end: u64,
     absolute_offset: u64,
     logical_offset: u64,
     expected_lsn: u64,
-) -> Result<FileFrameRead, DurabilityError> {
-    let remaining = file_len.saturating_sub(absolute_offset);
+    crypto: Option<&StorageAeadCodec>,
+) -> Result<ReaderFrameRead, DurabilityError> {
+    let remaining = region_end.saturating_sub(absolute_offset);
     let offset_usize = usize::try_from(logical_offset).map_err(|_| CodecError::LengthOverflow)?;
     if remaining < u64::try_from(HEADER_LEN).expect("WAL header length fits u64") {
         let tail_len = usize::try_from(remaining).map_err(|_| CodecError::LengthOverflow)?;
         let mut tail = vec![0_u8; tail_len];
-        file.read_exact(&mut tail)?;
+        read_declared_region_exact(reader, &mut tail, offset_usize)?;
         let prefix_len = tail.len().min(MAGIC.len());
         let looks_torn = tail[..prefix_len] == MAGIC[..prefix_len];
-        return Ok(FileFrameRead::Tail(if looks_torn {
+        return Ok(ReaderFrameRead::Tail(if looks_torn {
             TailStatus::Truncated {
                 offset: offset_usize,
             }
@@ -66,7 +94,7 @@ fn read_wal_file_frame(
     }
 
     let mut header = [0_u8; HEADER_LEN];
-    file.read_exact(&mut header)?;
+    read_declared_region_exact(reader, &mut header, offset_usize)?;
     if header[..4] != MAGIC {
         return Err(DurabilityError::Corruption {
             offset: offset_usize,
@@ -92,88 +120,140 @@ fn read_wal_file_frame(
             reason: "frame length overflow",
         })?;
     if remaining < u64::try_from(frame_len).map_err(|_| CodecError::LengthOverflow)? {
-        return Ok(FileFrameRead::Tail(TailStatus::Truncated {
+        return Ok(ReaderFrameRead::Tail(TailStatus::Truncated {
             offset: offset_usize,
         }));
     }
-    let mut payload = Vec::new();
-    payload
+    let mut stored_payload = Vec::new();
+    stored_payload
         .try_reserve_exact(payload_len)
         .map_err(|_| DurabilityError::PayloadTooLarge)?;
-    payload.resize(payload_len, 0);
-    file.read_exact(&mut payload)?;
+    stored_payload.resize(payload_len, 0);
+    read_declared_region_exact(reader, &mut stored_payload, offset_usize)?;
     let payload_crc = read_u32(&header[28..32]);
-    if crc32c(&payload) != payload_crc {
+    if crc32c(&stored_payload) != payload_crc {
         return Err(DurabilityError::Corruption {
             offset: offset_usize,
             reason: "payload checksum mismatch",
         });
     }
-    Ok(FileFrameRead::Complete(OwnedWalFrame {
+    let kind = RecordKind::try_from(header[6]).map_err(|()| DurabilityError::Corruption {
+        offset: offset_usize,
+        reason: "unknown frame kind",
+    })?;
+    let lsn = read_u64(&header[12..20]);
+    let revision = RevisionId::new(read_u64(&header[20..28]));
+    let payload = if let Some(crypto) = crypto {
+        crypto.open(
+            StorageEncryptionDomain::Wal,
+            &wal_aad_context(kind, lsn, revision),
+            &stored_payload,
+        )?
+    } else {
+        if stored_payload.starts_with(b"CFAE") {
+            return Err(DurabilityError::Protocol {
+                offset: offset_usize,
+                reason: "encrypted WAL frame requires a database key",
+            });
+        }
+        stored_payload.clone()
+    };
+    Ok(ReaderFrameRead::Complete(OwnedWalFrame {
         header,
-        kind: RecordKind::try_from(header[6]).map_err(|()| DurabilityError::Corruption {
-            offset: offset_usize,
-            reason: "unknown frame kind",
-        })?,
-        lsn: read_u64(&header[12..20]),
-        revision: RevisionId::new(read_u64(&header[20..28])),
+        kind,
+        lsn,
+        revision,
         payload_crc,
         payload,
+        stored_payload,
         frame_len,
     }))
 }
 
 pub(super) fn scan_wal_file_seeded(
-    file: &mut File,
+    file: &mut std::fs::File,
     base_revision: RevisionId,
     first_lsn: u64,
     seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+    crypto: Option<&StorageAeadCodec>,
 ) -> Result<(RecoveryScan, Sha256, u64), DurabilityError> {
     let file_len = file.metadata()?.len();
-    let (scan, hasher) =
-        scan_wal_file_region_seeded(file, 0, file_len, base_revision, first_lsn, seeded_prepares)?;
+    let (scan, hasher) = scan_wal_file_region_seeded(
+        file,
+        0,
+        file_len,
+        base_revision,
+        first_lsn,
+        seeded_prepares,
+        crypto,
+    )?;
     Ok((scan, hasher, file_len))
 }
 
 pub(super) fn scan_wal_file_region_seeded(
-    file: &mut File,
+    file: &mut std::fs::File,
     start_offset: u64,
     end_offset: u64,
     base_revision: RevisionId,
     first_lsn: u64,
     seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+    crypto: Option<&StorageAeadCodec>,
 ) -> Result<(RecoveryScan, Sha256), DurabilityError> {
-    if first_lsn == 0 {
+    let backing_len = file.metadata()?.len();
+    let spec = WalRegionScanSpec {
+        start_offset,
+        end_offset,
+        base_revision,
+        first_lsn,
+        seeded_prepares,
+        crypto,
+    };
+    scan_wal_reader_region_seeded(file, backing_len, &spec)
+}
+
+pub(super) fn scan_wal_reader_region_seeded(
+    reader: &mut (impl Read + Seek),
+    backing_len: u64,
+    spec: &WalRegionScanSpec<'_>,
+) -> Result<(RecoveryScan, Sha256), DurabilityError> {
+    if spec.first_lsn == 0 {
         return Err(DurabilityError::Protocol {
             offset: 0,
             reason: "WAL first LSN must be nonzero",
         });
     }
-    let file_len = file.metadata()?.len();
-    if start_offset > end_offset || end_offset > file_len {
+    if spec.start_offset > spec.end_offset || spec.end_offset > backing_len {
         return Err(DurabilityError::Corruption {
             offset: 0,
             reason: "WAL region range is outside the backing file",
         });
     }
-    file.seek(SeekFrom::Start(start_offset))?;
-    let mut state = ScanState::new(base_revision);
-    for (lsn, descriptor, payload_crc) in seeded_prepares {
+    reader.seek(SeekFrom::Start(spec.start_offset))?;
+    let mut state = ScanState::new(spec.base_revision);
+    for (lsn, descriptor, payload_crc) in spec.seeded_prepares {
         state.seed_prepare(*lsn, descriptor.clone(), *payload_crc)?;
     }
     let mut freshness_hasher = Sha256::new();
     freshness_hasher.update(WAL_FRESHNESS_PREFIX_DOMAIN);
     let mut offset = 0_u64;
-    let region_len = end_offset - start_offset;
-    let mut expected_lsn = first_lsn;
+    let region_len = spec.end_offset - spec.start_offset;
+    let mut expected_lsn = spec.first_lsn;
 
     while offset < region_len {
-        let absolute_offset = start_offset
+        let absolute_offset = spec
+            .start_offset
             .checked_add(offset)
             .ok_or(CodecError::LengthOverflow)?;
-        file.seek(SeekFrom::Start(absolute_offset))?;
-        match read_wal_file_frame(file, end_offset, absolute_offset, offset, expected_lsn)? {
-            FileFrameRead::Tail(tail_status) => {
+        reader.seek(SeekFrom::Start(absolute_offset))?;
+        match read_wal_reader_frame(
+            reader,
+            spec.end_offset,
+            absolute_offset,
+            offset,
+            expected_lsn,
+            spec.crypto,
+        )? {
+            ReaderFrameRead::Tail(tail_status) => {
                 return Ok((
                     state.finish(
                         usize::try_from(offset).map_err(|_| CodecError::LengthOverflow)?,
@@ -183,7 +263,7 @@ pub(super) fn scan_wal_file_region_seeded(
                     freshness_hasher,
                 ));
             }
-            FileFrameRead::Complete(frame) => {
+            ReaderFrameRead::Complete(frame) => {
                 state.accept(&DecodedFrame {
                     offset: usize::try_from(offset).map_err(|_| CodecError::LengthOverflow)?,
                     kind: frame.kind,
@@ -194,7 +274,7 @@ pub(super) fn scan_wal_file_region_seeded(
                     frame_len: frame.frame_len,
                 })?;
                 freshness_hasher.update(frame.header);
-                freshness_hasher.update(&frame.payload);
+                freshness_hasher.update(&frame.stored_payload);
                 offset = offset
                     .checked_add(
                         u64::try_from(frame.frame_len).map_err(|_| CodecError::LengthOverflow)?,

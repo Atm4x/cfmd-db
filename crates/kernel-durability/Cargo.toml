@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cfmd-secure-memory = { path = "../cfmd-secure-memory" }
+aes = { version = "=0.9.3", default-features = false, features = ["zeroize"] }
+aes-gcm-siv = { version = "=0.12.1", default-features = false, features = ["aes", "zeroize"] }
+getrandom = { version = "=0.4.3", default-features = false }
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 kernel-auth = { path = "../kernel-auth" }
 kernel-change = { path = "../kernel-change" }
@@ -15,7 +19,11 @@ kernel-revision = { path = "../kernel-revision" }
 kernel-schema = { path = "../kernel-schema" }
 kernel-semantics = { path = "../kernel-semantics" }
 kernel-types = { path = "../kernel-types" }
-sha2 = { version = "=0.11.0", default-features = false }
+sha2 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
+zeroize = { version = "=1.9.0", default-features = false }
+
+[dev-dependencies]
+hkdf = { version = "=0.13.0", default-features = false }
 
 [lints]
 workspace = true

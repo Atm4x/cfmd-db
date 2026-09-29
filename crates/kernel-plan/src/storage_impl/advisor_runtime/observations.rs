@@ -180,6 +180,7 @@ fn collect_semantic_index_advice_observations(
     }
     match plan {
         Plan::FilterEqConst { input, .. }
+        | Plan::FilterOrderConst { input, .. }
         | Plan::FilterEqColumns { input, .. }
         | Plan::Project { input, .. }
         | Plan::Distinct { input, .. }

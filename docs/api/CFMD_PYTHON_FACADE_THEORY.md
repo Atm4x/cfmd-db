@@ -5,7 +5,7 @@
 **Target:** Python-first facade for embedded/local CFMD applications  
 **Repository changes:** none
 
-> **Implementation-order note (Pass281):** this document remains the Python UX/design target. Its semantics are now implemented **Rust-runtime first** in `cfmd-runtime`; Python will bind to that stable product boundary and will not call `kernel-*` crates directly.
+> **Implementation-order note (Pass337):** this document remains the Python UX/design target, not the active implementation-order authority. Rust applications use the public `cfmd` crate; shared semantics live in `cfmd-runtime`; Python will bind to that runtime boundary later and will not call `kernel-*` crates directly.
 
 ---
 
