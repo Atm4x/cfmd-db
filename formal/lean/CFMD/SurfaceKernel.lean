@@ -195,9 +195,14 @@ inductive Aggregate where
 
 inductive Direction where | asc | desc deriving DecidableEq, Repr
 
+inductive OrderComparison where
+  | less | lessOrEqual | greater | greaterOrEqual
+  deriving DecidableEq, Repr
+
 inductive SurfaceQuery where
   | scan (relation : Id)
   | filterConst (input : SurfaceQuery) (column : Column) (value : ValueToken) (equivalence : Id)
+  | filterOrderConst (input : SurfaceQuery) (column : Column) (value : ValueToken) (ordering : Id) (comparison : OrderComparison)
   | filterColumns (input : SurfaceQuery) (left right : Column) (equivalence : Id)
   | project (input : SurfaceQuery) (columns : List Column)
   | join (left right : SurfaceQuery) (leftCol rightCol : Column) (equivalence : Id)
@@ -212,6 +217,7 @@ inductive SurfaceQuery where
 inductive KernelQuery where
   | scan (relation : Id)
   | filterConst (input : KernelQuery) (column : Column) (value : ValueToken) (equivalence : Id)
+  | filterOrderConst (input : KernelQuery) (column : Column) (value : ValueToken) (ordering : Id) (comparison : OrderComparison)
   | filterColumns (input : KernelQuery) (left right : Column) (equivalence : Id)
   | project (input : KernelQuery) (columns : List Column)
   | join (left right : KernelQuery) (leftCol rightCol : Column) (equivalence : Id)
@@ -226,6 +232,7 @@ inductive KernelQuery where
 def elaborateQuery : SurfaceQuery → KernelQuery
   | .scan r => .scan r
   | .filterConst q c v e => .filterConst (elaborateQuery q) c v e
+  | .filterOrderConst q c v o comparison => .filterOrderConst (elaborateQuery q) c v o comparison
   | .filterColumns q l r e => .filterColumns (elaborateQuery q) l r e
   | .project q cs => .project (elaborateQuery q) cs
   | .join l r lc rc e => .join (elaborateQuery l) (elaborateQuery r) lc rc e
@@ -243,6 +250,7 @@ inductive TopKAlgorithm where | generic | maintained deriving DecidableEq, Repr
 inductive Plan where
   | scan (relation : Id) (algorithm : ScanAlgorithm)
   | filterConst (input : Plan) (column : Column) (value : ValueToken) (equivalence : Id)
+  | filterOrderConst (input : Plan) (column : Column) (value : ValueToken) (ordering : Id) (comparison : OrderComparison)
   | filterColumns (input : Plan) (left right : Column) (equivalence : Id)
   | project (input : Plan) (columns : List Column)
   | join (left right : Plan) (leftCol rightCol : Column) (equivalence : Id)
@@ -257,6 +265,7 @@ inductive Plan where
 def lower : KernelQuery → Plan
   | .scan r => .scan r .row
   | .filterConst q c v e => .filterConst (lower q) c v e
+  | .filterOrderConst q c v o comparison => .filterOrderConst (lower q) c v o comparison
   | .filterColumns q l r e => .filterColumns (lower q) l r e
   | .project q cs => .project (lower q) cs
   | .join l r lc rc e => .join (lower l) (lower r) lc rc e
@@ -270,6 +279,7 @@ def lower : KernelQuery → Plan
 def erase : Plan → KernelQuery
   | .scan r _ => .scan r
   | .filterConst q c v e => .filterConst (erase q) c v e
+  | .filterOrderConst q c v o comparison => .filterOrderConst (erase q) c v o comparison
   | .filterColumns q l r e => .filterColumns (erase q) l r e
   | .project q cs => .project (erase q) cs
   | .join l r lc rc e => .join (erase l) (erase r) lc rc e
@@ -282,13 +292,13 @@ def erase : Plan → KernelQuery
 
 def KernelQuery.nodeCount : KernelQuery → Nat
   | .scan _ => 1
-  | .filterConst q .. | .filterColumns q .. | .project q .. | .distinct q .. |
+  | .filterConst q .. | .filterOrderConst q .. | .filterColumns q .. | .project q .. | .distinct q .. |
     .group q .. | .topK q .. | .promoteToBag q => 1 + q.nodeCount
   | .join l r .. | .difference l r | .antiJoin l r .. => 1 + l.nodeCount + r.nodeCount
 
 def Plan.nodeCount : Plan → Nat
   | .scan .. => 1
-  | .filterConst q .. | .filterColumns q .. | .project q .. | .distinct q .. |
+  | .filterConst q .. | .filterOrderConst q .. | .filterColumns q .. | .project q .. | .distinct q .. |
     .group q .. | .topK q .. | .promoteToBag q => 1 + q.nodeCount
   | .join l r .. | .difference l r | .antiJoin l r .. => 1 + l.nodeCount + r.nodeCount
 
@@ -297,6 +307,7 @@ theorem lower_roundtrip (q : KernelQuery) : erase (lower q) = q := by
   induction q with
   | scan => rfl
   | filterConst q c v e ih => simp [lower, erase, ih]
+  | filterOrderConst q c v o comparison ih => simp [lower, erase, ih]
   | filterColumns q l r e ih => simp [lower, erase, ih]
   | project q cs ih => simp [lower, erase, ih]
   | join l r lc rc e ihL ihR => simp [lower, erase, ihL, ihR]
@@ -312,6 +323,7 @@ theorem lower_node_count (q : KernelQuery) : (lower q).nodeCount = q.nodeCount :
   induction q with
   | scan => rfl
   | filterConst q c v e ih => simp [lower, Plan.nodeCount, KernelQuery.nodeCount, ih]
+  | filterOrderConst q c v o comparison ih => simp [lower, Plan.nodeCount, KernelQuery.nodeCount, ih]
   | filterColumns q l r e ih => simp [lower, Plan.nodeCount, KernelQuery.nodeCount, ih]
   | project q cs ih => simp [lower, Plan.nodeCount, KernelQuery.nodeCount, ih]
   | join l r lc rc e ihL ihR => simp [lower, Plan.nodeCount, KernelQuery.nodeCount, ihL, ihR]

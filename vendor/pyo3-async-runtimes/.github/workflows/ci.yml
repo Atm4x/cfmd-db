@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install black==24.10.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check python formatting (black)
+        run: black --check .
+      - name: Check rust formatting (rustfmt)
+        run: cargo fmt --all -- --check
+
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      MSRV: ${{ steps.resolve-msrv.outputs.MSRV }}
+      verbose: ${{ runner.debug == '1' }}
+    steps:
+      - uses: actions/checkout@v6.0.1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - name: resolve MSRV
+        id: resolve-msrv
+        run: echo MSRV=`python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])'` >> $GITHUB_OUTPUT
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+      - run: make clippy
+
+  build:
+    needs: [fmt, resolve] # don't wait for clippy as fails rarely and takes longer
+    name: python${{ matrix.python-version }}-${{ matrix.platform.python-architecture }} ${{ matrix.platform.os }} ${{ matrix.msrv }}
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false # If one platform fails, allow the rest to keep testing.
+      matrix:
+        rust: [stable]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.14t", "3.15-dev", "3.15t-dev", "pypy-3.11"]
+        platform: [{os: "macos-latest", python-architecture: "arm64", rust-target: "aarch64-apple-darwin"}, {os: "ubuntu-latest", python-architecture: "x64", rust-target: "x86_64-unknown-linux-gnu"}, {os: "windows-latest", python-architecture: "x64", rust-target: "x86_64-pc-windows-msvc"}]
+        include:
+          # Test minimal supported Rust version
+          - rust: ${{ needs.resolve.outputs.MSRV }}
+            python-version: "3.13"
+            platform: {os: "ubuntu-latest", python-architecture: "x64", rust-target: "x86_64-unknown-linux-gnu"}
+            msrv: "MSRV"
+
+          # Test the `nightly` feature
+          - rust: nightly
+            python-version: "3.13"
+            platform: {os: "ubuntu-latest", python-architecture: "x64", rust-target: "x86_64-unknown-linux-gnu"}
+            msrv: "nightly"
+            extra_features: "nightly"
+
+          # Test 32-bit windows just on latest Python
+          - rust: stable
+            python-version: "3.13"
+            platform: {os: "windows-latest", python-architecture: "x86", rust-target: "i686-pc-windows-msvc"}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.platform.python-architecture }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          target: ${{ matrix.platform.rust-target }}
+
+      - if: ${{ matrix.msrv == 'MSRV' }}
+        name: Lock package versions for MSRV
+        run: cargo +stable update
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+
+      - name: Build (no features)
+        run: cargo build --no-default-features --verbose --target ${{ matrix.platform.rust-target }}
+
+      - name: Build
+        run: cargo build --features=${{env.features}} --verbose --target ${{ matrix.platform.rust-target }}
+
+      # uvloop doesn't compile under
+      # Windows, https://github.com/MagicStack/uvloop/issues/536,
+      # nor PyPy, https://github.com/MagicStack/uvloop/issues/537
+      # nor for free-threaded Python, see https://github.com/MagicStack/uvloop/issues/642
+      # nor on 3.14, see https://github.com/MagicStack/uvloop/issues/637
+      - if: ${{ matrix.platform.os != 'windows-latest' && !startsWith(matrix.python-version, 'pypy') && !endsWith(matrix.python-version, 't') && !startsWith(matrix.python-version, '3.14') }}
+        name: Install uvloop
+        run: |
+          python -m pip install -U uvloop
+
+      - if: ${{ !startsWith(matrix.python-version, 'pypy') }}
+        name: Test
+        run: cargo test --all-features --target ${{ matrix.platform.rust-target }}
+
+    env:
+      RUST_BACKTRACE: 1
+      RUSTFLAGS: "-D warnings"
+
+  coverage:
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install pyo3-asyncio test dependencies
+        run: python -m pip install -U uvloop
+
+      - run: cargo llvm-cov --all-features --codecov --output-path coverage.json
+      - uses: codecov/codecov-action@v5
+        with:
+          files: coverage.json

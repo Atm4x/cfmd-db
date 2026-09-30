@@ -8,6 +8,6 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 
-vendor/** linguist-vendored
+vendor/** -text linguist-vendored
 artifacts/** linguist-generated
 docs/history/** linguist-documentation

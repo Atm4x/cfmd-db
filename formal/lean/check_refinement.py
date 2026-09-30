@@ -143,9 +143,24 @@ for needle in [
 chunks_start = store.find('pub fn write_streaming_checkpoint_chunks(')
 chunks_end = store.find('pub fn finalize_streaming_checkpoint(', chunks_start)
 chunks = store[chunks_start:chunks_end]
-for needle in ['file.sync_all()?;', 'write_chunked_checkpoint_root(', 'sync_directory(directory)?;']:
+for needle in ['write_next_directory_checkpoint_chunk(job, directory)', 'write_chunked_checkpoint_root(', 'sync_directory(directory)?;']:
     if needle not in chunks:
         raise SystemExit(f'streaming chunk durability step missing: {needle}')
+
+chunk_writer_start = store.find('fn write_next_directory_checkpoint_chunk(')
+chunk_writer_end = store.find('\nimpl DurableRevisionStore', chunk_writer_start)
+if chunk_writer_start < 0 or chunk_writer_end < 0:
+    raise SystemExit('directory streaming chunk writer not found')
+chunk_writer = store[chunk_writer_start:chunk_writer_end]
+chunk_writer_needles = [
+    '.create_new(true)',
+    'write_spooled_checkpoint_chunk(',
+    'file.sync_all()?;',
+    'Ok(crc)',
+]
+positions = [chunk_writer.find(needle) for needle in chunk_writer_needles]
+if any(position < 0 for position in positions) or positions != sorted(positions):
+    raise SystemExit(f'directory streaming chunk durability order changed: {positions}')
 
 final_start = store.find('pub fn finalize_streaming_checkpoint(')
 final_end = store.find('pub fn abort_streaming_checkpoint', final_start)
@@ -165,8 +180,19 @@ if any(p < 0 for p in pos) or pos != sorted(pos):
     raise SystemExit(f'streaming finalize refinement changed: {pos}')
 
 # Generation creation remains monotone by construction through next_generation.
-if store.count('let generation = next_generation(&directory)?;') < 2:
+if 'let generation = next_generation(&directory)?;' not in rotate:
     raise SystemExit('generation monotonicity binding changed')
+
+encoding_start = store.find('fn prepare_store_checkpoint_encoding(')
+encoding_end = store.find('\nfn ', encoding_start + 1)
+if encoding_start < 0 or encoding_end < 0:
+    raise SystemExit('streaming generation preparation not found')
+encoding = store[encoding_start:encoding_end]
+for needle in ['next_generation(store.backend.directory_root()?)?', '.checked_add(1)']:
+    if needle not in encoding:
+        raise SystemExit(f'streaming generation monotonicity binding missing: {needle}')
+if 'prepare_store_checkpoint_encoding(self, revision, chunk_size)?' not in start_stream:
+    raise SystemExit('streaming start no longer uses monotone generation preparation')
 
 # Immutable generation artifacts must be created as new files rather than
 # opened for in-place overwrite.

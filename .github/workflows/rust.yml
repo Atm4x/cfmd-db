@@ -11,6 +11,10 @@ on:
       - 'vendor/**'
       - 'scripts/ci-rust.sh'
       - 'scripts/verify-repository.sh'
+      - 'scripts/update-repository-manifest.py'
+      - 'REPOSITORY_MANIFEST.sha256'
+      - '.gitattributes'
+      - '.gitignore'
       - 'scripts/verify-public-api.sh'
       - '.github/workflows/rust.yml'
   pull_request:
@@ -23,6 +27,10 @@ on:
       - 'vendor/**'
       - 'scripts/ci-rust.sh'
       - 'scripts/verify-repository.sh'
+      - 'scripts/update-repository-manifest.py'
+      - 'REPOSITORY_MANIFEST.sha256'
+      - '.gitattributes'
+      - '.gitignore'
       - 'scripts/verify-public-api.sh'
       - '.github/workflows/rust.yml'
   workflow_dispatch:
