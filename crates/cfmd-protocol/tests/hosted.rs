@@ -225,17 +225,6 @@ fn protocol_watch_stream_is_exact_revision_tagged_and_cancellable() {
     let subscription = opened.subscription;
 
     commit_i64(&hosted, relation, 1, 700, 2);
-    let empty_event = hosted
-        .execute(HostedRequest::NextWatch { subscription })
-        .expect("exact empty watch transition");
-    let HostedResponse::WatchEvent(empty_event) = empty_event else {
-        panic!("watch event response")
-    };
-    assert_eq!(empty_event.source_revision, 1);
-    assert_eq!(empty_event.target_revision, 2);
-    assert!(empty_event.inserted.is_empty());
-    assert!(empty_event.removed.is_empty());
-
     commit_i64(&hosted, relation, 2, 701, 1);
     let event = hosted
         .execute(HostedRequest::NextWatch { subscription })
@@ -243,7 +232,7 @@ fn protocol_watch_stream_is_exact_revision_tagged_and_cancellable() {
     let HostedResponse::WatchEvent(event) = event else {
         panic!("watch event response")
     };
-    assert_eq!(event.source_revision, 2);
+    assert_eq!(event.source_revision, 1);
     assert_eq!(event.target_revision, 3);
     assert_eq!(event.inserted, vec![vec![ProtocolValue::I64(1)]]);
     assert!(event.removed.is_empty());

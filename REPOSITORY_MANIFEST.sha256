@@ -860,7 +860,7 @@ bd39ecc9e6a39e854b1f7679847e725f93faeb68df67e9c7481af4f9cb89ba30  ./crates/cfmd-
 fbae65939d0bef3c30453def74614c224a72691904ff8fa87c173ea26ec93f67  ./crates/cfmd-protocol/src/watch.rs
 a0a9543de9f7e9e0cf9672df773203eabb44bb8791524769888f8ad60d9a2162  ./crates/cfmd-protocol/src/wire/codec.rs
 9c0d505030ee5d98a1de113406c9baf3ffa17678d471dedaa02354cb7c26bdcc  ./crates/cfmd-protocol/src/wire/mod.rs
-991abbced53a0c2cf9475a14929742e67917ab30119043fbabc55ef356247bbb  ./crates/cfmd-protocol/tests/hosted.rs
+42493e102cbd2b7489974c207409bf404c93009f7f7ba70ad88e99b5962015e3  ./crates/cfmd-protocol/tests/hosted.rs
 bbaa909b172782416c76a67f774c5ebf76c327d3eee52b31439495db2d957bfc  ./crates/cfmd-protocol/tests/wire.rs
 53845e0a84b002e905fe42f0824aaf62b3f37e1bdddd070ee3c017623581b40c  ./crates/cfmd-python-probe/Cargo.toml
 7bce645c81efaf5338e33c13b345b2bceb73e5ce33c4fd49e594d776c89043c5  ./crates/cfmd-python-probe/python/asyncio_probe.py
