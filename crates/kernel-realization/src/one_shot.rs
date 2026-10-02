@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_model::Value;
 use kernel_query::{
     AggregateSpec, CanonicalRowKey, CertifiedCanonicalRowKey, OrderDirection, RelExpr,
-    RelQueryError, RelType,
-    RelationOccurrenceCertificate, RelationRowCanonicalizer, canonical_row_key,
+    RelQueryError, RelType, RelationOccurrenceCertificate, RelationRowCanonicalizer,
+    canonical_row_key,
 };
 use kernel_schema::{RelationSemantics, SemanticContext};
 use kernel_semantics::{CanonicalEqKey, SemanticRegistry};
@@ -192,6 +192,10 @@ pub fn evaluate_relation_expr_factorized(
     Ok(rows)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn execute_expr(
     source: &dyn RelExecutionSource,
     expr: &RelExpr,
@@ -307,9 +311,9 @@ fn execute_expr(
             value,
             equivalence,
         } => execute_expr(source, input, context, registry, &mut |row| {
-            let candidate = row
-                .get(*column)
-                .ok_or(RealizationError::RelationQuery(RelQueryError::ColumnOutOfBounds))?;
+            let candidate = row.get(*column).ok_or(RealizationError::RelationQuery(
+                RelQueryError::ColumnOutOfBounds,
+            ))?;
             if registry
                 .equivalent(context, *equivalence, candidate, value)
                 .map_err(RelQueryError::from)
@@ -335,9 +339,9 @@ fn execute_expr(
                 .map_err(RelQueryError::from)
                 .map_err(RealizationError::RelationQuery)?;
             execute_expr(source, input, context, registry, &mut |row| {
-                let candidate = row
-                    .get(*column)
-                    .ok_or(RealizationError::RelationQuery(RelQueryError::ColumnOutOfBounds))?;
+                let candidate = row.get(*column).ok_or(RealizationError::RelationQuery(
+                    RelQueryError::ColumnOutOfBounds,
+                ))?;
                 let order = compiled
                     .canonical_key(candidate)
                     .map_err(RelQueryError::from)
@@ -363,10 +367,14 @@ fn execute_expr(
         } => execute_expr(source, input, context, registry, &mut |row| {
             let left = row
                 .get(*left_column)
-                .ok_or(RealizationError::RelationQuery(RelQueryError::ColumnOutOfBounds))?;
+                .ok_or(RealizationError::RelationQuery(
+                    RelQueryError::ColumnOutOfBounds,
+                ))?;
             let right = row
                 .get(*right_column)
-                .ok_or(RealizationError::RelationQuery(RelQueryError::ColumnOutOfBounds))?;
+                .ok_or(RealizationError::RelationQuery(
+                    RelQueryError::ColumnOutOfBounds,
+                ))?;
             if registry
                 .equivalent(context, *equivalence, left, right)
                 .map_err(RelQueryError::from)
@@ -381,32 +389,32 @@ fn execute_expr(
                 .typecheck(context, registry)
                 .map_err(RealizationError::RelationQuery)?;
             match result_type.semantics {
-                RelationSemantics::Bag { .. } => execute_expr(
-                    source,
-                    input,
-                    context,
-                    registry,
-                    &mut |row| {
+                RelationSemantics::Bag { .. } => {
+                    execute_expr(source, input, context, registry, &mut |row| {
                         let projected = columns
                             .iter()
                             .map(|ordinal| {
-                                row.get(*ordinal).cloned().ok_or(RealizationError::RelationQuery(
-                                    RelQueryError::ColumnOutOfBounds,
-                                ))
+                                row.get(*ordinal)
+                                    .cloned()
+                                    .ok_or(RealizationError::RelationQuery(
+                                        RelQueryError::ColumnOutOfBounds,
+                                    ))
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         emit(projected)
-                    },
-                ),
+                    })
+                }
                 RelationSemantics::Set { .. } => {
                     let mut seen = BTreeSet::<CanonicalRowKey>::new();
                     execute_expr(source, input, context, registry, &mut |row| {
                         let projected = columns
                             .iter()
                             .map(|ordinal| {
-                                row.get(*ordinal).cloned().ok_or(RealizationError::RelationQuery(
-                                    RelQueryError::ColumnOutOfBounds,
-                                ))
+                                row.get(*ordinal)
+                                    .cloned()
+                                    .ok_or(RealizationError::RelationQuery(
+                                        RelQueryError::ColumnOutOfBounds,
+                                    ))
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         let key = canonical_key(&projected, &result_type, context, registry)?;
@@ -442,7 +450,9 @@ fn execute_expr(
             execute_expr(source, right, context, registry, &mut |row| {
                 let value = row
                     .get(*right_column)
-                    .ok_or(RealizationError::RelationQuery(RelQueryError::ColumnOutOfBounds))?;
+                    .ok_or(RealizationError::RelationQuery(
+                        RelQueryError::ColumnOutOfBounds,
+                    ))?;
                 let key = registry
                     .canonical_equivalence_key(context, *equivalence, value)
                     .map_err(RelQueryError::from)
@@ -453,7 +463,9 @@ fn execute_expr(
             execute_expr(source, left, context, registry, &mut |left_row| {
                 let value = left_row
                     .get(*left_column)
-                    .ok_or(RealizationError::RelationQuery(RelQueryError::ColumnOutOfBounds))?;
+                    .ok_or(RealizationError::RelationQuery(
+                        RelQueryError::ColumnOutOfBounds,
+                    ))?;
                 let key = registry
                     .canonical_equivalence_key(context, *equivalence, value)
                     .map_err(RelQueryError::from)
@@ -486,9 +498,11 @@ fn execute_expr(
                 let key = group_columns
                     .iter()
                     .map(|column| {
-                        row.get(*column).cloned().ok_or(RealizationError::RelationQuery(
-                            RelQueryError::ColumnOutOfBounds,
-                        ))
+                        row.get(*column)
+                            .cloned()
+                            .ok_or(RealizationError::RelationQuery(
+                                RelQueryError::ColumnOutOfBounds,
+                            ))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let canonical = canonical_row_key(&key, group_equivalences, context, registry)
@@ -511,15 +525,16 @@ fn execute_expr(
                 };
                 match (&mut groups[index].1, aggregate) {
                     (State::Count(count), AggregateSpec::Count { .. }) => count.add_one(),
-                    (
-                        State::ExactF64Sum(sum),
-                        AggregateSpec::ExactF64Sum { value_column, .. },
-                    ) => {
-                        let value = row.get(*value_column).ok_or(
-                            RealizationError::RelationQuery(RelQueryError::ColumnOutOfBounds),
-                        )?;
+                    (State::ExactF64Sum(sum), AggregateSpec::ExactF64Sum { value_column, .. }) => {
+                        let value =
+                            row.get(*value_column)
+                                .ok_or(RealizationError::RelationQuery(
+                                    RelQueryError::ColumnOutOfBounds,
+                                ))?;
                         let Value::F64Bits(bits) = value else {
-                            return Err(RealizationError::RelationQuery(RelQueryError::TypeMismatch));
+                            return Err(RealizationError::RelationQuery(
+                                RelQueryError::TypeMismatch,
+                            ));
                         };
                         sum.add(f64::from_bits(*bits))
                             .map_err(RelQueryError::from)
@@ -568,15 +583,16 @@ fn execute_expr(
                 .compile_ordering(context, *ordering)
                 .map_err(RelQueryError::from)
                 .map_err(RealizationError::RelationQuery)?;
-            let mut buckets = BTreeMap::<kernel_semantics::CanonicalOrderKey, Vec<Vec<Value>>>::new();
+            let mut buckets =
+                BTreeMap::<kernel_semantics::CanonicalOrderKey, Vec<Vec<Value>>>::new();
             let mut retained = 0usize;
             execute_expr(source, input, context, registry, &mut |row| {
                 if *k == 0 {
                     return Ok(());
                 }
-                let value = row
-                    .get(*column)
-                    .ok_or(RealizationError::RelationQuery(RelQueryError::ColumnOutOfBounds))?;
+                let value = row.get(*column).ok_or(RealizationError::RelationQuery(
+                    RelQueryError::ColumnOutOfBounds,
+                ))?;
                 let key = compiled
                     .canonical_key(value)
                     .map_err(RelQueryError::from)
@@ -627,6 +643,10 @@ fn execute_expr(
 /// row so the physical witness can adopt it instead of canonicalizing output a
 /// second time. `Ok(false)` means this expression has no such lowering; the
 /// caller may use the ordinary one-shot executor, never the legacy evaluator.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn execute_certified_output(
     source: &dyn RelExecutionSource,
     expr: &RelExpr,
@@ -640,25 +660,19 @@ fn execute_certified_output(
             column,
             value,
             equivalence,
-        } => execute_certified_output(
-            source,
-            input,
-            context,
-            registry,
-            &mut |row, evidence| {
-                let candidate = row.get(*column).ok_or(RealizationError::RelationQuery(
-                    RelQueryError::ColumnOutOfBounds,
-                ))?;
-                if registry
-                    .equivalent(context, *equivalence, candidate, value)
-                    .map_err(RelQueryError::from)
-                    .map_err(RealizationError::RelationQuery)?
-                {
-                    emit(row, evidence)?;
-                }
-                Ok(())
-            },
-        ),
+        } => execute_certified_output(source, input, context, registry, &mut |row, evidence| {
+            let candidate = row.get(*column).ok_or(RealizationError::RelationQuery(
+                RelQueryError::ColumnOutOfBounds,
+            ))?;
+            if registry
+                .equivalent(context, *equivalence, candidate, value)
+                .map_err(RelQueryError::from)
+                .map_err(RealizationError::RelationQuery)?
+            {
+                emit(row, evidence)?;
+            }
+            Ok(())
+        }),
         RelExpr::FilterOrderConst {
             input,
             column,
@@ -674,60 +688,52 @@ fn execute_certified_output(
                 .canonical_key(value)
                 .map_err(RelQueryError::from)
                 .map_err(RealizationError::RelationQuery)?;
-            execute_certified_output(
-                source,
-                input,
-                context,
-                registry,
-                &mut |row, evidence| {
-                    let candidate = row.get(*column).ok_or(RealizationError::RelationQuery(
-                        RelQueryError::ColumnOutOfBounds,
-                    ))?;
-                    let order = compiled
-                        .canonical_key(candidate)
-                        .map_err(RelQueryError::from)
-                        .map_err(RealizationError::RelationQuery)?
-                        .cmp(&threshold);
-                    let passes = match comparison {
-                        kernel_query::OrderComparison::Less => order.is_lt(),
-                        kernel_query::OrderComparison::LessOrEqual => order.is_le(),
-                        kernel_query::OrderComparison::Greater => order.is_gt(),
-                        kernel_query::OrderComparison::GreaterOrEqual => order.is_ge(),
-                    };
-                    if passes {
-                        emit(row, evidence)?;
-                    }
-                    Ok(())
-                },
-            )
+            execute_certified_output(source, input, context, registry, &mut |row, evidence| {
+                let candidate = row.get(*column).ok_or(RealizationError::RelationQuery(
+                    RelQueryError::ColumnOutOfBounds,
+                ))?;
+                let order = compiled
+                    .canonical_key(candidate)
+                    .map_err(RelQueryError::from)
+                    .map_err(RealizationError::RelationQuery)?
+                    .cmp(&threshold);
+                let passes = match comparison {
+                    kernel_query::OrderComparison::Less => order.is_lt(),
+                    kernel_query::OrderComparison::LessOrEqual => order.is_le(),
+                    kernel_query::OrderComparison::Greater => order.is_gt(),
+                    kernel_query::OrderComparison::GreaterOrEqual => order.is_ge(),
+                };
+                if passes {
+                    emit(row, evidence)?;
+                }
+                Ok(())
+            })
         }
         RelExpr::FilterEqColumns {
             input,
             left_column,
             right_column,
             equivalence,
-        } => execute_certified_output(
-            source,
-            input,
-            context,
-            registry,
-            &mut |row, evidence| {
-                let left = row.get(*left_column).ok_or(RealizationError::RelationQuery(
+        } => execute_certified_output(source, input, context, registry, &mut |row, evidence| {
+            let left = row
+                .get(*left_column)
+                .ok_or(RealizationError::RelationQuery(
                     RelQueryError::ColumnOutOfBounds,
                 ))?;
-                let right = row.get(*right_column).ok_or(RealizationError::RelationQuery(
+            let right = row
+                .get(*right_column)
+                .ok_or(RealizationError::RelationQuery(
                     RelQueryError::ColumnOutOfBounds,
                 ))?;
-                if registry
-                    .equivalent(context, *equivalence, left, right)
-                    .map_err(RelQueryError::from)
-                    .map_err(RealizationError::RelationQuery)?
-                {
-                    emit(row, evidence)?;
-                }
-                Ok(())
-            },
-        ),
+            if registry
+                .equivalent(context, *equivalence, left, right)
+                .map_err(RelQueryError::from)
+                .map_err(RealizationError::RelationQuery)?
+            {
+                emit(row, evidence)?;
+            }
+            Ok(())
+        }),
         RelExpr::AntiJoin {
             left,
             right,
@@ -740,9 +746,11 @@ fn execute_certified_output(
             }
             let mut blocked = BTreeSet::<CanonicalEqKey>::new();
             execute_expr(source, right, context, registry, &mut |row| {
-                let value = row.get(*right_column).ok_or(RealizationError::RelationQuery(
-                    RelQueryError::ColumnOutOfBounds,
-                ))?;
+                let value = row
+                    .get(*right_column)
+                    .ok_or(RealizationError::RelationQuery(
+                        RelQueryError::ColumnOutOfBounds,
+                    ))?;
                 blocked.insert(
                     registry
                         .canonical_equivalence_key(context, *equivalence, value)
@@ -751,25 +759,21 @@ fn execute_certified_output(
                 );
                 Ok(())
             })?;
-            execute_certified_output(
-                source,
-                left,
-                context,
-                registry,
-                &mut |row, evidence| {
-                    let value = row.get(*left_column).ok_or(RealizationError::RelationQuery(
+            execute_certified_output(source, left, context, registry, &mut |row, evidence| {
+                let value = row
+                    .get(*left_column)
+                    .ok_or(RealizationError::RelationQuery(
                         RelQueryError::ColumnOutOfBounds,
                     ))?;
-                    let key = registry
-                        .canonical_equivalence_key(context, *equivalence, value)
-                        .map_err(RelQueryError::from)
-                        .map_err(RealizationError::RelationQuery)?;
-                    if !blocked.contains(&key) {
-                        emit(row, evidence)?;
-                    }
-                    Ok(())
-                },
-            )
+                let key = registry
+                    .canonical_equivalence_key(context, *equivalence, value)
+                    .map_err(RelQueryError::from)
+                    .map_err(RealizationError::RelationQuery)?;
+                if !blocked.contains(&key) {
+                    emit(row, evidence)?;
+                }
+                Ok(())
+            })
         }
         RelExpr::Union { left, right } => {
             let result_type = expr
@@ -778,12 +782,8 @@ fn execute_certified_output(
             if !matches!(result_type.semantics, RelationSemantics::Set { .. }) {
                 return Ok(false);
             }
-            let canonicalizer = RelationRowCanonicalizer::compile(
-                result_type,
-                context,
-                registry,
-            )
-            .map_err(RealizationError::RelationQuery)?;
+            let canonicalizer = RelationRowCanonicalizer::compile(result_type, context, registry)
+                .map_err(RealizationError::RelationQuery)?;
             let mut seen = BTreeSet::<CanonicalRowKey>::new();
             let mut accept = |row: Vec<Value>| {
                 let evidence = canonicalizer
@@ -802,12 +802,9 @@ fn execute_certified_output(
             let result_type = expr
                 .typecheck(context, registry)
                 .map_err(RealizationError::RelationQuery)?;
-            let canonicalizer = RelationRowCanonicalizer::compile(
-                result_type.clone(),
-                context,
-                registry,
-            )
-            .map_err(RealizationError::RelationQuery)?;
+            let canonicalizer =
+                RelationRowCanonicalizer::compile(result_type.clone(), context, registry)
+                    .map_err(RealizationError::RelationQuery)?;
             match result_type.semantics {
                 RelationSemantics::Bag { .. } => {
                     let mut blocked = BTreeMap::<CanonicalRowKey, usize>::new();
@@ -860,20 +857,18 @@ fn execute_certified_output(
             if !matches!(result_type.semantics, RelationSemantics::Set { .. }) {
                 return Ok(false);
             }
-            let canonicalizer = RelationRowCanonicalizer::compile(
-                result_type,
-                context,
-                registry,
-            )
-            .map_err(RealizationError::RelationQuery)?;
+            let canonicalizer = RelationRowCanonicalizer::compile(result_type, context, registry)
+                .map_err(RealizationError::RelationQuery)?;
             let mut seen = BTreeSet::<CanonicalRowKey>::new();
             execute_expr(source, input, context, registry, &mut |row| {
                 let projected = columns
                     .iter()
                     .map(|ordinal| {
-                        row.get(*ordinal).cloned().ok_or(RealizationError::RelationQuery(
-                            RelQueryError::ColumnOutOfBounds,
-                        ))
+                        row.get(*ordinal)
+                            .cloned()
+                            .ok_or(RealizationError::RelationQuery(
+                                RelQueryError::ColumnOutOfBounds,
+                            ))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let evidence = canonicalizer
@@ -890,12 +885,8 @@ fn execute_certified_output(
             let result_type = expr
                 .typecheck(context, registry)
                 .map_err(RealizationError::RelationQuery)?;
-            let canonicalizer = RelationRowCanonicalizer::compile(
-                result_type,
-                context,
-                registry,
-            )
-            .map_err(RealizationError::RelationQuery)?;
+            let canonicalizer = RelationRowCanonicalizer::compile(result_type, context, registry)
+                .map_err(RealizationError::RelationQuery)?;
             let mut seen = BTreeSet::<CanonicalRowKey>::new();
             execute_expr(source, input, context, registry, &mut |row| {
                 let evidence = canonicalizer
@@ -943,7 +934,7 @@ fn execute_direct_bag_union_columnar(
         for relation in [*left_relation, *right_relation] {
             let mut push = |value| {
                 sink.push_column_value(ordinal, value)
-                    .expect("validated one-shot sink arity")
+                    .expect("validated one-shot sink arity");
             };
             source.visit_relation_column(relation, ordinal, &mut push)?;
         }
@@ -1022,9 +1013,11 @@ pub(crate) fn prepare_one_shot_relation(
 #[cfg(test)]
 mod executor_tests {
     use super::*;
-    use kernel_schema::{RelationDef, RelationSemantics, ScalarType, Schema, SemanticEnvironment, TypeExpr};
-    use kernel_semantics::{EquivalenceModule, OrderingModule};
     use kernel_query::RelationBaseWitness;
+    use kernel_schema::{
+        RelationDef, RelationSemantics, ScalarType, Schema, SemanticEnvironment, TypeExpr,
+    };
+    use kernel_semantics::{EquivalenceModule, OrderingModule};
     use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId};
 
     struct MockSource {
@@ -1050,45 +1043,82 @@ mod executor_tests {
             visit: &mut dyn FnMut(Value),
         ) -> Result<(), RealizationError> {
             for row in self.rows.get(&relation).into_iter().flatten() {
-                visit(row.get(ordinal).cloned().ok_or(RealizationError::OneShotRelationArityMismatch)?);
+                visit(
+                    row.get(ordinal)
+                        .cloned()
+                        .ok_or(RealizationError::OneShotRelationArityMismatch)?,
+                );
             }
             Ok(())
         }
 
         fn relation_arity(&self, relation: SemanticId) -> Result<usize, RealizationError> {
-            Ok(self.rows.get(&relation).and_then(|rows| rows.first()).map_or(1, Vec::len))
+            Ok(self
+                .rows
+                .get(&relation)
+                .and_then(|rows| rows.first())
+                .map_or(1, Vec::len))
         }
 
-        fn relation_dependencies(&self, _relation: SemanticId) -> Result<BTreeSet<PhysicalAtomId>, RealizationError> {
+        fn relation_dependencies(
+            &self,
+            _relation: SemanticId,
+        ) -> Result<BTreeSet<PhysicalAtomId>, RealizationError> {
             Ok(BTreeSet::new())
         }
     }
 
-    fn context(set: bool, arity: usize) -> (SemanticContext, SemanticRegistry, SemanticId, SemanticId, SemanticId) {
+    fn context(
+        set: bool,
+        arity: usize,
+    ) -> (
+        SemanticContext,
+        SemanticRegistry,
+        SemanticId,
+        SemanticId,
+        SemanticId,
+    ) {
         let left = SemanticId::new(91_000);
         let right = SemanticId::new(91_001);
         let eq = SemanticId::new(91_002);
         let mut registry = SemanticRegistry::default();
         let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
         let semantics = if set {
-            RelationSemantics::Set { column_equivalences: vec![eq; arity] }
+            RelationSemantics::Set {
+                column_equivalences: vec![eq; arity],
+            }
         } else {
-            RelationSemantics::Bag { column_equivalences: vec![eq; arity] }
+            RelationSemantics::Bag {
+                column_equivalences: vec![eq; arity],
+            }
         };
         let mut schema = Schema::new(SchemaRevisionId::new(910));
         for relation in [left, right] {
-            schema.define_relation_with_column_ids(
-                RelationDef {
-                    id: relation,
-                    columns: vec![TypeExpr::Scalar(ScalarType::I64); arity],
-                    semantics: semantics.clone(),
-                },
-                (0..arity).map(|i| SemanticId::new(91_100_u128 + i as u128)).collect(),
-            ).unwrap();
+            schema
+                .define_relation_with_column_ids(
+                    RelationDef {
+                        id: relation,
+                        columns: vec![TypeExpr::Scalar(ScalarType::I64); arity],
+                        semantics: semantics.clone(),
+                    },
+                    (0..arity)
+                        .map(|i| SemanticId::new(91_100_u128 + i as u128))
+                        .collect(),
+                )
+                .unwrap();
         }
         let mut environment = SemanticEnvironment::new(SemanticEnvId::new(910));
         environment.pin_module(eq, digest);
-        (SemanticContext { schema, environment }, registry, left, right, eq)
+        (
+            SemanticContext {
+                schema,
+                environment,
+            },
+            registry,
+            left,
+            right,
+            eq,
+        )
     }
 
     fn run(
@@ -1111,30 +1141,36 @@ mod executor_tests {
         let mut state = kernel_model::DatabaseState::default();
         state.model.relations.insert(
             left,
-            vec![vec![Value::I64(1)], vec![Value::I64(2)], vec![Value::I64(3)]],
+            vec![
+                vec![Value::I64(1)],
+                vec![Value::I64(2)],
+                vec![Value::I64(3)],
+            ],
         );
-        state.model.relations.insert(
-            right,
-            vec![vec![Value::I64(2)]],
-        );
+        state
+            .model
+            .relations
+            .insert(right, vec![vec![Value::I64(2)]]);
         let (atoms, root) = crate::realize_database_state_factorized(&state, &context).unwrap();
         let expr = RelExpr::Difference {
             left: Box::new(RelExpr::Scan(left)),
             right: Box::new(RelExpr::Scan(right)),
         };
 
-        let rows = evaluate_relation_expr_factorized(&root, &atoms, &context, &registry, &expr)
-            .unwrap();
+        let rows =
+            evaluate_relation_expr_factorized(&root, &atoms, &context, &registry, &expr).unwrap();
         assert_eq!(rows, vec![vec![Value::I64(1)], vec![Value::I64(3)]]);
     }
 
     #[test]
     fn set_union_project_and_distinct_quotient_in_gamma_space() {
         let (context, registry, left, right, eq) = context(true, 1);
-        let source = MockSource { rows: BTreeMap::from([
-            (left, vec![vec![Value::I64(1)], vec![Value::I64(2)]]),
-            (right, vec![vec![Value::I64(2)], vec![Value::I64(3)]]),
-        ])};
+        let source = MockSource {
+            rows: BTreeMap::from([
+                (left, vec![vec![Value::I64(1)], vec![Value::I64(2)]]),
+                (right, vec![vec![Value::I64(2)], vec![Value::I64(3)]]),
+            ]),
+        };
         let expr = RelExpr::Distinct {
             input: Box::new(RelExpr::Project {
                 input: Box::new(RelExpr::Union {
@@ -1145,18 +1181,39 @@ mod executor_tests {
             }),
             column_equivalences: vec![eq],
         };
-        assert_eq!(run(&source, &expr, &context, &registry).unwrap(), vec![
-            vec![Value::I64(1)], vec![Value::I64(2)], vec![Value::I64(3)]
-        ]);
+        assert_eq!(
+            run(&source, &expr, &context, &registry).unwrap(),
+            vec![
+                vec![Value::I64(1)],
+                vec![Value::I64(2)],
+                vec![Value::I64(3)]
+            ]
+        );
     }
 
     #[test]
     fn nested_set_filter_union_project_distinct_join_composes_without_fallback() {
         let (context, registry, left, right, eq) = context(true, 1);
-        let source = MockSource { rows: BTreeMap::from([
-            (left, vec![vec![Value::I64(1)], vec![Value::I64(2)], vec![Value::I64(4)]]),
-            (right, vec![vec![Value::I64(2)], vec![Value::I64(3)], vec![Value::I64(4)]]),
-        ])};
+        let source = MockSource {
+            rows: BTreeMap::from([
+                (
+                    left,
+                    vec![
+                        vec![Value::I64(1)],
+                        vec![Value::I64(2)],
+                        vec![Value::I64(4)],
+                    ],
+                ),
+                (
+                    right,
+                    vec![
+                        vec![Value::I64(2)],
+                        vec![Value::I64(3)],
+                        vec![Value::I64(4)],
+                    ],
+                ),
+            ]),
+        };
         let left_set = RelExpr::Distinct {
             input: Box::new(RelExpr::Project {
                 input: Box::new(RelExpr::Union {
@@ -1179,43 +1236,62 @@ mod executor_tests {
             right_column: 0,
             equivalence: eq,
         };
-        assert_eq!(run(&source, &expr, &context, &registry).unwrap(), vec![
-            vec![Value::I64(2), Value::I64(2)],
-            vec![Value::I64(3), Value::I64(3)],
-            vec![Value::I64(4), Value::I64(4)],
-        ]);
+        assert_eq!(
+            run(&source, &expr, &context, &registry).unwrap(),
+            vec![
+                vec![Value::I64(2), Value::I64(2)],
+                vec![Value::I64(3), Value::I64(3)],
+                vec![Value::I64(4), Value::I64(4)],
+            ]
+        );
     }
 
     #[test]
     fn group_count_owns_only_group_and_exact_aggregate_state() {
         let (context, registry, left, _right, eq) = context(false, 1);
-        let source = MockSource { rows: BTreeMap::from([(
-            left,
-            vec![
-                vec![Value::I64(2)],
-                vec![Value::I64(1)],
-                vec![Value::I64(2)],
-            ],
-        )]) };
+        let source = MockSource {
+            rows: BTreeMap::from([(
+                left,
+                vec![
+                    vec![Value::I64(2)],
+                    vec![Value::I64(1)],
+                    vec![Value::I64(2)],
+                ],
+            )]),
+        };
         let expr = RelExpr::Group {
             input: Box::new(RelExpr::Scan(left)),
             group_columns: vec![0],
             group_equivalences: vec![eq],
-            aggregate: AggregateSpec::Count { result_equivalence: eq },
+            aggregate: AggregateSpec::Count {
+                result_equivalence: eq,
+            },
         };
-        assert_eq!(run(&source, &expr, &context, &registry).unwrap(), vec![
-            vec![Value::I64(2), Value::I64(2)],
-            vec![Value::I64(1), Value::I64(1)],
-        ]);
+        assert_eq!(
+            run(&source, &expr, &context, &registry).unwrap(),
+            vec![
+                vec![Value::I64(2), Value::I64(2)],
+                vec![Value::I64(1), Value::I64(1)],
+            ]
+        );
     }
 
     #[test]
     fn certified_gamma_survives_filter_and_antijoin_without_recanonicalization() {
         let (context, registry, left, right, eq) = context(true, 1);
-        let source = MockSource { rows: BTreeMap::from([
-            (left, vec![vec![Value::I64(1)], vec![Value::I64(2)], vec![Value::I64(3)]]),
-            (right, vec![vec![Value::I64(3)]]),
-        ]) };
+        let source = MockSource {
+            rows: BTreeMap::from([
+                (
+                    left,
+                    vec![
+                        vec![Value::I64(1)],
+                        vec![Value::I64(2)],
+                        vec![Value::I64(3)],
+                    ],
+                ),
+                (right, vec![vec![Value::I64(3)]]),
+            ]),
+        };
         let expr = RelExpr::AntiJoin {
             left: Box::new(RelExpr::FilterOrderConst {
                 input: Box::new(RelExpr::Distinct {
@@ -1243,18 +1319,20 @@ mod executor_tests {
         context.environment.pin_module(ordering, digest);
         let mut rows = Vec::new();
         let mut evidence = Vec::new();
-        assert!(execute_certified_output(
-            &source,
-            &expr,
-            &context,
-            &registry,
-            &mut |row, certified| {
-                rows.push(row);
-                evidence.push(certified);
-                Ok(())
-            },
-        )
-        .unwrap());
+        assert!(
+            execute_certified_output(
+                &source,
+                &expr,
+                &context,
+                &registry,
+                &mut |row, certified| {
+                    rows.push(row);
+                    evidence.push(certified);
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
         assert_eq!(rows, vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
         assert_eq!(evidence.len(), 2);
         RelationOccurrenceCertificate::from_dense_certified_keys(evidence).unwrap();
@@ -1266,16 +1344,18 @@ mod executor_tests {
         let ordering = SemanticId::new(91_003);
         let ordering_digest = registry.install_ordering(OrderingModule::I64Ascending);
         context.environment.pin_module(ordering, ordering_digest);
-        let source = MockSource { rows: BTreeMap::from([(
-            left,
-            vec![
-                vec![Value::I64(4)],
-                vec![Value::I64(2)],
-                vec![Value::I64(1)],
-                vec![Value::I64(2)],
-                vec![Value::I64(9)],
-            ],
-        )]) };
+        let source = MockSource {
+            rows: BTreeMap::from([(
+                left,
+                vec![
+                    vec![Value::I64(4)],
+                    vec![Value::I64(2)],
+                    vec![Value::I64(1)],
+                    vec![Value::I64(2)],
+                    vec![Value::I64(9)],
+                ],
+            )]),
+        };
         let expr = RelExpr::TopKWithTies {
             input: Box::new(RelExpr::Scan(left)),
             column: 0,
@@ -1283,11 +1363,14 @@ mod executor_tests {
             direction: kernel_query::OrderDirection::Ascending,
             k: 2,
         };
-        assert_eq!(run(&source, &expr, &context, &registry).unwrap(), vec![
-            vec![Value::I64(1)],
-            vec![Value::I64(2)],
-            vec![Value::I64(2)],
-        ]);
+        assert_eq!(
+            run(&source, &expr, &context, &registry).unwrap(),
+            vec![
+                vec![Value::I64(1)],
+                vec![Value::I64(2)],
+                vec![Value::I64(2)],
+            ]
+        );
     }
 
     #[test]
@@ -1296,9 +1379,23 @@ mod executor_tests {
         use std::time::Instant;
         let (context, registry, left, right, eq) = context(false, 1);
         let rows = 100_000usize;
-        let left_rows = (0..rows).map(|i| vec![Value::I64(i as i64)]).collect::<Vec<_>>();
-        let right_rows = (0..rows).map(|i| vec![Value::I64(i as i64)]).collect::<Vec<_>>();
-        let source = MockSource { rows: BTreeMap::from([(left, left_rows.clone()), (right, right_rows.clone())]) };
+        let left_rows = (0..rows)
+            .map(|i| {
+                vec![Value::I64(
+                    i64::try_from(i).expect("fixture value fits i64"),
+                )]
+            })
+            .collect::<Vec<_>>();
+        let right_rows = (0..rows)
+            .map(|i| {
+                vec![Value::I64(
+                    i64::try_from(i).expect("fixture value fits i64"),
+                )]
+            })
+            .collect::<Vec<_>>();
+        let source = MockSource {
+            rows: BTreeMap::from([(left, left_rows.clone()), (right, right_rows.clone())]),
+        };
         let mut model = kernel_model::FiniteModel::default();
         model.relations.insert(left, left_rows);
         model.relations.insert(right, right_rows);
@@ -1309,12 +1406,18 @@ mod executor_tests {
             right_column: 0,
             equivalence: eq,
         };
-        let expected = expr.evaluate(&model, &context, &registry).unwrap().into_rows();
+        let expected = expr
+            .evaluate(&model, &context, &registry)
+            .unwrap()
+            .into_rows();
         let mut generic_ms = Vec::new();
         let mut one_shot_ms = Vec::new();
         for _ in 0..3 {
             let started = Instant::now();
-            let generic = expr.evaluate(&model, &context, &registry).unwrap().into_rows();
+            let generic = expr
+                .evaluate(&model, &context, &registry)
+                .unwrap()
+                .into_rows();
             generic_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
             assert_eq!(generic, expected);
             let started = Instant::now();
@@ -1328,10 +1431,19 @@ mod executor_tests {
     #[test]
     fn join_owns_only_one_side_fiber_index_and_streams_left() {
         let (context, registry, left, right, eq) = context(false, 1);
-        let source = MockSource { rows: BTreeMap::from([
-            (left, vec![vec![Value::I64(1)], vec![Value::I64(2)], vec![Value::I64(1)]]),
-            (right, vec![vec![Value::I64(1)], vec![Value::I64(3)]]),
-        ])};
+        let source = MockSource {
+            rows: BTreeMap::from([
+                (
+                    left,
+                    vec![
+                        vec![Value::I64(1)],
+                        vec![Value::I64(2)],
+                        vec![Value::I64(1)],
+                    ],
+                ),
+                (right, vec![vec![Value::I64(1)], vec![Value::I64(3)]]),
+            ]),
+        };
         let expr = RelExpr::JoinEq {
             left: Box::new(RelExpr::Scan(left)),
             right: Box::new(RelExpr::Scan(right)),
@@ -1339,27 +1451,27 @@ mod executor_tests {
             right_column: 0,
             equivalence: eq,
         };
-        assert_eq!(run(&source, &expr, &context, &registry).unwrap(), vec![
-            vec![Value::I64(1), Value::I64(1)],
-            vec![Value::I64(1), Value::I64(1)],
-        ]);
+        assert_eq!(
+            run(&source, &expr, &context, &registry).unwrap(),
+            vec![
+                vec![Value::I64(1), Value::I64(1)],
+                vec![Value::I64(1), Value::I64(1)],
+            ]
+        );
     }
 
     #[test]
     fn certified_gamma_rows_adopt_occurrence_root_without_recanonicalization() {
         let (context, registry, left, _right, _eq) = context(true, 1);
         let result_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
-        let canonicalizer = RelationRowCanonicalizer::compile(
-            result_type.clone(),
-            &context,
-            &registry,
-        )
-        .unwrap();
+        let canonicalizer =
+            RelationRowCanonicalizer::compile(result_type.clone(), &context, &registry).unwrap();
         let certified = [1_i64, 2, 3]
             .into_iter()
             .map(|value| canonicalizer.certify_row(&vec![Value::I64(value)]).unwrap())
             .collect::<Vec<_>>();
-        let certificate = RelationOccurrenceCertificate::from_dense_certified_keys(certified).unwrap();
+        let certificate =
+            RelationOccurrenceCertificate::from_dense_certified_keys(certified).unwrap();
         let probe = certificate.clone();
         let witness = RelationBaseWitness::from_occurrence_certificate(
             RevisionId::new(0),
@@ -1372,12 +1484,9 @@ mod executor_tests {
         .unwrap();
         assert!(probe.shares_occurrence_root_with(&witness));
 
-        let other = RelationRowCanonicalizer::compile(
-            witness.result_type().clone(),
-            &context,
-            &registry,
-        )
-        .unwrap();
+        let other =
+            RelationRowCanonicalizer::compile(witness.result_type().clone(), &context, &registry)
+                .unwrap();
         let mixed = vec![
             canonicalizer.certify_row(&vec![Value::I64(4)]).unwrap(),
             other.certify_row(&vec![Value::I64(5)]).unwrap(),

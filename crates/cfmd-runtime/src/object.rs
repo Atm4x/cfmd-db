@@ -1426,6 +1426,10 @@ pub trait Object: RowCodec + Sized + 'static {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBuilder {
     let fields = E::fields();
     let (registered, types, equivalences) = register_object_field_semantics::<E>(builder, &fields);
@@ -1461,18 +1465,18 @@ pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBu
             field.role(),
             ObjectFieldRole::Reference { .. } | ObjectFieldRole::OptionalReference { .. }
         ) {
-            let (target_relation, target_type) = match field.role() {
-                ObjectFieldRole::Reference {
-                    target_relation,
-                    target_type,
-                    ..
-                }
-                | ObjectFieldRole::OptionalReference {
-                    target_relation,
-                    target_type,
-                    ..
-                } => (target_relation, target_type),
-                _ => unreachable!("reference-role guard keeps only reference fields"),
+            let (ObjectFieldRole::Reference {
+                target_relation,
+                target_type,
+                ..
+            }
+            | ObjectFieldRole::OptionalReference {
+                target_relation,
+                target_type,
+                ..
+            }) = field.role()
+            else {
+                unreachable!("reference-role guard keeps only reference fields")
             };
             builder = builder.__require_relation(
                 target_relation,
@@ -1909,11 +1913,7 @@ impl<T: Object> Many<T> {
             }),
             source.source_equivalence,
         );
-        let rows = source
-            .context
-            .execute_for_mutation(&query)?
-            .rows()
-            .to_vec();
+        let rows = source.context.execute_for_mutation(&query)?.rows().to_vec();
         let mut plan = source.context.plan()?;
         for row in rows {
             let target_id = match row.get(1) {
@@ -2350,7 +2350,7 @@ impl<E: Object> ObjectSet<E> {
         })
     }
 
-    pub(crate) fn new_projected(context: ReadContext, persisted: Relation<E>) -> Result<Self> {
+    pub(crate) fn new_projected(context: ReadContext, persisted: &Relation<E>) -> Result<Self> {
         let fields = E::fields();
         let mut projection = Vec::with_capacity(fields.len());
         let mut columns = Vec::with_capacity(fields.len());
@@ -2532,6 +2532,10 @@ impl<E: Object> ObjectSet<E> {
     /// Patches one persisted scalar/reference field while preserving every persisted field omitted
     /// by this local entity contract. Reference patches also update the exact mirrored live-field
     /// authority; identity remains immutable.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn set<V, F, P>(
         &self,
         transaction: &mut crate::Transaction,

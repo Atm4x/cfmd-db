@@ -1,14 +1,14 @@
 mod error;
 mod extents;
+mod rules;
 mod state;
 mod violation;
-mod rules;
 
 pub use error::*;
 pub use extents::*;
+pub use rules::*;
 pub use state::*;
 pub use violation::*;
-pub use rules::*;
 
 #[cfg(test)]
 mod tests {
@@ -269,7 +269,8 @@ mod tests {
 
         let rows = state.model.relations.get(&relation).unwrap();
         let measure =
-            relation_uniqueness_violation_measure(&rows.to_vec(), &[text_eq], &context, &registry).unwrap();
+            relation_uniqueness_violation_measure(&rows.to_vec(), &[text_eq], &context, &registry)
+                .unwrap();
         assert_eq!(measure.witness_count(), 1);
         assert_eq!(measure.iter().next().map(|(_, mass)| mass), Some(1));
     }

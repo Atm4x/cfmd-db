@@ -158,7 +158,9 @@ fn relation_len(
     relations: &kernel_model::RelationStore,
     relation: kernel_types::SemanticId,
 ) -> usize {
-    relations.get(&relation).map_or(0, kernel_model::SharedRelationRows::len)
+    relations
+        .get(&relation)
+        .map_or(0, kernel_model::SharedRelationRows::len)
 }
 
 fn expected_relation_len(plan: &Plan, relation: RelationId) -> usize {

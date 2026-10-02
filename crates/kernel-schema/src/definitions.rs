@@ -12,14 +12,8 @@ pub struct CapabilityDef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldRule {
-    I64Range {
-        min: Option<i64>,
-        max: Option<i64>,
-    },
-    TextLength {
-        min: usize,
-        max: Option<usize>,
-    },
+    I64Range { min: Option<i64>, max: Option<i64> },
+    TextLength { min: usize, max: Option<usize> },
     TextOneOf(BTreeSet<String>),
     TextMatches(crate::TextPattern),
     Expr(crate::SemanticRuleExpr),

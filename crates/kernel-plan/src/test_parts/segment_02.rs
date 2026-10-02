@@ -435,7 +435,7 @@ fn runtime_relation_transition_updates_only_dependency_consumers() {
         relation: left,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target = target_revision_for(&runtime, 8_972_020, &mutations, &registry);
     let prepared = runtime
@@ -490,7 +490,7 @@ fn dependency_frontier_revision_anchor_skips_unrelated_revisions_without_rebindi
         relation: left,
         delta: &left_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let left_target = target_revision_for(&runtime, 8_972_020, &left_mutations, &registry);
     let left_prepared = runtime
@@ -518,7 +518,7 @@ fn dependency_frontier_revision_anchor_skips_unrelated_revisions_without_rebindi
         relation: right,
         delta: &right_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let right_target = target_revision_for(&after_left, 8_972_030, &right_mutations, &registry);
     let right_prepared = after_left
@@ -559,7 +559,7 @@ fn runtime_relation_transition_reuses_unchanged_bundle_directories() {
             relation,
             delta: &delta,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         }],
         &registry,
     );
@@ -570,7 +570,7 @@ fn runtime_relation_transition_reuses_unchanged_bundle_directories() {
                 relation,
                 delta: &delta,
             object_field_writes: &[],
-            authorization: Default::default(),
+            authorization: kernel_durability::DurableRelationAuthorization::default(),
             }],
             registry: &registry,
         })
@@ -919,7 +919,7 @@ fn revision_prepare_is_invisible_until_sealed_publish() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let before = runtime.clone_for_test();
     let prepared = prepare_runtime_revision(&runtime, 41, &mutations, &registry).unwrap();
@@ -998,7 +998,7 @@ fn relation_rewrite_prepare_preserves_intent_and_uses_existing_vmf_dtc_boundary(
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     };
     let target = target_revision_for(&runtime, 441, &[mutation], &registry);
     let rewrites = [RevisionRelationRewrite {
@@ -1051,7 +1051,7 @@ fn runtime_relation_base_witness_binds_rewrite_without_recanonicalizing_source_r
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     };
     let target = target_revision_for(&runtime, 443, &[mutation], &registry);
     let rewrites = [RevisionRelationRewrite {
@@ -1105,7 +1105,7 @@ fn derived_rewrite_endpoint_certificate_is_bound_to_exact_delta_payload() {
         relation,
         delta: &certified_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     };
     let target = target_revision_for(&runtime, 453, &[certified_mutation], &registry);
 
@@ -1145,7 +1145,7 @@ fn derived_rewrite_effect_is_bound_to_its_prepared_gamma_base() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     };
     let target = target_revision_for(&runtime, 455, &[mutation], &registry);
 
@@ -1193,7 +1193,7 @@ fn seal_rejects_nonzero_candidate_violation_state_before_publication() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let mut prepared = prepare_runtime_revision(&runtime, 43, &mutations, &registry).unwrap();
     prepared.inject_candidate_violation_for_test(
@@ -1228,7 +1228,7 @@ fn vmf_invariant_closure_certificate_is_zero_and_revision_bound() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let mut prepared = prepare_runtime_revision(&runtime, 44, &mutations, &registry).unwrap();
     let candidate_certificate = prepared.candidate_invariant_closure_certificate_for_test().unwrap();
@@ -1270,7 +1270,7 @@ fn coherent_resolution_binding_requires_cube_endpoint_and_candidate_vmf_closure(
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     };
     let target = target_revision_for(&runtime, 46, &[mutation], &registry);
     let rewrites = [RevisionRelationRewrite {
@@ -1325,7 +1325,7 @@ fn runtime_observation_guard_classifies_prepared_transition_via_dtc() {
         relation,
         delta: &unaffected_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let unaffected =
         prepare_runtime_revision(&runtime, 45, &unaffected_mutations, &registry).unwrap();
@@ -1347,7 +1347,7 @@ fn runtime_observation_guard_classifies_prepared_transition_via_dtc() {
         relation,
         delta: &changed_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let changed = prepare_runtime_revision(&runtime, 46, &changed_mutations, &registry).unwrap();
     assert_eq!(
@@ -1379,7 +1379,7 @@ fn bounded_repair_accepts_one_observation_preserving_candidate() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target = target_revision_for(&runtime, 65, &borrowed, &registry);
     let provider = vec![RuntimeRepairCandidate::RelationData {
@@ -1581,7 +1581,7 @@ fn bounded_repair_rejects_observation_change_and_reports_no_repair() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target = target_revision_for(&runtime, 67, &borrowed, &registry);
     let provider = vec![RuntimeRepairCandidate::RelationData {
@@ -1617,7 +1617,7 @@ fn bounded_repair_reports_ambiguity_for_two_valid_candidates() {
         relation,
         delta: &delta_a,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target_a = target_revision_for(&runtime, 69, &borrowed_a, &registry);
     let delta_b = scan_delta(relation, &[5], &[2], &context, &registry);
@@ -1625,7 +1625,7 @@ fn bounded_repair_reports_ambiguity_for_two_valid_candidates() {
         relation,
         delta: &delta_b,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target_b = target_revision_for(&runtime, 70, &borrowed_b, &registry);
     let provider = vec![
@@ -1672,7 +1672,7 @@ fn bounded_repair_enforces_candidate_budget_before_evaluation() {
         relation,
         delta: &delta_a,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target_a = target_revision_for(&runtime, 72, &borrowed_a, &registry);
     let delta_b = scan_delta(relation, &[5], &[2], &context, &registry);
@@ -1680,7 +1680,7 @@ fn bounded_repair_enforces_candidate_budget_before_evaluation() {
         relation,
         delta: &delta_b,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target_b = target_revision_for(&runtime, 73, &borrowed_b, &registry);
     let provider = vec![
@@ -1728,7 +1728,7 @@ fn runtime_observation_guard_is_root_lineage_bound() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let prepared =
         prepare_runtime_revision(&identical_other_root, 48, &mutations, &registry).unwrap();
@@ -1756,7 +1756,7 @@ fn reader_snapshot_remains_on_old_root_after_atomic_publication() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let prepared = prepare_runtime_cell_revision(&cell, 46, &mutations, &registry).unwrap();
     let _ = prepared.seal(&cell).unwrap().publish();
@@ -1806,7 +1806,7 @@ fn prepared_transition_cannot_cross_identical_runtime_root_lineages() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let prepared = prepare_runtime_revision(&source, 48, &mutations, &registry).unwrap();
     let wrong_cell = RuntimeRevisionCell::new(identical);
@@ -1831,7 +1831,7 @@ fn semantic_context_change_is_rejected_without_publication() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let mut target_state = runtime.revision().state().clone();
     target_state
@@ -1867,7 +1867,7 @@ fn prepared_transition_rejects_different_same_revision_bundle() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let prepared = prepare_runtime_revision(&source, 61, &mutations, &registry).unwrap();
     let different_before = different.clone_for_test();
@@ -1888,7 +1888,7 @@ fn physical_index_change_after_prepare_makes_transition_stale() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let prepared = prepare_runtime_revision(&runtime, 71, &mutations, &registry).unwrap();
     let cell = RuntimeRevisionCell::new(runtime);
@@ -1925,7 +1925,7 @@ fn semantic_statistics_publish_as_reconstructible_runtime_state() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let prepared = prepare_runtime_revision(&runtime, 74, &mutations, &registry).unwrap();
     let cell = RuntimeRevisionCell::new(runtime);
@@ -2081,13 +2081,13 @@ fn competing_prepared_transitions_from_same_revision_cannot_both_publish() {
         relation,
         delta: &delta_a,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let mutations_b = [RevisionRelationMutation {
         relation,
         delta: &delta_b,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let prepared_a = prepare_runtime_revision(&runtime, 101, &mutations_a, &registry).unwrap();
     let prepared_b = prepare_runtime_revision(&runtime, 102, &mutations_b, &registry).unwrap();
@@ -2118,7 +2118,7 @@ fn sequential_transitions_carry_revision_and_stable_handles_forward() {
         relation,
         delta: &first,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let _ = prepare_runtime_cell_revision(&cell, 111, &first_mutations, &registry)
         .unwrap()
@@ -2143,7 +2143,7 @@ fn sequential_transitions_carry_revision_and_stable_handles_forward() {
         relation,
         delta: &second,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let _ = prepare_runtime_cell_revision(&cell, 112, &second_mutations, &registry)
         .unwrap()
@@ -2181,7 +2181,7 @@ fn revision_prepare_rejects_same_source_and_target_without_mutation() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target = target_revision_for(&runtime, 119, &mutations, &registry);
     let before = runtime.clone_for_test();
@@ -2205,7 +2205,7 @@ fn sealed_transition_drop_aborts_without_publication() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let before = runtime.clone_for_test();
     let prepared = prepare_runtime_revision(&runtime, 126, &mutations, &registry).unwrap();
@@ -2273,7 +2273,7 @@ fn target_revision_state_must_match_logical_mutation_descriptor() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let mismatched_target = revision_with_same_state(&runtime, 141, &registry);
     let before = runtime.clone_for_test();
@@ -2297,7 +2297,7 @@ fn logical_transition_validation_reconstructs_only_affected_relation() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target = target_revision_for(&runtime, 146, &mutations, &registry);
 
@@ -2323,7 +2323,7 @@ fn certified_relation_endpoint_skips_global_provenance_recheck_but_not_delta_rep
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
 
     let expected = target_revision_for(&runtime, 148, &mutations, &registry);
@@ -2417,7 +2417,7 @@ fn materialization_registry_advances_all_registered_plans_atomically() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target = target_revision_for(&runtime, 151, &mutations, &registry);
     let prepared = runtime
@@ -2799,6 +2799,7 @@ fn advisor_i64_recovery_bundle(
 
 
 #[test]
+#[allow(clippy::cast_precision_loss, reason = "This operation explicitly uses IEEE-754 conversion or diagnostic floating-point ratios.")]
 fn pinned_runtime_snapshots_share_relation_witness_nodes_and_reclaim_dropped_oldest_root() {
     let values = (0_i64..4_096).collect::<Vec<_>>();
     let (context, registry, relation, _binding, runtime) =
@@ -2809,8 +2810,8 @@ fn pinned_runtime_snapshots_share_relation_witness_nodes_and_reclaim_dropped_old
     for step in 0..32_usize {
         let delta = scan_delta(
             relation,
-            &[20_000 + step as i64],
-            &[step as i64],
+            &[20_000 + i64::try_from(step).expect("fixture value fits i64")],
+            &[i64::try_from(step).expect("fixture value fits i64")],
             &context,
             &registry,
         );
@@ -2818,7 +2819,7 @@ fn pinned_runtime_snapshots_share_relation_witness_nodes_and_reclaim_dropped_old
             relation,
             delta: &delta,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         }];
         let prepared = prepare_runtime_cell_revision(
             &cell,
@@ -2865,6 +2866,7 @@ fn pinned_runtime_snapshots_share_relation_witness_nodes_and_reclaim_dropped_old
 }
 
 #[test]
+#[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
 fn pinned_runtime_whole_root_census_uses_persistent_logical_delta_roots() {
     let values = (0_i64..4_096).collect::<Vec<_>>();
     let (context, registry, relation, _binding, runtime) =
@@ -2875,8 +2877,8 @@ fn pinned_runtime_whole_root_census_uses_persistent_logical_delta_roots() {
     for step in 0..32_usize {
         let delta = scan_delta(
             relation,
-            &[30_000 + step as i64],
-            &[step as i64],
+            &[30_000 + i64::try_from(step).expect("fixture value fits i64")],
+            &[i64::try_from(step).expect("fixture value fits i64")],
             &context,
             &registry,
         );
@@ -2884,7 +2886,7 @@ fn pinned_runtime_whole_root_census_uses_persistent_logical_delta_roots() {
             relation,
             delta: &delta,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         }];
         let snapshot = cell.snapshot().unwrap();
         let target = snapshot

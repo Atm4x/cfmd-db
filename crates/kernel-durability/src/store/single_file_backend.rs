@@ -11,8 +11,8 @@ use crate::descriptor::{
 };
 use crate::domain::IdempotencyEpoch;
 use crate::metadata;
-use crate::replication::authority::ReplicationAuthorityJournal;
 use crate::realization::DurableFactorizedRealization;
+use crate::replication::authority::ReplicationAuthorityJournal;
 use crate::runtime::{DurabilityError, RecoveryScan};
 use crate::single_file::{
     SingleFileContainer, SingleFileSectionInput, SingleFileSectionKind, SingleFileSectionSource,
@@ -349,10 +349,11 @@ impl DurableRevisionStore {
                 || Ok(PreparedCutCapsule::default()),
                 |bytes| decode_prepared_cut_capsule(&bytes),
             )?;
-        let checkpoint_realization = container
-            .with_section_reader(SingleFileSectionKind::PhysicalArtifact, 0, |reader, len| {
-                DurableFactorizedRealization::decode_from_reader(reader, len)
-            })?;
+        let checkpoint_realization = container.with_section_reader(
+            SingleFileSectionKind::PhysicalArtifact,
+            0,
+            |reader, len| DurableFactorizedRealization::decode_from_reader(reader, len),
+        )?;
         if checkpoint_realization
             .as_ref()
             .is_some_and(|physical| physical.revision() != checkpoint.id())
@@ -387,6 +388,10 @@ impl DurableRevisionStore {
         Ok((store, scan))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub(super) fn rotate_single_file_checkpoint(
         &mut self,
         revision: &Revision,

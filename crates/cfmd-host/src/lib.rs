@@ -483,7 +483,10 @@ where
             .refresh_permissions(grant.permissions().clone())
             .map_err(|_| host_internal())?;
         *connection.expires_at.lock().map_err(|_| host_internal())? = grant.expires_at();
-        connection.wire.reauthorize_watches().map_err(|_| host_internal())?;
+        connection
+            .wire
+            .reauthorize_watches()
+            .map_err(|_| host_internal())?;
         Ok(())
     }
 

@@ -5,8 +5,9 @@ use std::{
 };
 
 use cfmd::{
-    CfmdEntity, CfmdSchema, CommitOutcome, Database, DiagnosticCode, EntitySet, ErrorDiagnosticExt, ErrorKind, Id, Schema,
-    Object, ObjectPredicate, RuleValueExpr, SemanticRuleExpr, Transaction, TransactionId,
+    CfmdEntity, CfmdSchema, CommitOutcome, Database, DiagnosticCode, EntitySet, ErrorDiagnosticExt,
+    ErrorKind, Id, Object, ObjectPredicate, RuleValueExpr, Schema, SemanticRuleExpr, Transaction,
+    TransactionId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -445,25 +446,45 @@ fn history_undo_composes_atomically_with_ordinary_crud() {
     fs::remove_file(path).expect("remove database");
 }
 
-
 #[test]
 fn typed_context_snapshot_keeps_one_exact_revision_while_context_tracks_head() {
     let path = temp_path();
     let schema = Schema::builder().object::<Todo>().build().expect("schema");
-    let database = Database::builder(&path).schema(schema).create().expect("create database");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
     let context = database.context::<TodoSchema>().expect("context");
     let snapshot = context.snapshot().expect("snapshot");
 
     let mut transaction = Transaction::new();
-    context.todos.add(&mut transaction, Todo {
-        id: Id::new(358_099),
-        title: "after-snapshot".to_owned(),
-        done: false,
-    }).expect("add");
+    context
+        .todos
+        .add(
+            &mut transaction,
+            Todo {
+                id: Id::new(358_099),
+                title: "after-snapshot".to_owned(),
+                done: false,
+            },
+        )
+        .expect("add");
     context.commit(&transaction).expect("commit");
 
-    assert!(context.todos.get(Id::new(358_099)).expect("current read").is_some());
-    assert!(snapshot.todos.get(Id::new(358_099)).expect("snapshot read").is_none());
+    assert!(
+        context
+            .todos
+            .get(Id::new(358_099))
+            .expect("current read")
+            .is_some()
+    );
+    assert!(
+        snapshot
+            .todos
+            .get(Id::new(358_099))
+            .expect("snapshot read")
+            .is_none()
+    );
 
     drop(snapshot);
     drop(context);
@@ -1250,6 +1271,10 @@ fn derive_many_is_first_class_object_relation() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn many_count_predicates_preserve_zero_degree_in_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -1272,7 +1297,9 @@ fn many_count_predicates_preserve_zero_degree_in_exact_candidate_and_watch() {
             Parent::cfmd_new(Id::new(3), "zero".into(), cfmd::Many::empty()),
         )
         .expect("zero-degree parent");
-    database.commit(&add_zero).expect("commit zero-degree parent");
+    database
+        .commit(&add_zero)
+        .expect("commit zero-degree parent");
 
     let ids = |rows: Vec<Parent>| {
         let mut ids = rows
@@ -2044,21 +2071,21 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
     );
     assert_eq!(
         ids(children
-            .top(2, |child| child.score())
+            .top(2, ChildFields::score)
             .all()
             .expect("top boundary")),
         vec![2, 3, 4]
     );
     assert_eq!(
         ids(children
-            .bottom(2, |child| child.score())
+            .bottom(2, ChildFields::score)
             .all()
             .expect("bottom boundary")),
         vec![1, 2, 3]
     );
 
     let mut watch = children
-        .top(2, |child| child.score())
+        .top(2, ChildFields::score)
         .watch()
         .expect("boundary watch");
     assert_eq!(ids(watch.initial().to_vec()), vec![2, 3, 4]);
@@ -2087,6 +2114,10 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -2119,11 +2150,7 @@ fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() 
         .objects::<ColumnPair>()
         .expect("pairs")
         .where_(|row| row.left().eq(row.right()));
-    let ids = |rows: Vec<ColumnPair>| {
-        rows.into_iter()
-            .map(|row| row.id.raw())
-            .collect::<Vec<_>>()
-    };
+    let ids = |rows: Vec<ColumnPair>| rows.into_iter().map(|row| row.id.raw()).collect::<Vec<_>>();
     assert_eq!(ids(query.all().expect("exact field equality")), vec![1, 3]);
     assert_eq!(
         ids(database
@@ -2173,7 +2200,10 @@ fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() 
         )
         .expect("matching pair");
     database.commit(&matching).expect("matching commit");
-    let event = watch.try_recv().expect("watch read").expect("matching event");
+    let event = watch
+        .try_recv()
+        .expect("watch read")
+        .expect("matching event");
     assert_eq!(ids(event.inserted().to_vec()), vec![4]);
     assert!(event.removed().is_empty());
 
@@ -2306,7 +2336,10 @@ fn predicate_or_uses_native_gamma_union_for_exact_candidate_and_watch() {
 #[test]
 fn projection_and_group_keys_do_not_stop_at_three_columns() {
     let path = temp_path();
-    let schema = Schema::builder().object::<WideRow>().build().expect("schema");
+    let schema = Schema::builder()
+        .object::<WideRow>()
+        .build()
+        .expect("schema");
     let database = Database::builder(&path)
         .schema(schema)
         .create()
@@ -2370,26 +2403,32 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
         database
             .objects::<Child>()
             .expect("children")
-            .add(&mut seed, Child { id: Id::new(id), score })
+            .add(
+                &mut seed,
+                Child {
+                    id: Id::new(id),
+                    score,
+                },
+            )
             .expect("seed child");
     }
     database.commit(&seed).expect("seed commit");
 
     let children = database.objects::<Child>().expect("children");
-    let projection = children.select(|child| child.score());
+    let projection = children.select(ChildFields::score);
     let mut scores = projection.all().expect("projected scores");
     scores.sort_unstable();
     assert_eq!(scores, vec![3, 7, 7, 11]);
     assert_eq!(projection.count().expect("projection count"), 4);
 
-    let distinct = children.select(|child| child.score()).distinct();
+    let distinct = children.select(ChildFields::score).distinct();
     let mut unique_scores = distinct.all().expect("distinct scores");
     unique_scores.sort_unstable();
     assert_eq!(unique_scores, vec![3, 7, 11]);
     assert_eq!(distinct.count().expect("distinct count"), 3);
 
     let mut grouped = children
-        .group_by(|child| child.score())
+        .group_by(ChildFields::score)
         .count()
         .all()
         .expect("grouped count");
@@ -2419,7 +2458,7 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
     assert!(event.removed().is_empty());
 
     let mut distinct_watch = children
-        .select(|child| child.score())
+        .select(ChildFields::score)
         .distinct()
         .watch()
         .expect("distinct projection watch");
@@ -2487,14 +2526,14 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
     database.commit(&seed).expect("seed commit");
 
     let metrics = database.objects::<GroupedMetric>().expect("metrics");
-    let count_query = metrics.group_by(|metric| metric.bucket()).count();
+    let count_query = metrics.group_by(GroupedMetricFields::bucket).count();
     let mut counts = count_query.all().expect("group counts");
     counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(counts, vec![(1, 2), (2, 1)]);
 
     let sum_query = metrics
-        .group_by(|metric| metric.bucket())
-        .sum(|metric| metric.value());
+        .group_by(GroupedMetricFields::bucket)
+        .sum(GroupedMetricFields::value);
     let mut sums = sum_query.all().expect("group sums");
     sums.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(sums, vec![(1, 4.0), (2, 10.0)]);
@@ -2517,10 +2556,12 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
         })
         .expect("future metric plan");
     let candidate = future.candidate().expect("candidate");
-    let candidate_metrics = candidate.objects::<GroupedMetric>().expect("candidate metrics");
+    let candidate_metrics = candidate
+        .objects::<GroupedMetric>()
+        .expect("candidate metrics");
 
     let mut future_counts = candidate_metrics
-        .group_by(|metric| metric.bucket())
+        .group_by(GroupedMetricFields::bucket)
         .count()
         .all()
         .expect("candidate group counts");
@@ -2528,8 +2569,8 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
     assert_eq!(future_counts, vec![(1, 3), (2, 1)]);
 
     let mut future_sums = candidate_metrics
-        .group_by(|metric| metric.bucket())
-        .sum(|metric| metric.value())
+        .group_by(GroupedMetricFields::bucket)
+        .sum(GroupedMetricFields::value)
         .all()
         .expect("candidate group sums");
     future_sums.sort_unstable_by_key(|(bucket, _)| *bucket);
@@ -2548,7 +2589,9 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
             },
         )
         .expect("live aggregate update");
-    database.commit(&live_insert).expect("live aggregate commit");
+    database
+        .commit(&live_insert)
+        .expect("live aggregate commit");
 
     let count_event = count_watch
         .try_recv()
@@ -2570,6 +2613,10 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -2605,13 +2652,13 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     database.commit(&seed).expect("seed commit");
 
     let metrics = database.objects::<GroupedMetric>().expect("metrics");
-    let count_top = metrics.group_by(|metric| metric.bucket()).count().top(1);
+    let count_top = metrics.group_by(GroupedMetricFields::bucket).count().top(1);
     let mut top_counts = count_top.all().expect("top grouped counts");
     top_counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(top_counts, vec![(1, 2), (2, 2)]);
     assert_eq!(
         metrics
-            .group_by(|metric| metric.bucket())
+            .group_by(GroupedMetricFields::bucket)
             .count()
             .bottom(1)
             .all()
@@ -2620,8 +2667,8 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     );
 
     let sum_top = metrics
-        .group_by(|metric| metric.bucket())
-        .sum(|metric| metric.value())
+        .group_by(GroupedMetricFields::bucket)
+        .sum(GroupedMetricFields::value)
         .top(1);
     let mut top_sums = sum_top.all().expect("top grouped sums");
     top_sums.sort_unstable_by_key(|(bucket, _)| *bucket);
@@ -2645,9 +2692,11 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
         })
         .expect("future metric plan");
     let candidate = future.candidate().expect("candidate");
-    let candidate_metrics = candidate.objects::<GroupedMetric>().expect("candidate metrics");
+    let candidate_metrics = candidate
+        .objects::<GroupedMetric>()
+        .expect("candidate metrics");
     let mut candidate_counts = candidate_metrics
-        .group_by(|metric| metric.bucket())
+        .group_by(GroupedMetricFields::bucket)
         .count()
         .top(1)
         .all()
@@ -2655,8 +2704,8 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     candidate_counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(candidate_counts, vec![(1, 2), (2, 2), (3, 2)]);
     let mut candidate_sums = candidate_metrics
-        .group_by(|metric| metric.bucket())
-        .sum(|metric| metric.value())
+        .group_by(GroupedMetricFields::bucket)
+        .sum(GroupedMetricFields::value)
         .top(1)
         .all()
         .expect("candidate top sums");
@@ -2676,7 +2725,9 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
             },
         )
         .expect("live aggregate boundary update");
-    database.commit(&live_insert).expect("live aggregate commit");
+    database
+        .commit(&live_insert)
+        .expect("live aggregate commit");
 
     let count_event = count_watch
         .try_recv()
@@ -2972,7 +3023,7 @@ fn composite_group_keys_use_kernel_group_for_exact_candidate_and_watch() {
 
     let top_sum = metrics
         .group_by(|metric| (metric.bucket(), metric.value()))
-        .sum(|metric| metric.value())
+        .sum(GroupedMetricFields::value)
         .top(1);
     let top_sum_exact = top_sum.all().expect("composite top sums");
     assert_eq!(top_sum_exact.len(), 2);
@@ -3002,7 +3053,7 @@ fn composite_group_keys_use_kernel_group_for_exact_candidate_and_watch() {
         .objects::<GroupedMetric>()
         .expect("candidate metrics")
         .group_by(|metric| (metric.bucket(), metric.value()))
-        .sum(|metric| metric.value())
+        .sum(GroupedMetricFields::value)
         .top(1)
         .all()
         .expect("candidate composite top sums");
@@ -3126,35 +3177,20 @@ fn deep_typed_reference_path_lowers_without_nested_matches_or_hidden_io() {
     let snapshot = db.snapshot().expect("path snapshot");
     let people = snapshot.objects::<PathPerson>().expect("people");
     let query = people.where_(|person| {
-        person
-            .passport()
-            .region()
-            .code()
-            .eq("RU".to_owned())
-            & person.name().eq("Artem".to_owned())
+        person.passport().region().code().eq("RU".to_owned()) & person.name().eq("Artem".to_owned())
     });
     let selected = query.one().expect("deep path match");
     assert_eq!(selected.id, person_id);
 
     let none = people
-        .where_(|person| {
-            person
-                .passport()
-                .region()
-                .code()
-                .eq("NL".to_owned())
-        })
+        .where_(|person| person.passport().region().code().eq("NL".to_owned()))
         .all()
         .expect("non-matching deep path");
     assert!(none.is_empty());
 
     let ergonomic = people
         .where_(|person| {
-            person
-                .passport()
-                .region()
-                .code()
-                .eq("NL".to_owned())
+            person.passport().region().code().eq("NL".to_owned())
                 | (!person.name().eq("Nobody".to_owned()))
         })
         .one()
@@ -3267,11 +3303,13 @@ fn same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_in
     fs::remove_file(path).expect("remove database");
 }
 
-
 #[test]
 fn database_owned_object_field_rules_reject_invalid_candidates_and_survive_reopen() {
     let path = temp_path();
-    let schema = Schema::builder().object::<RuleUser>().build().expect("schema");
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .build()
+        .expect("schema");
     let database = Database::builder(&path)
         .schema(schema)
         .create()
@@ -3307,7 +3345,9 @@ fn database_owned_object_field_rules_reject_invalid_candidates_and_survive_reope
             },
         )
         .expect("invalid value may form an intent");
-    let error = database.preview(&invalid).expect_err("rule must reject candidate");
+    let error = database
+        .preview(&invalid)
+        .expect_err("rule must reject candidate");
     assert_eq!(error.kind(), ErrorKind::InvariantViolation);
 
     drop(valid);
@@ -3337,21 +3377,33 @@ fn database_owned_object_field_rules_reject_invalid_candidates_and_survive_reope
     fs::remove_file(path).expect("remove database");
 }
 
-
 #[test]
 fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
     let path = temp_path();
-    let schema = Schema::builder().object::<RuleUser>().build().expect("schema");
-    let database = Database::builder(&path).schema(schema).create().expect("create database");
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
     let id = Id::new(446_001);
 
     let mut create = Transaction::new();
-    database.objects::<RuleUser>().expect("users").add(&mut create, RuleUser {
-        id,
-        name: "Artem".to_owned(),
-        age: 19,
-        role: "user".to_owned(),
-    }).expect("create intent");
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut create,
+            RuleUser {
+                id,
+                name: "Artem".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("create intent");
     database.commit(&create).expect("create commit");
 
     let adult = SemanticRuleExpr::I64Range {
@@ -3361,17 +3413,35 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
     };
     let users = database.objects::<RuleUser>().expect("users");
     let mut invalid = Transaction::new();
-    users.set(&mut invalid, id, |user| user.age(), 17).expect("patch intent");
-    invalid.require::<RuleUser>(id, adult.clone()).expect("require intent");
-    let error = database.preview(&invalid).expect_err("future-world requirement must reject");
+    users
+        .set(&mut invalid, id, RuleUserFields::age, 17)
+        .expect("patch intent");
+    invalid
+        .require::<RuleUser>(id, adult.clone())
+        .expect("require intent");
+    let error = database
+        .preview(&invalid)
+        .expect_err("future-world requirement must reject");
     assert_eq!(error.kind(), ErrorKind::TransactionConflict);
 
     let mut valid = Transaction::new();
-    users.set(&mut valid, id, |user| user.age(), 20).expect("valid patch intent");
-    valid.require::<RuleUser>(id, adult).expect("valid require intent");
+    users
+        .set(&mut valid, id, RuleUserFields::age, 20)
+        .expect("valid patch intent");
+    valid
+        .require::<RuleUser>(id, adult)
+        .expect("valid require intent");
     database.preview(&valid).expect("valid future candidate");
     database.commit(&valid).expect("require-backed commit");
-    assert_eq!(database.objects::<RuleUser>().expect("fresh users").require(id).expect("stored user").age, 20);
+    assert_eq!(
+        database
+            .objects::<RuleUser>()
+            .expect("fresh users")
+            .require(id)
+            .expect("stored user")
+            .age,
+        20
+    );
 
     drop(valid);
     drop(invalid);
@@ -3379,7 +3449,6 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
     drop(database);
     fs::remove_file(path).expect("remove database");
 }
-
 
 #[test]
 fn typed_schema_root_binds_live_entity_sets_without_global_registration() {
@@ -3509,13 +3578,17 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         .set(
             &mut partial_tx,
             Id::new(378_001),
-            |account| account.doctor_note(),
+            HostileReaderAccountFields::doctor_note,
             "changed-by-reader".to_owned(),
         )
         .expect("semantic scalar patch");
-    ctx.commit(&partial_tx).expect("commit partial scalar patch");
+    ctx.commit(&partial_tx)
+        .expect("commit partial scalar patch");
 
-    let stored = db.accounts.require(account.id).expect("authoritative reread");
+    let stored = db
+        .accounts
+        .require(account.id)
+        .expect("authoritative reread");
     assert_eq!(stored.passport_secret, "SECRET");
     assert_eq!(stored.doctor_note, "changed-by-reader");
 
@@ -3526,7 +3599,7 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         .set(
             &mut invalid_tx,
             Id::new(378_001),
-            |account| account.doctor_note(),
+            HostileReaderAccountFields::doctor_note,
             "x".repeat(64),
         )
         .expect("reader can form a patch without knowing the hidden authoritative rule");
@@ -3534,7 +3607,10 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         .commit(&invalid_tx)
         .expect_err("persisted semantic rules must reject the invalid full candidate");
     assert_eq!(error.kind(), ErrorKind::InvariantViolation);
-    let stored = db.accounts.require(account.id).expect("reread after rejected patch");
+    let stored = db
+        .accounts
+        .require(account.id)
+        .expect("reread after rejected patch");
     assert_eq!(stored.passport_secret, "SECRET");
     assert_eq!(stored.doctor_note, "changed-by-reader");
 
@@ -3548,6 +3624,10 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish the before and after states of the same operation."
+)]
 fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema() {
     let path = temp_path();
     let db = RenamedAccountSchema::database(&path)
@@ -3580,7 +3660,7 @@ fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema()
         .set(
             &mut patch,
             Id::new(379_001),
-            |row| row.doctor_note(),
+            LegacyRenameAccountFields::doctor_note,
             "changed-through-old-name".to_owned(),
         )
         .expect("legacy patch resolves through the explicit client-side bind");
@@ -3598,7 +3678,7 @@ fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema()
         .set(
             &mut invalid,
             Id::new(379_001),
-            |row| row.doctor_note(),
+            LegacyRenameAccountFields::doctor_note,
             "x".repeat(64),
         )
         .expect("legacy client can form patch without copying authoritative rules");
@@ -3628,7 +3708,9 @@ fn client_bind_can_keep_old_reference_name_without_authoritative_alias() {
         primary_doctor: cfmd::Ref::new(doctor.id),
     };
     let mut tx = Transaction::new();
-    db.doctors.add(&mut tx, doctor.clone()).expect("doctor insert");
+    db.doctors
+        .add(&mut tx, doctor.clone())
+        .expect("doctor insert");
     db.patients.add(&mut tx, patient).expect("patient insert");
     db.commit(&tx).expect("reference commit");
     drop(tx);
@@ -3654,11 +3736,23 @@ fn client_bind_can_keep_old_reference_name_without_authoritative_alias() {
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish the before and after states of the same operation."
+)]
 fn partial_context_patches_required_and_optional_references_without_hidden_row_rewrite() {
     let path = temp_path();
-    let db = AppSchema::database(&path).create().expect("authoritative app schema");
-    let alice = User { id: Id::new(438_001), name: "Alice".into() };
-    let bob = User { id: Id::new(438_002), name: "Bob".into() };
+    let db = AppSchema::database(&path)
+        .create()
+        .expect("authoritative app schema");
+    let alice = User {
+        id: Id::new(438_001),
+        name: "Alice".into(),
+    };
+    let bob = User {
+        id: Id::new(438_002),
+        name: "Bob".into(),
+    };
     let mut seed = Transaction::new();
     db.users.add(&mut seed, alice.clone()).expect("alice");
     db.users.add(&mut seed, bob.clone()).expect("bob");
@@ -3675,22 +3769,33 @@ fn partial_context_patches_required_and_optional_references_without_hidden_row_r
         .expect("task");
     db.commit(&seed).expect("seed commit");
 
-    let ctx = db.raw().context::<PartialTaskSchema>().expect("partial task context");
+    let ctx = db
+        .raw()
+        .context::<PartialTaskSchema>()
+        .expect("partial task context");
     let mut patch = Transaction::new();
     ctx.tasks
-        .set(&mut patch, Id::new(438_010), |task| task.owner(), cfmd::Ref::new(bob.id))
+        .set(
+            &mut patch,
+            Id::new(438_010),
+            PartialTaskFields::owner,
+            cfmd::Ref::new(bob.id),
+        )
         .expect("required reference patch");
     ctx.tasks
         .set(
             &mut patch,
             Id::new(438_010),
-            |task| task.reviewer(),
+            PartialTaskFields::reviewer,
             Some(cfmd::Ref::new(alice.id)),
         )
         .expect("optional reference patch");
     ctx.commit(&patch).expect("reference patch commit");
 
-    let stored = db.tasks.require(Id::new(438_010)).expect("authoritative reread");
+    let stored = db
+        .tasks
+        .require(Id::new(438_010))
+        .expect("authoritative reread");
     assert_eq!(stored.title, "hidden-title");
     assert_eq!(stored.owner.id(), bob.id);
     assert_eq!(stored.reviewer.as_ref().map(cfmd::Ref::id), Some(alice.id));
@@ -3709,15 +3814,26 @@ fn partial_context_many_mutation_preserves_hidden_owner_fields() {
         .object::<Child>()
         .build()
         .expect("relationship schema");
-    let database = Database::builder(&path).schema(schema).create().expect("database");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("database");
     seed_object_many(&database);
 
-    let ctx = database.context::<ParentReaderSchema>().expect("partial parent context");
+    let ctx = database
+        .context::<ParentReaderSchema>()
+        .expect("partial parent context");
     let parent = ctx.parents.require(Id::new(1)).expect("partial owner");
     assert_eq!(parent.children.count().expect("initial count"), 2);
     let mut tx = Transaction::new();
-    parent.children.attach(&mut tx, Id::new(12)).expect("attach existing child");
-    parent.children.detach(&mut tx, Id::new(10)).expect("detach child");
+    parent
+        .children
+        .attach(&mut tx, Id::new(12))
+        .expect("attach existing child");
+    parent
+        .children
+        .detach(&mut tx, Id::new(10))
+        .expect("detach child");
     ctx.commit(&tx).expect("relationship mutation commit");
 
     let snapshot = database.snapshot().expect("snapshot");
@@ -3745,44 +3861,103 @@ fn partial_context_many_mutation_preserves_hidden_owner_fields() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field() {
     let path = temp_path();
-    let db = AppSchema::database(&path).create().expect("authoritative app schema");
-    let alice = User { id: Id::new(438_101), name: "Alice".into() };
-    let bob = User { id: Id::new(438_102), name: "Bob".into() };
+    let db = AppSchema::database(&path)
+        .create()
+        .expect("authoritative app schema");
+    let alice = User {
+        id: Id::new(438_101),
+        name: "Alice".into(),
+    };
+    let bob = User {
+        id: Id::new(438_102),
+        name: "Bob".into(),
+    };
     let mut seed = Transaction::new();
     db.users.add(&mut seed, alice.clone()).expect("alice");
     db.users.add(&mut seed, bob.clone()).expect("bob");
-    db.tasks.add(&mut seed, Task {
-        id: Id::new(438_110),
-        title: "base".into(),
-        owner: cfmd::Ref::new(alice.id),
-        reviewer: None,
-    }).expect("task");
+    db.tasks
+        .add(
+            &mut seed,
+            Task {
+                id: Id::new(438_110),
+                title: "base".into(),
+                owner: cfmd::Ref::new(alice.id),
+                reviewer: None,
+            },
+        )
+        .expect("task");
     db.commit(&seed).expect("seed commit");
 
-    let partial = db.raw().context::<PartialTaskSchema>().expect("partial task context");
+    let partial = db
+        .raw()
+        .context::<PartialTaskSchema>()
+        .expect("partial task context");
     let mut title_tx = Transaction::new();
-    db.tasks.set(&mut title_tx, Id::new(438_110), |task| task.title(), "title-a".to_string()).expect("title patch");
+    db.tasks
+        .set(
+            &mut title_tx,
+            Id::new(438_110),
+            TaskFields::title,
+            "title-a".to_string(),
+        )
+        .expect("title patch");
     let mut owner_tx = Transaction::new();
-    partial.tasks.set(&mut owner_tx, Id::new(438_110), |task| task.owner(), cfmd::Ref::new(bob.id)).expect("owner patch");
+    partial
+        .tasks
+        .set(
+            &mut owner_tx,
+            Id::new(438_110),
+            PartialTaskFields::owner,
+            cfmd::Ref::new(bob.id),
+        )
+        .expect("owner patch");
 
-    db.commit(&title_tx).expect("first independent field commit");
-    partial.commit(&owner_tx).expect("stale independent field rebase");
+    db.commit(&title_tx)
+        .expect("first independent field commit");
+    partial
+        .commit(&owner_tx)
+        .expect("stale independent field rebase");
     let stored = db.tasks.require(Id::new(438_110)).expect("reread");
     assert_eq!(stored.title, "title-a");
     assert_eq!(stored.owner.id(), bob.id);
 
     let mut left = Transaction::new();
-    db.tasks.set(&mut left, Id::new(438_110), |task| task.title(), "left".to_string()).expect("left title");
+    db.tasks
+        .set(
+            &mut left,
+            Id::new(438_110),
+            TaskFields::title,
+            "left".to_string(),
+        )
+        .expect("left title");
     let mut right = Transaction::new();
-    db.tasks.set(&mut right, Id::new(438_110), |task| task.title(), "right".to_string()).expect("right title");
+    db.tasks
+        .set(
+            &mut right,
+            Id::new(438_110),
+            TaskFields::title,
+            "right".to_string(),
+        )
+        .expect("right title");
     db.commit(&left).expect("left commit");
-    let conflict = db.commit(&right).expect_err("same semantic field must conflict");
+    let conflict = db
+        .commit(&right)
+        .expect_err("same semantic field must conflict");
     assert_eq!(conflict.kind(), ErrorKind::TransactionConflict);
 
-    let retry = partial.commit(&owner_tx).expect("committed field intent retry");
-    assert!(matches!(retry, cfmd::CommitOutcome::AlreadyCommitted { .. }));
+    let retry = partial
+        .commit(&owner_tx)
+        .expect("committed field intent retry");
+    assert!(matches!(
+        retry,
+        cfmd::CommitOutcome::AlreadyCommitted { .. }
+    ));
 
     drop(stored);
     drop(seed);
@@ -3793,7 +3968,9 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
     drop(partial);
     drop(db);
     let reopened = Database::open(&path).expect("reopen");
-    let ctx = reopened.context::<AppSchema>().expect("reopen authoritative context");
+    let ctx = reopened
+        .context::<AppSchema>()
+        .expect("reopen authoritative context");
     let stored = ctx.tasks.require(Id::new(438_110)).expect("reopen reread");
     assert_eq!(stored.title, "left");
     assert_eq!(stored.owner.id(), bob.id);
@@ -3894,7 +4071,10 @@ fn owned_detach_cannot_bypass_object_delete_authority() {
     let relationship = Owner::many_fields()[0].relation();
     let session = Session::new(
         PrincipalId::new(440_010),
-        PermissionSet::from([Permission::Read, Permission::DetachRelationship(relationship)]),
+        PermissionSet::from([
+            Permission::Read,
+            Permission::DetachRelationship(relationship),
+        ]),
     );
     let restricted = database.session(session.clone());
     let owner = restricted

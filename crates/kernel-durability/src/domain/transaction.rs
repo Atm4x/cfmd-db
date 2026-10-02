@@ -264,6 +264,10 @@ pub struct DurableObjectFieldWrite {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "These flags record independent transaction validation facts."
+)]
 pub struct DurableRelationAuthorization {
     pub relation_write: bool,
     pub object_create: bool,
@@ -301,6 +305,10 @@ pub struct DurableRelationResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations to this representation."
+)]
 pub enum DurableRevisionChange {
     RelationData {
         semantic_revision: SemanticRevision,
@@ -434,6 +442,10 @@ impl DurableTransactionIntent {
     /// causal resolutions remain exact because their endpoint/parent identity
     /// is part of the requested operation itself.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn same_client_intent(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -449,12 +461,8 @@ impl DurableTransactionIntent {
                     semantic_modules: right_modules,
                     ..
                 },
-            ) => {
-                left_semantic == right_semantic
-                    && left_mutations == right_mutations
-                    && left_modules == right_modules
-            }
-            (
+            )
+            | (
                 Self::RelationDataExact {
                     semantic_revision: left_semantic,
                     relation_mutations: left_mutations,

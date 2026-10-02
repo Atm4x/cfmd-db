@@ -479,6 +479,10 @@ fn validate_replicated_authority(
 }
 
 impl DurableRevisionStore {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn historical_epoch_material(
         &mut self,
         effect_id: RevisionEffectId,

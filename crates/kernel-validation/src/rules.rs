@@ -17,10 +17,24 @@ pub enum CompiledSemanticRuleExpr {
     And(Vec<Self>),
     Or(Vec<Self>),
     Not(Box<Self>),
-    I64Range { value: RuleValueExpr, min: Option<i64>, max: Option<i64> },
-    TextLength { value: RuleValueExpr, min: usize, max: Option<usize> },
-    TextOneOf { value: RuleValueExpr, allowed: BTreeSet<String> },
-    TextMatches { value: RuleValueExpr, pattern: CompiledTextPattern },
+    I64Range {
+        value: RuleValueExpr,
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+    TextLength {
+        value: RuleValueExpr,
+        min: usize,
+        max: Option<usize>,
+    },
+    TextOneOf {
+        value: RuleValueExpr,
+        allowed: BTreeSet<String>,
+    },
+    TextMatches {
+        value: RuleValueExpr,
+        pattern: CompiledTextPattern,
+    },
 }
 
 impl CompiledSemanticRuleExpr {
@@ -32,10 +46,24 @@ impl CompiledSemanticRuleExpr {
             SemanticRuleExpr::And(rules) => Self::And(rules.iter().map(Self::compile).collect()),
             SemanticRuleExpr::Or(rules) => Self::Or(rules.iter().map(Self::compile).collect()),
             SemanticRuleExpr::Not(rule) => Self::Not(Box::new(Self::compile(rule))),
-            SemanticRuleExpr::I64Range { value, min, max } => Self::I64Range { value: value.clone(), min: *min, max: *max },
-            SemanticRuleExpr::TextLength { value, min, max } => Self::TextLength { value: value.clone(), min: *min, max: *max },
-            SemanticRuleExpr::TextOneOf { value, allowed } => Self::TextOneOf { value: value.clone(), allowed: allowed.clone() },
-            SemanticRuleExpr::TextMatches { value, pattern } => Self::TextMatches { value: value.clone(), pattern: CompiledTextPattern::compile(pattern) },
+            SemanticRuleExpr::I64Range { value, min, max } => Self::I64Range {
+                value: value.clone(),
+                min: *min,
+                max: *max,
+            },
+            SemanticRuleExpr::TextLength { value, min, max } => Self::TextLength {
+                value: value.clone(),
+                min: *min,
+                max: *max,
+            },
+            SemanticRuleExpr::TextOneOf { value, allowed } => Self::TextOneOf {
+                value: value.clone(),
+                allowed: allowed.clone(),
+            },
+            SemanticRuleExpr::TextMatches { value, pattern } => Self::TextMatches {
+                value: value.clone(),
+                pattern: CompiledTextPattern::compile(pattern),
+            },
         }
     }
 
@@ -47,29 +75,49 @@ impl CompiledSemanticRuleExpr {
             Self::True => Ok(true),
             Self::False => Ok(false),
             Self::And(rules) => {
-                for rule in rules { if !rule.matches(resolve)? { return Ok(false); } }
+                for rule in rules {
+                    if !rule.matches(resolve)? {
+                        return Ok(false);
+                    }
+                }
                 Ok(true)
             }
             Self::Or(rules) => {
-                for rule in rules { if rule.matches(resolve)? { return Ok(true); } }
+                for rule in rules {
+                    if rule.matches(resolve)? {
+                        return Ok(true);
+                    }
+                }
                 Ok(false)
             }
             Self::Not(rule) => Ok(!rule.matches(resolve)?),
             Self::I64Range { value, min, max } => {
-                let Value::I64(value) = resolve(value).ok_or(RuleEvaluationError::MissingValue)? else { return Err(RuleEvaluationError::TypeMismatch); };
+                let Value::I64(value) = resolve(value).ok_or(RuleEvaluationError::MissingValue)?
+                else {
+                    return Err(RuleEvaluationError::TypeMismatch);
+                };
                 Ok(min.is_none_or(|min| *value >= min) && max.is_none_or(|max| *value <= max))
             }
             Self::TextLength { value, min, max } => {
-                let Value::Text(value) = resolve(value).ok_or(RuleEvaluationError::MissingValue)? else { return Err(RuleEvaluationError::TypeMismatch); };
+                let Value::Text(value) = resolve(value).ok_or(RuleEvaluationError::MissingValue)?
+                else {
+                    return Err(RuleEvaluationError::TypeMismatch);
+                };
                 let len = value.chars().count();
                 Ok(len >= *min && max.is_none_or(|max| len <= max))
             }
             Self::TextOneOf { value, allowed } => {
-                let Value::Text(value) = resolve(value).ok_or(RuleEvaluationError::MissingValue)? else { return Err(RuleEvaluationError::TypeMismatch); };
+                let Value::Text(value) = resolve(value).ok_or(RuleEvaluationError::MissingValue)?
+                else {
+                    return Err(RuleEvaluationError::TypeMismatch);
+                };
                 Ok(allowed.contains(value))
             }
             Self::TextMatches { value, pattern } => {
-                let Value::Text(value) = resolve(value).ok_or(RuleEvaluationError::MissingValue)? else { return Err(RuleEvaluationError::TypeMismatch); };
+                let Value::Text(value) = resolve(value).ok_or(RuleEvaluationError::MissingValue)?
+                else {
+                    return Err(RuleEvaluationError::TypeMismatch);
+                };
                 Ok(pattern.is_match(value))
             }
         }
@@ -81,18 +129,23 @@ pub struct CompiledFieldRule(CompiledSemanticRuleExpr);
 
 impl CompiledFieldRule {
     #[must_use]
-    pub fn compile(rule: &FieldRule) -> Self { Self(CompiledSemanticRuleExpr::compile(&rule.expression())) }
+    pub fn compile(rule: &FieldRule) -> Self {
+        Self(CompiledSemanticRuleExpr::compile(&rule.expression()))
+    }
 
     pub fn matches(&self, value: &Value) -> Result<bool, RuleEvaluationError> {
-        self.0.matches(&|coordinate| match coordinate { RuleValueExpr::Input => Some(value), RuleValueExpr::Field(_) => None })
+        self.0.matches(&|coordinate| match coordinate {
+            RuleValueExpr::Input => Some(value),
+            RuleValueExpr::Field(_) => None,
+        })
     }
 }
 
 #[derive(Debug, Default)]
 pub struct CompiledRulePlan {
-    field_rules: BTreeMap<SemanticId, Vec<CompiledFieldRule>>,
-    relation_column_rules: BTreeMap<(SemanticId, SemanticId), Vec<CompiledFieldRule>>,
-    entity_rules: BTreeMap<SemanticId, Vec<CompiledSemanticRuleExpr>>,
+    fields: BTreeMap<SemanticId, Vec<CompiledFieldRule>>,
+    relation_columns: BTreeMap<(SemanticId, SemanticId), Vec<CompiledFieldRule>>,
+    entities: BTreeMap<SemanticId, Vec<CompiledSemanticRuleExpr>>,
 }
 
 impl CompiledRulePlan {
@@ -100,35 +153,60 @@ impl CompiledRulePlan {
     pub fn compile(context: &SemanticContext) -> Self {
         let mut plan = Self::default();
         for (field, rule) in context.schema.all_field_rules() {
-            plan.field_rules.entry(field).or_default().push(CompiledFieldRule::compile(rule));
+            plan.fields
+                .entry(field)
+                .or_default()
+                .push(CompiledFieldRule::compile(rule));
         }
         for (target, rule) in context.schema.all_relation_column_rules() {
-            plan.relation_column_rules.entry(target).or_default().push(CompiledFieldRule::compile(rule));
+            plan.relation_columns
+                .entry(target)
+                .or_default()
+                .push(CompiledFieldRule::compile(rule));
         }
         for (owner, rule) in context.schema.all_entity_rules() {
-            plan.entity_rules.entry(owner).or_default().push(CompiledSemanticRuleExpr::compile(rule));
+            plan.entities
+                .entry(owner)
+                .or_default()
+                .push(CompiledSemanticRuleExpr::compile(rule));
         }
         plan
     }
 
     #[must_use]
     pub fn field_rules(&self, field: SemanticId) -> &[CompiledFieldRule] {
-        self.field_rules.get(&field).map(Vec::as_slice).unwrap_or_default()
+        self.fields
+            .get(&field)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     #[must_use]
-    pub fn relation_column_rules(&self, context: &SemanticContext, relation: SemanticId, ordinal: usize) -> &[CompiledFieldRule] {
-        let Some(column) = context.schema.relation_column_id(relation, ordinal) else { return &[]; };
-        self.relation_column_rules.get(&(relation, column)).map(Vec::as_slice).unwrap_or_default()
+    pub fn relation_column_rules(
+        &self,
+        context: &SemanticContext,
+        relation: SemanticId,
+        ordinal: usize,
+    ) -> &[CompiledFieldRule] {
+        let Some(column) = context.schema.relation_column_id(relation, ordinal) else {
+            return &[];
+        };
+        self.relation_columns
+            .get(&(relation, column))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     #[must_use]
     pub fn entity_rules(&self, owner: SemanticId) -> &[CompiledSemanticRuleExpr] {
-        self.entity_rules.get(&owner).map(Vec::as_slice).unwrap_or_default()
+        self.entities
+            .get(&owner)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn entity_rule_owners(&self) -> impl Iterator<Item = SemanticId> + '_ {
-        self.entity_rules.keys().copied()
+        self.entities.keys().copied()
     }
 }
 
@@ -136,7 +214,10 @@ pub fn field_rule_matches(rule: &FieldRule, value: &Value) -> Result<bool, RuleE
     CompiledFieldRule::compile(rule).matches(value)
 }
 
-pub fn semantic_rule_matches(rule: &SemanticRuleExpr, input: &Value) -> Result<bool, RuleEvaluationError> {
+pub fn semantic_rule_matches(
+    rule: &SemanticRuleExpr,
+    input: &Value,
+) -> Result<bool, RuleEvaluationError> {
     CompiledSemanticRuleExpr::compile(rule).matches(&|coordinate| match coordinate {
         RuleValueExpr::Input => Some(input),
         RuleValueExpr::Field(_) => None,
@@ -394,7 +475,13 @@ mod tests {
                 ]),
             },
         ]);
-        assert_eq!(semantic_rule_matches(&rule, &Value::Text("db42".into())), Ok(true));
-        assert_eq!(semantic_rule_matches(&rule, &Value::Text("xx42".into())), Ok(false));
+        assert_eq!(
+            semantic_rule_matches(&rule, &Value::Text("db42".into())),
+            Ok(true)
+        );
+        assert_eq!(
+            semantic_rule_matches(&rule, &Value::Text("xx42".into())),
+            Ok(false)
+        );
     }
 }

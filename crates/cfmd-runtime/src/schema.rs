@@ -15,7 +15,6 @@ pub enum ScalarType {
     HistoricalEntityRef(TypeId),
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextPattern {
     Never,
@@ -29,13 +28,21 @@ pub enum TextPattern {
 
 impl TextPattern {
     #[must_use]
-    pub fn literal(value: impl Into<String>) -> Self { Self::Literal(value.into()) }
+    pub fn literal(value: impl Into<String>) -> Self {
+        Self::Literal(value.into())
+    }
     #[must_use]
-    pub fn concat(parts: impl IntoIterator<Item = Self>) -> Self { Self::Concat(parts.into_iter().collect()) }
+    pub fn concat(parts: impl IntoIterator<Item = Self>) -> Self {
+        Self::Concat(parts.into_iter().collect())
+    }
     #[must_use]
-    pub fn alternate(parts: impl IntoIterator<Item = Self>) -> Self { Self::Alternate(parts.into_iter().collect()) }
+    pub fn alternate(parts: impl IntoIterator<Item = Self>) -> Self {
+        Self::Alternate(parts.into_iter().collect())
+    }
     #[must_use]
-    pub fn zero_or_more(pattern: Self) -> Self { Self::ZeroOrMore(Box::new(pattern)) }
+    pub fn zero_or_more(pattern: Self) -> Self {
+        Self::ZeroOrMore(Box::new(pattern))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,10 +58,24 @@ pub enum SemanticRuleExpr {
     And(Vec<Self>),
     Or(Vec<Self>),
     Not(Box<Self>),
-    I64Range { value: RuleValueExpr, min: Option<i64>, max: Option<i64> },
-    TextLength { value: RuleValueExpr, min: usize, max: Option<usize> },
-    TextOneOf { value: RuleValueExpr, allowed: BTreeSet<String> },
-    TextMatches { value: RuleValueExpr, pattern: TextPattern },
+    I64Range {
+        value: RuleValueExpr,
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+    TextLength {
+        value: RuleValueExpr,
+        min: usize,
+        max: Option<usize>,
+    },
+    TextOneOf {
+        value: RuleValueExpr,
+        allowed: BTreeSet<String>,
+    },
+    TextMatches {
+        value: RuleValueExpr,
+        pattern: TextPattern,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -560,9 +581,15 @@ pub(crate) fn text_pattern_to_kernel(pattern: TextPattern) -> kernel_schema::Tex
         TextPattern::Empty => kernel_schema::TextPattern::Empty,
         TextPattern::Literal(value) => kernel_schema::TextPattern::Literal(value),
         TextPattern::AnyScalar => kernel_schema::TextPattern::AnyScalar,
-        TextPattern::Concat(parts) => kernel_schema::TextPattern::Concat(parts.into_iter().map(text_pattern_to_kernel).collect()),
-        TextPattern::Alternate(parts) => kernel_schema::TextPattern::Alternate(parts.into_iter().map(text_pattern_to_kernel).collect()),
-        TextPattern::ZeroOrMore(inner) => kernel_schema::TextPattern::ZeroOrMore(Box::new(text_pattern_to_kernel(*inner))),
+        TextPattern::Concat(parts) => kernel_schema::TextPattern::Concat(
+            parts.into_iter().map(text_pattern_to_kernel).collect(),
+        ),
+        TextPattern::Alternate(parts) => kernel_schema::TextPattern::Alternate(
+            parts.into_iter().map(text_pattern_to_kernel).collect(),
+        ),
+        TextPattern::ZeroOrMore(inner) => {
+            kernel_schema::TextPattern::ZeroOrMore(Box::new(text_pattern_to_kernel(*inner)))
+        }
     }
 }
 
@@ -570,20 +597,48 @@ pub(crate) fn semantic_rule_to_kernel(rule: SemanticRuleExpr) -> kernel_schema::
     match rule {
         SemanticRuleExpr::True => kernel_schema::SemanticRuleExpr::True,
         SemanticRuleExpr::False => kernel_schema::SemanticRuleExpr::False,
-        SemanticRuleExpr::And(rules) => kernel_schema::SemanticRuleExpr::And(rules.into_iter().map(semantic_rule_to_kernel).collect()),
-        SemanticRuleExpr::Or(rules) => kernel_schema::SemanticRuleExpr::Or(rules.into_iter().map(semantic_rule_to_kernel).collect()),
-        SemanticRuleExpr::Not(rule) => kernel_schema::SemanticRuleExpr::Not(Box::new(semantic_rule_to_kernel(*rule))),
-        SemanticRuleExpr::I64Range { value, min, max } => kernel_schema::SemanticRuleExpr::I64Range { value: rule_value_to_kernel(value), min, max },
-        SemanticRuleExpr::TextLength { value, min, max } => kernel_schema::SemanticRuleExpr::TextLength { value: rule_value_to_kernel(value), min, max },
-        SemanticRuleExpr::TextOneOf { value, allowed } => kernel_schema::SemanticRuleExpr::TextOneOf { value: rule_value_to_kernel(value), allowed },
-        SemanticRuleExpr::TextMatches { value, pattern } => kernel_schema::SemanticRuleExpr::TextMatches { value: rule_value_to_kernel(value), pattern: text_pattern_to_kernel(pattern) },
+        SemanticRuleExpr::And(rules) => kernel_schema::SemanticRuleExpr::And(
+            rules.into_iter().map(semantic_rule_to_kernel).collect(),
+        ),
+        SemanticRuleExpr::Or(rules) => kernel_schema::SemanticRuleExpr::Or(
+            rules.into_iter().map(semantic_rule_to_kernel).collect(),
+        ),
+        SemanticRuleExpr::Not(rule) => {
+            kernel_schema::SemanticRuleExpr::Not(Box::new(semantic_rule_to_kernel(*rule)))
+        }
+        SemanticRuleExpr::I64Range { value, min, max } => {
+            kernel_schema::SemanticRuleExpr::I64Range {
+                value: rule_value_to_kernel(&value),
+                min,
+                max,
+            }
+        }
+        SemanticRuleExpr::TextLength { value, min, max } => {
+            kernel_schema::SemanticRuleExpr::TextLength {
+                value: rule_value_to_kernel(&value),
+                min,
+                max,
+            }
+        }
+        SemanticRuleExpr::TextOneOf { value, allowed } => {
+            kernel_schema::SemanticRuleExpr::TextOneOf {
+                value: rule_value_to_kernel(&value),
+                allowed,
+            }
+        }
+        SemanticRuleExpr::TextMatches { value, pattern } => {
+            kernel_schema::SemanticRuleExpr::TextMatches {
+                value: rule_value_to_kernel(&value),
+                pattern: text_pattern_to_kernel(pattern),
+            }
+        }
     }
 }
 
-fn rule_value_to_kernel(value: RuleValueExpr) -> kernel_schema::RuleValueExpr {
+fn rule_value_to_kernel(value: &RuleValueExpr) -> kernel_schema::RuleValueExpr {
     match value {
         RuleValueExpr::Input => kernel_schema::RuleValueExpr::Input,
-        RuleValueExpr::Field(field) => kernel_schema::RuleValueExpr::Field(field.into()),
+        RuleValueExpr::Field(field) => kernel_schema::RuleValueExpr::Field((*field).into()),
     }
 }
 

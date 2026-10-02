@@ -403,7 +403,12 @@ fn authorization_refresh_revokes_watch_when_exact_read_footprint_disappears() {
     server
         .refresh_authorization(&connection)
         .expect("refresh authorization");
-    assert!(connection.permissions().expect("permissions").contains(Permission::Watch));
+    assert!(
+        connection
+            .permissions()
+            .expect("permissions")
+            .contains(Permission::Watch)
+    );
     assert!(!connection.is_closed());
 
     let response = waiter

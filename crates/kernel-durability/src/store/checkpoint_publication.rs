@@ -144,11 +144,8 @@ impl DurableRevisionStore {
                 reason: "physical checkpoint revision does not match durable WAL head",
             });
         }
-        let mut physical = DurableFactorizedRealization::new(
-            revision.id(),
-            atoms.clone(),
-            root.clone(),
-        )?;
+        let mut physical =
+            DurableFactorizedRealization::new(revision.id(), atoms.clone(), root.clone())?;
         if let Some(previous) = self.checkpoint_realization.as_ref() {
             physical.inherit_retained_historical_roots(
                 previous,
@@ -248,6 +245,10 @@ impl DurableRevisionStore {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep the explicit semantic and durability inputs at this boundary."
+    )]
     fn rotate_checkpoint_with_hook(
         &mut self,
         revision: &Revision,

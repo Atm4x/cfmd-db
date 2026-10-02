@@ -310,11 +310,7 @@ impl DurableRevisionStore {
             .as_ref()
             .filter(|physical| physical.revision() == revision.id())
             .cloned();
-        self.begin_streaming_checkpoint_with_chunk_size_and_physical(
-            revision,
-            chunk_size,
-            physical,
-        )
+        self.begin_streaming_checkpoint_with_chunk_size_and_physical(revision, chunk_size, physical)
     }
 
     pub fn begin_streaming_checkpoint_with_factorized_realization(
@@ -338,11 +334,8 @@ impl DurableRevisionStore {
         root: &FactorizedRealizationRoot,
         chunk_size: usize,
     ) -> Result<StreamingCheckpointProgress, DurabilityError> {
-        let mut physical = DurableFactorizedRealization::new(
-            revision.id(),
-            atoms.clone(),
-            root.clone(),
-        )?;
+        let mut physical =
+            DurableFactorizedRealization::new(revision.id(), atoms.clone(), root.clone())?;
         if let Some(previous) = self.checkpoint_realization.as_ref() {
             physical.inherit_retained_historical_roots(
                 previous,
@@ -359,6 +352,10 @@ impl DurableRevisionStore {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn begin_streaming_checkpoint_with_chunk_size_and_physical(
         &mut self,
         revision: &Revision,
@@ -640,6 +637,10 @@ impl DurableRevisionStore {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep the explicit semantic and durability inputs at this boundary."
+    )]
     fn finalize_directory_streaming_checkpoint(
         &mut self,
         job: StreamingCheckpointJob,
@@ -697,11 +698,8 @@ impl DurableRevisionStore {
             capsule_crc32c,
         )?;
         if let Some(binding) = physical_binding {
-            let verified = read_published_factorized_realization(
-                &directory,
-                job.generation,
-                binding,
-            )?;
+            let verified =
+                read_published_factorized_realization(&directory, job.generation, binding)?;
             if verified.revision() != job.cut_revision.id() {
                 return Err(DurabilityError::Protocol {
                     offset: 0,
@@ -743,6 +741,10 @@ impl DurableRevisionStore {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn finalize_single_file_streaming_checkpoint(
         &mut self,
         job: StreamingCheckpointJob,
@@ -779,8 +781,8 @@ impl DurableRevisionStore {
         let checkpoint_source = RevisionSectionSource(&job.cut_revision);
         let metadata_source = MetadataSectionSource(metadata_record);
         let replication_frames = replication_prefix(&self.replication, replication_cut_frames)?;
-        let retained_historical_generations = self
-            .pinned_historical_generations_for(physical_realization.as_ref());
+        let retained_historical_generations =
+            self.pinned_historical_generations_for(physical_realization.as_ref());
         let archive_outgoing = retained_historical_generations
             .contains(&self.generation)
             .then_some(HistoricalGenerationArchive {

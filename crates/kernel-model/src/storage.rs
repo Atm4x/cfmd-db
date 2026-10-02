@@ -113,7 +113,10 @@ impl RelationRowsDeltaRoot {
     }
 
     fn map_survivor_rank_to_base_position(&self, rank: usize) -> Option<usize> {
-        let base_survivors = self.base.len().saturating_sub(self.removed_base_positions.len());
+        let base_survivors = self
+            .base
+            .len()
+            .saturating_sub(self.removed_base_positions.len());
         if rank >= base_survivors {
             return None;
         }
@@ -130,12 +133,17 @@ impl RelationRowsDeltaRoot {
 
     fn apply_patch(&self, removed_positions: &[usize], inserted: Vec<Vec<Value>>) -> Option<Self> {
         if removed_positions.windows(2).any(|pair| pair[0] >= pair[1])
-            || removed_positions.last().is_some_and(|index| *index >= self.len())
+            || removed_positions
+                .last()
+                .is_some_and(|index| *index >= self.len())
         {
             return None;
         }
 
-        let base_survivors = self.base.len().saturating_sub(self.removed_base_positions.len());
+        let base_survivors = self
+            .base
+            .len()
+            .saturating_sub(self.removed_base_positions.len());
         let mut removed_base_positions = self.removed_base_positions.clone();
         let mut removed_inserted = Vec::new();
         for &position in removed_positions {
@@ -176,7 +184,6 @@ pub(super) enum SharedRelationRowsRepr {
     DeltaRoot(Arc<RelationRowsDeltaRoot>),
 }
 
-
 #[derive(Debug)]
 pub struct SharedRelationRowsStorageProbe {
     removed: Option<PersistentOrdMapStorageProbe<usize, ()>>,
@@ -186,8 +193,13 @@ pub struct SharedRelationRowsStorageProbe {
 impl SharedRelationRowsStorageProbe {
     #[must_use]
     pub fn total_nodes(&self) -> usize {
-        self.removed.as_ref().map_or(0, PersistentOrdMapStorageProbe::total_nodes)
-            + self.inserted.as_ref().map_or(0, PersistentVecStorageProbe::total_nodes)
+        self.removed
+            .as_ref()
+            .map_or(0, PersistentOrdMapStorageProbe::total_nodes)
+            + self
+                .inserted
+                .as_ref()
+                .map_or(0, PersistentVecStorageProbe::total_nodes)
     }
 
     #[must_use]
@@ -251,13 +263,16 @@ impl SharedRelationRows {
             .expect("empty-removal persistent append must be valid")
     }
 
+    #[must_use]
     pub fn patch_persistent(
         &self,
         removed_positions: &[usize],
         inserted: Vec<Vec<Value>>,
     ) -> Option<Self> {
         if removed_positions.windows(2).any(|pair| pair[0] >= pair[1])
-            || removed_positions.last().is_some_and(|index| *index >= self.len())
+            || removed_positions
+                .last()
+                .is_some_and(|index| *index >= self.len())
         {
             return None;
         }
@@ -271,7 +286,7 @@ impl SharedRelationRows {
                     base: Arc::clone(base),
                     removed_base_positions,
                     inserted_tail: PersistentVec::from_vec(inserted),
-                        }
+                }
             }
             SharedRelationRowsRepr::DeltaRoot(root) => {
                 return root
@@ -298,7 +313,6 @@ impl SharedRelationRows {
         }
     }
 
-
     #[must_use]
     pub fn persistent_delta_structural_nodes(&self) -> usize {
         match &self.0 {
@@ -316,22 +330,21 @@ impl SharedRelationRows {
         successor: &Self,
     ) -> SharedRelationRowsStorageProbe {
         match (&self.0, &successor.0) {
-            (SharedRelationRowsRepr::DeltaRoot(current), SharedRelationRowsRepr::DeltaRoot(next))
-                if Arc::ptr_eq(&current.base, &next.base) =>
-            {
-                SharedRelationRowsStorageProbe {
-                    removed: Some(
-                        current
-                            .removed_base_positions
-                            .unique_storage_probe_against(&next.removed_base_positions),
-                    ),
-                    inserted: Some(
-                        current
-                            .inserted_tail
-                            .unique_storage_probe_against(&next.inserted_tail),
-                    ),
-                }
-            }
+            (
+                SharedRelationRowsRepr::DeltaRoot(current),
+                SharedRelationRowsRepr::DeltaRoot(next),
+            ) if Arc::ptr_eq(&current.base, &next.base) => SharedRelationRowsStorageProbe {
+                removed: Some(
+                    current
+                        .removed_base_positions
+                        .unique_storage_probe_against(&next.removed_base_positions),
+                ),
+                inserted: Some(
+                    current
+                        .inserted_tail
+                        .unique_storage_probe_against(&next.inserted_tail),
+                ),
+            },
             _ => SharedRelationRowsStorageProbe {
                 removed: None,
                 inserted: None,
@@ -343,9 +356,10 @@ impl SharedRelationRows {
     pub fn persistent_delta_nodes_new_since(&self, predecessor: &Self) -> usize {
         match (&self.0, &predecessor.0) {
             (SharedRelationRowsRepr::Materialized(_), _) => 0,
-            (SharedRelationRowsRepr::DeltaRoot(current), SharedRelationRowsRepr::DeltaRoot(previous))
-                if Arc::ptr_eq(&current.base, &previous.base) =>
-            {
+            (
+                SharedRelationRowsRepr::DeltaRoot(current),
+                SharedRelationRowsRepr::DeltaRoot(previous),
+            ) if Arc::ptr_eq(&current.base, &previous.base) => {
                 current
                     .removed_base_positions
                     .structural_node_count()
@@ -527,11 +541,15 @@ impl RelationStore {
 
     #[must_use]
     pub fn materialize_owned(&self, relation: &SemanticId) -> Option<Vec<Vec<Value>>> {
-        self.0.get(relation).map(SharedRelationRows::materialize_owned)
+        self.0
+            .get(relation)
+            .map(SharedRelationRows::materialize_owned)
     }
 
     pub fn get_mut(&mut self, relation: &SemanticId) -> Option<&mut Vec<Vec<Value>>> {
-        self.0.get_mut(relation).map(SharedRelationRows::materialized_mut)
+        self.0
+            .get_mut(relation)
+            .map(SharedRelationRows::materialized_mut)
     }
 
     pub fn append_persistent(&mut self, relation: SemanticId, inserted: Vec<Vec<Value>>) {

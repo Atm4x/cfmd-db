@@ -69,7 +69,8 @@ impl DurableRevisionStore {
         let Some(physical) = self.checkpoint_realization.as_ref() else {
             return Ok(None);
         };
-        let Some(revision) = physical.historical_revision(effect_id, &self.semantic_registry)? else {
+        let Some(revision) = physical.historical_revision(effect_id, &self.semantic_registry)?
+        else {
             return Ok(None);
         };
         if revision.id() != anchor.source_revision

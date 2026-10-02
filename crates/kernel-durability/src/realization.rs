@@ -58,13 +58,21 @@ pub struct DurableFactorizedReadSnapshot {
 
 impl DurableFactorizedReadSnapshot {
     #[must_use]
-    pub const fn revision(&self) -> RevisionId { self.revision }
+    pub const fn revision(&self) -> RevisionId {
+        self.revision
+    }
     #[must_use]
-    pub const fn semantic_context(&self) -> &SemanticContext { &self.semantic_context }
+    pub const fn semantic_context(&self) -> &SemanticContext {
+        &self.semantic_context
+    }
     #[must_use]
-    pub const fn atoms(&self) -> &PhysicalAtomStore { &self.atoms }
+    pub const fn atoms(&self) -> &PhysicalAtomStore {
+        &self.atoms
+    }
     #[must_use]
-    pub const fn root(&self) -> &FactorizedRealizationRoot { &self.root }
+    pub const fn root(&self) -> &FactorizedRealizationRoot {
+        &self.root
+    }
 
     pub fn advance_relation_delta(
         &self,
@@ -91,6 +99,10 @@ impl DurableFactorizedReadSnapshot {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn advance_model_delta(
         &self,
         target_revision: RevisionId,
@@ -108,7 +120,10 @@ impl DurableFactorizedReadSnapshot {
             || !delta.lifecycle_roots_removed.is_empty()
             || !delta.lifecycle_keeps_alive.is_empty()
         {
-            let mut lifecycle = match atoms.get(direct.lifecycle).map(|atom| atom.payload()) {
+            let mut lifecycle = match atoms
+                .get(direct.lifecycle)
+                .map(kernel_realization::PhysicalAtom::payload)
+            {
                 Some(PhysicalAtomPayload::Lifecycle(graph)) => graph.clone(),
                 _ => return Err(protocol("historical factorized lifecycle atom is invalid")),
             };
@@ -139,7 +154,10 @@ impl DurableFactorizedReadSnapshot {
 
         for patch in &delta.carriers {
             let mut entities = match direct.carriers.get(&patch.carrier).copied() {
-                Some(atom) => match atoms.get(atom).map(|atom| atom.payload()) {
+                Some(atom) => match atoms
+                    .get(atom)
+                    .map(kernel_realization::PhysicalAtom::payload)
+                {
                     Some(PhysicalAtomPayload::EntityOrder(entities)) => {
                         entities.iter().copied().collect::<BTreeSet<_>>()
                     }
@@ -167,7 +185,10 @@ impl DurableFactorizedReadSnapshot {
         }
         for (field, patches) in field_patches {
             let mut entries = match direct.fields.get(&field) {
-                Some(field_root) => match atoms.get(field_root.atom).map(|atom| atom.payload()) {
+                Some(field_root) => match atoms
+                    .get(field_root.atom)
+                    .map(kernel_realization::PhysicalAtom::payload)
+                {
                     Some(PhysicalAtomPayload::FieldColumnSegment(column)) => column
                         .iter()
                         .map(|(entity, value)| (entity, value.clone()))
@@ -199,13 +220,9 @@ impl DurableFactorizedReadSnapshot {
             let column = FieldColumnSegment::new(entries)
                 .map_err(|_| protocol("historical factorized field patch is invalid"))?;
             let atom = atoms.insert(PhysicalAtomPayload::FieldColumnSegment(column));
-            direct.fields.insert(
-                field,
-                DirectFactorizedFieldRoot {
-                    owner,
-                    atom,
-                },
-            );
+            direct
+                .fields
+                .insert(field, DirectFactorizedFieldRoot { owner, atom });
         }
 
         let root = FactorizedRealizationRoot::from_direct_durable_root(direct);
@@ -308,7 +325,9 @@ impl DurableFactorizedRealization {
             {
                 return Ok(());
             }
-            return Err(protocol("historical realization effect identity conflicts with retained root"));
+            return Err(protocol(
+                "historical realization effect identity conflicts with retained root",
+            ));
         }
 
         let mut merged = self.atoms.clone();
@@ -396,19 +415,17 @@ impl DurableFactorizedRealization {
         let Some(context) = historical.semantic_context.as_ref() else {
             return Ok(None);
         };
-        let state = historical
-            .root
-            .evaluate(&self.atoms)
-            .map_err(|_| protocol("historical realization root cannot materialize its logical state"))?;
+        let state = historical.root.evaluate(&self.atoms).map_err(|_| {
+            protocol("historical realization root cannot materialize its logical state")
+        })?;
         Revision::build(historical.revision, context, registry, state)
             .map(Some)
-            .map_err(|_| protocol("historical realization root is invalid under its semantic context"))
+            .map_err(|_| {
+                protocol("historical realization root is invalid under its semantic context")
+            })
     }
 
-    pub fn release_historical_root(
-        &mut self,
-        effect_id: RevisionEffectId,
-    ) -> bool {
+    pub fn release_historical_root(&mut self, effect_id: RevisionEffectId) -> bool {
         let removed = self.historical_roots.remove(&effect_id).is_some();
         if removed {
             self.prune_unreachable_atoms();
@@ -518,8 +535,10 @@ fn encode_atom_payload(
         }
         PhysicalAtomPayload::Lifecycle(graph) => {
             out.push(6);
-            let mut state = DatabaseState::default();
-            state.lifecycle = graph.clone().into();
+            let state = DatabaseState {
+                lifecycle: graph.clone().into(),
+                ..DatabaseState::default()
+            };
             let mut encoded = Vec::new();
             encode_state(&mut encoded, &state)?;
             push_bytes(out, &encoded)?;
@@ -528,9 +547,13 @@ fn encode_atom_payload(
     Ok(())
 }
 
-fn decode_atom_payload(cursor: &mut impl BinarySource) -> Result<PhysicalAtomPayload, DurabilityError> {
+fn decode_atom_payload(
+    cursor: &mut impl BinarySource,
+) -> Result<PhysicalAtomPayload, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
-        0 => Ok(PhysicalAtomPayload::Value(cursor.value(0).map_err(corrupt)?)),
+        0 => Ok(PhysicalAtomPayload::Value(
+            cursor.value(0).map_err(corrupt)?,
+        )),
         1 => {
             let count = cursor.len().map_err(corrupt)?;
             let mut entities = BTreeSet::new();
@@ -553,7 +576,9 @@ fn decode_atom_payload(cursor: &mut impl BinarySource) -> Result<PhysicalAtomPay
             }
             Ok(PhysicalAtomPayload::EntityOrder(entities))
         }
-        3 => Ok(PhysicalAtomPayload::RelationRows(cursor.rows(0).map_err(corrupt)?)),
+        3 => Ok(PhysicalAtomPayload::RelationRows(
+            cursor.rows(0).map_err(corrupt)?,
+        )),
         4 => {
             let count = cursor.len().map_err(corrupt)?;
             let mut entries = Vec::with_capacity(cursor.bounded_capacity(count));
@@ -698,10 +723,9 @@ fn encode_factorized_realization_authority_into(
         }
         encode_direct_root(
             out,
-            historical
-                .root
-                .to_direct_durable_root()
-                .map_err(|_| protocol("historical realization requires a direct factorized root"))?,
+            historical.root.to_direct_durable_root().map_err(|_| {
+                protocol("historical realization requires a direct factorized root")
+            })?,
         )?;
     }
     Ok(())
@@ -739,7 +763,9 @@ fn decode_direct_root(
     for _ in 0..carrier_count {
         let semantic = SemanticId::new(cursor.u128().map_err(corrupt)?);
         if previous_semantic.is_some_and(|previous| previous >= semantic) {
-            return Err(corrupt("durable carriers are not strictly sorted and unique"));
+            return Err(corrupt(
+                "durable carriers are not strictly sorted and unique",
+            ));
         }
         previous_semantic = Some(semantic);
         carriers.insert(
@@ -770,7 +796,9 @@ fn decode_direct_root(
     for _ in 0..relation_count {
         let relation = SemanticId::new(cursor.u128().map_err(corrupt)?);
         if previous_semantic.is_some_and(|previous| previous >= relation) {
-            return Err(corrupt("durable relations are not strictly sorted and unique"));
+            return Err(corrupt(
+                "durable relations are not strictly sorted and unique",
+            ));
         }
         previous_semantic = Some(relation);
         let row_count = usize::try_from(cursor.u64().map_err(corrupt)?)
@@ -782,13 +810,12 @@ fn decode_direct_root(
         for _ in 0..column_count {
             let column = SemanticId::new(cursor.u128().map_err(corrupt)?);
             if !seen_columns.insert(column) {
-                return Err(corrupt("durable relation column order contains a duplicate"));
+                return Err(corrupt(
+                    "durable relation column order contains a duplicate",
+                ));
             }
             column_order.push(column);
-            column_atoms.insert(
-                column,
-                PhysicalAtomId::new(cursor.u128().map_err(corrupt)?),
-            );
+            column_atoms.insert(column, PhysicalAtomId::new(cursor.u128().map_err(corrupt)?));
         }
         relations.insert(
             relation,
@@ -839,7 +866,9 @@ fn decode_durable_factorized_realization_from_source(
         for _ in 0..historical_count {
             let effect_id = RevisionEffectId(cursor.u128().map_err(corrupt)?);
             if previous_effect.is_some_and(|previous| previous >= effect_id) {
-                return Err(corrupt("historical realization roots are not strictly sorted and unique"));
+                return Err(corrupt(
+                    "historical realization roots are not strictly sorted and unique",
+                ));
             }
             previous_effect = Some(effect_id);
             let historical_revision = RevisionId::new(cursor.u64().map_err(corrupt)?);
@@ -849,7 +878,9 @@ fn decode_durable_factorized_realization_from_source(
                     1 => {
                         let context_version = cursor.u16().map_err(corrupt)?;
                         if context_version > crate::checkpoint::CHECKPOINT_CODEC_VERSION {
-                            return Err(corrupt("historical semantic context codec is unsupported"));
+                            return Err(corrupt(
+                                "historical semantic context codec is unsupported",
+                            ));
                         }
                         Some(crate::checkpoint::decode_context(cursor, context_version)?)
                     }
@@ -938,12 +969,12 @@ mod tests {
 
     use kernel_change::RevisionEffectId;
     use kernel_model::{DatabaseState, Value};
+    use kernel_query::{RelExpr, RelationDelta};
     use kernel_realization::{
         DirectFactorizedFieldRoot, DirectFactorizedRealizationRoot, DirectFactorizedRelationRoot,
         FactorizedRealizationRoot, FieldColumnSegment, PhysicalAtomPayload, PhysicalAtomStore,
         RelationColumnSegment, realize_database_state_factorized,
     };
-    use kernel_query::{RelExpr, RelationDelta};
     use kernel_schema::{
         FieldDef, RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext,
         SemanticEnvironment, TypeExpr,
@@ -957,8 +988,7 @@ mod tests {
     };
 
     use super::{
-        DurableFactorizedRealization, decode_factorized_realization,
-        encode_factorized_realization,
+        DurableFactorizedRealization, decode_factorized_realization, encode_factorized_realization,
     };
 
     fn fixture() -> (
@@ -978,8 +1008,8 @@ mod tests {
         let value = atoms.insert(PhysicalAtomPayload::FieldColumnSegment(
             FieldColumnSegment::new([(entity, Value::I64(7))]).unwrap(),
         ));
-        let root = FactorizedRealizationRoot::from_direct_durable_root(
-            DirectFactorizedRealizationRoot {
+        let root =
+            FactorizedRealizationRoot::from_direct_durable_root(DirectFactorizedRealizationRoot {
                 lifecycle,
                 carriers: BTreeMap::from([(entity_type, carrier)]),
                 fields: BTreeMap::from([(
@@ -990,8 +1020,7 @@ mod tests {
                     },
                 )]),
                 relations: BTreeMap::new(),
-            },
-        );
+            });
         (atoms, root, field, entity)
     }
 
@@ -1099,17 +1128,22 @@ mod tests {
             .carriers
             .insert(entity_type, [first].into_iter().collect());
         source.model.fields.insert((field, first), Value::I64(1));
-        source.model.relations.insert(relation, vec![vec![]].into());
+        source.model.relations.insert(relation, vec![vec![]]);
 
         let mut target = source.clone();
         target.lifecycle.entities.insert(second);
         target.lifecycle.roots.insert(second);
-        target.model.carriers.get_mut(&entity_type).unwrap().insert(second);
+        target
+            .model
+            .carriers
+            .get_mut(&entity_type)
+            .unwrap()
+            .insert(second);
         target.model.fields.insert((field, second), Value::I64(2));
         target
             .model
             .relations
-            .insert(relation, vec![vec![], vec![]].into());
+            .insert(relation, vec![vec![], vec![]]);
 
         let (atoms, root) = realize_database_state_factorized(&source, &context).unwrap();
         let snapshot = super::DurableFactorizedReadSnapshot {
@@ -1118,7 +1152,9 @@ mod tests {
             atoms,
             root,
         };
-        let result_type = RelExpr::Scan(relation).typecheck(&context, &registry).unwrap();
+        let result_type = RelExpr::Scan(relation)
+            .typecheck(&context, &registry)
+            .unwrap();
         let relation_delta = RelationDelta {
             inserted: vec![vec![]],
             removed: Vec::new(),
@@ -1138,10 +1174,13 @@ mod tests {
     fn direct_realization_roundtrips_without_logical_state_reconstruction() {
         let (atoms, root, field, entity) = fixture();
         let bytes = encode_factorized_realization(RevisionId::new(42), &atoms, &root).unwrap();
-        let (revision, decoded_atoms, decoded_root) = decode_factorized_realization(&bytes).unwrap();
+        let (revision, decoded_atoms, decoded_root) =
+            decode_factorized_realization(&bytes).unwrap();
         assert_eq!(revision, RevisionId::new(42));
         assert_eq!(
-            decoded_root.read_field(&decoded_atoms, field, entity).unwrap(),
+            decoded_root
+                .read_field(&decoded_atoms, field, entity)
+                .unwrap(),
             Value::I64(7)
         );
         assert_eq!(decoded_root.dependencies(), root.dependencies());
@@ -1156,11 +1195,7 @@ mod tests {
             historical_root.clone(),
         )
         .unwrap();
-        let old_atom = historical_root
-            .to_direct_durable_root()
-            .unwrap()
-            .fields[&field]
-            .atom;
+        let old_atom = historical_root.to_direct_durable_root().unwrap().fields[&field].atom;
 
         let mut current_atoms = historical_atoms;
         let new_atom = current_atoms.insert(PhysicalAtomPayload::FieldColumnSegment(
@@ -1169,12 +1204,9 @@ mod tests {
         let mut current_direct = historical_root.to_direct_durable_root().unwrap();
         current_direct.fields.get_mut(&field).unwrap().atom = new_atom;
         let current_root = FactorizedRealizationRoot::from_direct_durable_root(current_direct);
-        let mut current = DurableFactorizedRealization::new(
-            RevisionId::new(42),
-            current_atoms,
-            current_root,
-        )
-        .unwrap();
+        let mut current =
+            DurableFactorizedRealization::new(RevisionId::new(42), current_atoms, current_root)
+                .unwrap();
         let effect_id = RevisionEffectId(700);
         current
             .retain_historical_root(effect_id, &historical)
@@ -1191,7 +1223,10 @@ mod tests {
             Value::I64(7)
         );
         assert_eq!(
-            current.root().read_field(current.atoms(), field, entity).unwrap(),
+            current
+                .root()
+                .read_field(current.atoms(), field, entity)
+                .unwrap(),
             Value::I64(9)
         );
 
@@ -1214,22 +1249,34 @@ mod tests {
         let mut base_atoms = lineage_atoms.clone();
         base_atoms.retain(&base_root.dependencies());
         roots.push(
-            DurableFactorizedRealization::new(RevisionId::new(10_000), base_atoms, base_root.clone())
-                .unwrap(),
+            DurableFactorizedRealization::new(
+                RevisionId::new(10_000),
+                base_atoms,
+                base_root.clone(),
+            )
+            .unwrap(),
         );
 
         let mut direct = base_root.to_direct_durable_root().unwrap();
         for index in 0..64_u64 {
             let atom = lineage_atoms.insert(PhysicalAtomPayload::FieldColumnSegment(
-                FieldColumnSegment::new([(entity, Value::I64(100 + index as i64))]).unwrap(),
+                FieldColumnSegment::new([(
+                    entity,
+                    Value::I64(100 + i64::try_from(index).expect("fixture value fits i64")),
+                )])
+                .unwrap(),
             ));
             direct.fields.get_mut(&field).unwrap().atom = atom;
             let root = FactorizedRealizationRoot::from_direct_durable_root(direct.clone());
             let mut exact_atoms = lineage_atoms.clone();
             exact_atoms.retain(&root.dependencies());
             roots.push(
-                DurableFactorizedRealization::new(RevisionId::new(10_001 + index), exact_atoms, root)
-                    .unwrap(),
+                DurableFactorizedRealization::new(
+                    RevisionId::new(10_001 + index),
+                    exact_atoms,
+                    root,
+                )
+                .unwrap(),
             );
         }
 
@@ -1285,8 +1332,8 @@ mod tests {
         let second = atoms.insert(PhysicalAtomPayload::RelationColumnSegment(
             RelationColumnSegment::new(vec![Value::I64(2)]),
         ));
-        let root = FactorizedRealizationRoot::from_direct_durable_root(
-            DirectFactorizedRealizationRoot {
+        let root =
+            FactorizedRealizationRoot::from_direct_durable_root(DirectFactorizedRealizationRoot {
                 lifecycle,
                 carriers: BTreeMap::new(),
                 fields: BTreeMap::new(),
@@ -1301,8 +1348,7 @@ mod tests {
                         row_count: 1,
                     },
                 )]),
-            },
-        );
+            });
         let bytes = encode_factorized_realization(RevisionId::new(7), &atoms, &root).unwrap();
         let (_, decoded_atoms, decoded_root) = decode_factorized_realization(&bytes).unwrap();
         assert_eq!(
@@ -1327,8 +1373,8 @@ mod tests {
             (*DatabaseState::default().lifecycle).clone(),
         ));
         let carrier = atoms.insert(PhysicalAtomPayload::EntityOrder(vec![entity]));
-        let root = FactorizedRealizationRoot::from_direct_durable_root(
-            DirectFactorizedRealizationRoot {
+        let root =
+            FactorizedRealizationRoot::from_direct_durable_root(DirectFactorizedRealizationRoot {
                 lifecycle,
                 carriers: BTreeMap::from([(entity_type, carrier)]),
                 fields: BTreeMap::from([(
@@ -1339,8 +1385,7 @@ mod tests {
                     },
                 )]),
                 relations: BTreeMap::new(),
-            },
-        );
+            });
         assert!(encode_factorized_realization(RevisionId::new(1), &atoms, &root).is_err());
     }
 
@@ -1355,9 +1400,8 @@ mod tests {
             entity.raw()
         ));
         let _ = std::fs::remove_file(&path);
-        let encryption = StorageEncryption::aes256_gcm_siv(
-            StorageEncryptionKey::try_new([0x6d; 32]).unwrap(),
-        );
+        let encryption =
+            StorageEncryption::aes256_gcm_siv(StorageEncryptionKey::try_new([0x6d; 32]).unwrap());
         let container = SingleFileContainer::create_with_encryption(
             &path,
             &[SingleFileSectionInput::physical_realization(&bytes)],
@@ -1372,7 +1416,9 @@ mod tests {
             .unwrap();
         assert_eq!(opened_revision, revision);
         assert_eq!(
-            opened_root.read_field(&opened_atoms, field, entity).unwrap(),
+            opened_root
+                .read_field(&opened_atoms, field, entity)
+                .unwrap(),
             Value::I64(7)
         );
         drop(reopened);
@@ -1399,9 +1445,13 @@ mod tests {
         let committed_len = std::fs::metadata(&path).unwrap().len();
 
         let old_dependencies = root.dependencies();
-        root.materialize_field_column(&mut atoms, field, [entity]).unwrap();
+        root.materialize_field_column(&mut atoms, field, [entity])
+            .unwrap();
         assert_ne!(root.dependencies(), old_dependencies);
-        assert_eq!(root.read_field(&atoms, field, entity).unwrap(), Value::I64(7));
+        assert_eq!(
+            root.read_field(&atoms, field, entity).unwrap(),
+            Value::I64(7)
+        );
         let second = encode_factorized_realization(revision, &atoms, &root).unwrap();
         drop(container);
 
@@ -1420,7 +1470,9 @@ mod tests {
             .unwrap();
         assert_eq!(active_revision, revision);
         assert_eq!(
-            active_root.read_field(&active_atoms, field, entity).unwrap(),
+            active_root
+                .read_field(&active_atoms, field, entity)
+                .unwrap(),
             Value::I64(7)
         );
         assert_eq!(active_root.dependencies(), old_dependencies);
@@ -1450,7 +1502,9 @@ mod tests {
             .unwrap();
         assert_eq!(active_revision, revision);
         assert_eq!(
-            active_root.read_field(&active_atoms, field, entity).unwrap(),
+            active_root
+                .read_field(&active_atoms, field, entity)
+                .unwrap(),
             Value::I64(7)
         );
         assert_eq!(active_root.dependencies(), root.dependencies());

@@ -2800,10 +2800,13 @@ fn provider_rotation_rewraps_dmk_without_rewriting_database_ciphertext() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     use cfmd_runtime::{
-        ErrorKind, Id, Object, Permission, PermissionSet, PrincipalId, Query,
-        RowCodec, Session,
+        ErrorKind, Id, Object, Permission, PermissionSet, PrincipalId, Query, RowCodec, Session,
     };
 
     let directory = temp_directory();
@@ -2872,16 +2875,20 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
             .kind(),
         ErrorKind::PermissionDenied
     );
-    let countries = field_writer.objects::<Country>().expect("write-only countries handle");
+    let countries = field_writer
+        .objects::<Country>()
+        .expect("write-only countries handle");
     let mut tx = field_writer
         .transaction_with_id(TransactionId::new(9_202))
         .expect("field transaction");
     countries
-        .set(&mut tx, Id::new(1), |country| country.code(), "DE".to_owned())
+        .set(&mut tx, Id::new(1), CountryFields::code, "DE".to_owned())
         .expect("authorized semantic field patch");
     field_writer.commit(&tx).expect("field-only commit");
 
-    let mut raw_plan = field_writer.plan().expect("granular writer can form a plan");
+    let mut raw_plan = field_writer
+        .plan()
+        .expect("granular writer can form a plan");
     raw_plan.insert(
         Country::relation_id(),
         Country {
@@ -2902,7 +2909,9 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
         PrincipalId::new(303),
         PermissionSet::from([Permission::CreateObject(Country::relation_id())]),
     ));
-    let creator_countries = creator.objects::<Country>().expect("create-only countries handle");
+    let creator_countries = creator
+        .objects::<Country>()
+        .expect("create-only countries handle");
     let mut create_tx = creator
         .transaction_with_id(TransactionId::new(9_204))
         .expect("create-only transaction");
@@ -2917,7 +2926,9 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
         .expect("semantic create planning");
     creator.commit(&create_tx).expect("create-only commit");
 
-    let mut raw_create = creator.plan().expect("create authority can form low-level plan");
+    let mut raw_create = creator
+        .plan()
+        .expect("create authority can form low-level plan");
     raw_create.insert(
         Country::relation_id(),
         Country {
@@ -2938,7 +2949,9 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
         PrincipalId::new(304),
         PermissionSet::from([Permission::DeleteObject(Country::relation_id())]),
     ));
-    let delete_countries = deleter.objects::<Country>().expect("delete-only countries handle");
+    let delete_countries = deleter
+        .objects::<Country>()
+        .expect("delete-only countries handle");
     let mut delete_tx = deleter
         .transaction_with_id(TransactionId::new(9_206))
         .expect("delete-only transaction");
@@ -3068,14 +3081,14 @@ fn roles_flatten_into_exact_permissions_and_model_metadata_is_separate_authority
         relation: Country::relation_id(),
         field: code_field,
     });
-    let observer = database.session(Session::from_roles(
-        PrincipalId::new(442_001),
-        [&reader],
-    ));
+    let observer = database.session(Session::from_roles(PrincipalId::new(442_001), [&reader]));
     let snapshot = observer.snapshot().expect("field reader snapshot");
     assert_eq!(snapshot.schema_revision(), 1);
     assert_eq!(
-        snapshot.schema().expect_err("model metadata must stay hidden").kind(),
+        snapshot
+            .schema()
+            .expect_err("model metadata must stay hidden")
+            .kind(),
         ErrorKind::PermissionDenied
     );
 
@@ -3086,15 +3099,20 @@ fn roles_flatten_into_exact_permissions_and_model_metadata_is_separate_authority
     ));
     let snapshot = observer.snapshot().expect("model reader snapshot");
     assert_eq!(
-        snapshot.schema().expect("model metadata authority").revision(),
+        snapshot
+            .schema()
+            .expect("model metadata authority")
+            .revision(),
         snapshot.schema_revision()
     );
 
     assert_eq!(reader.name(), "country-code-reader");
-    assert!(PermissionSet::from_roles([&reader]).contains(Permission::ReadField {
-        relation: Country::relation_id(),
-        field: code_field,
-    }));
+    assert!(
+        PermissionSet::from_roles([&reader]).contains(Permission::ReadField {
+            relation: Country::relation_id(),
+            field: code_field,
+        })
+    );
 
     drop(database);
     fs::remove_dir_all(directory).expect("remove fixture directory");
@@ -3109,9 +3127,15 @@ fn schema_migration_requires_dedicated_authority_not_generic_write() {
 
     let directory = temp_directory();
     fs::create_dir_all(&directory).expect("create fixture directory");
-    let source = Schema::builder().revisions(442, 1).build().expect("source schema");
+    let source = Schema::builder()
+        .revisions(442, 1)
+        .build()
+        .expect("source schema");
     let database = Database::create(&directory, source).expect("create database");
-    let target = Schema::builder().revisions(443, 1).build().expect("target schema");
+    let target = Schema::builder()
+        .revisions(443, 1)
+        .build()
+        .expect("target schema");
     let migration = MigrationModel::new(442_443, target);
 
     let generic_writer = database.session(Session::new(
@@ -3132,10 +3156,8 @@ fn schema_migration_requires_dedicated_authority_not_generic_write() {
     assert_eq!(database.snapshot().expect("head").schema_revision(), 442);
 
     let migrator = Role::new("schema-migrator").grant(Permission::SchemaMigrate);
-    let migration_session = database.session(Session::from_roles(
-        PrincipalId::new(442_004),
-        [&migrator],
-    ));
+    let migration_session =
+        database.session(Session::from_roles(PrincipalId::new(442_004), [&migrator]));
     migration_session
         .migrate(
             &migration,
@@ -3143,7 +3165,13 @@ fn schema_migration_requires_dedicated_authority_not_generic_write() {
             MigrationHistoryPolicy::Forget,
         )
         .expect("dedicated migration authority");
-    assert_eq!(database.snapshot().expect("migrated head").schema_revision(), 443);
+    assert_eq!(
+        database
+            .snapshot()
+            .expect("migrated head")
+            .schema_revision(),
+        443
+    );
 
     drop(database);
     fs::remove_dir_all(directory).expect("remove fixture directory");

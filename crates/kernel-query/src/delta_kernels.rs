@@ -15,13 +15,19 @@ pub(super) fn rel_delta_scan(
     let prepared = RelExpr::Scan(relation).prepare(context, registry)?;
     let result_type = prepared.result_type().clone();
     let column_equivalences = relation_column_equivalences(&result_type);
-    let old_rows = old.relations.materialize_owned(&relation).unwrap_or_default();
+    let old_rows = old
+        .relations
+        .materialize_owned(&relation)
+        .unwrap_or_default();
     let next = match change {
         Change::NoChange => old,
         Change::Replace(next) => next,
         Change::Fine(fine) => fine.endpoint(),
     };
-    let next_rows = next.relations.materialize_owned(&relation).unwrap_or_default();
+    let next_rows = next
+        .relations
+        .materialize_owned(&relation)
+        .unwrap_or_default();
     Ok(RelationDelta {
         inserted: unmatched_semantic_rows(
             &next_rows,

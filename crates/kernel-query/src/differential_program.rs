@@ -2,12 +2,11 @@ use super::{
     BTreeMap, BTreeSet, BlockerBuildSpec, Change, CompiledDeltaProgram, Impact,
     MaintainedBlockerKind, MaterializedBlockerDeltaState, MaterializedGroupDeltaState,
     MaterializedJoinDeltaState, MaterializedSetSupportState, MaterializedTopKDeltaState, NodeId,
-    PreparedRelGraph, RelExpr,
-    RelQueryError, RelType, RelationDelta, Value, canonical_row_multiset_counts,
-    collect_rel_source_relations, materialize_exact_quotient_delta_view, rel_delta_distinct,
-    rel_delta_filter, rel_delta_filter_columns, rel_delta_filter_order_const,
-    rel_delta_project_bag, rel_delta_project_set, rel_delta_scan, rel_impact_by_recompute,
-    relation_column_equivalences,
+    PreparedRelGraph, RelExpr, RelQueryError, RelType, RelationDelta, Value,
+    canonical_row_multiset_counts, collect_rel_source_relations,
+    materialize_exact_quotient_delta_view, rel_delta_distinct, rel_delta_filter,
+    rel_delta_filter_columns, rel_delta_filter_order_const, rel_delta_project_bag,
+    rel_delta_project_set, rel_delta_scan, rel_impact_by_recompute, relation_column_equivalences,
 };
 
 /// Exact differential class of a relational operator.
@@ -529,20 +528,11 @@ impl RelDifferentialNode {
 
         let mut old_support_rows = left_expr.evaluate(old, context, registry)?.into_rows();
         old_support_rows.extend(right_expr.evaluate(old, context, registry)?.into_rows());
-        let mut supports = MaterializedSetSupportState::build(
-            &old_support_rows,
-            result_type,
-            context,
-            registry,
-        )?;
+        let mut supports =
+            MaterializedSetSupportState::build(&old_support_rows, result_type, context, registry)?;
         left_delta.inserted.extend(right_delta.inserted);
         left_delta.removed.extend(right_delta.removed);
-        supports.apply_rows_delta(
-            left_delta.inserted,
-            left_delta.removed,
-            context,
-            registry,
-        )
+        supports.apply_rows_delta(left_delta.inserted, left_delta.removed, context, registry)
     }
 
     fn apply_blocker(

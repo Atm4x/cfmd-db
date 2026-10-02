@@ -171,7 +171,8 @@ impl PermissionSet {
     }
 
     fn can_write_field(&self, relation: RelationId, field: RelationColumnId) -> bool {
-        self.can_write_relation(relation) || self.contains(Permission::WriteField { relation, field })
+        self.can_write_relation(relation)
+            || self.contains(Permission::WriteField { relation, field })
     }
 
     fn can_mutate_action(&self, relation: RelationId, action: crate::plan::MutationAction) -> bool {
@@ -181,8 +182,12 @@ impl PermissionSet {
         let permission = match action {
             crate::plan::MutationAction::ObjectCreate => Permission::CreateObject(relation),
             crate::plan::MutationAction::ObjectDelete => Permission::DeleteObject(relation),
-            crate::plan::MutationAction::RelationshipAttach => Permission::AttachRelationship(relation),
-            crate::plan::MutationAction::RelationshipDetach => Permission::DetachRelationship(relation),
+            crate::plan::MutationAction::RelationshipAttach => {
+                Permission::AttachRelationship(relation)
+            }
+            crate::plan::MutationAction::RelationshipDetach => {
+                Permission::DetachRelationship(relation)
+            }
             crate::plan::MutationAction::RelationshipMove => Permission::MoveRelationship(relation),
         };
         self.contains(permission)
@@ -264,7 +269,10 @@ impl Session {
     }
 
     #[must_use]
-    pub fn from_roles<'a>(principal: PrincipalId, roles: impl IntoIterator<Item = &'a Role>) -> Self {
+    pub fn from_roles<'a>(
+        principal: PrincipalId,
+        roles: impl IntoIterator<Item = &'a Role>,
+    ) -> Self {
         Self::new(principal, PermissionSet::from_roles(roles))
     }
 

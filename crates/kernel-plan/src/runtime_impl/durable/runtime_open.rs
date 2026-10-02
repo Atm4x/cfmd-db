@@ -45,7 +45,7 @@ impl DurableRuntime {
                 inserted: rewrite.rewrite.delta().inserted.clone(),
                 removed: rewrite.rewrite.delta().removed.clone(),
                 object_field_writes: Vec::new(),
-                authorization: Default::default(),
+                authorization: kernel_durability::DurableRelationAuthorization::default(),
             });
             intents.push(DurableRelationRewriteIntent {
                 relation: rewrite.relation,

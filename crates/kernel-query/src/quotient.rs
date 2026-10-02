@@ -76,13 +76,10 @@ impl CanonicalRowPositionIndex {
 
     pub(super) fn push_key(&mut self, key: CanonicalRowKey) {
         let position = self.by_position.len();
-        let (shared_key, mut bucket) = self
-            .by_key
-            .get_key_value(&key)
-            .map_or_else(
-                || (Arc::new(key), PersistentVec::default()),
-                |(shared, bucket)| (Arc::clone(shared), bucket.clone()),
-            );
+        let (shared_key, mut bucket) = self.by_key.get_key_value(&key).map_or_else(
+            || (Arc::new(key), PersistentVec::default()),
+            |(shared, bucket)| (Arc::clone(shared), bucket.clone()),
+        );
         let bucket_slot = bucket.len();
         bucket.push(position);
         self.by_key.insert(Arc::clone(&shared_key), bucket);
@@ -158,7 +155,7 @@ mod position_index_tests {
 
     #[test]
     fn position_index_shares_one_canonical_payload_per_gamma_class() {
-        let keys = vec![key(1), key(1), key(2), key(1), key(2)];
+        let keys = [key(1), key(1), key(2), key(1), key(2)];
         let index = canonical_row_position_index_from_keys(keys.iter());
 
         assert_eq!(index.by_key.len(), 2);
@@ -174,7 +171,7 @@ mod position_index_tests {
 
     #[test]
     fn position_index_swap_remove_preserves_shared_class_payloads() {
-        let keys = vec![key(1), key(2), key(1), key(3)];
+        let keys = [key(1), key(2), key(1), key(3)];
         let mut index = canonical_row_position_index_from_keys(keys.iter());
         index.remove_position(1);
         index.push_key(key(3));
@@ -196,13 +193,12 @@ mod position_index_tests {
         use std::time::Instant;
 
         for (label, keys) in [
-            (
-                "unique-100k",
-                (0..100_000_i64).map(key).collect::<Vec<_>>(),
-            ),
+            ("unique-100k", (0..100_000_i64).map(key).collect::<Vec<_>>()),
             (
                 "repeated-100k-1024-classes",
-                (0..100_000_i64).map(|value| key(value % 1024)).collect::<Vec<_>>(),
+                (0..100_000_i64)
+                    .map(|value| key(value % 1024))
+                    .collect::<Vec<_>>(),
             ),
         ] {
             let started = Instant::now();

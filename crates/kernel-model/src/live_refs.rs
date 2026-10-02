@@ -67,7 +67,10 @@ impl LiveRefSensitivityIndex {
             .iter()
             .map(|(&relation, rows)| {
                 let materialized = rows.materialize_owned();
-                (relation, Arc::new(Self::compile_relation(&materialized, ids)))
+                (
+                    relation,
+                    Arc::new(Self::compile_relation(&materialized, ids)),
+                )
             })
             .collect();
         Self {

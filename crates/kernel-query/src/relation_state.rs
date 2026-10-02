@@ -10,7 +10,10 @@ use super::{
 use kernel_persistent::{
     PersistentOrdMap, PersistentOrdMapStorageProbe, PersistentVec, PersistentVecStorageProbe,
 };
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// Persistent FIFO of stable occurrences for one Γ-class.  The head offset
 /// makes Bag removals follow logical survivor-order without O(class-size)
@@ -24,14 +27,19 @@ struct OccurrenceBucket {
 
 impl OccurrenceBucket {
     fn from_vec(handles: Vec<kernel_types::StableRowHandle>) -> Self {
-        Self { handles: PersistentVec::from_vec(handles), head: 0 }
+        Self {
+            handles: PersistentVec::from_vec(handles),
+            head: 0,
+        }
     }
 
     fn len(&self) -> usize {
         self.handles.len().saturating_sub(self.head)
     }
 
-    fn is_empty(&self) -> bool { self.len() == 0 }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     fn iter(&self) -> impl Iterator<Item = &kernel_types::StableRowHandle> {
         self.handles.iter().skip(self.head)
@@ -56,9 +64,12 @@ impl OccurrenceBucket {
 
 impl<'a> IntoIterator for &'a OccurrenceBucket {
     type Item = &'a kernel_types::StableRowHandle;
-    type IntoIter = std::iter::Skip<kernel_persistent::PersistentVecIter<'a, kernel_types::StableRowHandle>>;
+    type IntoIter =
+        std::iter::Skip<kernel_persistent::PersistentVecIter<'a, kernel_types::StableRowHandle>>;
 
-    fn into_iter(self) -> Self::IntoIter { self.handles.iter().skip(self.head) }
+    fn into_iter(self) -> Self::IntoIter {
+        self.handles.iter().skip(self.head)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +87,7 @@ pub struct RelationDelta {
 pub struct RelationOccurrenceCertificate {
     result_type: RelType,
     semantic_context: kernel_schema::SemanticContext,
-    occurrences:
-        PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+    occurrences: PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
     row_count: usize,
 }
 
@@ -119,11 +129,8 @@ impl RelationRowCanonicalizer {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, RelQueryError> {
-        let canonicalizers = RelationBaseWitness::compile_canonicalizers(
-            &result_type,
-            context,
-            registry,
-        )?;
+        let canonicalizers =
+            RelationBaseWitness::compile_canonicalizers(&result_type, context, registry)?;
         Ok(Self {
             authority: Arc::new(RelationCanonicalAuthority {
                 result_type,
@@ -295,7 +302,8 @@ impl RelationScanOccurrenceSeed {
     ) -> Result<(), RelQueryError> {
         if prepared.relation() != self.relation
             || removed_positions.len() != prepared.removed_occurrence_keys().len()
-            || prepared.inserted_occurrence_keys().len() != prepared.inserted_occurrence_handles().len()
+            || prepared.inserted_occurrence_keys().len()
+                != prepared.inserted_occurrence_handles().len()
         {
             return Err(RelQueryError::StructuralRewriteBaseMismatch);
         }
@@ -317,7 +325,6 @@ impl RelationScanOccurrenceSeed {
         }
         Ok(())
     }
-
 }
 
 impl RelationOccurrenceCertificate {
@@ -363,7 +370,7 @@ impl RelationOccurrenceCertificate {
     pub(crate) fn from_dense_set_keys(
         result_type: RelType,
         context: &kernel_schema::SemanticContext,
-        canonical_keys_by_row: CanonicalRowEvidence,
+        canonical_keys_by_row: &CanonicalRowEvidence,
     ) -> Result<Self, RelQueryError> {
         let row_count = canonical_keys_by_row.len();
         let strictly_sorted = canonical_keys_by_row
@@ -406,7 +413,12 @@ impl RelationOccurrenceCertificate {
                 .collect(),
         )
         .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-        if occurrences.values().map(OccurrenceBucket::len).sum::<usize>() != row_count {
+        if occurrences
+            .values()
+            .map(OccurrenceBucket::len)
+            .sum::<usize>()
+            != row_count
+        {
             return Err(RelQueryError::InconsistentIncrementalDelta);
         }
         Ok(Self {
@@ -460,10 +472,8 @@ pub struct RelationBaseWitness {
     result_type: RelType,
     semantic_context: kernel_schema::SemanticContext,
     canonicalizers: Vec<kernel_semantics::CompiledEquivalence>,
-    occurrences:
-        PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
-    ordered_occurrences:
-        PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
+    occurrences: PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+    ordered_occurrences: PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
     next_occurrence_slot: usize,
     authority: Arc<()>,
 }
@@ -493,8 +503,7 @@ impl RelationWitnessStorageStats {
 #[derive(Debug)]
 pub struct RelationWitnessStorageProbe {
     occurrence_map: PersistentOrdMapStorageProbe<CanonicalRowKey, OccurrenceBucket>,
-    ordered_map:
-        PersistentOrdMapStorageProbe<kernel_types::StableRowHandle, CanonicalRowKey>,
+    ordered_map: PersistentOrdMapStorageProbe<kernel_types::StableRowHandle, CanonicalRowKey>,
     bucket_vectors: Vec<PersistentVecStorageProbe<kernel_types::StableRowHandle>>,
 }
 
@@ -532,10 +541,8 @@ impl RelationWitnessStorageProbe {
 }
 
 struct RelationSupportTransition {
-    occurrences:
-        PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
-    ordered_occurrences:
-        PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
+    occurrences: PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+    ordered_occurrences: PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
     next_occurrence_slot: usize,
     removed_keys: Vec<CanonicalRowKey>,
     inserted_keys: Vec<CanonicalRowKey>,
@@ -588,8 +595,10 @@ impl RelationBaseWitness {
             ordered.push((handle, key.clone()));
             grouped.entry(key.clone()).or_default().push(handle);
         }
-        if matches!(self.result_type.semantics, kernel_schema::RelationSemantics::Set { .. })
-            && grouped.values().any(|handles| handles.len() != 1)
+        if matches!(
+            self.result_type.semantics,
+            kernel_schema::RelationSemantics::Set { .. }
+        ) && grouped.values().any(|handles| handles.len() != 1)
         {
             return Err(RelQueryError::InconsistentIncrementalDelta);
         }
@@ -635,13 +644,10 @@ impl RelationBaseWitness {
     /// gives the exact structural-node growth retained by pinning the lineage.
     #[must_use]
     pub fn structural_nodes_new_since(&self, predecessor: &Self) -> usize {
-        let occurrence_map_nodes = self
-            .occurrences
-            .structural_node_count()
-            .saturating_sub(
-                self.occurrences
-                    .shared_structural_node_count_with(&predecessor.occurrences),
-            );
+        let occurrence_map_nodes = self.occurrences.structural_node_count().saturating_sub(
+            self.occurrences
+                .shared_structural_node_count_with(&predecessor.occurrences),
+        );
         let ordered_map_nodes = self
             .ordered_occurrences
             .structural_node_count()
@@ -804,14 +810,16 @@ impl RelationBaseWitness {
                 .zip(&canonicalizers)
                 .enumerate()
             {
-                let value = column
-                    .get(slot)
-                    .ok_or(RelQueryError::TypeMismatch)?;
+                let value = column.get(slot).ok_or(RelQueryError::TypeMismatch)?;
                 let _ = ordinal;
                 if !value_shape_matches_type(value, ty) {
                     return Err(RelQueryError::TypeMismatch);
                 }
-                key.push(equivalence.canonical_key(value).map_err(RelQueryError::from)?);
+                key.push(
+                    equivalence
+                        .canonical_key(value)
+                        .map_err(RelQueryError::from)?,
+                );
             }
             keyed_occurrences.push((
                 key,
@@ -846,7 +854,11 @@ impl RelationBaseWitness {
         }
         equivalences
             .iter()
-            .map(|equivalence| registry.compile_equivalence(context, *equivalence).map_err(Into::into))
+            .map(|equivalence| {
+                registry
+                    .compile_equivalence(context, *equivalence)
+                    .map_err(Into::into)
+            })
             .collect()
     }
 
@@ -871,7 +883,9 @@ impl RelationBaseWitness {
         let ordered_occurrences = PersistentOrdMap::from_sorted_unique_owned(ordered)
             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
 
-        keyed_occurrences.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        keyed_occurrences.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
         let mut grouped = Vec::<(CanonicalRowKey, Vec<kernel_types::StableRowHandle>)>::new();
         for (key, handle) in keyed_occurrences {
             if let Some((last_key, handles)) = grouped.last_mut()
@@ -908,7 +922,8 @@ impl RelationBaseWitness {
     fn ordered_occurrences_from_support(
         occurrences: &PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
         row_count: usize,
-    ) -> Result<PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>, RelQueryError> {
+    ) -> Result<PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>, RelQueryError>
+    {
         let mut ordered = Vec::with_capacity(row_count);
         for (key, handles) in occurrences {
             for handle in handles {
@@ -927,7 +942,9 @@ impl RelationBaseWitness {
     /// authority. Occurrence buckets remove the oldest live handle, matching
     /// logical survivor-order for both Set and Bag; stable slots are monotone
     /// creation ordinals, so ordered live occurrences are survivor-order + append.
-    pub fn logical_scan_occurrence_seed(&self) -> Result<RelationScanOccurrenceSeed, RelQueryError> {
+    pub fn logical_scan_occurrence_seed(
+        &self,
+    ) -> Result<RelationScanOccurrenceSeed, RelQueryError> {
         Ok(RelationScanOccurrenceSeed {
             relation: self.relation,
             result_type: self.result_type.clone(),
@@ -1047,9 +1064,11 @@ impl RelationBaseWitness {
         handles: &[kernel_types::StableRowHandle],
     ) -> bool {
         self.next_occurrence_slot == handles.len()
-            && handles.iter().copied().enumerate().all(|(slot, handle)| {
-                handle.slot == slot && handle.generation == 0
-            })
+            && handles
+                .iter()
+                .copied()
+                .enumerate()
+                .all(|(slot, handle)| handle.slot == slot && handle.generation == 0)
             && self
                 .occurrences
                 .values()
@@ -1150,7 +1169,10 @@ impl RelationBaseWitness {
         }
         let mut inserted_handles = Vec::with_capacity(delta.inserted.len());
         for key in inserted_keys {
-            let mut bucket = occurrences.get(key).cloned().unwrap_or_else(|| OccurrenceBucket::from_vec(Vec::new()));
+            let mut bucket = occurrences
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| OccurrenceBucket::from_vec(Vec::new()));
             if set_semantics && !bucket.is_empty() {
                 return Err(RelQueryError::InconsistentIncrementalDelta);
             }
@@ -1204,7 +1226,8 @@ impl RelationBaseWitness {
         target_revision: kernel_types::RevisionId,
         resolved: &StorageResolvedRelationDelta,
     ) -> Result<Self, RelQueryError> {
-        if resolved.relation != self.relation || &resolved.semantic_context != &self.semantic_context {
+        if resolved.relation != self.relation || resolved.semantic_context != self.semantic_context
+        {
             return Err(RelQueryError::StructuralRewriteBaseMismatch);
         }
         let transition = self.apply_delta_support_keys(
@@ -1322,10 +1345,8 @@ impl<I> PreparedRelationRewrite<I> {
 pub struct RelationStructuralEffect {
     delta: RelationDelta,
     base: RelationBaseWitness,
-    next_occurrences:
-        PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
-    next_ordered_occurrences:
-        PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
+    next_occurrences: PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+    next_ordered_occurrences: PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
     next_occurrence_slot: usize,
     removed_keys: Vec<CanonicalRowKey>,
     inserted_keys: Vec<CanonicalRowKey>,
@@ -1565,6 +1586,10 @@ struct CanonicalRelationMutationKeys {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations to this representation."
+)]
 pub(super) enum MaintainedScanCommitPatch {
     Semantic(RelationMutationPlan),
     StorageResolved(StorageResolvedScanPatch),
@@ -1769,7 +1794,10 @@ impl RelationDelta {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, RelQueryError> {
-        if !matches!(self.result_type.semantics, kernel_schema::RelationSemantics::Set { .. }) {
+        if !matches!(
+            self.result_type.semantics,
+            kernel_schema::RelationSemantics::Set { .. }
+        ) {
             return Ok(self.clone());
         }
 
@@ -1807,8 +1835,8 @@ impl RelationDelta {
         let mut inserted = Vec::new();
         for row in &self.inserted {
             let key = canonical_row_key(row, equivalences, context, registry)?;
-            if !current_by_key.contains_key(&key) {
-                current_by_key.insert(key, row.clone());
+            if let std::collections::btree_map::Entry::Vacant(e) = current_by_key.entry(key) {
+                e.insert(row.clone());
                 inserted.push(row.clone());
             }
         }
@@ -2356,11 +2384,9 @@ fn apply_prepared_relation_effect(
         row_keys.push(key);
     }
     if support_counts.len() != effect.base.occurrences.len()
-        || !support_counts
-            .iter()
-            .all(|(key, count)| {
-                effect.base.occurrences.get(key).map(OccurrenceBucket::len) == Some(*count)
-            })
+        || !support_counts.iter().all(|(key, count)| {
+            effect.base.occurrences.get(key).map(OccurrenceBucket::len) == Some(*count)
+        })
     {
         return Err(RelQueryError::StructuralRewriteBaseMismatch);
     }

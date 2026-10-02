@@ -15,9 +15,7 @@ impl RelReadFootprint {
     }
 
     #[must_use]
-    pub const fn columns(
-        &self,
-    ) -> &BTreeSet<(kernel_types::SemanticId, kernel_types::SemanticId)> {
+    pub const fn columns(&self) -> &BTreeSet<(kernel_types::SemanticId, kernel_types::SemanticId)> {
         &self.columns
     }
 }
@@ -33,6 +31,10 @@ pub(crate) fn read_footprint(
     Ok(footprint)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn collect(
     expr: &RelExpr,
     context: &kernel_schema::SemanticContext,
@@ -179,10 +181,12 @@ fn output_width(
         | RelExpr::TopKWithTies { input, .. }
         | RelExpr::PromoteToBag(input) => output_width(input, context),
         RelExpr::Project { columns, .. } => Ok(columns.len()),
-        RelExpr::JoinEq { left, right, .. } => Ok(output_width(left, context)? + output_width(right, context)?),
-        RelExpr::Difference { left, .. } | RelExpr::Union { left, .. } | RelExpr::AntiJoin { left, .. } => {
-            output_width(left, context)
+        RelExpr::JoinEq { left, right, .. } => {
+            Ok(output_width(left, context)? + output_width(right, context)?)
         }
+        RelExpr::Difference { left, .. }
+        | RelExpr::Union { left, .. }
+        | RelExpr::AntiJoin { left, .. } => output_width(left, context),
         RelExpr::Group { group_columns, .. } => Ok(group_columns.len() + 1),
     }
 }

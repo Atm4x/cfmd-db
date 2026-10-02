@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_model::{DatabaseState, Value};
 use kernel_persistent::{PersistentOrdMap, PersistentVec};
 use kernel_query::{
-    ExactQuery, PreparedRelationRewrite, RelationBaseWitness, RelationDelta, RelationScanOccurrenceSeed,
-    RelationValue,
+    ExactQuery, PreparedRelationRewrite, RelationBaseWitness, RelationDelta,
+    RelationScanOccurrenceSeed, RelationValue,
 };
 use kernel_schema::SemanticContext;
 use kernel_semantics::SemanticRegistry;
@@ -77,6 +77,11 @@ impl CarrierSegmentCoordinate {
     #[must_use]
     pub const fn len(self) -> usize {
         self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
     }
 
     #[must_use]
@@ -166,6 +171,7 @@ impl FieldColumnSegment {
         self.entities.is_empty()
     }
 
+    #[must_use]
     pub fn get(&self, entity: EntityId) -> Option<&Value> {
         self.entities
             .binary_search(&entity)
@@ -208,6 +214,10 @@ pub enum FactorizedFieldExpr {
 }
 
 impl FactorizedFieldExpr {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "This operation explicitly uses IEEE-754 conversion or diagnostic floating-point ratios."
+    )]
     pub fn evaluate_entity(
         &self,
         atoms: &PhysicalAtomStore,
@@ -289,11 +299,8 @@ impl FactorizedFieldExpr {
 
     fn collect_dependencies(&self, into: &mut BTreeSet<PhysicalAtomId>) {
         match self {
-            Self::Direct(atom) => {
-                into.insert(*atom);
-            }
             Self::Constant(_) => {}
-            Self::I64ToF64Direct(atom) => {
+            Self::Direct(atom) | Self::I64ToF64Direct(atom) => {
                 into.insert(*atom);
             }
             Self::Product(fields) => {
@@ -318,6 +325,10 @@ impl FactorizedFieldExpr {
         }
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "This operation explicitly uses IEEE-754 conversion or diagnostic floating-point ratios."
+    )]
     fn visit_carrier_range<F>(
         &self,
         atoms: &PhysicalAtomStore,
@@ -455,6 +466,10 @@ pub enum FactorizedRelationColumnExpr {
 }
 
 impl FactorizedRelationColumnExpr {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "This operation explicitly uses IEEE-754 conversion or diagnostic floating-point ratios."
+    )]
     pub fn evaluate_row(
         &self,
         atoms: &PhysicalAtomStore,
@@ -528,6 +543,10 @@ impl FactorizedRelationColumnExpr {
         }
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "This operation explicitly uses IEEE-754 conversion or diagnostic floating-point ratios."
+    )]
     fn visit_range<F>(
         &self,
         atoms: &PhysicalAtomStore,
@@ -1108,6 +1127,10 @@ impl PreparedFactorizedRelation {
         &self.base_witness
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep the explicit semantic and durability inputs at this boundary."
+    )]
     pub(crate) fn from_execution_columns(
         atoms: &mut PhysicalAtomStore,
         target_relation: SemanticId,
@@ -1339,6 +1362,7 @@ impl FactorizedRealizationRoot {
         })
     }
 
+    #[must_use]
     pub fn from_direct_durable_root(root: DirectFactorizedRealizationRoot) -> Self {
         let fields = root
             .fields
@@ -1539,8 +1563,10 @@ impl FactorizedRealizationRoot {
                 });
             }
         };
-        let mut state = DatabaseState::default();
-        state.lifecycle = lifecycle.into();
+        let mut state = DatabaseState {
+            lifecycle: lifecycle.into(),
+            ..DatabaseState::default()
+        };
         for (&semantic, &atom) in &self.carriers {
             match atom_payload(atoms, atom)? {
                 PhysicalAtomPayload::EntityOrder(entities) => {
@@ -1759,7 +1785,6 @@ impl FactorizedRealizationRoot {
         Ok(atom)
     }
 
-    #[must_use]
     pub fn field_native_chunk_count(&self, field: SemanticId) -> Result<usize, RealizationError> {
         let expr = &self
             .fields
@@ -1921,7 +1946,7 @@ impl FactorizedRealizationRoot {
     /// `kernel-query`; this layer only materializes that certified endpoint.
     /// No inverse migration or source-schema row identity participates.
     /// Applies one already-authoritative current-schema relation delta without
-    /// materializing the surrounding logical DatabaseState. Only the touched
+    /// materializing the surrounding logical `DatabaseState`. Only the touched
     /// relation is decoded from factorized columns; the exact Γ delta law is
     /// still owned by kernel-query. Untouched physical atoms remain shared.
     pub fn apply_exact_relation_delta_endpoint(
@@ -1939,7 +1964,9 @@ impl FactorizedRealizationRoot {
         let old_rows = rule.evaluate_rows(atoms)?;
         let old = match &delta.result_type.semantics {
             kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(old_rows),
-            kernel_schema::RelationSemantics::Set { column_equivalences } => RelationValue::Set {
+            kernel_schema::RelationSemantics::Set {
+                column_equivalences,
+            } => RelationValue::Set {
                 rows: old_rows,
                 column_equivalences: column_equivalences.clone(),
             },
@@ -1953,7 +1980,9 @@ impl FactorizedRealizationRoot {
         let mut column_values = vec![Vec::with_capacity(row_count); column_order.len()];
         for row in rows {
             if row.len() != column_order.len() {
-                return Err(RealizationError::FactorizedRelationColumnArityMismatch(relation));
+                return Err(RealizationError::FactorizedRelationColumnArityMismatch(
+                    relation,
+                ));
             }
             for (ordinal, value) in row.into_iter().enumerate() {
                 column_values[ordinal].push(value);
@@ -2046,7 +2075,6 @@ impl FactorizedRealizationRoot {
         Ok(native_atoms)
     }
 
-    #[must_use]
     pub fn relation_base_witness(
         &self,
         relation: SemanticId,
@@ -2059,7 +2087,6 @@ impl FactorizedRealizationRoot {
             .ok_or(RealizationError::RelationDeltaOverlayUnavailable(relation))
     }
 
-    #[must_use]
     pub fn relation_scan_occurrence_seed(
         &self,
         relation: SemanticId,
@@ -2072,7 +2099,6 @@ impl FactorizedRealizationRoot {
             .ok_or(RealizationError::RelationDeltaOverlayUnavailable(relation))
     }
 
-    #[must_use]
     pub fn relation_delta_overlay_stats(
         &self,
         relation: SemanticId,
@@ -2199,7 +2225,6 @@ impl FactorizedRealizationRoot {
         Ok(native_atoms)
     }
 
-    #[must_use]
     pub fn relation_column_native_chunk_count(
         &self,
         relation: SemanticId,
@@ -2379,10 +2404,10 @@ fn normalize_factorized_field_rewrite(
         }
     }
 
-    if rewrite.source_fields.is_empty() {
-        if let Expr::Const(value) | Expr::TypedConst { value, .. } = rewrite.transform.root() {
-            return Ok(FactorizedFieldExpr::Constant(value.clone()));
-        }
+    if rewrite.source_fields.is_empty()
+        && let Expr::Const(value) | Expr::TypedConst { value, .. } = rewrite.transform.root()
+    {
+        return Ok(FactorizedFieldExpr::Constant(value.clone()));
     }
 
     let product = rewrite
@@ -2436,10 +2461,10 @@ fn normalize_factorized_relation_column_rewrite(
         }
     }
 
-    if rewrite.source_columns.is_empty() {
-        if let Expr::Const(value) | Expr::TypedConst { value, .. } = rewrite.transform.root() {
-            return Ok(FactorizedRelationColumnExpr::Constant(value.clone()));
-        }
+    if rewrite.source_columns.is_empty()
+        && let Expr::Const(value) | Expr::TypedConst { value, .. } = rewrite.transform.root()
+    {
+        return Ok(FactorizedRelationColumnExpr::Constant(value.clone()));
     }
 
     let product = rewrite
@@ -2532,6 +2557,10 @@ pub fn compose_schema_migration_factorized(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn compose_schema_migration_factorized_impl(
     source_root: &FactorizedRealizationRoot,
     atoms: Option<&PhysicalAtomStore>,

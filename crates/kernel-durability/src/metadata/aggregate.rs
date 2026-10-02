@@ -170,6 +170,10 @@ pub(crate) fn decode_from_reader(
     decode_from_cursor(&mut cursor)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn decode_from_cursor(
     cursor: &mut impl BinarySource,
 ) -> Result<DurableStoreMetadata, &'static str> {

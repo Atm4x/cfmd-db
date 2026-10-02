@@ -38,8 +38,8 @@ fn descriptor(source: u64, target: u64, value: Value) -> DurableRevisionDescript
             relation: SemanticId::new(11),
             inserted: vec![vec![value]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -144,8 +144,8 @@ fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
             relation: SemanticId::new(11),
             inserted: vec![vec![Value::I64(7)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -214,7 +214,7 @@ fn schema_migration_prepare_carries_program_not_target_snapshot() {
             source_schema: SchemaRevisionId::new(380),
             target_schema: SchemaRevisionId::new(381),
             lens_spec: LensSpecId(SemanticId::new(380_381)),
-            semantic_pins: SemanticManifestId(SemanticId::new(0xCF4D_3803_81)),
+            semantic_pins: SemanticManifestId(SemanticId::new(0x00CF_4D38_0381)),
             encoding_version: 1,
             complement: Value::Unit,
         },
@@ -332,6 +332,10 @@ fn mixed_revision_intent_roundtrips_compactly_and_reconstructs_exact_target() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
     let registry = SemanticRegistry::default();
     let context = SemanticContext {
@@ -349,8 +353,8 @@ fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
         relation: SemanticId::new(11),
         inserted: vec![vec![Value::I64(7)]],
         removed: Vec::new(),
-    object_field_writes: Vec::new(),
-    authorization: Default::default(),
+        object_field_writes: Vec::new(),
+        authorization: crate::DurableRelationAuthorization::default(),
     };
     let rewrite = DurableRevisionDescriptor::relation_rewrites(
         ClientTransactionId::new(0x701),
@@ -382,8 +386,8 @@ fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
                 relation: SemanticId::new(11),
                 inserted: vec![vec![Value::I64(8)]],
                 removed: Vec::new(),
-            object_field_writes: Vec::new(),
-            authorization: Default::default(),
+                object_field_writes: Vec::new(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             rewrite_intents: vec![DurableRelationRewriteIntent {
                 relation: SemanticId::new(11),
@@ -410,8 +414,19 @@ fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
         &registry,
     )
     .unwrap();
-    let DurableTransactionIntent::RelationDataExact { semantic_modules, .. } = &relation_data.intent else { unreachable!() };
-    let DurableRevisionChange::RelationData { semantic_revision, relation_mutations } = &relation_data.change else { unreachable!() };
+    let DurableTransactionIntent::RelationDataExact {
+        semantic_modules, ..
+    } = &relation_data.intent
+    else {
+        unreachable!()
+    };
+    let DurableRevisionChange::RelationData {
+        semantic_revision,
+        relation_mutations,
+    } = &relation_data.change
+    else {
+        unreachable!()
+    };
     let mut legacy_v5 = Vec::new();
     push_u16(&mut legacy_v5, 5);
     push_u128(&mut legacy_v5, relation_data.transaction_id.raw());
@@ -426,7 +441,10 @@ fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
         encode_rows(&mut legacy_v5, &mutation.inserted).unwrap();
         encode_rows(&mut legacy_v5, &mutation.removed).unwrap();
     }
-    assert_eq!(decode_prepare_payload(target.id(), &legacy_v5).unwrap(), relation_data);
+    assert_eq!(
+        decode_prepare_payload(target.id(), &legacy_v5).unwrap(),
+        relation_data
+    );
 }
 
 #[test]

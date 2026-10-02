@@ -192,17 +192,17 @@ impl RelationUpdateCandidate<'_> {
             .map_err(RevisionError::InvalidSemantics)?;
         let live = &self.source.state.lifecycle.entities;
         for relation in &self.touched_relations {
-            let has_dangling = self
-                .state
-                .model
-                .relations
-                .get_shared(relation)
-                .is_some_and(|rows| {
-                    rows.iter().any(|row| {
-                        row.iter()
-                            .any(|value| value.first_dangling_live_ref(live).is_some())
-                    })
-                });
+            let has_dangling =
+                self.state
+                    .model
+                    .relations
+                    .get_shared(relation)
+                    .is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row.iter()
+                                .any(|value| value.first_dangling_live_ref(live).is_some())
+                        })
+                    });
             if has_dangling {
                 let filtered = self
                     .state

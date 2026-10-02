@@ -278,7 +278,11 @@ pub struct RefField<S: Object, T: Object> {
 
 impl<S: Object, T: Object> crate::ObjectPatchField<S, Ref<T>> for RefField<S, T> {
     fn into_patch_field(self) -> Result<crate::Field<S, Ref<T>>> {
-        Ok(crate::Field::__from_parts(self.source_relation, self.source_column, self.equivalence))
+        Ok(crate::Field::__from_parts(
+            self.source_relation,
+            self.source_column,
+            self.equivalence,
+        ))
     }
 }
 
@@ -686,11 +690,13 @@ pub struct OptionalRefField<S: Object, T: Object> {
     marker: PhantomData<fn() -> (S, T)>,
 }
 
-impl<S: Object, T: Object> crate::ObjectPatchField<S, Option<Ref<T>>>
-    for OptionalRefField<S, T>
-{
+impl<S: Object, T: Object> crate::ObjectPatchField<S, Option<Ref<T>>> for OptionalRefField<S, T> {
     fn into_patch_field(self) -> Result<crate::Field<S, Option<Ref<T>>>> {
-        Ok(crate::Field::__from_parts(self.source_relation, self.source_column, self.equivalence))
+        Ok(crate::Field::__from_parts(
+            self.source_relation,
+            self.source_column,
+            self.equivalence,
+        ))
     }
 }
 

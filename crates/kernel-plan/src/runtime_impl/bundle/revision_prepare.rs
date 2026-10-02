@@ -127,6 +127,7 @@ impl RuntimeRevisionBundle {
         self.prepare_revision_inner(&request, RelationEndpointValidation::ExactDerived)
     }
 
+    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn prepare_revision_inner(
         &self,
         request: &RevisionTransitionRequest<'_>,
@@ -234,7 +235,7 @@ impl RuntimeRevisionBundle {
             },
             rewrite_intents: BTreeMap::new(),
             object_field_writes: request.mutations.iter().filter(|mutation| !mutation.object_field_writes.is_empty()).map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec())).collect(),
-            relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != Default::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
+            relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != kernel_durability::DurableRelationAuthorization::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
         };
         Ok(PreparedRuntimeRevisionTransition {
             descriptor,
@@ -284,7 +285,7 @@ impl RuntimeRevisionBundle {
                 relation: relation_rewrite.relation,
                 delta: relation_rewrite.rewrite.delta(),
                 object_field_writes: &[],
-                authorization: Default::default(),
+                authorization: kernel_durability::DurableRelationAuthorization::default(),
             });
             rewrite_intents.insert(
                 relation_rewrite.relation,
@@ -447,7 +448,7 @@ impl RuntimeRevisionBundle {
                 },
                 rewrite_intents: BTreeMap::new(),
                 object_field_writes: request.mutations.iter().filter(|mutation| !mutation.object_field_writes.is_empty()).map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec())).collect(),
-                relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != Default::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
+                relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != kernel_durability::DurableRelationAuthorization::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
             },
             source_identity: self.root_identity,
             candidate: Box::new(candidate),

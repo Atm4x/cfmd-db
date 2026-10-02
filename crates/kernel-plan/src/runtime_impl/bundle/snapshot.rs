@@ -25,6 +25,7 @@ impl RuntimeRevisionSnapshot {
     /// immutable source snapshot. This is read-only authority shared by product preview and the
     /// durable derived-relation commit path, so preview and publication cannot disagree about the
     /// logical endpoint.
+    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn derive_relation_target_revision(
         &self,
         target_revision: RevisionId,

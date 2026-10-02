@@ -3,8 +3,9 @@ use std::io::Read;
 
 use kernel_revision::Revision;
 use kernel_schema::{
-    CapabilityDef, FieldDef, FieldRule, ModuleDigest, RelationDef, RelationSemantics, RuleValueExpr, Schema,
-    SemanticContext, SemanticEnvironment, SemanticRuleExpr, Symbol, TextPattern,
+    CapabilityDef, FieldDef, FieldRule, ModuleDigest, RelationDef, RelationSemantics,
+    RuleValueExpr, Schema, SemanticContext, SemanticEnvironment, SemanticRuleExpr, Symbol,
+    TextPattern,
 };
 use kernel_semantics::SemanticRegistry;
 use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
@@ -93,6 +94,10 @@ fn corrupt(reason: &'static str) -> DurabilityError {
     DurabilityError::Corruption { offset: 0, reason }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub(crate) fn encode_context(
     out: &mut impl crate::binary_codec::BinarySink,
     context: &SemanticContext,
@@ -354,31 +359,43 @@ fn encode_field_rule(out: &mut impl BinarySink, rule: &FieldRule) -> Result<(), 
     Ok(())
 }
 
-
 const MAX_TEXT_PATTERN_DEPTH: usize = 128;
 
 fn encode_text_pattern(out: &mut impl BinarySink, pattern: &TextPattern) -> Result<(), CodecError> {
     match pattern {
         TextPattern::Never => out.push(0),
         TextPattern::Empty => out.push(1),
-        TextPattern::Literal(value) => { out.push(2); push_bytes(out, value.as_bytes())?; }
+        TextPattern::Literal(value) => {
+            out.push(2);
+            push_bytes(out, value.as_bytes())?;
+        }
         TextPattern::AnyScalar => out.push(3),
         TextPattern::Concat(parts) => {
             out.push(4);
             push_len(out, parts.len())?;
-            for part in parts { encode_text_pattern(out, part)?; }
+            for part in parts {
+                encode_text_pattern(out, part)?;
+            }
         }
         TextPattern::Alternate(parts) => {
             out.push(5);
             push_len(out, parts.len())?;
-            for part in parts { encode_text_pattern(out, part)?; }
+            for part in parts {
+                encode_text_pattern(out, part)?;
+            }
         }
-        TextPattern::ZeroOrMore(inner) => { out.push(6); encode_text_pattern(out, inner)?; }
+        TextPattern::ZeroOrMore(inner) => {
+            out.push(6);
+            encode_text_pattern(out, inner)?;
+        }
     }
     Ok(())
 }
 
-fn decode_text_pattern(cursor: &mut impl BinarySource, depth: usize) -> Result<TextPattern, DurabilityError> {
+fn decode_text_pattern(
+    cursor: &mut impl BinarySource,
+    depth: usize,
+) -> Result<TextPattern, DurabilityError> {
     if depth > MAX_TEXT_PATTERN_DEPTH {
         return Err(corrupt("text pattern nesting exceeds codec limit"));
     }
@@ -393,9 +410,16 @@ fn decode_text_pattern(cursor: &mut impl BinarySource, depth: usize) -> Result<T
             for _ in 0..count {
                 parts.push(decode_text_pattern(cursor, depth + 1)?);
             }
-            if tag == 4 { Ok(TextPattern::Concat(parts)) } else { Ok(TextPattern::Alternate(parts)) }
+            if tag == 4 {
+                Ok(TextPattern::Concat(parts))
+            } else {
+                Ok(TextPattern::Alternate(parts))
+            }
         }
-        6 => Ok(TextPattern::ZeroOrMore(Box::new(decode_text_pattern(cursor, depth + 1)?))),
+        6 => Ok(TextPattern::ZeroOrMore(Box::new(decode_text_pattern(
+            cursor,
+            depth + 1,
+        )?))),
         _ => Err(corrupt("unknown text pattern tag")),
     }
 }
@@ -404,7 +428,7 @@ fn encode_optional_i64(out: &mut impl BinarySink, value: Option<i64>) {
     match value {
         Some(value) => {
             out.push(1);
-            push_u64(out, value as u64);
+            push_u64(out, value.cast_unsigned());
         }
         None => out.push(0),
     }
@@ -413,7 +437,7 @@ fn encode_optional_i64(out: &mut impl BinarySink, value: Option<i64>) {
 fn decode_optional_i64(cursor: &mut impl BinarySource) -> Result<Option<i64>, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(None),
-        1 => Ok(Some(cursor.u64().map_err(corrupt)? as i64)),
+        1 => Ok(Some((cursor.u64().map_err(corrupt)?).cast_signed())),
         _ => Err(corrupt("invalid optional i64 rule tag")),
     }
 }
@@ -458,85 +482,167 @@ const MAX_SEMANTIC_RULE_DEPTH: usize = 128;
 fn encode_rule_value_expr(out: &mut impl BinarySink, value: &RuleValueExpr) {
     match value {
         RuleValueExpr::Input => out.push(0),
-        RuleValueExpr::Field(field) => { out.push(1); push_u128(out, field.raw()); }
+        RuleValueExpr::Field(field) => {
+            out.push(1);
+            push_u128(out, field.raw());
+        }
     }
 }
 
-fn decode_rule_value_expr(cursor: &mut impl BinarySource) -> Result<RuleValueExpr, DurabilityError> {
+fn decode_rule_value_expr(
+    cursor: &mut impl BinarySource,
+) -> Result<RuleValueExpr, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(RuleValueExpr::Input),
-        1 => Ok(RuleValueExpr::Field(SemanticId::new(cursor.u128().map_err(corrupt)?))),
+        1 => Ok(RuleValueExpr::Field(SemanticId::new(
+            cursor.u128().map_err(corrupt)?,
+        ))),
         _ => Err(corrupt("unknown semantic rule value tag")),
     }
 }
 
-fn encode_semantic_rule_expr(out: &mut impl BinarySink, rule: &SemanticRuleExpr, depth: usize) -> Result<(), CodecError> {
-    if depth > MAX_SEMANTIC_RULE_DEPTH { return Err(CodecError::LengthOverflow); }
+fn encode_semantic_rule_expr(
+    out: &mut impl BinarySink,
+    rule: &SemanticRuleExpr,
+    depth: usize,
+) -> Result<(), CodecError> {
+    if depth > MAX_SEMANTIC_RULE_DEPTH {
+        return Err(CodecError::LengthOverflow);
+    }
     match rule {
         SemanticRuleExpr::True => out.push(0),
         SemanticRuleExpr::False => out.push(1),
         SemanticRuleExpr::And(rules) | SemanticRuleExpr::Or(rules) => {
-            out.push(if matches!(rule, SemanticRuleExpr::And(_)) { 2 } else { 3 });
+            out.push(if matches!(rule, SemanticRuleExpr::And(_)) {
+                2
+            } else {
+                3
+            });
             push_len(out, rules.len())?;
-            for rule in rules { encode_semantic_rule_expr(out, rule, depth + 1)?; }
+            for rule in rules {
+                encode_semantic_rule_expr(out, rule, depth + 1)?;
+            }
         }
-        SemanticRuleExpr::Not(rule) => { out.push(4); encode_semantic_rule_expr(out, rule, depth + 1)?; }
+        SemanticRuleExpr::Not(rule) => {
+            out.push(4);
+            encode_semantic_rule_expr(out, rule, depth + 1)?;
+        }
         SemanticRuleExpr::I64Range { value, min, max } => {
-            out.push(5); encode_rule_value_expr(out, value); encode_optional_i64(out, *min); encode_optional_i64(out, *max);
+            out.push(5);
+            encode_rule_value_expr(out, value);
+            encode_optional_i64(out, *min);
+            encode_optional_i64(out, *max);
         }
         SemanticRuleExpr::TextLength { value, min, max } => {
-            out.push(6); encode_rule_value_expr(out, value);
-            push_u64(out, u64::try_from(*min).map_err(|_| CodecError::LengthOverflow)?);
-            match max { Some(max) => { out.push(1); push_u64(out, u64::try_from(*max).map_err(|_| CodecError::LengthOverflow)?); }, None => out.push(0) }
+            out.push(6);
+            encode_rule_value_expr(out, value);
+            push_u64(
+                out,
+                u64::try_from(*min).map_err(|_| CodecError::LengthOverflow)?,
+            );
+            match max {
+                Some(max) => {
+                    out.push(1);
+                    push_u64(
+                        out,
+                        u64::try_from(*max).map_err(|_| CodecError::LengthOverflow)?,
+                    );
+                }
+                None => out.push(0),
+            }
         }
         SemanticRuleExpr::TextOneOf { value, allowed } => {
-            out.push(7); encode_rule_value_expr(out, value); push_len(out, allowed.len())?;
-            for item in allowed { push_bytes(out, item.as_bytes())?; }
+            out.push(7);
+            encode_rule_value_expr(out, value);
+            push_len(out, allowed.len())?;
+            for item in allowed {
+                push_bytes(out, item.as_bytes())?;
+            }
         }
         SemanticRuleExpr::TextMatches { value, pattern } => {
-            out.push(8); encode_rule_value_expr(out, value); encode_text_pattern(out, pattern)?;
+            out.push(8);
+            encode_rule_value_expr(out, value);
+            encode_text_pattern(out, pattern)?;
         }
     }
     Ok(())
 }
 
-fn decode_semantic_rule_expr(cursor: &mut impl BinarySource, depth: usize) -> Result<SemanticRuleExpr, DurabilityError> {
-    if depth > MAX_SEMANTIC_RULE_DEPTH { return Err(corrupt("semantic rule nesting exceeds codec limit")); }
+fn decode_semantic_rule_expr(
+    cursor: &mut impl BinarySource,
+    depth: usize,
+) -> Result<SemanticRuleExpr, DurabilityError> {
+    if depth > MAX_SEMANTIC_RULE_DEPTH {
+        return Err(corrupt("semantic rule nesting exceeds codec limit"));
+    }
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(SemanticRuleExpr::True),
         1 => Ok(SemanticRuleExpr::False),
         tag @ (2 | 3) => {
             let count = cursor.len().map_err(corrupt)?;
             let mut rules = Vec::with_capacity(count);
-            for _ in 0..count { rules.push(decode_semantic_rule_expr(cursor, depth + 1)?); }
-            if tag == 2 { Ok(SemanticRuleExpr::And(rules)) } else { Ok(SemanticRuleExpr::Or(rules)) }
+            for _ in 0..count {
+                rules.push(decode_semantic_rule_expr(cursor, depth + 1)?);
+            }
+            if tag == 2 {
+                Ok(SemanticRuleExpr::And(rules))
+            } else {
+                Ok(SemanticRuleExpr::Or(rules))
+            }
         }
-        4 => Ok(SemanticRuleExpr::Not(Box::new(decode_semantic_rule_expr(cursor, depth + 1)?))),
-        5 => Ok(SemanticRuleExpr::I64Range { value: decode_rule_value_expr(cursor)?, min: decode_optional_i64(cursor)?, max: decode_optional_i64(cursor)? }),
+        4 => Ok(SemanticRuleExpr::Not(Box::new(decode_semantic_rule_expr(
+            cursor,
+            depth + 1,
+        )?))),
+        5 => Ok(SemanticRuleExpr::I64Range {
+            value: decode_rule_value_expr(cursor)?,
+            min: decode_optional_i64(cursor)?,
+            max: decode_optional_i64(cursor)?,
+        }),
         6 => {
             let value = decode_rule_value_expr(cursor)?;
-            let min = usize::try_from(cursor.u64().map_err(corrupt)?).map_err(|_| corrupt("semantic rule length overflow"))?;
-            let max = match cursor.u8().map_err(corrupt)? { 0 => None, 1 => Some(usize::try_from(cursor.u64().map_err(corrupt)?).map_err(|_| corrupt("semantic rule length overflow"))?), _ => return Err(corrupt("invalid semantic rule optional length")) };
+            let min = usize::try_from(cursor.u64().map_err(corrupt)?)
+                .map_err(|_| corrupt("semantic rule length overflow"))?;
+            let max = match cursor.u8().map_err(corrupt)? {
+                0 => None,
+                1 => Some(
+                    usize::try_from(cursor.u64().map_err(corrupt)?)
+                        .map_err(|_| corrupt("semantic rule length overflow"))?,
+                ),
+                _ => return Err(corrupt("invalid semantic rule optional length")),
+            };
             Ok(SemanticRuleExpr::TextLength { value, min, max })
         }
         7 => {
             let value = decode_rule_value_expr(cursor)?;
             let count = cursor.len().map_err(corrupt)?;
             let mut allowed = BTreeSet::new();
-            for _ in 0..count { if !allowed.insert(cursor.string().map_err(corrupt)?) { return Err(corrupt("duplicate semantic membership value")); } }
+            for _ in 0..count {
+                if !allowed.insert(cursor.string().map_err(corrupt)?) {
+                    return Err(corrupt("duplicate semantic membership value"));
+                }
+            }
             Ok(SemanticRuleExpr::TextOneOf { value, allowed })
         }
-        8 => Ok(SemanticRuleExpr::TextMatches { value: decode_rule_value_expr(cursor)?, pattern: decode_text_pattern(cursor, 0)? }),
+        8 => Ok(SemanticRuleExpr::TextMatches {
+            value: decode_rule_value_expr(cursor)?,
+            pattern: decode_text_pattern(cursor, 0)?,
+        }),
         _ => Err(corrupt("unknown semantic rule expression tag")),
     }
 }
 
-fn decode_entity_rules(cursor: &mut impl BinarySource, schema: &mut Schema) -> Result<(), DurabilityError> {
+fn decode_entity_rules(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
     let count = cursor.len().map_err(corrupt)?;
     for _ in 0..count {
         let owner = SemanticId::new(cursor.u128().map_err(corrupt)?);
         let rule = decode_semantic_rule_expr(cursor, 0)?;
-        schema.add_entity_rule(owner, rule).map_err(|_| corrupt("invalid checkpoint entity rule"))?;
+        schema
+            .add_entity_rule(owner, rule)
+            .map_err(|_| corrupt("invalid checkpoint entity rule"))?;
     }
     Ok(())
 }

@@ -171,6 +171,14 @@ impl DurabilityBackend {
         single_file_freshness_material(&mut container)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep the explicit semantic and durability inputs at this boundary."
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub(super) fn compact_obsolete_generations(
         &mut self,
         wal: &mut FileRevisionWal,

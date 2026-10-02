@@ -1132,6 +1132,10 @@ fn semantic_environment_transport_is_generic_across_ordering_modules() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn schema_migration_transport_supports_merge_split_create_and_drop_in_one_verified_step() {
     use std::collections::BTreeSet;
 
@@ -1269,6 +1273,10 @@ fn schema_migration_transport_supports_merge_split_create_and_drop_in_one_verifi
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish the before and after states of the same operation."
+)]
 fn schema_migration_row_rewrite_changes_relation_column_type_without_host_callback() {
     let relation = SemanticId::new(21_000);
     let eq_i64 = SemanticId::new(21_001);
@@ -1357,12 +1365,20 @@ fn schema_migration_row_rewrite_changes_relation_column_type_without_host_callba
         )
         .unwrap();
     assert_eq!(
-        migrated.state().model.relations.materialize_owned(&relation),
+        migrated
+            .state()
+            .model
+            .relations
+            .materialize_owned(&relation),
         Some(vec![vec![kernel_model::Value::F64Bits(7.0_f64.to_bits())]])
     );
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish the before and after states of the same operation."
+)]
 fn schema_migration_exposes_independent_row_local_physical_slice() {
     let relation = SemanticId::new(22_000);
     let eq_i64 = SemanticId::new(22_001);
@@ -1556,6 +1572,10 @@ fn schema_migration_query_slice_declares_exact_source_dependency_set() {
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish the before and after states of the same operation."
+)]
 fn mixed_migration_source_retention_frontier_is_dependency_exact_and_monotone() {
     let source_a = SemanticId::new(24_000);
     let source_b = SemanticId::new(24_001);

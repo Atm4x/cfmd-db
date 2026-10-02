@@ -64,7 +64,7 @@ fn wal_core_replay_uses_relation_semantics_for_coarse_first_match_removal() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     runtime
         .commit_derived_relation_data(
@@ -936,7 +936,7 @@ fn subprocess_commit_durable_before_publish_recovers_target_revision() {
         relation,
         delta: &retry_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let retry_target = target_revision_for(&root, 531, &retry_mutations, &registry);
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
@@ -1010,7 +1010,7 @@ fn crash_worker_commit_durable_before_publish() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let target = target_revision_for(&root, 531, &mutations, &registry);
     let (durability, scan) = kernel_durability::DurableRevisionStore::open(&dir).unwrap();
@@ -1043,7 +1043,7 @@ fn client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent() 
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 541, &mutations, &registry);
@@ -1107,7 +1107,7 @@ fn client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent() 
         relation,
         delta: &next_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let live = reopened.snapshot().unwrap();
     let next_target = target_revision_for(live.root(), 542, &next_mutations, &registry);
@@ -1141,7 +1141,7 @@ fn supervisor_recovers_fail_stopped_runtime_and_retries_same_transaction() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let snapshot = supervisor.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 551, &mutations, &registry);
@@ -1386,7 +1386,7 @@ fn durable_mixed_revision_updates_lifecycle_and_relations_incrementally() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let model_delta = DurableModelDelta::between(source.state(), target.state());
     let model_complement = DurableModelDelta::between(target.state(), source.state());
@@ -1786,7 +1786,7 @@ fn committed_transaction_id_rejects_same_revision_id_with_different_revision_con
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 861, &mutations, &registry);
@@ -1847,7 +1847,7 @@ fn exact_transaction_intent_survives_later_heads_checkpoint_compaction_and_reope
         relation,
         delta: &first_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let first_target = target_revision_for(snapshot.root(), 866, &first_mutations, &registry);
@@ -1868,7 +1868,7 @@ fn exact_transaction_intent_survives_later_heads_checkpoint_compaction_and_reope
         relation,
         delta: &second_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let second_target = target_revision_for(snapshot.root(), 867, &second_mutations, &registry);
@@ -1949,7 +1949,7 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
         relation,
         delta: &first_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let first_request = DerivedRelationTransitionRequest {
         source_revision: RevisionId::new(875),
@@ -1968,7 +1968,7 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
         relation,
         delta: &second_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     runtime
         .commit_derived_relation_data(
@@ -1999,7 +1999,7 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
         relation,
         delta: &conflicting_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     assert!(matches!(
         reopened.commit_derived_relation_data(
@@ -2240,6 +2240,7 @@ fn assert_reopened_effect_prerequisites(
 }
 
 #[test]
+#[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
 fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
     let dir = durable_test_dir("multi-parent-coherent-resolution");
     let (context, registry, relation, _, root) = scan_runtime_bundle(900, 1320, &[1]);
@@ -2254,7 +2255,7 @@ fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
             relation,
             delta: &delta,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         }];
         runtime
             .commit_derived_relation_data(
@@ -2368,7 +2369,7 @@ fn derived_relation_commit_matches_authoritative_target_and_rejects_stale_source
         relation,
         delta: &first_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let source = runtime.snapshot().unwrap();
     let expected = target_revision_for(source.root(), 879, &first_mutations, &registry);
@@ -2390,7 +2391,7 @@ fn derived_relation_commit_matches_authoritative_target_and_rejects_stale_source
         relation,
         delta: &stale_delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let stale_transaction = ClientTransactionId::new(0x8782);
     let stale_request = DerivedRelationTransitionRequest {
@@ -2440,7 +2441,7 @@ fn revision_and_materialization_registry_commit_and_recover_atomically() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: Default::default(),
+    authorization: kernel_durability::DurableRelationAuthorization::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 869, &mutations, &registry);

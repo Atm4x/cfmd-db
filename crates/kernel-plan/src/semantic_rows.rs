@@ -90,10 +90,7 @@ pub(super) fn relation_value_matches_revision_relation(
                 rows,
                 column_equivalences,
             },
-        ) => {
-            expected_rows == rows
-                && column_equivalences == expected_equivalences
-        }
+        ) => expected_rows == rows && column_equivalences == expected_equivalences,
         _ => false,
     }
 }

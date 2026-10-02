@@ -55,7 +55,6 @@ pub(crate) struct ObjectContract {
     pub(crate) references: Vec<ReferenceContract>,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum MutationDirection {
     Insert,
@@ -124,12 +123,20 @@ impl Plan {
     }
 
     pub fn insert(&mut self, relation: RelationId, row: Row) -> &mut Self {
-        self.mutations.entry(relation).or_default().inserted.push(row);
+        self.mutations
+            .entry(relation)
+            .or_default()
+            .inserted
+            .push(row);
         self
     }
 
     pub fn remove(&mut self, relation: RelationId, row: Row) -> &mut Self {
-        self.mutations.entry(relation).or_default().removed.push(row);
+        self.mutations
+            .entry(relation)
+            .or_default()
+            .removed
+            .push(row);
         self
     }
 
@@ -199,6 +206,10 @@ impl Plan {
         Ok(self.remove(relation.id(), row))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep the explicit semantic and durability inputs at this boundary."
+    )]
     pub(crate) fn patch_object_field(
         &mut self,
         relation: RelationId,
@@ -210,21 +221,29 @@ impl Plan {
         owner: kernel_types::EntityId,
         field: kernel_types::SemanticId,
     ) -> crate::Result<()> {
-        let patch = self
-            .object_field_patches
-            .entry((relation, identity_raw))
-            .or_insert_with(|| PendingObjectFieldPatch {
-                identity_column,
-                identity_value: identity_value.clone(),
-                owner,
-                fields: BTreeMap::new(),
-            });
-        if patch.identity_column != identity_column || patch.identity_value != identity_value || patch.owner != owner {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidPlan,
-                "object field patches disagree on semantic identity",
-            ));
-        }
+        let patch = match self.object_field_patches.entry((relation, identity_raw)) {
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                let patch = entry.into_mut();
+                if patch.identity_column != identity_column
+                    || patch.identity_value != identity_value
+                    || patch.owner != owner
+                {
+                    return Err(crate::Error::new(
+                        crate::ErrorKind::InvalidPlan,
+                        "object field patches disagree on semantic identity",
+                    ));
+                }
+                patch
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(PendingObjectFieldPatch {
+                    identity_column,
+                    identity_value,
+                    owner,
+                    fields: BTreeMap::new(),
+                })
+            }
+        };
         patch.fields.insert(target_column, (value, field));
         Ok(())
     }
@@ -266,7 +285,11 @@ impl Plan {
             }
             return Ok(());
         }
-        delta.fields.push(kernel_durability::DurableFieldPatch { field, owner, value });
+        delta.fields.push(kernel_durability::DurableFieldPatch {
+            field,
+            owner,
+            value,
+        });
         delta.fields.sort_by_key(|patch| (patch.field, patch.owner));
         Ok(())
     }
@@ -275,6 +298,10 @@ impl Plan {
     ///
     /// Composition is structural: no hidden retry, rebase, or read of a newer HEAD occurs.
     /// A plan from any other snapshot fails closed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn extend(&mut self, other: Self) -> crate::Result<&mut Self> {
         if self.database_identity != other.database_identity
             || self.source != other.source
@@ -303,17 +330,17 @@ impl Plan {
                     ));
                 }
                 for patch in other.fields {
-                    if let Some(current) = existing
-                        .fields
-                        .iter_mut()
-                        .find(|current| current.field == patch.field && current.owner == patch.owner)
-                    {
+                    if let Some(current) = existing.fields.iter_mut().find(|current| {
+                        current.field == patch.field && current.owner == patch.owner
+                    }) {
                         current.value = patch.value;
                     } else {
                         existing.fields.push(patch);
                     }
                 }
-                existing.fields.sort_by_key(|patch| (patch.field, patch.owner));
+                existing
+                    .fields
+                    .sort_by_key(|patch| (patch.field, patch.owner));
             }
             _ => {}
         }
@@ -324,12 +351,15 @@ impl Plan {
             self.owned_relations.insert(relation, contract);
         }
         for (key, patch) in other.object_field_patches {
-            let target = self.object_field_patches.entry(key).or_insert_with(|| PendingObjectFieldPatch {
-                identity_column: patch.identity_column,
-                identity_value: patch.identity_value.clone(),
-                owner: patch.owner,
-                fields: BTreeMap::new(),
-            });
+            let target =
+                self.object_field_patches
+                    .entry(key)
+                    .or_insert_with(|| PendingObjectFieldPatch {
+                        identity_column: patch.identity_column,
+                        identity_value: patch.identity_value.clone(),
+                        owner: patch.owner,
+                        fields: BTreeMap::new(),
+                    });
             if target.identity_column != patch.identity_column
                 || target.identity_value != patch.identity_value
                 || target.owner != patch.owner
@@ -346,13 +376,16 @@ impl Plan {
         for (relation, mutation) in other.mutations {
             if let Some(coverage) = other_history_authorization.get(&relation) {
                 let existing = self.mutations.get(&relation);
-                if existing.is_some_and(|mutation| !mutation.inserted.is_empty() || !mutation.removed.is_empty()) {
+                if existing.is_some_and(|mutation| {
+                    !mutation.inserted.is_empty() || !mutation.removed.is_empty()
+                }) {
                     return Err(crate::Error::new(
                         crate::ErrorKind::InvalidPlan,
                         "cannot compose history-authorized inverse after existing mutations of the same relation",
                     ));
                 }
-                self.history_authorization.insert(relation, coverage.clone());
+                self.history_authorization
+                    .insert(relation, coverage.clone());
             }
             let target = self.mutations.entry(relation).or_default();
             let inserted_offset = target.inserted.len();

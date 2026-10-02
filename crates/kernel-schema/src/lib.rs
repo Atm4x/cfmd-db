@@ -240,9 +240,9 @@ mod tests {
 
 #[cfg(test)]
 mod semantic_rule_persistence_tests {
-    use std::collections::BTreeSet;
     use super::*;
     use kernel_types::{SchemaRevisionId, SemanticId};
+    use std::collections::BTreeSet;
 
     #[test]
     fn full_boolean_field_rule_and_entity_field_coordinates_share_type_law() {
@@ -250,21 +250,55 @@ mod semantic_rule_persistence_tests {
         let name = SemanticId::new(902);
         let age = SemanticId::new(903);
         let mut schema = Schema::new(SchemaRevisionId::new(9));
-        schema.define_field(FieldDef { id: name, owner: person, value: TypeExpr::Scalar(ScalarType::Text) }).unwrap();
-        schema.define_field(FieldDef { id: age, owner: person, value: TypeExpr::Scalar(ScalarType::I64) }).unwrap();
+        schema
+            .define_field(FieldDef {
+                id: name,
+                owner: person,
+                value: TypeExpr::Scalar(ScalarType::Text),
+            })
+            .unwrap();
+        schema
+            .define_field(FieldDef {
+                id: age,
+                owner: person,
+                value: TypeExpr::Scalar(ScalarType::I64),
+            })
+            .unwrap();
 
-        schema.add_field_rule(name, FieldRule::Expr(SemanticRuleExpr::And(vec![
-            SemanticRuleExpr::TextLength { value: RuleValueExpr::Input, min: 2, max: Some(32) },
-            SemanticRuleExpr::Not(Box::new(SemanticRuleExpr::TextOneOf {
-                value: RuleValueExpr::Input,
-                allowed: BTreeSet::from(["forbidden".to_owned()]),
-            })),
-        ]))).unwrap();
+        schema
+            .add_field_rule(
+                name,
+                FieldRule::Expr(SemanticRuleExpr::And(vec![
+                    SemanticRuleExpr::TextLength {
+                        value: RuleValueExpr::Input,
+                        min: 2,
+                        max: Some(32),
+                    },
+                    SemanticRuleExpr::Not(Box::new(SemanticRuleExpr::TextOneOf {
+                        value: RuleValueExpr::Input,
+                        allowed: BTreeSet::from(["forbidden".to_owned()]),
+                    })),
+                ])),
+            )
+            .unwrap();
 
-        schema.add_entity_rule(person, SemanticRuleExpr::And(vec![
-            SemanticRuleExpr::TextLength { value: RuleValueExpr::Field(name), min: 2, max: Some(32) },
-            SemanticRuleExpr::I64Range { value: RuleValueExpr::Field(age), min: Some(0), max: Some(150) },
-        ])).unwrap();
+        schema
+            .add_entity_rule(
+                person,
+                SemanticRuleExpr::And(vec![
+                    SemanticRuleExpr::TextLength {
+                        value: RuleValueExpr::Field(name),
+                        min: 2,
+                        max: Some(32),
+                    },
+                    SemanticRuleExpr::I64Range {
+                        value: RuleValueExpr::Field(age),
+                        min: Some(0),
+                        max: Some(150),
+                    },
+                ]),
+            )
+            .unwrap();
 
         assert_eq!(schema.entity_rules(person).len(), 1);
     }

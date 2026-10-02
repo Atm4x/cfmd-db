@@ -11,7 +11,9 @@ use crate::{
     blocker::{
         BlockerBuildSpec, BlockerDeltaPatch, MaintainedBlockerKind, MaterializedBlockerDeltaState,
     },
-    delta_abi::{CompiledDeltaEdgeIdentity, ExactDeltaSink, ExactDeltaView, ValidatedTransitionFrame},
+    delta_abi::{
+        CompiledDeltaEdgeIdentity, ExactDeltaSink, ExactDeltaView, ValidatedTransitionFrame,
+    },
     delta_kernels::{rel_delta_filter, rel_delta_filter_columns, rel_delta_filter_order_const},
     delta_materialization::{
         maintained_delta_from_relation_delta, materialize_exact_delta_view,
@@ -38,9 +40,8 @@ use crate::{
     relation_oracles::relation_values_semantically_equivalent,
     relation_state::{
         MaintainedScanCommitPatch, MaterializedSetSupportState, RelationDelta,
-        RelationScanOccurrenceSeed, SetSupportPatch,
-        StorageResolvedRelationDelta, StorageResolvedScanPatch, commit_relation_mutation,
-        plan_relation_mutation,
+        RelationScanOccurrenceSeed, SetSupportPatch, StorageResolvedRelationDelta,
+        StorageResolvedScanPatch, commit_relation_mutation, plan_relation_mutation,
     },
     topk::{MaterializedTopKDeltaState, TopKDeltaPatch},
 };
@@ -205,6 +206,10 @@ enum FlatMaintainedRelPlanNodeKind {
 
 #[derive(Debug)]
 #[cfg(debug_assertions)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations to this representation."
+)]
 enum MaintainedRelPlanPatch {
     Scan(Option<MaintainedScanCommitPatch>),
     Unary(Box<MaintainedRelPlanPatch>),
@@ -242,6 +247,10 @@ enum MaintainedRelPlanPatch {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations to this representation."
+)]
 enum GraphNodePatch {
     Scan(MaintainedScanCommitPatch),
     SetSupport(SetSupportPatch),
@@ -618,27 +627,30 @@ impl MaterializedRelPlanState {
                     .result_type(id)
                     .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
                 let value = relation_value_from_rows(
-                    old.relations.materialize_owned(relation).unwrap_or_default(),
+                    old.relations
+                        .materialize_owned(relation)
+                        .unwrap_or_default(),
                     result_type,
                 );
-                let canonical_lookup = if let Some(seed) = scan_seeds.and_then(|seeds| seeds.get(relation)) {
-                    if seed.relation() != *relation
-                        || seed.result_type() != result_type
-                        || seed.semantic_context() != context
-                        || seed.row_count() != value.rows().len()
-                    {
-                        return Err(RelQueryError::StructuralRewriteBaseMismatch);
-                    }
-                    let evidence = seed.canonical_keys_by_row();
-                    canonical_row_position_index_from_keys(evidence.iter())
-                } else {
-                    canonical_row_position_index(
-                        value.rows(),
-                        relation_column_equivalences(result_type),
-                        context,
-                        registry,
-                    )?
-                };
+                let canonical_lookup =
+                    if let Some(seed) = scan_seeds.and_then(|seeds| seeds.get(relation)) {
+                        if seed.relation() != *relation
+                            || seed.result_type() != result_type
+                            || seed.semantic_context() != context
+                            || seed.row_count() != value.rows().len()
+                        {
+                            return Err(RelQueryError::StructuralRewriteBaseMismatch);
+                        }
+                        let evidence = seed.canonical_keys_by_row();
+                        canonical_row_position_index_from_keys(evidence.iter())
+                    } else {
+                        canonical_row_position_index(
+                            value.rows(),
+                            relation_column_equivalences(result_type),
+                            context,
+                            registry,
+                        )?
+                    };
                 (
                     FlatMaintainedRelPlanNodeKind::Scan {
                         relation: *relation,
@@ -656,8 +668,15 @@ impl MaterializedRelPlanState {
                 value,
                 equivalence,
             } => {
-                let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
+                let input = Self::build_flat_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let input_type = graph
                     .result_type(input.id)
                     .cloned()
@@ -695,8 +714,15 @@ impl MaterializedRelPlanState {
                 ordering,
                 comparison,
             } => {
-                let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
+                let input = Self::build_flat_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let input_type = graph
                     .result_type(input.id)
                     .cloned()
@@ -735,8 +761,15 @@ impl MaterializedRelPlanState {
                 right_column,
                 equivalence,
             } => {
-                let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
+                let input = Self::build_flat_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let input_type = graph
                     .result_type(input.id)
                     .cloned()
@@ -768,8 +801,15 @@ impl MaterializedRelPlanState {
                 )
             }
             RelExpr::Project { input, columns } => {
-                let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
+                let input = Self::build_flat_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let rows = project_rows(input.output.into_rows(), columns)?;
                 let id = out.len();
                 let result_type = graph
@@ -806,10 +846,24 @@ impl MaterializedRelPlanState {
                 }
             }
             RelExpr::Union { left, right } => {
-                let left =
-                    Self::build_flat_subtree(left, old, context, registry, differential, scan_seeds, out)?;
-                let right =
-                    Self::build_flat_subtree(right, old, context, registry, differential, scan_seeds, out)?;
+                let left = Self::build_flat_subtree(
+                    left,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
+                let right = Self::build_flat_subtree(
+                    right,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let id = out.len();
                 let result_type = graph
                     .result_type(id)
@@ -821,12 +875,8 @@ impl MaterializedRelPlanState {
                 ) {
                     let mut rows = left.output.into_rows();
                     rows.extend(right.output.into_rows());
-                    let supports = MaterializedSetSupportState::build(
-                        &rows,
-                        result_type,
-                        context,
-                        registry,
-                    )?;
+                    let supports =
+                        MaterializedSetSupportState::build(&rows, result_type, context, registry)?;
                     let output = supports.output_value();
                     (
                         FlatMaintainedRelPlanNodeKind::UnionSet {
@@ -850,10 +900,24 @@ impl MaterializedRelPlanState {
                 }
             }
             RelExpr::Difference { left, right } => {
-                let left =
-                    Self::build_flat_subtree(left, old, context, registry, differential, scan_seeds, out)?;
-                let right =
-                    Self::build_flat_subtree(right, old, context, registry, differential, scan_seeds, out)?;
+                let left = Self::build_flat_subtree(
+                    left,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
+                let right = Self::build_flat_subtree(
+                    right,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let id = out.len();
                 let result_type = graph
                     .result_type(id)
@@ -894,10 +958,24 @@ impl MaterializedRelPlanState {
                 right_column,
                 equivalence,
             } => {
-                let left =
-                    Self::build_flat_subtree(left, old, context, registry, differential, scan_seeds, out)?;
-                let right =
-                    Self::build_flat_subtree(right, old, context, registry, differential, scan_seeds, out)?;
+                let left = Self::build_flat_subtree(
+                    left,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
+                let right = Self::build_flat_subtree(
+                    right,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let id = out.len();
                 let kind = MaintainedBlockerKind::AntiJoin {
                     left_column: *left_column,
@@ -936,8 +1014,15 @@ impl MaterializedRelPlanState {
                 )
             }
             RelExpr::Distinct { input, .. } => {
-                let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
+                let input = Self::build_flat_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let id = out.len();
                 let result_type = graph
                     .result_type(id)
@@ -959,8 +1044,15 @@ impl MaterializedRelPlanState {
                 )
             }
             RelExpr::PromoteToBag(input) => {
-                let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
+                let input = Self::build_flat_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let output = RelationValue::Bag(input.output.into_rows());
                 (
                     FlatMaintainedRelPlanNodeKind::PromoteToBag { input: input.id },
@@ -968,10 +1060,24 @@ impl MaterializedRelPlanState {
                 )
             }
             RelExpr::JoinEq { left, right, .. } => {
-                let left =
-                    Self::build_flat_subtree(left, old, context, registry, differential, scan_seeds, out)?;
-                let right =
-                    Self::build_flat_subtree(right, old, context, registry, differential, scan_seeds, out)?;
+                let left = Self::build_flat_subtree(
+                    left,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
+                let right = Self::build_flat_subtree(
+                    right,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let state = MaterializedJoinDeltaState::build_from_input_values(
                     query,
                     &left.output,
@@ -991,8 +1097,15 @@ impl MaterializedRelPlanState {
                 )
             }
             RelExpr::Group { input, .. } => {
-                let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
+                let input = Self::build_flat_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let state = MaterializedGroupDeltaState::build_from_input_value(
                     query,
                     input.output,
@@ -1010,8 +1123,15 @@ impl MaterializedRelPlanState {
                 )
             }
             RelExpr::TopKWithTies { input, .. } => {
-                let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
+                let input = Self::build_flat_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    differential,
+                    scan_seeds,
+                    out,
+                )?;
                 let state = MaterializedTopKDeltaState::build_from_input_value(
                     query,
                     input.output,
@@ -1291,6 +1411,10 @@ impl MaterializedRelPlanState {
         self.output_value_from_arena(root, context, registry)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn output_value_from_arena(
         &self,
         node_id: NodeId,
@@ -1386,7 +1510,9 @@ impl MaterializedRelPlanState {
                     .into_rows(),
             )),
             FlatMaintainedRelPlanNodeKind::UnionBag { left, right } => {
-                let mut rows = self.output_value_from_arena(*left, context, registry)?.into_rows();
+                let mut rows = self
+                    .output_value_from_arena(*left, context, registry)?
+                    .into_rows();
                 rows.extend(
                     self.output_value_from_arena(*right, context, registry)?
                         .into_rows(),
@@ -1437,6 +1563,10 @@ impl MaterializedRelPlanState {
     }
 
     #[cfg(debug_assertions)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn output_value_recursive(
         &self,
         context: &kernel_schema::SemanticContext,
@@ -1533,7 +1663,8 @@ impl MaterializedRelPlanState {
                 Ok(relation_value_from_rows(rows, &self.result_type))
             }
             MaintainedRelPlanNode::ProjectSet { supports, .. }
-            | MaintainedRelPlanNode::Distinct { supports, .. } => Ok(supports.output_value()),
+            | MaintainedRelPlanNode::Distinct { supports, .. }
+            | MaintainedRelPlanNode::UnionSet { supports, .. } => Ok(supports.output_value()),
             MaintainedRelPlanNode::PromoteToBag { input } => Ok(RelationValue::Bag(
                 input.output_value_recursive(context, registry)?.into_rows(),
             )),
@@ -1542,7 +1673,6 @@ impl MaterializedRelPlanState {
                 rows.extend(right.output_value_recursive(context, registry)?.into_rows());
                 Ok(RelationValue::Bag(rows))
             }
-            MaintainedRelPlanNode::UnionSet { supports, .. } => Ok(supports.output_value()),
             MaintainedRelPlanNode::Blocker { state, .. } => state.output_value(),
             MaintainedRelPlanNode::Join { state, .. } => state.output_value(context, registry),
             MaintainedRelPlanNode::Group { state, .. } => state.output_value(),
@@ -2039,6 +2169,10 @@ impl MaterializedRelPlanState {
     /// planner, but seals Scan publication to already-resolved stable handles.
     /// All operator state above Scan therefore goes through one immutable
     /// plan/commit semantics regardless of the source delta representation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn validate_resolved_leaf_frames(
         &self,
         deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
@@ -2437,6 +2571,10 @@ impl MaterializedRelPlanState {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn plan_execgraph_node(
         state: &FlatMaintainedRelPlanNode,
         mut inbox: NodeInbox<MaintainedDelta>,
@@ -2722,6 +2860,10 @@ impl MaterializedRelPlanState {
     }
 
     #[cfg(debug_assertions)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn plan_relation_deltas_inner(
         &self,
         plan: &mut RelationDeltaPlanContext<'_>,
@@ -2806,7 +2948,11 @@ impl MaterializedRelPlanState {
                     effect: combine_maintained_deltas(&left.effect, &right.effect),
                 })
             }
-            MaintainedRelPlanNode::UnionSet { left, right, supports } => {
+            MaintainedRelPlanNode::UnionSet {
+                left,
+                right,
+                supports,
+            } => {
                 let left = left.plan_relation_deltas_inner(plan)?;
                 let right = right.plan_relation_deltas_inner(plan)?;
                 let combined = combine_maintained_deltas(&left.effect, &right.effect);
@@ -3058,6 +3204,10 @@ impl MaterializedRelPlanState {
     }
 
     #[cfg(debug_assertions)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn commit_relation_plan(&mut self, patch: MaintainedRelPlanPatch) {
         match (
             Arc::make_mut(
@@ -3076,13 +3226,9 @@ impl MaterializedRelPlanState {
                     ..
                 },
                 MaintainedRelPlanPatch::Scan(Some(plan)),
-            ) => Self::commit_debug_scan_patch(
-                value,
-                handles,
-                base_witness,
-                canonical_lookup,
-                plan,
-            ),
+            ) => {
+                Self::commit_debug_scan_patch(value, handles, base_witness, canonical_lookup, plan);
+            }
             (MaintainedRelPlanNode::Scan { .. }, MaintainedRelPlanPatch::Scan(None)) => {}
             (
                 MaintainedRelPlanNode::Filter { input, .. }
@@ -3116,7 +3262,11 @@ impl MaterializedRelPlanState {
                 right.commit_relation_plan(*right_patch);
             }
             (
-                MaintainedRelPlanNode::UnionSet { left, right, supports },
+                MaintainedRelPlanNode::UnionSet {
+                    left,
+                    right,
+                    supports,
+                },
                 MaintainedRelPlanPatch::SetBinary {
                     left: left_patch,
                     right: right_patch,

@@ -6,6 +6,10 @@ use crate::runtime::CodecError;
 
 const MAX_QUERY_DEPTH: usize = 128;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub(super) fn encode_rel_expr(
     out: &mut impl crate::binary_codec::BinarySink,
     expr: &RelExpr,

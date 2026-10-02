@@ -349,7 +349,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: Default::default(),
+            authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -424,7 +424,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: Default::default(),
+            authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -652,7 +652,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: Default::default(),
+            authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         let target =

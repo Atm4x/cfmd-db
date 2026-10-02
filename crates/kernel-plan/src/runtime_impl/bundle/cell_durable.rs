@@ -220,6 +220,7 @@ impl RuntimeRevisionCell {
         })
     }
 
+    #[allow(clippy::too_many_arguments, reason = "Keep the explicit semantic and durability inputs at this boundary.")]
     pub(crate) fn commit_prepared_mixed_residual_durable<D: RevisionDurability>(
         &self,
         transaction_id: ClientTransactionId,

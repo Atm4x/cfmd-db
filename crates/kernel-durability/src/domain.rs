@@ -14,7 +14,6 @@ pub use historical::{
 pub use transaction::{
     DurableCarrierPatch, DurableEffectKind, DurableFieldPatch, DurableKeepsAlivePatch,
     DurableModelDelta, DurableObjectFieldWrite, DurableRelationAuthorization,
-    DurableRelationMutation, DurableRelationResolution,
-    DurableRelationRewriteIntent, DurableRevisionChange, DurableTransactionIntent,
-    DurableTransactionKey, IdempotencyEpoch,
+    DurableRelationMutation, DurableRelationResolution, DurableRelationRewriteIntent,
+    DurableRevisionChange, DurableTransactionIntent, DurableTransactionKey, IdempotencyEpoch,
 };

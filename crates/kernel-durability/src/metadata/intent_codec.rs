@@ -175,6 +175,10 @@ pub(crate) fn encode_transaction_intent(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub(crate) fn decode_transaction_intent(
     cursor: &mut impl BinarySource,
 ) -> Result<DurableTransactionIntent, &'static str> {
@@ -629,7 +633,7 @@ pub(crate) fn decode_relation_mutations_legacy(
             inserted: cursor.rows(0)?,
             removed: cursor.rows(0)?,
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         });
     }
     Ok(relation_mutations)
@@ -656,14 +660,20 @@ pub(crate) fn decode_relation_mutations(
             let owner = kernel_types::EntityId::new(cursor.u128()?);
             let field = SemanticId::new(cursor.u128()?);
             let rows = cursor.rows(1)?;
-            if rows.len() != 1 || rows[0].len() != 1 { return Err("invalid object field write value"); }
+            if rows.len() != 1 || rows[0].len() != 1 {
+                return Err("invalid object field write value");
+            }
             let value = rows[0][0].clone();
             let key = (owner, field);
             if previous_field.is_some_and(|previous| previous >= key) {
                 return Err("object field writes are not strictly sorted and unique");
             }
             previous_field = Some(key);
-            object_field_writes.push(crate::DurableObjectFieldWrite { owner, field, value });
+            object_field_writes.push(crate::DurableObjectFieldWrite {
+                owner,
+                field,
+                value,
+            });
         }
         let authorization_bits = cursor.u8()?;
         if authorization_bits & !0b00_111111 != 0 {

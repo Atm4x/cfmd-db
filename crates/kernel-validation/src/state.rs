@@ -33,6 +33,10 @@ pub fn validate_state_with_ids(
     validate_state_with_extents(context, registry, state, &entity_types)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub fn validate_state_with_extents(
     context: &SemanticContext,
     registry: &SemanticRegistry,
@@ -63,9 +67,10 @@ pub fn validate_state_with_extents(
             &BTreeMap::new(),
         )?;
         for (rule_index, rule) in compiled_rules.field_rules(field_id).iter().enumerate() {
-            if !rule.matches(value).map_err(|_| {
-                ValidationError::FieldRuleTypeMismatch { field: field_id }
-            })? {
+            if !rule
+                .matches(value)
+                .map_err(|_| ValidationError::FieldRuleTypeMismatch { field: field_id })?
+            {
                 return Err(ValidationError::FieldRuleViolation {
                     field: field_id,
                     entity: owner,
@@ -78,12 +83,20 @@ pub fn validate_state_with_extents(
     for owner in compiled_rules.entity_rule_owners() {
         for entity in entity_types.entities(owner) {
             for (rule_index, rule) in compiled_rules.entity_rules(owner).iter().enumerate() {
-                let matches = rule.matches(&|coordinate| match coordinate {
-                    kernel_schema::RuleValueExpr::Input => None,
-                    kernel_schema::RuleValueExpr::Field(field) => state.model.fields.get(&(*field, entity)),
-                }).unwrap_or(false);
+                let matches = rule
+                    .matches(&|coordinate| match coordinate {
+                        kernel_schema::RuleValueExpr::Input => None,
+                        kernel_schema::RuleValueExpr::Field(field) => {
+                            state.model.fields.get(&(*field, entity))
+                        }
+                    })
+                    .unwrap_or(false);
                 if !matches {
-                    return Err(ValidationError::EntityRuleViolation { owner, entity, rule_index });
+                    return Err(ValidationError::EntityRuleViolation {
+                        owner,
+                        entity,
+                        rule_index,
+                    });
                 }
             }
         }
@@ -117,9 +130,12 @@ pub fn validate_state_with_extents(
                     .iter()
                     .enumerate()
                 {
-                    if !rule.matches(value).map_err(|_|
-                        ValidationError::FieldRuleTypeMismatch { field: relation_id },
-                    )? {
+                    if !rule
+                        .matches(value)
+                        .map_err(|_| ValidationError::FieldRuleTypeMismatch {
+                            field: relation_id,
+                        })?
+                    {
                         return Err(ValidationError::RelationColumnRuleViolation {
                             relation: relation_id,
                             row: row_index,
@@ -137,7 +153,12 @@ pub fn validate_state_with_extents(
             for (column, equivalence) in relation.columns.iter().zip(column_equivalences) {
                 validate_equivalence_type(*equivalence, column, context, registry)?;
             }
-            ensure_relation_rows_unique(&tuples.materialize_owned(), column_equivalences, context, registry)?;
+            ensure_relation_rows_unique(
+                &tuples.materialize_owned(),
+                column_equivalences,
+                context,
+                registry,
+            )?;
         }
     }
 
@@ -234,9 +255,12 @@ pub fn validate_relations_with_extents(
                     .iter()
                     .enumerate()
                 {
-                    if !rule.matches(value).map_err(|_|
-                        ValidationError::FieldRuleTypeMismatch { field: relation_id },
-                    )? {
+                    if !rule
+                        .matches(value)
+                        .map_err(|_| ValidationError::FieldRuleTypeMismatch {
+                            field: relation_id,
+                        })?
+                    {
                         return Err(ValidationError::RelationColumnRuleViolation {
                             relation: relation_id,
                             row: row_index,

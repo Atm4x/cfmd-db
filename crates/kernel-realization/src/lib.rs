@@ -16,10 +16,10 @@ use kernel_types::{EntityId, SemanticId};
 mod factorized;
 mod one_shot;
 pub use factorized::{
-    CarrierSegmentCoordinate, FactorizedFieldExpr, FactorizedFieldNativeChunk, FactorizedFieldRule,
-    DirectFactorizedFieldRoot, DirectFactorizedRealizationRoot, DirectFactorizedRelationRoot,
-    FactorizedRealizationRoot, FactorizedRelationColumnExpr, FactorizedRelationRule,
-    FieldColumnSegment, PreparedFactorizedRelation, RelationColumnSegment,
+    CarrierSegmentCoordinate, DirectFactorizedFieldRoot, DirectFactorizedRealizationRoot,
+    DirectFactorizedRelationRoot, FactorizedFieldExpr, FactorizedFieldNativeChunk,
+    FactorizedFieldRule, FactorizedRealizationRoot, FactorizedRelationColumnExpr,
+    FactorizedRelationRule, FieldColumnSegment, PreparedFactorizedRelation, RelationColumnSegment,
     RelationCompactionDecision, RelationCompactionWorkloadCost, RelationDeltaOverlayStats,
     compose_schema_migration_factorized, compose_schema_migration_factorized_with_prepared,
     prepare_general_relation_factorized, realize_database_state_factorized,
@@ -127,7 +127,10 @@ impl PhysicalAtomStoreProbe {
 
     #[must_use]
     pub fn live_atom_allocations(&self) -> usize {
-        self.atoms.iter().filter(|atom| atom.strong_count() != 0).count()
+        self.atoms
+            .iter()
+            .filter(|atom| atom.strong_count() != 0)
+            .count()
     }
 }
 
@@ -169,13 +172,11 @@ impl PhysicalAtomStore {
                 return Err(RealizationError::DuplicatePhysicalAtom(pair[0].0));
             }
         }
-        let next_id = entries
-            .last()
-            .map_or(Ok(0), |(id, _)| {
-                id.raw()
-                    .checked_add(1)
-                    .ok_or(RealizationError::PhysicalAtomIdExhausted)
-            })?;
+        let next_id = entries.last().map_or(Ok(0), |(id, _)| {
+            id.raw()
+                .checked_add(1)
+                .ok_or(RealizationError::PhysicalAtomIdExhausted)
+        })?;
         let atoms = PersistentOrdMap::from_sorted_unique_owned(entries)
             .expect("sorted unique physical atom entries");
         Ok(Self { atoms, next_id })
@@ -435,8 +436,10 @@ impl RealizationRoot {
             }
         };
 
-        let mut state = DatabaseState::default();
-        state.lifecycle = lifecycle.into();
+        let mut state = DatabaseState {
+            lifecycle: lifecycle.into(),
+            ..DatabaseState::default()
+        };
 
         for (&semantic, &atom) in &self.carriers {
             match atom_payload(atoms, atom)? {
@@ -623,6 +626,7 @@ pub enum RealizationError {
     SemanticMismatch,
 }
 
+#[must_use]
 pub fn realize_database_state(state: &DatabaseState) -> (PhysicalAtomStore, RealizationRoot) {
     let mut atoms = PhysicalAtomStore::default();
     let lifecycle = atoms.insert(PhysicalAtomPayload::Lifecycle((*state.lifecycle).clone()));
@@ -668,6 +672,10 @@ pub fn realize_database_state(state: &DatabaseState) -> (PhysicalAtomStore, Real
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub fn compose_schema_migration(
     atoms: &PhysicalAtomStore,
     source_root: &RealizationRoot,

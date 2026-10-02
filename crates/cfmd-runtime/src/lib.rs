@@ -48,9 +48,9 @@ pub use migration::{
 pub use notification::{InProcessPublicationNotifier, PublicationNotifier};
 pub use object::{
     __row_shape_error, GroupedAggregateQuery, Many, ManySelection, Object, ObjectEquivalence,
-    ObjectFieldRole, ObjectFieldSchema, ObjectGroupQuery, ObjectManyFieldSchema,
+    ObjectFieldRole, ObjectFieldSchema, ObjectGroupQuery, ObjectManyFieldSchema, ObjectPatchField,
     ObjectProjectionQuery, ObjectProxy, ObjectQuery, ObjectRelationshipCardinality, ObjectSet,
-    ObjectPatchField, ObjectValue, OrderedObjectValue, OwnedMany, OwnedManySelection,
+    ObjectValue, OrderedObjectValue, OwnedMany, OwnedManySelection,
 };
 pub use plan::{CommitOutcome, OrphanPolicy, Plan};
 pub use query::{
@@ -64,7 +64,8 @@ pub use runtime::{
 };
 pub use schema::{
     FieldRule, PrimitiveEquivalence, PrimitiveOrdering, RelationSchema, RelationSemantics,
-    RuleValueExpr, ScalarType, Schema, SchemaBuilder, SchemaView, SemanticRuleExpr, StructuralEquivalence, TextPattern, Type,
+    RuleValueExpr, ScalarType, Schema, SchemaBuilder, SchemaView, SemanticRuleExpr,
+    StructuralEquivalence, TextPattern, Type,
 };
 #[doc(hidden)]
 pub use schema_model::{
@@ -72,8 +73,8 @@ pub use schema_model::{
     SchemaAuthorityPair,
 };
 pub use schema_model::{
-    CfmdSchema, Context, ContextSource, DatabaseContext, DatabaseDefinition, EntitySet, SchemaDatabase,
-    SchemaDatabaseBuilder, Snapshot,
+    CfmdSchema, Context, ContextSource, DatabaseContext, DatabaseDefinition, EntitySet,
+    SchemaDatabase, SchemaDatabaseBuilder, Snapshot,
 };
 pub use security::{
     Permission, PermissionSet, PrincipalId, Role, Session, SessionDatabase, SessionSnapshot,
@@ -82,8 +83,8 @@ pub use transaction::{Transaction, TransactionReadiness};
 pub use value::{EntityRef, Row, Value};
 pub use watch::{
     GroupedAggregateWatch, GroupedAggregateWatchEvent, ObjectWatch, ObjectWatchEvent,
-    ProjectionWatch, ProjectionWatchEvent, QueryWatch, WatchCancellation, WatchDrain, WatchEvent,
-    WatchAuthorization, WatchNext, WatchReadiness, WatchReadinessSourceId, WatchStatus,
+    ProjectionWatch, ProjectionWatchEvent, QueryWatch, WatchAuthorization, WatchCancellation,
+    WatchDrain, WatchEvent, WatchNext, WatchReadiness, WatchReadinessSourceId, WatchStatus,
     WatchSubscriptionId, WatchWake,
 };
 

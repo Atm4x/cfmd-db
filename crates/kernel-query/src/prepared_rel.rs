@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    RelExpr, RelQueryError, RelType, RelationOccurrenceCertificate, RelationScanOccurrenceSeed, RelationValue,
-    rel_eval::{evaluate_prepared_expr, evaluate_prepared_expr_with_occurrence_certificate,
-        evaluate_prepared_expr_with_occurrence_certificate_seeded, evaluate_prepared_expr_seeded},
+    RelExpr, RelQueryError, RelType, RelationOccurrenceCertificate, RelationScanOccurrenceSeed,
+    RelationValue,
+    rel_eval::{
+        evaluate_prepared_expr, evaluate_prepared_expr_seeded,
+        evaluate_prepared_expr_with_occurrence_certificate,
+        evaluate_prepared_expr_with_occurrence_certificate_seeded,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +125,11 @@ impl PreparedRelExpr {
     }
 
     pub fn read_footprint(&self) -> Result<crate::RelReadFootprint, RelQueryError> {
-        crate::access::read_footprint(&self.expr, &self.semantic_context, self.result_type.columns.len())
+        crate::access::read_footprint(
+            &self.expr,
+            &self.semantic_context,
+            self.result_type.columns.len(),
+        )
     }
 
     #[must_use]

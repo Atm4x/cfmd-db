@@ -755,8 +755,8 @@ mod tests {
                 relation: SemanticId::new(11),
                 inserted: vec![vec![value]],
                 removed: Vec::new(),
-            object_field_writes: Vec::new(),
-            authorization: Default::default(),
+                object_field_writes: Vec::new(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             &registry,
         )

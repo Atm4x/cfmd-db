@@ -325,7 +325,10 @@ mod tests {
             panic!("append must create a persistent delta root");
         };
         assert!(!appended.has_materialized_projection());
-        assert_eq!(base.to_vec(), vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
+        assert_eq!(
+            base.to_vec(),
+            vec![vec![Value::I64(1)], vec![Value::I64(2)]]
+        );
         assert_eq!(
             appended.to_vec(),
             vec![

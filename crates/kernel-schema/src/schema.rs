@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_types::{SchemaRevisionId, SemanticId};
 
 use crate::{
-    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, RuleValueExpr, SemanticRuleExpr,
-    SemanticRuleTypeError, StructuralEquivalenceDef, StructuralOrderingDef, SubtypeClosure, Symbol, TypeError, TypeExpr,
+    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, RuleValueExpr,
+    SemanticRuleExpr, SemanticRuleTypeError, StructuralEquivalenceDef, StructuralOrderingDef,
+    SubtypeClosure, Symbol, TypeError, TypeExpr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,9 +29,14 @@ pub struct Schema {
 fn validate_field_rule_type(rule: &FieldRule, ty: &TypeExpr) -> Result<(), SchemaError> {
     match rule.expression().validate_for_input(ty) {
         Ok(()) => Ok(()),
-        Err(crate::SemanticRuleTypeError::TypeMismatch) => Err(SchemaError::FieldRuleTypeMismatch),
-        Err(crate::SemanticRuleTypeError::InvalidBounds) => Err(SchemaError::InvalidFieldRuleBounds),
-        Err(crate::SemanticRuleTypeError::UnknownField(_)) | Err(crate::SemanticRuleTypeError::FieldOutsideOwner { .. }) => Err(SchemaError::FieldRuleTypeMismatch),
+        Err(crate::SemanticRuleTypeError::InvalidBounds) => {
+            Err(SchemaError::InvalidFieldRuleBounds)
+        }
+        Err(
+            crate::SemanticRuleTypeError::TypeMismatch
+            | crate::SemanticRuleTypeError::UnknownField(_)
+            | crate::SemanticRuleTypeError::FieldOutsideOwner { .. },
+        ) => Err(SchemaError::FieldRuleTypeMismatch),
     }
 }
 
@@ -100,16 +106,26 @@ impl Schema {
         rule.validate_values(&mut |value| match value {
             RuleValueExpr::Input => Err(SemanticRuleTypeError::TypeMismatch),
             RuleValueExpr::Field(field_id) => {
-                let field = self.fields.get(field_id).ok_or(SemanticRuleTypeError::UnknownField(*field_id))?;
+                let field = self
+                    .fields
+                    .get(field_id)
+                    .ok_or(SemanticRuleTypeError::UnknownField(*field_id))?;
                 if !self.is_subtype(owner, field.owner) {
-                    return Err(SemanticRuleTypeError::FieldOutsideOwner { field: *field_id, owner });
+                    return Err(SemanticRuleTypeError::FieldOutsideOwner {
+                        field: *field_id,
+                        owner,
+                    });
                 }
                 Ok(field.value.clone())
             }
-        }).map_err(|error| match error {
+        })
+        .map_err(|error| match error {
             SemanticRuleTypeError::InvalidBounds => SchemaError::InvalidFieldRuleBounds,
             SemanticRuleTypeError::UnknownField(field) => SchemaError::UnknownFieldForRule(field),
-            SemanticRuleTypeError::TypeMismatch | SemanticRuleTypeError::FieldOutsideOwner { .. } => SchemaError::EntityRuleTypeMismatch,
+            SemanticRuleTypeError::TypeMismatch
+            | SemanticRuleTypeError::FieldOutsideOwner { .. } => {
+                SchemaError::EntityRuleTypeMismatch
+            }
         })
     }
 
@@ -125,11 +141,16 @@ impl Schema {
 
     #[must_use]
     pub fn entity_rules(&self, owner: SemanticId) -> &[SemanticRuleExpr] {
-        self.entity_rules.get(&owner).map(Vec::as_slice).unwrap_or_default()
+        self.entity_rules
+            .get(&owner)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn all_entity_rules(&self) -> impl Iterator<Item = (SemanticId, &SemanticRuleExpr)> {
-        self.entity_rules.iter().flat_map(|(&owner, rules)| rules.iter().map(move |rule| (owner, rule)))
+        self.entity_rules
+            .iter()
+            .flat_map(|(&owner, rules)| rules.iter().map(move |rule| (owner, rule)))
     }
 
     pub fn validate_relation_row_rule(
@@ -147,7 +168,10 @@ impl Schema {
         .map_err(|error| match error {
             SemanticRuleTypeError::InvalidBounds => SchemaError::InvalidFieldRuleBounds,
             SemanticRuleTypeError::UnknownField(field) => SchemaError::UnknownFieldForRule(field),
-            SemanticRuleTypeError::TypeMismatch | SemanticRuleTypeError::FieldOutsideOwner { .. } => SchemaError::EntityRuleTypeMismatch,
+            SemanticRuleTypeError::TypeMismatch
+            | SemanticRuleTypeError::FieldOutsideOwner { .. } => {
+                SchemaError::EntityRuleTypeMismatch
+            }
         })
     }
 

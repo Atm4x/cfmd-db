@@ -398,6 +398,10 @@ struct PreparedMigrationColumnRewrite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations to this representation."
+)]
 enum PreparedMigrationRelationRewrite {
     Query {
         rewrite: PreparedRelationRewrite,
@@ -548,6 +552,10 @@ pub struct SchemaMigrationTransport {
 }
 
 impl SchemaMigrationTransport {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn verify(
         source: &SemanticContext,
         target: &SemanticContext,

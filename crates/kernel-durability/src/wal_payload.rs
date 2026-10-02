@@ -11,8 +11,8 @@ use crate::domain::{
     DurableRelationResolution, DurableRevisionChange, DurableTransactionIntent, IdempotencyEpoch,
 };
 use crate::metadata::{
-    self, decode_relation_mutations, decode_relation_mutations_legacy, decode_relation_rewrite_intents, encode_relation_mutations,
-    encode_relation_rewrite_intents,
+    self, decode_relation_mutations, decode_relation_mutations_legacy,
+    decode_relation_rewrite_intents, encode_relation_mutations, encode_relation_rewrite_intents,
 };
 use crate::runtime::CodecError;
 
@@ -189,6 +189,10 @@ fn encode_relation_data_prepare(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep the explicit semantic and durability inputs at this boundary."
+)]
 fn encode_relation_data_residual_prepare(
     out: &mut Vec<u8>,
     descriptor: &DurableRevisionDescriptor,
@@ -620,7 +624,6 @@ fn decode_v4_prepare_payload(
 }
 
 #[allow(clippy::too_many_lines)] // Versioned wire decoder; linear order must mirror the encoded payload.
-
 fn decode_relation_mutations_for_version(
     cursor: &mut Cursor<'_>,
     version: u16,
@@ -632,6 +635,10 @@ fn decode_relation_mutations_for_version(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn decode_current_prepare_payload(
     cursor: &mut Cursor<'_>,
     source_revision: RevisionId,
@@ -670,7 +677,8 @@ fn decode_current_prepare_payload(
             );
             let client_relation_mutations = decode_relation_mutations_for_version(cursor, version)?;
             let client_model_delta = metadata::decode_model_delta(cursor)?;
-            let realized_relation_mutations = decode_relation_mutations_for_version(cursor, version)?;
+            let realized_relation_mutations =
+                decode_relation_mutations_for_version(cursor, version)?;
             let realized_model_delta = metadata::decode_model_delta(cursor)?;
             let realized_model_complement = Box::new(metadata::decode_model_delta(cursor)?);
             let intent = DurableTransactionIntent::MixedRevisionResidualExact {

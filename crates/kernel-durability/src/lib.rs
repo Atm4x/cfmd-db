@@ -5,9 +5,9 @@ mod domain;
 mod freshness_tcp;
 mod metadata;
 mod platform_assurance;
+mod realization;
 mod replication;
 mod replication_transport;
-mod realization;
 mod runtime;
 mod single_file;
 mod storage_encryption;
@@ -26,13 +26,13 @@ pub use domain::{
     DurableCarrierPatch, DurableEffectCoordinationClass, DurableEffectKind,
     DurableExternalFreshnessBinding, DurableFieldPatch, DurableKeepsAlivePatch,
     DurableMigrationComplement, DurableModelDelta, DurableObjectFieldWrite,
-    DurableRelationAuthorization, DurableRelationMutation,
-    DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
-    DurableRevisionEffectRecord, DurableTransactionIntent, DurableTransactionKey,
-    HistoricalBoundaryAuthority, HistoricalComplementError, HistoricalEpochAnchor,
-    HistoricalLensImplementation, HistoricalLensImplementationKey, HistoricalLensRegistry,
-    HistoricalRestoreError, IdempotencyEpoch, LocalHistoricalComplementChain,
-    MigrationPhysicalAuthority, SchemaMigrationPhysicalState, SemanticChangeEvent,
+    DurableRelationAuthorization, DurableRelationMutation, DurableRelationResolution,
+    DurableRelationRewriteIntent, DurableRevisionChange, DurableRevisionEffectRecord,
+    DurableTransactionIntent, DurableTransactionKey, HistoricalBoundaryAuthority,
+    HistoricalComplementError, HistoricalEpochAnchor, HistoricalLensImplementation,
+    HistoricalLensImplementationKey, HistoricalLensRegistry, HistoricalRestoreError,
+    IdempotencyEpoch, LocalHistoricalComplementChain, MigrationPhysicalAuthority,
+    SchemaMigrationPhysicalState, SemanticChangeEvent,
 };
 pub use freshness_tcp::{TcpExternalFreshnessAuthority, TcpExternalFreshnessAuthorityServer};
 pub use wal_frame::{FORMAT_VERSION, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN};
@@ -62,6 +62,10 @@ pub use replication::{
     replication_peer_evidence_signing_message,
 };
 
+pub use realization::{
+    DurableFactorizedReadSnapshot, DurableFactorizedRealization, DurableHistoricalRealizationRoot,
+    decode_factorized_realization, encode_factorized_realization,
+};
 pub use replication_transport::{
     MAX_ANTI_ENTROPY_LOCKS, ReplicationAntiEntropyChunk, ReplicationAntiEntropyRelation,
     ReplicationAntiEntropyRequest, ReplicationAntiEntropySummary, ReplicationFailureDetector,
@@ -71,10 +75,6 @@ pub use replication_transport::{
     encode_signed_replication_transport_frame, replication_anti_entropy_summary,
     replication_lock_frontier_digest, replication_transport_signing_message,
     validate_replication_anti_entropy_chunk,
-};
-pub use realization::{
-    DurableFactorizedReadSnapshot, DurableFactorizedRealization, DurableHistoricalRealizationRoot,
-    decode_factorized_realization, encode_factorized_realization,
 };
 
 pub use runtime::{

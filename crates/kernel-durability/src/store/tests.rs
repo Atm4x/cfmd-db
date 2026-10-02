@@ -2229,8 +2229,8 @@ fn committed_descriptor(
             relation,
             inserted: vec![vec![Value::I64(inserted)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         registry,
     )
@@ -2267,8 +2267,8 @@ fn transition_from(
             relation,
             inserted: vec![vec![Value::I64(inserted)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         registry,
     )
@@ -2904,8 +2904,8 @@ fn store_reopens_exact_checkpoint_and_committed_wal_tail() {
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -2967,8 +2967,8 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
                 relation,
                 inserted: vec![vec![Value::I64(inserted)]],
                 removed: Vec::new(),
-            object_field_writes: Vec::new(),
-            authorization: Default::default(),
+                object_field_writes: Vec::new(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             &registry,
         )
@@ -2988,8 +2988,8 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
                 relation,
                 inserted: vec![vec![Value::I64(4)]],
                 removed: Vec::new(),
-            object_field_writes: Vec::new(),
-            authorization: Default::default(),
+                object_field_writes: Vec::new(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             rewrite_intents: vec![crate::DurableRelationRewriteIntent {
                 relation,
@@ -3162,8 +3162,8 @@ fn checkpoint_rotation_publishes_new_generation_and_resets_wal_base() {
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -3965,8 +3965,8 @@ fn idempotency_epoch_reuse_survives_crash_before_checkpoint_without_causal_alias
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -3993,8 +3993,8 @@ fn idempotency_epoch_reuse_survives_crash_before_checkpoint_without_causal_alias
             relation,
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -4061,8 +4061,8 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -4089,8 +4089,8 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
             relation,
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -4240,8 +4240,8 @@ fn group_commit_rejects_provisional_local_target_reuse_before_wal_mutation() {
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
-        object_field_writes: Vec::new(),
-        authorization: Default::default(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -7226,7 +7226,6 @@ fn single_file_streaming_checkpoint_archives_pinned_historical_epoch() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
 fn directory_root_backed_history_releases_generation_pin_and_reopens_exact_source() {
     let dir = test_dir("directory-root-backed-history");
@@ -7277,9 +7276,11 @@ fn directory_root_backed_history_releases_generation_pin_and_reopens_exact_sourc
     store
         .rotate_checkpoint_with_factorized_realization(&target, &target_atoms, &target_root)
         .unwrap();
-    assert!(!store
-        .pinned_historical_generations()
-        .contains(&historical_generation));
+    assert!(
+        !store
+            .pinned_historical_generations()
+            .contains(&historical_generation)
+    );
     assert_eq!(
         store
             .historical_revision_from_realization(anchor.effect_id)
@@ -7306,15 +7307,20 @@ fn directory_root_backed_history_releases_generation_pin_and_reopens_exact_sourc
         .release_historical_epoch_authority(&target, anchor.effect_id)
         .unwrap()
         .unwrap();
-    assert!(reopened
-        .historical_revision_from_realization(anchor.effect_id)
-        .unwrap()
-        .is_none());
+    assert!(
+        reopened
+            .historical_revision_from_realization(anchor.effect_id)
+            .unwrap()
+            .is_none()
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn aborted_streaming_complete_historical_root_never_supersedes_old_generation_authority() {
     let dir = test_dir("aborted-streaming-complete-historical-root");
     let (base, registry, _) = setup_revision(40_365, &[1, 2, 3]);
@@ -7374,10 +7380,12 @@ fn aborted_streaming_complete_historical_root_never_supersedes_old_generation_au
     assert_eq!(scan.durable_revision(), target.id());
     assert_eq!(reopened.durable_head(), target.id());
     assert_eq!(reopened.checkpoint_revision().id(), base.id());
-    assert!(reopened
-        .historical_revision_from_realization(anchor.effect_id)
-        .unwrap()
-        .is_none());
+    assert!(
+        reopened
+            .historical_revision_from_realization(anchor.effect_id)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         reopened
             .historical_epoch_material(anchor.effect_id)
@@ -7387,9 +7395,11 @@ fn aborted_streaming_complete_historical_root_never_supersedes_old_generation_au
             .id(),
         base.id()
     );
-    assert!(reopened
-        .pinned_historical_generations()
-        .contains(&historical_generation));
+    assert!(
+        reopened
+            .pinned_historical_generations()
+            .contains(&historical_generation)
+    );
 
     reopened
         .begin_streaming_checkpoint_with_factorized_realization_and_chunk_size(
@@ -7399,7 +7409,9 @@ fn aborted_streaming_complete_historical_root_never_supersedes_old_generation_au
             32,
         )
         .unwrap();
-    reopened.write_streaming_checkpoint_chunks(usize::MAX).unwrap();
+    reopened
+        .write_streaming_checkpoint_chunks(usize::MAX)
+        .unwrap();
     reopened.finalize_streaming_checkpoint().unwrap();
     assert_eq!(
         reopened
@@ -7408,9 +7420,11 @@ fn aborted_streaming_complete_historical_root_never_supersedes_old_generation_au
             .unwrap(),
         base
     );
-    assert!(!reopened
-        .pinned_historical_generations()
-        .contains(&historical_generation));
+    assert!(
+        !reopened
+            .pinned_historical_generations()
+            .contains(&historical_generation)
+    );
     reopened.compact_obsolete_generations().unwrap();
     assert!(!super::generation_layout::checkpoint_path(&dir, historical_generation).exists());
     drop(reopened);
@@ -7477,12 +7491,14 @@ fn single_file_root_backed_history_does_not_retain_generation_archive() {
         .rotate_checkpoint_with_factorized_realization(&target, &target_atoms, &target_root)
         .unwrap();
     store.compact_obsolete_generations().unwrap();
-    assert!(!store
-        .backend
-        .single_file_container()
-        .unwrap()
-        .has_historical_epoch_archive(historical_generation)
-        .unwrap());
+    assert!(
+        !store
+            .backend
+            .single_file_container()
+            .unwrap()
+            .has_historical_epoch_archive(historical_generation)
+            .unwrap()
+    );
     assert_eq!(
         store
             .historical_revision_from_realization(anchor.effect_id)
@@ -7510,8 +7526,8 @@ fn single_file_checkpoint_owns_and_reopens_factorized_realization() {
     let dir = test_dir("single-file-checkpoint-factorized-realization");
     let path = dir.join("database.cfmd");
     let (base, registry, _) = setup_revision(40_280, &[1, 2, 3]);
-    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
-        .unwrap();
+    let (atoms, root) =
+        realize_database_state_factorized(base.state(), base.semantic_context()).unwrap();
     let expected_dependencies = root.dependencies();
 
     let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
@@ -7550,8 +7566,8 @@ fn single_file_streaming_factorized_cut_carries_newer_wal_exactly() {
     let (base, registry, relation) = setup_revision(40_290, &[1]);
     let (r1, d1) = transition_from(&base, &registry, relation, 40_291, 291);
     let (r2, d2) = transition_from(&r1, &registry, relation, 40_292, 292);
-    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
-        .unwrap();
+    let (atoms, root) =
+        realize_database_state_factorized(base.state(), base.semantic_context()).unwrap();
     let expected_dependencies = root.dependencies();
     let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
 
@@ -7570,7 +7586,13 @@ fn single_file_streaming_factorized_cut_carries_newer_wal_exactly() {
 
     assert_eq!(receipt.base_revision, base.id());
     assert_eq!(store.durable_head(), r2.id());
-    assert_eq!(store.checkpoint_factorized_realization().unwrap().revision(), base.id());
+    assert_eq!(
+        store
+            .checkpoint_factorized_realization()
+            .unwrap()
+            .revision(),
+        base.id()
+    );
     drop(store);
 
     let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
@@ -7646,8 +7668,8 @@ fn single_file_streaming_checkpoint_carries_exact_wal_and_replication_suffix() {
 fn directory_checkpoint_owns_and_reopens_factorized_realization() {
     let dir = test_dir("directory-checkpoint-factorized-realization");
     let (base, registry, _) = setup_revision(40_310, &[1, 2, 3]);
-    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
-        .unwrap();
+    let (atoms, root) =
+        realize_database_state_factorized(base.state(), base.semantic_context()).unwrap();
     let expected_dependencies = root.dependencies();
 
     let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
@@ -7685,8 +7707,8 @@ fn directory_streaming_factorized_cut_carries_newer_wal_exactly() {
     let (base, registry, relation) = setup_revision(40_320, &[1]);
     let (r1, d1) = transition_from(&base, &registry, relation, 40_321, 321);
     let (r2, d2) = transition_from(&r1, &registry, relation, 40_322, 322);
-    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
-        .unwrap();
+    let (atoms, root) =
+        realize_database_state_factorized(base.state(), base.semantic_context()).unwrap();
     let expected_dependencies = root.dependencies();
     let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
 
@@ -7705,7 +7727,13 @@ fn directory_streaming_factorized_cut_carries_newer_wal_exactly() {
 
     assert_eq!(receipt.base_revision, base.id());
     assert_eq!(store.durable_head(), r2.id());
-    assert_eq!(store.checkpoint_factorized_realization().unwrap().revision(), base.id());
+    assert_eq!(
+        store
+            .checkpoint_factorized_realization()
+            .unwrap()
+            .revision(),
+        base.id()
+    );
     drop(store);
 
     let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
@@ -7723,8 +7751,8 @@ fn directory_streaming_factorized_cut_carries_newer_wal_exactly() {
 fn directory_published_realization_missing_is_corruption() {
     let dir = test_dir("directory-published-realization-missing");
     let (base, registry, _) = setup_revision(40_330, &[1]);
-    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
-        .unwrap();
+    let (atoms, root) =
+        realize_database_state_factorized(base.state(), base.semantic_context()).unwrap();
     let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
     store
         .rotate_checkpoint_with_factorized_realization(&base, &atoms, &root)

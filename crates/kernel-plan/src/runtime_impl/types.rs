@@ -189,6 +189,7 @@ fn durable_model_delta_is_empty(delta: &DurableModelDelta) -> bool {
 }
 
 impl RuntimeHistoryEffect {
+    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn from_durable(record: &DurableRevisionEffectRecord) -> Self {
         let semantic_change = record.semantic_change_event();
         let (kind, reversibility, relation_mutations, model_delta, model_complement) =

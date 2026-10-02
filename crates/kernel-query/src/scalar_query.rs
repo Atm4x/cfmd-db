@@ -73,6 +73,10 @@ impl Expr {
         Ok(self.evaluate_internal(input)?.into_owned())
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "This operation explicitly uses IEEE-754 conversion or diagnostic floating-point ratios."
+    )]
     fn evaluate_internal<'a>(&self, input: &'a Value) -> Result<EvalValue<'a>, QueryError> {
         match self {
             Self::Input => Ok(EvalValue::Borrowed(input)),
@@ -374,7 +378,9 @@ mod migration_numeric_conversion_tests {
             query.typecheck(&kernel_schema::TypeExpr::Scalar(
                 kernel_schema::ScalarType::I64,
             )),
-            Ok(kernel_schema::TypeExpr::Scalar(kernel_schema::ScalarType::F64))
+            Ok(kernel_schema::TypeExpr::Scalar(
+                kernel_schema::ScalarType::F64
+            ))
         );
         assert_eq!(
             query.evaluate(&Value::I64(42)),

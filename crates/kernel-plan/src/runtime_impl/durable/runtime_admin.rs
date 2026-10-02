@@ -146,17 +146,14 @@ impl DurableRuntime {
                         removed: mutation.removed.clone(),
                         result_type,
                     };
-                    match next.advance_relation_delta(
+                    if let Ok(advanced) = next.advance_relation_delta(
                         effect.target_revision,
                         mutation.relation,
                         &delta,
                         &self.registry,
-                    ) {
-                        Ok(advanced) => next = advanced,
-                        Err(_) => {
-                            valid = false;
-                            break;
-                        }
+                    ) { next = advanced } else {
+                        valid = false;
+                        break;
                     }
                 }
                 if valid && let Some(model_delta) = &effect.model_delta {
@@ -173,6 +170,7 @@ impl DurableRuntime {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn revision_at(
         &self,
         revision: RevisionId,
@@ -413,6 +411,7 @@ impl DurableRuntime {
     /// intervening exact effect must be disjoint, while opaque/full/schema boundaries fail
     /// closed. This is the product-facing bridge to Γ-aware stale-intent transport; it does not
     /// synthesize a merge endpoint for overlapping writes.
+    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn certify_transition_rebase(
         &self,
         source_revision: RevisionId,

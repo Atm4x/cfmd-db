@@ -19,25 +19,26 @@ pub use cfmd_runtime::{cfmd_entity, cfmd_object};
 pub use cfmd_runtime::{
     AndPredicate, BetweenPredicate, Candidate, CandidateDerivedEffects, CandidateDiagnostics,
     CandidateEffects, CandidateGroupedAggregateQuery, CandidateObjectQuery, CandidateObjectSet,
-    CandidatePreview, CandidateProjectionQuery, CandidateReadiness, CommitOutcome, Database,
-    DatabaseBuilder, DatabaseDefinition, EntitySet, SchemaDatabase, SchemaDatabaseBuilder,
-    Encryption, EncryptionKey,
-    EncryptionKeyAcknowledgement, EncryptionKeyDestination, EncryptionKeyId,
-    EncryptionKeyOperation, EncryptionKeyProvider, EncryptionProviderKeyMetadata, Error, ErrorKind, FieldRule,
-    EqOperand, EqPredicate, Field, GroupKey, GroupedAggregateQuery, GroupedAggregateWatch, GroupedAggregateWatchEvent, History,
-    HistoryEffectKind, HistoryEntry, HistoryRelationChange, HistoryReversibility,
-    HistoryUndoReadiness, Id, InProcessPublicationNotifier, Many, ManyCount, ManyCountPredicate,
-    ManyField, ManyPredicate, ManySelection, Object, ObjectEquivalence, ObjectFieldRole,
-    NotPredicate, ObjectFieldSchema, ObjectManyFieldSchema, ObjectPredicate, ObjectProjectionQuery, ObjectProxy,
-    OrPredicate,
-    ObjectQuery, ObjectRelationshipCardinality, ObjectSet, ObjectPatchField, ObjectValue, ObjectWatch,
-    ObjectWatchEvent, OptionalRefField, OptionalRefIsSome, OrderPredicate, OrderedObjectValue,
-    OrphanPolicy, OwnedMany, OwnedManySelection, Permission, PermissionSet, Plan, PrincipalId, Role,
-    PathField, PathPredicate, Projection, ProjectionWatch, ProjectionWatchEvent, PublicationNotifier, QueryNodeId,
-    QuerySource, Ref, RefField, RefPath, RefPredicate, RelationChange, Result, RevisionId, RuleValueExpr,
-    CfmdSchema, Context, DatabaseContext, Schema, SemanticRuleExpr, Session, SessionDatabase, SessionSnapshot, Snapshot, Storage, TextPattern, Transaction, TransactionId,
-    TransactionReadiness, ValueCodec, WatchCancellation, WatchDrain, WatchNext, WatchReadiness,
-    WatchReadinessSourceId, WatchStatus, WatchSubscriptionId, WatchWake,
+    CandidatePreview, CandidateProjectionQuery, CandidateReadiness, CfmdSchema, CommitOutcome,
+    Context, Database, DatabaseBuilder, DatabaseContext, DatabaseDefinition, Encryption,
+    EncryptionKey, EncryptionKeyAcknowledgement, EncryptionKeyDestination, EncryptionKeyId,
+    EncryptionKeyOperation, EncryptionKeyProvider, EncryptionProviderKeyMetadata, EntitySet,
+    EqOperand, EqPredicate, Error, ErrorKind, Field, FieldRule, GroupKey, GroupedAggregateQuery,
+    GroupedAggregateWatch, GroupedAggregateWatchEvent, History, HistoryEffectKind, HistoryEntry,
+    HistoryRelationChange, HistoryReversibility, HistoryUndoReadiness, Id,
+    InProcessPublicationNotifier, Many, ManyCount, ManyCountPredicate, ManyField, ManyPredicate,
+    ManySelection, NotPredicate, Object, ObjectEquivalence, ObjectFieldRole, ObjectFieldSchema,
+    ObjectManyFieldSchema, ObjectPatchField, ObjectPredicate, ObjectProjectionQuery, ObjectProxy,
+    ObjectQuery, ObjectRelationshipCardinality, ObjectSet, ObjectValue, ObjectWatch,
+    ObjectWatchEvent, OptionalRefField, OptionalRefIsSome, OrPredicate, OrderPredicate,
+    OrderedObjectValue, OrphanPolicy, OwnedMany, OwnedManySelection, PathField, PathPredicate,
+    Permission, PermissionSet, Plan, PrincipalId, Projection, ProjectionWatch,
+    ProjectionWatchEvent, PublicationNotifier, QueryNodeId, QuerySource, Ref, RefField, RefPath,
+    RefPredicate, RelationChange, Result, RevisionId, Role, RuleValueExpr, Schema, SchemaDatabase,
+    SchemaDatabaseBuilder, SemanticRuleExpr, Session, SessionDatabase, SessionSnapshot, Snapshot,
+    Storage, TextPattern, Transaction, TransactionId, TransactionReadiness, ValueCodec,
+    WatchCancellation, WatchDrain, WatchNext, WatchReadiness, WatchReadinessSourceId, WatchStatus,
+    WatchSubscriptionId, WatchWake,
 };
 
 #[doc(hidden)]
@@ -47,8 +48,9 @@ pub mod __private {
         __append_remove_many_edges as append_remove_many_edges,
         __identity_equivalence_id as identity_equivalence_id,
         __many_relation_id as many_relation_id, __register_owned_many as register_owned_many,
-        __row_shape_error as row_shape_error, AuthoritativeObject, Relation, Row, RowCodec,
-        ContextSource, ReadContext, SchemaAuthorityEmpty, SchemaAuthorityLeaf, SchemaAuthorityPair, Type, ValueCodec,
+        __row_shape_error as row_shape_error, AuthoritativeObject, ContextSource, ReadContext,
+        Relation, Row, RowCodec, SchemaAuthorityEmpty, SchemaAuthorityLeaf, SchemaAuthorityPair,
+        Type, ValueCodec,
     };
 }
 
@@ -58,20 +60,20 @@ pub mod __private {
 /// object-first root surface and symbolic object proxies.
 pub mod dynamic {
     pub use cfmd_runtime::{
-        BetweenPredicate, EntityRef, EqPredicate, EquivalenceId, Field, FieldId, FieldRule, OrderComparison,
-        OrderDirection, OrderPredicate, OrderingId, PreparedQuery, PreparedTypedQuery,
-        PrimitiveEquivalence, PrimitiveOrdering, Query, QueryNode, QueryNodeKind, QueryWatch,
-        Relation, RelationId, RelationQuery, RelationResult, RelationSchema, RelationSemantics,
-        Row, RowCodec, ScalarType, SchemaBuilder, SchemaView, StructuralEquivalence, Type, TypeId,
-        TypedQuery, Value, VariantTagId, WatchEvent,
+        BetweenPredicate, EntityRef, EqPredicate, EquivalenceId, Field, FieldId, FieldRule,
+        OrderComparison, OrderDirection, OrderPredicate, OrderingId, PreparedQuery,
+        PreparedTypedQuery, PrimitiveEquivalence, PrimitiveOrdering, Query, QueryNode,
+        QueryNodeKind, QueryWatch, Relation, RelationId, RelationQuery, RelationResult,
+        RelationSchema, RelationSemantics, Row, RowCodec, ScalarType, SchemaBuilder, SchemaView,
+        StructuralEquivalence, Type, TypeId, TypedQuery, Value, VariantTagId, WatchEvent,
     };
 }
 
 /// Common object-first imports for Rust applications.
 pub mod prelude {
     pub use crate::{
-        CfmdEntity, CfmdSchema, Database, EntitySet, ErrorDiagnosticExt, Id, Many, Object, ObjectPredicate, OrphanPolicy,
-        OwnedMany, PrincipalId, Ref, Result, RevisionId, Schema, Storage, Transaction,
-        TransactionId, TransactionReadiness, cfmd_entity, cfmd_object,
+        CfmdEntity, CfmdSchema, Database, EntitySet, ErrorDiagnosticExt, Id, Many, Object,
+        ObjectPredicate, OrphanPolicy, OwnedMany, PrincipalId, Ref, Result, RevisionId, Schema,
+        Storage, Transaction, TransactionId, TransactionReadiness, cfmd_entity, cfmd_object,
     };
 }

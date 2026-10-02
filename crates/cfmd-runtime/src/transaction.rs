@@ -1,4 +1,7 @@
-use crate::{Id, Object, ObjectSet, Plan, ReadContext, Result, RevisionId, SemanticRuleExpr, TransactionId, Value, ValueCodec};
+use crate::{
+    Id, Object, ObjectSet, Plan, ReadContext, Result, RevisionId, SemanticRuleExpr, TransactionId,
+    Value, ValueCodec,
+};
 
 /// Whether a transaction may be semantically transported to a newer live head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,10 +138,15 @@ impl Transaction {
         entity: Id<E>,
         expression: SemanticRuleExpr,
     ) -> Result<&mut Self> {
-        let identity_column = E::identity_column().ok_or_else(|| crate::Error::new(
-            crate::ErrorKind::InvalidSchema,
-            format!("object {} has no identity field for transaction requirement", E::KEY),
-        ))?;
+        let identity_column = E::identity_column().ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::InvalidSchema,
+                format!(
+                    "object {} has no identity field for transaction requirement",
+                    E::KEY
+                ),
+            )
+        })?;
         self.requirements.push(TransactionRequirement {
             relation: E::relation_id(),
             entity: entity.raw(),

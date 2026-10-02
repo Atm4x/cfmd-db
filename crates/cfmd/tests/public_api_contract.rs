@@ -6,10 +6,10 @@ use std::path::Path;
 
 use cfmd::dynamic::{Query, QueryWatch, RelationId, WatchEvent};
 use cfmd::{
-    Candidate, CandidateDerivedEffects, CfmdEntity, CfmdSchema, Database, DatabaseBuilder, Diagnostic, EntitySet, Error,
-    ErrorDiagnosticExt, Id, Many, ManySelection, Object, ObjectQuery, Plan, PrincipalId,
-    DatabaseContext, QueryNodeId, QuerySource, Ref, Result, Schema, Snapshot, Storage, Transaction,
-    TransactionId,
+    Candidate, CandidateDerivedEffects, CfmdEntity, CfmdSchema, Database, DatabaseBuilder,
+    DatabaseContext, Diagnostic, EntitySet, Error, ErrorDiagnosticExt, Id, Many, ManySelection,
+    Object, ObjectQuery, Plan, PrincipalId, QueryNodeId, QuerySource, Ref, Result, Schema,
+    Snapshot, Storage, Transaction, TransactionId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -123,7 +123,8 @@ fn public_types_exist(
 #[test]
 fn public_contract_compiles_as_documented() {
     let _ = database_builder as fn(&Path) -> DatabaseBuilder;
-    let _ = typed_snapshot as fn(&DatabaseContext<ContractSchema>) -> Result<Snapshot<ContractSchema>>;
+    let _ =
+        typed_snapshot as fn(&DatabaseContext<ContractSchema>) -> Result<Snapshot<ContractSchema>>;
     let _ = diagnostic as fn(&Error) -> Diagnostic;
     let query = Query::scan(RelationId::new(1));
     let _ = query_identity(&query);

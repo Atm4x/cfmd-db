@@ -59,7 +59,6 @@ pub enum DynamicViolationWitness {
     },
 }
 
-
 fn add_missing_live_reference_violations(
     value: &Value,
     location: &DynamicViolationLocation,
@@ -218,12 +217,23 @@ pub fn dynamic_violation_measure(
     for owner in compiled_rules.entity_rule_owners() {
         for entity in entity_types.entities(owner) {
             for (rule_index, rule) in compiled_rules.entity_rules(owner).iter().enumerate() {
-                let matches = rule.matches(&|coordinate| match coordinate {
-                    kernel_schema::RuleValueExpr::Input => None,
-                    kernel_schema::RuleValueExpr::Field(field) => state.model.fields.get(&(*field, entity)),
-                }).unwrap_or(false);
+                let matches = rule
+                    .matches(&|coordinate| match coordinate {
+                        kernel_schema::RuleValueExpr::Input => None,
+                        kernel_schema::RuleValueExpr::Field(field) => {
+                            state.model.fields.get(&(*field, entity))
+                        }
+                    })
+                    .unwrap_or(false);
                 if !matches {
-                    measure.add(DynamicViolationWitness::EntityRule { owner, entity, rule_index }, 1)?;
+                    measure.add(
+                        DynamicViolationWitness::EntityRule {
+                            owner,
+                            entity,
+                            rule_index,
+                        },
+                        1,
+                    )?;
                 }
             }
         }
@@ -263,7 +273,12 @@ pub fn relation_dynamic_violation_measure(
 ) -> Result<ViolationMeasure<DynamicViolationWitness>, ValidationError> {
     let compiled_rules = crate::CompiledRulePlan::compile(context);
     relation_dynamic_violation_measure_with_plan(
-        context, registry, state, entity_types, relation_id, &compiled_rules,
+        context,
+        registry,
+        state,
+        entity_types,
+        relation_id,
+        &compiled_rules,
     )
 }
 

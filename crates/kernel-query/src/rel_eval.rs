@@ -1,12 +1,11 @@
 use super::{
     AggregateSpec, BTreeMap, BTreeSet, CanonicalRowKey, OrderComparison, OrderDirection,
-    PreparedRelExpr, RelExpr, RelQueryError, RelType, RelationValue, Row, Value,
-    anti_join_relation_values, canonical_row_key,
-    difference_relation_values, distinct_rows, distinct_rows_with_canonical_keys,
-    group_relation_value, project_rows, query_types_compatible,
+    PreparedRelExpr, RelExpr, RelQueryError, RelType, RelationOccurrenceCertificate,
+    RelationScanOccurrenceSeed, RelationValue, Row, Value, anti_join_relation_values,
+    canonical_row_key, difference_relation_values, distinct_rows,
+    distinct_rows_with_canonical_keys, group_relation_value, project_rows, query_types_compatible,
     relation_column_equivalence, relation_column_equivalences, union_relation_values,
-    validate_query_equivalence, value_shape_matches_type, RelationOccurrenceCertificate,
-    RelationScanOccurrenceSeed,
+    validate_query_equivalence, value_shape_matches_type,
 };
 use crate::relation_state::CanonicalRowEvidence;
 
@@ -108,7 +107,7 @@ pub(super) fn evaluate_prepared_expr_with_occurrence_certificate(
     let certificate = RelationOccurrenceCertificate::from_dense_set_keys(
         result_type,
         semantic,
-        canonical_keys_by_row,
+        &canonical_keys_by_row,
     )?;
     Ok((value, certificate))
 }
@@ -133,7 +132,7 @@ pub(super) fn evaluate_prepared_expr_with_occurrence_certificate_seeded(
     let certificate = RelationOccurrenceCertificate::from_dense_set_keys(
         result_type,
         semantic,
-        canonical_keys_by_row,
+        &canonical_keys_by_row,
     )?;
     Ok((value, certificate))
 }
@@ -156,6 +155,10 @@ pub(super) fn evaluate_prepared_expr_seeded(
     evaluate_expr_with_canonical_keys(expr, &eval).map(|(value, _, _)| value)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn evaluate_expr_with_canonical_keys(
     expr: &RelExpr,
     eval: &RelEvalContext<'_>,
@@ -195,9 +198,9 @@ fn evaluate_expr_with_canonical_keys(
                 (Ok((left_value, _, left_keys)), Ok((right_value, _, right_keys))) => {
                     union_relation_values_from_canonical_keys(
                         left_value,
-                        left_keys,
+                        &left_keys,
                         right_value,
-                        right_keys,
+                        &right_keys,
                         &equivalences,
                     )?
                 }
@@ -229,9 +232,9 @@ fn evaluate_expr_with_canonical_keys(
                 evaluate_expr_with_canonical_keys(right, eval)?;
             join_relation_values_with_canonical_keys(
                 left_value,
-                left_keys,
+                &left_keys,
                 right_value,
-                right_keys,
+                &right_keys,
                 *left_column,
                 *right_column,
                 *equivalence,
@@ -248,9 +251,9 @@ fn evaluate_expr_with_canonical_keys(
                 (Ok((left_value, _, left_keys)), Ok((right_value, _, right_keys))) => {
                     difference_relation_values_from_canonical_keys(
                         left_value,
-                        left_keys,
+                        &left_keys,
                         right_value,
-                        right_keys,
+                        &right_keys,
                         &equivalences,
                     )?
                 }
@@ -276,15 +279,14 @@ fn evaluate_expr_with_canonical_keys(
             right_column,
             equivalence,
         } => {
-            let (left_value, left_type, left_keys) =
-                evaluate_expr_with_canonical_keys(left, eval)?;
+            let (left_value, left_type, left_keys) = evaluate_expr_with_canonical_keys(left, eval)?;
             if left_type != result_type {
                 return Err(RelQueryError::TypeMismatch);
             }
             let right_value = right.evaluate_unchecked(eval)?;
             anti_join_relation_values_with_canonical_keys(
                 left_value,
-                left_keys,
+                &left_keys,
                 &right_value,
                 *left_column,
                 *right_column,
@@ -297,17 +299,20 @@ fn evaluate_expr_with_canonical_keys(
             input,
             column_equivalences,
         } => match evaluate_expr_with_canonical_keys(input, eval) {
-            Ok((RelationValue::Set { rows, column_equivalences: input_equivalences }, _, keys))
-                if input_equivalences == *column_equivalences =>
-            {
-                (
-                    RelationValue::Set {
-                        rows,
-                        column_equivalences: input_equivalences,
-                    },
-                    keys,
-                )
-            }
+            Ok((
+                RelationValue::Set {
+                    rows,
+                    column_equivalences: input_equivalences,
+                },
+                _,
+                keys,
+            )) if input_equivalences == *column_equivalences => (
+                RelationValue::Set {
+                    rows,
+                    column_equivalences: input_equivalences,
+                },
+                keys,
+            ),
             Ok(_) | Err(RelQueryError::CanonicalObservationUnavailable) => {
                 let rows = input.evaluate_unchecked(eval)?.into_rows();
                 let (rows, canonical_keys) = distinct_rows_with_canonical_keys(
@@ -332,7 +337,7 @@ fn evaluate_expr_with_canonical_keys(
                 Ok((RelationValue::Set { rows, .. }, _, input_keys)) => {
                     project_relation_value_from_canonical_keys(
                         rows,
-                        input_keys,
+                        &input_keys,
                         columns,
                         equivalences,
                     )?
@@ -369,18 +374,24 @@ fn evaluate_expr_with_canonical_keys(
     Ok((value, result_type, canonical_keys_by_row))
 }
 
-
 fn union_relation_values_from_canonical_keys(
     left: RelationValue,
-    left_keys_by_row: CanonicalRowEvidence,
+    left_keys_by_row: &CanonicalRowEvidence,
     right: RelationValue,
-    right_keys_by_row: CanonicalRowEvidence,
+    right_keys_by_row: &CanonicalRowEvidence,
     column_equivalences: &[kernel_types::SemanticId],
 ) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
     let (
-        RelationValue::Set { rows: left_rows, column_equivalences: left_equivalences },
-        RelationValue::Set { rows: right_rows, column_equivalences: right_equivalences },
-    ) = (left, right) else {
+        RelationValue::Set {
+            rows: left_rows,
+            column_equivalences: left_equivalences,
+        },
+        RelationValue::Set {
+            rows: right_rows,
+            column_equivalences: right_equivalences,
+        },
+    ) = (left, right)
+    else {
         return Err(RelQueryError::CanonicalObservationUnavailable);
     };
     if left_equivalences != column_equivalences
@@ -391,8 +402,18 @@ fn union_relation_values_from_canonical_keys(
         return Err(RelQueryError::TypeMismatch);
     }
     let mut keyed_rows = Vec::with_capacity(left_rows.len() + right_rows.len());
-    keyed_rows.extend(left_rows.into_iter().zip(left_keys_by_row.iter().cloned()).map(|(row, key)| (key, row)));
-    keyed_rows.extend(right_rows.into_iter().zip(right_keys_by_row.iter().cloned()).map(|(row, key)| (key, row)));
+    keyed_rows.extend(
+        left_rows
+            .into_iter()
+            .zip(left_keys_by_row.iter().cloned())
+            .map(|(row, key)| (key, row)),
+    );
+    keyed_rows.extend(
+        right_rows
+            .into_iter()
+            .zip(right_keys_by_row.iter().cloned())
+            .map(|(row, key)| (key, row)),
+    );
     keyed_rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     keyed_rows.dedup_by(|left, right| left.0 == right.0);
     let mut rows = Vec::with_capacity(keyed_rows.len());
@@ -402,22 +423,32 @@ fn union_relation_values_from_canonical_keys(
         rows.push(row);
     }
     Ok((
-        RelationValue::Set { rows, column_equivalences: column_equivalences.to_vec() },
+        RelationValue::Set {
+            rows,
+            column_equivalences: column_equivalences.to_vec(),
+        },
         CanonicalRowEvidence::from_dense(keys),
     ))
 }
 
 fn difference_relation_values_from_canonical_keys(
     left: RelationValue,
-    left_keys_by_row: CanonicalRowEvidence,
+    left_keys_by_row: &CanonicalRowEvidence,
     right: RelationValue,
-    right_keys_by_row: CanonicalRowEvidence,
+    right_keys_by_row: &CanonicalRowEvidence,
     column_equivalences: &[kernel_types::SemanticId],
 ) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
     let (
-        RelationValue::Set { rows: left_rows, column_equivalences: left_equivalences },
-        RelationValue::Set { rows: right_rows, column_equivalences: right_equivalences },
-    ) = (left, right) else {
+        RelationValue::Set {
+            rows: left_rows,
+            column_equivalences: left_equivalences,
+        },
+        RelationValue::Set {
+            rows: right_rows,
+            column_equivalences: right_equivalences,
+        },
+    ) = (left, right)
+    else {
         return Err(RelQueryError::CanonicalObservationUnavailable);
     };
     if left_equivalences != column_equivalences
@@ -438,14 +469,17 @@ fn difference_relation_values_from_canonical_keys(
         keys.push(key.clone());
     }
     Ok((
-        RelationValue::Set { rows, column_equivalences: column_equivalences.to_vec() },
+        RelationValue::Set {
+            rows,
+            column_equivalences: column_equivalences.to_vec(),
+        },
         CanonicalRowEvidence::from_dense(keys),
     ))
 }
 
 fn project_relation_value_from_canonical_keys(
     rows: Vec<Row>,
-    input_keys_by_row: CanonicalRowEvidence,
+    input_keys_by_row: &CanonicalRowEvidence,
     columns: &[usize],
     output_equivalences: Vec<kernel_types::SemanticId>,
 ) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
@@ -457,7 +491,12 @@ fn project_relation_value_from_canonical_keys(
     for (row, input_key) in projected_rows.into_iter().zip(input_keys_by_row.iter()) {
         let key = columns
             .iter()
-            .map(|&column| input_key.get(column).cloned().ok_or(RelQueryError::ColumnOutOfBounds))
+            .map(|&column| {
+                input_key
+                    .get(column)
+                    .cloned()
+                    .ok_or(RelQueryError::ColumnOutOfBounds)
+            })
             .collect::<Result<CanonicalRowKey, RelQueryError>>()?;
         keyed_rows.push((key, row));
     }
@@ -470,16 +509,23 @@ fn project_relation_value_from_canonical_keys(
         rows.push(row);
     }
     Ok((
-        RelationValue::Set { rows, column_equivalences: output_equivalences },
+        RelationValue::Set {
+            rows,
+            column_equivalences: output_equivalences,
+        },
         CanonicalRowEvidence::from_dense(keys),
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep the explicit semantic and durability inputs at this boundary."
+)]
 fn join_relation_values_with_canonical_keys(
     left: RelationValue,
-    left_keys_by_row: CanonicalRowEvidence,
+    left_keys_by_row: &CanonicalRowEvidence,
     right: RelationValue,
-    right_keys_by_row: CanonicalRowEvidence,
+    right_keys_by_row: &CanonicalRowEvidence,
     left_column: usize,
     right_column: usize,
     equivalence: kernel_types::SemanticId,
@@ -503,14 +549,10 @@ fn join_relation_values_with_canonical_keys(
         return Err(RelQueryError::InconsistentIncrementalDelta);
     }
 
-    let mut right_buckets = BTreeMap::<
-        kernel_semantics::CanonicalEqKey,
-        Vec<(usize, &CanonicalRowKey)>,
-    >::new();
-    for ((right_index, right_row), right_full_key) in right_rows
-        .iter()
-        .enumerate()
-        .zip(right_keys_by_row.iter())
+    let mut right_buckets =
+        BTreeMap::<kernel_semantics::CanonicalEqKey, Vec<(usize, &CanonicalRowKey)>>::new();
+    for ((right_index, right_row), right_full_key) in
+        right_rows.iter().enumerate().zip(right_keys_by_row.iter())
     {
         let right_key = right_row
             .get(right_column)
@@ -564,9 +606,13 @@ fn join_relation_values_with_canonical_keys(
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep the explicit semantic and durability inputs at this boundary."
+)]
 fn anti_join_relation_values_with_canonical_keys(
     left: RelationValue,
-    left_keys_by_row: CanonicalRowEvidence,
+    left_keys_by_row: &CanonicalRowEvidence,
     right: &RelationValue,
     left_column: usize,
     right_column: usize,
@@ -814,9 +860,7 @@ impl RelExpr {
             Self::Difference { left, right } => {
                 Self::typecheck_difference(left, right, context, registry)
             }
-            Self::Union { left, right } => {
-                Self::typecheck_union(left, right, context, registry)
-            }
+            Self::Union { left, right } => Self::typecheck_union(left, right, context, registry),
             Self::AntiJoin {
                 left,
                 right,

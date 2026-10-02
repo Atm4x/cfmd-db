@@ -38,7 +38,10 @@ impl<T> PersistentVecStorageProbe<T> {
 
     #[must_use]
     pub fn live_nodes(&self) -> usize {
-        self.nodes.iter().filter(|node| node.strong_count() != 0).count()
+        self.nodes
+            .iter()
+            .filter(|node| node.strong_count() != 0)
+            .count()
     }
 
     #[must_use]

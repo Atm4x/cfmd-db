@@ -1,9 +1,9 @@
 use kernel_model::{DatabaseState, Value};
 use kernel_revision::Revision;
 use kernel_schema::{
-    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext,
-    RuleValueExpr, SemanticEnvironment, SemanticRuleExpr, StructuralEquivalenceDef, StructuralOrderingDef, Symbol, SymbolKind,
-    TextPattern, TypeExpr, TypeVar,
+    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, RuleValueExpr, ScalarType,
+    Schema, SemanticContext, SemanticEnvironment, SemanticRuleExpr, StructuralEquivalenceDef,
+    StructuralOrderingDef, Symbol, SymbolKind, TextPattern, TypeExpr, TypeVar,
 };
 use kernel_semantics::{EquivalenceModule, OrderingModule, SemanticRegistry};
 use kernel_types::{EntityId, RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
@@ -16,6 +16,10 @@ fn sid(raw: u128) -> SemanticId {
     SemanticId::new(raw)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn complex_revision() -> (Revision, SemanticRegistry) {
     let entity_type = sid(1);
     let subtype = sid(2);

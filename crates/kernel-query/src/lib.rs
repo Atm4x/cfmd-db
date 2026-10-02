@@ -101,8 +101,8 @@ use kernel_change::{
 };
 use kernel_model::Value;
 pub use prepared_rel::PreparedRelExpr;
-pub use quotient::{CanonicalRowKey, canonical_row_key};
 use quotient::CanonicalRowPositionIndex;
+pub use quotient::{CanonicalRowKey, canonical_row_key};
 pub use recursive_query::{
     CompactRecursiveBag, FixpointCall, PositiveRecursiveRowAtom, PositiveRecursiveRowRule,
 };

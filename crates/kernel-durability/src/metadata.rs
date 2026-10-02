@@ -16,9 +16,9 @@ pub(crate) use artifact_codec::{
     encode_migration_complements,
 };
 pub(crate) use intent_codec::{
-    decode_relation_mutations, decode_relation_mutations_legacy, decode_relation_rewrite_intents, decode_semantic_module_specs,
-    decode_transaction_intent, encode_relation_mutations, encode_relation_rewrite_intents,
-    encode_semantic_module_specs, encode_transaction_intent,
+    decode_relation_mutations, decode_relation_mutations_legacy, decode_relation_rewrite_intents,
+    decode_semantic_module_specs, decode_transaction_intent, encode_relation_mutations,
+    encode_relation_rewrite_intents, encode_semantic_module_specs, encode_transaction_intent,
 };
 pub(crate) use migration_program_codec::{
     decode_schema_migration_program, encode_schema_migration_program,
