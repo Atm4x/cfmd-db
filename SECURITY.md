@@ -15,6 +15,8 @@ The planned local tooling/Studio endpoint is not implicitly trusted because it i
 
 `Database` is an unrestricted in-process capability intended for trusted embedded/host code. Untrusted hosted clients must be represented by `SessionDatabase`; raw `Database` must not be exposed across a protocol boundary. Authentication establishes `PrincipalId` and grants outside the runtime. Runtime authorization propagates one shared session authority through derived read/write/history/watch product values; grants may be refreshed by the trusted host, while revocation is monotone and invalidates stale product values. Localhost, local IPC and transport identity are never implicit trust signals.
 
+Full schema/model introspection is a separate `ModelRead` capability; possessing data `Read` or one `ReadField` does not reveal the authoritative model. `schema_revision()` exposes only schema-epoch metadata. Schema migration requires `SchemaMigrate`; generic `Write` is insufficient. Migration preparation may run without holding a session lock, but durable publication revalidates/holds current migration authority at the publication boundary. Named roles are flattened permission presets only and cannot manufacture authority beyond their constituent grants.
+
 
 ## Hosted protocol boundary
 

@@ -11,7 +11,7 @@ use crate::domain::{
     DurableRelationResolution, DurableRevisionChange, DurableTransactionIntent, IdempotencyEpoch,
 };
 use crate::metadata::{
-    self, decode_relation_mutations, decode_relation_rewrite_intents, encode_relation_mutations,
+    self, decode_relation_mutations, decode_relation_mutations_legacy, decode_relation_rewrite_intents, encode_relation_mutations,
     encode_relation_rewrite_intents,
 };
 use crate::runtime::CodecError;
@@ -51,7 +51,7 @@ fn encode_schema_migration_prepare(
     descriptor: &DurableRevisionDescriptor,
     source_revision: RevisionId,
     target_revision: RevisionId,
-    encoded_target_revision: &[u8],
+    program: &kernel_transport::SchemaMigrationProgram,
     migration_complement: &DurableMigrationComplement,
     semantic_modules: &[BuiltinSemanticModuleSpec],
 ) -> Result<(), CodecError> {
@@ -60,17 +60,17 @@ fn encode_schema_migration_prepare(
     {
         return Err(CodecError::CollectionTooLarge);
     }
-    let DurableRevisionChange::FullRevision {
-        encoded_target_revision: change_target,
+    let DurableRevisionChange::SchemaMigration {
+        program: change_program,
     } = &descriptor.change
     else {
         return Err(CodecError::CollectionTooLarge);
     };
-    if encoded_target_revision != change_target {
+    if program != change_program {
         return Err(CodecError::CollectionTooLarge);
     }
     out.push(4);
-    push_bytes(out, encoded_target_revision)?;
+    metadata::encode_schema_migration_program(out, program)?;
     metadata::encode_migration_complements(out, std::slice::from_ref(migration_complement))?;
     metadata::encode_semantic_module_specs(out, semantic_modules)?;
     Ok(())
@@ -116,6 +116,48 @@ fn encode_mixed_revision_prepare(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn encode_mixed_revision_residual_prepare(
+    out: &mut Vec<u8>,
+    descriptor: &DurableRevisionDescriptor,
+    source_revision: RevisionId,
+    target_revision: RevisionId,
+    semantic_revision: SemanticRevision,
+    client_relation_mutations: &[DurableRelationMutation],
+    client_model_delta: &DurableModelDelta,
+    realized_relation_mutations: &[DurableRelationMutation],
+    realized_model_delta: &DurableModelDelta,
+    realized_model_complement: &DurableModelDelta,
+    semantic_modules: &[BuiltinSemanticModuleSpec],
+) -> Result<(), CodecError> {
+    let DurableRevisionChange::MixedRevision {
+        semantic_revision: change_semantics,
+        relation_mutations: change_mutations,
+        model_delta: change_model_delta,
+    } = &descriptor.change
+    else {
+        return Err(CodecError::CollectionTooLarge);
+    };
+    if source_revision != descriptor.source_revision
+        || target_revision != descriptor.target_revision
+        || semantic_revision != *change_semantics
+        || realized_relation_mutations != change_mutations
+        || realized_model_delta != change_model_delta
+    {
+        return Err(CodecError::CollectionTooLarge);
+    }
+    out.push(9);
+    metadata::encode_semantic_module_specs(out, semantic_modules)?;
+    push_u64(out, semantic_revision.schema.raw());
+    push_u64(out, semantic_revision.environment.raw());
+    encode_relation_mutations(out, client_relation_mutations)?;
+    metadata::encode_model_delta(out, client_model_delta)?;
+    encode_relation_mutations(out, realized_relation_mutations)?;
+    metadata::encode_model_delta(out, realized_model_delta)?;
+    metadata::encode_model_delta(out, realized_model_complement)?;
+    Ok(())
+}
+
 fn encode_relation_data_prepare(
     out: &mut Vec<u8>,
     descriptor: &DurableRevisionDescriptor,
@@ -147,6 +189,38 @@ fn encode_relation_data_prepare(
     Ok(())
 }
 
+fn encode_relation_data_residual_prepare(
+    out: &mut Vec<u8>,
+    descriptor: &DurableRevisionDescriptor,
+    source_revision: RevisionId,
+    target_revision: RevisionId,
+    semantic_revision: SemanticRevision,
+    client_mutations: &[DurableRelationMutation],
+    realized_mutations: &[DurableRelationMutation],
+    semantic_modules: &[BuiltinSemanticModuleSpec],
+) -> Result<(), CodecError> {
+    let DurableRevisionChange::RelationData {
+        semantic_revision: change_semantics,
+        relation_mutations: change_mutations,
+    } = &descriptor.change
+    else {
+        return Err(CodecError::CollectionTooLarge);
+    };
+    if source_revision != descriptor.source_revision
+        || target_revision != descriptor.target_revision
+        || semantic_revision != *change_semantics
+        || realized_mutations != change_mutations
+    {
+        return Err(CodecError::CollectionTooLarge);
+    }
+    out.push(8);
+    metadata::encode_semantic_module_specs(out, semantic_modules)?;
+    push_u64(out, semantic_revision.schema.raw());
+    push_u64(out, semantic_revision.environment.raw());
+    encode_relation_mutations(out, client_mutations)?;
+    encode_relation_mutations(out, realized_mutations)?;
+    Ok(())
+}
 fn encode_relation_resolution_prepare(
     out: &mut Vec<u8>,
     descriptor: &DurableRevisionDescriptor,
@@ -227,7 +301,12 @@ fn encode_prepare_identity_prefix(out: &mut Vec<u8>, descriptor: &DurableRevisio
         || descriptor.revision_effect_id.is_some();
     let requires_current_codec = matches!(
         descriptor.intent,
-        DurableTransactionIntent::MixedRevisionExact { .. }
+        DurableTransactionIntent::RelationDataExact { .. }
+            | DurableTransactionIntent::RelationDataResidualExact { .. }
+            | DurableTransactionIntent::RelationRewriteExact { .. }
+            | DurableTransactionIntent::RelationResolutionExact { .. }
+            | DurableTransactionIntent::MixedRevisionExact { .. }
+            | DurableTransactionIntent::MixedRevisionResidualExact { .. }
     );
     let uses_identity_fields = identity_bound || requires_current_codec;
     push_u16(
@@ -274,6 +353,23 @@ pub(crate) fn encode_prepare_payload(
             relation_mutations,
             semantic_modules,
         )?,
+        DurableTransactionIntent::RelationDataResidualExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            client_mutations,
+            realized_mutations,
+            semantic_modules,
+        } => encode_relation_data_residual_prepare(
+            &mut out,
+            descriptor,
+            *source_revision,
+            *target_revision,
+            *semantic_revision,
+            client_mutations,
+            realized_mutations,
+            semantic_modules,
+        )?,
         intent @ DurableTransactionIntent::RelationRewriteExact { .. } => {
             encode_relation_rewrite_prepare(&mut out, descriptor, intent)?;
         }
@@ -317,6 +413,29 @@ pub(crate) fn encode_prepare_payload(
             model_complement.as_deref(),
             semantic_modules,
         )?,
+        DurableTransactionIntent::MixedRevisionResidualExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            client_relation_mutations,
+            client_model_delta,
+            realized_relation_mutations,
+            realized_model_delta,
+            realized_model_complement,
+            semantic_modules,
+        } => encode_mixed_revision_residual_prepare(
+            &mut out,
+            descriptor,
+            *source_revision,
+            *target_revision,
+            *semantic_revision,
+            client_relation_mutations,
+            client_model_delta,
+            realized_relation_mutations,
+            realized_model_delta,
+            realized_model_complement,
+            semantic_modules,
+        )?,
         DurableTransactionIntent::Exact {
             target_revision,
             encoded_target_revision,
@@ -340,7 +459,8 @@ pub(crate) fn encode_prepare_payload(
                 DurableRevisionChange::FullRevision { .. } => out.push(1),
                 DurableRevisionChange::FullRevisionAndMaterializations { .. } => out.push(2),
                 DurableRevisionChange::RelationData { .. }
-                | DurableRevisionChange::MixedRevision { .. } => {
+                | DurableRevisionChange::MixedRevision { .. }
+                | DurableRevisionChange::SchemaMigration { .. } => {
                     return Err(CodecError::CollectionTooLarge);
                 }
             }
@@ -348,7 +468,7 @@ pub(crate) fn encode_prepare_payload(
         DurableTransactionIntent::SchemaMigrationExact {
             source_revision,
             target_revision,
-            encoded_target_revision,
+            program,
             migration_complement,
             semantic_modules,
         } => encode_schema_migration_prepare(
@@ -356,7 +476,7 @@ pub(crate) fn encode_prepare_payload(
             descriptor,
             *source_revision,
             *target_revision,
-            encoded_target_revision,
+            program,
             migration_complement,
             semantic_modules,
         )?,
@@ -394,7 +514,7 @@ pub(crate) fn decode_prepare_payload(
                     kernel_types::SchemaRevisionId::new(cursor.u64()?),
                     kernel_types::SemanticEnvId::new(cursor.u64()?),
                 ),
-                relation_mutations: decode_relation_mutations(&mut cursor)?,
+                relation_mutations: decode_relation_mutations_legacy(&mut cursor)?,
             },
         ),
         3 => {
@@ -404,7 +524,7 @@ pub(crate) fn decode_prepare_payload(
                         kernel_types::SchemaRevisionId::new(cursor.u64()?),
                         kernel_types::SemanticEnvId::new(cursor.u64()?),
                     ),
-                    relation_mutations: decode_relation_mutations(&mut cursor)?,
+                    relation_mutations: decode_relation_mutations_legacy(&mut cursor)?,
                 },
                 1 => {
                     let len = cursor.len()?;
@@ -425,6 +545,7 @@ pub(crate) fn decode_prepare_payload(
                 },
                 DurableRevisionChange::RelationData { .. }
                 | DurableRevisionChange::MixedRevision { .. }
+                | DurableRevisionChange::SchemaMigration { .. }
                 | DurableRevisionChange::FullRevisionAndMaterializations { .. } => {
                     DurableTransactionIntent::LegacyTargetOnly { target_revision }
                 }
@@ -433,7 +554,7 @@ pub(crate) fn decode_prepare_payload(
         }
         4 => decode_v4_prepare_payload(&mut cursor, target_revision)?,
         5 | 6 | 7 | 8 | 9 | 10 | MUTATION_CODEC_VERSION => {
-            decode_current_prepare_payload(&mut cursor, source_revision, target_revision)?
+            decode_current_prepare_payload(&mut cursor, source_revision, target_revision, version)?
         }
         _ => return Err("unsupported mutation codec version"),
     };
@@ -478,7 +599,7 @@ fn decode_v4_prepare_payload(
                 kernel_types::SchemaRevisionId::new(cursor.u64()?),
                 kernel_types::SemanticEnvId::new(cursor.u64()?),
             ),
-            relation_mutations: decode_relation_mutations(cursor)?,
+            relation_mutations: decode_relation_mutations_legacy(cursor)?,
         },
         1 => {
             if materializations.is_some() {
@@ -499,20 +620,84 @@ fn decode_v4_prepare_payload(
 }
 
 #[allow(clippy::too_many_lines)] // Versioned wire decoder; linear order must mirror the encoded payload.
+
+fn decode_relation_mutations_for_version(
+    cursor: &mut Cursor<'_>,
+    version: u16,
+) -> Result<Vec<DurableRelationMutation>, &'static str> {
+    if version >= MUTATION_CODEC_VERSION {
+        decode_relation_mutations(cursor)
+    } else {
+        decode_relation_mutations_legacy(cursor)
+    }
+}
+
 fn decode_current_prepare_payload(
     cursor: &mut Cursor<'_>,
     source_revision: RevisionId,
     target_revision: RevisionId,
+    version: u16,
 ) -> Result<(DurableTransactionIntent, DurableRevisionChange), &'static str> {
     let tag = cursor.u8()?;
     match tag {
+        8 => {
+            let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
+            let semantic_revision = SemanticRevision::new(
+                kernel_types::SchemaRevisionId::new(cursor.u64()?),
+                kernel_types::SemanticEnvId::new(cursor.u64()?),
+            );
+            let client_mutations = decode_relation_mutations_for_version(cursor, version)?;
+            let realized_mutations = decode_relation_mutations_for_version(cursor, version)?;
+            let intent = DurableTransactionIntent::RelationDataResidualExact {
+                source_revision,
+                target_revision,
+                semantic_revision,
+                client_mutations,
+                realized_mutations: realized_mutations.clone(),
+                semantic_modules,
+            };
+            let change = DurableRevisionChange::RelationData {
+                semantic_revision,
+                relation_mutations: realized_mutations,
+            };
+            Ok((intent, change))
+        }
+        9 => {
+            let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
+            let semantic_revision = SemanticRevision::new(
+                kernel_types::SchemaRevisionId::new(cursor.u64()?),
+                kernel_types::SemanticEnvId::new(cursor.u64()?),
+            );
+            let client_relation_mutations = decode_relation_mutations_for_version(cursor, version)?;
+            let client_model_delta = metadata::decode_model_delta(cursor)?;
+            let realized_relation_mutations = decode_relation_mutations_for_version(cursor, version)?;
+            let realized_model_delta = metadata::decode_model_delta(cursor)?;
+            let realized_model_complement = Box::new(metadata::decode_model_delta(cursor)?);
+            let intent = DurableTransactionIntent::MixedRevisionResidualExact {
+                source_revision,
+                target_revision,
+                semantic_revision,
+                client_relation_mutations,
+                client_model_delta,
+                realized_relation_mutations: realized_relation_mutations.clone(),
+                realized_model_delta: realized_model_delta.clone(),
+                realized_model_complement,
+                semantic_modules,
+            };
+            let change = DurableRevisionChange::MixedRevision {
+                semantic_revision,
+                relation_mutations: realized_relation_mutations,
+                model_delta: realized_model_delta,
+            };
+            Ok((intent, change))
+        }
         6 | 7 => {
             let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
             let semantic_revision = SemanticRevision::new(
                 kernel_types::SchemaRevisionId::new(cursor.u64()?),
                 kernel_types::SemanticEnvId::new(cursor.u64()?),
             );
-            let relation_mutations = decode_relation_mutations(cursor)?;
+            let relation_mutations = decode_relation_mutations_for_version(cursor, version)?;
             let model_delta = metadata::decode_model_delta(cursor)?;
             let model_complement = if tag == 7 {
                 Some(Box::new(metadata::decode_model_delta(cursor)?))
@@ -535,7 +720,7 @@ fn decode_current_prepare_payload(
             };
             Ok((intent, change))
         }
-        5 => decode_relation_resolution_prepare(cursor, source_revision, target_revision),
+        5 => decode_relation_resolution_prepare(cursor, source_revision, target_revision, version),
         4 => decode_schema_migration_prepare(cursor, source_revision, target_revision),
         3 => {
             let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
@@ -543,7 +728,7 @@ fn decode_current_prepare_payload(
                 kernel_types::SchemaRevisionId::new(cursor.u64()?),
                 kernel_types::SemanticEnvId::new(cursor.u64()?),
             );
-            let relation_mutations = decode_relation_mutations(cursor)?;
+            let relation_mutations = decode_relation_mutations_for_version(cursor, version)?;
             let rewrite_intents = decode_relation_rewrite_intents(cursor)?;
             if relation_mutations.len() != rewrite_intents.len()
                 || relation_mutations
@@ -573,7 +758,7 @@ fn decode_current_prepare_payload(
                 kernel_types::SchemaRevisionId::new(cursor.u64()?),
                 kernel_types::SemanticEnvId::new(cursor.u64()?),
             );
-            let relation_mutations = decode_relation_mutations(cursor)?;
+            let relation_mutations = decode_relation_mutations_for_version(cursor, version)?;
             let intent = DurableTransactionIntent::RelationDataExact {
                 source_revision,
                 target_revision,
@@ -630,13 +815,14 @@ fn decode_relation_resolution_prepare(
     cursor: &mut Cursor<'_>,
     source_revision: RevisionId,
     target_revision: RevisionId,
+    version: u16,
 ) -> Result<(DurableTransactionIntent, DurableRevisionChange), &'static str> {
     let semantic_modules = metadata::decode_semantic_module_specs(cursor)?;
     let semantic_revision = SemanticRevision::new(
         kernel_types::SchemaRevisionId::new(cursor.u64()?),
         kernel_types::SemanticEnvId::new(cursor.u64()?),
     );
-    let relation_mutations = decode_relation_mutations(cursor)?;
+    let relation_mutations = decode_relation_mutations_for_version(cursor, version)?;
     let rewrite_intents = decode_relation_rewrite_intents(cursor)?;
     if relation_mutations.len() != rewrite_intents.len()
         || relation_mutations
@@ -685,10 +871,7 @@ fn decode_schema_migration_prepare(
     source_revision: RevisionId,
     target_revision: RevisionId,
 ) -> Result<(DurableTransactionIntent, DurableRevisionChange), &'static str> {
-    let encoded_target_revision = {
-        let len = cursor.len()?;
-        cursor.take(len)?.to_vec()
-    };
+    let program = metadata::decode_schema_migration_program(cursor)?;
     let mut complements = metadata::decode_migration_complements(cursor)?;
     if complements.len() != 1 {
         return Err("schema migration prepare must carry exactly one complement");
@@ -698,14 +881,9 @@ fn decode_schema_migration_prepare(
     let intent = DurableTransactionIntent::SchemaMigrationExact {
         source_revision,
         target_revision,
-        encoded_target_revision: encoded_target_revision.clone(),
+        program: program.clone(),
         migration_complement,
         semantic_modules,
     };
-    Ok((
-        intent,
-        DurableRevisionChange::FullRevision {
-            encoded_target_revision,
-        },
-    ))
+    Ok((intent, DurableRevisionChange::SchemaMigration { program }))
 }

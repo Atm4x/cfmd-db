@@ -14,6 +14,8 @@ impl DurableRuntime {
                 relation: mutation.relation,
                 inserted: mutation.delta.inserted.clone(),
                 removed: mutation.delta.removed.clone(),
+                object_field_writes: mutation.object_field_writes.to_vec(),
+                authorization: mutation.authorization,
             });
         }
         durable.sort_by_key(|mutation| mutation.relation);
@@ -42,6 +44,8 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 inserted: rewrite.rewrite.delta().inserted.clone(),
                 removed: rewrite.rewrite.delta().removed.clone(),
+                object_field_writes: Vec::new(),
+                authorization: Default::default(),
             });
             intents.push(DurableRelationRewriteIntent {
                 relation: rewrite.relation,

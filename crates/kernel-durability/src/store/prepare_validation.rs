@@ -79,7 +79,7 @@ struct SchemaMigrationPrepare<'a> {
     expected_source_schema: Option<SchemaRevisionId>,
     source_revision: RevisionId,
     target_revision: RevisionId,
-    encoded_target_revision: &'a [u8],
+    program: &'a kernel_transport::SchemaMigrationProgram,
     migration_complement: &'a DurableMigrationComplement,
     semantic_modules: &'a [kernel_semantics::BuiltinSemanticModuleSpec],
 }
@@ -94,7 +94,7 @@ fn validate_schema_migration_prepare_intent(
         expected_source_schema,
         source_revision,
         target_revision,
-        encoded_target_revision,
+        program,
         migration_complement,
         semantic_modules,
     } = prepare;
@@ -104,18 +104,38 @@ fn validate_schema_migration_prepare_intent(
             reason: "schema migration source revision does not match descriptor",
         });
     }
+    if target_revision != descriptor.target_revision {
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "schema migration target revision does not match descriptor",
+        });
+    }
+    let DurableRevisionChange::SchemaMigration {
+        program: change_program,
+    } = &descriptor.change
+    else {
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "schema migration intent is paired with a non-migration change",
+        });
+    };
+    if program != change_program {
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "schema migration intent program does not match descriptor change",
+        });
+    }
     install_semantic_module_packages(registry, semantic_modules)?;
-    validate_full_revision_prepare_intent(
-        descriptor,
-        target_revision,
-        encoded_target_revision,
-        registry,
-    )?;
+    registry
+        .validate_context(program.target())
+        .map_err(|_| DurabilityError::Protocol {
+            offset: 0,
+            reason: "schema migration target semantic context is invalid",
+        })?;
     migration_complement
         .validate()
         .map_err(|reason| DurabilityError::Protocol { offset: 0, reason })?;
-    let target = checkpoint::decode_revision(encoded_target_revision, registry)?;
-    if migration_complement.target_schema != target.semantic_revision().schema {
+    if migration_complement.target_schema != program.target().schema.revision {
         return Err(DurabilityError::Protocol {
             offset: 0,
             reason: "migration complement target schema does not match target revision",
@@ -314,6 +334,37 @@ pub(super) fn validate_bound_prepare_intent(
             install_semantic_module_packages(registry, semantic_modules)?;
             Ok(())
         }
+        DurableTransactionIntent::RelationDataResidualExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            client_mutations: _,
+            realized_mutations,
+            semantic_modules,
+        } => {
+            let DurableRevisionChange::RelationData {
+                semantic_revision: change_semantics,
+                relation_mutations: change_mutations,
+            } = &descriptor.change
+            else {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "residual relation intent is paired with a non-relation change",
+                });
+            };
+            if *source_revision != descriptor.source_revision
+                || *target_revision != descriptor.target_revision
+                || *semantic_revision != *change_semantics
+                || realized_mutations != change_mutations
+            {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "residual relation realization does not match descriptor delta",
+                });
+            }
+            install_semantic_module_packages(registry, semantic_modules)?;
+            Ok(())
+        }
         DurableTransactionIntent::MixedRevisionExact {
             source_revision,
             target_revision,
@@ -348,6 +399,42 @@ pub(super) fn validate_bound_prepare_intent(
             install_semantic_module_packages(registry, semantic_modules)?;
             Ok(())
         }
+        DurableTransactionIntent::MixedRevisionResidualExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            client_relation_mutations: _,
+            client_model_delta: _,
+            realized_relation_mutations,
+            realized_model_delta,
+            realized_model_complement: _,
+            semantic_modules,
+        } => {
+            let DurableRevisionChange::MixedRevision {
+                semantic_revision: change_semantics,
+                relation_mutations: change_mutations,
+                model_delta: change_model_delta,
+            } = &descriptor.change
+            else {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "residual mixed intent is paired with a non-mixed change",
+                });
+            };
+            if *source_revision != descriptor.source_revision
+                || *target_revision != descriptor.target_revision
+                || *semantic_revision != *change_semantics
+                || realized_relation_mutations != change_mutations
+                || realized_model_delta != change_model_delta
+            {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "residual mixed realization does not match descriptor delta",
+                });
+            }
+            install_semantic_module_packages(registry, semantic_modules)?;
+            Ok(())
+        }
         DurableTransactionIntent::Exact {
             target_revision,
             encoded_target_revision,
@@ -365,7 +452,7 @@ pub(super) fn validate_bound_prepare_intent(
         DurableTransactionIntent::SchemaMigrationExact {
             source_revision,
             target_revision,
-            encoded_target_revision,
+            program,
             migration_complement,
             semantic_modules,
         } => validate_schema_migration_prepare_intent(
@@ -376,7 +463,7 @@ pub(super) fn validate_bound_prepare_intent(
                 expected_source_schema: expected_migration_source_schema,
                 source_revision: *source_revision,
                 target_revision: *target_revision,
-                encoded_target_revision,
+                program,
                 migration_complement,
                 semantic_modules,
             },

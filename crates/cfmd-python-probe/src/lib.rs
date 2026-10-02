@@ -8,7 +8,7 @@ use std::{
 
 use cfmd::{
     CfmdEntity, CommitOutcome, Database, Id, ObjectWatch, ObjectWatchEvent, OwnedMany, Plan, Ref,
-    Schema, TransactionId,
+    Schema, Transaction, TransactionId,
     dynamic::{
         EquivalenceId, PrimitiveEquivalence, Query, RelationId, RelationSchema, Type, Value,
     },
@@ -244,11 +244,20 @@ struct ProbeDatabase {
 }
 
 impl ProbeDatabase {
+    fn commit_transaction(&self, transaction: &Transaction) -> PyResult<u64> {
+        let outcome = self.database.commit(transaction).map_err(runtime_error)?;
+        let revision = match outcome {
+            CommitOutcome::Committed { revision }
+            | CommitOutcome::AlreadyCommitted { revision } => revision,
+        };
+        Ok(revision.raw())
+    }
+
     fn commit_plan(&self, plan: &Plan) -> PyResult<u64> {
         let transaction = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
         let outcome = self
             .database
-            .commit(plan, TransactionId::new(u128::from(transaction)))
+            .commit_plan(plan, TransactionId::new(u128::from(transaction)))
             .map_err(runtime_error)?;
         let revision = match outcome {
             CommitOutcome::Committed { revision }
@@ -349,7 +358,7 @@ impl ProbeDatabase {
             .objects::<Todo>()
             .map_err(runtime_error)?
             .where_(|todo| todo.id().eq(Id::new(id)))
-            .update(|mut todo| {
+            .update_plan(|mut todo| {
                 title.clone_into(&mut todo.title);
                 todo
             })
@@ -364,7 +373,7 @@ impl ProbeDatabase {
             .objects::<Todo>()
             .map_err(runtime_error)?
             .where_(|todo| todo.id().eq(Id::new(id)))
-            .update(|mut todo| {
+            .update_plan(|mut todo| {
                 todo.done = done;
                 todo
             })
@@ -379,7 +388,7 @@ impl ProbeDatabase {
             .objects::<Todo>()
             .map_err(runtime_error)?
             .where_(|todo| todo.id().eq(Id::new(id)))
-            .delete()
+            .delete_plan()
             .map_err(runtime_error)?;
         drop(snapshot);
         self.commit_plan(&plan)
@@ -491,12 +500,13 @@ impl ProbeDatabase {
         let owners = snapshot.objects::<Owner>().map_err(runtime_error)?;
         let source = owners.require(Id::new(source)).map_err(runtime_error)?;
         let target = owners.require(Id::new(target)).map_err(runtime_error)?;
-        let plan = source
+        let mut transaction = Transaction::new();
+        source
             .assets
-            .move_to(Id::new(asset), &target.assets)
+            .move_to(&mut transaction, Id::new(asset), &target.assets)
             .map_err(runtime_error)?;
         drop(snapshot);
-        self.commit_plan(&plan)
+        self.commit_transaction(&transaction)
     }
 
     fn owner_asset_ids(&self, owner: u128) -> PyResult<Vec<u128>> {
@@ -526,19 +536,18 @@ impl ProbeDatabase {
             .map_err(runtime_error)?
             .require(Id::new(owner))
             .map_err(runtime_error)?;
-        let plan = owner
+        let mut transaction = Transaction::new();
+        owner
             .assets
             .where_(|asset| asset.label().eq(label.to_owned()))
             .map_err(runtime_error)?
-            .detach_all()
+            .detach_all(&mut transaction)
             .map_err(runtime_error)?;
-        let candidate = plan.candidate().map_err(runtime_error)?;
-        let preview = candidate.preview();
+        let preview = self.database.preview(&transaction).map_err(runtime_error)?;
         let orphaned = preview.derived().orphan_entities_deleted();
         let normalized = preview.derived().normalized_rows_removed();
-        drop(candidate);
         drop(snapshot);
-        let revision = self.commit_plan(&plan)?;
+        let revision = self.commit_transaction(&transaction)?;
         Ok((orphaned, normalized, revision))
     }
 
@@ -562,13 +571,11 @@ impl ProbeDatabase {
     }
 
     fn undo_latest(&self) -> PyResult<u64> {
-        let plan = self
-            .database
-            .history()
-            .map_err(runtime_error)?
-            .undo_latest()
+        let mut transaction = Transaction::new();
+        self.database
+            .undo_latest(&mut transaction)
             .map_err(runtime_error)?;
-        self.commit_plan(&plan)
+        self.commit_transaction(&transaction)
     }
 
     #[staticmethod]

@@ -359,6 +359,7 @@ fn compile_postorder(query: &RelExpr, nodes: &mut Vec<PreparedGraphNode>) -> Nod
         }
         RelExpr::JoinEq { left, right, .. }
         | RelExpr::Difference { left, right }
+        | RelExpr::Union { left, right }
         | RelExpr::AntiJoin { left, right, .. } => PreparedNodeInputs::Binary {
             left: compile_postorder(left, nodes),
             right: compile_postorder(right, nodes),
@@ -447,7 +448,9 @@ fn compile_postorder_typed(
                 joined_type(&result_types[left_id], &result_types[right_id]),
             )
         }
-        RelExpr::Difference { left, right } | RelExpr::AntiJoin { left, right, .. } => {
+        RelExpr::Difference { left, right }
+        | RelExpr::Union { left, right }
+        | RelExpr::AntiJoin { left, right, .. } => {
             let left_id = compile_postorder_typed(left, context, nodes, result_types)?;
             let right_id = compile_postorder_typed(right, context, nodes, result_types)?;
             (

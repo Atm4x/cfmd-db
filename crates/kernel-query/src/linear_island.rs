@@ -282,6 +282,19 @@ fn collect_barriers(
             out.push(BarrierKernelClass::BlockerZeroCrossing);
             Ok(())
         }
+        RelExpr::Union { left, right } => {
+            collect_binary_barrier_children(left, right, node, graph, out)?;
+            if matches!(
+                graph
+                    .result_type(node)
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?
+                    .semantics,
+                kernel_schema::RelationSemantics::Set { .. }
+            ) {
+                out.push(BarrierKernelClass::ZeroCrossing);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -360,6 +373,7 @@ fn collect_barrier_children(
         }
         RelExpr::JoinEq { left, right, .. }
         | RelExpr::Difference { left, right }
+        | RelExpr::Union { left, right }
         | RelExpr::AntiJoin { left, right, .. } => {
             let (left_id, right_id) = graph
                 .binary_inputs(node)

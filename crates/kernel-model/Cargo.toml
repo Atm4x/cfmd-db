@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+kernel-persistent = { path = "../kernel-persistent" }
 kernel-identity = { path = "../kernel-identity" }
 kernel-types = { path = "../kernel-types" }
 kernel-schema = { path = "../kernel-schema" }

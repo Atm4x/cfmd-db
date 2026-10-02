@@ -102,6 +102,7 @@ pub enum HostedResponse {
 struct HostedSubscription {
     watch: Mutex<cfmd_runtime::QueryWatch>,
     cancellation: cfmd_runtime::WatchCancellation,
+    authorization: cfmd_runtime::WatchAuthorization,
 }
 
 #[derive(Debug)]
@@ -133,6 +134,7 @@ impl SubscriptionRegistry {
         max_subscriptions: usize,
     ) -> Result<SubscriptionId> {
         let cancellation = watch.cancellation();
+        let authorization = watch.authorization();
         let mut state = self.state.lock().map_err(|_| protocol_internal())?;
         if state.closed {
             return Err(session_closed());
@@ -150,6 +152,7 @@ impl SubscriptionRegistry {
             Arc::new(HostedSubscription {
                 watch: Mutex::new(watch),
                 cancellation,
+                authorization,
             }),
         );
         Ok(id)
@@ -188,6 +191,22 @@ impl SubscriptionRegistry {
         };
         for subscription in subscriptions {
             subscription.cancellation.cancel();
+        }
+        Ok(())
+    }
+
+    fn reauthorize_all(&self) -> Result<()> {
+        let subscriptions = {
+            let state = self.state.lock().map_err(|_| protocol_internal())?;
+            if state.closed {
+                return Err(session_closed());
+            }
+            state.subscriptions.values().cloned().collect::<Vec<_>>()
+        };
+        for subscription in subscriptions {
+            if subscription.authorization.reauthorize().is_err() {
+                subscription.cancellation.cancel();
+            }
         }
         Ok(())
     }
@@ -262,6 +281,10 @@ impl HostedSession {
 
     pub fn cancel_all_watches(&self) -> Result<()> {
         self.subscriptions.cancel_all()
+    }
+
+    pub fn reauthorize_watches(&self) -> Result<()> {
+        self.subscriptions.reauthorize_all()
     }
 
     pub fn close(&self) -> Result<()> {
@@ -411,7 +434,7 @@ impl HostedSession {
         }
         let outcome = self
             .database
-            .commit(&plan, TransactionId::new(request.transaction))?;
+            .commit_plan(&plan, TransactionId::new(request.transaction))?;
         Ok(match outcome {
             cfmd_runtime::CommitOutcome::Committed { revision } => CommitResponse::Committed {
                 revision: revision.raw(),

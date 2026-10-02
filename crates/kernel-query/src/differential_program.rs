@@ -1,7 +1,8 @@
 use super::{
     BTreeMap, BTreeSet, BlockerBuildSpec, Change, CompiledDeltaProgram, Impact,
     MaintainedBlockerKind, MaterializedBlockerDeltaState, MaterializedGroupDeltaState,
-    MaterializedJoinDeltaState, MaterializedTopKDeltaState, NodeId, PreparedRelGraph, RelExpr,
+    MaterializedJoinDeltaState, MaterializedSetSupportState, MaterializedTopKDeltaState, NodeId,
+    PreparedRelGraph, RelExpr,
     RelQueryError, RelType, RelationDelta, Value, canonical_row_multiset_counts,
     collect_rel_source_relations, materialize_exact_quotient_delta_view, rel_delta_distinct,
     rel_delta_filter, rel_delta_filter_columns, rel_delta_filter_order_const,
@@ -77,6 +78,14 @@ enum RelDifferentialNode {
         left: Box<Self>,
         right: Box<Self>,
         result_expr: RelExpr,
+    },
+    Union {
+        left: Box<Self>,
+        right: Box<Self>,
+        left_expr: RelExpr,
+        right_expr: RelExpr,
+        result_expr: RelExpr,
+        set_semantics: bool,
     },
     AntiJoin {
         left: Box<Self>,
@@ -191,6 +200,23 @@ impl RelDifferentialNode {
             RelExpr::Difference { left, right } => {
                 Self::compile_blocker(left, right, expr, node, graph, false)
             }
+            RelExpr::Union { left, right } => {
+                let (left_id, right_id) = Self::binary_children(node, graph)?;
+                Ok(Self::Union {
+                    left: Box::new(Self::compile(left, left_id, graph)?),
+                    right: Box::new(Self::compile(right, right_id, graph)?),
+                    left_expr: left.as_ref().clone(),
+                    right_expr: right.as_ref().clone(),
+                    result_expr: expr.clone(),
+                    set_semantics: matches!(
+                        graph
+                            .result_type(node)
+                            .ok_or(RelQueryError::InconsistentIncrementalDelta)?
+                            .semantics,
+                        kernel_schema::RelationSemantics::Set { .. }
+                    ),
+                })
+            }
             RelExpr::AntiJoin { left, right, .. } => {
                 Self::compile_blocker(left, right, expr, node, graph, true)
             }
@@ -282,8 +308,16 @@ impl RelDifferentialNode {
             | Self::Project {
                 set_semantics: false,
                 ..
+            }
+            | Self::Union {
+                set_semantics: false,
+                ..
             } => RelDifferentialClass::Linear,
             Self::Project {
+                set_semantics: true,
+                ..
+            }
+            | Self::Union {
                 set_semantics: true,
                 ..
             }
@@ -312,6 +346,18 @@ impl RelDifferentialNode {
             Self::Distinct { input, .. } => {
                 input.collect_state_requirements(out);
                 out.insert(RelDifferentialStateRequirement::SetSupport);
+            }
+            Self::Union {
+                left,
+                right,
+                set_semantics,
+                ..
+            } => {
+                left.collect_state_requirements(out);
+                right.collect_state_requirements(out);
+                if *set_semantics {
+                    out.insert(RelDifferentialStateRequirement::SetSupport);
+                }
             }
             Self::JoinEq { left, right, .. } => {
                 left.collect_state_requirements(out);
@@ -394,6 +440,7 @@ impl RelDifferentialNode {
             Self::Difference { .. } | Self::AntiJoin { .. } => {
                 self.apply_blocker(old, change, context, registry)
             }
+            Self::Union { .. } => self.apply_union(old, change, context, registry),
             Self::Distinct {
                 input,
                 input_expr,
@@ -450,6 +497,52 @@ impl RelDifferentialNode {
         } else {
             rel_delta_project_bag(input_delta, columns, result_expr, context, registry)
         }
+    }
+
+    fn apply_union(
+        &self,
+        old: &kernel_model::FiniteModel,
+        change: &Change<kernel_model::FiniteModel>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelationDelta, RelQueryError> {
+        let Self::Union {
+            left,
+            right,
+            left_expr,
+            right_expr,
+            result_expr,
+            set_semantics,
+        } = self
+        else {
+            unreachable!("apply_union is only called for union nodes");
+        };
+        let mut left_delta = left.apply(old, change, context, registry)?;
+        let right_delta = right.apply(old, change, context, registry)?;
+        let result_type = result_expr.typecheck(context, registry)?;
+        if !*set_semantics {
+            left_delta.inserted.extend(right_delta.inserted);
+            left_delta.removed.extend(right_delta.removed);
+            left_delta.result_type = result_type;
+            return Ok(left_delta);
+        }
+
+        let mut old_support_rows = left_expr.evaluate(old, context, registry)?.into_rows();
+        old_support_rows.extend(right_expr.evaluate(old, context, registry)?.into_rows());
+        let mut supports = MaterializedSetSupportState::build(
+            &old_support_rows,
+            result_type,
+            context,
+            registry,
+        )?;
+        left_delta.inserted.extend(right_delta.inserted);
+        left_delta.removed.extend(right_delta.removed);
+        supports.apply_rows_delta(
+            left_delta.inserted,
+            left_delta.removed,
+            context,
+            registry,
+        )
     }
 
     fn apply_blocker(

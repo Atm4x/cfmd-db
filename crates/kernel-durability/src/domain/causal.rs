@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use kernel_change::RevisionEffectId;
 use kernel_types::{ClientTransactionId, RevisionId};
 
-use super::transaction::{DurableEffectKind, DurableTransactionIntent, IdempotencyEpoch};
+use super::{
+    historical::SemanticChangeEvent,
+    transaction::{DurableEffectKind, DurableTransactionIntent, IdempotencyEpoch},
+};
 
 /// Durable causal identity for one exact committed transition.
 ///
@@ -40,6 +43,37 @@ impl DurableRevisionEffectRecord {
     #[must_use]
     pub const fn coordination_class(&self) -> DurableEffectCoordinationClass {
         DurableEffectCoordinationClass::OpaqueNonConfluent
+    }
+
+    /// Projects a committed schema migration into semantic history without
+    /// creating another history authority. Non-migration causal effects return
+    /// `None`.
+    #[must_use]
+    pub fn semantic_change_event(&self) -> Option<SemanticChangeEvent> {
+        let DurableTransactionIntent::SchemaMigrationExact {
+            source_revision,
+            target_revision,
+            migration_complement,
+            ..
+        } = &self.intent
+        else {
+            return None;
+        };
+        debug_assert_eq!(*source_revision, self.source_revision);
+        debug_assert_eq!(*target_revision, self.target_revision);
+        Some(SemanticChangeEvent {
+            effect_id: self.id,
+            transaction_epoch: self.transaction_epoch,
+            transaction_id: self.transaction_id,
+            source_revision: self.source_revision,
+            target_revision: self.target_revision,
+            source_schema: migration_complement.source_schema,
+            target_schema: migration_complement.target_schema,
+            lens_spec: migration_complement.lens_spec,
+            semantic_pins: migration_complement.semantic_pins,
+            encoding_version: migration_complement.encoding_version,
+            historical_authority: migration_complement.historical_boundary_authority(),
+        })
     }
 
     pub fn validate_identity(&self) -> Result<(), &'static str> {

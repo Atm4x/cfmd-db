@@ -35,6 +35,8 @@ fn current_test_transactions() -> BTreeMap<DurableTransactionKey, DurableTransac
                     relation: SemanticId::new(9),
                     inserted: vec![vec![kernel_model::Value::I64(5)]],
                     removed: Vec::new(),
+                object_field_writes: Vec::new(),
+                authorization: Default::default(),
                 }],
                 semantic_modules: Vec::new(),
             },
@@ -115,6 +117,7 @@ fn metadata_roundtrip_covers_all_current_query_variants_and_transactions() {
         ],
         physical_artifacts: current_physical_artifact_specs(eq),
         migration_complements: Vec::new(),
+        historical_epoch_anchors: BTreeMap::new(),
         committed_transactions: current_test_transactions(),
         semantic_modules: Vec::new(),
         ..DurableStoreMetadata::default()
@@ -136,6 +139,8 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
             relation: SemanticId::new(10),
             inserted: vec![vec![kernel_model::Value::I64(6)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         rewrite_intents: vec![crate::DurableRelationRewriteIntent {
             relation: SemanticId::new(10),
@@ -152,6 +157,7 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
         physical_artifacts: Vec::new(),
         artifact_cores: Vec::new(),
         migration_complements: Vec::new(),
+        historical_epoch_anchors: BTreeMap::new(),
         committed_transactions: BTreeMap::from([(
             DurableTransactionKey::new(IdempotencyEpoch::ZERO, transaction_id),
             intent.clone(),
@@ -177,6 +183,7 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
                 BTreeSet::from([RevisionEffectId(transaction_id.raw())]),
             ),
         ]),
+        checkpoint_realization: None,
     };
     let bytes = encode(&metadata).unwrap();
     assert_eq!(decode(&bytes).unwrap(), metadata);

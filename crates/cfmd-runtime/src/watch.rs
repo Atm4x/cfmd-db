@@ -230,6 +230,21 @@ pub struct QueryWatch {
     cancellation: WatchCancellation,
     readiness: WatchReadiness,
     initial: RelationResult,
+    authorization: WatchAuthorization,
+}
+
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct WatchAuthorization {
+    authority: crate::security::RuntimeAuthority,
+    footprint: kernel_query::RelReadFootprint,
+}
+
+impl WatchAuthorization {
+    pub fn reauthorize(&self) -> Result<()> {
+        self.authority.require(crate::Permission::Watch)?;
+        self.authority.require_read_footprint(&self.footprint)
+    }
 }
 
 impl QueryWatch {
@@ -241,14 +256,58 @@ impl QueryWatch {
                 "watch requires a live snapshot; historical db.at(...) views are immutable",
             ));
         }
+        let prepared = context.prepare(query)?;
+        let footprint = prepared.inner.read_footprint().map_err(|error| {
+            Error::new(
+                ErrorKind::Query,
+                format!("watch authorization footprint failed: {error:?}"),
+            )
+        })?;
+        context.authority.require_read_footprint(&footprint)?;
+        let authorization = WatchAuthorization {
+            authority: context.authority.clone(),
+            footprint,
+        };
         let runtime = context.runtime_arc();
         let revision = context.kernel_revision();
-        let state = kernel_query::MaterializedRelPlanState::build(
-            &query.inner,
-            &revision.state().model,
-            revision.semantic_context(),
-            runtime.semantic_registry(),
-        )
+        let seeded = if let Some(snapshot) = context.live_snapshot_ref() {
+            let mut seeds = std::collections::BTreeMap::new();
+            for relation in query.inner.scan_relations() {
+                let seed = snapshot
+                    .relation_scan_occurrence_seed(relation)
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::Internal,
+                            format!("watch scan-evidence derivation failed: {error:?}"),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::Internal,
+                            format!("runtime has no relation witness for {relation:?}"),
+                        )
+                    })?;
+                seeds.insert(relation, seed);
+            }
+            Some(seeds)
+        } else {
+            None
+        };
+        let state = match seeded.as_ref() {
+            Some(seeds) => kernel_query::MaterializedRelPlanState::build_with_scan_seeds(
+                &query.inner,
+                &revision.state().model,
+                revision.semantic_context(),
+                runtime.semantic_registry(),
+                seeds,
+            ),
+            None => kernel_query::MaterializedRelPlanState::build(
+                &query.inner,
+                &revision.state().model,
+                revision.semantic_context(),
+                runtime.semantic_registry(),
+            ),
+        }
         .map_err(|error| {
             Error::new(
                 ErrorKind::WatchUnavailable,
@@ -278,7 +337,14 @@ impl QueryWatch {
             cancellation: WatchCancellation { inner: wait_handle },
             readiness,
             initial,
+            authorization,
         })
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn authorization(&self) -> WatchAuthorization {
+        self.authorization.clone()
     }
 
     #[must_use]
@@ -322,6 +388,7 @@ impl QueryWatch {
     }
 
     pub fn status(&self) -> Result<WatchStatus> {
+        self.authorization.reauthorize()?;
         if self.cancellation.is_cancelled() {
             return Ok(WatchStatus::Cancelled {
                 revision: self.cursor_revision,
@@ -375,6 +442,7 @@ impl QueryWatch {
     }
 
     pub fn try_recv(&mut self) -> Result<Option<WatchEvent>> {
+        self.authorization.reauthorize()?;
         if self.cancellation.is_cancelled() {
             return Err(watch_closed("watch was cancelled"));
         }
@@ -440,6 +508,7 @@ impl QueryWatch {
                     self.publication_generation = generation;
                 }
                 kernel_plan::RuntimeRevisionPublicationWaitOutcome::Cancelled => {
+                    self.authorization.reauthorize()?;
                     return Err(watch_closed("watch was cancelled"));
                 }
             }
@@ -859,6 +928,134 @@ impl<R, P: crate::Projection<R>> ProjectionWatch<R, P> {
     }
 }
 
+pub struct GroupedAggregateWatch<K, A> {
+    inner: QueryWatch,
+    decode: fn(&Row) -> Result<(K, A)>,
+    initial: Vec<(K, A)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupedAggregateWatchEvent<K, A> {
+    source_revision: RevisionId,
+    target_revision: RevisionId,
+    inserted: Vec<(K, A)>,
+    removed: Vec<(K, A)>,
+}
+
+impl<K, A> GroupedAggregateWatchEvent<K, A> {
+    #[must_use]
+    pub const fn source_revision(&self) -> RevisionId {
+        self.source_revision
+    }
+
+    #[must_use]
+    pub const fn target_revision(&self) -> RevisionId {
+        self.target_revision
+    }
+
+    #[must_use]
+    pub fn inserted(&self) -> &[(K, A)] {
+        &self.inserted
+    }
+
+    #[must_use]
+    pub fn removed(&self) -> &[(K, A)] {
+        &self.removed
+    }
+}
+
+impl<K, A> GroupedAggregateWatch<K, A> {
+    pub(crate) fn new(
+        context: &crate::ReadContext,
+        query: &Query,
+        decode: fn(&Row) -> Result<(K, A)>,
+    ) -> Result<Self> {
+        let inner = QueryWatch::new(context, query)?;
+        let initial = inner
+            .initial()
+            .rows()
+            .iter()
+            .map(decode)
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            inner,
+            decode,
+            initial,
+        })
+    }
+
+    #[must_use]
+    pub fn initial(&self) -> &[(K, A)] {
+        &self.initial
+    }
+
+    pub fn try_recv(&mut self) -> Result<Option<GroupedAggregateWatchEvent<K, A>>> {
+        self.inner
+            .try_recv()?
+            .map(|event| decode_grouped_aggregate_event(self.decode, &event))
+            .transpose()
+    }
+
+    #[must_use]
+    pub const fn subscription_id(&self) -> WatchSubscriptionId {
+        self.inner.subscription_id()
+    }
+
+    #[must_use]
+    pub fn readiness(&self) -> WatchReadiness {
+        self.inner.readiness()
+    }
+
+    pub fn drain_ready(
+        &mut self,
+        max_events: usize,
+    ) -> Result<WatchDrain<GroupedAggregateWatchEvent<K, A>>> {
+        let decode = self.decode;
+        self.inner
+            .drain_ready(max_events)?
+            .try_map(|event| decode_grouped_aggregate_event(decode, &event))
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> WatchNext<'_, Self> {
+        WatchNext::new(self)
+    }
+
+    pub fn recv(&mut self) -> Result<GroupedAggregateWatchEvent<K, A>> {
+        decode_grouped_aggregate_event(self.decode, &self.inner.recv()?)
+    }
+
+    #[must_use]
+    pub fn cancellation(&self) -> WatchCancellation {
+        self.inner.cancellation()
+    }
+
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    pub fn close(&self) {
+        self.inner.close();
+    }
+
+    pub fn status(&self) -> Result<WatchStatus> {
+        self.inner.status()
+    }
+}
+
+fn decode_grouped_aggregate_event<K, A>(
+    decode: fn(&Row) -> Result<(K, A)>,
+    event: &WatchEvent,
+) -> Result<GroupedAggregateWatchEvent<K, A>> {
+    Ok(GroupedAggregateWatchEvent {
+        source_revision: event.source_revision(),
+        target_revision: event.target_revision(),
+        inserted: event.inserted().iter().map(decode).collect::<Result<_>>()?,
+        removed: event.removed().iter().map(decode).collect::<Result<_>>()?,
+    })
+}
+
 mod watch_receiver_sealed {
     pub trait Sealed {}
 }
@@ -911,6 +1108,19 @@ impl<R, P: crate::Projection<R>> WatchReceiver for ProjectionWatch<R, P> {
 
     fn try_recv(&mut self) -> Result<Option<Self::Event>> {
         ProjectionWatch::try_recv(self)
+    }
+}
+
+impl<K, A> watch_receiver_sealed::Sealed for GroupedAggregateWatch<K, A> {}
+impl<K, A> WatchReceiver for GroupedAggregateWatch<K, A> {
+    type Event = GroupedAggregateWatchEvent<K, A>;
+
+    fn readiness(&self) -> WatchReadiness {
+        GroupedAggregateWatch::readiness(self)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<Self::Event>> {
+        GroupedAggregateWatch::try_recv(self)
     }
 }
 

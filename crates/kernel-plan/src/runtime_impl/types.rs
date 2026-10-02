@@ -66,6 +66,8 @@ pub struct RuntimeHistoryRelationMutation {
     pub relation: SemanticId,
     pub inserted: Vec<Vec<Value>>,
     pub removed: Vec<Vec<Value>>,
+    pub object_field_writes: Vec<kernel_durability::DurableObjectFieldWrite>,
+    pub authorization: kernel_durability::DurableRelationAuthorization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +82,7 @@ pub struct RuntimeHistoryEffect {
     pub relation_mutations: Vec<RuntimeHistoryRelationMutation>,
     pub model_delta: Option<DurableModelDelta>,
     pub model_complement: Option<DurableModelDelta>,
+    pub semantic_change: Option<SemanticChangeEvent>,
 }
 
 /// Exact write coordinate used to prove that a historical inverse can be
@@ -104,6 +107,11 @@ pub enum RuntimeHistoryCoordinate {
         field: SemanticId,
         owner: kernel_types::EntityId,
     },
+    ObjectField {
+        relation: SemanticId,
+        owner: kernel_types::EntityId,
+        field: SemanticId,
+    },
     LifecycleEntity {
         entity: kernel_types::EntityId,
     },
@@ -121,7 +129,7 @@ pub enum RuntimeHistoryCoordinate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeHistoryFootprint {
-    pub writes: BTreeSet<RuntimeHistoryCoordinate>,
+    pub writes: BTreeMap<RuntimeHistoryCoordinate, kernel_change::RewriteActionLaw>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +155,29 @@ pub enum RuntimeHistoryRebaseOutcome {
     Conflict(RuntimeHistoryRebaseConflict),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTransitionRebaseCertificate {
+    pub source_revision: RevisionId,
+    pub current_revision: RevisionId,
+    pub intervening_effects: Vec<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTransitionRebaseConflict {
+    pub source_revision: RevisionId,
+    pub current_revision: RevisionId,
+    pub conflicting_effects: Vec<u128>,
+    pub coordination_effects: Vec<u128>,
+    pub coordinates: Vec<RuntimeHistoryCoordinate>,
+    pub opaque_effects: Vec<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeTransitionRebaseOutcome {
+    Certified(RuntimeTransitionRebaseCertificate),
+    Conflict(RuntimeTransitionRebaseConflict),
+}
+
 fn durable_model_delta_is_empty(delta: &DurableModelDelta) -> bool {
     delta.carriers.is_empty()
         && delta.fields.is_empty()
@@ -159,6 +190,7 @@ fn durable_model_delta_is_empty(delta: &DurableModelDelta) -> bool {
 
 impl RuntimeHistoryEffect {
     fn from_durable(record: &DurableRevisionEffectRecord) -> Self {
+        let semantic_change = record.semantic_change_event();
         let (kind, reversibility, relation_mutations, model_delta, model_complement) =
             match &record.intent {
                 DurableTransactionIntent::RelationDataExact {
@@ -167,6 +199,15 @@ impl RuntimeHistoryEffect {
                     RuntimeHistoryEffectKind::RelationData,
                     RuntimeHistoryReversibility::ExactPlanInverse,
                     relation_mutations.as_slice(),
+                    None,
+                    None,
+                ),
+                DurableTransactionIntent::RelationDataResidualExact {
+                    realized_mutations, ..
+                } => (
+                    RuntimeHistoryEffectKind::RelationData,
+                    RuntimeHistoryReversibility::ExactPlanInverse,
+                    realized_mutations.as_slice(),
                     None,
                     None,
                 ),
@@ -203,6 +244,18 @@ impl RuntimeHistoryEffect {
                     relation_mutations.as_slice(),
                     Some(model_delta.clone()),
                     model_complement.as_deref().cloned(),
+                ),
+                DurableTransactionIntent::MixedRevisionResidualExact {
+                    realized_relation_mutations,
+                    realized_model_delta,
+                    realized_model_complement,
+                    ..
+                } => (
+                    RuntimeHistoryEffectKind::MixedRevision,
+                    RuntimeHistoryReversibility::ExactPlanInverse,
+                    realized_relation_mutations.as_slice(),
+                    Some(realized_model_delta.clone()),
+                    Some(realized_model_complement.as_ref().clone()),
                 ),
                 DurableTransactionIntent::Exact { .. } => (
                     RuntimeHistoryEffectKind::FullRevision,
@@ -253,10 +306,13 @@ impl RuntimeHistoryEffect {
                     relation: mutation.relation,
                     inserted: mutation.inserted.clone(),
                     removed: mutation.removed.clone(),
+                    object_field_writes: mutation.object_field_writes.clone(),
+                    authorization: mutation.authorization,
                 })
                 .collect(),
             model_delta,
             model_complement,
+            semantic_change,
         }
     }
 }
@@ -264,6 +320,7 @@ impl RuntimeHistoryEffect {
 #[derive(Debug)]
 pub enum RuntimeHistoricalSnapshotError {
     Durability(DurabilityError),
+    Recovery(RuntimeRecoveryError),
     Runtime(PhysicalExecutionError),
     Revision(kernel_revision::RevisionError),
     Unavailable { revision: RevisionId },
@@ -274,6 +331,12 @@ pub enum RuntimeHistoricalSnapshotError {
 impl From<DurabilityError> for RuntimeHistoricalSnapshotError {
     fn from(value: DurabilityError) -> Self {
         Self::Durability(value)
+    }
+}
+
+impl From<RuntimeRecoveryError> for RuntimeHistoricalSnapshotError {
+    fn from(value: RuntimeRecoveryError) -> Self {
+        Self::Recovery(value)
     }
 }
 
@@ -307,6 +370,8 @@ fn allocate_runtime_root_id() -> Result<u64, PhysicalExecutionError> {
 pub struct RevisionRelationMutation<'a> {
     pub relation: SemanticId,
     pub delta: &'a RelationDelta,
+    pub object_field_writes: &'a [kernel_durability::DurableObjectFieldWrite],
+    pub authorization: kernel_durability::DurableRelationAuthorization,
 }
 
 /// Failure while deriving an exact logical target Revision from one immutable
@@ -367,6 +432,8 @@ pub struct RevisionCommitDescriptor {
     target: Box<kernel_revision::Revision>,
     change: RevisionCommitChange,
     rewrite_intents: BTreeMap<SemanticId, RuntimeRewriteIntent>,
+    object_field_writes: BTreeMap<SemanticId, Vec<kernel_durability::DurableObjectFieldWrite>>,
+    relation_authorizations: BTreeMap<SemanticId, kernel_durability::DurableRelationAuthorization>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +527,8 @@ impl RevisionCommitDescriptor {
                         relation,
                         inserted: delta.inserted.clone(),
                         removed: delta.removed.clone(),
+                        object_field_writes: self.object_field_writes.get(&relation).cloned().unwrap_or_default(),
+                        authorization: self.relation_authorizations.get(&relation).copied().unwrap_or_default(),
                     })
                     .collect();
                 if self.rewrite_intents.is_empty() {
@@ -504,6 +573,8 @@ impl RevisionCommitDescriptor {
                         relation,
                         inserted: delta.inserted.clone(),
                         removed: delta.removed.clone(),
+                        object_field_writes: self.object_field_writes.get(&relation).cloned().unwrap_or_default(),
+                        authorization: self.relation_authorizations.get(&relation).copied().unwrap_or_default(),
                     })
                     .collect();
                 DurableRevisionDescriptor::mixed_revision(
@@ -566,6 +637,8 @@ impl RevisionCommitDescriptor {
                 relation,
                 inserted: delta.inserted.clone(),
                 removed: delta.removed.clone(),
+                object_field_writes: Vec::new(),
+                authorization: self.relation_authorizations.get(&relation).copied().unwrap_or_default(),
             })
             .collect();
         let rewrite_intents = self
@@ -597,6 +670,7 @@ impl RevisionCommitDescriptor {
 pub enum DurableRuntimeCommitError {
     Runtime(PhysicalExecutionError),
     Recovery(RuntimeRecoveryError),
+    MigrationTransport(kernel_transport::TransportError),
     PrepareDurability(DurabilityError),
     CommitDurabilityUncertain(DurabilityError),
     TransactionIdConflict {
@@ -674,6 +748,7 @@ pub enum RuntimeRecoveryError {
     Durability(DurabilityError),
     Runtime(PhysicalExecutionError),
     Revision(kernel_revision::RevisionError),
+    MigrationTransport(kernel_transport::TransportError),
     BaseRevisionMismatch,
     SemanticRevisionMismatch,
     DurableHeadMismatch,

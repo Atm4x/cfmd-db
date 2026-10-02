@@ -12,14 +12,14 @@ impl RuntimeRevisionBundle {
                 .state()
                 .model
                 .relations
-                .get(&relation)
-                .map_or(&[][..], Vec::as_slice);
+                .materialize_owned(&relation)
+                .unwrap_or_default();
             witnesses.insert(
                 relation,
                 RelationBaseWitness::build(
                     revision.id(),
                     relation,
-                    rows,
+                    &rows,
                     result_type,
                     revision.semantic_context(),
                     registry,
@@ -27,6 +27,22 @@ impl RuntimeRevisionBundle {
             );
         }
         Ok(witnesses)
+    }
+
+    fn materialization_scan_seeds(
+        query: &RelExpr,
+        relation_bases: &PersistentOrdMap<SemanticId, RelationBaseWitness>,
+    ) -> Result<BTreeMap<SemanticId, kernel_query::RelationScanOccurrenceSeed>, PhysicalExecutionError> {
+        query
+            .scan_relations()
+            .into_iter()
+            .map(|relation| {
+                let witness = relation_bases.get(&relation).ok_or(
+                    PhysicalExecutionError::MissingRuntimeRelationBinding(relation),
+                )?;
+                Ok((relation, witness.logical_scan_occurrence_seed()?))
+            })
+            .collect()
     }
 
     fn materialization_dependency_indexes(
@@ -172,11 +188,13 @@ impl RuntimeRevisionBundle {
             if materializations.contains_key(&spec.id) {
                 return Err(PhysicalExecutionError::DuplicateMaterialization(spec.id));
             }
-            let mut maintained = MaterializedRelPlanState::build(
+            let scan_seeds = Self::materialization_scan_seeds(&spec.query, &relation_bases)?;
+            let mut maintained = MaterializedRelPlanState::build_with_scan_seeds(
                 &spec.query,
                 &revision.state().model,
                 revision.semantic_context(),
                 registry,
+                &scan_seeds,
             )?;
             for relation in maintained.scan_relations() {
                 let layout = relation_layouts.get(&relation).copied().ok_or(
@@ -232,8 +250,7 @@ impl RuntimeRevisionBundle {
                 .state()
                 .model
                 .relations
-                .get(&relation)
-                .cloned()
+                .materialize_owned(&relation)
                 .unwrap_or_default();
             let layout = relation_layouts.get(&relation).copied().ok_or(
                 PhysicalExecutionError::MissingRuntimeRelationBinding(relation),

@@ -52,6 +52,10 @@ impl Plan {
                 left: Box::new(Self::lower_with_catalog(left, catalog)),
                 right: Box::new(Self::lower_with_catalog(right, catalog)),
             },
+            RelExpr::Union { left, right } => Self::Union {
+                left: Box::new(Self::lower_with_catalog(left, catalog)),
+                right: Box::new(Self::lower_with_catalog(right, catalog)),
+            },
             RelExpr::AntiJoin {
                 left,
                 right,
@@ -278,6 +282,10 @@ impl Plan {
                 left: Box::new(left.to_logical_expr()),
                 right: Box::new(right.to_logical_expr()),
             },
+            Self::Union { left, right } => RelExpr::Union {
+                left: Box::new(left.to_logical_expr()),
+                right: Box::new(right.to_logical_expr()),
+            },
             Self::AntiJoin {
                 left,
                 right,
@@ -382,6 +390,11 @@ impl Plan {
                 left.accumulate_shape(shape);
                 right.accumulate_shape(shape);
             }
+            Self::Union { left, right } => {
+                shape.unions += 1;
+                left.accumulate_shape(shape);
+                right.accumulate_shape(shape);
+            }
             Self::AntiJoin { left, right, .. } => {
                 shape.anti_joins += 1;
                 left.accumulate_shape(shape);
@@ -430,6 +443,7 @@ impl Plan {
             | Self::Project { .. }
             | Self::JoinEq { .. }
             | Self::Difference { .. }
+            | Self::Union { .. }
             | Self::AntiJoin { .. }
             | Self::PromoteToBag(_) => false,
         }
@@ -653,6 +667,9 @@ impl Plan {
             ),
             Self::Difference { left, right } => {
                 execute_difference_plan(left, right, store, context, registry, stats)
+            }
+            Self::Union { left, right } => {
+                execute_union_plan(left, right, store, context, registry, stats)
             }
             Self::AntiJoin {
                 left,

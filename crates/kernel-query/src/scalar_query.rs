@@ -39,6 +39,7 @@ pub enum Expr {
     SeqLength(Box<Self>),
     SeqSumI64(Box<Self>),
     AddI64(Box<Self>, Box<Self>),
+    I64ToF64(Box<Self>),
     If {
         condition: Box<Self>,
         when_true: Box<Self>,
@@ -128,6 +129,13 @@ impl Expr {
                 left.checked_add(*right)
                     .map(|value| EvalValue::Owned(Value::I64(value)))
                     .ok_or(QueryError::ArithmeticOverflow)
+            }
+            Self::I64ToF64(source) => {
+                let source = source.evaluate_internal(input)?;
+                let Value::I64(value) = source.as_ref() else {
+                    return Err(QueryError::TypeMismatch);
+                };
+                Ok(EvalValue::Owned(Value::F64Bits((*value as f64).to_bits())))
             }
             Self::If {
                 condition,
@@ -226,6 +234,13 @@ impl Expr {
                     && right.typecheck(input_type)? == expected
                 {
                     Ok(expected)
+                } else {
+                    Err(QueryTypeError::TypeMismatch)
+                }
+            }
+            Self::I64ToF64(source) => {
+                if source.typecheck(input_type)? == TypeExpr::Scalar(ScalarType::I64) {
+                    Ok(TypeExpr::Scalar(ScalarType::F64))
                 } else {
                     Err(QueryTypeError::TypeMismatch)
                 }
@@ -345,5 +360,25 @@ pub fn impact_by_recompute(query: &ExactQuery, old: &Value, change: &Change<Valu
         Impact::Unaffected
     } else {
         Impact::Changed
+    }
+}
+
+#[cfg(test)]
+mod migration_numeric_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn i64_to_f64_is_exactly_typed_and_deterministic() {
+        let query = ExactQuery::new(Expr::I64ToF64(Box::new(Expr::Input)));
+        assert_eq!(
+            query.typecheck(&kernel_schema::TypeExpr::Scalar(
+                kernel_schema::ScalarType::I64,
+            )),
+            Ok(kernel_schema::TypeExpr::Scalar(kernel_schema::ScalarType::F64))
+        );
+        assert_eq!(
+            query.evaluate(&Value::I64(42)),
+            Ok(Value::F64Bits(42.0_f64.to_bits()))
+        );
     }
 }

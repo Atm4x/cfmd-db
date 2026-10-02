@@ -23,6 +23,7 @@ members = [
   "crates/kernel-identity",
   "crates/kernel-retention",
   "crates/kernel-model",
+  "crates/kernel-realization",
   "crates/kernel-semantics",
   "crates/kernel-auth",
   "crates/kernel-deployment",

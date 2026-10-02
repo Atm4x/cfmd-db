@@ -1,21 +1,26 @@
 use super::checkpoint_storage::write_checkpoint_file;
 use super::file_io::sync_directory;
 use super::freshness::ExternalFreshnessState;
-use super::generation_layout::{checkpoint_path, metadata_path, next_generation, wal_path};
+use super::generation_layout::{
+    checkpoint_path, metadata_path, next_generation, realization_path, wal_path,
+};
 use super::manifest::{ManifestRecord, publish_manifest_with_hook};
 use super::metadata_storage::write_metadata_file;
 use super::publication_protocol::{
     NoStoreFault, PublicationAttempt, StoreFaultHook, StoreFaultPoint,
 };
+use super::realization_storage::write_factorized_realization_file;
 use super::{DurableGenerationReceipt, DurableRevisionStore};
 use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
     canonical_physical_artifact_specs,
 };
 use crate::metadata;
+use crate::realization::DurableFactorizedRealization;
 use crate::runtime::DurabilityError;
 use crate::single_file::compaction_io::{OsSingleFileCompactionIo, SingleFileCompactionIo};
 use crate::wal::FileRevisionWal;
+use kernel_realization::{FactorizedRealizationRoot, PhysicalAtomStore};
 use kernel_revision::Revision;
 
 impl DurableRevisionStore {
@@ -118,6 +123,70 @@ impl DurableRevisionStore {
         )
     }
 
+    pub fn rotate_checkpoint_with_factorized_realization(
+        &mut self,
+        revision: &Revision,
+        atoms: &PhysicalAtomStore,
+        root: &FactorizedRealizationRoot,
+    ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        if self.poisoned {
+            return Err(DurabilityError::Poisoned);
+        }
+        if self.streaming_checkpoint.is_some() {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "synchronous checkpoint rotation is blocked by streaming checkpoint job",
+            });
+        }
+        if revision.id() != self.durable_head {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "physical checkpoint revision does not match durable WAL head",
+            });
+        }
+        let mut physical = DurableFactorizedRealization::new(
+            revision.id(),
+            atoms.clone(),
+            root.clone(),
+        )?;
+        if let Some(previous) = self.checkpoint_realization.as_ref() {
+            physical.inherit_retained_historical_roots(
+                previous,
+                self.checkpoint.semantic_context(),
+                self.historical_epoch_anchors
+                    .values()
+                    .map(|anchor| (anchor.effect_id, anchor.source_revision)),
+            )?;
+        }
+        let materializations = self.materialization_specs.clone();
+        let physical_artifacts = self.physical_artifact_specs.clone();
+        let artifact_cores = self.artifact_cores.clone();
+        if self.backend.is_single_file() {
+            self.rotate_single_file_checkpoint(
+                revision,
+                &materializations,
+                &physical_artifacts,
+                &artifact_cores,
+                Some(&physical),
+            )
+        } else {
+            let mut publication = PublicationAttempt::default();
+            let result = self.rotate_checkpoint_with_hook(
+                revision,
+                &materializations,
+                &physical_artifacts,
+                &artifact_cores,
+                Some(&physical),
+                &mut NoStoreFault,
+                &mut publication,
+            );
+            if result.is_err() && publication.requires_recovery_after_error() {
+                self.poisoned = true;
+            }
+            result
+        }
+    }
+
     /// Re-encodes the fully recovered in-memory durable authority into the
     /// current writable component formats and publishes it as a fresh immutable
     /// generation. Historical source files are never modified in place.
@@ -145,19 +214,31 @@ impl DurableRevisionStore {
         hook: &mut impl StoreFaultHook,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
         if self.backend.is_single_file() {
+            let physical = self
+                .checkpoint_realization
+                .as_ref()
+                .filter(|physical| physical.revision() == revision.id())
+                .cloned();
             return self.rotate_single_file_checkpoint(
                 revision,
                 materialization_specs,
                 physical_artifact_specs,
                 artifact_cores,
+                physical.as_ref(),
             );
         }
+        let physical = self
+            .checkpoint_realization
+            .as_ref()
+            .filter(|physical| physical.revision() == revision.id())
+            .cloned();
         let mut publication = PublicationAttempt::default();
         let result = self.rotate_checkpoint_with_hook(
             revision,
             materialization_specs,
             physical_artifact_specs,
             artifact_cores,
+            physical.as_ref(),
             hook,
             &mut publication,
         );
@@ -173,6 +254,7 @@ impl DurableRevisionStore {
         materialization_specs: &[DurableMaterializationSpec],
         physical_artifact_specs: &[DurablePhysicalArtifactSpec],
         artifact_cores: &[DurableArtifactCore],
+        physical_realization: Option<&DurableFactorizedRealization>,
         hook: &mut impl StoreFaultHook,
         publication: &mut PublicationAttempt,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
@@ -186,6 +268,20 @@ impl DurableRevisionStore {
         wal.durability_barrier()?;
         hook.hit(StoreFaultPoint::AfterWalSync)?;
         let physical_artifact_specs = canonical_physical_artifact_specs(physical_artifact_specs);
+        let checkpoint_realization = physical_realization
+            .map(|physical| {
+                if physical.revision() != revision.id() {
+                    return Err(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "directory physical realization revision does not match checkpoint cut",
+                    });
+                }
+                write_factorized_realization_file(
+                    &realization_path(&directory, generation),
+                    physical,
+                )
+            })
+            .transpose()?;
         let metadata_record = metadata::DurableStoreMetadata {
             external_freshness: self
                 .external_freshness
@@ -197,6 +293,7 @@ impl DurableRevisionStore {
             physical_artifacts: physical_artifact_specs.clone(),
             artifact_cores: artifact_cores.to_vec(),
             migration_complements: self.migration_complements.clone(),
+            historical_epoch_anchors: self.historical_epoch_anchors.clone(),
             committed_transactions: self.committed_transactions.clone(),
             semantic_modules: self
                 .semantic_registry
@@ -208,6 +305,7 @@ impl DurableRevisionStore {
             causal_coverage_root: Some(self.causal_coverage_root),
             revision_effects: self.revision_effects.clone(),
             revision_effect_frontiers: self.revision_effect_frontiers.clone(),
+            checkpoint_realization,
         };
         let metadata_file = metadata_path(&directory, generation);
         let metadata_crc32c = write_metadata_file(&metadata_file, &metadata_record)?;
@@ -232,6 +330,7 @@ impl DurableRevisionStore {
         let freshness_digest = wal.freshness_digest();
         self.generation = generation;
         self.checkpoint = revision.clone();
+        self.checkpoint_realization = physical_realization.cloned();
         self.wal = wal;
         self.materialization_specs = materialization_specs.to_vec();
         self.physical_artifact_specs = physical_artifact_specs;
@@ -277,11 +376,13 @@ impl DurableRevisionStore {
             });
         }
         let poison_on_error = self.backend.is_single_file();
+        let pinned_historical_generations = self.pinned_historical_generations();
         let result = self.backend.compact_obsolete_generations(
             &mut self.wal,
             self.generation,
             self.checkpoint.id(),
             self.durable_head,
+            &pinned_historical_generations,
             hook,
             compaction_io,
         );

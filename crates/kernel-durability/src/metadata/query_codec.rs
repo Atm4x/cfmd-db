@@ -65,6 +65,11 @@ pub(super) fn encode_rel_expr(
             encode_rel_expr(out, left, depth + 1)?;
             encode_rel_expr(out, right, depth + 1)?;
         }
+        RelExpr::Union { left, right } => {
+            out.push(12);
+            encode_rel_expr(out, left, depth + 1)?;
+            encode_rel_expr(out, right, depth + 1)?;
+        }
         RelExpr::AntiJoin {
             left,
             right,
@@ -303,6 +308,10 @@ pub(super) fn decode_rel_expr(
             equivalence: SemanticId::new(cursor.u128()?),
         }),
         11 => decode_order_filter(cursor, depth),
+        12 => Ok(RelExpr::Union {
+            left: Box::new(decode_rel_expr(cursor, depth + 1)?),
+            right: Box::new(decode_rel_expr(cursor, depth + 1)?),
+        }),
         _ => Err("unknown durable relation expression tag"),
     }
 }

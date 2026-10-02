@@ -25,6 +25,7 @@ pub fn logical_node_count(expr: &RelExpr) -> usize {
         | RelExpr::PromoteToBag(input) => 1 + logical_node_count(input),
         RelExpr::JoinEq { left, right, .. }
         | RelExpr::Difference { left, right }
+        | RelExpr::Union { left, right }
         | RelExpr::AntiJoin { left, right, .. } => {
             1 + logical_node_count(left) + logical_node_count(right)
         }

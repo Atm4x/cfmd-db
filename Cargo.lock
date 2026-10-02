@@ -101,13 +101,19 @@ dependencies = [
 name = "cfmd-runtime"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
+ "kernel-durability",
+ "kernel-lens",
  "kernel-model",
  "kernel-plan",
  "kernel-query",
+ "kernel-realization",
  "kernel-revision",
  "kernel-schema",
  "kernel-semantics",
+ "kernel-transport",
  "kernel-types",
+ "kernel-validation",
  "tokio",
 ]
 
@@ -399,9 +405,11 @@ dependencies = [
  "kernel-lens",
  "kernel-model",
  "kernel-query",
+ "kernel-realization",
  "kernel-revision",
  "kernel-schema",
  "kernel-semantics",
+ "kernel-transport",
  "kernel-types",
  "sha2",
  "zeroize",
@@ -481,6 +489,7 @@ version = "0.1.0"
 dependencies = [
  "kernel-identity",
  "kernel-lifecycle",
+ "kernel-persistent",
  "kernel-schema",
  "kernel-types",
 ]
@@ -531,6 +540,23 @@ dependencies = [
  "kernel-schema",
  "kernel-semantic-index",
  "kernel-semantics",
+ "kernel-types",
+]
+
+[[package]]
+name = "kernel-realization"
+version = "0.1.0"
+dependencies = [
+ "kernel-aggregate",
+ "kernel-change",
+ "kernel-lifecycle",
+ "kernel-model",
+ "kernel-persistent",
+ "kernel-query",
+ "kernel-revision",
+ "kernel-schema",
+ "kernel-semantics",
+ "kernel-transport",
  "kernel-types",
 ]
 

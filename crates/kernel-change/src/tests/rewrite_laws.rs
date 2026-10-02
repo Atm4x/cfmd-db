@@ -190,3 +190,27 @@ fn compiled_coordination_graph_is_complete_for_current_footprint_law() {
         PairCoordinationDecision::CoordinationFree
     );
 }
+
+#[test]
+fn generic_write_action_maps_preserve_idempotent_presence_law() {
+    use std::collections::BTreeMap;
+
+    let left = BTreeMap::from([
+        (1_u8, RewriteActionLaw::EnsurePresent),
+        (2_u8, RewriteActionLaw::EnsurePresent),
+    ]);
+    let right = BTreeMap::from([
+        (1_u8, RewriteActionLaw::EnsurePresent),
+        (3_u8, RewriteActionLaw::EnsurePresent),
+    ]);
+    assert_eq!(
+        infer_write_action_law(&left, &right),
+        PairRewriteLaw::StrongCommute
+    );
+
+    let opposite = BTreeMap::from([(1_u8, RewriteActionLaw::EnsureAbsent)]);
+    assert_eq!(
+        infer_write_action_law(&left, &opposite),
+        PairRewriteLaw::DefiniteIntentConflict
+    );
+}

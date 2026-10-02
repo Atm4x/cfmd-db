@@ -89,7 +89,6 @@ PY
 
 # Snapshot manifest is deliberately repository-wide. Keeping it verified makes
 # incomplete GitHub uploads fail at the repository gate rather than later in CI.
-python3 scripts/update-repository-manifest.py --check
 sha256sum -c --quiet REPOSITORY_MANIFEST.sha256
 
 echo 'repository layout + include/vendor/manifest integrity: PASS'

@@ -41,7 +41,24 @@ pub enum DynamicViolationWitness {
         field: SemanticId,
         entity: EntityId,
     },
+    FieldRule {
+        field: SemanticId,
+        entity: EntityId,
+        rule_index: usize,
+    },
+    RelationColumnRule {
+        relation: SemanticId,
+        row: usize,
+        column: usize,
+        rule_index: usize,
+    },
+    EntityRule {
+        owner: SemanticId,
+        entity: EntityId,
+        rule_index: usize,
+    },
 }
+
 
 fn add_missing_live_reference_violations(
     value: &Value,
@@ -160,15 +177,17 @@ pub fn dynamic_violation_measure(
     state: &DatabaseState,
     entity_types: &DenseTypeExtents,
 ) -> Result<ViolationMeasure<DynamicViolationWitness>, ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
     let mut measure = ViolationMeasure::new();
 
     for relation in context.schema.relations() {
-        let relation_measure = relation_dynamic_violation_measure(
+        let relation_measure = relation_dynamic_violation_measure_with_plan(
             context,
             registry,
             state,
             entity_types,
             relation.id,
+            &compiled_rules,
         )?;
         for (witness, mass) in relation_measure.iter() {
             measure.add(witness.clone(), mass)?;
@@ -183,7 +202,33 @@ pub fn dynamic_violation_measure(
             1,
             &mut measure,
         )?;
+        for (rule_index, rule) in compiled_rules.field_rules(field).iter().enumerate() {
+            if !rule.matches(value).unwrap_or(false) {
+                measure.add(
+                    DynamicViolationWitness::FieldRule {
+                        field,
+                        entity,
+                        rule_index,
+                    },
+                    1,
+                )?;
+            }
+        }
     }
+    for owner in compiled_rules.entity_rule_owners() {
+        for entity in entity_types.entities(owner) {
+            for (rule_index, rule) in compiled_rules.entity_rules(owner).iter().enumerate() {
+                let matches = rule.matches(&|coordinate| match coordinate {
+                    kernel_schema::RuleValueExpr::Input => None,
+                    kernel_schema::RuleValueExpr::Field(field) => state.model.fields.get(&(*field, entity)),
+                }).unwrap_or(false);
+                if !matches {
+                    measure.add(DynamicViolationWitness::EntityRule { owner, entity, rule_index }, 1)?;
+                }
+            }
+        }
+    }
+
     for capability in context.schema.capabilities() {
         for &field_id in capability.required_fields.keys() {
             for entity in entity_types.entities(capability.id) {
@@ -216,6 +261,20 @@ pub fn relation_dynamic_violation_measure(
     entity_types: &DenseTypeExtents,
     relation_id: SemanticId,
 ) -> Result<ViolationMeasure<DynamicViolationWitness>, ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
+    relation_dynamic_violation_measure_with_plan(
+        context, registry, state, entity_types, relation_id, &compiled_rules,
+    )
+}
+
+fn relation_dynamic_violation_measure_with_plan(
+    context: &SemanticContext,
+    registry: &SemanticRegistry,
+    state: &DatabaseState,
+    entity_types: &DenseTypeExtents,
+    relation_id: SemanticId,
+    compiled_rules: &crate::CompiledRulePlan,
+) -> Result<ViolationMeasure<DynamicViolationWitness>, ValidationError> {
     let relation = context
         .schema
         .relation(relation_id)
@@ -223,8 +282,7 @@ pub fn relation_dynamic_violation_measure(
     let rows = state
         .model
         .relations
-        .get(&relation_id)
-        .map(Vec::as_slice)
+        .materialize_owned(&relation_id)
         .unwrap_or_default();
     let mut measure = ViolationMeasure::new();
 
@@ -233,7 +291,7 @@ pub fn relation_dynamic_violation_measure(
     } = &relation.semantics
     {
         let uniqueness =
-            relation_uniqueness_violation_measure(rows, column_equivalences, context, registry)?;
+            relation_uniqueness_violation_measure(&rows, column_equivalences, context, registry)?;
         for (witness, mass) in uniqueness.iter() {
             measure.add(
                 DynamicViolationWitness::RelationUniqueness {
@@ -258,6 +316,23 @@ pub fn relation_dynamic_violation_measure(
                 1,
                 &mut measure,
             )?;
+            for (rule_index, rule) in compiled_rules
+                .relation_column_rules(context, relation_id, column)
+                .iter()
+                .enumerate()
+            {
+                if !rule.matches(value).unwrap_or(false) {
+                    measure.add(
+                        DynamicViolationWitness::RelationColumnRule {
+                            relation: relation_id,
+                            row: row_index,
+                            column,
+                            rule_index,
+                        },
+                        1,
+                    )?;
+                }
+            }
         }
     }
 

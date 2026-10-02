@@ -294,6 +294,7 @@ fn build_indexed_join_batch_program<'a>(
         | Plan::FilterOrderConst { .. }
         | Plan::FilterEqColumns { .. }
         | Plan::Difference { .. }
+        | Plan::Union { .. }
         | Plan::AntiJoin { .. }
         | Plan::Distinct { .. }
         | Plan::Group { .. }

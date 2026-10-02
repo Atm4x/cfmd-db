@@ -7,12 +7,18 @@ license.workspace = true
 
 [dependencies]
 kernel-model = { path = "../kernel-model" }
+kernel-lens = { path = "../kernel-lens" }
+kernel-durability = { path = "../kernel-durability" }
 kernel-plan = { path = "../kernel-plan" }
 kernel-query = { path = "../kernel-query" }
+kernel-realization = { path = "../kernel-realization" }
 kernel-revision = { path = "../kernel-revision" }
 kernel-schema = { path = "../kernel-schema" }
 kernel-semantics = { path = "../kernel-semantics" }
+kernel-transport = { path = "../kernel-transport" }
 kernel-types = { path = "../kernel-types" }
+kernel-validation = { path = "../kernel-validation" }
+getrandom = { version = "=0.4.3", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "=1.53.1", default-features = false, features = ["rt", "sync"] }

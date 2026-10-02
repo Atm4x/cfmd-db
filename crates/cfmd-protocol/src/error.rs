@@ -109,6 +109,10 @@ impl From<cfmd_runtime::Error> for ProtocolError {
                 ProtocolErrorCode::PermissionDenied,
                 "permission denied".to_owned(),
             ),
+            ErrorKind::SessionRevoked => (
+                ProtocolErrorCode::SessionClosed,
+                "hosted session is closed".to_owned(),
+            ),
             ErrorKind::Internal | _ => (
                 ProtocolErrorCode::Internal,
                 "internal database error".to_owned(),

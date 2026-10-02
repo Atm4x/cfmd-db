@@ -190,6 +190,63 @@ pub(super) fn scan_wal_file_seeded(
     Ok((scan, hasher, file_len))
 }
 
+pub(crate) fn scan_wal_stream_seeded(
+    reader: &mut impl Read,
+    region_len: u64,
+    base_revision: RevisionId,
+    first_lsn: u64,
+    seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+    crypto: Option<&StorageAeadCodec>,
+) -> Result<RecoveryScan, DurabilityError> {
+    if first_lsn == 0 {
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "WAL first LSN must be nonzero",
+        });
+    }
+    let mut state = ScanState::new(base_revision);
+    for (lsn, descriptor, payload_crc) in seeded_prepares {
+        state.seed_prepare(*lsn, descriptor.clone(), *payload_crc)?;
+    }
+    let mut offset = 0_u64;
+    let mut expected_lsn = first_lsn;
+    while offset < region_len {
+        match read_wal_reader_frame(reader, region_len, offset, offset, expected_lsn, crypto)? {
+            ReaderFrameRead::Tail(tail_status) => {
+                return Ok(state.finish(
+                    usize::try_from(offset).map_err(|_| CodecError::LengthOverflow)?,
+                    expected_lsn,
+                    tail_status,
+                ));
+            }
+            ReaderFrameRead::Complete(frame) => {
+                state.accept(&DecodedFrame {
+                    offset: usize::try_from(offset).map_err(|_| CodecError::LengthOverflow)?,
+                    kind: frame.kind,
+                    lsn: frame.lsn,
+                    revision: frame.revision,
+                    payload_crc: frame.payload_crc,
+                    payload: &frame.payload,
+                    frame_len: frame.frame_len,
+                })?;
+                offset = offset
+                    .checked_add(
+                        u64::try_from(frame.frame_len).map_err(|_| CodecError::LengthOverflow)?,
+                    )
+                    .ok_or(CodecError::LengthOverflow)?;
+                expected_lsn = expected_lsn
+                    .checked_add(1)
+                    .ok_or(DurabilityError::LsnExhausted)?;
+            }
+        }
+    }
+    Ok(state.finish(
+        usize::try_from(offset).map_err(|_| CodecError::LengthOverflow)?,
+        expected_lsn,
+        TailStatus::Clean,
+    ))
+}
+
 pub(super) fn scan_wal_file_region_seeded(
     file: &mut std::fs::File,
     start_offset: u64,
@@ -698,6 +755,8 @@ mod tests {
                 relation: SemanticId::new(11),
                 inserted: vec![vec![value]],
                 removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: Default::default(),
             }],
             &registry,
         )

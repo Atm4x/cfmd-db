@@ -181,15 +181,15 @@ P345-P348 provide runtime-neutral readiness/drain plus direct watch Future/Waker
 The object-first Rust facade now has an explicit snapshot-bound transaction composer:
 
 ```rust
-let mut tx = db.transaction(TransactionId::new(42))?;
+let mut tx = Transaction::new()?;
 let todos = tx.objects::<Todo>()?;
-tx.apply(todos.insert(first)?)?;
-tx.apply(todos.insert(second)?)?;
-let preview = tx.preview()?;
-tx.commit()?;
+db.objects::<Todo>()?.add(&mut tx, first)??;
+db.objects::<Todo>()?.add(&mut tx, second)??;
+let preview = db.preview(&tx)?;
+let outcome = db.commit(&tx)?;
 ```
 
-`Transaction` is intentionally not a parallel transactional store. Every mutation remains an ordinary `Plan`; composition is admitted only for the exact same database snapshot and authority, preview is the ordinary Candidate preview, and commit is the ordinary exact commit. Stale publication and cross-snapshot composition fail closed. Explicit certified rebase remains a distinct operation rather than an implicit transaction fallback.
+`Transaction` is intentionally not a parallel transactional store or publication authority. Every mutation remains an ordinary `Plan`; composition is admitted only for the exact same database snapshot and authority. Preview and publication are database-owned operations (`db.preview(&tx)` / `db.commit(&tx)`). Stale publication and cross-snapshot composition fail closed. Explicit certified rebase remains a distinct operation rather than an implicit transaction fallback.
 
 Publication does not consume the `Transaction`; retrying the unchanged transaction preserves the same durable transaction identity and returns the ordinary idempotent `AlreadyCommitted` outcome. This is required for caller-side uncertainty after publication and avoids inventing a second retry protocol.
 

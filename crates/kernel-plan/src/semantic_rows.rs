@@ -80,7 +80,7 @@ pub(super) fn relation_value_matches_revision_relation(
     };
     match (&definition.semantics, value) {
         (kernel_schema::RelationSemantics::Bag { .. }, super::RelationValue::Bag(rows)) => {
-            rows.as_slice() == expected_rows.as_slice()
+            expected_rows == rows
         }
         (
             kernel_schema::RelationSemantics::Set {
@@ -91,7 +91,7 @@ pub(super) fn relation_value_matches_revision_relation(
                 column_equivalences,
             },
         ) => {
-            rows.as_slice() == expected_rows.as_slice()
+            expected_rows == rows
                 && column_equivalences == expected_equivalences
         }
         _ => false,

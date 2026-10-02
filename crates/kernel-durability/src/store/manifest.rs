@@ -154,6 +154,13 @@ pub(super) fn read_current_manifest(directory: &Path) -> Result<ManifestRecord, 
         offset: 0,
         reason: "durable store has no published manifest",
     })?;
+    read_manifest_generation(directory, generation)
+}
+
+pub(super) fn read_manifest_generation(
+    directory: &Path,
+    generation: u64,
+) -> Result<ManifestRecord, DurabilityError> {
     let bytes = read_manifest_bytes_bounded(&manifest_path(directory, generation))?;
     let manifest = decode_manifest(&bytes)?;
     if manifest.generation != generation {

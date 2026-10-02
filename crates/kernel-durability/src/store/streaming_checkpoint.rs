@@ -6,7 +6,7 @@ use super::file_io::sync_directory;
 use super::freshness::ExternalFreshnessState;
 use super::generation_layout::{
     checkpoint_chunk_path, checkpoint_stream_spool_path, metadata_path, next_generation,
-    prepared_capsule_path, wal_path,
+    prepared_capsule_path, realization_path, wal_path,
 };
 use super::manifest::{ManifestRecord, publish_manifest_with_hook};
 use super::metadata_storage::{read_metadata_bytes_bounded, write_metadata_file};
@@ -15,14 +15,24 @@ use super::prepared_capsule::{
     write_prepared_cut_capsule,
 };
 use super::publication_protocol::{NoStoreFault, PublicationAttempt};
-use super::single_file_backend::{MetadataSectionSource, RevisionSectionSource};
+use super::realization_storage::{
+    read_published_factorized_realization, write_factorized_realization_file,
+};
+use super::single_file_backend::{
+    FactorizedRealizationSectionSource, MetadataSectionSource, RevisionSectionSource,
+};
 use super::{DurableGenerationReceipt, DurableRevisionStore, StreamingCheckpointProgress};
 use crate::binary_codec::{crc32c, crc32c_update};
+use crate::realization::DurableFactorizedRealization;
 use crate::runtime::{CodecError, DurabilityError, TailStatus};
-use crate::single_file::{CarriedWalPublication, SingleFileSectionInput, SingleFileSectionKind};
+use crate::single_file::{
+    CarriedWalPublication, HistoricalGenerationArchive, SingleFileSectionInput,
+    SingleFileSectionKind,
+};
 use crate::wal::FileRevisionWal;
 use crate::wal_frame::EncodedFrame;
 use crate::{checkpoint, metadata};
+use kernel_realization::{FactorizedRealizationRoot, PhysicalAtomStore};
 use kernel_revision::Revision;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -35,12 +45,15 @@ enum StreamingCheckpointPhysical {
         metadata_crc32c: u32,
         capsule_crc32c: u32,
         shadow_wal: Box<FileRevisionWal>,
+        physical_realization: Option<DurableFactorizedRealization>,
+        physical_binding: Option<metadata::DurableCheckpointRealizationBinding>,
     },
     SingleFile {
         carry_start_offset: u64,
         metadata_record: Box<metadata::DurableStoreMetadata>,
         prepared_bytes: Vec<u8>,
         replication_cut_frames: usize,
+        physical_realization: Option<DurableFactorizedRealization>,
     },
 }
 
@@ -292,6 +305,66 @@ impl DurableRevisionStore {
         revision: &Revision,
         chunk_size: usize,
     ) -> Result<StreamingCheckpointProgress, DurabilityError> {
+        let physical = self
+            .checkpoint_realization
+            .as_ref()
+            .filter(|physical| physical.revision() == revision.id())
+            .cloned();
+        self.begin_streaming_checkpoint_with_chunk_size_and_physical(
+            revision,
+            chunk_size,
+            physical,
+        )
+    }
+
+    pub fn begin_streaming_checkpoint_with_factorized_realization(
+        &mut self,
+        revision: &Revision,
+        atoms: &PhysicalAtomStore,
+        root: &FactorizedRealizationRoot,
+    ) -> Result<StreamingCheckpointProgress, DurabilityError> {
+        self.begin_streaming_checkpoint_with_factorized_realization_and_chunk_size(
+            revision,
+            atoms,
+            root,
+            DEFAULT_CHECKPOINT_CHUNK_SIZE,
+        )
+    }
+
+    pub fn begin_streaming_checkpoint_with_factorized_realization_and_chunk_size(
+        &mut self,
+        revision: &Revision,
+        atoms: &PhysicalAtomStore,
+        root: &FactorizedRealizationRoot,
+        chunk_size: usize,
+    ) -> Result<StreamingCheckpointProgress, DurabilityError> {
+        let mut physical = DurableFactorizedRealization::new(
+            revision.id(),
+            atoms.clone(),
+            root.clone(),
+        )?;
+        if let Some(previous) = self.checkpoint_realization.as_ref() {
+            physical.inherit_retained_historical_roots(
+                previous,
+                self.checkpoint.semantic_context(),
+                self.historical_epoch_anchors
+                    .values()
+                    .map(|anchor| (anchor.effect_id, anchor.source_revision)),
+            )?;
+        }
+        self.begin_streaming_checkpoint_with_chunk_size_and_physical(
+            revision,
+            chunk_size,
+            Some(physical),
+        )
+    }
+
+    fn begin_streaming_checkpoint_with_chunk_size_and_physical(
+        &mut self,
+        revision: &Revision,
+        chunk_size: usize,
+        physical_realization: Option<DurableFactorizedRealization>,
+    ) -> Result<StreamingCheckpointProgress, DurabilityError> {
         if !self.backend.capabilities().streaming_checkpoint {
             return Err(DurabilityError::Protocol {
                 offset: 0,
@@ -330,7 +403,7 @@ impl DurableRevisionStore {
             &self.prepared_transactions,
             self.durable_head,
         );
-        let metadata_record = self.streaming_metadata_record(revision)?;
+        let mut metadata_record = self.streaming_metadata_record(revision)?;
         let (generation, physical) = if self.backend.is_single_file() {
             let generation = planned_generation;
             let carry_start_offset = self.wal.current_end_offset()?;
@@ -343,6 +416,7 @@ impl DurableRevisionStore {
                     metadata_record: Box::new(metadata_record),
                     prepared_bytes,
                     replication_cut_frames,
+                    physical_realization,
                 },
             )
         } else {
@@ -352,6 +426,16 @@ impl DurableRevisionStore {
                 &prepared_capsule_path(&directory, generation),
                 &prepared_capsule,
             )?;
+            let physical_binding = physical_realization
+                .as_ref()
+                .map(|physical| {
+                    write_factorized_realization_file(
+                        &realization_path(&directory, generation),
+                        physical,
+                    )
+                })
+                .transpose()?;
+            metadata_record.checkpoint_realization = physical_binding;
             let metadata_crc32c =
                 write_metadata_file(&metadata_path(&directory, generation), &metadata_record)?;
             let mut shadow_wal =
@@ -364,6 +448,8 @@ impl DurableRevisionStore {
                     metadata_crc32c,
                     capsule_crc32c,
                     shadow_wal: Box::new(shadow_wal),
+                    physical_realization,
+                    physical_binding,
                 },
             )
         };
@@ -404,6 +490,7 @@ impl DurableRevisionStore {
             physical_artifacts: self.physical_artifact_specs.clone(),
             artifact_cores: self.artifact_cores.clone(),
             migration_complements: self.migration_complements.clone(),
+            historical_epoch_anchors: self.historical_epoch_anchors.clone(),
             committed_transactions: self.committed_transactions.clone(),
             semantic_modules: self
                 .semantic_registry
@@ -415,6 +502,7 @@ impl DurableRevisionStore {
             causal_coverage_root: Some(self.causal_coverage_root),
             revision_effects: self.revision_effects.clone(),
             revision_effect_frontiers: self.revision_effect_frontiers.clone(),
+            checkpoint_realization: None,
         })
     }
 
@@ -524,24 +612,30 @@ impl DurableRevisionStore {
                 metadata_crc32c,
                 capsule_crc32c,
                 shadow_wal,
+                physical_realization,
+                physical_binding,
             } => self.finalize_directory_streaming_checkpoint(
                 job,
                 checkpoint_crc32c,
                 metadata_crc32c,
                 capsule_crc32c,
                 *shadow_wal,
+                physical_realization,
+                physical_binding,
             ),
             StreamingCheckpointPhysical::SingleFile {
                 carry_start_offset,
                 metadata_record,
                 prepared_bytes,
                 replication_cut_frames,
+                physical_realization,
             } => self.finalize_single_file_streaming_checkpoint(
                 job,
                 carry_start_offset,
                 &metadata_record,
                 &prepared_bytes,
                 replication_cut_frames,
+                physical_realization,
             ),
         }
     }
@@ -553,6 +647,8 @@ impl DurableRevisionStore {
         metadata_crc32c: u32,
         capsule_crc32c: u32,
         mut shadow_wal: FileRevisionWal,
+        physical_realization: Option<DurableFactorizedRealization>,
+        physical_binding: Option<metadata::DurableCheckpointRealizationBinding>,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
         let directory = self.backend.directory_root()?.to_path_buf();
         let seeds = job.prepared_capsule.scan_seeds();
@@ -600,6 +696,19 @@ impl DurableRevisionStore {
             &prepared_capsule_path(&directory, job.generation),
             capsule_crc32c,
         )?;
+        if let Some(binding) = physical_binding {
+            let verified = read_published_factorized_realization(
+                &directory,
+                job.generation,
+                binding,
+            )?;
+            if verified.revision() != job.cut_revision.id() {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "streaming durable realization does not match pinned checkpoint cut",
+                });
+            }
+        }
         sync_directory(&directory)?;
         let mut publication = PublicationAttempt::default();
         if let Err(error) = publish_manifest_with_hook(
@@ -621,6 +730,7 @@ impl DurableRevisionStore {
             .retain_published_generation(job.wal_first_lsn, job.prepared_capsule.prepare_lsns());
         self.generation = job.generation;
         self.checkpoint = job.cut_revision;
+        self.checkpoint_realization = physical_realization;
         self.wal = shadow_wal;
         self.advance_external_freshness_generation_with_digest(
             published_generation,
@@ -640,6 +750,7 @@ impl DurableRevisionStore {
         metadata_record: &metadata::DurableStoreMetadata,
         prepared_bytes: &[u8],
         replication_cut_frames: usize,
+        physical_realization: Option<DurableFactorizedRealization>,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
         let seeds = job.prepared_capsule.scan_seeds();
         let active_end = self.wal.current_end_offset()?;
@@ -668,7 +779,16 @@ impl DurableRevisionStore {
         let checkpoint_source = RevisionSectionSource(&job.cut_revision);
         let metadata_source = MetadataSectionSource(metadata_record);
         let replication_frames = replication_prefix(&self.replication, replication_cut_frames)?;
-        let sections = [
+        let retained_historical_generations = self
+            .pinned_historical_generations_for(physical_realization.as_ref());
+        let archive_outgoing = retained_historical_generations
+            .contains(&self.generation)
+            .then_some(HistoricalGenerationArchive {
+                generation: self.generation,
+                checkpoint_revision: self.checkpoint.id(),
+                durable_head: self.durable_head,
+            });
+        let mut sections = vec![
             SingleFileSectionInput::streaming(
                 SingleFileSectionKind::Checkpoint,
                 0,
@@ -681,6 +801,16 @@ impl DurableRevisionStore {
                 prepared_bytes,
             ),
         ];
+        let physical_source = physical_realization
+            .as_ref()
+            .map(FactorizedRealizationSectionSource);
+        if let Some(source) = physical_source.as_ref() {
+            sections.push(SingleFileSectionInput::streaming(
+                SingleFileSectionKind::PhysicalArtifact,
+                0,
+                source,
+            ));
+        }
         let (backend, wal) = (&mut self.backend, &mut self.wal);
         let container = backend.single_file_container()?;
         let view = container
@@ -695,6 +825,8 @@ impl DurableRevisionStore {
                 },
                 &sections,
                 replication_frames,
+                archive_outgoing,
+                &retained_historical_generations,
             )
             .inspect_err(|_| self.poisoned = true)?;
         let (wal, reopened_scan) = container
@@ -714,6 +846,7 @@ impl DurableRevisionStore {
             .retain_published_generation(job.wal_first_lsn, job.prepared_capsule.prepare_lsns());
         self.generation = view.generation;
         self.checkpoint = job.cut_revision;
+        self.checkpoint_realization = physical_realization;
         self.wal = wal;
         self.replication
             .advance_single_file_generation_prefix(replication_cut_frames);

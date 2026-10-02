@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    borrow::Borrow,
+    cmp::Ordering,
+    collections::BTreeSet,
+    sync::{Arc, Weak},
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct MapNode<K, V> {
@@ -15,6 +20,34 @@ pub struct PersistentOrdMap<K, V> {
     len: usize,
 }
 
+/// Weak diagnostic probe for structural nodes that belong exclusively to one
+/// persistent-map snapshot relative to another snapshot.
+///
+/// The probe never keeps storage alive. It exists so kernel-level retention
+/// tests can prove that pinned immutable roots retain only path-copied nodes
+/// and that those nodes are reclaimed after the last owning root is dropped.
+#[derive(Debug)]
+pub struct PersistentOrdMapStorageProbe<K, V> {
+    nodes: Vec<Weak<MapNode<K, V>>>,
+}
+
+impl<K, V> PersistentOrdMapStorageProbe<K, V> {
+    #[must_use]
+    pub fn total_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[must_use]
+    pub fn live_nodes(&self) -> usize {
+        self.nodes.iter().filter(|node| node.strong_count() != 0).count()
+    }
+
+    #[must_use]
+    pub fn is_fully_reclaimed(&self) -> bool {
+        self.live_nodes() == 0
+    }
+}
+
 impl<K, V> Default for PersistentOrdMap<K, V> {
     fn default() -> Self {
         Self { root: None, len: 0 }
@@ -22,6 +55,64 @@ impl<K, V> Default for PersistentOrdMap<K, V> {
 }
 
 impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
+    #[must_use]
+    pub fn from_sorted_unique(entries: Vec<(K, V)>) -> Option<Self> {
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return None;
+        }
+        fn build<K: Clone, V: Clone>(entries: &[(K, V)]) -> Option<Arc<MapNode<K, V>>> {
+            if entries.is_empty() {
+                return None;
+            }
+            let mid = entries.len() / 2;
+            let left = build(&entries[..mid]);
+            let right = build(&entries[mid + 1..]);
+            Some(map_node(
+                entries[mid].0.clone(),
+                entries[mid].1.clone(),
+                left,
+                right,
+            ))
+        }
+        let len = entries.len();
+        Some(Self {
+            root: build(&entries),
+            len,
+        })
+    }
+
+    #[must_use]
+    pub fn from_sorted_unique_owned(entries: Vec<(K, V)>) -> Option<Self> {
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return None;
+        }
+        fn build<K, V>(
+            entries: &mut std::vec::IntoIter<(K, V)>,
+            len: usize,
+        ) -> Option<Arc<MapNode<K, V>>> {
+            if len == 0 {
+                return None;
+            }
+            let left_len = len / 2;
+            let left = build(entries, left_len);
+            let (key, value) = entries.next().expect("validated owned bulk map length");
+            let right = build(entries, len - left_len - 1);
+            Some(map_node(key, value, left, right))
+        }
+        let len = entries.len();
+        let mut entries = entries.into_iter();
+        Some(Self {
+            root: build(&mut entries, len),
+            len,
+        })
+    }
+
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let (root, replaced) = map_insert(self.root.as_ref(), key, value);
         self.root = Some(root);
@@ -50,13 +141,34 @@ impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
     }
 
     #[must_use]
-    pub fn get(&self, key: &K) -> Option<&V> {
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         let mut current = self.root.as_deref();
         while let Some(node) = current {
-            match key.cmp(&node.key) {
+            match key.cmp(node.key.borrow()) {
                 Ordering::Less => current = node.left.as_deref(),
                 Ordering::Greater => current = node.right.as_deref(),
                 Ordering::Equal => return Some(&node.value),
+            }
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut current = self.root.as_deref();
+        while let Some(node) = current {
+            match key.cmp(node.key.borrow()) {
+                Ordering::Less => current = node.left.as_deref(),
+                Ordering::Greater => current = node.right.as_deref(),
+                Ordering::Equal => return Some((&node.key, &node.value)),
             }
         }
         None
@@ -67,7 +179,11 @@ impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
     }
 
     #[must_use]
-    pub fn contains_key(&self, key: &K) -> bool {
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         self.get(key).is_some()
     }
 
@@ -141,6 +257,78 @@ impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
             (Some(left), Some(right)) => Arc::ptr_eq(left, right),
             _ => false,
         }
+    }
+
+    /// Number of structural AVL nodes reachable from this immutable root.
+    /// This intentionally excludes heap owned by `K`/`V`; it is a path-copy
+    /// retention metric rather than a general allocator estimate.
+    #[must_use]
+    pub fn structural_node_count(&self) -> usize {
+        fn count<K, V>(node: Option<&Arc<MapNode<K, V>>>) -> usize {
+            let Some(node) = node else { return 0 };
+            1 + count(node.left.as_ref()) + count(node.right.as_ref())
+        }
+        count(self.root.as_ref())
+    }
+
+    /// Exact count of structural nodes shared by pointer identity with
+    /// `other`. The traversal is diagnostic-only and therefore deliberately
+    /// O(N); hot-path code must use ordinary persistent operations instead.
+    #[must_use]
+    pub fn shared_structural_node_count_with(&self, other: &Self) -> usize {
+        fn collect<K, V>(node: Option<&Arc<MapNode<K, V>>>, ids: &mut BTreeSet<usize>) {
+            let Some(node) = node else { return };
+            ids.insert(Arc::as_ptr(node) as usize);
+            collect(node.left.as_ref(), ids);
+            collect(node.right.as_ref(), ids);
+        }
+        fn count_shared<K, V>(
+            node: Option<&Arc<MapNode<K, V>>>,
+            ids: &BTreeSet<usize>,
+        ) -> usize {
+            let Some(node) = node else { return 0 };
+            usize::from(ids.contains(&(Arc::as_ptr(node) as usize)))
+                + count_shared(node.left.as_ref(), ids)
+                + count_shared(node.right.as_ref(), ids)
+        }
+
+        let mut ids = BTreeSet::new();
+        collect(self.root.as_ref(), &mut ids);
+        count_shared(other.root.as_ref(), &ids)
+    }
+
+    /// Weakly probes nodes reachable from this map but not shared with
+    /// `other`. Dropping this snapshot must reclaim every probed node unless a
+    /// third immutable root also owns it.
+    #[must_use]
+    pub fn unique_storage_probe_against(
+        &self,
+        other: &Self,
+    ) -> PersistentOrdMapStorageProbe<K, V> {
+        fn collect_ids<K, V>(node: Option<&Arc<MapNode<K, V>>>, ids: &mut BTreeSet<usize>) {
+            let Some(node) = node else { return };
+            ids.insert(Arc::as_ptr(node) as usize);
+            collect_ids(node.left.as_ref(), ids);
+            collect_ids(node.right.as_ref(), ids);
+        }
+        fn collect_unique<K, V>(
+            node: Option<&Arc<MapNode<K, V>>>,
+            shared: &BTreeSet<usize>,
+            into: &mut Vec<Weak<MapNode<K, V>>>,
+        ) {
+            let Some(node) = node else { return };
+            if !shared.contains(&(Arc::as_ptr(node) as usize)) {
+                into.push(Arc::downgrade(node));
+            }
+            collect_unique(node.left.as_ref(), shared, into);
+            collect_unique(node.right.as_ref(), shared, into);
+        }
+
+        let mut shared = BTreeSet::new();
+        collect_ids(other.root.as_ref(), &mut shared);
+        let mut nodes = Vec::new();
+        collect_unique(self.root.as_ref(), &shared, &mut nodes);
+        PersistentOrdMapStorageProbe { nodes }
     }
 }
 
@@ -233,6 +421,24 @@ impl<T: Ord + Clone> PersistentOrdSet<T> {
     #[must_use]
     pub fn shares_root_with(&self, other: &Self) -> bool {
         self.entries.shares_root_with(&other.entries)
+    }
+
+    #[must_use]
+    pub fn structural_node_count(&self) -> usize {
+        self.entries.structural_node_count()
+    }
+
+    #[must_use]
+    pub fn shared_structural_node_count_with(&self, other: &Self) -> usize {
+        self.entries.shared_structural_node_count_with(&other.entries)
+    }
+
+    #[must_use]
+    pub fn unique_storage_probe_against(
+        &self,
+        other: &Self,
+    ) -> PersistentOrdMapStorageProbe<T, ()> {
+        self.entries.unique_storage_probe_against(&other.entries)
     }
 }
 

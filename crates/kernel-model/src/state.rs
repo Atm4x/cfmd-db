@@ -124,6 +124,10 @@ pub struct NormalizedDatabaseState {
 }
 
 impl DatabaseState {
+    pub fn detach_relation_materialized_projections(&mut self) {
+        self.model.relations.detach_materialized_projections();
+    }
+
     pub fn normalize(self) -> Result<Self, ModelError> {
         Ok(self.normalize_certified()?.state)
     }

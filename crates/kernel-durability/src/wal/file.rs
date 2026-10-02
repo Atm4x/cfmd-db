@@ -58,6 +58,41 @@ impl WalRegionScan {
 }
 
 impl FileRevisionWal {
+    pub(crate) fn scan_recovered_seeded_read_only(
+        path: impl AsRef<Path>,
+        base_revision: RevisionId,
+        first_lsn: u64,
+        seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+    ) -> Result<RecoveryScan, DurabilityError> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let (scan, _, _) =
+            scan_wal_file_seeded(&mut file, base_revision, first_lsn, seeded_prepares, None)?;
+        Ok(scan)
+    }
+
+    pub(crate) fn scan_region_seeded_read_only(
+        path: impl AsRef<Path>,
+        start_offset: u64,
+        end_offset: u64,
+        base_revision: RevisionId,
+        first_lsn: u64,
+        seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+        crypto: Option<&StorageAeadCodec>,
+    ) -> Result<RecoveryScan, DurabilityError> {
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let (scan, _) = scan_wal_file_region_seeded(
+            &mut file,
+            start_offset,
+            end_offset,
+            base_revision,
+            first_lsn,
+            seeded_prepares,
+            crypto,
+        )?;
+        Ok(scan)
+    }
+
     pub fn create(path: impl AsRef<Path>) -> Result<Self, DurabilityError> {
         Self::create_at_lsn(path, 1)
     }

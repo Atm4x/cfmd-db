@@ -85,15 +85,14 @@ impl RuntimeRevisionSnapshot {
                 .schema
                 .relation(mutation.relation)
                 .ok_or(PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation))?;
-            let rows = source
+            let source_rows = source
                 .state()
                 .model
                 .relations
-                .get(&mutation.relation)
-                .cloned()
+                .materialize_owned(&mutation.relation)
                 .unwrap_or_default();
             let old = relation_value_from_rows(
-                rows,
+                source_rows.clone(),
                 &RelType {
                     columns: definition.columns.clone(),
                     semantics: definition.semantics.clone(),
@@ -105,7 +104,33 @@ impl RuntimeRevisionSnapshot {
                 .delta
                 .apply_to_value(old, source.semantic_context(), registry)
                 .map_err(PhysicalExecutionError::from)?;
-            candidate.replace_relation_rows(mutation.relation, next.into_rows());
+            let next_rows = next.into_rows();
+            let survivor_count = next_rows
+                .len()
+                .checked_sub(mutation.delta.inserted.len())
+                .ok_or(PhysicalExecutionError::LogicalRevisionMutationMismatch)?;
+            let survivors = &next_rows[..survivor_count];
+            let mut survivor = 0_usize;
+            let mut removed_positions = Vec::with_capacity(mutation.delta.removed.len());
+            for (position, row) in source_rows.iter().enumerate() {
+                if survivor < survivors.len() && row == &survivors[survivor] {
+                    survivor += 1;
+                } else {
+                    removed_positions.push(position);
+                }
+            }
+            if survivor != survivors.len()
+                || removed_positions.len() != mutation.delta.removed.len()
+            {
+                return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch.into());
+            }
+            candidate
+                .patch_relation_rows(
+                    mutation.relation,
+                    &removed_positions,
+                    mutation.delta.inserted.clone(),
+                )
+                .map_err(RuntimeRevisionDerivationError::from)?;
         }
         candidate.build(target_revision, registry).map_err(Into::into)
     }

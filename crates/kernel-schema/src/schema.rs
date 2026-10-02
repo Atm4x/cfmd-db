@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_types::{SchemaRevisionId, SemanticId};
 
 use crate::{
-    CapabilityDef, FieldDef, RelationDef, RelationSemantics, StructuralEquivalenceDef,
-    StructuralOrderingDef, SubtypeClosure, Symbol, TypeError, TypeExpr,
+    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, RuleValueExpr, SemanticRuleExpr,
+    SemanticRuleTypeError, StructuralEquivalenceDef, StructuralOrderingDef, SubtypeClosure, Symbol, TypeError, TypeExpr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,11 +14,24 @@ pub struct Schema {
     types: BTreeMap<SemanticId, TypeExpr>,
     capabilities: BTreeMap<SemanticId, CapabilityDef>,
     fields: BTreeMap<SemanticId, FieldDef>,
+    field_rules: BTreeMap<SemanticId, Vec<FieldRule>>,
+    relation_column_rules: BTreeMap<(SemanticId, SemanticId), Vec<FieldRule>>,
+    entity_rules: BTreeMap<SemanticId, Vec<SemanticRuleExpr>>,
+    relation_column_ids: BTreeMap<SemanticId, Vec<SemanticId>>,
     relations: BTreeMap<SemanticId, RelationDef>,
     structural_equivalences: BTreeMap<SemanticId, StructuralEquivalenceDef>,
     structural_orderings: BTreeMap<SemanticId, StructuralOrderingDef>,
     inclusions: BTreeSet<(SemanticId, SemanticId)>,
     subtype_closure: SubtypeClosure,
+}
+
+fn validate_field_rule_type(rule: &FieldRule, ty: &TypeExpr) -> Result<(), SchemaError> {
+    match rule.expression().validate_for_input(ty) {
+        Ok(()) => Ok(()),
+        Err(crate::SemanticRuleTypeError::TypeMismatch) => Err(SchemaError::FieldRuleTypeMismatch),
+        Err(crate::SemanticRuleTypeError::InvalidBounds) => Err(SchemaError::InvalidFieldRuleBounds),
+        Err(crate::SemanticRuleTypeError::UnknownField(_)) | Err(crate::SemanticRuleTypeError::FieldOutsideOwner { .. }) => Err(SchemaError::FieldRuleTypeMismatch),
+    }
 }
 
 impl Schema {
@@ -30,6 +43,10 @@ impl Schema {
             types: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             fields: BTreeMap::new(),
+            field_rules: BTreeMap::new(),
+            relation_column_rules: BTreeMap::new(),
+            entity_rules: BTreeMap::new(),
+            relation_column_ids: BTreeMap::new(),
             relations: BTreeMap::new(),
             structural_equivalences: BTreeMap::new(),
             structural_orderings: BTreeMap::new(),
@@ -61,7 +78,105 @@ impl Schema {
         Ok(())
     }
 
-    pub fn define_relation(&mut self, relation: RelationDef) -> Result<(), SchemaError> {
+    pub fn add_field_rule(
+        &mut self,
+        field: SemanticId,
+        rule: FieldRule,
+    ) -> Result<(), SchemaError> {
+        let definition = self
+            .fields
+            .get(&field)
+            .ok_or(SchemaError::UnknownFieldForRule(field))?;
+        validate_field_rule_type(&rule, &definition.value)?;
+        self.field_rules.entry(field).or_default().push(rule);
+        Ok(())
+    }
+
+    pub fn validate_entity_rule(
+        &self,
+        owner: SemanticId,
+        rule: &SemanticRuleExpr,
+    ) -> Result<(), SchemaError> {
+        rule.validate_values(&mut |value| match value {
+            RuleValueExpr::Input => Err(SemanticRuleTypeError::TypeMismatch),
+            RuleValueExpr::Field(field_id) => {
+                let field = self.fields.get(field_id).ok_or(SemanticRuleTypeError::UnknownField(*field_id))?;
+                if !self.is_subtype(owner, field.owner) {
+                    return Err(SemanticRuleTypeError::FieldOutsideOwner { field: *field_id, owner });
+                }
+                Ok(field.value.clone())
+            }
+        }).map_err(|error| match error {
+            SemanticRuleTypeError::InvalidBounds => SchemaError::InvalidFieldRuleBounds,
+            SemanticRuleTypeError::UnknownField(field) => SchemaError::UnknownFieldForRule(field),
+            SemanticRuleTypeError::TypeMismatch | SemanticRuleTypeError::FieldOutsideOwner { .. } => SchemaError::EntityRuleTypeMismatch,
+        })
+    }
+
+    pub fn add_entity_rule(
+        &mut self,
+        owner: SemanticId,
+        rule: SemanticRuleExpr,
+    ) -> Result<(), SchemaError> {
+        self.validate_entity_rule(owner, &rule)?;
+        self.entity_rules.entry(owner).or_default().push(rule);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn entity_rules(&self, owner: SemanticId) -> &[SemanticRuleExpr] {
+        self.entity_rules.get(&owner).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    pub fn all_entity_rules(&self) -> impl Iterator<Item = (SemanticId, &SemanticRuleExpr)> {
+        self.entity_rules.iter().flat_map(|(&owner, rules)| rules.iter().map(move |rule| (owner, rule)))
+    }
+
+    pub fn validate_relation_row_rule(
+        &self,
+        relation: SemanticId,
+        rule: &SemanticRuleExpr,
+    ) -> Result<(), SchemaError> {
+        rule.validate_values(&mut |value| match value {
+            RuleValueExpr::Input => Err(SemanticRuleTypeError::TypeMismatch),
+            RuleValueExpr::Field(column) => self
+                .relation_column_type(relation, *column)
+                .cloned()
+                .ok_or(SemanticRuleTypeError::UnknownField(*column)),
+        })
+        .map_err(|error| match error {
+            SemanticRuleTypeError::InvalidBounds => SchemaError::InvalidFieldRuleBounds,
+            SemanticRuleTypeError::UnknownField(field) => SchemaError::UnknownFieldForRule(field),
+            SemanticRuleTypeError::TypeMismatch | SemanticRuleTypeError::FieldOutsideOwner { .. } => SchemaError::EntityRuleTypeMismatch,
+        })
+    }
+
+    pub fn add_relation_column_rule(
+        &mut self,
+        relation: SemanticId,
+        column: SemanticId,
+        rule: FieldRule,
+    ) -> Result<(), SchemaError> {
+        let ty = self
+            .relation_column_type(relation, column)
+            .ok_or(SchemaError::UnknownRelationColumnForRule { relation, column })?;
+        validate_field_rule_type(&rule, ty)?;
+        self.relation_column_rules
+            .entry((relation, column))
+            .or_default()
+            .push(rule);
+        Ok(())
+    }
+
+    /// Defines a relation with explicit stable semantic identities for its columns.
+    ///
+    /// Column order remains a physical/query lowering coordinate. `column_ids` are
+    /// the schema identity and survive reorder/representation changes.
+    pub fn define_relation_with_column_ids(
+        &mut self,
+        relation: RelationDef,
+        column_ids: Vec<SemanticId>,
+    ) -> Result<(), SchemaError> {
         for column in &relation.columns {
             column.validate().map_err(SchemaError::InvalidType)?;
         }
@@ -76,10 +191,31 @@ impl Schema {
         if column_equivalences.len() != relation.columns.len() {
             return Err(SchemaError::RelationEquivalenceArityMismatch);
         }
-        if self.relations.insert(relation.id, relation).is_some() {
+        if column_ids.len() != relation.columns.len() {
+            return Err(SchemaError::RelationColumnIdentityArityMismatch);
+        }
+        let unique = column_ids.iter().copied().collect::<BTreeSet<_>>();
+        if unique.len() != column_ids.len() {
+            return Err(SchemaError::DuplicateRelationColumnIdentity);
+        }
+        let id = relation.id;
+        if self.relations.contains_key(&id) {
             return Err(SchemaError::DuplicateRelation);
         }
+        self.relation_column_ids.insert(id, column_ids);
+        self.relations.insert(id, relation);
         Ok(())
+    }
+
+    /// Convenience definition for relations that do not yet provide explicit
+    /// semantic column identities. The generated identities are deterministic
+    /// within the relation. Schema-evolution code should use
+    /// `define_relation_with_column_ids` so identity is independent of ordinal.
+    pub fn define_relation(&mut self, relation: RelationDef) -> Result<(), SchemaError> {
+        let column_ids = (0..relation.columns.len())
+            .map(|column| SemanticId::new((column as u128) + 1))
+            .collect();
+        self.define_relation_with_column_ids(relation, column_ids)
     }
 
     pub fn define_capability(&mut self, capability: CapabilityDef) -> Result<(), SchemaError> {
@@ -167,6 +303,78 @@ impl Schema {
 
     pub fn fields(&self) -> impl Iterator<Item = &FieldDef> {
         self.fields.values()
+    }
+
+    #[must_use]
+    pub fn field_rules(&self, field: SemanticId) -> &[FieldRule] {
+        self.field_rules
+            .get(&field)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn all_field_rules(&self) -> impl Iterator<Item = (SemanticId, &FieldRule)> {
+        self.field_rules
+            .iter()
+            .flat_map(|(&field, rules)| rules.iter().map(move |rule| (field, rule)))
+    }
+
+    #[must_use]
+    pub fn relation_column_ids(&self, relation: SemanticId) -> Option<&[SemanticId]> {
+        self.relation_column_ids.get(&relation).map(Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn relation_column_id(&self, relation: SemanticId, ordinal: usize) -> Option<SemanticId> {
+        self.relation_column_ids(relation)?.get(ordinal).copied()
+    }
+
+    #[must_use]
+    pub fn relation_column_ordinal(
+        &self,
+        relation: SemanticId,
+        column: SemanticId,
+    ) -> Option<usize> {
+        self.relation_column_ids(relation)?
+            .iter()
+            .position(|candidate| *candidate == column)
+    }
+
+    #[must_use]
+    pub fn relation_column_type(
+        &self,
+        relation: SemanticId,
+        column: SemanticId,
+    ) -> Option<&TypeExpr> {
+        let ordinal = self.relation_column_ordinal(relation, column)?;
+        self.relation(relation)?.columns.get(ordinal)
+    }
+
+    #[must_use]
+    pub fn relation_column_rules_by_id(
+        &self,
+        relation: SemanticId,
+        column: SemanticId,
+    ) -> &[FieldRule] {
+        self.relation_column_rules
+            .get(&(relation, column))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn relation_column_rules(&self, relation: SemanticId, ordinal: usize) -> &[FieldRule] {
+        self.relation_column_id(relation, ordinal)
+            .map(|column| self.relation_column_rules_by_id(relation, column))
+            .unwrap_or_default()
+    }
+
+    pub fn all_relation_column_rules(
+        &self,
+    ) -> impl Iterator<Item = ((SemanticId, SemanticId), &FieldRule)> {
+        self.relation_column_rules
+            .iter()
+            .flat_map(|(&target, rules)| rules.iter().map(move |rule| (target, rule)))
     }
 
     #[must_use]
@@ -322,6 +530,20 @@ impl Schema {
             && self.inclusions == other.inclusions
     }
 
+    /// Returns whether two schema revisions have the same non-data-bearing
+    /// structural foundation and therefore may be connected by one explicit
+    /// data migration. Fields, field rules, relations, relation-column rules,
+    /// presentation symbols and the schema revision itself are intentionally
+    /// excluded: those are the coordinates a migration is allowed to replace.
+    #[must_use]
+    pub fn migration_base_equivalent(&self, other: &Self) -> bool {
+        self.types == other.types
+            && self.capabilities == other.capabilities
+            && self.structural_equivalences == other.structural_equivalences
+            && self.structural_orderings == other.structural_orderings
+            && self.inclusions == other.inclusions
+    }
+
     #[must_use]
     pub fn definitionally_equivalent(&self, other: &Self) -> bool {
         let symbols_match = self.symbols.len() == other.symbols.len()
@@ -335,6 +557,10 @@ impl Schema {
             && self.types == other.types
             && self.capabilities == other.capabilities
             && self.fields == other.fields
+            && self.field_rules == other.field_rules
+            && self.relation_column_rules == other.relation_column_rules
+            && self.relation_column_ids == other.relation_column_ids
+            && self.entity_rules == other.entity_rules
             && self.relations == other.relations
             && self.structural_equivalences == other.structural_equivalences
             && self.structural_orderings == other.structural_orderings
@@ -359,6 +585,17 @@ pub enum SchemaError {
     DuplicateTypeDefinition,
     DuplicateCapability,
     DuplicateField,
+    UnknownFieldForRule(SemanticId),
+    UnknownRelationForRule(SemanticId),
+    UnknownRelationColumnForRule {
+        relation: SemanticId,
+        column: SemanticId,
+    },
+    RelationColumnIdentityArityMismatch,
+    DuplicateRelationColumnIdentity,
+    FieldRuleTypeMismatch,
+    InvalidFieldRuleBounds,
+    EntityRuleTypeMismatch,
     DuplicateRelation,
     DuplicateStructuralEquivalence,
     DuplicateStructuralOrdering,

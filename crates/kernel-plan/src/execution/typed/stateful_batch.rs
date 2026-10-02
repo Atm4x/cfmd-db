@@ -49,6 +49,7 @@ fn try_execute_typed_stateful_batch(
         | Plan::Project { .. }
         | Plan::JoinEq { .. }
         | Plan::Difference { .. }
+        | Plan::Union { .. }
         | Plan::AntiJoin { .. }
         | Plan::PromoteToBag(_) => Ok(None),
     }

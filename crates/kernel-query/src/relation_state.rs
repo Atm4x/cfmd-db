@@ -7,14 +7,430 @@ use super::{
     relation_value_from_rows, unmatched_semantic_rows, validate_query_equivalence,
     value_shape_matches_type,
 };
-use kernel_persistent::{PersistentOrdMap, PersistentVec};
-use std::{collections::BTreeMap, sync::Arc};
+use kernel_persistent::{
+    PersistentOrdMap, PersistentOrdMapStorageProbe, PersistentVec, PersistentVecStorageProbe,
+};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+
+/// Persistent FIFO of stable occurrences for one Γ-class.  The head offset
+/// makes Bag removals follow logical survivor-order without O(class-size)
+/// front shifts.  Periodic tail compaction keeps dead prefixes bounded and is
+/// amortized linear across a deletion run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OccurrenceBucket {
+    handles: PersistentVec<kernel_types::StableRowHandle>,
+    head: usize,
+}
+
+impl OccurrenceBucket {
+    fn from_vec(handles: Vec<kernel_types::StableRowHandle>) -> Self {
+        Self { handles: PersistentVec::from_vec(handles), head: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.handles.len().saturating_sub(self.head)
+    }
+
+    fn is_empty(&self) -> bool { self.len() == 0 }
+
+    fn iter(&self) -> impl Iterator<Item = &kernel_types::StableRowHandle> {
+        self.handles.iter().skip(self.head)
+    }
+
+    fn push(&mut self, handle: kernel_types::StableRowHandle) {
+        self.handles.push(handle);
+    }
+
+    fn pop_front(&mut self) -> Option<kernel_types::StableRowHandle> {
+        let handle = self.handles.get(self.head).copied()?;
+        self.head += 1;
+        // Geometric compaction bounds retained dead prefixes while preserving
+        // persistent sharing for short mutation runs.
+        if self.head >= 64 && self.head.saturating_mul(2) >= self.handles.len() {
+            self.handles = PersistentVec::from_vec(self.iter().copied().collect());
+            self.head = 0;
+        }
+        Some(handle)
+    }
+}
+
+impl<'a> IntoIterator for &'a OccurrenceBucket {
+    type Item = &'a kernel_types::StableRowHandle;
+    type IntoIter = std::iter::Skip<kernel_persistent::PersistentVecIter<'a, kernel_types::StableRowHandle>>;
+
+    fn into_iter(self) -> Self::IntoIter { self.handles.iter().skip(self.head) }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationDelta {
     pub inserted: Vec<Row>,
     pub removed: Vec<Row>,
     pub result_type: RelType,
+}
+
+/// Exact Γ-occurrence certificate emitted by relational execution together
+/// with its result rows. Fresh output positions are already bound to stable
+/// generation-zero handles, so a physical owner can adopt the persistent
+/// occurrence root without canonicalizing the result again.
+#[derive(Debug, Clone)]
+pub struct RelationOccurrenceCertificate {
+    result_type: RelType,
+    semantic_context: kernel_schema::SemanticContext,
+    occurrences:
+        PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+    row_count: usize,
+}
+
+/// Opaque Γ evidence for one exact semantic row. The canonical key is public
+/// only by reference; construction is sealed behind `RelationRowCanonicalizer`
+/// so downstream storage code cannot forge a key and present it as certified
+/// query evidence.
+#[derive(Debug, Clone)]
+pub struct CertifiedCanonicalRowKey {
+    authority: Arc<RelationCanonicalAuthority>,
+    key: CanonicalRowKey,
+}
+
+#[derive(Debug)]
+struct RelationCanonicalAuthority {
+    result_type: RelType,
+    semantic_context: kernel_schema::SemanticContext,
+    canonicalizers: Vec<kernel_semantics::CompiledEquivalence>,
+}
+
+/// Compiled Γ authority for a single relation result type/context. Reusing one
+/// instance lets an operator both make its semantic decision and emit sealed
+/// row-aligned evidence without canonicalizing the same row again downstream.
+#[derive(Debug, Clone)]
+pub struct RelationRowCanonicalizer {
+    authority: Arc<RelationCanonicalAuthority>,
+}
+
+impl CertifiedCanonicalRowKey {
+    #[must_use]
+    pub fn canonical_key(&self) -> &CanonicalRowKey {
+        &self.key
+    }
+}
+
+impl RelationRowCanonicalizer {
+    pub fn compile(
+        result_type: RelType,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        let canonicalizers = RelationBaseWitness::compile_canonicalizers(
+            &result_type,
+            context,
+            registry,
+        )?;
+        Ok(Self {
+            authority: Arc::new(RelationCanonicalAuthority {
+                result_type,
+                semantic_context: context.clone(),
+                canonicalizers,
+            }),
+        })
+    }
+
+    pub fn certify_row(&self, row: &Row) -> Result<CertifiedCanonicalRowKey, RelQueryError> {
+        if row.len() != self.authority.result_type.columns.len()
+            || !row
+                .iter()
+                .zip(&self.authority.result_type.columns)
+                .all(|(value, ty)| value_shape_matches_type(value, ty))
+        {
+            return Err(RelQueryError::TypeMismatch);
+        }
+        let key = row
+            .iter()
+            .zip(&self.authority.canonicalizers)
+            .map(|(value, equivalence)| equivalence.canonical_key(value).map_err(Into::into))
+            .collect::<Result<Vec<_>, RelQueryError>>()?;
+        Ok(CertifiedCanonicalRowKey {
+            authority: Arc::clone(&self.authority),
+            key,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationScanOccurrenceSeed {
+    relation: kernel_types::SemanticId,
+    result_type: RelType,
+    semantic_context: kernel_schema::SemanticContext,
+    canonical_keys_by_row: CanonicalRowEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CanonicalRowEvidence {
+    Dense(PersistentVec<CanonicalRowKey>),
+    StableOrder(PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>),
+}
+
+impl CanonicalRowEvidence {
+    pub(crate) fn from_dense(values: Vec<CanonicalRowKey>) -> Self {
+        Self::Dense(PersistentVec::from_vec(values))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Dense(values) => values.len(),
+            Self::StableOrder(values) => values.len(),
+        }
+    }
+
+    pub(crate) fn iter(&self) -> Box<dyn Iterator<Item = &CanonicalRowKey> + '_> {
+        match self {
+            Self::Dense(values) => Box::new(values.iter()),
+            Self::StableOrder(values) => Box::new(values.values()),
+        }
+    }
+
+    fn dense_mut(&mut self) -> Result<&mut PersistentVec<CanonicalRowKey>, RelQueryError> {
+        match self {
+            Self::Dense(values) => Ok(values),
+            Self::StableOrder(_) => Err(RelQueryError::StructuralRewriteBaseMismatch),
+        }
+    }
+}
+
+impl RelationScanOccurrenceSeed {
+    #[must_use]
+    pub const fn relation(&self) -> kernel_types::SemanticId {
+        self.relation
+    }
+
+    #[must_use]
+    pub const fn result_type(&self) -> &RelType {
+        &self.result_type
+    }
+
+    #[must_use]
+    pub const fn semantic_context(&self) -> &kernel_schema::SemanticContext {
+        &self.semantic_context
+    }
+
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.canonical_keys_by_row.len()
+    }
+
+    /// Returns true only when this execution seed is a persistent view of the
+    /// exact logical-order evidence owned by `witness`, rather than an
+    /// independently rebuilt row-key vector.
+    #[must_use]
+    pub fn shares_logical_order_root_with(&self, witness: &RelationBaseWitness) -> bool {
+        match &self.canonical_keys_by_row {
+            CanonicalRowEvidence::StableOrder(values) => {
+                values.shares_root_with(&witness.ordered_occurrences)
+            }
+            CanonicalRowEvidence::Dense(_) => false,
+        }
+    }
+
+    pub(crate) fn canonical_keys_by_row(&self) -> CanonicalRowEvidence {
+        self.canonical_keys_by_row.clone()
+    }
+
+    /// Advances row-aligned Γ evidence with the same survivor-order + append
+    /// law used by logical relation delta application. Unchanged rows are never
+    /// re-canonicalized; only delta rows cross Γ again.
+    #[cfg(test)]
+    pub(crate) fn advance_logical_delta(
+        &self,
+        delta: &RelationDelta,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        if delta.result_type != self.result_type || context != &self.semantic_context {
+            return Err(RelQueryError::StructuralRewriteBaseMismatch);
+        }
+        let equivalences = relation_column_equivalences(&self.result_type);
+        let mut removals = BTreeMap::<CanonicalRowKey, usize>::new();
+        for row in &delta.removed {
+            let key = canonical_row_key(row, equivalences, context, registry)?;
+            *removals.entry(key).or_default() += 1;
+        }
+
+        let CanonicalRowEvidence::Dense(current) = &self.canonical_keys_by_row else {
+            return Err(RelQueryError::StructuralRewriteBaseMismatch);
+        };
+        let mut next = Vec::with_capacity(
+            current
+                .len()
+                .saturating_sub(delta.removed.len())
+                .saturating_add(delta.inserted.len()),
+        );
+        for key in current {
+            let remove = removals.get_mut(key).is_some_and(|count| {
+                if *count == 0 {
+                    false
+                } else {
+                    *count -= 1;
+                    true
+                }
+            });
+            if !remove {
+                next.push(key.clone());
+            }
+        }
+        if removals.values().any(|count| *count != 0) {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        for row in &delta.inserted {
+            next.push(canonical_row_key(row, equivalences, context, registry)?);
+        }
+        Ok(Self {
+            relation: self.relation,
+            result_type: self.result_type.clone(),
+            semantic_context: self.semantic_context.clone(),
+            canonical_keys_by_row: CanonicalRowEvidence::from_dense(next),
+        })
+    }
+    pub fn apply_prepared_storage_transition<I>(
+        &mut self,
+        prepared: &PreparedRelationRewrite<I>,
+        removed_positions: &[usize],
+    ) -> Result<(), RelQueryError> {
+        if prepared.relation() != self.relation
+            || removed_positions.len() != prepared.removed_occurrence_keys().len()
+            || prepared.inserted_occurrence_keys().len() != prepared.inserted_occurrence_handles().len()
+        {
+            return Err(RelQueryError::StructuralRewriteBaseMismatch);
+        }
+        for (&position, expected_key) in removed_positions
+            .iter()
+            .zip(prepared.removed_occurrence_keys())
+        {
+            let dense = self.canonical_keys_by_row.dense_mut()?;
+            let actual = dense
+                .get(position)
+                .ok_or(RelQueryError::StructuralRewriteBaseMismatch)?;
+            if actual != expected_key {
+                return Err(RelQueryError::StructuralRewriteBaseMismatch);
+            }
+            dense.swap_remove(position);
+        }
+        for key in prepared.inserted_occurrence_keys() {
+            self.canonical_keys_by_row.dense_mut()?.push(key.clone());
+        }
+        Ok(())
+    }
+
+}
+
+impl RelationOccurrenceCertificate {
+    pub fn from_dense_certified_keys(
+        certified: Vec<CertifiedCanonicalRowKey>,
+    ) -> Result<Self, RelQueryError> {
+        let Some(first) = certified.first() else {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        };
+        let authority = Arc::clone(&first.authority);
+        if certified
+            .iter()
+            .any(|item| !Arc::ptr_eq(&item.authority, &authority))
+        {
+            return Err(RelQueryError::StructuralRewriteBaseMismatch);
+        }
+        let row_count = certified.len();
+        let mut grouped = BTreeMap::<CanonicalRowKey, Vec<kernel_types::StableRowHandle>>::new();
+        for (slot, item) in certified.into_iter().enumerate() {
+            grouped
+                .entry(item.key)
+                .or_default()
+                .push(kernel_types::StableRowHandle {
+                    slot,
+                    generation: 0,
+                });
+        }
+        if matches!(
+            authority.result_type.semantics,
+            kernel_schema::RelationSemantics::Set { .. }
+        ) && grouped.values().any(|handles| handles.len() != 1)
+        {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        Self::from_sorted_occurrences(
+            authority.result_type.clone(),
+            &authority.semantic_context,
+            grouped.into_iter().collect(),
+            row_count,
+        )
+    }
+
+    pub(crate) fn from_dense_set_keys(
+        result_type: RelType,
+        context: &kernel_schema::SemanticContext,
+        canonical_keys_by_row: CanonicalRowEvidence,
+    ) -> Result<Self, RelQueryError> {
+        let row_count = canonical_keys_by_row.len();
+        let strictly_sorted = canonical_keys_by_row
+            .iter()
+            .zip(canonical_keys_by_row.iter().skip(1))
+            .all(|(left, right)| left < right);
+        let mut grouped = canonical_keys_by_row
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(slot, key)| {
+                (
+                    key,
+                    vec![kernel_types::StableRowHandle {
+                        slot,
+                        generation: 0,
+                    }],
+                )
+            })
+            .collect::<Vec<_>>();
+        if !strictly_sorted {
+            grouped.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            if grouped.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            }
+        }
+        Self::from_sorted_occurrences(result_type, context, grouped, row_count)
+    }
+
+    pub(crate) fn from_sorted_occurrences(
+        result_type: RelType,
+        context: &kernel_schema::SemanticContext,
+        grouped: Vec<(CanonicalRowKey, Vec<kernel_types::StableRowHandle>)>,
+        row_count: usize,
+    ) -> Result<Self, RelQueryError> {
+        let occurrences = PersistentOrdMap::from_sorted_unique_owned(
+            grouped
+                .into_iter()
+                .map(|(key, handles)| (key, OccurrenceBucket::from_vec(handles)))
+                .collect(),
+        )
+        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        if occurrences.values().map(OccurrenceBucket::len).sum::<usize>() != row_count {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        Ok(Self {
+            result_type,
+            semantic_context: context.clone(),
+            occurrences,
+            row_count,
+        })
+    }
+
+    #[must_use]
+    pub const fn result_type(&self) -> &RelType {
+        &self.result_type
+    }
+
+    #[must_use]
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    #[must_use]
+    pub fn shares_occurrence_root_with(&self, witness: &RelationBaseWitness) -> bool {
+        self.occurrences.shares_root_with(&witness.occurrences)
+    }
 }
 
 /// One relation Rewrite intent whose derived effect is pinned to an exact
@@ -43,14 +459,88 @@ pub struct RelationBaseWitness {
     relation: kernel_types::SemanticId,
     result_type: RelType,
     semantic_context: kernel_schema::SemanticContext,
-    supports: PersistentOrdMap<CanonicalRowKey, usize>,
+    canonicalizers: Vec<kernel_semantics::CompiledEquivalence>,
+    occurrences:
+        PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+    ordered_occurrences:
+        PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
+    next_occurrence_slot: usize,
     authority: Arc<()>,
 }
 
+/// Structural persistent-node accounting for one relation witness. This is a
+/// kernel diagnostic used by retention/GC hostile tests; it deliberately
+/// counts persistent data-structure nodes rather than attempting allocator
+/// byte accounting for semantic values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelationWitnessStorageStats {
+    pub occurrence_map_nodes: usize,
+    pub ordered_map_nodes: usize,
+    pub bucket_vector_nodes: usize,
+}
+
+impl RelationWitnessStorageStats {
+    #[must_use]
+    pub const fn total_nodes(self) -> usize {
+        self.occurrence_map_nodes
+            .saturating_add(self.ordered_map_nodes)
+            .saturating_add(self.bucket_vector_nodes)
+    }
+}
+
+/// Weak probe for persistent nodes unique to one witness relative to a direct
+/// successor. Holding the probe never prolongs the lifetime of those nodes.
+#[derive(Debug)]
+pub struct RelationWitnessStorageProbe {
+    occurrence_map: PersistentOrdMapStorageProbe<CanonicalRowKey, OccurrenceBucket>,
+    ordered_map:
+        PersistentOrdMapStorageProbe<kernel_types::StableRowHandle, CanonicalRowKey>,
+    bucket_vectors: Vec<PersistentVecStorageProbe<kernel_types::StableRowHandle>>,
+}
+
+impl RelationWitnessStorageProbe {
+    #[must_use]
+    pub fn total_nodes(&self) -> usize {
+        self.occurrence_map
+            .total_nodes()
+            .saturating_add(self.ordered_map.total_nodes())
+            .saturating_add(
+                self.bucket_vectors
+                    .iter()
+                    .map(PersistentVecStorageProbe::total_nodes)
+                    .sum::<usize>(),
+            )
+    }
+
+    #[must_use]
+    pub fn live_nodes(&self) -> usize {
+        self.occurrence_map
+            .live_nodes()
+            .saturating_add(self.ordered_map.live_nodes())
+            .saturating_add(
+                self.bucket_vectors
+                    .iter()
+                    .map(PersistentVecStorageProbe::live_nodes)
+                    .sum::<usize>(),
+            )
+    }
+
+    #[must_use]
+    pub fn is_fully_reclaimed(&self) -> bool {
+        self.live_nodes() == 0
+    }
+}
+
 struct RelationSupportTransition {
-    supports: PersistentOrdMap<CanonicalRowKey, usize>,
+    occurrences:
+        PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+    ordered_occurrences:
+        PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
+    next_occurrence_slot: usize,
     removed_keys: Vec<CanonicalRowKey>,
     inserted_keys: Vec<CanonicalRowKey>,
+    removed_handles: Vec<kernel_types::StableRowHandle>,
+    inserted_handles: Vec<kernel_types::StableRowHandle>,
 }
 
 impl PartialEq for RelationBaseWitness {
@@ -59,13 +549,194 @@ impl PartialEq for RelationBaseWitness {
             && self.relation == other.relation
             && self.result_type == other.result_type
             && self.semantic_context == other.semantic_context
-            && self.supports == other.supports
+            && self.occurrences == other.occurrences
+            && self.ordered_occurrences == other.ordered_occurrences
+            && self.next_occurrence_slot == other.next_occurrence_slot
     }
 }
 
 impl Eq for RelationBaseWitness {}
 
 impl RelationBaseWitness {
+    /// Rebinds this exact semantic relation to a fresh dense generation-zero
+    /// storage-handle domain in the exact physical row order certified by
+    /// `seed`, without canonicalizing any row again.
+    ///
+    /// This is intentionally seed-driven rather than witness-logical-order
+    /// driven: a physical overlay may use swap-remove order while the semantic
+    /// witness preserves survivor-order + append. Compaction must bind the
+    /// semantic classes to the rows it actually materialized.
+    pub fn rebind_dense_storage_identity_from_seed(
+        &self,
+        revision: kernel_types::RevisionId,
+        seed: &RelationScanOccurrenceSeed,
+    ) -> Result<Self, RelQueryError> {
+        if seed.relation != self.relation
+            || seed.result_type != self.result_type
+            || seed.semantic_context != self.semantic_context
+        {
+            return Err(RelQueryError::StructuralRewriteBaseMismatch);
+        }
+        let row_count = seed.row_count();
+        let mut ordered = Vec::with_capacity(row_count);
+        let mut grouped = BTreeMap::<CanonicalRowKey, Vec<kernel_types::StableRowHandle>>::new();
+        for (slot, key) in seed.canonical_keys_by_row.iter().enumerate() {
+            let handle = kernel_types::StableRowHandle {
+                slot,
+                generation: 0,
+            };
+            ordered.push((handle, key.clone()));
+            grouped.entry(key.clone()).or_default().push(handle);
+        }
+        if matches!(self.result_type.semantics, kernel_schema::RelationSemantics::Set { .. })
+            && grouped.values().any(|handles| handles.len() != 1)
+        {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        let ordered_occurrences = PersistentOrdMap::from_sorted_unique_owned(ordered)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let occurrences = PersistentOrdMap::from_sorted_unique_owned(
+            grouped
+                .into_iter()
+                .map(|(key, handles)| (key, OccurrenceBucket::from_vec(handles)))
+                .collect(),
+        )
+        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        Ok(Self {
+            revision,
+            relation: self.relation,
+            result_type: self.result_type.clone(),
+            semantic_context: self.semantic_context.clone(),
+            canonicalizers: self.canonicalizers.clone(),
+            occurrences,
+            ordered_occurrences,
+            next_occurrence_slot: row_count,
+            authority: Arc::new(()),
+        })
+    }
+
+    /// Structural persistent-node footprint reachable from this witness.
+    #[must_use]
+    pub fn storage_stats(&self) -> RelationWitnessStorageStats {
+        RelationWitnessStorageStats {
+            occurrence_map_nodes: self.occurrences.structural_node_count(),
+            ordered_map_nodes: self.ordered_occurrences.structural_node_count(),
+            bucket_vector_nodes: self
+                .occurrences
+                .values()
+                .map(|bucket| bucket.handles.structural_node_count())
+                .sum(),
+        }
+    }
+
+    /// Exact number of persistent nodes newly introduced by this witness
+    /// relative to a direct predecessor. For a lineage produced only by
+    /// persistent path-copy transitions, summing this value across successors
+    /// gives the exact structural-node growth retained by pinning the lineage.
+    #[must_use]
+    pub fn structural_nodes_new_since(&self, predecessor: &Self) -> usize {
+        let occurrence_map_nodes = self
+            .occurrences
+            .structural_node_count()
+            .saturating_sub(
+                self.occurrences
+                    .shared_structural_node_count_with(&predecessor.occurrences),
+            );
+        let ordered_map_nodes = self
+            .ordered_occurrences
+            .structural_node_count()
+            .saturating_sub(
+                self.ordered_occurrences
+                    .shared_structural_node_count_with(&predecessor.ordered_occurrences),
+            );
+        let mut bucket_vector_nodes = 0usize;
+        for (key, bucket) in &self.occurrences {
+            let nodes = bucket.handles.structural_node_count();
+            bucket_vector_nodes = bucket_vector_nodes.saturating_add(
+                predecessor.occurrences.get(key).map_or(nodes, |previous| {
+                    nodes.saturating_sub(
+                        bucket
+                            .handles
+                            .shared_structural_node_count_with(&previous.handles),
+                    )
+                }),
+            );
+        }
+        occurrence_map_nodes
+            .saturating_add(ordered_map_nodes)
+            .saturating_add(bucket_vector_nodes)
+    }
+
+    /// Weak probe for nodes reachable only from this witness when compared to
+    /// a direct successor. Once all older roots are dropped these nodes must be
+    /// reclaimed; the probe itself cannot keep them alive.
+    #[must_use]
+    pub fn unique_storage_probe_against(&self, successor: &Self) -> RelationWitnessStorageProbe {
+        let occurrence_map = self
+            .occurrences
+            .unique_storage_probe_against(&successor.occurrences);
+        let ordered_map = self
+            .ordered_occurrences
+            .unique_storage_probe_against(&successor.ordered_occurrences);
+        let mut bucket_vectors = Vec::new();
+        for (key, bucket) in &self.occurrences {
+            if let Some(next) = successor.occurrences.get(key) {
+                let probe = bucket.handles.unique_storage_probe_against(&next.handles);
+                if probe.total_nodes() != 0 {
+                    bucket_vectors.push(probe);
+                }
+            } else {
+                let empty = PersistentVec::<kernel_types::StableRowHandle>::default();
+                let probe = bucket.handles.unique_storage_probe_against(&empty);
+                if probe.total_nodes() != 0 {
+                    bucket_vectors.push(probe);
+                }
+            }
+        }
+        RelationWitnessStorageProbe {
+            occurrence_map,
+            ordered_map,
+            bucket_vectors,
+        }
+    }
+
+    pub fn from_occurrence_certificate(
+        revision: kernel_types::RevisionId,
+        relation: kernel_types::SemanticId,
+        certificate: RelationOccurrenceCertificate,
+        target_type: RelType,
+        target_context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        if certificate.result_type != target_type {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let source_canonicalizers = Self::compile_canonicalizers(
+            &certificate.result_type,
+            &certificate.semantic_context,
+            registry,
+        )?;
+        let canonicalizers = Self::compile_canonicalizers(&target_type, target_context, registry)?;
+        if source_canonicalizers != canonicalizers {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let ordered_occurrences = Self::ordered_occurrences_from_support(
+            &certificate.occurrences,
+            certificate.row_count,
+        )?;
+        Ok(Self {
+            revision,
+            relation,
+            result_type: target_type,
+            semantic_context: target_context.clone(),
+            canonicalizers,
+            occurrences: certificate.occurrences,
+            ordered_occurrences,
+            next_occurrence_slot: certificate.row_count,
+            authority: Arc::new(()),
+        })
+    }
+
     pub fn build(
         revision: kernel_types::RevisionId,
         relation: kernel_types::SemanticId,
@@ -74,33 +745,196 @@ impl RelationBaseWitness {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, RelQueryError> {
-        MaterializedSetSupportState::validate_rows(rows, &result_type, context, registry)?;
-        let mut supports: PersistentOrdMap<CanonicalRowKey, usize> = PersistentOrdMap::default();
+        let canonicalizers = Self::compile_canonicalizers(&result_type, context, registry)?;
+        let mut keyed_occurrences = Vec::with_capacity(rows.len());
+        for (slot, row) in rows.iter().enumerate() {
+            if row.len() != result_type.columns.len()
+                || !row
+                    .iter()
+                    .zip(&result_type.columns)
+                    .all(|(value, ty)| value_shape_matches_type(value, ty))
+            {
+                return Err(RelQueryError::TypeMismatch);
+            }
+            let key = row
+                .iter()
+                .zip(&canonicalizers)
+                .map(|(value, equivalence)| equivalence.canonical_key(value).map_err(Into::into))
+                .collect::<Result<Vec<_>, RelQueryError>>()?;
+            keyed_occurrences.push((
+                key,
+                kernel_types::StableRowHandle {
+                    slot,
+                    generation: 0,
+                },
+            ));
+        }
+        Self::from_keyed_occurrences(
+            revision,
+            relation,
+            result_type,
+            context,
+            canonicalizers,
+            keyed_occurrences,
+            rows.len(),
+        )
+    }
+
+    pub fn build_columnar(
+        revision: kernel_types::RevisionId,
+        relation: kernel_types::SemanticId,
+        row_count: usize,
+        columns: &[&[Value]],
+        result_type: RelType,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        if columns.len() != result_type.columns.len()
+            || columns.iter().any(|column| column.len() != row_count)
+        {
+            return Err(RelQueryError::TypeMismatch);
+        }
+        let canonicalizers = Self::compile_canonicalizers(&result_type, context, registry)?;
+        let mut keyed_occurrences = Vec::with_capacity(row_count);
+        for slot in 0..row_count {
+            let mut key = Vec::with_capacity(columns.len());
+            for (ordinal, ((column, ty), equivalence)) in columns
+                .iter()
+                .zip(&result_type.columns)
+                .zip(&canonicalizers)
+                .enumerate()
+            {
+                let value = column
+                    .get(slot)
+                    .ok_or(RelQueryError::TypeMismatch)?;
+                let _ = ordinal;
+                if !value_shape_matches_type(value, ty) {
+                    return Err(RelQueryError::TypeMismatch);
+                }
+                key.push(equivalence.canonical_key(value).map_err(RelQueryError::from)?);
+            }
+            keyed_occurrences.push((
+                key,
+                kernel_types::StableRowHandle {
+                    slot,
+                    generation: 0,
+                },
+            ));
+        }
+        Self::from_keyed_occurrences(
+            revision,
+            relation,
+            result_type,
+            context,
+            canonicalizers,
+            keyed_occurrences,
+            row_count,
+        )
+    }
+
+    fn compile_canonicalizers(
+        result_type: &RelType,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Vec<kernel_semantics::CompiledEquivalence>, RelQueryError> {
+        let equivalences = relation_column_equivalences(result_type);
+        if equivalences.len() != result_type.columns.len() {
+            return Err(RelQueryError::TypeMismatch);
+        }
+        for (column_type, equivalence) in result_type.columns.iter().zip(equivalences) {
+            validate_query_equivalence(*equivalence, column_type, context, registry)?;
+        }
+        equivalences
+            .iter()
+            .map(|equivalence| registry.compile_equivalence(context, *equivalence).map_err(Into::into))
+            .collect()
+    }
+
+    fn from_keyed_occurrences(
+        revision: kernel_types::RevisionId,
+        relation: kernel_types::SemanticId,
+        result_type: RelType,
+        context: &kernel_schema::SemanticContext,
+        canonicalizers: Vec<kernel_semantics::CompiledEquivalence>,
+        mut keyed_occurrences: Vec<(CanonicalRowKey, kernel_types::StableRowHandle)>,
+        row_count: usize,
+    ) -> Result<Self, RelQueryError> {
         let set_semantics = matches!(
             result_type.semantics,
             kernel_schema::RelationSemantics::Set { .. }
         );
-        let equivalences = relation_column_equivalences(&result_type);
-        for row in rows {
-            let key = canonical_row_key(row, equivalences, context, registry)?;
-            let before = supports.get(&key).copied().unwrap_or_default();
-            if set_semantics && before != 0 {
-                return Err(RelQueryError::InconsistentIncrementalDelta);
+        let mut ordered = keyed_occurrences
+            .iter()
+            .map(|(key, handle)| (*handle, key.clone()))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(handle, _)| *handle);
+        let ordered_occurrences = PersistentOrdMap::from_sorted_unique_owned(ordered)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+
+        keyed_occurrences.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let mut grouped = Vec::<(CanonicalRowKey, Vec<kernel_types::StableRowHandle>)>::new();
+        for (key, handle) in keyed_occurrences {
+            if let Some((last_key, handles)) = grouped.last_mut()
+                && *last_key == key
+            {
+                if set_semantics {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                }
+                handles.push(handle);
+            } else {
+                grouped.push((key, vec![handle]));
             }
-            supports.insert(
-                key,
-                before
-                    .checked_add(1)
-                    .ok_or(RelQueryError::DerivedIdentityExhausted)?,
-            );
         }
+        let occurrences = PersistentOrdMap::from_sorted_unique_owned(
+            grouped
+                .into_iter()
+                .map(|(key, handles)| (key, OccurrenceBucket::from_vec(handles)))
+                .collect(),
+        )
+        .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
         Ok(Self {
             revision,
             relation,
             result_type,
             semantic_context: context.clone(),
-            supports,
+            canonicalizers,
+            occurrences,
+            ordered_occurrences,
+            next_occurrence_slot: row_count,
             authority: Arc::new(()),
+        })
+    }
+
+    fn ordered_occurrences_from_support(
+        occurrences: &PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+        row_count: usize,
+    ) -> Result<PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>, RelQueryError> {
+        let mut ordered = Vec::with_capacity(row_count);
+        for (key, handles) in occurrences {
+            for handle in handles {
+                ordered.push((*handle, key.clone()));
+            }
+        }
+        if ordered.len() != row_count {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        ordered.sort_unstable_by_key(|(handle, _)| *handle);
+        PersistentOrdMap::from_sorted_unique_owned(ordered)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)
+    }
+
+    /// Returns execution-facing row evidence directly from this witness
+    /// authority. Occurrence buckets remove the oldest live handle, matching
+    /// logical survivor-order for both Set and Bag; stable slots are monotone
+    /// creation ordinals, so ordered live occurrences are survivor-order + append.
+    pub fn logical_scan_occurrence_seed(&self) -> Result<RelationScanOccurrenceSeed, RelQueryError> {
+        Ok(RelationScanOccurrenceSeed {
+            relation: self.relation,
+            result_type: self.result_type.clone(),
+            semantic_context: self.semantic_context.clone(),
+            canonical_keys_by_row: CanonicalRowEvidence::StableOrder(
+                self.ordered_occurrences.clone(),
+            ),
         })
     }
 
@@ -120,6 +954,121 @@ impl RelationBaseWitness {
     }
 
     #[must_use]
+    pub const fn semantic_context(&self) -> &kernel_schema::SemanticContext {
+        &self.semantic_context
+    }
+
+    /// Returns true when two witnesses share the exact persistent Γ-occurrence
+    /// root rather than merely describing extensionally equal support.
+    #[must_use]
+    pub fn shares_occurrence_root_with(&self, other: &Self) -> bool {
+        self.occurrences.shares_root_with(&other.occurrences)
+    }
+
+    pub fn scan_occurrence_seed(
+        &self,
+        handles_by_row: &[kernel_types::StableRowHandle],
+    ) -> Result<RelationScanOccurrenceSeed, RelQueryError> {
+        let live_count = self
+            .occurrences
+            .values()
+            .map(OccurrenceBucket::len)
+            .sum::<usize>();
+        if handles_by_row.len() != live_count {
+            return Err(RelQueryError::StructuralRewriteBaseMismatch);
+        }
+
+        let dense_limit = live_count.saturating_mul(4).saturating_add(1024);
+        let canonical_keys_by_row = if self.next_occurrence_slot <= dense_limit {
+            let mut by_slot = vec![None; self.next_occurrence_slot];
+            for (key, handles) in &self.occurrences {
+                for handle in handles {
+                    let entry = by_slot
+                        .get_mut(handle.slot)
+                        .ok_or(RelQueryError::StructuralRewriteBaseMismatch)?;
+                    if entry.is_some() {
+                        return Err(RelQueryError::StructuralRewriteBaseMismatch);
+                    }
+                    *entry = Some((handle.generation, key.clone()));
+                }
+            }
+            let mut keys = Vec::with_capacity(handles_by_row.len());
+            for handle in handles_by_row {
+                let (generation, key) = by_slot
+                    .get_mut(handle.slot)
+                    .and_then(Option::take)
+                    .ok_or(RelQueryError::StructuralRewriteBaseMismatch)?;
+                if generation != handle.generation {
+                    return Err(RelQueryError::StructuralRewriteBaseMismatch);
+                }
+                keys.push(key);
+            }
+            if by_slot.into_iter().any(|entry| entry.is_some()) {
+                return Err(RelQueryError::StructuralRewriteBaseMismatch);
+            }
+            keys
+        } else {
+            let mut by_handle = BTreeMap::new();
+            for (key, handles) in &self.occurrences {
+                for handle in handles {
+                    if by_handle.insert(*handle, key.clone()).is_some() {
+                        return Err(RelQueryError::StructuralRewriteBaseMismatch);
+                    }
+                }
+            }
+            let mut keys = Vec::with_capacity(handles_by_row.len());
+            for handle in handles_by_row {
+                keys.push(
+                    by_handle
+                        .remove(handle)
+                        .ok_or(RelQueryError::StructuralRewriteBaseMismatch)?,
+                );
+            }
+            if !by_handle.is_empty() {
+                return Err(RelQueryError::StructuralRewriteBaseMismatch);
+            }
+            keys
+        };
+
+        Ok(RelationScanOccurrenceSeed {
+            relation: self.relation,
+            result_type: self.result_type.clone(),
+            semantic_context: self.semantic_context.clone(),
+            canonical_keys_by_row: CanonicalRowEvidence::from_dense(canonical_keys_by_row),
+        })
+    }
+
+    /// Certifies the identity storage-handle domain used by a freshly
+    /// factorized current relation. This check deliberately does not
+    /// canonicalize any row: the Γ root was already built by this witness.
+    #[must_use]
+    pub fn certifies_identity_storage_handles(
+        &self,
+        handles: &[kernel_types::StableRowHandle],
+    ) -> bool {
+        self.next_occurrence_slot == handles.len()
+            && handles.iter().copied().enumerate().all(|(slot, handle)| {
+                handle.slot == slot && handle.generation == 0
+            })
+            && self
+                .occurrences
+                .values()
+                .map(OccurrenceBucket::len)
+                .sum::<usize>()
+                == handles.len()
+    }
+
+    fn canonical_key(&self, row: &Row) -> Result<CanonicalRowKey, RelQueryError> {
+        if row.len() != self.canonicalizers.len() {
+            return Err(RelQueryError::EquivalenceArityMismatch);
+        }
+        row.iter()
+            .zip(&self.canonicalizers)
+            .map(|(value, equivalence)| equivalence.canonical_key(value).map_err(Into::into))
+            .collect()
+    }
+
+    #[must_use]
     pub fn certifies_same_base(&self, other: &Self) -> bool {
         if self.relation != other.relation
             || self.result_type != other.result_type
@@ -133,56 +1082,100 @@ impl RelationBaseWitness {
         if self.revision != kernel_types::RevisionId::new(0) {
             return false;
         }
-        self.supports == other.supports
+        self.occurrences == other.occurrences
+            && self.next_occurrence_slot == other.next_occurrence_slot
     }
 
     fn apply_delta_supports(
         &self,
         delta: &RelationDelta,
-        registry: &kernel_semantics::SemanticRegistry,
+        _registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<RelationSupportTransition, RelQueryError> {
         if delta.result_type != self.result_type {
             return Err(RelQueryError::TypeMismatch);
         }
-        let equivalences = relation_column_equivalences(&self.result_type);
+        let removed_keys = delta
+            .removed
+            .iter()
+            .map(|row| self.canonical_key(row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let inserted_keys = delta
+            .inserted
+            .iter()
+            .map(|row| self.canonical_key(row))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.apply_delta_support_keys(delta, &removed_keys, &inserted_keys)
+    }
+
+    fn apply_delta_support_keys(
+        &self,
+        delta: &RelationDelta,
+        removed_keys: &[CanonicalRowKey],
+        inserted_keys: &[CanonicalRowKey],
+    ) -> Result<RelationSupportTransition, RelQueryError> {
+        if delta.result_type != self.result_type
+            || removed_keys.len() != delta.removed.len()
+            || inserted_keys.len() != delta.inserted.len()
+        {
+            return Err(RelQueryError::TypeMismatch);
+        }
         let set_semantics = matches!(
             self.result_type.semantics,
             kernel_schema::RelationSemantics::Set { .. }
         );
-        let mut supports = self.supports.clone();
-        let mut removed_keys = Vec::with_capacity(delta.removed.len());
-        for row in &delta.removed {
-            let key = canonical_row_key(row, equivalences, &self.semantic_context, registry)?;
-            let before = supports.get(&key).copied().unwrap_or_default();
-            if before == 0 {
-                return Err(RelQueryError::InconsistentIncrementalDelta);
-            }
-            if before == 1 {
-                supports.remove(&key);
+        let mut occurrences = self.occurrences.clone();
+        let mut ordered_occurrences = self.ordered_occurrences.clone();
+        let mut next_occurrence_slot = self.next_occurrence_slot;
+        let mut removed_handles = Vec::with_capacity(delta.removed.len());
+        for key in removed_keys {
+            let mut bucket = occurrences
+                .get(key)
+                .cloned()
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let handle = bucket
+                .pop_front()
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            if bucket.is_empty() {
+                occurrences.remove(key);
             } else {
-                supports.insert(key.clone(), before - 1);
+                occurrences.insert(key.clone(), bucket);
             }
-            removed_keys.push(key);
-        }
-        let mut inserted_keys = Vec::with_capacity(delta.inserted.len());
-        for row in &delta.inserted {
-            let key = canonical_row_key(row, equivalences, &self.semantic_context, registry)?;
-            let before = supports.get(&key).copied().unwrap_or_default();
-            if set_semantics && before != 0 {
+            let removed_key = ordered_occurrences
+                .remove(&handle)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            if removed_key != *key {
                 return Err(RelQueryError::InconsistentIncrementalDelta);
             }
-            supports.insert(
-                key.clone(),
-                before
-                    .checked_add(1)
-                    .ok_or(RelQueryError::DerivedIdentityExhausted)?,
-            );
-            inserted_keys.push(key);
+            removed_handles.push(handle);
+        }
+        let mut inserted_handles = Vec::with_capacity(delta.inserted.len());
+        for key in inserted_keys {
+            let mut bucket = occurrences.get(key).cloned().unwrap_or_else(|| OccurrenceBucket::from_vec(Vec::new()));
+            if set_semantics && !bucket.is_empty() {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            }
+            let handle = kernel_types::StableRowHandle {
+                slot: next_occurrence_slot,
+                generation: 0,
+            };
+            next_occurrence_slot = next_occurrence_slot
+                .checked_add(1)
+                .ok_or(RelQueryError::DerivedIdentityExhausted)?;
+            bucket.push(handle);
+            occurrences.insert(key.clone(), bucket);
+            if ordered_occurrences.insert(handle, key.clone()).is_some() {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            }
+            inserted_handles.push(handle);
         }
         Ok(RelationSupportTransition {
-            supports,
-            removed_keys,
-            inserted_keys,
+            occurrences,
+            ordered_occurrences,
+            next_occurrence_slot,
+            removed_keys: removed_keys.to_vec(),
+            inserted_keys: inserted_keys.to_vec(),
+            removed_handles,
+            inserted_handles,
         })
     }
 
@@ -198,13 +1191,74 @@ impl RelationBaseWitness {
             relation: self.relation,
             result_type: self.result_type.clone(),
             semantic_context: self.semantic_context.clone(),
-            supports: transition.supports,
+            canonicalizers: self.canonicalizers.clone(),
+            occurrences: transition.occurrences,
+            ordered_occurrences: transition.ordered_occurrences,
+            next_occurrence_slot: transition.next_occurrence_slot,
             authority: Arc::new(()),
         })
+    }
+
+    pub fn advance_storage_resolved(
+        &self,
+        target_revision: kernel_types::RevisionId,
+        resolved: &StorageResolvedRelationDelta,
+    ) -> Result<Self, RelQueryError> {
+        if resolved.relation != self.relation || &resolved.semantic_context != &self.semantic_context {
+            return Err(RelQueryError::StructuralRewriteBaseMismatch);
+        }
+        let transition = self.apply_delta_support_keys(
+            &resolved.delta,
+            &resolved.removed_keys,
+            &resolved.inserted_keys,
+        )?;
+        Ok(Self {
+            revision: target_revision,
+            relation: self.relation,
+            result_type: self.result_type.clone(),
+            semantic_context: self.semantic_context.clone(),
+            canonicalizers: self.canonicalizers.clone(),
+            occurrences: transition.occurrences,
+            ordered_occurrences: transition.ordered_occurrences,
+            next_occurrence_slot: transition.next_occurrence_slot,
+            authority: Arc::new(()),
+        })
+    }
+
+    pub(crate) fn advance_with_expected_handles(
+        &self,
+        target_revision: kernel_types::RevisionId,
+        delta: &RelationDelta,
+        removed_handles: &[kernel_types::StableRowHandle],
+        inserted_handles: &[kernel_types::StableRowHandle],
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Option<Self>, RelQueryError> {
+        let transition = self.apply_delta_supports(delta, registry)?;
+        if transition.removed_handles != removed_handles
+            || transition.inserted_handles != inserted_handles
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            revision: target_revision,
+            relation: self.relation,
+            result_type: self.result_type.clone(),
+            semantic_context: self.semantic_context.clone(),
+            canonicalizers: self.canonicalizers.clone(),
+            occurrences: transition.occurrences,
+            ordered_occurrences: transition.ordered_occurrences,
+            next_occurrence_slot: transition.next_occurrence_slot,
+            authority: Arc::new(()),
+        }))
     }
 }
 
 impl<I> PreparedRelationRewrite<I> {
+    #[must_use]
+    pub fn relation(&self) -> kernel_types::SemanticId {
+        self.rewrite.effect().base.relation()
+    }
+
     #[must_use]
     pub const fn rewrite(
         &self,
@@ -222,6 +1276,39 @@ impl<I> PreparedRelationRewrite<I> {
         self.rewrite.effect().delta()
     }
 
+    #[must_use]
+    pub fn base_witness(&self) -> &RelationBaseWitness {
+        &self.rewrite.effect().base
+    }
+
+    #[must_use]
+    pub fn removed_occurrence_handles(&self) -> &[kernel_types::StableRowHandle] {
+        &self.rewrite.effect().removed_handles
+    }
+
+    #[must_use]
+    pub fn inserted_occurrence_handles(&self) -> &[kernel_types::StableRowHandle] {
+        &self.rewrite.effect().inserted_handles
+    }
+
+    #[must_use]
+    pub fn removed_occurrence_keys(&self) -> &[CanonicalRowKey] {
+        &self.rewrite.effect().removed_keys
+    }
+
+    #[must_use]
+    pub fn inserted_occurrence_keys(&self) -> &[CanonicalRowKey] {
+        &self.rewrite.effect().inserted_keys
+    }
+
+    #[must_use]
+    pub fn advanced_base_witness(
+        &self,
+        target_revision: kernel_types::RevisionId,
+    ) -> RelationBaseWitness {
+        self.rewrite.effect().advanced_base_witness(target_revision)
+    }
+
     pub fn apply_structural(
         &self,
         old: &RelationValue,
@@ -235,8 +1322,15 @@ impl<I> PreparedRelationRewrite<I> {
 pub struct RelationStructuralEffect {
     delta: RelationDelta,
     base: RelationBaseWitness,
+    next_occurrences:
+        PersistentOrdMap<CanonicalRowKey, OccurrenceBucket>,
+    next_ordered_occurrences:
+        PersistentOrdMap<kernel_types::StableRowHandle, CanonicalRowKey>,
+    next_occurrence_slot: usize,
     removed_keys: Vec<CanonicalRowKey>,
     inserted_keys: Vec<CanonicalRowKey>,
+    removed_handles: Vec<kernel_types::StableRowHandle>,
+    inserted_handles: Vec<kernel_types::StableRowHandle>,
 }
 
 impl RelationStructuralEffect {
@@ -274,8 +1368,13 @@ impl RelationStructuralEffect {
         Ok(Self {
             delta: delta.clone(),
             base: base.clone(),
+            next_occurrences: transition.occurrences,
+            next_ordered_occurrences: transition.ordered_occurrences,
+            next_occurrence_slot: transition.next_occurrence_slot,
             removed_keys: transition.removed_keys,
             inserted_keys: transition.inserted_keys,
+            removed_handles: transition.removed_handles,
+            inserted_handles: transition.inserted_handles,
         })
     }
 
@@ -289,16 +1388,40 @@ impl RelationStructuralEffect {
         self.base.certifies_same_base(base)
     }
 
+    #[must_use]
+    fn advanced_base_witness(
+        &self,
+        target_revision: kernel_types::RevisionId,
+    ) -> RelationBaseWitness {
+        RelationBaseWitness {
+            revision: target_revision,
+            relation: self.base.relation,
+            result_type: self.base.result_type.clone(),
+            semantic_context: self.base.semantic_context.clone(),
+            canonicalizers: self.base.canonicalizers.clone(),
+            occurrences: self.next_occurrences.clone(),
+            ordered_occurrences: self.next_ordered_occurrences.clone(),
+            next_occurrence_slot: self.next_occurrence_slot,
+            authority: Arc::new(()),
+        }
+    }
+
     fn rewrite_footprint(&self, relation: kernel_types::SemanticId) -> RewriteFootprint {
         let mut footprint = RewriteFootprint::default();
-        for key in self.removed_keys.iter().chain(&self.inserted_keys) {
-            footprint.writes.insert(
-                SemanticWriteCoordinate::RelationClass {
-                    relation,
-                    canonical_key: kernel_semantics::encode_canonical_eq_key_tuple(key)
-                        .into_boxed_slice(),
-                },
-                RewriteActionLaw::Opaque,
+        for key in &self.removed_keys {
+            record_relation_class_action(
+                &mut footprint,
+                relation,
+                key,
+                relation_class_action(&self.base.result_type.semantics, false),
+            );
+        }
+        for key in &self.inserted_keys {
+            record_relation_class_action(
+                &mut footprint,
+                relation,
+                key,
+                relation_class_action(&self.base.result_type.semantics, true),
             );
         }
         footprint
@@ -336,22 +1459,45 @@ pub struct StorageResolvedRelationDelta {
     delta: RelationDelta,
     removed_handles: Vec<kernel_types::StableRowHandle>,
     inserted_handles: Vec<kernel_types::StableRowHandle>,
+    semantic_context: kernel_schema::SemanticContext,
+    removed_keys: Vec<CanonicalRowKey>,
+    inserted_keys: Vec<CanonicalRowKey>,
 }
 
 impl StorageResolvedRelationDelta {
-    #[must_use]
     pub fn from_parts(
         relation: kernel_types::SemanticId,
         delta: RelationDelta,
         removed_handles: Vec<kernel_types::StableRowHandle>,
         inserted_handles: Vec<kernel_types::StableRowHandle>,
-    ) -> Self {
-        Self {
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        if removed_handles.len() != delta.removed.len()
+            || inserted_handles.len() != delta.inserted.len()
+        {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        let equivalences = relation_column_equivalences(&delta.result_type);
+        let removed_keys = delta
+            .removed
+            .iter()
+            .map(|row| canonical_row_key(row, equivalences, context, registry))
+            .collect::<Result<Vec<_>, _>>()?;
+        let inserted_keys = delta
+            .inserted
+            .iter()
+            .map(|row| canonical_row_key(row, equivalences, context, registry))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
             relation,
             delta,
             removed_handles,
             inserted_handles,
-        }
+            semantic_context: context.clone(),
+            removed_keys,
+            inserted_keys,
+        })
     }
 
     #[must_use]
@@ -370,6 +1516,15 @@ impl StorageResolvedRelationDelta {
 
     pub(super) fn inserted_handles(&self) -> &[kernel_types::StableRowHandle] {
         &self.inserted_handles
+    }
+
+    pub(super) fn inserted_keys(&self) -> &[CanonicalRowKey] {
+        &self.inserted_keys
+    }
+
+    #[must_use]
+    pub fn semantic_context(&self) -> &kernel_schema::SemanticContext {
+        &self.semantic_context
     }
 }
 
@@ -419,6 +1574,7 @@ pub(super) enum MaintainedScanCommitPatch {
 pub(super) struct StorageResolvedScanPatch {
     pub(super) removed_handles: Vec<kernel_types::StableRowHandle>,
     pub(super) inserted: Vec<(kernel_types::StableRowHandle, CanonicalRowKey, Row)>,
+    pub(super) next_base_witness: Option<RelationBaseWitness>,
 }
 
 pub(super) fn plan_relation_mutation(
@@ -498,6 +1654,48 @@ pub(super) fn commit_relation_mutation(
     }
 }
 
+fn relation_class_action(
+    semantics: &kernel_schema::RelationSemantics,
+    present: bool,
+) -> RewriteActionLaw {
+    match semantics {
+        kernel_schema::RelationSemantics::Set { .. } => {
+            if present {
+                RewriteActionLaw::EnsurePresent
+            } else {
+                RewriteActionLaw::EnsureAbsent
+            }
+        }
+        // Bag classes carry exact multiplicity, not boolean presence. Until the rewrite law
+        // records the signed multiplicity delta/algebra, overlapping bag-class writes require
+        // generic coordination rather than being weakened into set semantics.
+        kernel_schema::RelationSemantics::Bag { .. } => RewriteActionLaw::Opaque,
+    }
+}
+
+fn record_relation_class_action(
+    footprint: &mut RewriteFootprint,
+    relation: kernel_types::SemanticId,
+    key: &CanonicalRowKey,
+    action: RewriteActionLaw,
+) {
+    use std::collections::btree_map::Entry;
+
+    let coordinate = SemanticWriteCoordinate::RelationClass {
+        relation,
+        canonical_key: kernel_semantics::encode_canonical_eq_key_tuple(key).into_boxed_slice(),
+    };
+    match footprint.writes.entry(coordinate) {
+        Entry::Vacant(entry) => {
+            entry.insert(action);
+        }
+        Entry::Occupied(mut entry) if entry.get() != &action => {
+            entry.insert(RewriteActionLaw::Opaque);
+        }
+        Entry::Occupied(_) => {}
+    }
+}
+
 impl RelationDelta {
     #[must_use]
     pub fn as_delta_view(&self) -> RelationDeltaView<'_> {
@@ -525,15 +1723,22 @@ impl RelationDelta {
     ) -> Result<RewriteFootprint, RelQueryError> {
         let equivalences = relation_column_equivalences(&self.result_type);
         let mut footprint = RewriteFootprint::default();
-        for row in self.removed.iter().chain(&self.inserted) {
+        for row in &self.removed {
             let key = canonical_row_key(row, equivalences, context, registry)?;
-            footprint.writes.insert(
-                SemanticWriteCoordinate::RelationClass {
-                    relation,
-                    canonical_key: kernel_semantics::encode_canonical_eq_key_tuple(&key)
-                        .into_boxed_slice(),
-                },
-                RewriteActionLaw::Opaque,
+            record_relation_class_action(
+                &mut footprint,
+                relation,
+                &key,
+                relation_class_action(&self.result_type.semantics, false),
+            );
+        }
+        for row in &self.inserted {
+            let key = canonical_row_key(row, equivalences, context, registry)?;
+            record_relation_class_action(
+                &mut footprint,
+                relation,
+                &key,
+                relation_class_action(&self.result_type.semantics, true),
             );
         }
         Ok(footprint)
@@ -546,6 +1751,73 @@ impl RelationDelta {
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<RelationValue, RelQueryError> {
         apply_relation_delta_to_value(old, self, context, registry)
+    }
+
+    /// Residualizes this exact relation effect against a newer relation value.
+    ///
+    /// Set deltas denote presence intents (`EnsurePresent` / `EnsureAbsent`) in
+    /// the rewrite-law layer.  When a stale transition has already been
+    /// certified coordination-free, an intervening equal presence intent may
+    /// therefore have satisfied part of the original effect.  This method
+    /// removes exactly those already-satisfied set actions using the pinned Γ
+    /// canonical classes.  Bag deltas retain their exact multiplicity delta;
+    /// overlapping bag writes are not classified as coordination-free by the
+    /// rewrite-law engine.
+    pub fn residualize_against(
+        &self,
+        current: &RelationValue,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        if !matches!(self.result_type.semantics, kernel_schema::RelationSemantics::Set { .. }) {
+            return Ok(self.clone());
+        }
+
+        let equivalences = relation_column_equivalences(&self.result_type);
+        let mut current_by_key = BTreeMap::<CanonicalRowKey, Row>::new();
+        for row in current.rows() {
+            let key = canonical_row_key(row, equivalences, context, registry)?;
+            if current_by_key.insert(key, row.clone()).is_some() {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            }
+        }
+
+        let removed_keys = self
+            .removed
+            .iter()
+            .map(|row| canonical_row_key(row, equivalences, context, registry))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let inserted_keys = self
+            .inserted
+            .iter()
+            .map(|row| canonical_row_key(row, equivalences, context, registry))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if !removed_keys.is_disjoint(&inserted_keys) {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+
+        let mut removed = Vec::new();
+        for row in &self.removed {
+            let key = canonical_row_key(row, equivalences, context, registry)?;
+            if let Some(existing) = current_by_key.remove(&key) {
+                removed.push(existing);
+            }
+        }
+
+        let mut inserted = Vec::new();
+        for row in &self.inserted {
+            let key = canonical_row_key(row, equivalences, context, registry)?;
+            if !current_by_key.contains_key(&key) {
+                current_by_key.insert(key, row.clone());
+                inserted.push(row.clone());
+            }
+        }
+
+        Ok(Self {
+            inserted,
+            removed,
+            result_type: self.result_type.clone(),
+        })
     }
 
     pub fn between_values(
@@ -1066,7 +2338,7 @@ pub(super) fn apply_relation_delta_to_value(
 fn apply_prepared_relation_effect(
     old: &RelationValue,
     effect: &RelationStructuralEffect,
-    registry: &kernel_semantics::SemanticRegistry,
+    _registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<RelationValue, RelQueryError> {
     let expected_set = matches!(
         effect.delta.result_type.semantics,
@@ -1076,18 +2348,19 @@ fn apply_prepared_relation_effect(
         return Err(RelQueryError::StructuralRewriteBaseMismatch);
     }
 
-    let equivalences = relation_column_equivalences(&effect.delta.result_type);
     let mut support_counts = BTreeMap::<CanonicalRowKey, usize>::new();
     let mut row_keys = Vec::with_capacity(old.rows().len());
     for row in old.rows() {
-        let key = canonical_row_key(row, equivalences, &effect.base.semantic_context, registry)?;
+        let key = effect.base.canonical_key(row)?;
         *support_counts.entry(key.clone()).or_default() += 1;
         row_keys.push(key);
     }
-    if support_counts.len() != effect.base.supports.len()
+    if support_counts.len() != effect.base.occurrences.len()
         || !support_counts
             .iter()
-            .all(|(key, count)| effect.base.supports.get(key) == Some(count))
+            .all(|(key, count)| {
+                effect.base.occurrences.get(key).map(OccurrenceBucket::len) == Some(*count)
+            })
     {
         return Err(RelQueryError::StructuralRewriteBaseMismatch);
     }

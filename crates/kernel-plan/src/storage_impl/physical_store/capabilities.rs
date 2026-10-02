@@ -42,7 +42,6 @@ impl PhysicalStore {
         self.i64_index(index).map(I64IndexCapability::new)
     }
 
-
     pub(super) fn semantic_fiber_capability(
         &self,
         binding: &SemanticIndexBinding,
@@ -114,7 +113,6 @@ impl PhysicalStore {
                     && matches!(state.compatible_with(context, registry), Ok(true))
             }))
     }
-
 
     pub(super) fn semantic_quotient_support(
         &self,
@@ -213,12 +211,8 @@ impl PhysicalStore {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<usize, PhysicalExecutionError> {
-        let (created, _) = self.materialize_semantic_quotient_artifacts(
-            bindings,
-            None,
-            context,
-            registry,
-        )?;
+        let (created, _) =
+            self.materialize_semantic_quotient_artifacts(bindings, None, context, registry)?;
         Ok(created)
     }
 
@@ -283,13 +277,9 @@ impl PhysicalStore {
                     .semantic_quotient_factors
                     .insert(factor_binding.clone(), Arc::clone(state));
             }
-            let state = build_semantic_quotient_support_state(
-                binding.clone(),
-                &staged,
-                context,
-                registry,
-            )?
-            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let state =
+                build_semantic_quotient_support_state(binding.clone(), &staged, context, registry)?
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
             let changed = self
                 .semantic_quotient_supports
                 .get(&binding)
@@ -341,6 +331,14 @@ impl PhysicalStore {
                 relation,
                 layout: binding.id,
             })
+    }
+
+    pub(crate) fn native_relation_at(
+        &self,
+        relation: SemanticId,
+        binding: LayoutBinding,
+    ) -> Result<&NativeRelation, PhysicalExecutionError> {
+        Ok(&self.installed(relation, binding)?.data)
     }
 }
 

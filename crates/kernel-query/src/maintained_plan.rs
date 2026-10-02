@@ -11,7 +11,7 @@ use crate::{
     blocker::{
         BlockerBuildSpec, BlockerDeltaPatch, MaintainedBlockerKind, MaterializedBlockerDeltaState,
     },
-    delta_abi::{CompiledDeltaEdgeIdentity, ExactDeltaView, ValidatedTransitionFrame},
+    delta_abi::{CompiledDeltaEdgeIdentity, ExactDeltaSink, ExactDeltaView, ValidatedTransitionFrame},
     delta_kernels::{rel_delta_filter, rel_delta_filter_columns, rel_delta_filter_order_const},
     delta_materialization::{
         maintained_delta_from_relation_delta, materialize_exact_delta_view,
@@ -27,14 +27,18 @@ use crate::{
         project_bag_delta_view, project_delta_view,
     },
     projection::project_rows,
-    quotient::{CanonicalRowPositionIndex, canonical_row_key, canonical_row_position_index},
+    quotient::{
+        CanonicalRowPositionIndex, canonical_row_position_index,
+        canonical_row_position_index_from_keys,
+    },
     rel_model::{
         RelExpr, RelQueryError, RelType, RelationValue, Row, relation_column_equivalences,
         relation_value_from_rows,
     },
     relation_oracles::relation_values_semantically_equivalent,
     relation_state::{
-        MaintainedScanCommitPatch, MaterializedSetSupportState, RelationDelta, SetSupportPatch,
+        MaintainedScanCommitPatch, MaterializedSetSupportState, RelationDelta,
+        RelationScanOccurrenceSeed, SetSupportPatch,
         StorageResolvedRelationDelta, StorageResolvedScanPatch, commit_relation_mutation,
         plan_relation_mutation,
     },
@@ -48,6 +52,7 @@ enum MaintainedRelPlanNode {
         relation: kernel_types::SemanticId,
         value: PersistentVec<Row>,
         handles: Option<MaintainedLeafHandles>,
+        base_witness: Option<crate::RelationBaseWitness>,
         canonical_lookup: CanonicalRowPositionIndex,
     },
     Filter {
@@ -84,6 +89,15 @@ enum MaintainedRelPlanNode {
     },
     PromoteToBag {
         input: Box<MaterializedRelPlanState>,
+    },
+    UnionBag {
+        left: Box<MaterializedRelPlanState>,
+        right: Box<MaterializedRelPlanState>,
+    },
+    UnionSet {
+        left: Box<MaterializedRelPlanState>,
+        right: Box<MaterializedRelPlanState>,
+        supports: MaterializedSetSupportState,
     },
     Blocker {
         left: Box<MaterializedRelPlanState>,
@@ -122,6 +136,7 @@ enum FlatMaintainedRelPlanNodeKind {
         relation: kernel_types::SemanticId,
         value: PersistentVec<Row>,
         handles: Option<MaintainedLeafHandles>,
+        base_witness: Option<crate::RelationBaseWitness>,
         canonical_lookup: CanonicalRowPositionIndex,
     },
     Filter {
@@ -159,6 +174,15 @@ enum FlatMaintainedRelPlanNodeKind {
     PromoteToBag {
         input: NodeId,
     },
+    UnionBag {
+        left: NodeId,
+        right: NodeId,
+    },
+    UnionSet {
+        left: NodeId,
+        right: NodeId,
+        supports: MaterializedSetSupportState,
+    },
     Blocker {
         left: NodeId,
         right: NodeId,
@@ -186,6 +210,15 @@ enum MaintainedRelPlanPatch {
     Unary(Box<MaintainedRelPlanPatch>),
     SetUnary {
         input: Box<MaintainedRelPlanPatch>,
+        patch: SetSupportPatch,
+    },
+    Binary {
+        left: Box<MaintainedRelPlanPatch>,
+        right: Box<MaintainedRelPlanPatch>,
+    },
+    SetBinary {
+        left: Box<MaintainedRelPlanPatch>,
+        right: Box<MaintainedRelPlanPatch>,
         patch: SetSupportPatch,
     },
     Blocker {
@@ -399,6 +432,13 @@ impl MaintainedLeafHandles {
     }
 }
 
+fn combine_maintained_deltas(left: &MaintainedDelta, right: &MaintainedDelta) -> MaintainedDelta {
+    let mut combined = MaintainedDelta::with_capacity(left.support_len() + right.support_len());
+    left.visit_exact(|weight, row| combined.push_exact(weight.clone(), row.clone()));
+    right.visit_exact(|weight, row| combined.push_exact(weight.clone(), row.clone()));
+    combined
+}
+
 fn collect_flat_maintained_state_requirements(
     arena: &[Arc<FlatMaintainedRelPlanNode>],
     out: &mut BTreeSet<RelDifferentialStateRequirement>,
@@ -410,9 +450,11 @@ fn collect_flat_maintained_state_requirements(
             | FlatMaintainedRelPlanNodeKind::FilterOrder { .. }
             | FlatMaintainedRelPlanNodeKind::FilterColumns { .. }
             | FlatMaintainedRelPlanNodeKind::ProjectBag { .. }
-            | FlatMaintainedRelPlanNodeKind::PromoteToBag { .. } => {}
+            | FlatMaintainedRelPlanNodeKind::PromoteToBag { .. }
+            | FlatMaintainedRelPlanNodeKind::UnionBag { .. } => {}
             FlatMaintainedRelPlanNodeKind::ProjectSet { .. }
-            | FlatMaintainedRelPlanNodeKind::Distinct { .. } => {
+            | FlatMaintainedRelPlanNodeKind::Distinct { .. }
+            | FlatMaintainedRelPlanNodeKind::UnionSet { .. } => {
                 out.insert(RelDifferentialStateRequirement::SetSupport);
             }
             FlatMaintainedRelPlanNodeKind::Blocker { .. } => {
@@ -489,14 +531,41 @@ impl MaterializedRelPlanState {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, RelQueryError> {
+        Self::build_inner(query, old, context, registry, None)
+    }
+
+    pub fn build_with_scan_seeds(
+        query: &RelExpr,
+        old: &kernel_model::FiniteModel,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+        scan_seeds: &BTreeMap<kernel_types::SemanticId, RelationScanOccurrenceSeed>,
+    ) -> Result<Self, RelQueryError> {
+        Self::build_inner(query, old, context, registry, Some(scan_seeds))
+    }
+
+    fn build_inner(
+        query: &RelExpr,
+        old: &kernel_model::FiniteModel,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+        scan_seeds: Option<&BTreeMap<kernel_types::SemanticId, RelationScanOccurrenceSeed>>,
+    ) -> Result<Self, RelQueryError> {
         let differential = Arc::new(RelDifferentialProgram::compile(query, context, registry)?);
         let graph = differential.physical_program().execution_graph();
         if !graph.has_typed_metadata() {
             return Err(RelQueryError::InconsistentIncrementalDelta);
         }
         let mut arena = Vec::with_capacity(graph.node_count());
-        let built =
-            Self::build_flat_subtree(query, old, context, registry, &differential, &mut arena)?;
+        let built = Self::build_flat_subtree(
+            query,
+            old,
+            context,
+            registry,
+            &differential,
+            scan_seeds,
+            &mut arena,
+        )?;
         if built.id != graph.root() || arena.len() != graph.node_count() {
             return Err(RelQueryError::InconsistentIncrementalDelta);
         }
@@ -538,6 +607,7 @@ impl MaterializedRelPlanState {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
         differential: &Arc<RelDifferentialProgram>,
+        scan_seeds: Option<&BTreeMap<kernel_types::SemanticId, RelationScanOccurrenceSeed>>,
         out: &mut Vec<Arc<FlatMaintainedRelPlanNode>>,
     ) -> Result<BuiltFlatMaintainedSubtree, RelQueryError> {
         let graph = differential.physical_program().execution_graph();
@@ -548,20 +618,33 @@ impl MaterializedRelPlanState {
                     .result_type(id)
                     .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
                 let value = relation_value_from_rows(
-                    old.relations.get(relation).cloned().unwrap_or_default(),
+                    old.relations.materialize_owned(relation).unwrap_or_default(),
                     result_type,
                 );
-                let canonical_lookup = canonical_row_position_index(
-                    value.rows(),
-                    relation_column_equivalences(result_type),
-                    context,
-                    registry,
-                )?;
+                let canonical_lookup = if let Some(seed) = scan_seeds.and_then(|seeds| seeds.get(relation)) {
+                    if seed.relation() != *relation
+                        || seed.result_type() != result_type
+                        || seed.semantic_context() != context
+                        || seed.row_count() != value.rows().len()
+                    {
+                        return Err(RelQueryError::StructuralRewriteBaseMismatch);
+                    }
+                    let evidence = seed.canonical_keys_by_row();
+                    canonical_row_position_index_from_keys(evidence.iter())
+                } else {
+                    canonical_row_position_index(
+                        value.rows(),
+                        relation_column_equivalences(result_type),
+                        context,
+                        registry,
+                    )?
+                };
                 (
                     FlatMaintainedRelPlanNodeKind::Scan {
                         relation: *relation,
                         value: value.rows().to_vec().into(),
                         handles: None,
+                        base_witness: None,
                         canonical_lookup,
                     },
                     value,
@@ -574,7 +657,7 @@ impl MaterializedRelPlanState {
                 equivalence,
             } => {
                 let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
                 let input_type = graph
                     .result_type(input.id)
                     .cloned()
@@ -613,7 +696,7 @@ impl MaterializedRelPlanState {
                 comparison,
             } => {
                 let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
                 let input_type = graph
                     .result_type(input.id)
                     .cloned()
@@ -653,7 +736,7 @@ impl MaterializedRelPlanState {
                 equivalence,
             } => {
                 let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
                 let input_type = graph
                     .result_type(input.id)
                     .cloned()
@@ -686,7 +769,7 @@ impl MaterializedRelPlanState {
             }
             RelExpr::Project { input, columns } => {
                 let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
                 let rows = project_rows(input.output.into_rows(), columns)?;
                 let id = out.len();
                 let result_type = graph
@@ -722,11 +805,55 @@ impl MaterializedRelPlanState {
                     )
                 }
             }
+            RelExpr::Union { left, right } => {
+                let left =
+                    Self::build_flat_subtree(left, old, context, registry, differential, scan_seeds, out)?;
+                let right =
+                    Self::build_flat_subtree(right, old, context, registry, differential, scan_seeds, out)?;
+                let id = out.len();
+                let result_type = graph
+                    .result_type(id)
+                    .cloned()
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                if matches!(
+                    result_type.semantics,
+                    kernel_schema::RelationSemantics::Set { .. }
+                ) {
+                    let mut rows = left.output.into_rows();
+                    rows.extend(right.output.into_rows());
+                    let supports = MaterializedSetSupportState::build(
+                        &rows,
+                        result_type,
+                        context,
+                        registry,
+                    )?;
+                    let output = supports.output_value();
+                    (
+                        FlatMaintainedRelPlanNodeKind::UnionSet {
+                            left: left.id,
+                            right: right.id,
+                            supports,
+                        },
+                        output,
+                    )
+                } else {
+                    let mut rows = left.output.into_rows();
+                    rows.extend(right.output.into_rows());
+                    let output = relation_value_from_rows(rows, &result_type);
+                    (
+                        FlatMaintainedRelPlanNodeKind::UnionBag {
+                            left: left.id,
+                            right: right.id,
+                        },
+                        output,
+                    )
+                }
+            }
             RelExpr::Difference { left, right } => {
                 let left =
-                    Self::build_flat_subtree(left, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(left, old, context, registry, differential, scan_seeds, out)?;
                 let right =
-                    Self::build_flat_subtree(right, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(right, old, context, registry, differential, scan_seeds, out)?;
                 let id = out.len();
                 let result_type = graph
                     .result_type(id)
@@ -768,9 +895,9 @@ impl MaterializedRelPlanState {
                 equivalence,
             } => {
                 let left =
-                    Self::build_flat_subtree(left, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(left, old, context, registry, differential, scan_seeds, out)?;
                 let right =
-                    Self::build_flat_subtree(right, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(right, old, context, registry, differential, scan_seeds, out)?;
                 let id = out.len();
                 let kind = MaintainedBlockerKind::AntiJoin {
                     left_column: *left_column,
@@ -810,7 +937,7 @@ impl MaterializedRelPlanState {
             }
             RelExpr::Distinct { input, .. } => {
                 let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
                 let id = out.len();
                 let result_type = graph
                     .result_type(id)
@@ -833,7 +960,7 @@ impl MaterializedRelPlanState {
             }
             RelExpr::PromoteToBag(input) => {
                 let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
                 let output = RelationValue::Bag(input.output.into_rows());
                 (
                     FlatMaintainedRelPlanNodeKind::PromoteToBag { input: input.id },
@@ -842,9 +969,9 @@ impl MaterializedRelPlanState {
             }
             RelExpr::JoinEq { left, right, .. } => {
                 let left =
-                    Self::build_flat_subtree(left, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(left, old, context, registry, differential, scan_seeds, out)?;
                 let right =
-                    Self::build_flat_subtree(right, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(right, old, context, registry, differential, scan_seeds, out)?;
                 let state = MaterializedJoinDeltaState::build_from_input_values(
                     query,
                     &left.output,
@@ -865,7 +992,7 @@ impl MaterializedRelPlanState {
             }
             RelExpr::Group { input, .. } => {
                 let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
                 let state = MaterializedGroupDeltaState::build_from_input_value(
                     query,
                     input.output,
@@ -884,7 +1011,7 @@ impl MaterializedRelPlanState {
             }
             RelExpr::TopKWithTies { input, .. } => {
                 let input =
-                    Self::build_flat_subtree(input, old, context, registry, differential, out)?;
+                    Self::build_flat_subtree(input, old, context, registry, differential, scan_seeds, out)?;
                 let state = MaterializedTopKDeltaState::build_from_input_value(
                     query,
                     input.output,
@@ -954,12 +1081,14 @@ impl MaterializedRelPlanState {
                     relation: flat_relation,
                     value,
                     handles,
+                    base_witness,
                     canonical_lookup,
                 },
             ) if relation == flat_relation => MaintainedRelPlanNode::Scan {
                 relation: *relation,
                 value: value.clone(),
                 handles: handles.clone(),
+                base_witness: base_witness.clone(),
                 canonical_lookup: canonical_lookup.clone(),
             },
             (
@@ -1040,6 +1169,28 @@ impl MaterializedRelPlanState {
                 FlatMaintainedRelPlanNodeKind::PromoteToBag { input: id },
             ) => MaintainedRelPlanNode::PromoteToBag {
                 input: child_state(input, *id)?,
+            },
+            (
+                RelExpr::Union { left, right },
+                FlatMaintainedRelPlanNodeKind::UnionBag {
+                    left: left_id,
+                    right: right_id,
+                },
+            ) => MaintainedRelPlanNode::UnionBag {
+                left: child_state(left, *left_id)?,
+                right: child_state(right, *right_id)?,
+            },
+            (
+                RelExpr::Union { left, right },
+                FlatMaintainedRelPlanNodeKind::UnionSet {
+                    left: left_id,
+                    right: right_id,
+                    supports,
+                },
+            ) => MaintainedRelPlanNode::UnionSet {
+                left: child_state(left, *left_id)?,
+                right: child_state(right, *right_id)?,
+                supports: supports.clone(),
             },
             (
                 RelExpr::Difference { left, right } | RelExpr::AntiJoin { left, right, .. },
@@ -1234,6 +1385,15 @@ impl MaterializedRelPlanState {
                 self.output_value_from_arena(*input, context, registry)?
                     .into_rows(),
             )),
+            FlatMaintainedRelPlanNodeKind::UnionBag { left, right } => {
+                let mut rows = self.output_value_from_arena(*left, context, registry)?.into_rows();
+                rows.extend(
+                    self.output_value_from_arena(*right, context, registry)?
+                        .into_rows(),
+                );
+                Ok(RelationValue::Bag(rows))
+            }
+            FlatMaintainedRelPlanNodeKind::UnionSet { supports, .. } => Ok(supports.output_value()),
             FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => state.output_value(),
             FlatMaintainedRelPlanNodeKind::Join { state, .. } => {
                 state.output_value(context, registry)
@@ -1377,6 +1537,12 @@ impl MaterializedRelPlanState {
             MaintainedRelPlanNode::PromoteToBag { input } => Ok(RelationValue::Bag(
                 input.output_value_recursive(context, registry)?.into_rows(),
             )),
+            MaintainedRelPlanNode::UnionBag { left, right } => {
+                let mut rows = left.output_value_recursive(context, registry)?.into_rows();
+                rows.extend(right.output_value_recursive(context, registry)?.into_rows());
+                Ok(RelationValue::Bag(rows))
+            }
+            MaintainedRelPlanNode::UnionSet { supports, .. } => Ok(supports.output_value()),
             MaintainedRelPlanNode::Blocker { state, .. } => state.output_value(),
             MaintainedRelPlanNode::Join { state, .. } => state.output_value(context, registry),
             MaintainedRelPlanNode::Group { state, .. } => state.output_value(),
@@ -1459,16 +1625,98 @@ impl MaterializedRelPlanState {
         relation: kernel_types::SemanticId,
         rows: &[(kernel_types::StableRowHandle, Row)],
     ) -> Result<(), RelQueryError> {
+        self.attach_storage_rows_inner(relation, rows, None)
+    }
+
+    /// Attaches storage identities and the already-built exact Γ occurrence
+    /// witness owned by the current physical relation. The witness is cloned
+    /// by persistent-root sharing; no position -> handle Γ index translation
+    /// or row re-canonicalization is performed.
+    pub fn attach_storage_rows_with_base_witness(
+        &mut self,
+        relation: kernel_types::SemanticId,
+        rows: &[(kernel_types::StableRowHandle, Row)],
+        witness: &crate::RelationBaseWitness,
+    ) -> Result<(), RelQueryError> {
+        self.attach_storage_rows_inner(relation, rows, Some(witness))
+    }
+
+    fn attach_storage_rows_inner(
+        &mut self,
+        relation: kernel_types::SemanticId,
+        rows: &[(kernel_types::StableRowHandle, Row)],
+        witness: Option<&crate::RelationBaseWitness>,
+    ) -> Result<(), RelQueryError> {
         let next_epoch = self
             .transition_epoch
             .checked_add(1)
             .ok_or(RelQueryError::TransitionEpochExhausted)?;
         let handles = self.validate_storage_rows_binding(relation, rows)?;
+        if let Some(witness) = witness {
+            if witness.relation() != relation
+                || witness.semantic_context() != &self.semantic_context
+                || !witness.certifies_identity_storage_handles(
+                    &rows.iter().map(|(handle, _)| *handle).collect::<Vec<_>>(),
+                )
+            {
+                return Err(RelQueryError::StructuralRewriteBaseMismatch);
+            }
+            let source_nodes = self
+                .differential
+                .physical_program()
+                .execution_graph()
+                .transition_program()
+                .source_occurrence_directory(relation)
+                .ok_or(RelQueryError::UnknownRelation(relation))?;
+            if source_nodes.iter().any(|occurrence| {
+                self.arena
+                    .get(occurrence.node())
+                    .is_none_or(|node| node.result_type != *witness.result_type())
+            }) {
+                return Err(RelQueryError::TypeMismatch);
+            }
+        }
         #[cfg(debug_assertions)]
-        self.attach_storage_rows_recursive(relation, rows)?;
-        self.commit_storage_rows_binding(relation, &handles);
+        self.attach_storage_rows_recursive(relation, rows, witness)?;
+        self.commit_storage_rows_binding(relation, &handles, witness);
         self.transition_epoch = next_epoch;
         Ok(())
+    }
+
+    /// Returns an O(1) clone of the shared current-relation Γ occurrence
+    /// witness when every Scan occurrence is bound to the same authority.
+    pub fn storage_relation_base_witness(
+        &self,
+        relation: kernel_types::SemanticId,
+    ) -> Result<Option<crate::RelationBaseWitness>, RelQueryError> {
+        let occurrences = self
+            .differential
+            .physical_program()
+            .execution_graph()
+            .transition_program()
+            .source_occurrence_directory(relation)
+            .ok_or(RelQueryError::UnknownRelation(relation))?;
+        let mut shared: Option<crate::RelationBaseWitness> = None;
+        for occurrence in occurrences {
+            let node = self
+                .arena
+                .get(occurrence.node())
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let FlatMaintainedRelPlanNodeKind::Scan { base_witness, .. } = &node.kind else {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            };
+            let Some(witness) = base_witness else {
+                return Ok(None);
+            };
+            if let Some(current) = &shared {
+                if !current.certifies_same_base(witness) {
+                    return Err(RelQueryError::StructuralRewriteBaseMismatch);
+                }
+            } else {
+                shared = Some(witness.clone());
+            }
+        }
+        Ok(shared)
     }
 
     fn validate_storage_rows_binding(
@@ -1515,6 +1763,7 @@ impl MaterializedRelPlanState {
         &mut self,
         relation: kernel_types::SemanticId,
         handles: &MaintainedLeafHandles,
+        base_witness: Option<&crate::RelationBaseWitness>,
     ) {
         let source_nodes = self
             .differential
@@ -1535,6 +1784,7 @@ impl MaterializedRelPlanState {
             let FlatMaintainedRelPlanNodeKind::Scan {
                 relation: current,
                 handles: target,
+                base_witness: target_witness,
                 ..
             } = &mut node.kind
             else {
@@ -1542,6 +1792,7 @@ impl MaterializedRelPlanState {
             };
             debug_assert_eq!(*current, relation);
             *target = Some(handles.clone());
+            *target_witness = base_witness.cloned();
         }
     }
 
@@ -1550,6 +1801,7 @@ impl MaterializedRelPlanState {
         &mut self,
         relation: kernel_types::SemanticId,
         rows: &[(kernel_types::StableRowHandle, Row)],
+        base_witness: Option<&crate::RelationBaseWitness>,
     ) -> Result<(), RelQueryError> {
         match Arc::make_mut(
             self.node
@@ -1560,6 +1812,7 @@ impl MaterializedRelPlanState {
                 relation: current,
                 value,
                 handles,
+                base_witness: target_witness,
                 ..
             } => {
                 if *current != relation {
@@ -1576,6 +1829,7 @@ impl MaterializedRelPlanState {
                 *handles = Some(MaintainedLeafHandles::new(
                     rows.iter().map(|(id, _)| *id).collect(),
                 )?);
+                *target_witness = base_witness.cloned();
                 Ok(())
             }
             MaintainedRelPlanNode::Filter { input, .. }
@@ -1587,12 +1841,14 @@ impl MaterializedRelPlanState {
             | MaintainedRelPlanNode::PromoteToBag { input }
             | MaintainedRelPlanNode::Group { input, .. }
             | MaintainedRelPlanNode::TopK { input, .. } => {
-                input.attach_storage_rows_recursive(relation, rows)
+                input.attach_storage_rows_recursive(relation, rows, base_witness)
             }
-            MaintainedRelPlanNode::Blocker { left, right, .. }
+            MaintainedRelPlanNode::UnionBag { left, right }
+            | MaintainedRelPlanNode::UnionSet { left, right, .. }
+            | MaintainedRelPlanNode::Blocker { left, right, .. }
             | MaintainedRelPlanNode::Join { left, right, .. } => {
-                left.attach_storage_rows_recursive(relation, rows)?;
-                right.attach_storage_rows_recursive(relation, rows)
+                left.attach_storage_rows_recursive(relation, rows, base_witness)?;
+                right.attach_storage_rows_recursive(relation, rows, base_witness)
             }
         }
     }
@@ -1809,6 +2065,7 @@ impl MaterializedRelPlanState {
                     relation: node_relation,
                     value,
                     handles,
+                    base_witness,
                     ..
                 } = &node.kind
                 else {
@@ -1855,23 +2112,27 @@ impl MaterializedRelPlanState {
                         return Err(RelQueryError::InconsistentIncrementalDelta);
                     }
                 }
+                let next_base_witness = match base_witness {
+                    Some(witness) => witness.advance_with_expected_handles(
+                        kernel_types::RevisionId::new(0),
+                        resolved.delta(),
+                        resolved.removed_handles(),
+                        resolved.inserted_handles(),
+                        registry,
+                    )?,
+                    None => None,
+                };
                 let patch = StorageResolvedScanPatch {
                     removed_handles: resolved.removed_handles().to_vec(),
                     inserted: resolved
                         .inserted_handles()
                         .iter()
                         .copied()
+                        .zip(resolved.inserted_keys())
                         .zip(&resolved.delta().inserted)
-                        .map(|(id, row)| {
-                            canonical_row_key(
-                                row,
-                                relation_column_equivalences(&node.result_type),
-                                context,
-                                registry,
-                            )
-                            .map(|key| (id, key, row.clone()))
-                        })
-                        .collect::<Result<Vec<_>, RelQueryError>>()?,
+                        .map(|((id, key), row)| (id, key.clone(), row.clone()))
+                        .collect(),
+                    next_base_witness,
                 };
                 if frames
                     .insert(
@@ -1894,13 +2155,19 @@ impl MaterializedRelPlanState {
     fn commit_storage_resolved_scan_patch(
         value: &mut PersistentVec<Row>,
         handles: &mut Option<MaintainedLeafHandles>,
+        base_witness: &mut Option<crate::RelationBaseWitness>,
         canonical_lookup: &mut CanonicalRowPositionIndex,
         patch: StorageResolvedScanPatch,
     ) {
         let handles = handles
             .as_mut()
             .expect("sealed storage-resolved Scan patch requires bound handles");
-        for id in patch.removed_handles {
+        let StorageResolvedScanPatch {
+            removed_handles,
+            inserted,
+            next_base_witness,
+        } = patch;
+        for id in removed_handles {
             let position = *handles
                 .positions
                 .get(&id)
@@ -1910,12 +2177,13 @@ impl MaterializedRelPlanState {
                 .remove(value, id)
                 .expect("validated storage-resolved Scan removal must commit");
         }
-        for (id, key, row) in patch.inserted {
+        for (id, key, row) in inserted {
             handles
                 .insert(value, id, row)
                 .expect("validated storage-resolved Scan insertion must commit");
             canonical_lookup.push_key(key);
         }
+        *base_witness = next_base_witness;
     }
 
     fn apply_storage_resolved_deltas_in_place(
@@ -2268,6 +2536,24 @@ impl MaterializedRelPlanState {
                 patch: None,
                 effect: inbox.take_unary().unwrap_or_else(empty),
             }),
+            FlatMaintainedRelPlanNodeKind::UnionBag { .. } => {
+                let left = inbox.take_left().unwrap_or_else(empty);
+                let right = inbox.take_right().unwrap_or_else(empty);
+                Ok(PlannedGraphNodeTransition {
+                    patch: None,
+                    effect: combine_maintained_deltas(&left, &right),
+                })
+            }
+            FlatMaintainedRelPlanNodeKind::UnionSet { supports, .. } => {
+                let left = inbox.take_left().unwrap_or_else(empty);
+                let right = inbox.take_right().unwrap_or_else(empty);
+                let combined = combine_maintained_deltas(&left, &right);
+                let planned = supports.plan_delta_view(&combined, context, registry)?;
+                Ok(PlannedGraphNodeTransition {
+                    patch: Some(GraphNodePatch::SetSupport(planned.patch)),
+                    effect: planned.effect,
+                })
+            }
             FlatMaintainedRelPlanNodeKind::Blocker { .. }
             | FlatMaintainedRelPlanNodeKind::Join { .. }
             | FlatMaintainedRelPlanNodeKind::Group { .. }
@@ -2364,6 +2650,7 @@ impl MaterializedRelPlanState {
                     FlatMaintainedRelPlanNodeKind::Scan {
                         value,
                         handles,
+                        base_witness,
                         canonical_lookup,
                         ..
                     },
@@ -2371,11 +2658,13 @@ impl MaterializedRelPlanState {
                 ) => match patch {
                     MaintainedScanCommitPatch::Semantic(plan) => {
                         commit_relation_mutation(value, canonical_lookup, plan);
+                        *base_witness = None;
                     }
                     MaintainedScanCommitPatch::StorageResolved(plan) => {
                         Self::commit_storage_resolved_scan_patch(
                             value,
                             handles,
+                            base_witness,
                             canonical_lookup,
                             plan,
                         );
@@ -2383,7 +2672,8 @@ impl MaterializedRelPlanState {
                 },
                 (
                     FlatMaintainedRelPlanNodeKind::ProjectSet { supports, .. }
-                    | FlatMaintainedRelPlanNodeKind::Distinct { supports, .. },
+                    | FlatMaintainedRelPlanNodeKind::Distinct { supports, .. }
+                    | FlatMaintainedRelPlanNodeKind::UnionSet { supports, .. },
                     GraphNodePatch::SetSupport(patch),
                 ) => supports.commit_support_patch(patch),
                 (
@@ -2503,6 +2793,31 @@ impl MaterializedRelPlanState {
                 Ok(PlannedMaintainedRelPlanTransition {
                     patch: MaintainedRelPlanPatch::Unary(Box::new(child.patch)),
                     effect: child.effect,
+                })
+            }
+            MaintainedRelPlanNode::UnionBag { left, right } => {
+                let left = left.plan_relation_deltas_inner(plan)?;
+                let right = right.plan_relation_deltas_inner(plan)?;
+                Ok(PlannedMaintainedRelPlanTransition {
+                    patch: MaintainedRelPlanPatch::Binary {
+                        left: Box::new(left.patch),
+                        right: Box::new(right.patch),
+                    },
+                    effect: combine_maintained_deltas(&left.effect, &right.effect),
+                })
+            }
+            MaintainedRelPlanNode::UnionSet { left, right, supports } => {
+                let left = left.plan_relation_deltas_inner(plan)?;
+                let right = right.plan_relation_deltas_inner(plan)?;
+                let combined = combine_maintained_deltas(&left.effect, &right.effect);
+                let planned = supports.plan_delta_view(&combined, plan.context, plan.registry)?;
+                Ok(PlannedMaintainedRelPlanTransition {
+                    patch: MaintainedRelPlanPatch::SetBinary {
+                        left: Box::new(left.patch),
+                        right: Box::new(right.patch),
+                        patch: planned.patch,
+                    },
+                    effect: planned.effect,
                 })
             }
             MaintainedRelPlanNode::Blocker { left, right, state } => {
@@ -2721,15 +3036,23 @@ impl MaterializedRelPlanState {
     fn commit_debug_scan_patch(
         value: &mut PersistentVec<Row>,
         handles: &mut Option<MaintainedLeafHandles>,
+        base_witness: &mut Option<crate::RelationBaseWitness>,
         canonical_lookup: &mut CanonicalRowPositionIndex,
         patch: MaintainedScanCommitPatch,
     ) {
         match patch {
             MaintainedScanCommitPatch::Semantic(plan) => {
                 commit_relation_mutation(value, canonical_lookup, plan);
+                *base_witness = None;
             }
             MaintainedScanCommitPatch::StorageResolved(plan) => {
-                Self::commit_storage_resolved_scan_patch(value, handles, canonical_lookup, plan);
+                Self::commit_storage_resolved_scan_patch(
+                    value,
+                    handles,
+                    base_witness,
+                    canonical_lookup,
+                    plan,
+                );
             }
         }
     }
@@ -2748,11 +3071,18 @@ impl MaterializedRelPlanState {
                 MaintainedRelPlanNode::Scan {
                     value,
                     handles,
+                    base_witness,
                     canonical_lookup,
                     ..
                 },
                 MaintainedRelPlanPatch::Scan(Some(plan)),
-            ) => Self::commit_debug_scan_patch(value, handles, canonical_lookup, plan),
+            ) => Self::commit_debug_scan_patch(
+                value,
+                handles,
+                base_witness,
+                canonical_lookup,
+                plan,
+            ),
             (MaintainedRelPlanNode::Scan { .. }, MaintainedRelPlanPatch::Scan(None)) => {}
             (
                 MaintainedRelPlanNode::Filter { input, .. }
@@ -2774,6 +3104,28 @@ impl MaterializedRelPlanState {
             ) => {
                 supports.commit_support_patch(patch);
                 input.commit_relation_plan(*child);
+            }
+            (
+                MaintainedRelPlanNode::UnionBag { left, right },
+                MaintainedRelPlanPatch::Binary {
+                    left: left_patch,
+                    right: right_patch,
+                },
+            ) => {
+                left.commit_relation_plan(*left_patch);
+                right.commit_relation_plan(*right_patch);
+            }
+            (
+                MaintainedRelPlanNode::UnionSet { left, right, supports },
+                MaintainedRelPlanPatch::SetBinary {
+                    left: left_patch,
+                    right: right_patch,
+                    patch,
+                },
+            ) => {
+                supports.commit_support_patch(patch);
+                left.commit_relation_plan(*left_patch);
+                right.commit_relation_plan(*right_patch);
             }
             (
                 MaintainedRelPlanNode::Blocker { left, right, state },

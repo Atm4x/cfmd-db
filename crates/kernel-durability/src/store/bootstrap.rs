@@ -153,11 +153,13 @@ impl DurableRevisionStore {
             physical_artifacts: physical_artifact_specs.clone(),
             artifact_cores: artifact_cores.to_vec(),
             migration_complements: Vec::new(),
+            historical_epoch_anchors: BTreeMap::new(),
             committed_transactions: committed_transactions.clone(),
             semantic_modules,
             causal_coverage_root: Some(causal_coverage_root),
             revision_effects: revision_effects.clone(),
             revision_effect_frontiers: revision_effect_frontiers.clone(),
+            checkpoint_realization: None,
         };
         let metadata_file = metadata_path(&directory, generation);
         let metadata_crc32c = write_metadata_file(&metadata_file, &metadata_record)?;
@@ -191,8 +193,10 @@ impl DurableRevisionStore {
             semantic_registry: registry.clone(),
             materialization_specs: materialization_specs.to_vec(),
             physical_artifact_specs,
+            checkpoint_realization: None,
             artifact_cores: artifact_cores.to_vec(),
             migration_complements: Vec::new(),
+            historical_epoch_anchors: BTreeMap::new(),
             migration_complement_index: BTreeMap::new(),
             current_idempotency_epoch: IdempotencyEpoch::ZERO,
             minimum_retry_epoch: IdempotencyEpoch::ZERO,

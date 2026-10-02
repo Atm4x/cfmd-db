@@ -16,7 +16,7 @@ use kernel_durability::{
     DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
     DurableRevisionDescriptor, DurableRevisionEffectRecord, DurableRevisionStore,
     DurableSemanticKeyPart, DurableTransactionIntent, DurableTransactionOutcome, IdempotencyEpoch,
-    RecoveryScan, RevisionDurability,
+    RecoveryScan, RevisionDurability, SemanticChangeEvent,
 };
 pub use kernel_durability::{
     DurableModelDelta, StorageAeadAlgorithm, StorageEncryption, StorageEncryptionKey,
@@ -62,7 +62,13 @@ fn saturating_usize_sum(values: impl Iterator<Item = usize>) -> usize {
 // Native storage and runtime data vocabulary remain root-owned so every promoted implementation
 // module shares one stable type boundary. Behavior-heavy ownership lives in real submodules below.
 include!("native_storage.rs");
+mod migration_physical;
 mod native_relation;
+pub use migration_physical::{
+    MixedMigrationCutoverCertificate, MixedMigrationPhysicalAuthority,
+    MixedMigrationRelationCoordinate, MixedMigrationRelationCursor, MixedMigrationRevisionView,
+    RowLocalMigrationCursor,
+};
 mod physical_delta;
 mod semantic_key;
 mod semantic_quotient_physical;
@@ -96,7 +102,8 @@ pub use runtime_impl::{
     RuntimeRevisionCell, RuntimeRevisionDerivationError, RuntimeRevisionPublicationNotifier,
     RuntimeRevisionPublicationWaitHandle, RuntimeRevisionPublicationWaitOutcome,
     RuntimeRevisionSnapshot, RuntimeRewriteIntent, RuntimeRootVersion, RuntimeStorageOptions,
-    RuntimeViolationState, SealedRuntimeRevisionTransition,
+    RuntimeTransitionRebaseCertificate, RuntimeTransitionRebaseConflict,
+    RuntimeTransitionRebaseOutcome, RuntimeViolationState, SealedRuntimeRevisionTransition,
 };
 
 mod recovery;

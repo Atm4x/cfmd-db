@@ -97,6 +97,7 @@ fn compile_writable_expr(expr: &kernel_query::Expr) -> Result<LensExpr, Writabil
         kernel_query::Expr::SeqLength(_)
         | kernel_query::Expr::SeqSumI64(_)
         | kernel_query::Expr::AddI64(_, _)
+        | kernel_query::Expr::I64ToF64(_)
         | kernel_query::Expr::If { .. } => {
             Err(WritabilityFailure::DerivedOperatorHasNoCertifiedLift)
         }

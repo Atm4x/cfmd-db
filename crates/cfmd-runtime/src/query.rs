@@ -41,12 +41,15 @@ impl QuerySource {
 pub enum QueryNodeKind {
     Scan,
     FilterEq,
+    FilterEqColumns,
     FilterOrder,
     Project,
     JoinEq,
     Difference,
+    Union,
     AntiJoin,
     GroupCount,
+    GroupExactF64Sum,
     Distinct,
     TopKWithTies,
 }
@@ -189,6 +192,27 @@ impl Query {
 
     #[track_caller]
     #[must_use]
+    pub fn filter_eq_columns(
+        self,
+        left_column: usize,
+        right_column: usize,
+        equivalence: EquivalenceId,
+    ) -> Self {
+        let input = Box::new(self.inner.clone());
+        self.unary(
+            kernel_query::RelExpr::FilterEqColumns {
+                input,
+                left_column,
+                right_column,
+                equivalence: equivalence.into(),
+            },
+            QueryNodeKind::FilterEqColumns,
+            caller_source(std::panic::Location::caller()),
+        )
+    }
+
+    #[track_caller]
+    #[must_use]
     pub fn filter_order(
         self,
         column: usize,
@@ -220,6 +244,22 @@ impl Query {
     #[must_use]
     pub fn project(self, columns: impl Into<Vec<usize>>) -> Self {
         let input = Box::new(self.inner.clone());
+        self.unary(
+            kernel_query::RelExpr::Project {
+                input,
+                columns: columns.into(),
+            },
+            QueryNodeKind::Project,
+            caller_source(std::panic::Location::caller()),
+        )
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub(crate) fn project_preserving_multiplicity(self, columns: impl Into<Vec<usize>>) -> Self {
+        let input = Box::new(kernel_query::RelExpr::PromoteToBag(Box::new(
+            self.inner.clone(),
+        )));
         self.unary(
             kernel_query::RelExpr::Project {
                 input,
@@ -283,6 +323,27 @@ impl Query {
 
     #[track_caller]
     #[must_use]
+    pub fn union(mut self, right: Self) -> Self {
+        let left_root = self.root;
+        let right_root = right.root;
+        let inner = kernel_query::RelExpr::Union {
+            left: Box::new(self.inner.clone()),
+            right: Box::new(right.inner),
+        };
+        merge_nodes(&mut self.nodes, right.nodes);
+        let node = next_node(
+            QueryNodeKind::Union,
+            caller_source(std::panic::Location::caller()),
+            vec![left_root, right_root],
+        );
+        self.root = node.id;
+        self.nodes.push(node);
+        self.inner = inner;
+        self
+    }
+
+    #[track_caller]
+    #[must_use]
     pub fn anti_join(
         mut self,
         right: Self,
@@ -315,16 +376,67 @@ impl Query {
     #[must_use]
     pub fn group_count(
         self,
-        group_column: usize,
-        group_equivalence: EquivalenceId,
+        group_columns: impl Into<Vec<usize>>,
+        group_equivalences: impl Into<Vec<EquivalenceId>>,
         result_equivalence: EquivalenceId,
     ) -> Self {
         let input = Box::new(self.inner.clone());
         self.unary(
             kernel_query::RelExpr::Group {
                 input,
-                group_columns: vec![group_column],
-                group_equivalences: vec![group_equivalence.into()],
+                group_columns: group_columns.into(),
+                group_equivalences: group_equivalences
+                    .into()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                aggregate: kernel_query::AggregateSpec::Count {
+                    result_equivalence: result_equivalence.into(),
+                },
+            },
+            QueryNodeKind::GroupCount,
+            caller_source(std::panic::Location::caller()),
+        )
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn group_exact_f64_sum(
+        self,
+        group_columns: impl Into<Vec<usize>>,
+        group_equivalences: impl Into<Vec<EquivalenceId>>,
+        value_column: usize,
+        result_equivalence: EquivalenceId,
+    ) -> Self {
+        let input = Box::new(self.inner.clone());
+        self.unary(
+            kernel_query::RelExpr::Group {
+                input,
+                group_columns: group_columns.into(),
+                group_equivalences: group_equivalences
+                    .into()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                aggregate: kernel_query::AggregateSpec::ExactF64Sum {
+                    value_column,
+                    result_equivalence: result_equivalence.into(),
+                },
+            },
+            QueryNodeKind::GroupExactF64Sum,
+            caller_source(std::panic::Location::caller()),
+        )
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn count(self, result_equivalence: EquivalenceId) -> Self {
+        let input = Box::new(self.inner.clone());
+        self.unary(
+            kernel_query::RelExpr::Group {
+                input,
+                group_columns: Vec::new(),
+                group_equivalences: Vec::new(),
                 aggregate: kernel_query::AggregateSpec::Count {
                     result_equivalence: result_equivalence.into(),
                 },

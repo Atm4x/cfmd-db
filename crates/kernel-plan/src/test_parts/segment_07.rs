@@ -63,6 +63,8 @@ fn wal_core_replay_uses_relation_semantics_for_coarse_first_match_removal() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     runtime
         .commit_derived_relation_data(
@@ -366,10 +368,12 @@ fn deferred_recovery_uses_live_telemetry_to_rank_optional_rebuilds() {
     root.physical_store_mut_for_test()
         .install_i64_index(i64, &context, &registry)
         .unwrap();
-    root.physical_store_mut_for_test().advisor_managed_artifacts_mut().extend([
-        UnifiedArtifactId::SemanticIndex(semantic.clone()),
-        UnifiedArtifactId::I64Index(i64),
-    ]);
+    root.physical_store_mut_for_test()
+        .advisor_managed_artifacts_mut()
+        .extend([
+            UnifiedArtifactId::SemanticIndex(semantic.clone()),
+            UnifiedArtifactId::I64Index(i64),
+        ]);
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
 
     let (runtime, initial) = DurableRuntime::open_with_recovery_policy(
@@ -646,7 +650,12 @@ fn stale_durable_physical_recipe_never_blocks_logical_recovery() {
         DurableRuntime::open_with_recovery_policy(&dir, PhysicalRecoveryPolicy::default()).unwrap();
     let snapshot = reopened.snapshot().unwrap();
     assert_eq!(snapshot.revision_id(), RevisionId::new(517));
-    assert!(snapshot.physical_store().semantic_indexes_for_test().is_empty());
+    assert!(
+        snapshot
+            .physical_store()
+            .semantic_indexes_for_test()
+            .is_empty()
+    );
     assert_eq!(report.dropped_incompatible, vec![stale]);
     drop(snapshot);
     drop(reopened);
@@ -926,6 +935,8 @@ fn subprocess_commit_durable_before_publish_recovers_target_revision() {
     let retry_mutations = [RevisionRelationMutation {
         relation,
         delta: &retry_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let retry_target = target_revision_for(&root, 531, &retry_mutations, &registry);
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
@@ -998,6 +1009,8 @@ fn crash_worker_commit_durable_before_publish() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let target = target_revision_for(&root, 531, &mutations, &registry);
     let (durability, scan) = kernel_durability::DurableRevisionStore::open(&dir).unwrap();
@@ -1029,6 +1042,8 @@ fn client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent() 
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 541, &mutations, &registry);
@@ -1091,6 +1106,8 @@ fn client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent() 
     let next_mutations = [RevisionRelationMutation {
         relation,
         delta: &next_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let live = reopened.snapshot().unwrap();
     let next_target = target_revision_for(live.root(), 542, &next_mutations, &registry);
@@ -1123,6 +1140,8 @@ fn supervisor_recovers_fail_stopped_runtime_and_retries_same_transaction() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = supervisor.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 551, &mutations, &registry);
@@ -1325,7 +1344,15 @@ fn durable_mixed_revision_updates_lifecycle_and_relations_incrementally() {
     let second = EntityId::new(7952);
     let mut registry = SemanticRegistry::default();
     let digest = registry.install_equivalence_revision(EquivalenceModule::TextExact, 11);
-    let context = migration_context(7951, 7951, relation, equivalence, entity_type, field, digest);
+    let context = migration_context(
+        7951,
+        7951,
+        relation,
+        equivalence,
+        entity_type,
+        field,
+        digest,
+    );
     let source = kernel_revision::Revision::build(
         RevisionId::new(7951),
         &context,
@@ -1347,13 +1374,20 @@ fn durable_mixed_revision_updates_lifecycle_and_relations_incrementally() {
         ),
     )
     .unwrap();
-    let result_type = RelExpr::Scan(relation).typecheck(&context, &registry).unwrap();
+    let result_type = RelExpr::Scan(relation)
+        .typecheck(&context, &registry)
+        .unwrap();
     let delta = RelationDelta {
         inserted: vec![vec![Value::Text("B".into())]],
         removed: vec![],
         result_type,
     };
-    let mutations = [RevisionRelationMutation { relation, delta: &delta }];
+    let mutations = [RevisionRelationMutation {
+        relation,
+        delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
+    }];
     let model_delta = DurableModelDelta::between(source.state(), target.state());
     let model_complement = DurableModelDelta::between(target.state(), source.state());
     let transaction_id = ClientTransactionId::new(0x7952);
@@ -1403,7 +1437,9 @@ fn durable_mixed_revision_updates_lifecycle_and_relations_incrementally() {
     assert_eq!(reopened.snapshot().unwrap().revision(), &target);
     assert_eq!(
         reopened.transaction_outcome(transaction_id).unwrap(),
-        DurableTransactionOutcome::Committed { target_revision: target.id() }
+        DurableTransactionOutcome::Committed {
+            target_revision: target.id()
+        }
     );
     let reopened_retry = reopened
         .commit_mixed_revision(
@@ -1540,9 +1576,14 @@ fn durable_schema_migration_publishes_target_and_complement_atomically() {
         RevisionId::new(852),
         &target_context,
         &registry,
-        migration_state(entity_type, field, relation, &[(entity, 2)], &["a"]),
+        migration_state(entity_type, field, relation, &[(entity, 1)], &["A"]),
     )
     .unwrap();
+    let migration_program = kernel_transport::SchemaMigrationProgram::new(
+        target_context.clone(),
+        Vec::new(),
+        Vec::new(),
+    );
     let complement = DurableMigrationComplement::from_capsule(
         kernel_lens::ComplementCapsule {
             source_schema: source_context.schema.revision,
@@ -1561,6 +1602,7 @@ fn durable_schema_migration_publishes_target_and_complement_atomically() {
                 target_revision: &target,
                 registry: &registry,
             },
+            &migration_program,
             &complement,
         )
         .unwrap();
@@ -1743,6 +1785,8 @@ fn committed_transaction_id_rejects_same_revision_id_with_different_revision_con
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 861, &mutations, &registry);
@@ -1802,6 +1846,8 @@ fn exact_transaction_intent_survives_later_heads_checkpoint_compaction_and_reope
     let first_mutations = [RevisionRelationMutation {
         relation,
         delta: &first_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let first_target = target_revision_for(snapshot.root(), 866, &first_mutations, &registry);
@@ -1821,6 +1867,8 @@ fn exact_transaction_intent_survives_later_heads_checkpoint_compaction_and_reope
     let second_mutations = [RevisionRelationMutation {
         relation,
         delta: &second_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let second_target = target_revision_for(snapshot.root(), 867, &second_mutations, &registry);
@@ -1900,6 +1948,8 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
     let first_mutations = [RevisionRelationMutation {
         relation,
         delta: &first_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let first_request = DerivedRelationTransitionRequest {
         source_revision: RevisionId::new(875),
@@ -1917,6 +1967,8 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
     let second_mutations = [RevisionRelationMutation {
         relation,
         delta: &second_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     runtime
         .commit_derived_relation_data(
@@ -1946,6 +1998,8 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
     let conflicting_mutations = [RevisionRelationMutation {
         relation,
         delta: &conflicting_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     assert!(matches!(
         reopened.commit_derived_relation_data(
@@ -2009,7 +2063,14 @@ fn derived_relation_rewrite_persists_intent_and_idempotency_distinguishes_spec()
         footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let rewrite = delta
-        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
+        .prepare_relation_rewrite(
+            relation,
+            &old,
+            &context,
+            &registry,
+            &spec,
+            Vec::<Value>::new(),
+        )
         .unwrap();
     let rewrites = [RevisionRelationRewrite {
         relation,
@@ -2102,7 +2163,14 @@ fn coherent_resolution_gate_precedes_durable_rewrite_publication() {
         footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let rewrite = delta
-        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
+        .prepare_relation_rewrite(
+            relation,
+            &old,
+            &context,
+            &registry,
+            &spec,
+            Vec::<Value>::new(),
+        )
         .unwrap();
     let rewrites = [RevisionRelationRewrite {
         relation,
@@ -2185,6 +2253,8 @@ fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
         let mutations = [RevisionRelationMutation {
             relation,
             delta: &delta,
+        object_field_writes: &[],
+        authorization: Default::default(),
         }];
         runtime
             .commit_derived_relation_data(
@@ -2212,7 +2282,14 @@ fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
         footprint: kernel_change::RewriteFootprint::opaque_relation(relation),
     };
     let rewrite = delta
-        .prepare_relation_rewrite(relation, &old, &context, &registry, &spec, Vec::<Value>::new())
+        .prepare_relation_rewrite(
+            relation,
+            &old,
+            &context,
+            &registry,
+            &spec,
+            Vec::<Value>::new(),
+        )
         .unwrap();
     let rewrites = [RevisionRelationRewrite {
         relation,
@@ -2234,41 +2311,42 @@ fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
         )
         .unwrap();
 
-    let (parent_901, parent_902, resolution_effect) = runtime.with_durability_for_test(|durability| {
-        assert!(matches!(
-            durability.transaction_intent(transaction_id),
-            Some(DurableTransactionIntent::RelationResolutionExact {
-                causal_parents,
-                ..
-            }) if causal_parents == &vec![RevisionId::new(901), RevisionId::new(902)]
-        ));
-        let parent_901 = *durability
-            .revision_effect_frontier(RevisionId::new(901))
-            .unwrap()
-            .iter()
-            .next()
-            .unwrap();
-        let parent_902 = *durability
-            .revision_effect_frontier(RevisionId::new(902))
-            .unwrap()
-            .iter()
-            .next()
-            .unwrap();
-        let resolution_effect = *durability
-            .revision_effect_frontier(RevisionId::new(903))
-            .unwrap()
-            .iter()
-            .next()
-            .unwrap();
-        assert_eq!(
-            durability
-                .revision_effect_record(resolution_effect)
+    let (parent_901, parent_902, resolution_effect) =
+        runtime.with_durability_for_test(|durability| {
+            assert!(matches!(
+                durability.transaction_intent(transaction_id),
+                Some(DurableTransactionIntent::RelationResolutionExact {
+                    causal_parents,
+                    ..
+                }) if causal_parents == &vec![RevisionId::new(901), RevisionId::new(902)]
+            ));
+            let parent_901 = *durability
+                .revision_effect_frontier(RevisionId::new(901))
                 .unwrap()
-                .prerequisites,
-            BTreeSet::from([parent_901, parent_902])
-        );
-        (parent_901, parent_902, resolution_effect)
-    });
+                .iter()
+                .next()
+                .unwrap();
+            let parent_902 = *durability
+                .revision_effect_frontier(RevisionId::new(902))
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap();
+            let resolution_effect = *durability
+                .revision_effect_frontier(RevisionId::new(903))
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap();
+            assert_eq!(
+                durability
+                    .revision_effect_record(resolution_effect)
+                    .unwrap()
+                    .prerequisites,
+                BTreeSet::from([parent_901, parent_902])
+            );
+            (parent_901, parent_902, resolution_effect)
+        });
     drop(runtime);
 
     assert_reopened_effect_prerequisites(
@@ -2289,6 +2367,8 @@ fn derived_relation_commit_matches_authoritative_target_and_rejects_stale_source
     let first_mutations = [RevisionRelationMutation {
         relation,
         delta: &first_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let source = runtime.snapshot().unwrap();
     let expected = target_revision_for(source.root(), 879, &first_mutations, &registry);
@@ -2309,6 +2389,8 @@ fn derived_relation_commit_matches_authoritative_target_and_rejects_stale_source
     let stale_mutations = [RevisionRelationMutation {
         relation,
         delta: &stale_delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let stale_transaction = ClientTransactionId::new(0x8782);
     let stale_request = DerivedRelationTransitionRequest {
@@ -2357,6 +2439,8 @@ fn revision_and_materialization_registry_commit_and_recover_atomically() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 869, &mutations, &registry);

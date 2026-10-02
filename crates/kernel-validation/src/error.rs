@@ -11,6 +11,10 @@ pub enum ValidationError {
         field: SemanticId,
         entity: EntityId,
     },
+    FieldRuleTypeMismatch { field: SemanticId },
+    FieldRuleViolation { field: SemanticId, entity: EntityId, rule_index: usize },
+    RelationColumnRuleViolation { relation: SemanticId, row: usize, column: usize, rule_index: usize },
+    EntityRuleViolation { owner: SemanticId, entity: EntityId, rule_index: usize },
     CapabilityRequiredFieldUndefined {
         capability: SemanticId,
         field: SemanticId,

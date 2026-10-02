@@ -6,13 +6,15 @@ mod transaction;
 pub use causal::{DurableEffectCoordinationClass, DurableRevisionEffectRecord};
 pub use freshness_binding::DurableExternalFreshnessBinding;
 pub use historical::{
-    DurableMigrationComplement, HistoricalComplementError, HistoricalLensImplementation,
-    HistoricalLensImplementationKey, HistoricalLensRegistry, HistoricalRestoreError,
-    LocalHistoricalComplementChain,
+    DurableMigrationComplement, HistoricalBoundaryAuthority, HistoricalComplementError,
+    HistoricalEpochAnchor, HistoricalLensImplementation, HistoricalLensImplementationKey,
+    HistoricalLensRegistry, HistoricalRestoreError, LocalHistoricalComplementChain,
+    MigrationPhysicalAuthority, SchemaMigrationPhysicalState, SemanticChangeEvent,
 };
 pub use transaction::{
     DurableCarrierPatch, DurableEffectKind, DurableFieldPatch, DurableKeepsAlivePatch,
-    DurableModelDelta, DurableRelationMutation, DurableRelationResolution,
+    DurableModelDelta, DurableObjectFieldWrite, DurableRelationAuthorization,
+    DurableRelationMutation, DurableRelationResolution,
     DurableRelationRewriteIntent, DurableRevisionChange, DurableTransactionIntent,
     DurableTransactionKey, IdempotencyEpoch,
 };

@@ -114,8 +114,8 @@ impl ProtocolQuery {
                 group_equivalence,
                 result_equivalence,
             } => input.into_runtime().group_count(
-                group_column,
-                cfmd_runtime::EquivalenceId::new(group_equivalence),
+                vec![group_column],
+                vec![cfmd_runtime::EquivalenceId::new(group_equivalence)],
                 cfmd_runtime::EquivalenceId::new(result_equivalence),
             ),
             Self::Distinct {

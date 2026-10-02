@@ -6,6 +6,7 @@ use kernel_revision::Revision;
 use kernel_semantics::SemanticRegistry;
 use kernel_types::RevisionId;
 
+use crate::checkpoint;
 use crate::replication::authority::ReplicationAuthorityJournal;
 
 use super::causal_ledger;
@@ -16,12 +17,13 @@ use super::freshness::{
 use super::generation_layout::{
     lock_directory, prepared_capsule_path, remove_orphan_checkpoint_stream_spools, wal_path,
 };
-use super::manifest::{ManifestRecord, read_current_manifest};
+use super::manifest::{ManifestRecord, read_current_manifest, read_manifest_generation};
 use super::metadata_storage::read_published_metadata;
 use super::migration_history::{
     MigrationComplementIndex, append_migration_complement, migration_complement_index,
 };
-use super::prepared_capsule::read_prepared_cut_capsule_file;
+use super::prepared_capsule::{decode_prepared_cut_capsule, read_prepared_cut_capsule_file};
+use super::realization_storage::read_published_factorized_realization;
 use super::semantic_deployment::{
     install_intent_semantic_modules, install_semantic_module_packages,
 };
@@ -31,7 +33,7 @@ use crate::descriptor::{
 };
 use crate::domain::{
     DurableMigrationComplement, DurableRevisionEffectRecord, DurableTransactionIntent,
-    DurableTransactionKey, IdempotencyEpoch,
+    DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
 };
 use crate::metadata;
 use crate::platform_assurance::{
@@ -40,6 +42,36 @@ use crate::platform_assurance::{
 };
 use crate::runtime::{DurabilityError, RecoveryScan};
 use crate::wal::FileRevisionWal;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalEpochMaterial {
+    generation: u64,
+    checkpoint: Revision,
+    recovery_scan: RecoveryScan,
+    semantic_registry: SemanticRegistry,
+}
+
+impl HistoricalEpochMaterial {
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn checkpoint(&self) -> &Revision {
+        &self.checkpoint
+    }
+
+    #[must_use]
+    pub const fn recovery_scan(&self) -> &RecoveryScan {
+        &self.recovery_scan
+    }
+
+    #[must_use]
+    pub const fn semantic_registry(&self) -> &SemanticRegistry {
+        &self.semantic_registry
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct CanonicalDurableState {
@@ -51,6 +83,7 @@ pub(super) struct CanonicalDurableState {
     artifact_cores: Vec<DurableArtifactCore>,
     migration_complements: Vec<DurableMigrationComplement>,
     migration_complement_index: MigrationComplementIndex,
+    historical_epoch_anchors: BTreeMap<RevisionEffectId, HistoricalEpochAnchor>,
     current_idempotency_epoch: IdempotencyEpoch,
     minimum_retry_epoch: IdempotencyEpoch,
     committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
@@ -77,9 +110,11 @@ impl CanonicalDurableState {
             semantic_registry: self.semantic_registry,
             materialization_specs: self.materialization_specs,
             physical_artifact_specs: self.physical_artifact_specs,
+            checkpoint_realization: None,
             artifact_cores: self.artifact_cores,
             migration_complements: self.migration_complements,
             migration_complement_index: self.migration_complement_index,
+            historical_epoch_anchors: self.historical_epoch_anchors,
             current_idempotency_epoch: self.current_idempotency_epoch,
             minimum_retry_epoch: self.minimum_retry_epoch,
             committed_transactions: self.committed_transactions,
@@ -98,9 +133,15 @@ impl CanonicalDurableState {
 
 fn merge_wal_migration_complements(
     mut complements: Vec<DurableMigrationComplement>,
-    base_schema: kernel_types::SchemaRevisionId,
+    checkpoint_schema: kernel_types::SchemaRevisionId,
     scan: &RecoveryScan,
 ) -> Result<(Vec<DurableMigrationComplement>, MigrationComplementIndex), DurabilityError> {
+    // The complement chain is historical lineage, not a projection of the
+    // current checkpoint schema.  Once a checkpoint has crossed A -> B, the
+    // durable chain still starts at A even though the checkpoint itself is B.
+    let base_schema = complements
+        .first()
+        .map_or(checkpoint_schema, |first| first.source_schema);
     let mut index = migration_complement_index(&complements, base_schema)?;
     for committed in scan.committed() {
         if let DurableTransactionIntent::SchemaMigrationExact {
@@ -215,6 +256,63 @@ fn open_published_generation(
     Ok((checkpoint, wal, scan))
 }
 
+fn scan_published_generation_read_only(
+    directory: &Path,
+    manifest: ManifestRecord,
+    registry: &SemanticRegistry,
+) -> Result<(Revision, RecoveryScan), DurabilityError> {
+    let checkpoint = read_checkpoint_generation(directory, manifest, registry)?;
+    if checkpoint.id() != manifest.base_revision {
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "manifest base revision does not match checkpoint",
+        });
+    }
+    let prepared_capsule = if manifest.prepared_capsule_crc32c == 0 {
+        PreparedCutCapsule::default()
+    } else {
+        read_prepared_cut_capsule_file(
+            &prepared_capsule_path(directory, manifest.generation),
+            manifest.prepared_capsule_crc32c,
+        )?
+    };
+    let wal_file = wal_path(directory, manifest.generation);
+    if !wal_file.is_file() {
+        return Err(DurabilityError::Corruption {
+            offset: 0,
+            reason: "published WAL segment is missing",
+        });
+    }
+    let seeds = prepared_capsule.scan_seeds();
+    let scan = FileRevisionWal::scan_recovered_seeded_read_only(
+        &wal_file,
+        checkpoint.id(),
+        manifest.wal_first_lsn,
+        &seeds,
+    )?;
+    if scan.next_lsn() <= manifest.published_tail_lsn {
+        return Err(DurabilityError::Corruption {
+            offset: scan.last_good_offset(),
+            reason: "published shadow WAL tail is shorter than manifest certificate",
+        });
+    }
+    let certified_head = scan
+        .committed()
+        .iter()
+        .take_while(|committed| committed.commit_lsn <= manifest.published_tail_lsn)
+        .last()
+        .map_or(checkpoint.id(), |committed| {
+            committed.descriptor.target_revision
+        });
+    if certified_head != manifest.published_head {
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "published WAL certificate does not reach manifest head exactly",
+        });
+    }
+    Ok((checkpoint, scan))
+}
+
 fn recover_retry_ledger(
     committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
     current: IdempotencyEpoch,
@@ -248,6 +346,7 @@ pub(super) fn recover_canonical_state(
     metadata: metadata::DurableStoreMetadata,
     checkpoint: Revision,
     scan: &RecoveryScan,
+    generation: u64,
     legacy_registry: Option<&SemanticRegistry>,
 ) -> Result<CanonicalDurableState, DurabilityError> {
     let mut registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
@@ -276,6 +375,48 @@ pub(super) fn recover_canonical_state(
         &revision_effects,
         &revision_effect_frontiers,
     )?;
+    let mut historical_epoch_anchors = metadata.historical_epoch_anchors;
+    for (effect_id, anchor) in &historical_epoch_anchors {
+        let Some(event) = revision_effects
+            .get(effect_id)
+            .and_then(DurableRevisionEffectRecord::semantic_change_event)
+        else {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "historical epoch anchor does not reference a semantic migration effect",
+            });
+        };
+        if anchor.effect_id != *effect_id
+            || anchor.source_revision != event.source_revision
+            || anchor.source_schema != event.source_schema
+            || anchor.generation == 0
+        {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "historical epoch anchor does not match its semantic migration boundary",
+            });
+        }
+    }
+    for committed in scan.committed() {
+        let effect_id = committed
+            .descriptor
+            .revision_effect_id
+            .unwrap_or(RevisionEffectId(committed.descriptor.transaction_id.raw()));
+        let Some(event) = revision_effects
+            .get(&effect_id)
+            .and_then(DurableRevisionEffectRecord::semantic_change_event)
+        else {
+            continue;
+        };
+        historical_epoch_anchors
+            .entry(effect_id)
+            .or_insert(HistoricalEpochAnchor {
+                effect_id,
+                source_revision: event.source_revision,
+                source_schema: event.source_schema,
+                generation,
+            });
+    }
     let next_revision_effect_id = revision_effects
         .keys()
         .map(|id| id.0)
@@ -295,6 +436,7 @@ pub(super) fn recover_canonical_state(
         artifact_cores: metadata.artifact_cores,
         migration_complements,
         migration_complement_index,
+        historical_epoch_anchors,
         current_idempotency_epoch,
         minimum_retry_epoch,
         committed_transactions,
@@ -337,6 +479,148 @@ fn validate_replicated_authority(
 }
 
 impl DurableRevisionStore {
+    pub fn historical_epoch_material(
+        &mut self,
+        effect_id: RevisionEffectId,
+    ) -> Result<Option<HistoricalEpochMaterial>, DurabilityError> {
+        let Some(anchor) = self.historical_epoch_anchors.get(&effect_id).copied() else {
+            return Ok(None);
+        };
+
+        let (generation, metadata, checkpoint, scan) = if self.backend.is_single_file() {
+            let active_generation = self.generation;
+            let container = self.backend.single_file_container()?;
+            if anchor.generation == active_generation {
+                let view = container.generation_view()?;
+                if view.generation != anchor.generation {
+                    return Err(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "single-file historical epoch anchor generation is not active",
+                    });
+                }
+                let metadata = container
+                    .with_section_reader(
+                        crate::single_file::SingleFileSectionKind::Metadata,
+                        0,
+                        |reader, len| {
+                            metadata::decode_from_reader(reader, len)
+                                .map_err(|reason| DurabilityError::Corruption { offset: 0, reason })
+                        },
+                    )?
+                    .ok_or(DurabilityError::Corruption {
+                        offset: 0,
+                        reason: "single-file historical metadata section is missing",
+                    })?;
+                let initial_registry = rebuild_semantic_registry(&metadata, None)?;
+                let checkpoint = container
+                    .with_section_reader(
+                        crate::single_file::SingleFileSectionKind::Checkpoint,
+                        0,
+                        |reader, len| {
+                            checkpoint::decode_revision_from_reader(reader, len, &initial_registry)
+                        },
+                    )?
+                    .ok_or(DurabilityError::Corruption {
+                        offset: 0,
+                        reason: "single-file historical checkpoint section is missing",
+                    })?;
+                let prepared = container
+                    .read_section(
+                        crate::single_file::SingleFileSectionKind::PreparedCapsule,
+                        0,
+                    )?
+                    .map_or_else(
+                        || Ok(PreparedCutCapsule::default()),
+                        |bytes| decode_prepared_cut_capsule(&bytes),
+                    )?;
+                let scan = container
+                    .scan_active_journal_read_only(checkpoint.id(), &prepared.scan_seeds())?;
+                (view.generation, metadata, checkpoint, scan)
+            } else {
+                let metadata = container
+                    .with_historical_epoch_section_reader(
+                        anchor.generation,
+                        crate::single_file::SingleFileSectionKind::HistoricalMetadata,
+                        |reader, len| {
+                            metadata::decode_from_reader(reader, len)
+                                .map_err(|reason| DurabilityError::Corruption { offset: 0, reason })
+                        },
+                    )?
+                    .ok_or(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "single-file historical epoch archive is missing metadata authority",
+                    })?;
+                let initial_registry = rebuild_semantic_registry(&metadata, None)?;
+                let checkpoint = container
+                    .with_historical_epoch_section_reader(
+                        anchor.generation,
+                        crate::single_file::SingleFileSectionKind::HistoricalCheckpoint,
+                        |reader, len| {
+                            checkpoint::decode_revision_from_reader(reader, len, &initial_registry)
+                        },
+                    )?
+                    .ok_or(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "single-file historical epoch archive is missing checkpoint authority",
+                    })?;
+                let prepared = container
+                    .read_historical_epoch_section(
+                        anchor.generation,
+                        crate::single_file::SingleFileSectionKind::HistoricalPreparedCapsule,
+                    )?
+                    .map_or_else(
+                        || Ok(PreparedCutCapsule::default()),
+                        |bytes| decode_prepared_cut_capsule(&bytes),
+                    )?;
+                let scan = container
+                    .scan_historical_epoch_journal(anchor.generation, &prepared.scan_seeds())?
+                    .ok_or(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "single-file historical epoch archive is missing WAL authority",
+                    })?;
+                (anchor.generation, metadata, checkpoint, scan)
+            }
+        } else {
+            let directory = self.backend.historical_directory_root()?;
+            let manifest = read_manifest_generation(directory, anchor.generation)?;
+            let metadata = read_published_metadata(directory, manifest)?;
+            let initial_registry = rebuild_semantic_registry(&metadata, None)?;
+            let (checkpoint, scan) =
+                scan_published_generation_read_only(directory, manifest, &initial_registry)?;
+            (manifest.generation, metadata, checkpoint, scan)
+        };
+
+        let initial_registry = rebuild_semantic_registry(&metadata, None)?;
+        let _canonical =
+            recover_canonical_state(metadata, checkpoint.clone(), &scan, generation, None)?;
+        let mut historical_registry = initial_registry;
+        let mut source_present = anchor.source_revision == checkpoint.id();
+        if !source_present {
+            for committed in scan.committed() {
+                install_intent_semantic_modules(
+                    &mut historical_registry,
+                    &committed.descriptor.intent,
+                )?;
+                if committed.descriptor.target_revision == anchor.source_revision {
+                    source_present = true;
+                    break;
+                }
+            }
+        }
+        if !source_present {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "historical epoch anchor source revision is absent from its durable generation",
+            });
+        }
+        Ok(Some(HistoricalEpochMaterial {
+            generation,
+            checkpoint,
+            recovery_scan: scan,
+            semantic_registry: historical_registry,
+        }))
+    }
+
     /// Opens a store only after the target directory has passed the named
     /// supported-platform durability profile and live fsync/rename probe.
     pub fn open_on_supported_platform(
@@ -395,6 +679,7 @@ impl DurableRevisionStore {
         remove_orphan_checkpoint_stream_spools(&directory)?;
         let manifest = read_current_manifest(&directory)?;
         let metadata = read_published_metadata(&directory, manifest)?;
+        let checkpoint_realization_binding = metadata.checkpoint_realization;
         if metadata.external_freshness.is_some() && !allow_external_freshness {
             return Err(DurabilityError::Protocol {
                 offset: 0,
@@ -403,7 +688,13 @@ impl DurableRevisionStore {
         }
         let registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
         let (checkpoint, wal, scan) = open_published_generation(&directory, manifest, &registry)?;
-        let mut canonical = recover_canonical_state(metadata, checkpoint, &scan, legacy_registry)?;
+        let mut canonical = recover_canonical_state(
+            metadata,
+            checkpoint,
+            &scan,
+            manifest.generation,
+            legacy_registry,
+        )?;
         let replication =
             ReplicationAuthorityJournal::open_or_create(directory.join("replication.cfre"))?;
         validate_replicated_authority(&mut canonical, &replication)?;
@@ -415,6 +706,21 @@ impl DurableRevisionStore {
             wal,
             replication,
         );
+        store.checkpoint_realization = checkpoint_realization_binding
+            .map(|binding| {
+                if binding.revision != store.checkpoint.id() {
+                    return Err(DurabilityError::Corruption {
+                        offset: 0,
+                        reason: "published durable realization is bound to a different checkpoint revision",
+                    });
+                }
+                read_published_factorized_realization(
+                    store.backend.directory_root()?,
+                    manifest.generation,
+                    binding,
+                )
+            })
+            .transpose()?;
         store.prepared_transactions = prepared_transactions;
         Ok((store, scan))
     }

@@ -133,5 +133,58 @@ struct BadVia {
 fn main() {}
 RS
 
+run_fail '#[cfmd(range(...))] requires an i64 field' <<'RS'
+use cfmd::{CfmdEntity, Id};
+
+#[derive(CfmdEntity)]
+#[cfmd(key = "ui.bad-range-rule")]
+struct BadRangeRule {
+    #[cfmd(id)]
+    id: Id<BadRangeRule>,
+    #[cfmd(range(min = 0, max = 10))]
+    name: String,
+}
+
+fn main() {}
+RS
+
+run_fail 'CFMD rule bounds must be integer literals, not host-language expressions' <<'RS'
+use cfmd::{CfmdEntity, Id};
+
+const MIN_AGE: i64 = 0;
+
+#[derive(CfmdEntity)]
+#[cfmd(key = "ui.dynamic-range-rule")]
+struct DynamicRangeRule {
+    #[cfmd(id)]
+    id: Id<DynamicRangeRule>,
+    #[cfmd(range(min = MIN_AGE))]
+    age: i64,
+}
+
+fn main() {}
+RS
+
+run_fail 'DatabaseDefinition' <<'RS'
+use cfmd::{CfmdEntity, CfmdSchema, EntitySet, Id};
+
+#[derive(CfmdEntity)]
+#[cfmd(key = "ui.reader-user")]
+struct ReaderUser {
+    #[cfmd(id)]
+    id: Id<ReaderUser>,
+    name: String,
+}
+
+#[derive(CfmdSchema)]
+struct ReaderSchema {
+    users: EntitySet<ReaderUser>,
+}
+
+fn main() {
+    let _ = ReaderSchema::database("reader.cfmd").create();
+}
+RS
+
 rm -rf "$TMP"
 echo 'cfmd derive compile-time diagnostics: PASS'

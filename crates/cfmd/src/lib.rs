@@ -13,27 +13,31 @@ mod diagnostic;
 
 pub use diagnostic::{Diagnostic, DiagnosticCode, ErrorDiagnosticExt, Severity};
 
-pub use cfmd_derive::CfmdEntity;
+pub use cfmd_derive::{CfmdEntity, CfmdSchema};
 pub use cfmd_runtime::{cfmd_entity, cfmd_object};
 
 pub use cfmd_runtime::{
-    BetweenPredicate, Candidate, CandidateDerivedEffects, CandidateDiagnostics, CandidateEffects,
-    CandidateObjectQuery, CandidateObjectSet, CandidatePreview, CandidateProjectionQuery,
-    CandidateReadiness, CommitOutcome, Database, DatabaseBuilder, Encryption, EncryptionKey,
+    AndPredicate, BetweenPredicate, Candidate, CandidateDerivedEffects, CandidateDiagnostics,
+    CandidateEffects, CandidateGroupedAggregateQuery, CandidateObjectQuery, CandidateObjectSet,
+    CandidatePreview, CandidateProjectionQuery, CandidateReadiness, CommitOutcome, Database,
+    DatabaseBuilder, DatabaseDefinition, EntitySet, SchemaDatabase, SchemaDatabaseBuilder,
+    Encryption, EncryptionKey,
     EncryptionKeyAcknowledgement, EncryptionKeyDestination, EncryptionKeyId,
-    EncryptionKeyOperation, EncryptionKeyProvider, EncryptionProviderKeyMetadata, Error, ErrorKind,
-    Field, History, HistoryEffectKind, HistoryEntry, HistoryRelationChange, HistoryReversibility,
-    HistoryUndoReadiness, Id, InProcessPublicationNotifier, Many, ManyCount, ManyCountEq,
+    EncryptionKeyOperation, EncryptionKeyProvider, EncryptionProviderKeyMetadata, Error, ErrorKind, FieldRule,
+    EqOperand, EqPredicate, Field, GroupKey, GroupedAggregateQuery, GroupedAggregateWatch, GroupedAggregateWatchEvent, History,
+    HistoryEffectKind, HistoryEntry, HistoryRelationChange, HistoryReversibility,
+    HistoryUndoReadiness, Id, InProcessPublicationNotifier, Many, ManyCount, ManyCountPredicate,
     ManyField, ManyPredicate, ManySelection, Object, ObjectEquivalence, ObjectFieldRole,
-    ObjectFieldSchema, ObjectManyFieldSchema, ObjectPredicate, ObjectProjectionQuery, ObjectProxy,
-    ObjectQuery, ObjectRelationshipCardinality, ObjectSet, ObjectValue, ObjectWatch,
+    NotPredicate, ObjectFieldSchema, ObjectManyFieldSchema, ObjectPredicate, ObjectProjectionQuery, ObjectProxy,
+    OrPredicate,
+    ObjectQuery, ObjectRelationshipCardinality, ObjectSet, ObjectPatchField, ObjectValue, ObjectWatch,
     ObjectWatchEvent, OptionalRefField, OptionalRefIsSome, OrderPredicate, OrderedObjectValue,
-    OrphanPolicy, OwnedMany, OwnedManySelection, Permission, PermissionSet, Plan, PrincipalId,
-    Projection, ProjectionWatch, ProjectionWatchEvent, PublicationNotifier, QueryNodeId,
-    QuerySource, ReadContext, Ref, RefField, RefPredicate, RelationChange, Result, RevisionId,
-    Schema, Session, SessionDatabase, SessionSnapshot, Storage, Transaction, TransactionId,
-    ValueCodec, WatchCancellation, WatchDrain, WatchNext, WatchReadiness, WatchReadinessSourceId,
-    WatchStatus, WatchSubscriptionId, WatchWake,
+    OrphanPolicy, OwnedMany, OwnedManySelection, Permission, PermissionSet, Plan, PrincipalId, Role,
+    PathField, PathPredicate, Projection, ProjectionWatch, ProjectionWatchEvent, PublicationNotifier, QueryNodeId,
+    QuerySource, Ref, RefField, RefPath, RefPredicate, RelationChange, Result, RevisionId, RuleValueExpr,
+    CfmdSchema, Context, DatabaseContext, Schema, SemanticRuleExpr, Session, SessionDatabase, SessionSnapshot, Snapshot, Storage, TextPattern, Transaction, TransactionId,
+    TransactionReadiness, ValueCodec, WatchCancellation, WatchDrain, WatchNext, WatchReadiness,
+    WatchReadinessSourceId, WatchStatus, WatchSubscriptionId, WatchWake,
 };
 
 #[doc(hidden)]
@@ -43,7 +47,8 @@ pub mod __private {
         __append_remove_many_edges as append_remove_many_edges,
         __identity_equivalence_id as identity_equivalence_id,
         __many_relation_id as many_relation_id, __register_owned_many as register_owned_many,
-        __row_shape_error as row_shape_error, Relation, Row, RowCodec, Type, ValueCodec,
+        __row_shape_error as row_shape_error, AuthoritativeObject, Relation, Row, RowCodec,
+        ContextSource, ReadContext, SchemaAuthorityEmpty, SchemaAuthorityLeaf, SchemaAuthorityPair, Type, ValueCodec,
     };
 }
 
@@ -53,7 +58,7 @@ pub mod __private {
 /// object-first root surface and symbolic object proxies.
 pub mod dynamic {
     pub use cfmd_runtime::{
-        BetweenPredicate, EntityRef, EqPredicate, EquivalenceId, Field, FieldId, OrderComparison,
+        BetweenPredicate, EntityRef, EqPredicate, EquivalenceId, Field, FieldId, FieldRule, OrderComparison,
         OrderDirection, OrderPredicate, OrderingId, PreparedQuery, PreparedTypedQuery,
         PrimitiveEquivalence, PrimitiveOrdering, Query, QueryNode, QueryNodeKind, QueryWatch,
         Relation, RelationId, RelationQuery, RelationResult, RelationSchema, RelationSemantics,
@@ -65,8 +70,8 @@ pub mod dynamic {
 /// Common object-first imports for Rust applications.
 pub mod prelude {
     pub use crate::{
-        CfmdEntity, Database, ErrorDiagnosticExt, Id, Many, Object, OrphanPolicy, OwnedMany, Plan,
-        PrincipalId, Ref, Result, RevisionId, Schema, Storage, Transaction, TransactionId,
-        cfmd_entity, cfmd_object,
+        CfmdEntity, CfmdSchema, Database, EntitySet, ErrorDiagnosticExt, Id, Many, Object, ObjectPredicate, OrphanPolicy,
+        OwnedMany, PrincipalId, Ref, Result, RevisionId, Schema, Storage, Transaction,
+        TransactionId, TransactionReadiness, cfmd_entity, cfmd_object,
     };
 }

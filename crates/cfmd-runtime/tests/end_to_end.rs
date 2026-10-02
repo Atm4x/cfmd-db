@@ -31,7 +31,7 @@ fn product_api_creates_opens_queries_and_commits_without_kernel_imports() {
     let database = Database::create(&directory, schema).expect("create through product facade");
     let initial = database.snapshot().expect("snapshot");
     assert_eq!(initial.revision().raw(), 1);
-    let schema = initial.schema();
+    let schema = initial.schema().expect("model read");
     assert_eq!(schema.revision(), 1);
     assert_eq!(
         schema.relation(relation).expect("relation").columns(),
@@ -44,7 +44,7 @@ fn product_api_creates_opens_queries_and_commits_without_kernel_imports() {
         .insert(relation, vec![Value::I64(2)]);
     assert_eq!(
         database
-            .commit(&seed, TransactionId::new(699))
+            .commit_plan(&seed, TransactionId::new(699))
             .expect("seed commit"),
         CommitOutcome::Committed {
             revision: cfmd_runtime::RevisionId::new(2)
@@ -62,7 +62,7 @@ fn product_api_creates_opens_queries_and_commits_without_kernel_imports() {
     let mut plan = database.plan().expect("plan");
     plan.insert(relation, vec![Value::I64(3)]);
     let outcome = database
-        .commit(&plan, TransactionId::new(700))
+        .commit_plan(&plan, TransactionId::new(700))
         .expect("commit product plan");
     assert_eq!(
         outcome,
@@ -72,7 +72,7 @@ fn product_api_creates_opens_queries_and_commits_without_kernel_imports() {
     );
     assert_eq!(
         database
-            .commit(&plan, TransactionId::new(700))
+            .commit_plan(&plan, TransactionId::new(700))
             .expect("idempotent retry"),
         CommitOutcome::AlreadyCommitted {
             revision: cfmd_runtime::RevisionId::new(3)
@@ -82,7 +82,7 @@ fn product_api_creates_opens_queries_and_commits_without_kernel_imports() {
     conflicting.insert(relation, vec![Value::I64(4)]);
     assert_eq!(
         database
-            .commit(&conflicting, TransactionId::new(700))
+            .commit_plan(&conflicting, TransactionId::new(700))
             .expect_err("transaction identity must bind intent")
             .kind(),
         cfmd_runtime::ErrorKind::TransactionConflict
@@ -148,7 +148,7 @@ fn typed_rust_query_uses_domain_fields_and_typed_projection() {
         .insert_typed(&numbers, (2_i64, "two".to_owned()))
         .expect("typed insert");
     database
-        .commit(&seed, TransactionId::new(902))
+        .commit_plan(&seed, TransactionId::new(902))
         .expect("seed data");
     drop(initial);
 
@@ -229,7 +229,7 @@ fn object_first_schema_query_and_plan_results_need_no_relation_plumbing() {
         })
         .expect("insert plan");
     database
-        .commit(&insert, TransactionId::new(2_840))
+        .commit_plan(&insert, TransactionId::new(2_840))
         .expect("commit object insert");
     drop(users);
     drop(snapshot);
@@ -247,13 +247,13 @@ fn object_first_schema_query_and_plan_results_need_no_relation_plumbing() {
 
     let update = users
         .where_(|u| u.id().eq(1))
-        .update(|mut user| {
+        .update_plan(|mut user| {
             user.name = "Artem II".to_owned();
             user
         })
         .expect("query produces update plan");
     database
-        .commit(&update, TransactionId::new(2_841))
+        .commit_plan(&update, TransactionId::new(2_841))
         .expect("commit object update");
     drop(users);
     drop(snapshot);
@@ -274,10 +274,10 @@ fn object_first_schema_query_and_plan_results_need_no_relation_plumbing() {
 
     let delete = users
         .where_(|u| u.id().eq(1))
-        .delete()
+        .delete_plan()
         .expect("query produces delete plan");
     database
-        .commit(&delete, TransactionId::new(2_842))
+        .commit_plan(&delete, TransactionId::new(2_842))
         .expect("commit object delete");
     drop(users);
     drop(snapshot);
@@ -329,7 +329,7 @@ fn plans_are_bound_to_one_open_database_instance() {
     let rows = snapshot.objects::<BoundRow>().expect("rows");
     let plan = rows.insert(BoundRow { value: 7 }).expect("plan");
     let error = right
-        .commit(&plan, TransactionId::new(2_843))
+        .commit_plan(&plan, TransactionId::new(2_843))
         .expect_err("cross-database plan must fail closed");
     assert_eq!(error.kind(), cfmd_runtime::ErrorKind::InvalidPlan);
     drop(rows);
@@ -415,7 +415,7 @@ fn entity_refs_validate_atomically_and_deep_predicates_preserve_root_shape() {
         )
         .expect("compose");
     database
-        .commit(&plan, TransactionId::new(2_850))
+        .commit_plan(&plan, TransactionId::new(2_850))
         .expect("atomic strong-ref commit");
     drop(people);
     drop(passports);
@@ -445,7 +445,7 @@ fn entity_refs_validate_atomically_and_deep_predicates_preserve_root_shape() {
         })
         .expect("dangling plan is inspectable before commit");
     let error = database
-        .commit(&dangling, TransactionId::new(2_851))
+        .commit_plan(&dangling, TransactionId::new(2_851))
         .expect_err("strong reference must fail closed at commit");
     assert_eq!(error.kind(), cfmd_runtime::ErrorKind::InvariantViolation);
 
@@ -457,7 +457,7 @@ fn entity_refs_validate_atomically_and_deep_predicates_preserve_root_shape() {
         })
         .expect("duplicate plan is inspectable before commit");
     let error = database
-        .commit(&duplicate, TransactionId::new(2_852))
+        .commit_plan(&duplicate, TransactionId::new(2_852))
         .expect_err("identity must be unique");
     assert_eq!(error.kind(), cfmd_runtime::ErrorKind::InvariantViolation);
 
@@ -502,7 +502,7 @@ fn kernel_lifecycle_rejects_deleting_a_referenced_target_after_reopen() {
         )
         .expect("compose");
     database
-        .commit(&plan, TransactionId::new(2_855))
+        .commit_plan(&plan, TransactionId::new(2_855))
         .expect("seed related entities");
     drop(passports);
     drop(countries);
@@ -514,10 +514,10 @@ fn kernel_lifecycle_rejects_deleting_a_referenced_target_after_reopen() {
     let countries = snapshot.objects::<Country>().expect("countries");
     let delete = countries
         .where_(|country| country.id().eq(country_id))
-        .delete()
+        .delete_plan()
         .expect("delete plan");
     let error = database
-        .commit(&delete, TransactionId::new(2_856))
+        .commit_plan(&delete, TransactionId::new(2_856))
         .expect_err("kernel lifecycle must reject a dangling strong reference");
     assert_eq!(error.kind(), cfmd_runtime::ErrorKind::InvariantViolation);
 
@@ -624,7 +624,7 @@ fn optional_refs_have_explicit_cardinality_semantics() {
         )
         .expect("compose");
     database
-        .commit(&plan, TransactionId::new(2_860))
+        .commit_plan(&plan, TransactionId::new(2_860))
         .expect("cardinality commit");
     drop(children);
     drop(parents);
@@ -667,7 +667,7 @@ fn optional_refs_have_explicit_cardinality_semantics() {
         })
         .expect("dangling optional ref plan");
     let error = database
-        .commit(&dangling, TransactionId::new(2_861))
+        .commit_plan(&dangling, TransactionId::new(2_861))
         .expect_err("optional strong ref must validate when present");
     assert_eq!(error.kind(), cfmd_runtime::ErrorKind::InvariantViolation);
 
@@ -700,9 +700,8 @@ fn candidate_previews_object_future_and_commits_the_same_plan() {
             code: "NL".into(),
         })
         .expect("seed plan");
-    seed.candidate()
-        .expect("seed candidate")
-        .commit(TransactionId::new(2_900))
+    database
+        .commit_plan(&seed, TransactionId::new(2_900))
         .expect("seed commit");
     drop(countries);
     drop(snapshot);
@@ -727,7 +726,7 @@ fn candidate_previews_object_future_and_commits_the_same_plan() {
 
     let plan = countries
         .where_(|country| country.id().eq(id))
-        .update(|mut country| {
+        .update_plan(|mut country| {
             country.code = "DE".into();
             country
         })
@@ -778,16 +777,16 @@ fn candidate_previews_object_future_and_commits_the_same_plan() {
     );
 
     assert_eq!(
-        candidate
-            .commit(TransactionId::new(2_901))
+        database
+            .commit_plan(&plan, TransactionId::new(2_901))
             .expect("candidate commit"),
         CommitOutcome::Committed {
             revision: candidate.revision()
         }
     );
     assert_eq!(
-        candidate
-            .commit(TransactionId::new(2_901))
+        database
+            .commit_plan(&plan, TransactionId::new(2_901))
             .expect("candidate retry"),
         CommitOutcome::AlreadyCommitted {
             revision: candidate.revision()
@@ -850,8 +849,8 @@ fn relation_only_plan_candidate_uses_the_same_derived_endpoint_as_commit() {
         candidate.execute(&Query::scan(relation)).expect("preview"),
         RelationResult::Bag(vec![vec![Value::I64(7)]])
     );
-    candidate
-        .commit(TransactionId::new(2_902))
+    database
+        .commit_plan(&plan, TransactionId::new(2_902))
         .expect("commit exact candidate intent");
     let snapshot = database.snapshot().expect("snapshot");
     assert_eq!(
@@ -881,13 +880,13 @@ fn durable_history_derives_undo_and_redo_as_ordinary_plans() {
     let mut seed = database.plan().expect("seed plan");
     seed.insert(relation, vec![Value::I64(1)]);
     database
-        .commit(&seed, TransactionId::new(7_710))
+        .commit_plan(&seed, TransactionId::new(7_710))
         .expect("seed commit");
 
     let mut change = database.plan().expect("change plan");
     change.insert(relation, vec![Value::I64(2)]);
     database
-        .commit(&change, TransactionId::new(7_711))
+        .commit_plan(&change, TransactionId::new(7_711))
         .expect("change commit");
 
     let history = database.history().expect("durable history");
@@ -908,9 +907,9 @@ fn durable_history_derives_undo_and_redo_as_ordinary_plans() {
     let preview = undo.candidate().expect("preview undo");
     assert_eq!(preview.source_revision(), cfmd_runtime::RevisionId::new(3));
     assert_eq!(preview.revision(), cfmd_runtime::RevisionId::new(4));
-    preview
-        .commit(TransactionId::new(7_712))
-        .expect("commit ordinary undo candidate");
+    database
+        .commit_plan(&undo, TransactionId::new(7_712))
+        .expect("commit ordinary undo plan");
     assert_eq!(
         database
             .snapshot()
@@ -924,9 +923,9 @@ fn durable_history_derives_undo_and_redo_as_ordinary_plans() {
     let undo_entry = redo_history.latest().expect("undo history entry");
     assert_eq!(undo_entry.transaction(), TransactionId::new(7_712));
     let redo = undo_entry.undo_plan().expect("undo-of-undo is redo plan");
-    redo.candidate()
-        .expect("preview redo")
-        .commit(TransactionId::new(7_713))
+    let _redo_candidate = redo.candidate().expect("preview redo");
+    database
+        .commit_plan(&redo, TransactionId::new(7_713))
         .expect("commit redo");
     assert_eq!(
         database
@@ -974,7 +973,7 @@ fn object_history_persists_exact_lifecycle_complement_for_undo_and_redo() {
         })
         .expect("seed plan");
     database
-        .commit(&seed, TransactionId::new(7_720))
+        .commit_plan(&seed, TransactionId::new(7_720))
         .expect("seed entity");
     drop(countries);
     drop(snapshot);
@@ -1000,9 +999,9 @@ fn object_history_persists_exact_lifecycle_complement_for_undo_and_redo() {
             .expect("candidate lookup")
             .is_none()
     );
-    candidate
-        .commit(TransactionId::new(7_721))
-        .expect("commit entity removal through ordinary candidate");
+    database
+        .commit_plan(&undo, TransactionId::new(7_721))
+        .expect("commit entity removal through ordinary plan");
     drop(database);
 
     let database = Database::open(&directory).expect("reopen before redo");
@@ -1023,8 +1022,8 @@ fn object_history_persists_exact_lifecycle_complement_for_undo_and_redo() {
             .code,
         "NL"
     );
-    candidate
-        .commit(TransactionId::new(7_722))
+    database
+        .commit_plan(&redo, TransactionId::new(7_722))
         .expect("commit redo");
     drop(database);
 
@@ -1088,7 +1087,7 @@ fn object_history_persists_reference_field_complement() {
         )
         .expect("compose passport");
     database
-        .commit(&seed, TransactionId::new(7_730))
+        .commit_plan(&seed, TransactionId::new(7_730))
         .expect("seed referenced entities");
     drop(passports);
     drop(countries);
@@ -1098,13 +1097,13 @@ fn object_history_persists_reference_field_complement() {
     let passports = snapshot.objects::<Passport>().expect("passports");
     let update = passports
         .where_(|passport| passport.id().eq(passport_id))
-        .update(|mut passport| {
+        .update_plan(|mut passport| {
             passport.country = Ref::new(second);
             passport
         })
         .expect("reference update");
     database
-        .commit(&update, TransactionId::new(7_731))
+        .commit_plan(&update, TransactionId::new(7_731))
         .expect("commit reference update");
     drop(passports);
     drop(snapshot);
@@ -1133,8 +1132,8 @@ fn object_history_persists_reference_field_complement() {
             .country,
         Ref::new(first)
     );
-    candidate
-        .commit(TransactionId::new(7_732))
+    database
+        .commit_plan(&undo, TransactionId::new(7_732))
         .expect("commit reference undo");
     drop(database);
     fs::remove_dir_all(directory).expect("remove fixture directory");
@@ -1156,14 +1155,14 @@ fn historical_at_reuses_typed_reads_and_anchors_history() {
     let mut first = database.plan().expect("first plan");
     first.insert(relation, vec![Value::I64(10)]);
     database
-        .commit(&first, TransactionId::new(7_810))
+        .commit_plan(&first, TransactionId::new(7_810))
         .expect("first commit");
     let first_revision = database.current_revision().expect("first revision");
 
     let mut second = database.plan().expect("second plan");
     second.insert(relation, vec![Value::I64(20)]);
     database
-        .commit(&second, TransactionId::new(7_811))
+        .commit_plan(&second, TransactionId::new(7_811))
         .expect("second commit");
 
     let past = database.at(first_revision).expect("historical snapshot");
@@ -1223,7 +1222,7 @@ fn historical_at_reconstructs_object_lifecycle_and_is_read_only() {
         })
         .expect("insert plan");
     database
-        .commit(&insert, TransactionId::new(7_820))
+        .commit_plan(&insert, TransactionId::new(7_820))
         .expect("insert country");
     let inserted_revision = database.current_revision().expect("inserted revision");
     drop(live);
@@ -1233,13 +1232,13 @@ fn historical_at_reconstructs_object_lifecycle_and_is_read_only() {
         .objects::<Country>()
         .expect("countries")
         .where_(|country| country.id().eq(id))
-        .update(|mut country| {
+        .update_plan(|mut country| {
             country.code = "DE".into();
             country
         })
         .expect("update plan");
     database
-        .commit(&update, TransactionId::new(7_821))
+        .commit_plan(&update, TransactionId::new(7_821))
         .expect("update country");
     drop(live);
 
@@ -1292,12 +1291,12 @@ fn non_head_history_undo_rebases_over_disjoint_canonical_relation_classes() {
     let mut first = database.plan().expect("first plan");
     first.insert(relation, vec![Value::I64(1)]);
     database
-        .commit(&first, TransactionId::new(7_910))
+        .commit_plan(&first, TransactionId::new(7_910))
         .expect("first commit");
     let mut second = database.plan().expect("second plan");
     second.insert(relation, vec![Value::I64(2)]);
     database
-        .commit(&second, TransactionId::new(7_911))
+        .commit_plan(&second, TransactionId::new(7_911))
         .expect("second commit");
     drop(database);
 
@@ -1320,10 +1319,9 @@ fn non_head_history_undo_rebases_over_disjoint_canonical_relation_classes() {
     let rebased = first_entry
         .undo_plan()
         .expect("certified rebased undo plan");
-    rebased
-        .candidate()
-        .expect("rebased candidate")
-        .commit(TransactionId::new(7_912))
+    let _rebased_candidate = rebased.candidate().expect("rebased candidate");
+    database
+        .commit_plan(&rebased, TransactionId::new(7_912))
         .expect("commit rebased undo");
     assert_eq!(
         database
@@ -1356,7 +1354,7 @@ fn non_head_history_undo_reports_same_coordinate_conflict() {
     let mut first = database.plan().expect("first plan");
     first.insert(relation, vec![Value::I64(1)]);
     database
-        .commit(&first, TransactionId::new(7_930))
+        .commit_plan(&first, TransactionId::new(7_930))
         .expect("first commit");
     let first_entry = database
         .history()
@@ -1368,7 +1366,7 @@ fn non_head_history_undo_reports_same_coordinate_conflict() {
     let mut second = database.plan().expect("second plan");
     second.remove(relation, vec![Value::I64(1)]);
     database
-        .commit(&second, TransactionId::new(7_931))
+        .commit_plan(&second, TransactionId::new(7_931))
         .expect("second commit");
 
     assert!(matches!(
@@ -1420,7 +1418,7 @@ fn non_head_object_undo_rebases_over_disjoint_entity_coordinates() {
         )
         .expect("compose seed");
     database
-        .commit(&seed, TransactionId::new(7_940))
+        .commit_plan(&seed, TransactionId::new(7_940))
         .expect("seed countries");
     drop(countries);
     drop(snapshot);
@@ -1430,13 +1428,13 @@ fn non_head_object_undo_rebases_over_disjoint_entity_coordinates() {
         .objects::<Country>()
         .expect("countries")
         .where_(|country| country.id().eq(first_id))
-        .update(|mut country| {
+        .update_plan(|mut country| {
             country.code = "DE".into();
             country
         })
         .expect("first update");
     database
-        .commit(&first_change, TransactionId::new(7_941))
+        .commit_plan(&first_change, TransactionId::new(7_941))
         .expect("first update commit");
     drop(snapshot);
 
@@ -1445,13 +1443,13 @@ fn non_head_object_undo_rebases_over_disjoint_entity_coordinates() {
         .objects::<Country>()
         .expect("countries")
         .where_(|country| country.id().eq(second_id))
-        .update(|mut country| {
+        .update_plan(|mut country| {
             country.code = "CA".into();
             country
         })
         .expect("second update");
     database
-        .commit(&second_change, TransactionId::new(7_942))
+        .commit_plan(&second_change, TransactionId::new(7_942))
         .expect("second update commit");
     drop(snapshot);
 
@@ -1465,12 +1463,10 @@ fn non_head_object_undo_rebases_over_disjoint_entity_coordinates() {
         first_update.undo_readiness(),
         HistoryUndoReadiness::Rebased { .. }
     ));
-    first_update
-        .undo_plan()
-        .expect("rebased object undo")
-        .candidate()
-        .expect("candidate")
-        .commit(TransactionId::new(7_943))
+    let rebased_undo = first_update.undo_plan().expect("rebased object undo");
+    let _candidate = rebased_undo.candidate().expect("candidate");
+    database
+        .commit_plan(&rebased_undo, TransactionId::new(7_943))
         .expect("commit object undo");
 
     let snapshot = database.snapshot().expect("final snapshot");
@@ -1507,7 +1503,7 @@ fn watch_emits_exact_revision_tagged_object_delta_without_recompute() {
         })
         .expect("seed plan");
     database
-        .commit(&seed, TransactionId::new(8_010))
+        .commit_plan(&seed, TransactionId::new(8_010))
         .expect("seed commit");
     drop(snapshot);
 
@@ -1526,13 +1522,13 @@ fn watch_emits_exact_revision_tagged_object_delta_without_recompute() {
         .objects::<Country>()
         .expect("countries")
         .where_(|country| country.id().eq(id))
-        .update(|mut country| {
+        .update_plan(|mut country| {
             country.code = "DE".into();
             country
         })
         .expect("update plan");
     database
-        .commit(&update, TransactionId::new(8_011))
+        .commit_plan(&update, TransactionId::new(8_011))
         .expect("update commit");
     let target_revision = database.current_revision().expect("target revision");
 
@@ -1584,7 +1580,7 @@ fn projection_watch_filters_irrelevant_changes_and_decodes_exact_delta() {
         )
         .expect("compose seed");
     database
-        .commit(&seed, TransactionId::new(8_020))
+        .commit_plan(&seed, TransactionId::new(8_020))
         .expect("seed commit");
     drop(countries);
     drop(snapshot);
@@ -1604,13 +1600,13 @@ fn projection_watch_filters_irrelevant_changes_and_decodes_exact_delta() {
         .objects::<Country>()
         .expect("countries")
         .where_(|country| country.id().eq(other))
-        .update(|mut country| {
+        .update_plan(|mut country| {
             country.code = "CA".into();
             country
         })
         .expect("other update");
     database
-        .commit(&other_update, TransactionId::new(8_021))
+        .commit_plan(&other_update, TransactionId::new(8_021))
         .expect("other commit");
     assert!(
         watch
@@ -1625,13 +1621,13 @@ fn projection_watch_filters_irrelevant_changes_and_decodes_exact_delta() {
         .objects::<Country>()
         .expect("countries")
         .where_(|country| country.id().eq(watched))
-        .update(|mut country| {
+        .update_plan(|mut country| {
             country.code = "DE".into();
             country
         })
         .expect("watched update");
     database
-        .commit(&watched_update, TransactionId::new(8_022))
+        .commit_plan(&watched_update, TransactionId::new(8_022))
         .expect("watched commit");
     let event = watch
         .try_recv()
@@ -1671,7 +1667,7 @@ fn watch_recv_blocks_on_runtime_publication_signal_and_wakes_on_commit() {
         let mut plan = writer.plan().expect("writer plan");
         plan.insert(relation, vec![Value::I64(42)]);
         writer
-            .commit(&plan, TransactionId::new(8_110))
+            .commit_plan(&plan, TransactionId::new(8_110))
             .expect("writer commit");
     });
     barrier.wait();
@@ -1726,7 +1722,7 @@ fn custom_publication_notifier_is_wake_only_and_cannot_fabricate_watch_state() {
     let mut plan = database.plan().expect("writer plan");
     plan.insert(relation, vec![Value::I64(77)]);
     database
-        .commit(&plan, TransactionId::new(8_210))
+        .commit_plan(&plan, TransactionId::new(8_210))
         .expect("writer commit");
 
     let event = watch.recv().expect("watch event from custom notifier");
@@ -1931,7 +1927,7 @@ fn watch_lag_is_durable_and_catches_up_one_transition_at_a_time() {
         let mut plan = database.plan().expect("writer plan");
         plan.insert(relation, vec![Value::I64(value)]);
         database
-            .commit(&plan, TransactionId::new(8_350 + offset as u128))
+            .commit_plan(&plan, TransactionId::new(8_350 + offset as u128))
             .expect("writer commit");
     }
     let head_revision = database.current_revision().expect("head revision");
@@ -2004,7 +2000,7 @@ fn hosted_session_permissions_follow_product_values_and_fail_closed() {
         })
         .expect("seed plan");
     database
-        .commit(&seed, TransactionId::new(9_001))
+        .commit_plan(&seed, TransactionId::new(9_001))
         .expect("seed commit");
     drop(countries);
     drop(seed_snapshot);
@@ -2114,9 +2110,9 @@ fn hosted_session_permissions_follow_product_values_and_fail_closed() {
             .kind(),
         ErrorKind::PermissionDenied
     );
-    candidate
-        .commit(TransactionId::new(9_002))
-        .expect("candidate keeps write authority");
+    writer
+        .commit_plan(&plan, TransactionId::new(9_002))
+        .expect("plan keeps write authority");
 
     drop(database);
     fs::remove_dir_all(directory).expect("remove fixture directory");
@@ -2150,15 +2146,15 @@ fn session_authority_refresh_and_revoke_reach_existing_product_values() {
         }
         .into_row(),
     );
-    let candidate = plan.candidate().expect("candidate before grant refresh");
+    let _candidate = plan.candidate().expect("candidate before grant refresh");
 
     session
         .refresh_permissions(PermissionSet::from([Permission::Read]))
         .expect("downgrade grants");
     assert_eq!(
-        candidate
-            .commit(TransactionId::new(9_101))
-            .expect_err("existing candidate must observe downgraded authority")
+        writer
+            .commit_plan(&plan, TransactionId::new(9_101))
+            .expect_err("existing plan must observe downgraded authority")
             .kind(),
         ErrorKind::PermissionDenied
     );
@@ -2166,9 +2162,9 @@ fn session_authority_refresh_and_revoke_reach_existing_product_values() {
     session
         .refresh_permissions(PermissionSet::from([Permission::Write]))
         .expect("restore write grant");
-    candidate
-        .commit(TransactionId::new(9_101))
-        .expect("existing candidate observes refreshed write authority");
+    writer
+        .commit_plan(&plan, TransactionId::new(9_101))
+        .expect("existing plan observes refreshed write authority");
 
     let mut second = writer.plan().expect("second write plan");
     second.insert(
@@ -2179,12 +2175,12 @@ fn session_authority_refresh_and_revoke_reach_existing_product_values() {
         }
         .into_row(),
     );
-    let second_candidate = second.candidate().expect("candidate before revoke");
+    let _second_candidate = second.candidate().expect("candidate before revoke");
     assert!(session.revoke().expect("revoke session"));
     assert_eq!(
-        second_candidate
-            .commit(TransactionId::new(9_102))
-            .expect_err("revoked authority invalidates existing candidate")
+        writer
+            .commit_plan(&second, TransactionId::new(9_102))
+            .expect_err("revoked authority invalidates existing plan")
             .kind(),
         ErrorKind::SessionRevoked
     );
@@ -2223,7 +2219,7 @@ fn database_builder_unifies_single_file_default_and_explicit_directory_storage()
     let mut plan = database.plan().expect("plan");
     plan.insert(relation, vec![Value::I64(41)]);
     database
-        .commit(&plan, TransactionId::new(9_102))
+        .commit_plan(&plan, TransactionId::new(9_102))
         .expect("commit");
     drop(database);
 
@@ -2273,7 +2269,7 @@ fn encrypted_single_file_builder_encrypts_wal_and_sections_and_requires_exact_ke
     let mut plan = database.plan().expect("plan");
     plan.insert(relation, vec![Value::I64(0x1122_3344_5566_7788)]);
     database
-        .commit(&plan, TransactionId::new(9_202))
+        .commit_plan(&plan, TransactionId::new(9_202))
         .expect("encrypted commit");
     drop(database);
 
@@ -2747,7 +2743,7 @@ fn provider_rotation_rewraps_dmk_without_rewriting_database_ciphertext() {
     let mut plan = database.plan().expect("plan");
     plan.insert(relation, vec![Value::I64(314)]);
     database
-        .commit(&plan, TransactionId::new(9_402))
+        .commit_plan(&plan, TransactionId::new(9_402))
         .expect("encrypted commit");
 
     let before = fs::read(&path).expect("read before rewrap");
@@ -2801,4 +2797,354 @@ fn provider_rotation_rewraps_dmk_without_rewriting_database_ciphertext() {
     drop(snapshot);
     drop(reopened);
     fs::remove_file(path).expect("remove rewrap fixture");
+}
+
+#[test]
+fn granular_authorization_uses_semantic_query_and_field_coordinates() {
+    use cfmd_runtime::{
+        ErrorKind, Id, Object, Permission, PermissionSet, PrincipalId, Query,
+        RowCodec, Session,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let schema = Schema::builder()
+        .object::<Country>()
+        .build()
+        .expect("country schema");
+    let database = Database::create(&directory, schema).expect("create database");
+
+    let seed_view = database.snapshot().expect("seed snapshot");
+    let seed = seed_view
+        .objects::<Country>()
+        .expect("countries")
+        .insert(Country {
+            id: Id::new(1),
+            code: "NL".to_owned(),
+        })
+        .expect("seed plan");
+    database
+        .commit_plan(&seed, TransactionId::new(9_201))
+        .expect("seed commit");
+    drop(seed_view);
+
+    let schema_view = database
+        .snapshot()
+        .expect("schema snapshot")
+        .schema()
+        .expect("unrestricted model read");
+    let relation = schema_view
+        .relation(Country::relation_id())
+        .expect("country relation");
+    let code_field = relation.column_ids()[1];
+
+    let projected_reader = database.session(Session::new(
+        PrincipalId::new(301),
+        PermissionSet::from([Permission::ReadField {
+            relation: Country::relation_id(),
+            field: code_field,
+        }]),
+    ));
+    let read_view = projected_reader.snapshot().expect("granular read snapshot");
+    let projected = read_view
+        .execute(&Query::scan(Country::relation_id()).project([1]))
+        .expect("authorized projected field");
+    assert_eq!(projected.rows().len(), 1);
+    assert_eq!(
+        read_view
+            .execute(&Query::scan(Country::relation_id()))
+            .expect_err("full row must require every observed field")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+
+    let field_writer = database.session(Session::new(
+        PrincipalId::new(302),
+        PermissionSet::from([Permission::WriteField {
+            relation: Country::relation_id(),
+            field: code_field,
+        }]),
+    ));
+    assert_eq!(
+        field_writer
+            .snapshot()
+            .expect_err("write-only field authority must not expose a readable snapshot")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+    let countries = field_writer.objects::<Country>().expect("write-only countries handle");
+    let mut tx = field_writer
+        .transaction_with_id(TransactionId::new(9_202))
+        .expect("field transaction");
+    countries
+        .set(&mut tx, Id::new(1), |country| country.code(), "DE".to_owned())
+        .expect("authorized semantic field patch");
+    field_writer.commit(&tx).expect("field-only commit");
+
+    let mut raw_plan = field_writer.plan().expect("granular writer can form a plan");
+    raw_plan.insert(
+        Country::relation_id(),
+        Country {
+            id: Id::new(2),
+            code: "FR".to_owned(),
+        }
+        .into_row(),
+    );
+    assert_eq!(
+        field_writer
+            .commit_plan(&raw_plan, TransactionId::new(9_203))
+            .expect_err("field grant must not authorize whole-relation mutation")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+
+    let creator = database.session(Session::new(
+        PrincipalId::new(303),
+        PermissionSet::from([Permission::CreateObject(Country::relation_id())]),
+    ));
+    let creator_countries = creator.objects::<Country>().expect("create-only countries handle");
+    let mut create_tx = creator
+        .transaction_with_id(TransactionId::new(9_204))
+        .expect("create-only transaction");
+    creator_countries
+        .add(
+            &mut create_tx,
+            Country {
+                id: Id::new(2),
+                code: "FR".to_owned(),
+            },
+        )
+        .expect("semantic create planning");
+    creator.commit(&create_tx).expect("create-only commit");
+
+    let mut raw_create = creator.plan().expect("create authority can form low-level plan");
+    raw_create.insert(
+        Country::relation_id(),
+        Country {
+            id: Id::new(3),
+            code: "BE".to_owned(),
+        }
+        .into_row(),
+    );
+    assert_eq!(
+        creator
+            .commit_plan(&raw_create, TransactionId::new(9_205))
+            .expect_err("semantic create authority must not authorize raw relation insertion")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+
+    let deleter = database.session(Session::new(
+        PrincipalId::new(304),
+        PermissionSet::from([Permission::DeleteObject(Country::relation_id())]),
+    ));
+    let delete_countries = deleter.objects::<Country>().expect("delete-only countries handle");
+    let mut delete_tx = deleter
+        .transaction_with_id(TransactionId::new(9_206))
+        .expect("delete-only transaction");
+    delete_countries
+        .remove(
+            &mut delete_tx,
+            Country {
+                id: Id::new(2),
+                code: "FR".to_owned(),
+            },
+        )
+        .expect("semantic delete planning");
+    deleter.commit(&delete_tx).expect("delete-only commit");
+
+    let unrestricted = database.snapshot().expect("final snapshot");
+    assert_eq!(
+        unrestricted
+            .objects::<Country>()
+            .expect("countries")
+            .require(Id::new(1))
+            .expect("country")
+            .code,
+        "DE"
+    );
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn history_inverse_preserves_object_action_authority_instead_of_raw_relation_write() {
+    use cfmd_runtime::{Id, Object, Permission, PermissionSet, PrincipalId, Session};
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let schema = Schema::builder()
+        .object::<Country>()
+        .build()
+        .expect("country schema");
+    let database = Database::create(&directory, schema).expect("create database");
+
+    let seed_view = database.snapshot().expect("seed snapshot");
+    let seed = seed_view
+        .objects::<Country>()
+        .expect("countries")
+        .insert(Country {
+            id: Id::new(441_001),
+            code: "NL".to_owned(),
+        })
+        .expect("semantic create plan");
+    database
+        .commit_plan(&seed, TransactionId::new(9_441_001))
+        .expect("semantic create commit");
+    drop(seed_view);
+
+    let delete_session = database.session(Session::new(
+        PrincipalId::new(441_001),
+        PermissionSet::from([
+            Permission::Read,
+            Permission::HistoryRead,
+            Permission::DeleteObject(Country::relation_id()),
+        ]),
+    ));
+    let mut undo_create = delete_session
+        .transaction_with_id(TransactionId::new(9_441_002))
+        .expect("undo transaction");
+    delete_session
+        .undo_latest(&mut undo_create)
+        .expect("derive create inverse under delete authority");
+    delete_session
+        .commit(&undo_create)
+        .expect("undo create without WriteRelation");
+
+    let create_session = database.session(Session::new(
+        PrincipalId::new(441_002),
+        PermissionSet::from([
+            Permission::Read,
+            Permission::HistoryRead,
+            Permission::CreateObject(Country::relation_id()),
+        ]),
+    ));
+    let mut undo_delete = create_session
+        .transaction_with_id(TransactionId::new(9_441_003))
+        .expect("redo transaction");
+    create_session
+        .undo_latest(&mut undo_delete)
+        .expect("derive delete inverse under create authority");
+    create_session
+        .commit(&undo_delete)
+        .expect("undo delete without WriteRelation");
+
+    let country = database
+        .snapshot()
+        .expect("final snapshot")
+        .objects::<Country>()
+        .expect("countries")
+        .require(Id::new(441_001))
+        .expect("country restored");
+    assert_eq!(country.code, "NL");
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn roles_flatten_into_exact_permissions_and_model_metadata_is_separate_authority() {
+    use cfmd_runtime::{ErrorKind, Object, Permission, PermissionSet, PrincipalId, Role, Session};
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let schema = Schema::builder()
+        .object::<Country>()
+        .build()
+        .expect("country schema");
+    let database = Database::create(&directory, schema).expect("create database");
+    let full_schema = database
+        .snapshot()
+        .expect("unrestricted snapshot")
+        .schema()
+        .expect("unrestricted schema");
+    let code_field = full_schema
+        .relation(Country::relation_id())
+        .expect("country relation")
+        .column_ids()[1];
+
+    let reader = Role::new("country-code-reader").grant(Permission::ReadField {
+        relation: Country::relation_id(),
+        field: code_field,
+    });
+    let observer = database.session(Session::from_roles(
+        PrincipalId::new(442_001),
+        [&reader],
+    ));
+    let snapshot = observer.snapshot().expect("field reader snapshot");
+    assert_eq!(snapshot.schema_revision(), 1);
+    assert_eq!(
+        snapshot.schema().expect_err("model metadata must stay hidden").kind(),
+        ErrorKind::PermissionDenied
+    );
+
+    let model_reader = Role::new("model-reader").grant(Permission::ModelRead);
+    let observer = database.session(Session::from_roles(
+        PrincipalId::new(442_002),
+        [&reader, &model_reader],
+    ));
+    let snapshot = observer.snapshot().expect("model reader snapshot");
+    assert_eq!(
+        snapshot.schema().expect("model metadata authority").revision(),
+        snapshot.schema_revision()
+    );
+
+    assert_eq!(reader.name(), "country-code-reader");
+    assert!(PermissionSet::from_roles([&reader]).contains(Permission::ReadField {
+        relation: Country::relation_id(),
+        field: code_field,
+    }));
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn schema_migration_requires_dedicated_authority_not_generic_write() {
+    use cfmd_runtime::{
+        ErrorKind, MigrationHistoryPolicy, MigrationModel, Permission, PermissionSet, PrincipalId,
+        Role, Session,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let source = Schema::builder().revisions(442, 1).build().expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+    let target = Schema::builder().revisions(443, 1).build().expect("target schema");
+    let migration = MigrationModel::new(442_443, target);
+
+    let generic_writer = database.session(Session::new(
+        PrincipalId::new(442_003),
+        PermissionSet::from([Permission::Write]),
+    ));
+    assert_eq!(
+        generic_writer
+            .migrate(
+                &migration,
+                TransactionId::new(9_442_001),
+                MigrationHistoryPolicy::Forget,
+            )
+            .expect_err("generic data write must not grant schema migration")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+    assert_eq!(database.snapshot().expect("head").schema_revision(), 442);
+
+    let migrator = Role::new("schema-migrator").grant(Permission::SchemaMigrate);
+    let migration_session = database.session(Session::from_roles(
+        PrincipalId::new(442_004),
+        [&migrator],
+    ));
+    migration_session
+        .migrate(
+            &migration,
+            TransactionId::new(9_442_002),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("dedicated migration authority");
+    assert_eq!(database.snapshot().expect("migrated head").schema_revision(), 443);
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
 }

@@ -205,6 +205,7 @@ fn collect_i64_join_advice_observations(
         }
         Plan::JoinEq { left, right, .. }
         | Plan::Difference { left, right }
+        | Plan::Union { left, right }
         | Plan::AntiJoin { left, right, .. } => {
             collect_i64_join_advice_observations(left, store, context, registry, observations)?;
             collect_i64_join_advice_observations(right, store, context, registry, observations)

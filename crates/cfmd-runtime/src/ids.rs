@@ -18,6 +18,7 @@ macro_rules! id_type {
 }
 
 id_type!(RelationId, u128);
+id_type!(RelationColumnId, u128);
 id_type!(EquivalenceId, u128);
 id_type!(OrderingId, u128);
 id_type!(TypeId, u128);
@@ -25,6 +26,12 @@ id_type!(FieldId, u128);
 id_type!(VariantTagId, u128);
 id_type!(RevisionId, u64);
 id_type!(TransactionId, u128);
+
+impl From<RelationColumnId> for kernel_types::SemanticId {
+    fn from(value: RelationColumnId) -> Self {
+        Self::new(value.raw())
+    }
+}
 
 impl From<RelationId> for kernel_types::SemanticId {
     fn from(value: RelationId) -> Self {

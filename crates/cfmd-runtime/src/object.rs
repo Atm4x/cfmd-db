@@ -1,6 +1,6 @@
 use crate::{
-    Error, ErrorKind, Field, Plan, PrimitiveEquivalence, PrimitiveOrdering, Projection, Query,
-    ReadContext, Relation, RelationId, RelationQuery, Result, RowCodec, SchemaBuilder, Type,
+    Error, ErrorKind, Field, GroupKey, Plan, PrimitiveEquivalence, PrimitiveOrdering, Projection,
+    Query, ReadContext, Relation, RelationId, RelationQuery, Result, RowCodec, SchemaBuilder, Type,
     TypedQuery, Value, ValueCodec,
 };
 
@@ -42,6 +42,46 @@ pub(crate) fn count_equivalence_id() -> crate::EquivalenceId {
     crate::EquivalenceId::new(__semantic_id("cfmd.runtime.aggregate.v1", "count", "i64"))
 }
 
+#[must_use]
+pub(crate) fn count_ordering_id() -> crate::OrderingId {
+    crate::OrderingId::new(__semantic_id(
+        "cfmd.runtime.aggregate.v1",
+        "count",
+        "ordering",
+    ))
+}
+
+#[must_use]
+pub(crate) fn exact_f64_sum_ordering_id() -> crate::OrderingId {
+    crate::OrderingId::new(__semantic_id(
+        "cfmd.runtime.aggregate.v1",
+        "exact-f64-sum",
+        "ordering",
+    ))
+}
+
+fn execute_exact_count(context: &ReadContext, query: Query) -> Result<usize> {
+    let result = context.execute(&query.count(count_equivalence_id()))?;
+    let [row] = result.rows() else {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "exact count aggregate did not return exactly one row",
+        ));
+    };
+    let [Value::I64(count)] = row.as_slice() else {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "exact count aggregate returned an invalid row shape",
+        ));
+    };
+    usize::try_from(*count).map_err(|_| {
+        Error::new(
+            ErrorKind::InvariantViolation,
+            "exact count aggregate cannot be represented as usize",
+        )
+    })
+}
+
 /// A Rust value that can appear as an object field with a default CFMD semantic equality.
 pub trait ObjectValue: ValueCodec {
     fn object_type() -> Type;
@@ -53,6 +93,16 @@ pub trait ObjectValue: ValueCodec {
     #[must_use]
     fn role() -> ObjectFieldRole {
         ObjectFieldRole::Value
+    }
+}
+
+pub trait ObjectPatchField<S: Object, V: ObjectValue> {
+    fn into_patch_field(self) -> Result<Field<S, V>>;
+}
+
+impl<S: Object, V: ObjectValue> ObjectPatchField<S, V> for Field<S, V> {
+    fn into_patch_field(self) -> Result<Field<S, V>> {
+        Ok(self)
     }
 }
 
@@ -293,6 +343,7 @@ impl<T: Object> Many<T> {
             context: binding.context.clone(),
             relation: set.relation.clone(),
             inner: RelationQuery::__from_raw(set.relation.clone(), target),
+            exact_shape: set.exact_shape,
         })
     }
 
@@ -349,7 +400,7 @@ impl<T: Object> Many<T> {
             }),
             binding.source_equivalence,
         );
-        Ok(binding.context.execute(&query)?.rows().len())
+        execute_exact_count(&binding.context, query)
     }
 }
 
@@ -381,6 +432,7 @@ impl<T: Object> ManySelection<T> {
             context: self.query.context.clone(),
             relation: self.query.relation.clone(),
             inner: self.query.inner.clone(),
+            exact_shape: self.query.exact_shape,
         }
     }
 
@@ -390,7 +442,7 @@ impl<T: Object> ManySelection<T> {
     }
 
     pub fn count(&self) -> Result<usize> {
-        Ok(self.ids()?.len())
+        self.query.count()
     }
 
     pub fn load(&self) -> Result<Vec<T>> {
@@ -413,33 +465,98 @@ impl<T: Object> ManySelection<T> {
         self.query.one()
     }
 
+    fn transaction_binding(&self, transaction: &mut crate::Transaction) -> Result<ManyBinding> {
+        let context = transaction.operation_context(&self.binding.context)?;
+        let mut binding = self.binding.clone();
+        binding.context = context;
+        Ok(binding)
+    }
+
+    fn ids_in_context(&self, context: &ReadContext) -> Result<Vec<crate::Id<T>>> {
+        ObjectQuery {
+            context: context.clone(),
+            relation: self.query.relation.clone(),
+            inner: self.query.inner.clone(),
+            exact_shape: self.query.exact_shape,
+        }
+        .identity_ids()
+    }
+
     /// Removes all selected relationship edges while leaving target objects alive.
-    pub fn detach_all(&self) -> Result<Plan> {
-        plan_detach_ids::<T>(&self.binding, self.ids()?)
+    pub fn detach_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+        let plan = self.detach_all_plan_in(transaction)?;
+        transaction.add_plan(plan)
     }
 
     /// Atomically moves all selected edges to another owner of the same relationship.
-    pub fn move_to(&self, destination: &Many<T>) -> Result<Plan> {
-        let dest = many_binding(destination)?;
-        plan_move_ids::<T>(&self.binding, dest, self.ids()?)
+    pub fn move_to(
+        &self,
+        transaction: &mut crate::Transaction,
+        destination: &Many<T>,
+    ) -> Result<()> {
+        let plan = self.move_to_plan_in(transaction, destination)?;
+        transaction.add_plan(plan)
     }
 
     /// Deletes selected target objects. CFMD reads exact stored rows but does not materialize
     /// Rust target objects; lifecycle normalization removes every now-dangling relationship edge.
-    pub fn delete_all(&self) -> Result<Plan> {
-        let rows = self
-            .binding
-            .context
+    pub fn delete_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+        let plan = self.delete_all_plan_in(transaction)?;
+        transaction.add_plan(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn detach_all_plan(&self) -> Result<Plan> {
+        plan_detach_ids::<T>(&self.binding, self.ids()?)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn move_to_plan(&self, destination: &Many<T>) -> Result<Plan> {
+        let dest = many_binding(destination)?;
+        plan_move_ids::<T>(&self.binding, dest, self.ids()?)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn delete_all_plan(&self) -> Result<Plan> {
+        self.delete_all_plan_with_context(&self.binding.context)
+    }
+
+    fn detach_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
+        let binding = self.transaction_binding(transaction)?;
+        plan_detach_ids::<T>(&binding, self.ids_in_context(&binding.context)?)
+    }
+
+    fn move_to_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        destination: &Many<T>,
+    ) -> Result<Plan> {
+        let source = self.transaction_binding(transaction)?;
+        let destination = transaction_many_binding(transaction, destination)?;
+        plan_move_ids::<T>(&source, &destination, self.ids_in_context(&source.context)?)
+    }
+
+    fn delete_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
+        let binding = self.transaction_binding(transaction)?;
+        self.delete_all_plan_with_context(&binding.context)
+    }
+
+    fn delete_all_plan_with_context(&self, context: &ReadContext) -> Result<Plan> {
+        let rows = context
             .execute(&self.query.inner.clone().raw())?
             .rows()
             .to_vec();
-        let mut plan = self.binding.context.plan()?;
+        let mut plan = context.plan()?;
         if let Some(contract) = object_contract::<T>()? {
             plan.register_object_contract(contract);
         }
         register_object_relationship_contracts::<T>(&mut plan)?;
         for row in rows {
-            plan.remove(T::relation_id(), row);
+            plan.remove_semantic(
+                T::relation_id(),
+                row,
+                crate::plan::MutationAction::ObjectDelete,
+            );
         }
         Ok(plan)
     }
@@ -487,8 +604,26 @@ impl<T: Object> OwnedManySelection<T> {
     pub fn one(&self) -> Result<T> {
         self.inner.one()
     }
-    pub fn detach_all(&self) -> Result<Plan> {
-        let mut plan = self.inner.detach_all()?;
+    pub fn detach_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+        let plan = self.detach_all_plan_in(transaction)?;
+        transaction.add_plan(plan)
+    }
+    pub fn move_to(
+        &self,
+        transaction: &mut crate::Transaction,
+        destination: &OwnedMany<T>,
+    ) -> Result<()> {
+        let plan = self.move_to_plan_in(transaction, destination)?;
+        transaction.add_plan(plan)
+    }
+    pub fn delete_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+        let plan = self.delete_all_plan_in(transaction)?;
+        transaction.add_plan(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn detach_all_plan(&self) -> Result<Plan> {
+        let mut plan = self.inner.detach_all_plan()?;
         __register_owned_contract::<T>(
             &many_from_binding::<T>(&self.inner.binding),
             &mut plan,
@@ -496,19 +631,62 @@ impl<T: Object> OwnedManySelection<T> {
         )?;
         Ok(plan)
     }
-    pub fn move_to(&self, destination: &OwnedMany<T>) -> Result<Plan> {
-        let mut plan = plan_move_ids::<T>(
-            &self.inner.binding,
-            many_binding(&destination.inner)?,
-            self.inner.ids()?,
-        )?;
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn move_to_plan(&self, destination: &OwnedMany<T>) -> Result<Plan> {
+        let mut plan = self.inner.move_to_plan(&destination.inner)?;
         __register_owned_contract::<T>(&destination.inner, &mut plan, self.orphan_policy)?;
         Ok(plan)
     }
-    pub fn delete_all(&self) -> Result<Plan> {
-        let mut plan = self.inner.delete_all()?;
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn delete_all_plan(&self) -> Result<Plan> {
+        let mut plan = self.inner.delete_all_plan()?;
         __register_owned_contract::<T>(
             &many_from_binding::<T>(&self.inner.binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn detach_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
+        let binding = self.inner.transaction_binding(transaction)?;
+        let mut plan =
+            plan_detach_ids::<T>(&binding, self.inner.ids_in_context(&binding.context)?)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn move_to_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        destination: &OwnedMany<T>,
+    ) -> Result<Plan> {
+        let source = self.inner.transaction_binding(transaction)?;
+        let destination_binding = transaction_many_binding(transaction, &destination.inner)?;
+        let mut plan = plan_move_ids::<T>(
+            &source,
+            &destination_binding,
+            self.inner.ids_in_context(&source.context)?,
+        )?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&destination_binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn delete_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
+        let binding = self.inner.transaction_binding(transaction)?;
+        let mut plan = self.inner.delete_all_plan_with_context(&binding.context)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&binding),
             &mut plan,
             self.orphan_policy,
         )?;
@@ -668,53 +846,194 @@ impl<T: Object> OwnedMany<T> {
         self.inner.count()
     }
 
-    /// Proposes attaching an existing target. Fails during candidate construction/commit if that
-    /// target already has a different owner in this ownership relation.
-    pub fn attach(&self, target: crate::Id<T>) -> Result<Plan> {
-        let mut plan = self.inner.__attach(target)?;
-        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
-        Ok(plan)
+    /// Attaches an existing target as part of `transaction`. Candidate construction/commit still
+    /// enforces exclusive ownership and the configured orphan policy.
+    pub fn attach(&self, transaction: &mut crate::Transaction, target: crate::Id<T>) -> Result<()> {
+        let plan = self.attach_plan_in(transaction, target)?;
+        transaction.add_plan(plan)
     }
 
-    pub fn detach(&self, target: crate::Id<T>) -> Result<Plan> {
-        let mut plan = self.inner.__detach(target)?;
-        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
-        Ok(plan)
+    pub fn detach(&self, transaction: &mut crate::Transaction, target: crate::Id<T>) -> Result<()> {
+        let plan = self.detach_plan_in(transaction, target)?;
+        transaction.add_plan(plan)
     }
 
     /// Atomically transfers one target from this owner to `destination` without rewriting the
     /// target object row.
-    pub fn move_to(&self, target: crate::Id<T>, destination: &Self) -> Result<Plan> {
-        let mut plan = self.inner.__move_to(target, &destination.inner)?;
-        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
-        Ok(plan)
+    pub fn move_to(
+        &self,
+        transaction: &mut crate::Transaction,
+        target: crate::Id<T>,
+        destination: &Self,
+    ) -> Result<()> {
+        let plan = self.move_to_plan_in(transaction, target, destination)?;
+        transaction.add_plan(plan)
     }
 
     /// Atomically transfers every edge owned by this object. Only edge rows are read; target
     /// objects are not materialized into Rust.
-    pub fn move_all_to(&self, destination: &Self) -> Result<Plan> {
-        let mut plan = self.inner.__move_all_to(&destination.inner)?;
-        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
-        Ok(plan)
+    pub fn move_all_to(
+        &self,
+        transaction: &mut crate::Transaction,
+        destination: &Self,
+    ) -> Result<()> {
+        let plan = self.move_all_to_plan_in(transaction, destination)?;
+        transaction.add_plan(plan)
     }
-    pub fn detach_all(&self) -> Result<Plan> {
-        let mut plan = self.inner.detach_all()?;
-        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
-        Ok(plan)
+    pub fn detach_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+        let plan = self.detach_all_plan_in(transaction)?;
+        transaction.add_plan(plan)
     }
-    pub fn detach_ids(&self, ids: impl IntoIterator<Item = crate::Id<T>>) -> Result<Plan> {
-        let mut plan = self.inner.detach_ids(ids)?;
-        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
-        Ok(plan)
+    pub fn detach_ids(
+        &self,
+        transaction: &mut crate::Transaction,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+    ) -> Result<()> {
+        let plan = self.detach_ids_plan_in(transaction, ids)?;
+        transaction.add_plan(plan)
     }
     pub fn move_ids_to(
+        &self,
+        transaction: &mut crate::Transaction,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<()> {
+        let plan = self.move_ids_to_plan_in(transaction, ids, destination)?;
+        transaction.add_plan(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn attach_plan(&self, target: crate::Id<T>) -> Result<Plan> {
+        let mut plan = self.inner.attach_plan(target)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn detach_plan(&self, target: crate::Id<T>) -> Result<Plan> {
+        let mut plan = self.inner.detach_plan(target)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn move_to_plan(&self, target: crate::Id<T>, destination: &Self) -> Result<Plan> {
+        let mut plan = self.inner.move_to_plan(target, &destination.inner)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn move_all_to_plan(&self, destination: &Self) -> Result<Plan> {
+        let mut plan = self.inner.move_all_to_plan(&destination.inner)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn detach_all_plan(&self) -> Result<Plan> {
+        let mut plan = self.inner.detach_all_plan()?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn detach_ids_plan(&self, ids: impl IntoIterator<Item = crate::Id<T>>) -> Result<Plan> {
+        let mut plan = self.inner.detach_ids_plan(ids)?;
+        __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
+        Ok(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn move_ids_to_plan(
         &self,
         ids: impl IntoIterator<Item = crate::Id<T>>,
         destination: &Self,
     ) -> Result<Plan> {
-        let mut plan = self.inner.move_ids_to(ids, &destination.inner)?;
+        let mut plan = self.inner.move_ids_to_plan(ids, &destination.inner)?;
         __register_owned_contract::<T>(&self.inner, &mut plan, self.orphan_policy)?;
         Ok(plan)
+    }
+
+    fn register_owned_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        mut plan: Plan,
+    ) -> Result<Plan> {
+        let binding = transaction_many_binding(transaction, &self.inner)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn attach_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        target: crate::Id<T>,
+    ) -> Result<Plan> {
+        let plan = self.inner.attach_plan_in(transaction, target)?;
+        self.register_owned_plan_in(transaction, plan)
+    }
+
+    fn detach_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        target: crate::Id<T>,
+    ) -> Result<Plan> {
+        let plan = self.inner.detach_plan_in(transaction, target)?;
+        self.register_owned_plan_in(transaction, plan)
+    }
+
+    fn move_to_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        target: crate::Id<T>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let plan = self
+            .inner
+            .move_to_plan_in(transaction, target, &destination.inner)?;
+        self.register_owned_plan_in(transaction, plan)
+    }
+
+    fn move_all_to_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let plan = self
+            .inner
+            .move_all_to_plan_in(transaction, &destination.inner)?;
+        self.register_owned_plan_in(transaction, plan)
+    }
+
+    fn detach_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
+        let plan = self.inner.detach_all_plan_in(transaction)?;
+        self.register_owned_plan_in(transaction, plan)
+    }
+
+    fn detach_ids_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+    ) -> Result<Plan> {
+        let plan = self.inner.detach_ids_plan_in(transaction, ids)?;
+        self.register_owned_plan_in(transaction, plan)
+    }
+
+    fn move_ids_to_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let plan = self
+            .inner
+            .move_ids_to_plan_in(transaction, ids, &destination.inner)?;
+        self.register_owned_plan_in(transaction, plan)
     }
 }
 
@@ -915,7 +1234,7 @@ pub fn __identity_equivalence_id<E: Object>() -> Result<crate::EquivalenceId> {
     Ok(crate::EquivalenceId::new(__semantic_id(
         "cfmd.object.field-equivalence.v1",
         E::KEY,
-        field.name(),
+        field.semantic_name(),
     )))
 }
 
@@ -948,10 +1267,12 @@ fn validate_many_field<S: Object, T: Object>() -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectFieldSchema {
     name: &'static str,
+    semantic_name: &'static str,
     ty: Type,
     equivalence: ObjectEquivalence,
     ordering: Option<PrimitiveOrdering>,
     role: ObjectFieldRole,
+    rules: Vec<crate::FieldRule>,
 }
 
 impl ObjectFieldSchema {
@@ -959,16 +1280,41 @@ impl ObjectFieldSchema {
     pub fn of<V: ObjectValue>(name: &'static str) -> Self {
         Self {
             name,
+            semantic_name: name,
             ty: V::object_type(),
             equivalence: V::equivalence(),
             ordering: V::ordering(),
             role: V::role(),
+            rules: Vec::new(),
         }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __with_semantic_name(mut self, semantic_name: &'static str) -> Self {
+        self.semantic_name = semantic_name;
+        self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __with_rules(mut self, rules: Vec<crate::FieldRule>) -> Self {
+        self.rules = rules;
+        self
     }
 
     #[must_use]
     pub const fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Persisted semantic field name used to derive field/equivalence coordinates.
+    /// It normally equals the Rust field name. A non-authoritative consumer may explicitly bind a
+    /// different local spelling with `#[cfmd(bind = "persisted_name")]`; authoritative entities
+    /// never carry compatibility metadata and schema evolution is expressed as a migration.
+    #[must_use]
+    pub const fn semantic_name(&self) -> &'static str {
+        self.semantic_name
     }
 
     #[must_use]
@@ -987,6 +1333,10 @@ impl ObjectFieldSchema {
     #[must_use]
     pub const fn role(&self) -> ObjectFieldRole {
         self.role
+    }
+
+    pub(crate) fn rules(&self) -> &[crate::FieldRule] {
+        &self.rules
     }
 }
 
@@ -1064,16 +1414,45 @@ pub trait Object: RowCodec + Sized + 'static {
             "relation",
         ))
     }
+
+    #[doc(hidden)]
+    #[must_use]
+    fn __field_id(semantic_name: &str) -> crate::FieldId {
+        crate::FieldId::new(__semantic_id(
+            "cfmd.object.kernel-field.v1",
+            Self::KEY,
+            semantic_name,
+        ))
+    }
 }
 
 pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBuilder {
     let fields = E::fields();
     let (registered, types, equivalences) = register_object_field_semantics::<E>(builder, &fields);
     builder = registered;
+    for (column, field) in fields.iter().enumerate() {
+        for rule in field.rules() {
+            builder = builder.__relation_column_rule(E::relation_id(), column, rule.clone());
+        }
+    }
+    let object_columns = fields
+        .iter()
+        .zip(types)
+        .map(|(field, ty)| {
+            (
+                crate::RelationColumnId::new(__semantic_id(
+                    "cfmd.object.kernel-field.v1",
+                    E::KEY,
+                    field.semantic_name(),
+                )),
+                ty,
+            )
+        })
+        .collect::<Vec<_>>();
     builder = builder
-        .relation(crate::RelationSchema::set(
+        .relation(crate::RelationSchema::set_with_column_ids(
             E::relation_id(),
-            types,
+            object_columns,
             equivalences,
         ))
         .__entity_type(E::type_id());
@@ -1082,6 +1461,28 @@ pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBu
             field.role(),
             ObjectFieldRole::Reference { .. } | ObjectFieldRole::OptionalReference { .. }
         ) {
+            let (target_relation, target_type) = match field.role() {
+                ObjectFieldRole::Reference {
+                    target_relation,
+                    target_type,
+                    ..
+                }
+                | ObjectFieldRole::OptionalReference {
+                    target_relation,
+                    target_type,
+                    ..
+                } => (target_relation, target_type),
+                _ => unreachable!("reference-role guard keeps only reference fields"),
+            };
+            builder = builder.__require_relation(
+                target_relation,
+                format!(
+                    "object reference {}.{} requires target object type {} to be part of this schema",
+                    E::KEY,
+                    field.name(),
+                    target_type.raw(),
+                ),
+            );
             let kernel_type = match field.role() {
                 ObjectFieldRole::Reference { target_type, .. } => {
                     Type::Scalar(crate::ScalarType::LiveEntityRef(target_type))
@@ -1095,7 +1496,7 @@ pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBu
                 crate::FieldId::new(__semantic_id(
                     "cfmd.object.kernel-field.v1",
                     E::KEY,
-                    field.name(),
+                    field.semantic_name(),
                 )),
                 E::type_id(),
                 kernel_type,
@@ -1115,13 +1516,41 @@ pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBu
                 many.target_live_equivalence(),
                 PrimitiveEquivalence::LiveEntityIdExact(many.target_type()),
             )
-            .relation(crate::RelationSchema::set(
+            .relation(crate::RelationSchema::set_with_column_ids(
                 many.relation(),
                 vec![
-                    Type::Scalar(crate::ScalarType::HistoricalEntityRef(E::type_id())),
-                    Type::Scalar(crate::ScalarType::HistoricalEntityRef(many.target_type())),
-                    Type::Scalar(crate::ScalarType::LiveEntityRef(E::type_id())),
-                    Type::Scalar(crate::ScalarType::LiveEntityRef(many.target_type())),
+                    (
+                        crate::RelationColumnId::new(__semantic_id(
+                            "cfmd.object.many-column.v1",
+                            E::KEY,
+                            &format!("{}:source-historical", many.name()),
+                        )),
+                        Type::Scalar(crate::ScalarType::HistoricalEntityRef(E::type_id())),
+                    ),
+                    (
+                        crate::RelationColumnId::new(__semantic_id(
+                            "cfmd.object.many-column.v1",
+                            E::KEY,
+                            &format!("{}:target-historical", many.name()),
+                        )),
+                        Type::Scalar(crate::ScalarType::HistoricalEntityRef(many.target_type())),
+                    ),
+                    (
+                        crate::RelationColumnId::new(__semantic_id(
+                            "cfmd.object.many-column.v1",
+                            E::KEY,
+                            &format!("{}:source-live", many.name()),
+                        )),
+                        Type::Scalar(crate::ScalarType::LiveEntityRef(E::type_id())),
+                    ),
+                    (
+                        crate::RelationColumnId::new(__semantic_id(
+                            "cfmd.object.many-column.v1",
+                            E::KEY,
+                            &format!("{}:target-live", many.name()),
+                        )),
+                        Type::Scalar(crate::ScalarType::LiveEntityRef(many.target_type())),
+                    ),
                 ],
                 vec![
                     many.source_equivalence(),
@@ -1153,7 +1582,7 @@ fn register_object_field_semantics<E: Object>(
         let id = crate::EquivalenceId::new(__semantic_id(
             "cfmd.object.field-equivalence.v1",
             E::KEY,
-            field.name(),
+            field.semantic_name(),
         ));
         builder = match field.equivalence() {
             ObjectEquivalence::Primitive(module) => builder.equivalence(id, module),
@@ -1161,7 +1590,7 @@ fn register_object_field_semantics<E: Object>(
                 let inner = crate::EquivalenceId::new(__semantic_id(
                     "cfmd.object.field-equivalence-inner.v1",
                     E::KEY,
-                    field.name(),
+                    field.semantic_name(),
                 ));
                 builder
                     .equivalence(inner, inner_module)
@@ -1173,7 +1602,7 @@ fn register_object_field_semantics<E: Object>(
                 crate::OrderingId::new(__semantic_id(
                     "cfmd.object.field-ordering.v1",
                     E::KEY,
-                    field.name(),
+                    field.semantic_name(),
                 )),
                 ordering,
             );
@@ -1195,7 +1624,12 @@ pub fn __append_flat_insert<E: Object>(
         plan.register_object_contract(contract);
     }
     register_object_relationship_contracts::<E>(plan)?;
-    plan.insert_typed(&relation, value)?;
+    let row = relation.encode_row(value)?;
+    plan.insert_semantic(
+        relation.id(),
+        row,
+        crate::plan::MutationAction::ObjectCreate,
+    );
     Ok(())
 }
 
@@ -1208,7 +1642,7 @@ pub fn __append_many_edge<S: Object, T: Object>(
 ) -> Result<()> {
     __identity_equivalence_id::<S>()?;
     __identity_equivalence_id::<T>()?;
-    plan.insert(
+    plan.insert_semantic(
         __many_relation_id::<S>(name),
         vec![
             Value::HistoricalEntityRef(crate::EntityRef {
@@ -1228,6 +1662,7 @@ pub fn __append_many_edge<S: Object, T: Object>(
                 id: crate::runtime::lifecycle_entity_id(T::type_id(), target_id).raw(),
             }),
         ],
+        crate::plan::MutationAction::RelationshipAttach,
     );
     Ok(())
 }
@@ -1256,8 +1691,12 @@ pub fn __append_remove_many_edges<E: Object>(
         }),
         many.source_equivalence(),
     );
-    for row in context.execute(&query)?.rows() {
-        plan.remove(many.relation(), row.clone());
+    for row in context.execute_for_mutation(&query)?.rows() {
+        plan.remove_semantic(
+            many.relation(),
+            row.clone(),
+            crate::plan::MutationAction::RelationshipDetach,
+        );
     }
     Ok(())
 }
@@ -1269,6 +1708,17 @@ fn many_binding<T>(many: &Many<T>) -> Result<&ManyBinding> {
             "relationship value is not bound to a database snapshot",
         )
     })
+}
+
+fn transaction_many_binding<T>(
+    transaction: &mut crate::Transaction,
+    many: &Many<T>,
+) -> Result<ManyBinding> {
+    let binding = many_binding(many)?;
+    let context = transaction.operation_context(&binding.context)?;
+    let mut rebound = binding.clone();
+    rebound.context = context;
+    Ok(rebound)
 }
 
 fn edge_row<T: Object>(binding: &ManyBinding, target: crate::Id<T>) -> crate::Row {
@@ -1315,7 +1765,7 @@ fn bound_target_ids<T: Object>(binding: &ManyBinding) -> Result<std::collections
     );
     binding
         .context
-        .execute(&query)?
+        .execute_for_mutation(&query)?
         .rows()
         .iter()
         .map(|row| match row.get(1) {
@@ -1349,7 +1799,11 @@ fn plan_detach_ids<T: Object>(
     }
     let mut plan = binding.context.plan()?;
     for id in ids {
-        plan.remove(binding.relation, edge_row(binding, id));
+        plan.remove_semantic(
+            binding.relation,
+            edge_row(binding, id),
+            crate::plan::MutationAction::RelationshipDetach,
+        );
     }
     Ok(plan)
 }
@@ -1373,8 +1827,16 @@ fn plan_move_ids<T: Object>(
     }
     let mut plan = source.context.plan()?;
     for id in ids {
-        plan.remove(source.relation, edge_row(source, id));
-        plan.insert(destination.relation, edge_row(destination, id));
+        plan.remove_semantic(
+            source.relation,
+            edge_row(source, id),
+            crate::plan::MutationAction::RelationshipMove,
+        );
+        plan.insert_semantic(
+            destination.relation,
+            edge_row(destination, id),
+            crate::plan::MutationAction::RelationshipMove,
+        );
     }
     Ok(plan)
 }
@@ -1384,7 +1846,11 @@ impl<T: Object> Many<T> {
     pub fn __attach(&self, target: crate::Id<T>) -> Result<Plan> {
         let binding = many_binding(self)?;
         let mut plan = binding.context.plan()?;
-        plan.insert(binding.relation, edge_row(binding, target));
+        plan.insert_semantic(
+            binding.relation,
+            edge_row(binding, target),
+            crate::plan::MutationAction::RelationshipAttach,
+        );
         Ok(plan)
     }
 
@@ -1395,7 +1861,7 @@ impl<T: Object> Many<T> {
         let row = edge_row(binding, target);
         let exists = binding
             .context
-            .execute(&Query::scan(binding.relation))?
+            .execute_for_mutation(&Query::scan(binding.relation))?
             .rows()
             .contains(&row);
         if !exists {
@@ -1404,7 +1870,11 @@ impl<T: Object> Many<T> {
                 "relationship edge is not present",
             ));
         }
-        plan.remove(binding.relation, row);
+        plan.remove_semantic(
+            binding.relation,
+            row,
+            crate::plan::MutationAction::RelationshipDetach,
+        );
         Ok(plan)
     }
 
@@ -1418,9 +1888,7 @@ impl<T: Object> Many<T> {
                 "relationship move requires the same relationship and snapshot",
             ));
         }
-        let mut plan = self.__detach(target)?;
-        plan.insert(dest.relation, edge_row(dest, target));
-        Ok(plan)
+        plan_move_ids::<T>(source, dest, [target])
     }
 
     #[doc(hidden)]
@@ -1441,7 +1909,11 @@ impl<T: Object> Many<T> {
             }),
             source.source_equivalence,
         );
-        let rows = source.context.execute(&query)?.rows().to_vec();
+        let rows = source
+            .context
+            .execute_for_mutation(&query)?
+            .rows()
+            .to_vec();
         let mut plan = source.context.plan()?;
         for row in rows {
             let target_id = match row.get(1) {
@@ -1457,43 +1929,178 @@ impl<T: Object> Many<T> {
                     ));
                 }
             };
-            plan.remove(source.relation, row);
-            plan.insert(
+            plan.remove_semantic(
+                source.relation,
+                row,
+                crate::plan::MutationAction::RelationshipMove,
+            );
+            plan.insert_semantic(
                 dest.relation,
                 edge_row(dest, crate::Id::<T>::new(target_id)),
+                crate::plan::MutationAction::RelationshipMove,
             );
         }
         Ok(plan)
     }
 
-    pub fn attach(&self, target: crate::Id<T>) -> Result<Plan> {
+    pub fn attach(&self, transaction: &mut crate::Transaction, target: crate::Id<T>) -> Result<()> {
+        let plan = self.attach_plan_in(transaction, target)?;
+        transaction.add_plan(plan)
+    }
+    pub fn detach(&self, transaction: &mut crate::Transaction, target: crate::Id<T>) -> Result<()> {
+        let plan = self.detach_plan_in(transaction, target)?;
+        transaction.add_plan(plan)
+    }
+    pub fn move_to(
+        &self,
+        transaction: &mut crate::Transaction,
+        target: crate::Id<T>,
+        destination: &Self,
+    ) -> Result<()> {
+        let plan = self.move_to_plan_in(transaction, target, destination)?;
+        transaction.add_plan(plan)
+    }
+    pub fn move_all_to(
+        &self,
+        transaction: &mut crate::Transaction,
+        destination: &Self,
+    ) -> Result<()> {
+        let plan = self.move_all_to_plan_in(transaction, destination)?;
+        transaction.add_plan(plan)
+    }
+    pub fn detach_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+        let plan = self.detach_all_plan_in(transaction)?;
+        transaction.add_plan(plan)
+    }
+    pub fn detach_ids(
+        &self,
+        transaction: &mut crate::Transaction,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+    ) -> Result<()> {
+        let plan = self.detach_ids_plan_in(transaction, ids)?;
+        transaction.add_plan(plan)
+    }
+    pub fn move_ids_to(
+        &self,
+        transaction: &mut crate::Transaction,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<()> {
+        let plan = self.move_ids_to_plan_in(transaction, ids, destination)?;
+        transaction.add_plan(plan)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn attach_plan(&self, target: crate::Id<T>) -> Result<Plan> {
         self.__attach(target)
     }
-    pub fn detach(&self, target: crate::Id<T>) -> Result<Plan> {
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn detach_plan(&self, target: crate::Id<T>) -> Result<Plan> {
         self.__detach(target)
     }
-    pub fn move_to(&self, target: crate::Id<T>, destination: &Self) -> Result<Plan> {
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn move_to_plan(&self, target: crate::Id<T>, destination: &Self) -> Result<Plan> {
         self.__move_to(target, destination)
     }
-    pub fn move_all_to(&self, destination: &Self) -> Result<Plan> {
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn move_all_to_plan(&self, destination: &Self) -> Result<Plan> {
         self.__move_all_to(destination)
     }
-    pub fn detach_all(&self) -> Result<Plan> {
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn detach_all_plan(&self) -> Result<Plan> {
         let binding = many_binding(self)?;
         let ids = bound_target_ids::<T>(binding)?
             .into_iter()
             .map(crate::Id::<T>::new);
         plan_detach_ids::<T>(binding, ids)
     }
-    pub fn detach_ids(&self, ids: impl IntoIterator<Item = crate::Id<T>>) -> Result<Plan> {
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn detach_ids_plan(&self, ids: impl IntoIterator<Item = crate::Id<T>>) -> Result<Plan> {
         plan_detach_ids::<T>(many_binding(self)?, ids)
     }
-    pub fn move_ids_to(
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn move_ids_to_plan(
         &self,
         ids: impl IntoIterator<Item = crate::Id<T>>,
         destination: &Self,
     ) -> Result<Plan> {
         plan_move_ids::<T>(many_binding(self)?, many_binding(destination)?, ids)
+    }
+
+    fn attach_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        target: crate::Id<T>,
+    ) -> Result<Plan> {
+        let binding = transaction_many_binding(transaction, self)?;
+        let mut plan = binding.context.plan()?;
+        plan.insert_semantic(
+            binding.relation,
+            edge_row(&binding, target),
+            crate::plan::MutationAction::RelationshipAttach,
+        );
+        Ok(plan)
+    }
+
+    fn detach_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        target: crate::Id<T>,
+    ) -> Result<Plan> {
+        let binding = transaction_many_binding(transaction, self)?;
+        plan_detach_ids::<T>(&binding, [target])
+    }
+
+    fn move_to_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        target: crate::Id<T>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let source = transaction_many_binding(transaction, self)?;
+        let destination = transaction_many_binding(transaction, destination)?;
+        plan_move_ids::<T>(&source, &destination, [target])
+    }
+
+    fn move_all_to_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let source = transaction_many_binding(transaction, self)?;
+        let destination = transaction_many_binding(transaction, destination)?;
+        let ids = bound_target_ids::<T>(&source)?
+            .into_iter()
+            .map(crate::Id::<T>::new);
+        plan_move_ids::<T>(&source, &destination, ids)
+    }
+
+    fn detach_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
+        let binding = transaction_many_binding(transaction, self)?;
+        let ids = bound_target_ids::<T>(&binding)?
+            .into_iter()
+            .map(crate::Id::<T>::new);
+        plan_detach_ids::<T>(&binding, ids)
+    }
+
+    fn detach_ids_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+    ) -> Result<Plan> {
+        let binding = transaction_many_binding(transaction, self)?;
+        plan_detach_ids::<T>(&binding, ids)
+    }
+
+    fn move_ids_to_plan_in(
+        &self,
+        transaction: &mut crate::Transaction,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let source = transaction_many_binding(transaction, self)?;
+        let destination = transaction_many_binding(transaction, destination)?;
+        plan_move_ids::<T>(&source, &destination, ids)
     }
 }
 
@@ -1578,7 +2185,7 @@ pub(crate) fn object_contract<E: Object>() -> Result<Option<crate::plan::ObjectC
                 field: crate::FieldId::new(__semantic_id(
                     "cfmd.object.kernel-field.v1",
                     E::KEY,
-                    field.name(),
+                    field.semantic_name(),
                 )),
                 target_type,
                 target_relation,
@@ -1594,7 +2201,7 @@ pub(crate) fn object_contract<E: Object>() -> Result<Option<crate::plan::ObjectC
                 field: crate::FieldId::new(__semantic_id(
                     "cfmd.object.kernel-field.v1",
                     E::KEY,
-                    field.name(),
+                    field.semantic_name(),
                 )),
                 target_type,
                 target_relation,
@@ -1622,7 +2229,7 @@ pub(crate) fn symbolic_relation<E: Object>() -> Relation<E> {
             crate::EquivalenceId::new(__semantic_id(
                 "cfmd.object.field-equivalence.v1",
                 E::KEY,
-                field.name(),
+                field.semantic_name(),
             ))
         })
         .collect();
@@ -1654,7 +2261,11 @@ impl<E: Object> ObjectProxy<E> {
             .equivalence_at(column)
             .expect("validated CFMD object field has equivalence semantics");
         let ordering = E::fields()[column].ordering().map(|_| {
-            crate::OrderingId::new(__semantic_id("cfmd.object.field-ordering.v1", E::KEY, name))
+            crate::OrderingId::new(__semantic_id(
+                "cfmd.object.field-ordering.v1",
+                E::KEY,
+                E::fields()[column].semantic_name(),
+            ))
         });
         Field::__from_semantics(self.relation.id(), column, equivalence, ordering)
     }
@@ -1698,6 +2309,8 @@ impl<E: Object> ObjectProxy<E> {
 pub struct ObjectSet<E: Object> {
     context: ReadContext,
     relation: Relation<E>,
+    projection: Option<Vec<usize>>,
+    exact_shape: bool,
 }
 
 impl<E: Object> ObjectSet<E> {
@@ -1716,7 +2329,7 @@ impl<E: Object> ObjectSet<E> {
             let expected = crate::EquivalenceId::new(__semantic_id(
                 "cfmd.object.field-equivalence.v1",
                 E::KEY,
-                field.name(),
+                field.semantic_name(),
             ));
             if relation.equivalence_at(index) != Some(expected) {
                 return Err(Error::new(
@@ -1729,7 +2342,81 @@ impl<E: Object> ObjectSet<E> {
                 ));
             }
         }
-        Ok(Self { context, relation })
+        Ok(Self {
+            context,
+            relation,
+            projection: None,
+            exact_shape: true,
+        })
+    }
+
+    pub(crate) fn new_projected(context: ReadContext, persisted: Relation<E>) -> Result<Self> {
+        let fields = E::fields();
+        let mut projection = Vec::with_capacity(fields.len());
+        let mut columns = Vec::with_capacity(fields.len());
+        let mut equivalences = Vec::with_capacity(fields.len());
+
+        for field in &fields {
+            let expected = crate::EquivalenceId::new(__semantic_id(
+                "cfmd.object.field-equivalence.v1",
+                E::KEY,
+                field.semantic_name(),
+            ));
+            let matches = persisted
+                .equivalences()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, equivalence)| (*equivalence == expected).then_some(index))
+                .collect::<Vec<_>>();
+            let [column] = matches.as_slice() else {
+                return Err(Error::new(
+                    ErrorKind::InvalidSchema,
+                    format!(
+                        "stored relation for object {} does not expose exactly one semantic field {}",
+                        E::KEY,
+                        field.name()
+                    ),
+                ));
+            };
+            let stored_type = persisted.column_types().get(*column).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidSchema,
+                    "semantic field column is out of bounds",
+                )
+            })?;
+            if stored_type != field.ty() {
+                return Err(Error::new(
+                    ErrorKind::TypeMismatch,
+                    format!(
+                        "stored field {}.{} is incompatible with the local Rust field type",
+                        E::KEY,
+                        field.name()
+                    ),
+                ));
+            }
+            projection.push(*column);
+            columns.push(stored_type.clone());
+            equivalences.push(expected);
+        }
+
+        if !E::accepts(&columns) {
+            return Err(Error::new(
+                ErrorKind::TypeMismatch,
+                format!(
+                    "stored relation for object {} cannot materialize the local contract",
+                    E::KEY
+                ),
+            ));
+        }
+        let exact_shape = persisted.width() == projection.len()
+            && projection.iter().copied().eq(0..persisted.width());
+        let relation = Relation::from_parts(persisted.id(), columns, equivalences);
+        Ok(Self {
+            context,
+            relation,
+            projection: (!exact_shape).then_some(projection),
+            exact_shape,
+        })
     }
 
     #[must_use]
@@ -1740,10 +2427,19 @@ impl<E: Object> ObjectSet<E> {
     #[track_caller]
     #[must_use]
     pub fn query(&self) -> ObjectQuery<E> {
+        let inner = if let Some(columns) = &self.projection {
+            RelationQuery::__from_raw(
+                self.relation.clone(),
+                Query::scan(self.relation.id()).project(columns.clone()),
+            )
+        } else {
+            self.relation.query()
+        };
         ObjectQuery {
             context: self.context.clone(),
             relation: self.relation.clone(),
-            inner: self.relation.query(),
+            inner,
+            exact_shape: self.exact_shape,
         }
     }
 
@@ -1757,8 +2453,52 @@ impl<E: Object> ObjectSet<E> {
         self.query().where_(predicate)
     }
 
+    #[track_caller]
+    #[must_use]
+    pub fn top<F, V>(&self, k: usize, field: F) -> ObjectQuery<E>
+    where
+        F: FnOnce(&E::Proxy) -> Field<E, V>,
+        V: OrderedObjectValue,
+    {
+        self.query().top(k, field)
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn bottom<F, V>(&self, k: usize, field: F) -> ObjectQuery<E>
+    where
+        F: FnOnce(&E::Proxy) -> Field<E, V>,
+        V: OrderedObjectValue,
+    {
+        self.query().bottom(k, field)
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn select<F, P>(&self, projection: F) -> ObjectProjectionQuery<E, P>
+    where
+        F: FnOnce(&E::Proxy) -> P,
+        P: Projection<E>,
+    {
+        self.query().select(projection)
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn group_by<F, G>(&self, key: F) -> ObjectGroupQuery<E, G>
+    where
+        F: FnOnce(&E::Proxy) -> G,
+        G: GroupKey<E>,
+    {
+        self.query().group_by(key)
+    }
+
     pub fn all(&self) -> Result<Vec<E>> {
         self.query().all()
+    }
+
+    pub fn count(&self) -> Result<usize> {
+        self.query().count()
     }
 
     pub fn get(&self, id: crate::Id<E>) -> Result<Option<E>> {
@@ -1789,21 +2529,224 @@ impl<E: Object> ObjectSet<E> {
         })
     }
 
-    /// Returns a proposed transition; it does not mutate the database.
+    /// Patches one persisted scalar/reference field while preserving every persisted field omitted
+    /// by this local entity contract. Reference patches also update the exact mirrored live-field
+    /// authority; identity remains immutable.
+    pub fn set<V, F, P>(
+        &self,
+        transaction: &mut crate::Transaction,
+        id: crate::Id<E>,
+        field: F,
+        value: V,
+    ) -> Result<()>
+    where
+        V: ObjectValue,
+        F: FnOnce(&E::Proxy) -> P,
+        P: ObjectPatchField<E, V>,
+    {
+        let local_field = field(&E::proxy(self.relation.clone())).into_patch_field()?;
+        if local_field.relation_id() != self.relation.id() {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "patch field belongs to a different entity relation",
+            ));
+        }
+        let local_column = local_field.column();
+        let fields = E::fields();
+        let schema_field = fields.get(local_column).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                "patch field is outside the local entity contract",
+            )
+        })?;
+        if matches!(schema_field.role(), ObjectFieldRole::Identity(_)) {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "object identity cannot be patched",
+            ));
+        }
+
+        let context = transaction.operation_context(&self.context)?;
+        let persisted = context.relation::<E>(E::relation_id())?;
+        let find_column = |name: &str| -> Result<usize> {
+            let expected = crate::EquivalenceId::new(__semantic_id(
+                "cfmd.object.field-equivalence.v1",
+                E::KEY,
+                name,
+            ));
+            let mut matches = persisted
+                .equivalences()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, equivalence)| (*equivalence == expected).then_some(index));
+            let column = matches.next().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidSchema,
+                    format!("persisted object {} has no semantic field {name}", E::KEY),
+                )
+            })?;
+            if matches.next().is_some() {
+                return Err(Error::new(
+                    ErrorKind::InvalidSchema,
+                    format!(
+                        "persisted object {} has duplicate semantic field {name}",
+                        E::KEY
+                    ),
+                ));
+            }
+            Ok(column)
+        };
+        let target_column = find_column(schema_field.semantic_name())?;
+        let target_type = persisted.column_types().get(target_column).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                "persisted patch column is out of bounds",
+            )
+        })?;
+        if !V::accepts(target_type) {
+            return Err(Error::new(
+                ErrorKind::TypeMismatch,
+                "patch value is incompatible with the persisted semantic field",
+            ));
+        }
+        let identity_local = E::identity_column().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                format!("object {} has no identity", E::KEY),
+            )
+        })?;
+        let identity_name = fields
+            .get(identity_local)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidSchema, "identity field is out of bounds"))?
+            .semantic_name();
+        let identity_column = find_column(identity_name)?;
+        let identity_equivalence = persisted.equivalence_at(identity_column).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                "persisted identity has no equivalence",
+            )
+        })?;
+        let query = Query::scan(persisted.id()).filter_eq(
+            identity_column,
+            id.into_value(),
+            identity_equivalence,
+        );
+        let result = context.execute_for_mutation(&query)?;
+        let [row] = result.rows() else {
+            return match result.rows().len() {
+                0 => Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("{} identity {} was not found", E::KEY, id.raw()),
+                )),
+                count => Err(Error::new(
+                    ErrorKind::Cardinality,
+                    format!("{} identity {} matched {count} rows", E::KEY, id.raw()),
+                )),
+            };
+        };
+        let encoded_value = value.into_value();
+        if row.get(target_column) == Some(&encoded_value) {
+            return Ok(());
+        }
+        let identity_value = row.get(identity_column).cloned().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                "persisted identity column is outside the object row",
+            )
+        })?;
+        let mut plan = context.plan()?;
+        let owner = crate::runtime::lifecycle_entity_id(E::type_id(), id.raw());
+        let semantic_field = kernel_types::SemanticId::new(__semantic_id(
+            "cfmd.object.kernel-field.v1",
+            E::KEY,
+            schema_field.semantic_name(),
+        ));
+        plan.patch_object_field(
+            persisted.id(),
+            id.raw(),
+            identity_column,
+            identity_value,
+            target_column,
+            encoded_value.clone(),
+            owner,
+            semantic_field,
+        )?;
+
+        match schema_field.role() {
+            ObjectFieldRole::Reference { target_type, .. }
+            | ObjectFieldRole::OptionalReference { target_type, .. } => {
+                let optional = matches!(
+                    schema_field.role(),
+                    ObjectFieldRole::OptionalReference { .. }
+                );
+                let mirrored = crate::runtime::mirrored_reference_value_for_role(
+                    &encoded_value,
+                    target_type,
+                    optional,
+                )?;
+                plan.patch_model_field(semantic_field, owner, Some(mirrored))?;
+            }
+            ObjectFieldRole::Value => {}
+            ObjectFieldRole::Identity(_) => unreachable!("identity patches fail before planning"),
+        }
+        transaction.add_plan(plan)
+    }
+
+    /// Adds one entity to this collection as part of `transaction`.
+    ///
+    /// The collection names the database resource, `transaction` names the atomic change set, and
+    /// `value` is the payload. Plan construction remains internal to the ordinary CRUD path.
+    pub fn add(&self, transaction: &mut crate::Transaction, value: E) -> Result<()> {
+        if !self.exact_shape {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "partial entity contracts cannot create or replace persisted rows; use semantic field patches",
+            ));
+        }
+        let context = transaction.operation_context(&self.context)?;
+        let collection = context.objects::<E>()?;
+        transaction.add_plan(collection.insert_plan(value)?)
+    }
+
+    /// Removes one exact entity value as part of `transaction`.
+    pub fn remove(&self, transaction: &mut crate::Transaction, value: E) -> Result<()> {
+        if !self.exact_shape {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "partial entity contracts cannot remove persisted rows by truncated value",
+            ));
+        }
+        let context = transaction.operation_context(&self.context)?;
+        let collection = context.objects::<E>()?;
+        transaction.add_plan(collection.remove_plan(value)?)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings. Normal application code should use
+    /// [`ObjectSet::add`].
     pub fn insert(&self, value: E) -> Result<Plan> {
+        self.insert_plan(value)
+    }
+
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn insert_plan(&self, value: E) -> Result<Plan> {
         let mut plan = self.context.plan()?;
         E::__append_insert(value, &self.context, &mut plan)?;
         Ok(plan)
     }
 
-    /// Returns a proposed transition; it does not mutate the database.
-    pub fn remove(&self, value: E) -> Result<Plan> {
+    /// Advanced exact-plan construction for tooling/bindings.
+    pub fn remove_plan(&self, value: E) -> Result<Plan> {
         let mut plan = self.context.plan()?;
         if let Some(contract) = crate::object::object_contract::<E>()? {
             plan.register_object_contract(contract);
         }
         crate::object::register_object_relationship_contracts::<E>(&mut plan)?;
-        plan.remove_typed(&self.relation, value)?;
+        let row = self.relation.encode_row(value)?;
+        plan.remove_semantic(
+            self.relation.id(),
+            row,
+            crate::plan::MutationAction::ObjectDelete,
+        );
         Ok(plan)
     }
 }
@@ -1813,6 +2756,7 @@ pub struct ObjectQuery<E: Object> {
     pub(crate) context: ReadContext,
     relation: Relation<E>,
     pub(crate) inner: RelationQuery<E>,
+    exact_shape: bool,
 }
 
 impl<E: Object> ObjectQuery<E> {
@@ -1834,6 +2778,30 @@ impl<E: Object> ObjectQuery<E> {
 
     #[track_caller]
     #[must_use]
+    pub fn top<F, V>(mut self, k: usize, field: F) -> Self
+    where
+        F: FnOnce(&E::Proxy) -> Field<E, V>,
+        V: OrderedObjectValue,
+    {
+        let proxy = E::proxy(self.relation.clone());
+        self.inner = self.inner.top(field(&proxy), k);
+        self
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn bottom<F, V>(mut self, k: usize, field: F) -> Self
+    where
+        F: FnOnce(&E::Proxy) -> Field<E, V>,
+        V: OrderedObjectValue,
+    {
+        let proxy = E::proxy(self.relation.clone());
+        self.inner = self.inner.bottom(field(&proxy), k);
+        self
+    }
+
+    #[track_caller]
+    #[must_use]
     pub fn select<F, P>(self, projection: F) -> ObjectProjectionQuery<E, P>
     where
         F: FnOnce(&E::Proxy) -> P,
@@ -1843,6 +2811,30 @@ impl<E: Object> ObjectQuery<E> {
         ObjectProjectionQuery {
             context: self.context,
             inner: self.inner.select(projection(&proxy)),
+        }
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn group_by<F, G>(self, key: F) -> ObjectGroupQuery<E, G>
+    where
+        F: FnOnce(&E::Proxy) -> G,
+        G: GroupKey<E>,
+    {
+        let proxy = E::proxy(self.relation.clone());
+        let key = key(&proxy);
+        let error = (!key.belongs_to(self.relation.id())).then(|| {
+            Error::new(
+                ErrorKind::InvalidPlan,
+                "group key belongs to a different relation handle",
+            )
+        });
+        ObjectGroupQuery {
+            context: self.context,
+            relation: self.relation,
+            inner: self.inner.raw(),
+            key,
+            error,
         }
     }
 
@@ -1893,16 +2885,22 @@ impl<E: Object> ObjectQuery<E> {
             .collect()
     }
 
+    pub fn count(&self) -> Result<usize> {
+        execute_exact_count(&self.context, self.inner.clone().raw())
+    }
+
     pub fn first_or_none(&self) -> Result<Option<E>> {
         let mut values = self.all()?;
         Ok(values.drain(..).next())
     }
 
     pub fn one_or_none(&self) -> Result<Option<E>> {
-        let mut values = self.all()?;
-        match values.len() {
+        match self.count()? {
             0 => Ok(None),
-            1 => Ok(values.pop()),
+            1 => {
+                let mut values = self.all()?;
+                Ok(values.pop())
+            }
             count => Err(Error::new(
                 ErrorKind::Cardinality,
                 format!("expected at most one object, query returned {count}"),
@@ -1919,8 +2917,54 @@ impl<E: Object> ObjectQuery<E> {
         })
     }
 
-    /// Evaluates this snapshot-bound query and returns its exact deletion as a proposed `Plan`.
-    pub fn delete(&self) -> Result<Plan> {
+    /// Deletes every object selected by this exact query as part of `transaction`.
+    pub fn delete(&self, transaction: &mut crate::Transaction) -> Result<()> {
+        let context = transaction.operation_context(&self.context)?;
+        if !self.exact_shape {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "partial entity queries cannot delete persisted rows until operation authority is checked by identity",
+            ));
+        }
+        let query = ObjectQuery {
+            context: context.clone(),
+            relation: context.relation::<E>(E::relation_id())?,
+            inner: self.inner.clone(),
+            exact_shape: true,
+        };
+        transaction.add_plan(query.delete_plan()?)
+    }
+
+    /// Rewrites every object selected by this exact query as part of `transaction`.
+    pub fn update<F>(&self, transaction: &mut crate::Transaction, rewrite: F) -> Result<()>
+    where
+        F: FnMut(E) -> E,
+        E: Clone,
+    {
+        let context = transaction.operation_context(&self.context)?;
+        if !self.exact_shape {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "partial entity queries cannot perform full-row rewrites; use semantic field patches",
+            ));
+        }
+        let query = ObjectQuery {
+            context: context.clone(),
+            relation: context.relation::<E>(E::relation_id())?,
+            inner: self.inner.clone(),
+            exact_shape: true,
+        };
+        transaction.add_plan(query.update_plan(rewrite)?)
+    }
+
+    /// Advanced exact-plan construction for query deletion.
+    pub fn delete_plan(&self) -> Result<Plan> {
+        if !self.exact_shape {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "partial entity query cannot build a full-row delete plan",
+            ));
+        }
         let values = self.all()?;
         let mut plan = self.context.plan()?;
         if let Some(contract) = crate::object::object_contract::<E>()? {
@@ -1928,17 +2972,28 @@ impl<E: Object> ObjectQuery<E> {
         }
         crate::object::register_object_relationship_contracts::<E>(&mut plan)?;
         for value in values {
-            plan.remove_typed(&self.relation, value)?;
+            let row = self.relation.encode_row(value)?;
+            plan.remove_semantic(
+                self.relation.id(),
+                row,
+                crate::plan::MutationAction::ObjectDelete,
+            );
         }
         Ok(plan)
     }
 
-    /// Evaluates this snapshot-bound query and returns exact remove+insert rewrites as a `Plan`.
-    pub fn update<F>(&self, mut rewrite: F) -> Result<Plan>
+    /// Advanced exact-plan construction for query rewrite.
+    pub fn update_plan<F>(&self, mut rewrite: F) -> Result<Plan>
     where
         F: FnMut(E) -> E,
         E: Clone,
     {
+        if !self.exact_shape {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "partial entity query cannot build a full-row rewrite plan",
+            ));
+        }
         let values = self.all()?;
         let mut plan = self.context.plan()?;
         if let Some(contract) = crate::object::object_contract::<E>()? {
@@ -1962,12 +3017,186 @@ impl<E: Object> ObjectQuery<E> {
 }
 
 #[derive(Debug, Clone)]
+pub struct ObjectGroupQuery<E: Object, G: GroupKey<E>> {
+    context: ReadContext,
+    relation: Relation<E>,
+    inner: Query,
+    key: G,
+    error: Option<Error>,
+}
+
+impl<E: Object, G: GroupKey<E>> ObjectGroupQuery<E, G> {
+    #[must_use]
+    pub fn count(self) -> GroupedAggregateQuery<G::Output, usize> {
+        let key_width = self.key.columns().len();
+        let query = self.inner.clone().group_count(
+            self.key.columns(),
+            self.key.equivalences(),
+            count_equivalence_id(),
+        );
+        GroupedAggregateQuery {
+            context: self.context,
+            inner: query,
+            decode: decode_group_count_row::<E, G>,
+            aggregate_column: key_width,
+            ordering: count_ordering_id(),
+            error: self.error,
+        }
+    }
+
+    #[must_use]
+    pub fn sum<F>(self, value: F) -> GroupedAggregateQuery<G::Output, f64>
+    where
+        F: FnOnce(&E::Proxy) -> Field<E, f64>,
+    {
+        let proxy = E::proxy(self.relation.clone());
+        let value = value(&proxy);
+        let error = self.error.or_else(|| {
+            (value.relation_id() != self.relation.id()).then(|| {
+                Error::new(
+                    ErrorKind::InvalidPlan,
+                    "group aggregate field belongs to a different relation handle",
+                )
+            })
+        });
+        let key_width = self.key.columns().len();
+        let query = self.inner.clone().group_exact_f64_sum(
+            self.key.columns(),
+            self.key.equivalences(),
+            value.column(),
+            value.equivalence(),
+        );
+        GroupedAggregateQuery {
+            context: self.context,
+            inner: query,
+            decode: decode_group_sum_row::<E, G>,
+            aggregate_column: key_width,
+            ordering: exact_f64_sum_ordering_id(),
+            error,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupedAggregateQuery<K, A> {
+    context: ReadContext,
+    inner: Query,
+    decode: fn(&crate::Row) -> Result<(K, A)>,
+    aggregate_column: usize,
+    ordering: crate::OrderingId,
+    error: Option<Error>,
+}
+
+impl<K, A> GroupedAggregateQuery<K, A> {
+    #[track_caller]
+    #[must_use]
+    pub fn top(mut self, k: usize) -> Self {
+        self.inner = self.inner.top_k_with_ties(
+            self.aggregate_column,
+            self.ordering,
+            crate::OrderDirection::Descending,
+            k,
+        );
+        self
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn bottom(mut self, k: usize) -> Self {
+        self.inner = self.inner.top_k_with_ties(
+            self.aggregate_column,
+            self.ordering,
+            crate::OrderDirection::Ascending,
+            k,
+        );
+        self
+    }
+
+    pub fn all(&self) -> Result<Vec<(K, A)>> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        self.context
+            .execute(&self.inner)?
+            .rows()
+            .iter()
+            .map(self.decode)
+            .collect()
+    }
+
+    pub fn watch(&self) -> Result<crate::GroupedAggregateWatch<K, A>> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        crate::GroupedAggregateWatch::new(&self.context, &self.inner, self.decode)
+    }
+
+    #[must_use]
+    pub const fn node_id(&self) -> crate::QueryNodeId {
+        self.inner.node_id()
+    }
+
+    #[must_use]
+    pub fn source(&self) -> crate::QuerySource {
+        self.inner.source()
+    }
+}
+
+pub(crate) fn decode_group_count_row<E: Object, G: GroupKey<E>>(
+    row: &crate::Row,
+) -> Result<(G::Output, usize)> {
+    let Some((count, key)) = row.split_last() else {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "group count aggregate returned an invalid row shape",
+        ));
+    };
+    let Value::I64(count) = count else {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "group count aggregate returned an invalid result value",
+        ));
+    };
+    let count = usize::try_from(*count).map_err(|_| {
+        Error::new(
+            ErrorKind::InvariantViolation,
+            "group count cannot be represented as usize",
+        )
+    })?;
+    Ok((G::decode(key)?, count))
+}
+
+pub(crate) fn decode_group_sum_row<E: Object, G: GroupKey<E>>(
+    row: &crate::Row,
+) -> Result<(G::Output, f64)> {
+    let Some((sum, key)) = row.split_last() else {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "group exact-f64 sum returned an invalid row shape",
+        ));
+    };
+    let Value::F64Bits(bits) = sum else {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "group exact-f64 sum returned an invalid result value",
+        ));
+    };
+    Ok((G::decode(key)?, f64::from_bits(*bits)))
+}
+
+#[derive(Debug, Clone)]
 pub struct ObjectProjectionQuery<E: Object, P: Projection<E>> {
     pub(crate) context: ReadContext,
     pub(crate) inner: TypedQuery<E, P>,
 }
 
 impl<E: Object, P: Projection<E>> ObjectProjectionQuery<E, P> {
+    #[must_use]
+    pub fn distinct(mut self) -> Self {
+        self.inner = self.inner.distinct();
+        self
+    }
+
     #[must_use]
     pub const fn node_id(&self) -> crate::QueryNodeId {
         self.inner.node_id()
@@ -1986,12 +3215,26 @@ impl<E: Object, P: Projection<E>> ObjectProjectionQuery<E, P> {
         self.inner.all(&self.context)
     }
 
+    pub fn count(&self) -> Result<usize> {
+        execute_exact_count(&self.context, self.inner.raw().clone())
+    }
+
     pub fn first_or_none(&self) -> Result<Option<P::Output>> {
         self.inner.first_or_none(&self.context)
     }
 
     pub fn one_or_none(&self) -> Result<Option<P::Output>> {
-        self.inner.one_or_none(&self.context)
+        match self.count()? {
+            0 => Ok(None),
+            1 => {
+                let mut values = self.all()?;
+                Ok(values.pop())
+            }
+            count => Err(Error::new(
+                ErrorKind::Cardinality,
+                format!("expected at most one projection, query returned {count}"),
+            )),
+        }
     }
 
     pub fn one(&self) -> Result<P::Output> {

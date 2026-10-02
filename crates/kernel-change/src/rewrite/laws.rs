@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_types::SemanticId;
 
@@ -248,26 +248,19 @@ pub const fn coordination_decision(law: PairRewriteLaw) -> PairCoordinationDecis
     }
 }
 
+/// Classifies two exact write-action maps independently of their coordinate domain.
+///
+/// This is the shared action-law core used by higher-level footprints and by runtime history
+/// domains whose persisted coordinates are richer than [`SemanticWriteCoordinate`]. Callers
+/// remain responsible for read dependencies and invariant obligations before using this result.
 #[must_use]
-pub fn infer_pair_rewrite_law(left: &RewriteFootprint, right: &RewriteFootprint) -> PairRewriteLaw {
-    if !left.invariant_obligations.is_empty() || !right.invariant_obligations.is_empty() {
-        return PairRewriteLaw::Unknown;
-    }
-    if left
-        .reads
-        .iter()
-        .any(|coord| right.writes.contains_key(coord))
-        || right
-            .reads
-            .iter()
-            .any(|coord| left.writes.contains_key(coord))
-    {
-        return PairRewriteLaw::Unknown;
-    }
-
+pub fn infer_write_action_law<K: Ord + Eq>(
+    left: &BTreeMap<K, RewriteActionLaw>,
+    right: &BTreeMap<K, RewriteActionLaw>,
+) -> PairRewriteLaw {
     let mut saw_same_idempotent = false;
-    for (coordinate, left_action) in &left.writes {
-        let Some(right_action) = right.writes.get(coordinate) else {
+    for (coordinate, left_action) in left {
+        let Some(right_action) = right.get(coordinate) else {
             continue;
         };
         match (left_action, right_action) {
@@ -303,9 +296,28 @@ pub fn infer_pair_rewrite_law(left: &RewriteFootprint, right: &RewriteFootprint)
         }
     }
 
-    if saw_same_idempotent && left.writes == right.writes {
+    if saw_same_idempotent && left == right {
         PairRewriteLaw::SameIdempotentIntent
     } else {
         PairRewriteLaw::StrongCommute
     }
+}
+
+#[must_use]
+pub fn infer_pair_rewrite_law(left: &RewriteFootprint, right: &RewriteFootprint) -> PairRewriteLaw {
+    if !left.invariant_obligations.is_empty() || !right.invariant_obligations.is_empty() {
+        return PairRewriteLaw::Unknown;
+    }
+    if left
+        .reads
+        .iter()
+        .any(|coord| right.writes.contains_key(coord))
+        || right
+            .reads
+            .iter()
+            .any(|coord| left.writes.contains_key(coord))
+    {
+        return PairRewriteLaw::Unknown;
+    }
+    infer_write_action_law(&left.writes, &right.writes)
 }

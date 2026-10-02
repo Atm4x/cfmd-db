@@ -2345,10 +2345,10 @@ mod tests {
                 column_equivalences: vec![text_eq],
             },
         };
-        let owner_rows = fixture.model.relations.get(&fixture.owner).unwrap();
+        let owner_rows = fixture.model.relations.materialize_owned(&fixture.owner).unwrap();
         let projection_calls = Cell::new(0_usize);
         let catalog = super::GammaPreimageCatalog::build(
-            owner_rows,
+            &owner_rows,
             &owner_type,
             &projected_type,
             &fixture.context,
@@ -2370,7 +2370,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                catalog.representative(&class, owner_rows),
+                catalog.representative(&class, &owner_rows),
                 Some(&owner_rows[0])
             );
         }
@@ -2391,7 +2391,7 @@ mod tests {
             },
         };
         let old_full_section = kernel_query::RelationValue::Bag(
-            fixture.model.relations.get(&fixture.owner).unwrap().clone(),
+            fixture.model.relations.materialize_owned(&fixture.owner).unwrap(),
         );
         let rows = old_full_section.rows().to_vec();
         let project_stages = vec![vec![0]];

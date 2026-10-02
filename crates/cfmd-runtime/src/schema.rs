@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{EquivalenceId, FieldId, OrderingId, RelationId, TypeId, VariantTagId};
+use crate::{
+    EquivalenceId, FieldId, OrderingId, RelationColumnId, RelationId, TypeId, VariantTagId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {
@@ -11,6 +13,58 @@ pub enum ScalarType {
     Text,
     LiveEntityRef(TypeId),
     HistoricalEntityRef(TypeId),
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextPattern {
+    Never,
+    Empty,
+    Literal(String),
+    AnyScalar,
+    Concat(Vec<Self>),
+    Alternate(Vec<Self>),
+    ZeroOrMore(Box<Self>),
+}
+
+impl TextPattern {
+    #[must_use]
+    pub fn literal(value: impl Into<String>) -> Self { Self::Literal(value.into()) }
+    #[must_use]
+    pub fn concat(parts: impl IntoIterator<Item = Self>) -> Self { Self::Concat(parts.into_iter().collect()) }
+    #[must_use]
+    pub fn alternate(parts: impl IntoIterator<Item = Self>) -> Self { Self::Alternate(parts.into_iter().collect()) }
+    #[must_use]
+    pub fn zero_or_more(pattern: Self) -> Self { Self::ZeroOrMore(Box::new(pattern)) }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleValueExpr {
+    Input,
+    Field(FieldId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticRuleExpr {
+    True,
+    False,
+    And(Vec<Self>),
+    Or(Vec<Self>),
+    Not(Box<Self>),
+    I64Range { value: RuleValueExpr, min: Option<i64>, max: Option<i64> },
+    TextLength { value: RuleValueExpr, min: usize, max: Option<usize> },
+    TextOneOf { value: RuleValueExpr, allowed: BTreeSet<String> },
+    TextMatches { value: RuleValueExpr, pattern: TextPattern },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FieldRule {
+    I64Range { min: Option<i64>, max: Option<i64> },
+    TextLength { min: usize, max: Option<usize> },
+    TextOneOf(BTreeSet<String>),
+    TextMatches(TextPattern),
+    Expr(SemanticRuleExpr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +161,7 @@ pub enum RelationSemantics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationSchema {
     id: RelationId,
+    column_ids: Vec<RelationColumnId>,
     columns: Vec<Type>,
     semantics: RelationSemantics,
 }
@@ -118,9 +173,14 @@ impl RelationSchema {
         columns: impl Into<Vec<Type>>,
         column_equivalences: impl Into<Vec<EquivalenceId>>,
     ) -> Self {
+        let columns = columns.into();
+        let column_ids = (0..columns.len())
+            .map(|ordinal| RelationColumnId::new((ordinal as u128) + 1))
+            .collect();
         Self {
             id,
-            columns: columns.into(),
+            column_ids,
+            columns,
             semantics: RelationSemantics::Bag {
                 column_equivalences: column_equivalences.into(),
             },
@@ -133,9 +193,48 @@ impl RelationSchema {
         columns: impl Into<Vec<Type>>,
         column_equivalences: impl Into<Vec<EquivalenceId>>,
     ) -> Self {
+        let columns = columns.into();
+        let column_ids = (0..columns.len())
+            .map(|ordinal| RelationColumnId::new((ordinal as u128) + 1))
+            .collect();
         Self {
             id,
-            columns: columns.into(),
+            column_ids,
+            columns,
+            semantics: RelationSemantics::Set {
+                column_equivalences: column_equivalences.into(),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn bag_with_column_ids(
+        id: RelationId,
+        columns: impl Into<Vec<(RelationColumnId, Type)>>,
+        column_equivalences: impl Into<Vec<EquivalenceId>>,
+    ) -> Self {
+        let columns = columns.into();
+        Self {
+            id,
+            column_ids: columns.iter().map(|(id, _)| *id).collect(),
+            columns: columns.into_iter().map(|(_, ty)| ty).collect(),
+            semantics: RelationSemantics::Bag {
+                column_equivalences: column_equivalences.into(),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn set_with_column_ids(
+        id: RelationId,
+        columns: impl Into<Vec<(RelationColumnId, Type)>>,
+        column_equivalences: impl Into<Vec<EquivalenceId>>,
+    ) -> Self {
+        let columns = columns.into();
+        Self {
+            id,
+            column_ids: columns.iter().map(|(id, _)| *id).collect(),
+            columns: columns.into_iter().map(|(_, ty)| ty).collect(),
             semantics: RelationSemantics::Set {
                 column_equivalences: column_equivalences.into(),
             },
@@ -145,6 +244,10 @@ impl RelationSchema {
     #[must_use]
     pub const fn id(&self) -> RelationId {
         self.id
+    }
+    #[must_use]
+    pub fn column_ids(&self) -> &[RelationColumnId] {
+        &self.column_ids
     }
     #[must_use]
     pub fn columns(&self) -> &[Type] {
@@ -165,6 +268,9 @@ pub struct Schema {
     pub(crate) orderings: BTreeMap<OrderingId, PrimitiveOrdering>,
     pub(crate) relations: BTreeMap<RelationId, RelationSchema>,
     pub(crate) entity_fields: BTreeMap<FieldId, (TypeId, Type)>,
+    pub(crate) field_rules: BTreeMap<FieldId, Vec<FieldRule>>,
+    pub(crate) relation_column_rules: BTreeMap<(RelationId, usize), Vec<FieldRule>>,
+    pub(crate) entity_rules: BTreeMap<TypeId, Vec<SemanticRuleExpr>>,
 }
 
 impl Schema {
@@ -188,6 +294,9 @@ pub struct SchemaBuilder {
     relations: BTreeMap<RelationId, RelationSchema>,
     entity_types: BTreeSet<TypeId>,
     entity_fields: BTreeMap<FieldId, (TypeId, Type)>,
+    field_rules: BTreeMap<FieldId, Vec<FieldRule>>,
+    relation_column_rules: BTreeMap<(RelationId, usize), Vec<FieldRule>>,
+    entity_rules: BTreeMap<TypeId, Vec<SemanticRuleExpr>>,
     duplicates: BTreeSet<u128>,
     invalid_schema: Vec<String>,
     required_relations: BTreeMap<RelationId, String>,
@@ -210,10 +319,22 @@ impl SchemaBuilder {
                 PrimitiveEquivalence::I64Exact,
             )]),
             structural_equivalences: BTreeMap::new(),
-            orderings: BTreeMap::new(),
+            orderings: BTreeMap::from([
+                (
+                    crate::object::count_ordering_id(),
+                    PrimitiveOrdering::I64Ascending,
+                ),
+                (
+                    crate::object::exact_f64_sum_ordering_id(),
+                    PrimitiveOrdering::F64Total,
+                ),
+            ]),
             relations: BTreeMap::new(),
             entity_types: BTreeSet::new(),
             entity_fields: BTreeMap::new(),
+            field_rules: BTreeMap::new(),
+            relation_column_rules: BTreeMap::new(),
+            entity_rules: BTreeMap::new(),
             duplicates: BTreeSet::new(),
             invalid_schema: Vec::new(),
             required_relations: BTreeMap::new(),
@@ -273,6 +394,33 @@ impl SchemaBuilder {
         self
     }
 
+    #[must_use]
+    pub fn field_rule(mut self, field: FieldId, rule: FieldRule) -> Self {
+        self.field_rules.entry(field).or_default().push(rule);
+        self
+    }
+
+    #[must_use]
+    pub fn entity_rule(mut self, owner: TypeId, rule: SemanticRuleExpr) -> Self {
+        self.entity_rules.entry(owner).or_default().push(rule);
+        self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __relation_column_rule(
+        mut self,
+        relation: RelationId,
+        column: usize,
+        rule: FieldRule,
+    ) -> Self {
+        self.relation_column_rules
+            .entry((relation, column))
+            .or_default()
+            .push(rule);
+        self
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn __entity_type(mut self, id: TypeId) -> Self {
@@ -320,6 +468,22 @@ impl SchemaBuilder {
                 ));
             }
         }
+        for field in self.field_rules.keys() {
+            if !self.entity_fields.contains_key(field) {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::InvalidSchema,
+                    format!("field rule references unknown field {}", field.raw()),
+                ));
+            }
+        }
+        for owner in self.entity_rules.keys() {
+            if !self.entity_types.contains(owner) {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::InvalidSchema,
+                    format!("entity rule references unknown entity type {}", owner.raw()),
+                ));
+            }
+        }
         if let Some(id) = self.duplicates.first() {
             return Err(crate::Error::new(
                 crate::ErrorKind::InvalidSchema,
@@ -352,6 +516,9 @@ impl SchemaBuilder {
             orderings: self.orderings,
             relations: self.relations,
             entity_fields: self.entity_fields,
+            field_rules: self.field_rules,
+            relation_column_rules: self.relation_column_rules,
+            entity_rules: self.entity_rules,
         })
     }
 }
@@ -366,7 +533,10 @@ impl SchemaView {
     pub(crate) fn from_kernel(schema: &kernel_schema::Schema) -> Self {
         Self {
             revision: schema.revision.raw(),
-            relations: schema.relations().map(relation_from_kernel).collect(),
+            relations: schema
+                .relations()
+                .map(|relation| relation_from_kernel(schema, relation))
+                .collect(),
         }
     }
 
@@ -381,6 +551,39 @@ impl SchemaView {
     #[must_use]
     pub fn relation(&self, id: RelationId) -> Option<&RelationSchema> {
         self.relations.iter().find(|relation| relation.id == id)
+    }
+}
+
+pub(crate) fn text_pattern_to_kernel(pattern: TextPattern) -> kernel_schema::TextPattern {
+    match pattern {
+        TextPattern::Never => kernel_schema::TextPattern::Never,
+        TextPattern::Empty => kernel_schema::TextPattern::Empty,
+        TextPattern::Literal(value) => kernel_schema::TextPattern::Literal(value),
+        TextPattern::AnyScalar => kernel_schema::TextPattern::AnyScalar,
+        TextPattern::Concat(parts) => kernel_schema::TextPattern::Concat(parts.into_iter().map(text_pattern_to_kernel).collect()),
+        TextPattern::Alternate(parts) => kernel_schema::TextPattern::Alternate(parts.into_iter().map(text_pattern_to_kernel).collect()),
+        TextPattern::ZeroOrMore(inner) => kernel_schema::TextPattern::ZeroOrMore(Box::new(text_pattern_to_kernel(*inner))),
+    }
+}
+
+pub(crate) fn semantic_rule_to_kernel(rule: SemanticRuleExpr) -> kernel_schema::SemanticRuleExpr {
+    match rule {
+        SemanticRuleExpr::True => kernel_schema::SemanticRuleExpr::True,
+        SemanticRuleExpr::False => kernel_schema::SemanticRuleExpr::False,
+        SemanticRuleExpr::And(rules) => kernel_schema::SemanticRuleExpr::And(rules.into_iter().map(semantic_rule_to_kernel).collect()),
+        SemanticRuleExpr::Or(rules) => kernel_schema::SemanticRuleExpr::Or(rules.into_iter().map(semantic_rule_to_kernel).collect()),
+        SemanticRuleExpr::Not(rule) => kernel_schema::SemanticRuleExpr::Not(Box::new(semantic_rule_to_kernel(*rule))),
+        SemanticRuleExpr::I64Range { value, min, max } => kernel_schema::SemanticRuleExpr::I64Range { value: rule_value_to_kernel(value), min, max },
+        SemanticRuleExpr::TextLength { value, min, max } => kernel_schema::SemanticRuleExpr::TextLength { value: rule_value_to_kernel(value), min, max },
+        SemanticRuleExpr::TextOneOf { value, allowed } => kernel_schema::SemanticRuleExpr::TextOneOf { value: rule_value_to_kernel(value), allowed },
+        SemanticRuleExpr::TextMatches { value, pattern } => kernel_schema::SemanticRuleExpr::TextMatches { value: rule_value_to_kernel(value), pattern: text_pattern_to_kernel(pattern) },
+    }
+}
+
+fn rule_value_to_kernel(value: RuleValueExpr) -> kernel_schema::RuleValueExpr {
+    match value {
+        RuleValueExpr::Input => kernel_schema::RuleValueExpr::Input,
+        RuleValueExpr::Field(field) => kernel_schema::RuleValueExpr::Field(field.into()),
     }
 }
 
@@ -502,7 +705,10 @@ fn type_from_kernel(value: &kernel_schema::TypeExpr) -> Type {
     }
 }
 
-fn relation_from_kernel(value: &kernel_schema::RelationDef) -> RelationSchema {
+fn relation_from_kernel(
+    schema: &kernel_schema::Schema,
+    value: &kernel_schema::RelationDef,
+) -> RelationSchema {
     let semantics = match &value.semantics {
         kernel_schema::RelationSemantics::Bag {
             column_equivalences,
@@ -523,6 +729,12 @@ fn relation_from_kernel(value: &kernel_schema::RelationDef) -> RelationSchema {
     };
     RelationSchema {
         id: RelationId::new(value.id.raw()),
+        column_ids: schema
+            .relation_column_ids(value.id)
+            .unwrap_or_default()
+            .iter()
+            .map(|id| RelationColumnId::new(id.raw()))
+            .collect(),
         columns: value.columns.iter().map(type_from_kernel).collect(),
         semantics,
     }

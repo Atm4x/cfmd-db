@@ -2,11 +2,13 @@ mod error;
 mod extents;
 mod state;
 mod violation;
+mod rules;
 
 pub use error::*;
 pub use extents::*;
 pub use state::*;
 pub use violation::*;
+pub use rules::*;
 
 #[cfg(test)]
 mod tests {
@@ -28,7 +30,7 @@ mod tests {
         EntityId::new(raw)
     }
 
-    fn fixture() -> (SemanticContext, SemanticRegistry, DatabaseState) {
+    pub(super) fn fixture() -> (SemanticContext, SemanticRegistry, DatabaseState) {
         let person = SemanticId::new(1);
         let name = SemanticId::new(2);
         let relation = SemanticId::new(3);
@@ -267,7 +269,7 @@ mod tests {
 
         let rows = state.model.relations.get(&relation).unwrap();
         let measure =
-            relation_uniqueness_violation_measure(rows, &[text_eq], &context, &registry).unwrap();
+            relation_uniqueness_violation_measure(&rows.to_vec(), &[text_eq], &context, &registry).unwrap();
         assert_eq!(measure.witness_count(), 1);
         assert_eq!(measure.iter().next().map(|(_, mass)| mass), Some(1));
     }
@@ -714,6 +716,50 @@ mod tests {
         println!(
             "compile_ns={compile_ns} baseline_ns={baseline_ns} dense_ns={dense_ns} ratio_milli={ratio_milli} probes={}",
             probes.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod entity_rule_hostile_tests {
+    use super::*;
+    use kernel_schema::{RuleValueExpr, SemanticRuleExpr, TextPattern};
+    use kernel_types::SemanticId;
+
+    #[test]
+    fn entity_rule_uses_stable_field_coordinate_in_validation_and_vmf() {
+        let (mut context, registry, state) = super::tests::fixture();
+        let person = SemanticId::new(1);
+        let name = SemanticId::new(2);
+        context
+            .schema
+            .add_entity_rule(
+                person,
+                SemanticRuleExpr::TextMatches {
+                    value: RuleValueExpr::Field(name),
+                    pattern: TextPattern::literal("Grace"),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            validate_state(&context, &registry, &state),
+            Err(ValidationError::EntityRuleViolation {
+                owner: person,
+                entity: kernel_types::EntityId::new(10),
+                rule_index: 0,
+            })
+        );
+
+        let extents = DenseTypeExtents::compile(&state.model, &context.schema).unwrap();
+        let measure = dynamic_violation_measure(&context, &registry, &state, &extents).unwrap();
+        assert_eq!(
+            measure.mass(&DynamicViolationWitness::EntityRule {
+                owner: person,
+                entity: kernel_types::EntityId::new(10),
+                rule_index: 0,
+            }),
+            1
         );
     }
 }

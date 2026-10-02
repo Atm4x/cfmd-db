@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_types::SemanticId;
 
@@ -8,6 +8,21 @@ use crate::TypeExpr;
 pub struct CapabilityDef {
     pub id: SemanticId,
     pub required_fields: BTreeMap<SemanticId, TypeExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldRule {
+    I64Range {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+    TextLength {
+        min: usize,
+        max: Option<usize>,
+    },
+    TextOneOf(BTreeSet<String>),
+    TextMatches(crate::TextPattern),
+    Expr(crate::SemanticRuleExpr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

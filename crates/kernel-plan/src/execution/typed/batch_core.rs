@@ -451,6 +451,7 @@ fn build_typed_batch_program<'a>(
         | Plan::FilterEqColumns { .. }
         | Plan::JoinEq { .. }
         | Plan::Difference { .. }
+        | Plan::Union { .. }
         | Plan::AntiJoin { .. }
         | Plan::Distinct { .. }
         | Plan::Group { .. }

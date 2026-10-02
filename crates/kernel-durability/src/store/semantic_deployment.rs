@@ -51,6 +51,9 @@ pub(super) fn install_intent_semantic_modules(
         DurableTransactionIntent::RelationDataExact {
             semantic_modules, ..
         }
+        | DurableTransactionIntent::RelationDataResidualExact {
+            semantic_modules, ..
+        }
         | DurableTransactionIntent::RelationRewriteExact {
             semantic_modules, ..
         }
@@ -58,6 +61,9 @@ pub(super) fn install_intent_semantic_modules(
             semantic_modules, ..
         }
         | DurableTransactionIntent::MixedRevisionExact {
+            semantic_modules, ..
+        }
+        | DurableTransactionIntent::MixedRevisionResidualExact {
             semantic_modules, ..
         }
         | DurableTransactionIntent::Exact {

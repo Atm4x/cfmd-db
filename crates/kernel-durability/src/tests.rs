@@ -38,10 +38,23 @@ fn descriptor(source: u64, target: u64, value: Value) -> DurableRevisionDescript
             relation: SemanticId::new(11),
             inserted: vec![vec![value]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
     .unwrap()
+}
+
+#[test]
+fn client_intent_identity_survives_revision_recertification() {
+    let first = descriptor(1, 2, Value::I64(7));
+    let rebased = descriptor(9, 10, Value::I64(7));
+    let different = descriptor(9, 10, Value::I64(8));
+
+    assert_ne!(first.intent, rebased.intent);
+    assert!(first.intent.same_client_intent(&rebased.intent));
+    assert!(!first.intent.same_client_intent(&different.intent));
 }
 
 #[test]
@@ -131,6 +144,8 @@ fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
             relation: SemanticId::new(11),
             inserted: vec![vec![Value::I64(7)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
@@ -145,6 +160,7 @@ fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
         physical_artifacts: Vec::new(),
         artifact_cores: Vec::new(),
         migration_complements: Vec::new(),
+        historical_epoch_anchors: BTreeMap::new(),
         committed_transactions: BTreeMap::from([(
             DurableTransactionKey::new(IdempotencyEpoch::ZERO, descriptor.transaction_id),
             descriptor.intent.clone(),
@@ -153,6 +169,7 @@ fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
         causal_coverage_root: None,
         revision_effects: BTreeMap::new(),
         revision_effect_frontiers: BTreeMap::new(),
+        checkpoint_realization: None,
     })
     .unwrap();
 
@@ -170,6 +187,61 @@ fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
         metadata_bytes.len() * 100 < full_revision.len(),
         "delta ledger={} full revision={}",
         metadata_bytes.len(),
+        full_revision.len()
+    );
+}
+
+#[test]
+fn schema_migration_prepare_carries_program_not_target_snapshot() {
+    let registry = SemanticRegistry::default();
+    let target_context = SemanticContext {
+        schema: Schema::new(SchemaRevisionId::new(381)),
+        environment: SemanticEnvironment::new(SemanticEnvId::new(1)),
+    };
+    let mut state = DatabaseState::default();
+    for raw in 1..=5_000_u128 {
+        let entity = EntityId::new(raw);
+        state.lifecycle.entities.insert(entity);
+        state.lifecycle.roots.insert(entity);
+    }
+    let target =
+        kernel_revision::Revision::build(RevisionId::new(2), &target_context, &registry, state)
+            .unwrap();
+    let program =
+        kernel_transport::SchemaMigrationProgram::new(target_context, Vec::new(), Vec::new());
+    let complement = DurableMigrationComplement::from_capsule(
+        ComplementCapsule {
+            source_schema: SchemaRevisionId::new(380),
+            target_schema: SchemaRevisionId::new(381),
+            lens_spec: LensSpecId(SemanticId::new(380_381)),
+            semantic_pins: SemanticManifestId(SemanticId::new(0xCF4D_3803_81)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        ComplementRetention::Forget,
+    );
+    let descriptor = DurableRevisionDescriptor::schema_migration_program(
+        ClientTransactionId::new(0x380_381),
+        RevisionId::new(1),
+        target.id(),
+        program,
+        complement,
+        &registry,
+    )
+    .unwrap();
+    let prepare = encode_prepare_payload(&descriptor).unwrap();
+    let full_revision = checkpoint::encode_revision(&target).unwrap();
+    let decoded = decode_prepare_payload(target.id(), &prepare).unwrap();
+
+    assert_eq!(decoded, descriptor);
+    assert!(matches!(
+        descriptor.change,
+        DurableRevisionChange::SchemaMigration { .. }
+    ));
+    assert!(
+        prepare.len() * 100 < full_revision.len(),
+        "migration program prepare={} full target={}",
+        prepare.len(),
         full_revision.len()
     );
 }
@@ -244,6 +316,7 @@ fn mixed_revision_intent_roundtrips_compactly_and_reconstructs_exact_target() {
         physical_artifacts: Vec::new(),
         artifact_cores: Vec::new(),
         migration_complements: Vec::new(),
+        historical_epoch_anchors: BTreeMap::new(),
         committed_transactions: BTreeMap::from([(
             DurableTransactionKey::new(IdempotencyEpoch::ZERO, descriptor.transaction_id),
             descriptor.intent.clone(),
@@ -252,6 +325,7 @@ fn mixed_revision_intent_roundtrips_compactly_and_reconstructs_exact_target() {
         causal_coverage_root: None,
         revision_effects: BTreeMap::new(),
         revision_effect_frontiers: BTreeMap::new(),
+        checkpoint_realization: None,
     };
     let encoded_metadata = metadata::encode(&metadata_value).unwrap();
     assert_eq!(metadata::decode(&encoded_metadata).unwrap(), metadata_value);
@@ -275,6 +349,8 @@ fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
         relation: SemanticId::new(11),
         inserted: vec![vec![Value::I64(7)]],
         removed: Vec::new(),
+    object_field_writes: Vec::new(),
+    authorization: Default::default(),
     };
     let rewrite = DurableRevisionDescriptor::relation_rewrites(
         ClientTransactionId::new(0x701),
@@ -306,6 +382,8 @@ fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
                 relation: SemanticId::new(11),
                 inserted: vec![vec![Value::I64(8)]],
                 removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: Default::default(),
             }],
             rewrite_intents: vec![DurableRelationRewriteIntent {
                 relation: SemanticId::new(11),
@@ -332,12 +410,23 @@ fn relation_rewrite_prepare_roundtrips_and_v5_relation_data_remains_readable() {
         &registry,
     )
     .unwrap();
-    let mut legacy_v5 = encode_prepare_payload(&relation_data).unwrap();
-    legacy_v5[..2].copy_from_slice(&5_u16.to_le_bytes());
-    assert_eq!(
-        decode_prepare_payload(target.id(), &legacy_v5).unwrap(),
-        relation_data
-    );
+    let DurableTransactionIntent::RelationDataExact { semantic_modules, .. } = &relation_data.intent else { unreachable!() };
+    let DurableRevisionChange::RelationData { semantic_revision, relation_mutations } = &relation_data.change else { unreachable!() };
+    let mut legacy_v5 = Vec::new();
+    push_u16(&mut legacy_v5, 5);
+    push_u128(&mut legacy_v5, relation_data.transaction_id.raw());
+    push_u64(&mut legacy_v5, relation_data.source_revision.raw());
+    legacy_v5.push(2);
+    crate::metadata::encode_semantic_module_specs(&mut legacy_v5, semantic_modules).unwrap();
+    push_u64(&mut legacy_v5, semantic_revision.schema.raw());
+    push_u64(&mut legacy_v5, semantic_revision.environment.raw());
+    push_len(&mut legacy_v5, relation_mutations.len()).unwrap();
+    for mutation in relation_mutations {
+        push_u128(&mut legacy_v5, mutation.relation.raw());
+        encode_rows(&mut legacy_v5, &mutation.inserted).unwrap();
+        encode_rows(&mut legacy_v5, &mutation.removed).unwrap();
+    }
+    assert_eq!(decode_prepare_payload(target.id(), &legacy_v5).unwrap(), relation_data);
 }
 
 #[test]

@@ -8,12 +8,13 @@ use std::{
 };
 
 use crate::{
-    CommitOutcome, Error, ErrorKind, Plan, PreparedQuery, Query, RelationResult, Result,
-    RevisionId, Schema, SchemaView, TransactionId,
+    CandidatePreview, CommitOutcome, Error, ErrorKind, Plan, PreparedQuery, Query, RelationId,
+    RelationResult, Result, RevisionId, Schema, SchemaView, SemanticRuleExpr, Transaction, TransactionId,
+    TransactionReadiness,
     query::{query_error, query_error_at},
     schema::{
         PrimitiveEquivalence, PrimitiveOrdering, RelationSemantics, StructuralEquivalence,
-        type_to_kernel,
+        semantic_rule_to_kernel, text_pattern_to_kernel, type_to_kernel,
     },
     security::{Permission, RuntimeAuthority, Session, SessionDatabase},
 };
@@ -485,7 +486,7 @@ fn relation_semantics(value: &RelationSemantics) -> kernel_schema::RelationSeman
     }
 }
 
-fn compile_schema(
+pub(crate) fn compile_schema(
     definition: Schema,
 ) -> Result<(
     kernel_schema::SemanticContext,
@@ -500,6 +501,9 @@ fn compile_schema(
         orderings,
         relations,
         entity_fields,
+        field_rules,
+        relation_column_rules,
+        entity_rules,
     } = definition;
     let mut registry = kernel_semantics::SemanticRegistry::default();
     let mut environment = kernel_schema::SemanticEnvironment::new(
@@ -549,19 +553,87 @@ fn compile_schema(
                 )
             })?;
     }
+    for (field, rules) in field_rules {
+        for rule in rules {
+            let rule = match rule {
+                crate::FieldRule::I64Range { min, max } => {
+                    kernel_schema::FieldRule::I64Range { min, max }
+                }
+                crate::FieldRule::TextLength { min, max } => {
+                    kernel_schema::FieldRule::TextLength { min, max }
+                }
+                crate::FieldRule::TextOneOf(values) => kernel_schema::FieldRule::TextOneOf(values),
+                crate::FieldRule::TextMatches(pattern) => kernel_schema::FieldRule::TextMatches(text_pattern_to_kernel(pattern)),
+                crate::FieldRule::Expr(expression) => kernel_schema::FieldRule::Expr(semantic_rule_to_kernel(expression)),
+            };
+            schema.add_field_rule(field.into(), rule).map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidSchema,
+                    format!("invalid field rule: {error:?}"),
+                )
+            })?;
+        }
+    }
+    for (owner, rules) in entity_rules {
+        for rule in rules {
+            schema.add_entity_rule(owner.into(), semantic_rule_to_kernel(rule)).map_err(|error| {
+                Error::new(ErrorKind::InvalidSchema, format!("invalid entity rule: {error:?}"))
+            })?;
+        }
+    }
     for relation in relations.values() {
         schema
-            .define_relation(kernel_schema::RelationDef {
-                id: relation.id().into(),
-                columns: relation.columns().iter().map(type_to_kernel).collect(),
-                semantics: relation_semantics(relation.semantics()),
-            })
+            .define_relation_with_column_ids(
+                kernel_schema::RelationDef {
+                    id: relation.id().into(),
+                    columns: relation.columns().iter().map(type_to_kernel).collect(),
+                    semantics: relation_semantics(relation.semantics()),
+                },
+                relation
+                    .column_ids()
+                    .iter()
+                    .copied()
+                    .map(Into::into)
+                    .collect(),
+            )
             .map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidSchema,
                     format!("invalid relation schema: {error:?}"),
                 )
             })?;
+    }
+    for ((relation, column), rules) in relation_column_rules {
+        for rule in rules {
+            let rule = match rule {
+                crate::FieldRule::I64Range { min, max } => {
+                    kernel_schema::FieldRule::I64Range { min, max }
+                }
+                crate::FieldRule::TextLength { min, max } => {
+                    kernel_schema::FieldRule::TextLength { min, max }
+                }
+                crate::FieldRule::TextOneOf(values) => kernel_schema::FieldRule::TextOneOf(values),
+                crate::FieldRule::TextMatches(pattern) => kernel_schema::FieldRule::TextMatches(text_pattern_to_kernel(pattern)),
+                crate::FieldRule::Expr(expression) => kernel_schema::FieldRule::Expr(semantic_rule_to_kernel(expression)),
+            };
+            let relation_id: kernel_types::SemanticId = relation.into();
+            let column_id = schema
+                .relation_column_id(relation_id, column)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidSchema,
+                        format!("relation column rule references unknown column {column}"),
+                    )
+                })?;
+            schema
+                .add_relation_column_rule(relation_id, column_id, rule)
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidSchema,
+                        format!("invalid object field rule: {error:?}"),
+                    )
+                })?;
+        }
     }
     let context = kernel_schema::SemanticContext {
         schema,
@@ -676,20 +748,28 @@ fn mirrored_reference_value(
     value: &crate::Value,
     reference: &crate::plan::ReferenceContract,
 ) -> Result<kernel_model::Value> {
+    mirrored_reference_value_for_role(value, reference.target_type, reference.optional)
+}
+
+pub(crate) fn mirrored_reference_value_for_role(
+    value: &crate::Value,
+    target_type: crate::TypeId,
+    optional: bool,
+) -> Result<kernel_model::Value> {
     let live = |value: crate::EntityRef| kernel_model::Value::LiveEntityRef {
-        entity_type: reference.target_type.into(),
-        id: lifecycle_entity_id(reference.target_type, value.id),
+        entity_type: target_type.into(),
+        id: lifecycle_entity_id(target_type, value.id),
     };
-    match (value, reference.optional) {
+    match (value, optional) {
         (crate::Value::HistoricalEntityRef(value), false)
-            if value.entity_type == reference.target_type =>
+            if value.entity_type == target_type =>
         {
             Ok(live(*value))
         }
         (crate::Value::Option(None), true) => Ok(kernel_model::Value::Option(None)),
         (crate::Value::Option(Some(value)), true) => match value.as_ref() {
             crate::Value::HistoricalEntityRef(value)
-                if value.entity_type == reference.target_type =>
+                if value.entity_type == target_type =>
             {
                 Ok(kernel_model::Value::Option(Some(Box::new(live(*value)))))
             }
@@ -745,6 +825,50 @@ fn apply_relation_mutations_to_state(
     Ok(())
 }
 
+fn apply_object_field_patches_to_state(
+    plan: &Plan,
+    state: &mut kernel_model::DatabaseState,
+) -> Result<()> {
+    for ((relation, _identity_raw), patch) in &plan.object_field_patches {
+        let rows = state
+            .model
+            .relations
+            .get_mut(&(*relation).into())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidPlan,
+                    format!("field patch targets unknown relation {relation:?}"),
+                )
+            })?;
+        let identity: kernel_model::Value = patch.identity_value.clone().into();
+        let mut matches = rows
+            .iter_mut()
+            .filter(|row| row.get(patch.identity_column) == Some(&identity));
+        let row = matches.next().ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                "object field patch identity is not present in its source revision",
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(Error::new(
+                ErrorKind::Cardinality,
+                "object field patch identity matched more than one row",
+            ));
+        }
+        for (column, (value, _field)) in &patch.fields {
+            let slot = row.get_mut(*column).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidSchema,
+                    "object field patch column is outside the persisted relation row",
+                )
+            })?;
+            *slot = value.clone().into();
+        }
+    }
+    Ok(())
+}
+
 fn refresh_entity_projection(plan: &Plan, state: &mut kernel_model::DatabaseState) -> Result<()> {
     // Clear the old projection for every object relation touched by this Plan.
     // The relation rows are canonical; carrier/lifecycle/reference-field state
@@ -785,8 +909,7 @@ fn refresh_entity_projection(plan: &Plan, state: &mut kernel_model::DatabaseStat
             .model
             .relations
             .get(&relation_id)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidPlan, "object relation is missing"))?
-            .clone();
+            .ok_or_else(|| Error::new(ErrorKind::InvalidPlan, "object relation is missing"))?;
         let mut carrier = BTreeSet::new();
         for kernel_row in rows {
             let row = kernel_row
@@ -984,6 +1107,10 @@ pub(crate) fn plan_relation_deltas(
     plan: &Plan,
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<Vec<(kernel_types::SemanticId, kernel_query::RelationDelta)>> {
+    if !plan.object_field_patches.is_empty() {
+        let target = build_plan_target(plan)?;
+        return revision_relation_deltas(plan.source.revision(), &target, registry);
+    }
     let mut deltas = Vec::with_capacity(plan.mutations.len());
     for (relation, mutation) in &plan.mutations {
         let expression = kernel_query::RelExpr::Scan((*relation).into());
@@ -1046,8 +1173,7 @@ fn revision_relation_deltas(
                 .state()
                 .model
                 .relations
-                .get(&relation)
-                .cloned()
+                .materialize_owned(&relation)
                 .unwrap_or_default(),
         );
         let next = relation_value(
@@ -1055,8 +1181,7 @@ fn revision_relation_deltas(
                 .state()
                 .model
                 .relations
-                .get(&relation)
-                .cloned()
+                .materialize_owned(&relation)
                 .unwrap_or_default(),
         );
         let delta = kernel_query::RelationDelta::between_values(
@@ -1081,6 +1206,7 @@ fn build_explicit_model_target(
 ) -> Result<kernel_revision::Revision> {
     let mut state = plan.source.revision().state().clone();
     apply_relation_mutations_to_state(plan, &mut state)?;
+    apply_object_field_patches_to_state(plan, &mut state)?;
     plan.model_delta
         .as_ref()
         .expect("explicit model target requires a model delta")
@@ -1102,8 +1228,25 @@ fn build_explicit_model_target(
 pub(crate) fn build_plan_target(plan: &Plan) -> Result<kernel_revision::Revision> {
     let target_revision = plan_target_revision_id(plan)?;
     let registry = &plan.registry;
-    if plan.model_delta.is_some() {
-        build_explicit_model_target(plan, target_revision, registry)
+    if plan.model_delta.is_some() || !plan.object_field_patches.is_empty() {
+        let mut state = plan.source.revision().state().clone();
+        apply_relation_mutations_to_state(plan, &mut state)?;
+        apply_object_field_patches_to_state(plan, &mut state)?;
+        if let Some(model_delta) = &plan.model_delta {
+            model_delta.apply_to(&mut state);
+        }
+        kernel_revision::Revision::build(
+            target_revision,
+            plan.source.revision().semantic_context(),
+            registry,
+            state,
+        )
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::InvariantViolation,
+                format!("field patch target rejected by kernel: {error:?}"),
+            )
+        })
     } else if plan.object_contracts.is_empty() {
         let deltas = plan_relation_deltas(plan, registry)?;
         let mutations = deltas
@@ -1111,6 +1254,8 @@ pub(crate) fn build_plan_target(plan: &Plan) -> Result<kernel_revision::Revision
             .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
                 relation: *relation,
                 delta,
+                object_field_writes: &[],
+                authorization: Default::default(),
             })
             .collect::<Vec<_>>();
         plan.source
@@ -1123,6 +1268,613 @@ pub(crate) fn build_plan_target(plan: &Plan) -> Result<kernel_revision::Revision
             })
     } else {
         build_object_target(plan, target_revision, registry)
+    }
+}
+
+fn collect_requirement_fields(expression: &SemanticRuleExpr, fields: &mut BTreeSet<crate::FieldId>) {
+    match expression {
+        SemanticRuleExpr::True | SemanticRuleExpr::False => {}
+        SemanticRuleExpr::And(parts) | SemanticRuleExpr::Or(parts) => {
+            for part in parts { collect_requirement_fields(part, fields); }
+        }
+        SemanticRuleExpr::Not(part) => collect_requirement_fields(part, fields),
+        SemanticRuleExpr::I64Range { value, .. }
+        | SemanticRuleExpr::TextLength { value, .. }
+        | SemanticRuleExpr::TextOneOf { value, .. }
+        | SemanticRuleExpr::TextMatches { value, .. } => {
+            if let crate::RuleValueExpr::Field(field) = value { fields.insert(*field); }
+        }
+    }
+}
+
+fn validate_transaction_requirements(
+    plan: &Plan,
+    requirements: &[crate::transaction::TransactionRequirement],
+) -> Result<()> {
+    if requirements.is_empty() { return Ok(()); }
+    let target = build_plan_target(plan)?;
+    let context = target.semantic_context();
+    for requirement in requirements {
+        let relation = kernel_types::SemanticId::new(requirement.relation.raw());
+        let expression = semantic_rule_to_kernel(requirement.expression.clone());
+        context.schema.validate_relation_row_rule(relation, &expression).map_err(|error| {
+            Error::new(ErrorKind::InvalidPlan, format!("transaction requirement is not valid for relation {}: {error:?}", requirement.relation.raw()))
+        })?;
+        let mut fields = BTreeSet::new();
+        collect_requirement_fields(&requirement.expression, &mut fields);
+        if fields.is_empty() {
+            plan.authority.require_read_relation(requirement.relation)?;
+        } else {
+            for field in fields {
+                plan.authority.require_read_field(requirement.relation, crate::RelationColumnId::new(field.raw()))?;
+            }
+        }
+        let rows = target.state().model.relations.get(&relation).ok_or_else(|| {
+            Error::new(ErrorKind::InvalidPlan, format!("transaction requirement relation {} is absent", requirement.relation.raw()))
+        })?;
+        let identity: kernel_model::Value = requirement.identity_value.clone().into();
+        let mut matches = rows.iter().filter(|row| row.get(requirement.identity_column) == Some(&identity));
+        let row = matches.next().ok_or_else(|| Error::new(
+            ErrorKind::TransactionConflict,
+            format!("transaction requirement entity {} is absent from the proposed future world", requirement.entity),
+        ))?;
+        if matches.next().is_some() {
+            return Err(Error::new(ErrorKind::Cardinality, "transaction requirement identity matched more than one future row"));
+        }
+        let matches = kernel_validation::relation_row_rule_matches(&expression, relation, row, context).map_err(|error| {
+            Error::new(ErrorKind::InvalidPlan, format!("transaction requirement evaluation failed: {error:?}"))
+        })?;
+        if !matches {
+            return Err(Error::new(ErrorKind::TransactionConflict, format!("transaction requirement failed for entity {}", requirement.entity)));
+        }
+    }
+    Ok(())
+}
+
+fn plan_object_field_writes(plan: &Plan) -> BTreeMap<kernel_types::SemanticId, Vec<kernel_durability::DurableObjectFieldWrite>> {
+    let mut field_writes = BTreeMap::<kernel_types::SemanticId, Vec<kernel_durability::DurableObjectFieldWrite>>::new();
+    for ((relation, _), patch) in &plan.object_field_patches {
+        let writes = field_writes.entry((*relation).into()).or_default();
+        for (_column, (value, field)) in &patch.fields {
+            writes.push(kernel_durability::DurableObjectFieldWrite { owner: patch.owner, field: *field, value: value.clone().into() });
+        }
+    }
+    for writes in field_writes.values_mut() { writes.sort_by_key(|write| (write.owner, write.field)); }
+    field_writes
+}
+
+fn plan_relation_authorizations(
+    plan: &Plan,
+) -> BTreeMap<kernel_types::SemanticId, kernel_durability::DurableRelationAuthorization> {
+    let mut authorizations = BTreeMap::new();
+    for (relation, mutation) in &plan.mutations {
+        let authorization = authorizations.entry((*relation).into()).or_default();
+        for index in 0..mutation.inserted.len() {
+            if let Some(coverage) = plan.history_authorization.get(relation)
+                && index < coverage.inserted_prefix
+            {
+                merge_durable_relation_authorization(authorization, coverage.authorization);
+                continue;
+            }
+            match plan
+                .mutation_actions
+                .get(&(*relation, crate::plan::MutationDirection::Insert, index))
+            {
+                Some(action) => add_durable_mutation_action(authorization, *action),
+                None => authorization.relation_write = true,
+            }
+        }
+        for index in 0..mutation.removed.len() {
+            if let Some(coverage) = plan.history_authorization.get(relation)
+                && index < coverage.removed_prefix
+            {
+                merge_durable_relation_authorization(authorization, coverage.authorization);
+                continue;
+            }
+            match plan
+                .mutation_actions
+                .get(&(*relation, crate::plan::MutationDirection::Remove, index))
+            {
+                Some(action) => add_durable_mutation_action(authorization, *action),
+                None => authorization.relation_write = true,
+            }
+        }
+    }
+    for contract in plan.owned_relations.values() {
+        if contract.orphan_policy != crate::plan::OrphanPolicy::DeleteIfUnowned {
+            continue;
+        }
+        let can_orphan = plan.mutation_actions.iter().any(|((relation, _, _), action)| {
+            *relation == contract.relation
+                && *action == crate::plan::MutationAction::RelationshipDetach
+        });
+        if can_orphan {
+            authorizations
+                .entry(contract.target_relation.into())
+                .or_default()
+                .object_delete = true;
+        }
+    }
+    authorizations
+}
+
+fn merge_durable_relation_authorization(
+    target: &mut kernel_durability::DurableRelationAuthorization,
+    source: kernel_durability::DurableRelationAuthorization,
+) {
+    target.relation_write |= source.relation_write;
+    target.object_create |= source.object_create;
+    target.object_delete |= source.object_delete;
+    target.relationship_attach |= source.relationship_attach;
+    target.relationship_detach |= source.relationship_detach;
+    target.relationship_move |= source.relationship_move;
+}
+
+fn add_durable_mutation_action(
+    authorization: &mut kernel_durability::DurableRelationAuthorization,
+    action: crate::plan::MutationAction,
+) {
+    match action {
+        crate::plan::MutationAction::ObjectCreate => authorization.object_create = true,
+        crate::plan::MutationAction::ObjectDelete => authorization.object_delete = true,
+        crate::plan::MutationAction::RelationshipAttach => authorization.relationship_attach = true,
+        crate::plan::MutationAction::RelationshipDetach => authorization.relationship_detach = true,
+        crate::plan::MutationAction::RelationshipMove => authorization.relationship_move = true,
+    }
+}
+
+struct RebasablePlanEffect {
+    deltas: Vec<(kernel_types::SemanticId, kernel_query::RelationDelta)>,
+    field_writes: BTreeMap<kernel_types::SemanticId, Vec<kernel_durability::DurableObjectFieldWrite>>,
+    authorizations: BTreeMap<kernel_types::SemanticId, kernel_durability::DurableRelationAuthorization>,
+    model_delta: kernel_plan::DurableModelDelta,
+    model_complement: kernel_plan::DurableModelDelta,
+}
+
+fn plan_rebasable_effect(plan: &Plan) -> Result<RebasablePlanEffect> {
+    let target = build_plan_target(plan)?;
+    let deltas = revision_relation_deltas(plan.source.revision(), &target, &plan.registry)?;
+    let field_writes = plan_object_field_writes(plan);
+    let authorizations = plan_relation_authorizations(plan);
+    Ok(RebasablePlanEffect {
+        field_writes,
+        authorizations,
+        model_delta: kernel_plan::DurableModelDelta::between(
+            plan.source.revision().state(),
+            target.state(),
+        ),
+        model_complement: kernel_plan::DurableModelDelta::between(
+            target.state(),
+            plan.source.revision().state(),
+        ),
+        deltas,
+    })
+}
+
+fn certify_plan_rebase(
+    runtime: &kernel_plan::DurableRuntime,
+    plan: &Plan,
+    effect: &RebasablePlanEffect,
+) -> Result<kernel_plan::RuntimeTransitionRebaseOutcome> {
+    let mutations = effect
+        .deltas
+        .iter()
+        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+            relation: *relation,
+            delta,
+            object_field_writes: effect.field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+            authorization: effect.authorizations.get(relation).copied().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    runtime
+        .certify_transition_rebase(
+            plan.source.revision().id(),
+            &mutations,
+            Some(&effect.model_delta),
+            Some(&effect.model_complement),
+        )
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::TransactionConflict,
+                format!("transaction rebase certification unavailable: {error:?}"),
+            )
+        })
+}
+
+fn exact_rebased_plan(
+    runtime: &Arc<kernel_plan::DurableRuntime>,
+    plan: &Plan,
+    effect: RebasablePlanEffect,
+) -> Result<Plan> {
+    let snapshot = runtime.snapshot().map_err(|error| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("transaction rebase snapshot failed: {error:?}"),
+        )
+    })?;
+    let mut rebased = Plan::new(
+        runtime,
+        snapshot,
+        plan.database_identity,
+        plan.authority.clone(),
+    );
+    if !effect.field_writes.is_empty() {
+        rebased.object_field_patches = plan.object_field_patches.clone();
+        rebased.object_contracts = plan.object_contracts.clone();
+        rebased.owned_relations = plan.owned_relations.clone();
+        rebased.model_delta = plan.model_delta.clone();
+        for (relation, mutation) in &plan.mutations {
+            let target = rebased.mutations.entry(*relation).or_default();
+            target.inserted.extend(mutation.inserted.clone());
+            target.removed.extend(mutation.removed.clone());
+        }
+        return Ok(rebased);
+    }
+    for (relation, delta) in effect.deltas {
+        let relation = RelationId::new(relation.raw());
+        for row in delta.removed {
+            rebased.remove(relation, row.into_iter().map(Into::into).collect());
+        }
+        for row in delta.inserted {
+            rebased.insert(relation, row.into_iter().map(Into::into).collect());
+        }
+    }
+    if effect.model_delta != kernel_plan::DurableModelDelta::default() {
+        rebased.model_delta = Some(effect.model_delta);
+    }
+    Ok(rebased)
+}
+
+fn commit_certified_relation_residual(
+    runtime: &Arc<kernel_plan::DurableRuntime>,
+    plan: &Plan,
+    effect: &RebasablePlanEffect,
+    transaction: TransactionId,
+) -> Result<Option<CommitOutcome>> {
+    if effect.model_delta != kernel_plan::DurableModelDelta::default()
+        || !plan.object_contracts.is_empty()
+        || !effect.field_writes.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let snapshot = runtime.snapshot().map_err(|error| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("transaction residual snapshot failed: {error:?}"),
+        )
+    })?;
+    let revision = snapshot.revision();
+    let context = revision.semantic_context();
+    let registry = runtime.semantic_registry();
+    let mut residuals = Vec::with_capacity(effect.deltas.len());
+    for (relation, delta) in &effect.deltas {
+        let rows = revision
+            .state()
+            .model
+            .relations
+            .materialize_owned(relation)
+            .unwrap_or_default();
+        let current = match &delta.result_type.semantics {
+            kernel_schema::RelationSemantics::Bag { .. } => kernel_query::RelationValue::Bag(rows),
+            kernel_schema::RelationSemantics::Set {
+                column_equivalences,
+            } => kernel_query::RelationValue::Set {
+                rows,
+                column_equivalences: column_equivalences.clone(),
+            },
+        };
+        let residual = delta
+            .residualize_against(&current, context, registry)
+            .map_err(|error| query_error(&error))?;
+        if !residual.is_empty() {
+            residuals.push((*relation, residual));
+        }
+    }
+
+    let realized_refs = residuals
+        .iter()
+        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+            relation: *relation,
+            delta,
+            object_field_writes: effect.field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+            authorization: effect.authorizations.get(relation).copied().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let client_refs = effect
+        .deltas
+        .iter()
+        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+            relation: *relation,
+            delta,
+            object_field_writes: effect.field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+            authorization: effect.authorizations.get(relation).copied().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let target_revision = revision
+        .id()
+        .raw()
+        .checked_add(1)
+        .map(kernel_types::RevisionId::new)
+        .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "revision id space exhausted"))?;
+    let request = kernel_plan::DerivedRelationTransitionRequest {
+        source_revision: revision.id(),
+        target_revision,
+        mutations: &realized_refs,
+    };
+    let transaction_id = kernel_types::ClientTransactionId::new(transaction.raw());
+    let outcome =
+        runtime.commit_derived_relation_data_residual(transaction_id, &request, &client_refs);
+    match outcome {
+        Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
+            Ok(Some(CommitOutcome::Committed {
+                revision: receipt.durable.target_revision().into(),
+            }))
+        }
+        Ok(kernel_plan::DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision }) => {
+            Ok(Some(CommitOutcome::AlreadyCommitted {
+                revision: target_revision.into(),
+            }))
+        }
+        Err(kernel_plan::DurableRuntimeCommitError::TransactionIdConflict { .. }) => {
+            Err(Error::new(
+                ErrorKind::TransactionConflict,
+                "transaction id conflicts with a different committed intent",
+            ))
+        }
+        Err(kernel_plan::DurableRuntimeCommitError::Runtime(
+            kernel_plan::PhysicalExecutionError::InvalidRevisionTransition,
+        )) => Err(Error::new(
+            ErrorKind::StaleRevision,
+            "certified residual source revision is no longer current",
+        )),
+        Err(error) => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!("residual commit rejected: {error:?}"),
+        )),
+    }
+}
+
+fn commit_certified_field_reapply_residual(
+    runtime: &Arc<kernel_plan::DurableRuntime>,
+    plan: &Plan,
+    effect: &RebasablePlanEffect,
+    transaction: TransactionId,
+) -> Result<Option<CommitOutcome>> {
+    if effect.field_writes.is_empty() {
+        return Ok(None);
+    }
+
+    let snapshot = runtime.snapshot().map_err(|error| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("transaction field reapply snapshot failed: {error:?}"),
+        )
+    })?;
+    let mut rebased = Plan::new(
+        runtime,
+        snapshot,
+        plan.database_identity,
+        plan.authority.clone(),
+    );
+    rebased.object_field_patches = plan.object_field_patches.clone();
+    rebased.object_contracts = plan.object_contracts.clone();
+    rebased.owned_relations = plan.owned_relations.clone();
+    rebased.model_delta = plan.model_delta.clone();
+    for (relation, mutation) in &plan.mutations {
+        let target = rebased.mutations.entry(*relation).or_default();
+        target.inserted.extend(mutation.inserted.clone());
+        target.removed.extend(mutation.removed.clone());
+    }
+
+    let realized = plan_rebasable_effect(&rebased)?;
+    let target = build_plan_target(&rebased)?;
+    let realized_refs = realized
+        .deltas
+        .iter()
+        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+            relation: *relation,
+            delta,
+            object_field_writes: effect
+                .field_writes
+                .get(relation)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            authorization: effect.authorizations.get(relation).copied().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let client_refs = effect
+        .deltas
+        .iter()
+        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+            relation: *relation,
+            delta,
+            object_field_writes: effect
+                .field_writes
+                .get(relation)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            authorization: effect.authorizations.get(relation).copied().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let request = kernel_plan::MixedRevisionTransitionRequest {
+        source_revision: rebased.source.revision().id(),
+        target_revision: &target,
+        mutations: &realized_refs,
+        model_delta: &realized.model_delta,
+        model_complement: &realized.model_complement,
+        registry: runtime.semantic_registry(),
+    };
+    let transaction_id = kernel_types::ClientTransactionId::new(transaction.raw());
+    let outcome = runtime.commit_mixed_revision_residual(
+        transaction_id,
+        &request,
+        &client_refs,
+        &effect.model_delta,
+    );
+    match outcome {
+        Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
+            Ok(Some(CommitOutcome::Committed {
+                revision: receipt.durable.target_revision().into(),
+            }))
+        }
+        Ok(kernel_plan::DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision }) => {
+            Ok(Some(CommitOutcome::AlreadyCommitted {
+                revision: target_revision.into(),
+            }))
+        }
+        Err(kernel_plan::DurableRuntimeCommitError::TransactionIdConflict { .. }) => Err(
+            Error::new(
+                ErrorKind::TransactionConflict,
+                "transaction id conflicts with a different committed intent",
+            ),
+        ),
+        Err(kernel_plan::DurableRuntimeCommitError::Runtime(
+            kernel_plan::PhysicalExecutionError::InvalidRevisionTransition,
+        )) => Err(Error::new(
+            ErrorKind::StaleRevision,
+            "certified field reapply source revision is no longer current",
+        )),
+        Err(error) => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!("field reapply residual commit rejected: {error:?}"),
+        )),
+    }
+}
+
+fn commit_certified_mixed_residual(
+    runtime: &Arc<kernel_plan::DurableRuntime>,
+    effect: &RebasablePlanEffect,
+    transaction: TransactionId,
+) -> Result<Option<CommitOutcome>> {
+    if effect.model_delta == kernel_plan::DurableModelDelta::default() || !effect.field_writes.is_empty() {
+        return Ok(None);
+    }
+
+    let snapshot = runtime.snapshot().map_err(|error| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("transaction mixed residual snapshot failed: {error:?}"),
+        )
+    })?;
+    let revision = snapshot.revision();
+    let context = revision.semantic_context();
+    let registry = runtime.semantic_registry();
+    let mut state = revision.state().clone();
+    let mut residuals = Vec::with_capacity(effect.deltas.len());
+
+    for (relation, delta) in &effect.deltas {
+        let rows = state
+            .model
+            .relations
+            .materialize_owned(relation)
+            .unwrap_or_default();
+        let current = match &delta.result_type.semantics {
+            kernel_schema::RelationSemantics::Bag { .. } => kernel_query::RelationValue::Bag(rows),
+            kernel_schema::RelationSemantics::Set {
+                column_equivalences,
+            } => kernel_query::RelationValue::Set {
+                rows,
+                column_equivalences: column_equivalences.clone(),
+            },
+        };
+        let residual = delta
+            .residualize_against(&current, context, registry)
+            .map_err(|error| query_error(&error))?;
+        if residual.is_empty() {
+            continue;
+        }
+        let next = residual
+            .apply_to_value(current, context, registry)
+            .map_err(|error| query_error(&error))?;
+        state.model.relations.insert(*relation, next.into_rows());
+        residuals.push((*relation, residual));
+    }
+
+    effect.model_delta.apply_to(&mut state);
+    let target_revision = revision
+        .id()
+        .raw()
+        .checked_add(1)
+        .map(kernel_types::RevisionId::new)
+        .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "revision id space exhausted"))?;
+    let target = kernel_revision::Revision::build(
+        target_revision,
+        revision.semantic_context(),
+        registry,
+        state,
+    )
+    .map_err(|error| {
+        Error::new(
+            ErrorKind::InvariantViolation,
+            format!("certified mixed residual rejected by kernel: {error:?}"),
+        )
+    })?;
+    let realized_model_delta =
+        kernel_plan::DurableModelDelta::between(revision.state(), target.state());
+    let realized_model_complement =
+        kernel_plan::DurableModelDelta::between(target.state(), revision.state());
+    let realized_refs = residuals
+        .iter()
+        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+            relation: *relation,
+            delta,
+            object_field_writes: effect.field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+            authorization: effect.authorizations.get(relation).copied().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let client_refs = effect
+        .deltas
+        .iter()
+        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+            relation: *relation,
+            delta,
+            object_field_writes: effect.field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+            authorization: effect.authorizations.get(relation).copied().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let request = kernel_plan::MixedRevisionTransitionRequest {
+        source_revision: revision.id(),
+        target_revision: &target,
+        mutations: &realized_refs,
+        model_delta: &realized_model_delta,
+        model_complement: &realized_model_complement,
+        registry,
+    };
+    let transaction_id = kernel_types::ClientTransactionId::new(transaction.raw());
+    let outcome = runtime.commit_mixed_revision_residual(
+        transaction_id,
+        &request,
+        &client_refs,
+        &effect.model_delta,
+    );
+    match outcome {
+        Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
+            Ok(Some(CommitOutcome::Committed {
+                revision: receipt.durable.target_revision().into(),
+            }))
+        }
+        Ok(kernel_plan::DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision }) => {
+            Ok(Some(CommitOutcome::AlreadyCommitted {
+                revision: target_revision.into(),
+            }))
+        }
+        Err(kernel_plan::DurableRuntimeCommitError::TransactionIdConflict { .. }) => {
+            Err(Error::new(
+                ErrorKind::TransactionConflict,
+                "transaction id conflicts with a different committed intent",
+            ))
+        }
+        Err(kernel_plan::DurableRuntimeCommitError::Runtime(
+            kernel_plan::PhysicalExecutionError::InvalidRevisionTransition,
+        )) => Err(Error::new(
+            ErrorKind::StaleRevision,
+            "certified mixed residual source revision is no longer current",
+        )),
+        Err(error) => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!("mixed residual commit rejected: {error:?}"),
+        )),
     }
 }
 
@@ -1152,6 +1904,226 @@ impl Database {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         Self::builder(path).open()
+    }
+
+    /// Applies one already-declared deterministic schema migration model.
+    ///
+    /// Frontends are expected to compile their own DSL/codegen into `MigrationModel`; runtime
+    /// never executes arbitrary host callbacks during the migration. Historical inversion is
+    /// currently available only as an explicit `Forget` policy until complement compilation is
+    /// generalized for structural migrations.
+    pub fn migrate(
+        &self,
+        model: &crate::MigrationModel,
+        transaction: TransactionId,
+        history: crate::MigrationHistoryPolicy,
+    ) -> Result<CommitOutcome> {
+        self.migrate_with_authority(
+            model,
+            transaction,
+            history,
+            &RuntimeAuthority::Unrestricted,
+        )
+    }
+
+    pub(crate) fn migrate_with_authority(
+        &self,
+        model: &crate::MigrationModel,
+        transaction: TransactionId,
+        history: crate::MigrationHistoryPolicy,
+        authority: &RuntimeAuthority,
+    ) -> Result<CommitOutcome> {
+        authority.require(Permission::SchemaMigrate)?;
+        let source_snapshot = self.runtime.snapshot().map_err(|error| {
+            Error::new(
+                ErrorKind::Internal,
+                format!("migration snapshot failed: {error:?}"),
+            )
+        })?;
+        let source = source_snapshot.revision();
+        let (target_context, _, _) = compile_schema(model.target())?;
+        let registry = self.runtime.semantic_registry();
+
+        let field_rewrites = model
+            .field_rules()
+            .iter()
+            .map(|rule| {
+                let mut sources = BTreeSet::new();
+                rule.value.source_fields(&mut sources);
+                kernel_transport::MigrationFieldRewrite {
+                    source_fields: sources.into_iter().map(Into::into).collect(),
+                    target_field: rule.target.into(),
+                    transform: kernel_query::ExactQuery::new(rule.value.to_kernel()),
+                }
+            })
+            .collect::<Vec<_>>();
+        let relation_rewrites = model
+            .relation_rules()
+            .iter()
+            .map(|rule| -> crate::Result<kernel_transport::MigrationRelationRewrite> {
+                Ok(match rule {
+                    crate::MigrationRelationRule::Query { target, query } => {
+                        kernel_transport::MigrationRelationRewrite::Query(
+                            kernel_transport::RelationRewrite {
+                                target_relation: (*target).into(),
+                                transform: query.inner.clone(),
+                            },
+                        )
+                    }
+                    crate::MigrationRelationRule::Rows {
+                        source: source_relation,
+                        target: target_relation,
+                        columns,
+                    } => {
+                        let source_relation_id: kernel_types::SemanticId = (*source_relation).into();
+                        let target_relation_id: kernel_types::SemanticId = (*target_relation).into();
+                        let source_column_ids = source
+                            .semantic_context()
+                            .schema
+                            .relation_column_ids(source_relation_id)
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::InvalidSchema,
+                                    "migration references unknown source relation",
+                                )
+                            })?;
+                        let target_column_ids = target_context
+                            .schema
+                            .relation_column_ids(target_relation_id)
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::InvalidSchema,
+                                    "migration references unknown target relation",
+                                )
+                            })?;
+                        kernel_transport::MigrationRelationRewrite::Rows(
+                            kernel_transport::MigrationRowRewrite {
+                                source_relation: source_relation_id,
+                                target_relation: target_relation_id,
+                                columns: columns
+                                    .iter()
+                                    .map(|column| {
+                                        let source_columns = column
+                                            .source_columns
+                                            .iter()
+                                            .map(|ordinal| {
+                                                source_column_ids.get(*ordinal).copied().ok_or_else(|| {
+                                                    Error::new(
+                                                        ErrorKind::InvalidSchema,
+                                                        format!(
+                                                            "migration references unknown source column {ordinal}"
+                                                        ),
+                                                    )
+                                                })
+                                            })
+                                            .collect::<crate::Result<Vec<_>>>()?;
+                                        let target_column = target_column_ids
+                                            .get(column.target_column)
+                                            .copied()
+                                            .ok_or_else(|| {
+                                                Error::new(
+                                                    ErrorKind::InvalidSchema,
+                                                    format!(
+                                                        "migration references unknown target column {}",
+                                                        column.target_column
+                                                    ),
+                                                )
+                                            })?;
+                                        Ok(kernel_transport::MigrationColumnRewrite {
+                                            source_columns,
+                                            target_column,
+                                            transform: kernel_query::ExactQuery::new(
+                                                column.value.to_kernel_for_relation(source_column_ids),
+                                            ),
+                                        })
+                                    })
+                                    .collect::<crate::Result<Vec<_>>>()?,
+                            },
+                        )
+                    }
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let migration_program = kernel_transport::SchemaMigrationProgram::new(
+            target_context,
+            field_rewrites,
+            relation_rewrites,
+        );
+        let transport = migration_program
+            .verify(source.semantic_context(), registry)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidSchema,
+                    format!("migration model is not valid for the current schema: {error:?}"),
+                )
+            })?;
+        let target_id = source
+            .id()
+            .raw()
+            .checked_add(1)
+            .map(kernel_types::RevisionId::new)
+            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "revision id space exhausted"))?;
+        let target = transport
+            .transport_revision(source, target_id, registry)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::InvariantViolation,
+                    format!("migration execution rejected: {error:?}"),
+                )
+            })?;
+
+        let complement = match history {
+            crate::MigrationHistoryPolicy::Forget => {
+                kernel_durability::DurableMigrationComplement::from_capsule(
+                    kernel_lens::ComplementCapsule {
+                        source_schema: source.semantic_revision().schema,
+                        target_schema: target.semantic_revision().schema,
+                        lens_spec: kernel_lens::LensSpecId(kernel_types::SemanticId::new(
+                            model.id(),
+                        )),
+                        semantic_pins: kernel_lens::SemanticManifestId(
+                            kernel_types::SemanticId::new(
+                                model.id() ^ 0x4346_4d44_4d49_4752_4154_494f_4e00_0001,
+                            ),
+                        ),
+                        encoding_version: 1,
+                        complement: kernel_model::Value::Unit,
+                    },
+                    kernel_lens::ComplementRetention::Forget,
+                )
+            }
+        };
+        let request = kernel_plan::FullRevisionTransitionRequest {
+            target_revision: &target,
+            registry,
+        };
+        authority.with_permission(Permission::SchemaMigrate, || match self.runtime.migrate_schema(
+            kernel_types::ClientTransactionId::new(transaction.raw()),
+            &request,
+            &migration_program,
+            &complement,
+        ) {
+            Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
+                Ok(CommitOutcome::Committed {
+                    revision: receipt.durable.target_revision().into(),
+                })
+            }
+            Ok(kernel_plan::DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision }) => {
+                Ok(CommitOutcome::AlreadyCommitted {
+                    revision: target_revision.into(),
+                })
+            }
+            Err(kernel_plan::DurableRuntimeCommitError::TransactionIdConflict { .. }) => {
+                Err(Error::new(
+                    ErrorKind::TransactionConflict,
+                    "migration transaction id conflict",
+                ))
+            }
+            Err(error) => Err(Error::new(
+                ErrorKind::InvariantViolation,
+                format!("migration publication rejected: {error:?}"),
+            )),
+        })
     }
 
     pub fn create_with_publication_notifier(
@@ -1228,6 +2200,24 @@ impl Database {
         Ok(database_key_epoch)
     }
 
+    pub(crate) fn __require_schema_definition(&self, definition: Schema) -> Result<()> {
+        let (expected, _, _) = compile_schema(definition)?;
+        let actual = self.snapshot()?;
+        let actual = actual.kernel_revision().semantic_context();
+        if actual.schema.definitionally_equivalent(&expected.schema)
+            && actual
+                .environment
+                .definitionally_equivalent(&expected.environment)
+        {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::InvalidSchema,
+            "persisted database schema does not match the requested typed schema root",
+        ))
+    }
+
+    #[doc(hidden)]
     pub fn snapshot(&self) -> Result<ReadContext> {
         let snapshot = self.runtime.snapshot().map_err(|error| {
             Error::new(ErrorKind::Internal, format!("snapshot failed: {error:?}"))
@@ -1236,7 +2226,8 @@ impl Database {
         Ok(ReadContext {
             runtime: Arc::clone(&self.runtime),
             database_identity: self.identity,
-            revision,
+            revision: Some(revision),
+            factorized: None,
             live_snapshot: Some(snapshot),
             authority: RuntimeAuthority::Unrestricted,
         })
@@ -1247,7 +2238,22 @@ impl Database {
     /// Historical worlds share the ordinary read/query vocabulary but do not
     /// carry a write capability. Reconstruction uses the durable causal effect
     /// authority; unavailable/non-reversible history fails closed.
+    #[doc(hidden)]
     pub fn at(&self, revision: RevisionId) -> Result<ReadContext> {
+        if let Some(factorized) = self
+            .runtime
+            .factorized_read_snapshot_at(kernel_types::RevisionId::new(revision.raw()))
+            .map_err(|error| Error::new(ErrorKind::Recovery, format!("historical factorized snapshot failed: {error:?}")))?
+        {
+            return Ok(ReadContext {
+                runtime: Arc::clone(&self.runtime),
+                database_identity: self.identity,
+                revision: None,
+                factorized: Some(factorized),
+                live_snapshot: None,
+                authority: RuntimeAuthority::Unrestricted,
+            });
+        }
         let revision = self
             .runtime
             .revision_at(kernel_types::RevisionId::new(revision.raw()))
@@ -1267,7 +2273,8 @@ impl Database {
         Ok(ReadContext {
             runtime: Arc::clone(&self.runtime),
             database_identity: self.identity,
-            revision,
+            revision: Some(revision),
+            factorized: None,
             live_snapshot: None,
             authority: RuntimeAuthority::Unrestricted,
         })
@@ -1281,9 +2288,132 @@ impl Database {
         self.snapshot()?.history()
     }
 
-    /// Starts one write intent pinned to the current exact live snapshot.
-    pub fn transaction(&self, transaction: TransactionId) -> Result<crate::Transaction> {
-        crate::Transaction::new(self.snapshot()?, transaction)
+    /// Adds the exact compensating inverse of one durable history entry to an ordinary
+    /// transaction. The database remains the visible authority; the history entry only describes
+    /// which committed effect is being inverted.
+    pub fn undo(&self, transaction: &mut Transaction, entry: &crate::HistoryEntry) -> Result<()> {
+        let plan = entry.undo_plan()?;
+        if plan.database_identity != self.identity {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "history entry belongs to a different open database instance",
+            ));
+        }
+        transaction.add_plan(plan)
+    }
+
+    /// Adds the current history head's exact inverse to `transaction`.
+    pub fn undo_latest(&self, transaction: &mut Transaction) -> Result<()> {
+        let history = self.history()?;
+        let entry = history.latest().ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "history has no transition at its head")
+        })?;
+        self.undo(transaction, entry)
+    }
+
+    /// Returns the current object collection. Reads are snapshot-consistent; transaction-aware
+    /// mutation methods keep the database collection visible at the call site.
+    pub fn objects<E: crate::Object>(&self) -> Result<crate::ObjectSet<E>> {
+        self.snapshot()?.objects::<E>()
+    }
+
+    pub(crate) fn projected_objects<E: crate::Object>(&self) -> Result<crate::ObjectSet<E>> {
+        self.snapshot()?.projected_objects::<E>()
+    }
+
+    /// Advanced deterministic-id constructor for protocol adapters and idempotency tests.
+    /// Ordinary application code should use [`Transaction::new`].
+    #[doc(hidden)]
+    pub fn transaction_with_id(&self, transaction: TransactionId) -> Result<crate::Transaction> {
+        crate::Transaction::from_context_with_id(self.snapshot()?, transaction)
+    }
+
+    /// Reports whether this transaction can be applied to the current head without changing its
+    /// exact semantic effect. A newer global revision is not itself a conflict: the kernel proves
+    /// transport across intervening exact effects by Γ-canonical write coordinates. Overlap or
+    /// opaque history fails closed.
+    pub fn transaction_readiness(&self, transaction: &Transaction) -> Result<TransactionReadiness> {
+        self.require_transaction_owner(transaction)?;
+        let Some(base_revision) = transaction.origin_revision() else {
+            return Ok(TransactionReadiness::Unbound);
+        };
+        let current_revision = self.current_revision()?;
+        if current_revision == base_revision {
+            return Ok(TransactionReadiness::Ready {
+                revision: current_revision,
+            });
+        }
+        if transaction.is_snapshot_bound() {
+            return Ok(TransactionReadiness::SnapshotChanged {
+                snapshot_revision: base_revision,
+                current_revision,
+            });
+        }
+        let plan = transaction.plan()?;
+        let effect = plan_rebasable_effect(plan)?;
+        match certify_plan_rebase(&self.runtime, plan, &effect)? {
+            kernel_plan::RuntimeTransitionRebaseOutcome::Certified(certificate) => {
+                Ok(TransactionReadiness::Rebasable {
+                    base_revision,
+                    current_revision: certificate.current_revision.into(),
+                    intervening_effects: certificate.intervening_effects,
+                })
+            }
+            kernel_plan::RuntimeTransitionRebaseOutcome::Conflict(conflict) => {
+                Ok(TransactionReadiness::Conflict {
+                    base_revision,
+                    current_revision: conflict.current_revision.into(),
+                    conflicting_effects: conflict.conflicting_effects,
+                    coordination_effects: conflict.coordination_effects,
+                    conflicting_coordinates: conflict.coordinates.len(),
+                    opaque_effects: conflict.opaque_effects,
+                })
+            }
+        }
+    }
+
+    /// Computes the exact proposed result of `transaction` against the current database world
+    /// without publishing it. If the transaction's source revision is older, preview uses the same
+    /// Γ-coordinate certificate as history rebase and transports only a proven-disjoint exact
+    /// effect. Conflicting or opaque intervening effects fail closed.
+    pub fn preview(&self, transaction: &Transaction) -> Result<CandidatePreview> {
+        self.require_transaction_owner(transaction)?;
+        let plan = transaction.plan()?;
+        let base_revision = plan.base_revision();
+        let current_revision = self.current_revision()?;
+        if current_revision == base_revision {
+            validate_transaction_requirements(plan, transaction.requirements())?;
+            return Ok(plan.candidate()?.preview());
+        }
+        if transaction.is_snapshot_bound() {
+            return Err(Error::new(
+                ErrorKind::StaleRevision,
+                format!(
+                    "snapshot-bound transaction was formed at revision {} but current revision is {}",
+                    base_revision.raw(),
+                    current_revision.raw(),
+                ),
+            ));
+        }
+        let effect = plan_rebasable_effect(plan)?;
+        match certify_plan_rebase(&self.runtime, plan, &effect)? {
+            kernel_plan::RuntimeTransitionRebaseOutcome::Certified(_) => {
+                let rebased = exact_rebased_plan(&self.runtime, plan, effect)?;
+                validate_transaction_requirements(&rebased, transaction.requirements())?;
+                Ok(rebased.candidate()?.preview())
+            }
+            kernel_plan::RuntimeTransitionRebaseOutcome::Conflict(conflict) => Err(Error::new(
+                ErrorKind::TransactionConflict,
+                format!(
+                    "transaction cannot be previewed on revision {}: definite conflicts {:?}, coordination-required effects {:?}, {} overlapping semantic coordinates; opaque effects {:?}",
+                    conflict.current_revision.raw(),
+                    conflict.conflicting_effects,
+                    conflict.coordination_effects,
+                    conflict.coordinates.len(),
+                    conflict.opaque_effects,
+                ),
+            )),
+        }
     }
 
     pub fn plan(&self) -> Result<Plan> {
@@ -1316,7 +2446,8 @@ impl Database {
         Ok(ReadContext {
             runtime: Arc::clone(&self.runtime),
             database_identity: self.identity,
-            revision,
+            revision: Some(revision),
+            factorized: None,
             live_snapshot: Some(snapshot),
             authority,
         })
@@ -1327,6 +2458,20 @@ impl Database {
         revision: RevisionId,
         authority: RuntimeAuthority,
     ) -> Result<ReadContext> {
+        if let Some(factorized) = self
+            .runtime
+            .factorized_read_snapshot_at(kernel_types::RevisionId::new(revision.raw()))
+            .map_err(|error| Error::new(ErrorKind::Recovery, format!("historical factorized snapshot failed: {error:?}")))?
+        {
+            return Ok(ReadContext {
+                runtime: Arc::clone(&self.runtime),
+                database_identity: self.identity,
+                revision: None,
+                factorized: Some(factorized),
+                live_snapshot: None,
+                authority,
+            });
+        }
         let revision = self
             .runtime
             .revision_at(kernel_types::RevisionId::new(revision.raw()))
@@ -1346,7 +2491,8 @@ impl Database {
         Ok(ReadContext {
             runtime: Arc::clone(&self.runtime),
             database_identity: self.identity,
-            revision,
+            revision: Some(revision),
+            factorized: None,
             live_snapshot: None,
             authority,
         })
@@ -1359,7 +2505,80 @@ impl Database {
             .map_err(|error| Error::new(ErrorKind::Internal, format!("snapshot failed: {error:?}")))
     }
 
-    pub fn commit(&self, plan: &Plan, transaction: TransactionId) -> Result<CommitOutcome> {
+    /// Publishes one transaction into this database.
+    ///
+    /// The transaction remains reusable after publication so the same semantic intent may be
+    /// retried idempotently after an uncertain caller-side failure.  If the live head advanced,
+    /// publication first asks the kernel to certify transport of the already-formed exact effect;
+    /// user code is never re-executed against the newer world.
+    pub fn commit(&self, transaction: &Transaction) -> Result<CommitOutcome> {
+        self.require_transaction_owner(transaction)?;
+        let plan = transaction.plan()?;
+        let transaction_id = transaction.transaction_id()?;
+        validate_transaction_requirements(plan, transaction.requirements())?;
+        match commit_bound_plan(&self.runtime, plan, transaction_id) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if error.kind() == ErrorKind::StaleRevision => {}
+            Err(error) => return Err(error),
+        }
+        if transaction.is_snapshot_bound() {
+            return Err(Error::new(
+                ErrorKind::StaleRevision,
+                "snapshot-bound transaction cannot be transported to a newer database revision",
+            ));
+        }
+
+        let effect = plan_rebasable_effect(plan)?;
+        match certify_plan_rebase(&self.runtime, plan, &effect)? {
+            kernel_plan::RuntimeTransitionRebaseOutcome::Certified(_) => {
+                if !transaction.requirements().is_empty() {
+                    let rebased_for_requirements = exact_rebased_plan(&self.runtime, plan, plan_rebasable_effect(plan)?)?;
+                    validate_transaction_requirements(&rebased_for_requirements, transaction.requirements())?;
+                }
+                // Recheck the original semantic intent immediately before publication. Residual
+                // rows are an internal realization of this already-authorized action.
+                authorize_bound_plan(plan)?;
+                if let Some(outcome) = commit_certified_field_reapply_residual(
+                    &self.runtime,
+                    plan,
+                    &effect,
+                    transaction_id,
+                )? {
+                    return Ok(outcome);
+                }
+                if let Some(outcome) = commit_certified_relation_residual(
+                    &self.runtime,
+                    plan,
+                    &effect,
+                    transaction_id,
+                )? {
+                    return Ok(outcome);
+                }
+                if let Some(outcome) =
+                    commit_certified_mixed_residual(&self.runtime, &effect, transaction_id)?
+                {
+                    return Ok(outcome);
+                }
+                let rebased = exact_rebased_plan(&self.runtime, plan, effect)?;
+                commit_bound_plan_authorized(&self.runtime, &rebased, transaction_id)
+            }
+            kernel_plan::RuntimeTransitionRebaseOutcome::Conflict(conflict) => Err(Error::new(
+                ErrorKind::TransactionConflict,
+                format!(
+                    "transaction cannot be published on revision {}: definite conflicts {:?}, coordination-required effects {:?}, {} overlapping semantic coordinates; opaque effects {:?}",
+                    conflict.current_revision.raw(),
+                    conflict.conflicting_effects,
+                    conflict.coordination_effects,
+                    conflict.coordinates.len(),
+                    conflict.opaque_effects,
+                ),
+            )),
+        }
+    }
+
+    /// Advanced low-level publication path for tooling and bindings that intentionally construct
+    /// ordinary [`Plan`] values themselves.
+    pub fn commit_plan(&self, plan: &Plan, transaction: TransactionId) -> Result<CommitOutcome> {
         if plan.database_identity != self.identity {
             return Err(Error::new(
                 ErrorKind::InvalidPlan,
@@ -1368,6 +2587,106 @@ impl Database {
         }
         commit_bound_plan(&self.runtime, plan, transaction)
     }
+
+    fn require_transaction_owner(&self, transaction: &Transaction) -> Result<()> {
+        let Some(identity) = transaction.database_identity() else {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "transaction is still unbound; add at least one database mutation first",
+            ));
+        };
+        if identity != self.identity {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "transaction belongs to a different open database instance",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn authorize_bound_plan(plan: &Plan) -> Result<()> {
+    plan.authority.require_write_entry()?;
+    for (relation, coverage) in &plan.history_authorization {
+        let authorization = coverage.authorization;
+        if authorization.relation_write {
+            plan.authority.require_write_relation(*relation)?;
+        }
+        for (required, action) in [
+            (authorization.object_create, crate::plan::MutationAction::ObjectCreate),
+            (authorization.object_delete, crate::plan::MutationAction::ObjectDelete),
+            (authorization.relationship_attach, crate::plan::MutationAction::RelationshipAttach),
+            (authorization.relationship_detach, crate::plan::MutationAction::RelationshipDetach),
+            (authorization.relationship_move, crate::plan::MutationAction::RelationshipMove),
+        ] {
+            if required {
+                plan.authority.require_mutation_action(*relation, action)?;
+            }
+        }
+        for field in &coverage.fields {
+            plan.authority.require_write_field(*relation, *field)?;
+        }
+    }
+    for (relation, mutation) in &plan.mutations {
+        for index in 0..mutation.inserted.len() {
+            if plan
+                .history_authorization
+                .get(relation)
+                .is_some_and(|coverage| index < coverage.inserted_prefix)
+            {
+                continue;
+            }
+            match plan
+                .mutation_actions
+                .get(&(*relation, crate::plan::MutationDirection::Insert, index))
+            {
+                Some(action) => plan.authority.require_mutation_action(*relation, *action)?,
+                None => plan.authority.require_write_relation(*relation)?,
+            }
+        }
+        for index in 0..mutation.removed.len() {
+            if plan
+                .history_authorization
+                .get(relation)
+                .is_some_and(|coverage| index < coverage.removed_prefix)
+            {
+                continue;
+            }
+            match plan
+                .mutation_actions
+                .get(&(*relation, crate::plan::MutationDirection::Remove, index))
+            {
+                Some(action) => plan.authority.require_mutation_action(*relation, *action)?,
+                None => plan.authority.require_write_relation(*relation)?,
+            }
+        }
+    }
+    for ((relation, _), patch) in &plan.object_field_patches {
+        for (_, field) in patch.fields.values() {
+            plan.authority.require_write_field(
+                *relation,
+                crate::RelationColumnId::new(field.raw()),
+            )?;
+        }
+    }
+    // Detaching an exclusively-owned edge under DeleteIfUnowned can delete the target object.
+    // That induced lifecycle effect must never be a route around explicit object-delete authority.
+    for contract in plan.owned_relations.values() {
+        if contract.orphan_policy != crate::plan::OrphanPolicy::DeleteIfUnowned {
+            continue;
+        }
+        let can_orphan = plan.mutation_actions.iter().any(|((relation, _, _), action)| {
+            *relation == contract.relation
+                && *action == crate::plan::MutationAction::RelationshipDetach
+        });
+        if can_orphan {
+            plan.authority.require_mutation_action(
+                contract.target_relation,
+                crate::plan::MutationAction::ObjectDelete,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn commit_bound_plan(
@@ -1375,7 +2694,15 @@ pub(crate) fn commit_bound_plan(
     plan: &Plan,
     transaction: TransactionId,
 ) -> Result<CommitOutcome> {
-    plan.authority.require(Permission::Write)?;
+    authorize_bound_plan(plan)?;
+    commit_bound_plan_authorized(runtime, plan, transaction)
+}
+
+fn commit_bound_plan_authorized(
+    runtime: &kernel_plan::DurableRuntime,
+    plan: &Plan,
+    transaction: TransactionId,
+) -> Result<CommitOutcome> {
     if plan.is_empty() {
         return Err(Error::new(
             ErrorKind::InvalidPlan,
@@ -1384,6 +2711,8 @@ pub(crate) fn commit_bound_plan(
     }
     let source_revision = plan.source.revision().id();
     let target_revision = plan_target_revision_id(plan)?;
+    let field_writes = plan_object_field_writes(plan);
+    let authorizations = plan_relation_authorizations(plan);
     let transaction_id = kernel_types::ClientTransactionId::new(transaction.raw());
     let outcome = if let Some(model_delta) = &plan.model_delta {
         let deltas = plan_relation_deltas(plan, runtime.semantic_registry())?;
@@ -1392,6 +2721,8 @@ pub(crate) fn commit_bound_plan(
             .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
                 relation: *relation,
                 delta,
+                object_field_writes: field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+                authorization: authorizations.get(relation).copied().unwrap_or_default(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -1414,6 +2745,8 @@ pub(crate) fn commit_bound_plan(
             .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
                 relation: *relation,
                 delta,
+                object_field_writes: field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+                authorization: authorizations.get(relation).copied().unwrap_or_default(),
             })
             .collect::<Vec<_>>();
         let request = kernel_plan::DerivedRelationTransitionRequest {
@@ -1431,6 +2764,8 @@ pub(crate) fn commit_bound_plan(
             .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
                 relation: *relation,
                 delta,
+                object_field_writes: field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+                authorization: authorizations.get(relation).copied().unwrap_or_default(),
             })
             .collect::<Vec<_>>();
         let model_delta =
@@ -1481,7 +2816,8 @@ pub(crate) fn commit_bound_plan(
 pub struct ReadContext {
     runtime: Arc<kernel_plan::DurableRuntime>,
     database_identity: u64,
-    revision: kernel_revision::Revision,
+    revision: Option<kernel_revision::Revision>,
+    factorized: Option<kernel_durability::DurableFactorizedReadSnapshot>,
     live_snapshot: Option<kernel_plan::RuntimeRevisionSnapshot>,
     pub(crate) authority: RuntimeAuthority,
 }
@@ -1503,8 +2839,22 @@ impl ReadContext {
         &self.runtime
     }
 
-    pub(crate) const fn kernel_revision(&self) -> &kernel_revision::Revision {
-        &self.revision
+    pub(crate) fn live_snapshot_ref(&self) -> Option<&kernel_plan::RuntimeRevisionSnapshot> {
+        self.live_snapshot.as_ref()
+    }
+
+    pub(crate) fn kernel_revision(&self) -> &kernel_revision::Revision {
+        self.revision
+            .as_ref()
+            .expect("live ReadContext must own a logical revision")
+    }
+
+    fn semantic_context(&self) -> &kernel_schema::SemanticContext {
+        match (&self.revision, &self.factorized) {
+            (Some(revision), None) => revision.semantic_context(),
+            (None, Some(factorized)) => factorized.semantic_context(),
+            _ => unreachable!("ReadContext has exactly one read representation"),
+        }
     }
 
     pub fn watch(&self, query: &Query) -> Result<crate::QueryWatch> {
@@ -1519,7 +2869,7 @@ impl ReadContext {
                 "historical snapshots are read-only; derive a transition explicitly against the live database",
             )
         })?;
-        self.authority.require(Permission::Write)?;
+        self.authority.require_write_entry()?;
         Ok(Plan::new(
             &self.runtime,
             snapshot,
@@ -1533,9 +2883,18 @@ impl ReadContext {
         crate::ObjectSet::new(self.clone(), relation)
     }
 
+    pub(crate) fn projected_objects<E: crate::Object>(&self) -> Result<crate::ObjectSet<E>> {
+        let relation = self.relation::<E>(E::relation_id())?;
+        crate::ObjectSet::new_projected(self.clone(), relation)
+    }
+
     #[must_use]
     pub fn revision(&self) -> RevisionId {
-        self.revision.id().into()
+        match (&self.revision, &self.factorized) {
+            (Some(revision), None) => revision.id().into(),
+            (None, Some(factorized)) => factorized.revision().into(),
+            _ => unreachable!("ReadContext has exactly one read representation"),
+        }
     }
 
     pub fn history(&self) -> Result<crate::History> {
@@ -1548,32 +2907,56 @@ impl ReadContext {
         )
     }
 
+    fn schema_unchecked(&self) -> SchemaView {
+        SchemaView::from_kernel(&self.semantic_context().schema)
+    }
+
+    pub fn schema(&self) -> Result<SchemaView> {
+        self.authority.require(Permission::ModelRead)?;
+        Ok(self.schema_unchecked())
+    }
+
     #[must_use]
-    pub fn schema(&self) -> SchemaView {
-        SchemaView::from_kernel(&self.revision.semantic_context().schema)
+    pub fn schema_revision(&self) -> u64 {
+        self.semantic_context().schema.revision.raw()
+    }
+
+    fn prepare_unchecked(&self, query: &Query) -> Result<PreparedQuery> {
+        let inner = query
+            .inner
+            .prepare(
+                self.semantic_context(),
+                self.runtime.semantic_registry(),
+            )
+            .map_err(|error| query_error_at(query, &error))?;
+        Ok(PreparedQuery {
+            inner,
+            node: query.node_id(),
+            source: query.source(),
+        })
     }
 
     pub fn prepare(&self, query: &Query) -> Result<PreparedQuery> {
-        query
+        let prepared = self.prepare_unchecked(query)?;
+        let footprint = prepared
             .inner
-            .prepare(
-                self.revision.semantic_context(),
-                self.runtime.semantic_registry(),
-            )
-            .map(|inner| PreparedQuery {
-                inner,
-                node: query.node_id(),
-                source: query.source(),
-            })
-            .map_err(|error| query_error_at(query, &error))
+            .read_footprint()
+            .map_err(|error| query_error_at(query, &error))?;
+        self.authority.require_read_footprint(&footprint)?;
+        Ok(prepared)
     }
 
     pub fn execute(&self, query: &Query) -> Result<RelationResult> {
         self.prepare(query)?.execute(self)
     }
 
+    pub(crate) fn execute_for_mutation(&self, query: &Query) -> Result<RelationResult> {
+        self.authority.require_write_entry()?;
+        self.prepare_unchecked(query)?.execute_unchecked(self)
+    }
+
     pub fn relation<R>(&self, id: crate::RelationId) -> Result<crate::Relation<R>> {
-        let schema = self.schema();
+        let schema = self.schema_unchecked();
         let relation = schema.relation(id).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidSchema,
@@ -1586,12 +2969,89 @@ impl ReadContext {
 
 impl PreparedQuery {
     pub fn execute(&self, context: &ReadContext) -> Result<RelationResult> {
-        self.inner
-            .evaluate(
-                &context.revision.state().model,
-                context.revision.semantic_context(),
-                context.runtime.semantic_registry(),
+        let footprint = self.inner.read_footprint().map_err(|error| {
+            Error::new(
+                ErrorKind::Query,
+                format!("prepared query authorization footprint failed: {error:?}"),
             )
+            .with_query(self.node, self.source)
+        })?;
+        context.authority.require_read_footprint(&footprint)?;
+        self.execute_unchecked(context)
+    }
+
+    fn execute_unchecked(&self, context: &ReadContext) -> Result<RelationResult> {
+        let registry = context.runtime.semantic_registry();
+        if let Some(factorized) = context.factorized.as_ref() {
+            let rows = kernel_realization::evaluate_relation_expr_factorized(
+                factorized.root(),
+                factorized.atoms(),
+                factorized.semantic_context(),
+                registry,
+                self.inner.expression(),
+            )
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Internal,
+                    format!("factorized read execution failed: {error:?}"),
+                )
+                .with_query(self.node, self.source)
+            })?;
+            let value = match &self.inner.result_type().semantics {
+                kernel_schema::RelationSemantics::Bag { .. } => kernel_query::RelationValue::Bag(rows),
+                kernel_schema::RelationSemantics::Set { column_equivalences } => {
+                    kernel_query::RelationValue::Set {
+                        rows,
+                        column_equivalences: column_equivalences.clone(),
+                    }
+                }
+            };
+            return Ok(value.into());
+        }
+        let seeded = if let Some(snapshot) = context.live_snapshot_ref() {
+            let relations = self.inner.scan_relations();
+            if self
+                .inner
+                .emits_occurrence_certificate_with_scan_seeds(&relations)
+            {
+                let mut seeds = BTreeMap::new();
+                for relation in &relations {
+                    let seed = snapshot
+                        .relation_scan_occurrence_seed(*relation)
+                        .map_err(|error| {
+                            Error::new(
+                                ErrorKind::Internal,
+                                format!("runtime scan-evidence derivation failed: {error:?}"),
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Internal,
+                                format!("runtime has no relation witness for {relation:?}"),
+                            )
+                        })?;
+                    seeds.insert(*relation, seed);
+                }
+                Some(seeds)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match seeded {
+            Some(seeds) => self.inner.evaluate_seeded(
+                &context.kernel_revision().state().model,
+                context.semantic_context(),
+                registry,
+                &seeds,
+            ),
+            None => self.inner.evaluate(
+                &context.kernel_revision().state().model,
+                context.semantic_context(),
+                registry,
+            ),
+        }
             .map(Into::into)
             .map_err(|error| query_error(&error).with_query(self.node, self.source))
     }

@@ -452,6 +452,7 @@ fn analyze_writable_rel(
         ),
         RelExpr::FilterOrderConst { .. }
         | RelExpr::Difference { .. }
+        | RelExpr::Union { .. }
         | RelExpr::AntiJoin { .. }
         | RelExpr::Distinct { .. }
         | RelExpr::Group { .. }

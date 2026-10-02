@@ -163,6 +163,33 @@ impl DurableRevisionDescriptor {
         })
     }
 
+    pub fn schema_migration_program(
+        transaction_id: ClientTransactionId,
+        source_revision: RevisionId,
+        target_revision: RevisionId,
+        program: kernel_transport::SchemaMigrationProgram,
+        migration_complement: DurableMigrationComplement,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, CodecError> {
+        let intent = DurableTransactionIntent::schema_migration(
+            source_revision,
+            target_revision,
+            program.clone(),
+            migration_complement,
+            registry,
+        )?;
+        Ok(Self {
+            idempotency_epoch: IdempotencyEpoch::ZERO,
+            revision_effect_id: None,
+            transaction_id,
+            source_revision,
+            target_revision,
+            intent,
+            change: DurableRevisionChange::SchemaMigration { program },
+        })
+    }
+
+    #[cfg(test)]
     pub fn schema_migration(
         transaction_id: ClientTransactionId,
         source_revision: RevisionId,
@@ -170,31 +197,19 @@ impl DurableRevisionDescriptor {
         migration_complement: DurableMigrationComplement,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, CodecError> {
-        let intent = DurableTransactionIntent::schema_migration(
-            source_revision,
-            target,
-            migration_complement,
-            registry,
-        )?;
-        let DurableTransactionIntent::SchemaMigrationExact {
-            encoded_target_revision,
-            ..
-        } = &intent
-        else {
-            unreachable!("schema migration intent has exact target bytes")
-        };
-        let encoded_target_revision = encoded_target_revision.clone();
-        Ok(Self {
-            idempotency_epoch: IdempotencyEpoch::ZERO,
-            revision_effect_id: None,
+        let program = kernel_transport::SchemaMigrationProgram::new(
+            target.semantic_context().clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        Self::schema_migration_program(
             transaction_id,
             source_revision,
-            target_revision: target.id(),
-            intent,
-            change: DurableRevisionChange::FullRevision {
-                encoded_target_revision,
-            },
-        })
+            target.id(),
+            program,
+            migration_complement,
+            registry,
+        )
     }
 
     pub fn full_revision_and_materializations(
@@ -237,7 +252,8 @@ impl DurableRevisionDescriptor {
     ) -> Result<Option<kernel_revision::Revision>, DurabilityError> {
         match &self.change {
             DurableRevisionChange::RelationData { .. }
-            | DurableRevisionChange::MixedRevision { .. } => Ok(None),
+            | DurableRevisionChange::MixedRevision { .. }
+            | DurableRevisionChange::SchemaMigration { .. } => Ok(None),
             DurableRevisionChange::FullRevision {
                 encoded_target_revision,
             }

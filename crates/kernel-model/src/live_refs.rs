@@ -65,7 +65,10 @@ impl LiveRefSensitivityIndex {
         let relations = model
             .relations
             .iter()
-            .map(|(&relation, rows)| (relation, Arc::new(Self::compile_relation(rows, ids))))
+            .map(|(&relation, rows)| {
+                let materialized = rows.materialize_owned();
+                (relation, Arc::new(Self::compile_relation(&materialized, ids)))
+            })
             .collect();
         Self {
             field_by_target: Arc::new(field_by_target),
@@ -139,8 +142,8 @@ impl LiveRefSensitivityIndex {
     ) -> Self {
         let mut next_relations = self.relations.clone();
         for &relation in relations {
-            if let Some(rows) = model.relations.get(&relation) {
-                next_relations.insert(relation, Arc::new(Self::compile_relation(rows, ids)));
+            if let Some(rows) = model.relations.materialize_owned(&relation) {
+                next_relations.insert(relation, Arc::new(Self::compile_relation(&rows, ids)));
             } else {
                 next_relations.remove(&relation);
             }

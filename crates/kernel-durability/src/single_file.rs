@@ -19,7 +19,7 @@ use crate::storage_encryption::{
     StorageEncryptionKey, StorageNonceSequence, WrappedDatabaseMasterKey,
     random_database_master_key, unwrap_database_master_key, wrap_database_master_key,
 };
-use crate::wal::{FileRevisionWal, WalRegionRecovery, WalRegionScanSpec};
+use crate::wal::{FileRevisionWal, WalRegionRecovery, WalRegionScanSpec, scan_wal_stream_seeded};
 
 pub(crate) mod compaction_io;
 mod compaction_protocol;
@@ -80,6 +80,11 @@ pub enum SingleFileSectionKind {
     ReplicationAuthority = 4,
     PhysicalArtifact = 5,
     Auxiliary = 6,
+    HistoricalEpochDescriptor = 7,
+    HistoricalCheckpoint = 8,
+    HistoricalMetadata = 9,
+    HistoricalPreparedCapsule = 10,
+    HistoricalWal = 11,
 }
 
 impl SingleFileSectionKind {
@@ -91,6 +96,11 @@ impl SingleFileSectionKind {
             4 => Ok(Self::ReplicationAuthority),
             5 => Ok(Self::PhysicalArtifact),
             6 => Ok(Self::Auxiliary),
+            7 => Ok(Self::HistoricalEpochDescriptor),
+            8 => Ok(Self::HistoricalCheckpoint),
+            9 => Ok(Self::HistoricalMetadata),
+            10 => Ok(Self::HistoricalPreparedCapsule),
+            11 => Ok(Self::HistoricalWal),
             _ => Err(corruption("single-file section kind is unsupported")),
         }
     }
@@ -140,6 +150,11 @@ pub struct SingleFileSectionInput<'a> {
 }
 
 impl<'a> SingleFileSectionInput<'a> {
+    #[must_use]
+    pub const fn physical_realization(bytes: &'a [u8]) -> Self {
+        Self::bytes(SingleFileSectionKind::PhysicalArtifact, 0, bytes)
+    }
+
     pub(crate) const fn bytes(kind: SingleFileSectionKind, ordinal: u32, bytes: &'a [u8]) -> Self {
         Self {
             kind,
@@ -168,6 +183,208 @@ pub(crate) struct CarriedWalPublication<'a> {
     pub(crate) base_revision: RevisionId,
     pub(crate) expected_durable_revision: RevisionId,
     pub(crate) seeded_prepares: &'a [(u64, DurableRevisionDescriptor, u32)],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HistoricalGenerationArchive {
+    pub(crate) generation: u64,
+    pub(crate) checkpoint_revision: RevisionId,
+    pub(crate) durable_head: RevisionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HistoricalArchiveDescriptor {
+    generation: u64,
+    checkpoint_revision: RevisionId,
+    journal_first_lsn: u64,
+    journal_next_lsn: u64,
+    durable_head: RevisionId,
+}
+
+const HISTORICAL_ARCHIVE_MAGIC: [u8; 4] = *b"CFEA";
+const HISTORICAL_ARCHIVE_VERSION: u16 = 1;
+const HISTORICAL_ARCHIVE_DESCRIPTOR_LEN: usize = 48;
+
+fn encode_historical_archive_descriptor(
+    descriptor: HistoricalArchiveDescriptor,
+) -> [u8; HISTORICAL_ARCHIVE_DESCRIPTOR_LEN] {
+    let mut out = [0_u8; HISTORICAL_ARCHIVE_DESCRIPTOR_LEN];
+    out[0..4].copy_from_slice(&HISTORICAL_ARCHIVE_MAGIC);
+    out[4..6].copy_from_slice(&HISTORICAL_ARCHIVE_VERSION.to_le_bytes());
+    out[8..16].copy_from_slice(&descriptor.generation.to_le_bytes());
+    out[16..24].copy_from_slice(&descriptor.checkpoint_revision.raw().to_le_bytes());
+    out[24..32].copy_from_slice(&descriptor.journal_first_lsn.to_le_bytes());
+    out[32..40].copy_from_slice(&descriptor.journal_next_lsn.to_le_bytes());
+    out[40..48].copy_from_slice(&descriptor.durable_head.raw().to_le_bytes());
+    out
+}
+
+fn decode_historical_archive_descriptor(
+    bytes: &[u8],
+) -> Result<HistoricalArchiveDescriptor, DurabilityError> {
+    if bytes.len() != HISTORICAL_ARCHIVE_DESCRIPTOR_LEN
+        || bytes[0..4] != HISTORICAL_ARCHIVE_MAGIC
+        || u16::from_le_bytes(bytes[4..6].try_into().expect("fixed slice"))
+            != HISTORICAL_ARCHIVE_VERSION
+        || bytes[6..8] != [0, 0]
+    {
+        return Err(corruption(
+            "single-file historical epoch descriptor is invalid",
+        ));
+    }
+    Ok(HistoricalArchiveDescriptor {
+        generation: u64::from_le_bytes(bytes[8..16].try_into().expect("fixed slice")),
+        checkpoint_revision: RevisionId::new(u64::from_le_bytes(
+            bytes[16..24].try_into().expect("fixed slice"),
+        )),
+        journal_first_lsn: u64::from_le_bytes(bytes[24..32].try_into().expect("fixed slice")),
+        journal_next_lsn: u64::from_le_bytes(bytes[32..40].try_into().expect("fixed slice")),
+        durable_head: RevisionId::new(u64::from_le_bytes(
+            bytes[40..48].try_into().expect("fixed slice"),
+        )),
+    })
+}
+
+#[derive(Clone)]
+struct HistoricalSectionSource {
+    path: PathBuf,
+    generation: u64,
+    section: SingleFileSectionDescriptor,
+    crypto: Option<StorageAeadCodec>,
+    plaintext_len: u64,
+}
+
+impl HistoricalSectionSource {
+    fn open(
+        path: &Path,
+        generation: u64,
+        section: SingleFileSectionDescriptor,
+        crypto: Option<StorageAeadCodec>,
+    ) -> Result<Self, DurabilityError> {
+        let mut file = File::open(path)?;
+        let reader =
+            SingleFileSectionReader::open(&mut file, generation, section.clone(), crypto.clone())?;
+        let plaintext_len = reader.plaintext_len();
+        Ok(Self {
+            path: path.to_path_buf(),
+            generation,
+            section,
+            crypto,
+            plaintext_len,
+        })
+    }
+}
+
+impl SingleFileSectionSource for HistoricalSectionSource {
+    fn plaintext_len(&self) -> Result<u64, DurabilityError> {
+        Ok(self.plaintext_len)
+    }
+
+    fn write_to(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+    ) -> Result<(), DurabilityError> {
+        let mut file = File::open(&self.path)?;
+        let mut reader = SingleFileSectionReader::open(
+            &mut file,
+            self.generation,
+            self.section.clone(),
+            self.crypto.clone(),
+        )?;
+        let mut buffer = [0_u8; IO_BUFFER_SIZE];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            emit(&buffer[..read])?;
+        }
+        reader.finish()
+    }
+}
+
+struct HistoricalWalSource {
+    path: PathBuf,
+    offset: u64,
+    len: u64,
+}
+
+impl SingleFileSectionSource for HistoricalWalSource {
+    fn plaintext_len(&self) -> Result<u64, DurabilityError> {
+        Ok(self.len)
+    }
+
+    fn write_to(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+    ) -> Result<(), DurabilityError> {
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut remaining = self.len;
+        let mut buffer = [0_u8; IO_BUFFER_SIZE];
+        while remaining != 0 {
+            let chunk = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| DurabilityError::PayloadTooLarge)?;
+            file.read_exact(&mut buffer[..chunk]).map_err(|error| {
+                eof_as_corruption(error, "single-file historical WAL is truncated")
+            })?;
+            emit(&buffer[..chunk])?;
+            remaining -= chunk as u64;
+        }
+        Ok(())
+    }
+}
+
+struct OutgoingHistoricalArchiveSources {
+    ordinal: u32,
+    descriptor: [u8; HISTORICAL_ARCHIVE_DESCRIPTOR_LEN],
+    checkpoint: HistoricalSectionSource,
+    metadata: HistoricalSectionSource,
+    prepared: Option<HistoricalSectionSource>,
+    wal: HistoricalWalSource,
+}
+
+struct HistoricalPublicationSources {
+    carried: Vec<(SingleFileSectionKind, u32, HistoricalSectionSource)>,
+    outgoing: Option<OutgoingHistoricalArchiveSources>,
+}
+
+impl HistoricalPublicationSources {
+    fn append_inputs<'a>(&'a self, inputs: &mut Vec<SingleFileSectionInput<'a>>) {
+        for (kind, ordinal, source) in &self.carried {
+            inputs.push(SingleFileSectionInput::streaming(*kind, *ordinal, source));
+        }
+        let Some(outgoing) = &self.outgoing else {
+            return;
+        };
+        inputs.push(SingleFileSectionInput::bytes(
+            SingleFileSectionKind::HistoricalEpochDescriptor,
+            outgoing.ordinal,
+            &outgoing.descriptor,
+        ));
+        inputs.push(SingleFileSectionInput::streaming(
+            SingleFileSectionKind::HistoricalCheckpoint,
+            outgoing.ordinal,
+            &outgoing.checkpoint,
+        ));
+        inputs.push(SingleFileSectionInput::streaming(
+            SingleFileSectionKind::HistoricalMetadata,
+            outgoing.ordinal,
+            &outgoing.metadata,
+        ));
+        if let Some(prepared) = &outgoing.prepared {
+            inputs.push(SingleFileSectionInput::streaming(
+                SingleFileSectionKind::HistoricalPreparedCapsule,
+                outgoing.ordinal,
+                prepared,
+            ));
+        }
+        inputs.push(SingleFileSectionInput::streaming(
+            SingleFileSectionKind::HistoricalWal,
+            outgoing.ordinal,
+            &outgoing.wal,
+        ));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1113,6 +1330,153 @@ impl SingleFileContainer {
         Ok(())
     }
 
+    fn prepare_historical_publication_sources(
+        &mut self,
+        old_journal_end: u64,
+        next_lsn: u64,
+        archive_outgoing: Option<HistoricalGenerationArchive>,
+        retained_generations: &BTreeSet<u64>,
+    ) -> Result<HistoricalPublicationSources, DurabilityError> {
+        let current_view = read_generation_view(&mut self.file, self.root)?;
+        let mut retained_ordinals = BTreeSet::new();
+        let mut max_archive_ordinal = None::<u32>;
+        let descriptor_sections: Vec<_> = current_view
+            .sections
+            .iter()
+            .filter(|section| section.kind == SingleFileSectionKind::HistoricalEpochDescriptor)
+            .cloned()
+            .collect();
+        for section in descriptor_sections {
+            let mut bytes = Vec::with_capacity(HISTORICAL_ARCHIVE_DESCRIPTOR_LEN);
+            self.copy_section_descriptor_plaintext_to(
+                current_view.generation,
+                &section,
+                &mut bytes,
+            )?;
+            let descriptor = decode_historical_archive_descriptor(&bytes)?;
+            if retained_generations.contains(&descriptor.generation) {
+                retained_ordinals.insert(section.ordinal);
+                max_archive_ordinal = Some(
+                    max_archive_ordinal
+                        .map_or(section.ordinal, |current| current.max(section.ordinal)),
+                );
+            }
+        }
+        let mut carried = Vec::new();
+        for section in &current_view.sections {
+            if retained_ordinals.contains(&section.ordinal)
+                && matches!(
+                    section.kind,
+                    SingleFileSectionKind::HistoricalEpochDescriptor
+                        | SingleFileSectionKind::HistoricalCheckpoint
+                        | SingleFileSectionKind::HistoricalMetadata
+                        | SingleFileSectionKind::HistoricalPreparedCapsule
+                        | SingleFileSectionKind::HistoricalWal
+                )
+            {
+                carried.push((
+                    section.kind,
+                    section.ordinal,
+                    HistoricalSectionSource::open(
+                        &self.path,
+                        current_view.generation,
+                        section.clone(),
+                        self.crypto.clone(),
+                    )?,
+                ));
+            }
+        }
+
+        let outgoing = if let Some(archive) = archive_outgoing {
+            if archive.generation != current_view.generation {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "single-file historical archive generation does not match active generation",
+                });
+            }
+            let ordinal = match max_archive_ordinal {
+                Some(value) => value
+                    .checked_add(1)
+                    .ok_or(DurabilityError::PayloadTooLarge)?,
+                None => 0,
+            };
+            let checkpoint_section = current_view
+                .sections
+                .iter()
+                .find(|section| {
+                    section.kind == SingleFileSectionKind::Checkpoint && section.ordinal == 0
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    corruption(
+                        "single-file checkpoint section is missing while archiving historical epoch",
+                    )
+                })?;
+            let metadata_section = current_view
+                .sections
+                .iter()
+                .find(|section| {
+                    section.kind == SingleFileSectionKind::Metadata && section.ordinal == 0
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    corruption(
+                        "single-file metadata section is missing while archiving historical epoch",
+                    )
+                })?;
+            let prepared_section = current_view
+                .sections
+                .iter()
+                .find(|section| {
+                    section.kind == SingleFileSectionKind::PreparedCapsule && section.ordinal == 0
+                })
+                .cloned();
+            Some(OutgoingHistoricalArchiveSources {
+                ordinal,
+                descriptor: encode_historical_archive_descriptor(HistoricalArchiveDescriptor {
+                    generation: archive.generation,
+                    checkpoint_revision: archive.checkpoint_revision,
+                    journal_first_lsn: self.root.journal_first_lsn,
+                    journal_next_lsn: next_lsn,
+                    durable_head: archive.durable_head,
+                }),
+                checkpoint: HistoricalSectionSource::open(
+                    &self.path,
+                    current_view.generation,
+                    checkpoint_section,
+                    self.crypto.clone(),
+                )?,
+                metadata: HistoricalSectionSource::open(
+                    &self.path,
+                    current_view.generation,
+                    metadata_section,
+                    self.crypto.clone(),
+                )?,
+                prepared: prepared_section
+                    .map(|section| {
+                        HistoricalSectionSource::open(
+                            &self.path,
+                            current_view.generation,
+                            section,
+                            self.crypto.clone(),
+                        )
+                    })
+                    .transpose()?,
+                wal: HistoricalWalSource {
+                    path: self.path.clone(),
+                    offset: self.root.journal_offset,
+                    len: old_journal_end
+                        .checked_sub(self.root.journal_offset)
+                        .ok_or(DurabilityError::PayloadTooLarge)?,
+                },
+            })
+        } else {
+            None
+        };
+
+        Ok(HistoricalPublicationSources { carried, outgoing })
+    }
+
     pub fn publish_generation(
         &mut self,
         sections: &[SingleFileSectionInput<'_>],
@@ -1153,6 +1517,8 @@ impl SingleFileContainer {
         wal: &mut FileRevisionWal,
         sections: &[SingleFileSectionInput<'_>],
         replication_frames: &[Vec<u8>],
+        archive_outgoing: Option<HistoricalGenerationArchive>,
+        retained_historical_generations: &BTreeSet<u64>,
     ) -> Result<SingleFileGenerationView, DurabilityError> {
         if wal.path() != self.path || wal.start_offset() != self.root.journal_offset {
             return Err(DurabilityError::Protocol {
@@ -1161,10 +1527,21 @@ impl SingleFileContainer {
             });
         }
         let next_lsn = wal.seal_for_generation_rotation()?;
-        self.seal_journal_boundary(next_lsn)?;
+        let old_journal_end = self.seal_journal_boundary(next_lsn)?;
         let replication_authority =
             self.append_replication_authority_segment(replication_frames)?;
-        self.publish_next_generation_with_authority(sections, replication_authority)
+        let historical_sources = self.prepare_historical_publication_sources(
+            old_journal_end,
+            next_lsn,
+            archive_outgoing,
+            retained_historical_generations,
+        )?;
+        let mut historical_inputs = Vec::new();
+        historical_sources.append_inputs(&mut historical_inputs);
+        let mut all_sections = Vec::with_capacity(sections.len() + historical_inputs.len());
+        all_sections.extend_from_slice(sections);
+        all_sections.extend_from_slice(&historical_inputs);
+        self.publish_next_generation_with_authority(&all_sections, replication_authority)
     }
 
     pub(crate) fn publish_generation_with_carried_wal(
@@ -1173,6 +1550,8 @@ impl SingleFileContainer {
         carry: CarriedWalPublication<'_>,
         sections: &[SingleFileSectionInput<'_>],
         replication_frames: &[Vec<u8>],
+        archive_outgoing: Option<HistoricalGenerationArchive>,
+        retained_historical_generations: &BTreeSet<u64>,
     ) -> Result<SingleFileGenerationView, DurabilityError> {
         if wal.path() != self.path || wal.start_offset() != self.root.journal_offset {
             return Err(DurabilityError::Protocol {
@@ -1200,6 +1579,18 @@ impl SingleFileContainer {
         let replication_authority =
             self.append_replication_authority_segment(replication_frames)?;
 
+        let historical_sources = self.prepare_historical_publication_sources(
+            old_journal_end,
+            next_lsn,
+            archive_outgoing,
+            retained_historical_generations,
+        )?;
+        let mut historical_inputs = Vec::new();
+        historical_sources.append_inputs(&mut historical_inputs);
+        let mut all_sections = Vec::with_capacity(sections.len() + historical_inputs.len());
+        all_sections.extend_from_slice(sections);
+        all_sections.extend_from_slice(&historical_inputs);
+
         let generation = self
             .root
             .generation
@@ -1210,7 +1601,7 @@ impl SingleFileContainer {
                 &mut self.file,
                 self.root,
                 generation,
-                sections,
+                &all_sections,
                 self.crypto.as_ref(),
             )?;
         let journal_offset = generation_offset
@@ -1375,6 +1766,138 @@ impl SingleFileContainer {
         )?;
         self.file.sync_all()?;
         Ok(Some(root))
+    }
+
+    fn historical_archive_descriptor(
+        &mut self,
+        generation: u64,
+    ) -> Result<Option<(u32, HistoricalArchiveDescriptor)>, DurabilityError> {
+        let view = self.generation_view()?;
+        let descriptors: Vec<_> = view
+            .sections
+            .iter()
+            .filter(|section| section.kind == SingleFileSectionKind::HistoricalEpochDescriptor)
+            .cloned()
+            .collect();
+        for section in descriptors {
+            let ordinal = section.ordinal;
+            let mut bytes = Vec::with_capacity(HISTORICAL_ARCHIVE_DESCRIPTOR_LEN);
+            self.copy_section_descriptor_plaintext_to(view.generation, &section, &mut bytes)?;
+            let descriptor = decode_historical_archive_descriptor(&bytes)?;
+            if descriptor.generation == generation {
+                return Ok(Some((ordinal, descriptor)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn has_historical_epoch_archive(
+        &mut self,
+        generation: u64,
+    ) -> Result<bool, DurabilityError> {
+        Ok(self.historical_archive_descriptor(generation)?.is_some())
+    }
+
+    pub(crate) fn with_historical_epoch_section_reader<T>(
+        &mut self,
+        generation: u64,
+        kind: SingleFileSectionKind,
+        decode: impl FnOnce(&mut dyn Read, u64) -> Result<T, DurabilityError>,
+    ) -> Result<Option<T>, DurabilityError> {
+        let Some((ordinal, _)) = self.historical_archive_descriptor(generation)? else {
+            return Ok(None);
+        };
+        self.with_section_reader(kind, ordinal, decode)
+    }
+
+    pub(crate) fn read_historical_epoch_section(
+        &mut self,
+        generation: u64,
+        kind: SingleFileSectionKind,
+    ) -> Result<Option<Vec<u8>>, DurabilityError> {
+        let Some((ordinal, _)) = self.historical_archive_descriptor(generation)? else {
+            return Ok(None);
+        };
+        self.read_section(kind, ordinal)
+    }
+
+    pub(crate) fn scan_historical_epoch_journal(
+        &mut self,
+        generation: u64,
+        seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+    ) -> Result<Option<RecoveryScan>, DurabilityError> {
+        let Some((ordinal, descriptor)) = self.historical_archive_descriptor(generation)? else {
+            return Ok(None);
+        };
+        let view = self.generation_view()?;
+        let section = view
+            .sections
+            .iter()
+            .find(|section| {
+                section.kind == SingleFileSectionKind::HistoricalWal && section.ordinal == ordinal
+            })
+            .cloned()
+            .ok_or_else(|| corruption("single-file historical epoch WAL section is missing"))?;
+        let mut reader = SingleFileSectionReader::open(
+            &mut self.file,
+            view.generation,
+            section,
+            self.crypto.clone(),
+        )?;
+        let plaintext_len = reader.plaintext_len();
+        let scan = scan_wal_stream_seeded(
+            &mut reader,
+            plaintext_len,
+            descriptor.checkpoint_revision,
+            descriptor.journal_first_lsn,
+            seeded_prepares,
+            self.crypto.as_ref(),
+        )?;
+        reader.finish()?;
+        if !matches!(scan.tail_status(), TailStatus::Clean)
+            || scan.next_lsn() != descriptor.journal_next_lsn
+            || scan.durable_revision() != descriptor.durable_head
+            || u64::try_from(scan.last_good_offset())
+                .map_err(|_| DurabilityError::PayloadTooLarge)?
+                != plaintext_len
+        {
+            return Err(corruption(
+                "single-file historical epoch WAL certificate mismatch",
+            ));
+        }
+        Ok(Some(scan))
+    }
+
+    pub(crate) fn scan_active_journal_read_only(
+        &self,
+        base_revision: RevisionId,
+        seeded_prepares: &[(u64, DurableRevisionDescriptor, u32)],
+    ) -> Result<RecoveryScan, DurabilityError> {
+        let end_offset = if self.root.journal_end == 0 {
+            self.file.metadata()?.len()
+        } else {
+            self.root.journal_end
+        };
+        let scan = FileRevisionWal::scan_region_seeded_read_only(
+            &self.path,
+            self.root.journal_offset,
+            end_offset,
+            base_revision,
+            self.root.journal_first_lsn,
+            seeded_prepares,
+            self.crypto.as_ref(),
+        )?;
+        if self.root.journal_end != 0
+            && (!matches!(scan.tail_status(), TailStatus::Clean)
+                || u64::try_from(scan.last_good_offset())
+                    .map_err(|_| DurabilityError::PayloadTooLarge)?
+                    != self.root.journal_end - self.root.journal_offset)
+        {
+            return Err(corruption(
+                "single-file sealed journal is not a complete historical WAL prefix",
+            ));
+        }
+        Ok(scan)
     }
 
     pub fn open_journal_recovered(
@@ -3764,6 +4287,8 @@ mod tests {
                 relation: SemanticId::new(11),
                 inserted: vec![vec![Value::I64(value)]],
                 removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: Default::default(),
             }],
             &registry,
         )

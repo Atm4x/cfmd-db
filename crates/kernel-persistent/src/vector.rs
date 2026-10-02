@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, OnceLock, Weak},
+};
 
 use super::{BRANCH, PAGE};
 
@@ -18,6 +21,30 @@ pub struct PersistentVec<T> {
     levels: usize,
     len: usize,
     contiguous_cache: OnceLock<Vec<T>>,
+}
+
+/// Weak diagnostic probe for persistent-vector radix nodes unique to one
+/// snapshot relative to another. The probe itself does not retain storage.
+#[derive(Debug)]
+pub struct PersistentVecStorageProbe<T> {
+    nodes: Vec<Weak<Node<T>>>,
+}
+
+impl<T> PersistentVecStorageProbe<T> {
+    #[must_use]
+    pub fn total_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[must_use]
+    pub fn live_nodes(&self) -> usize {
+        self.nodes.iter().filter(|node| node.strong_count() != 0).count()
+    }
+
+    #[must_use]
+    pub fn is_fully_reclaimed(&self) -> bool {
+        self.live_nodes() == 0
+    }
 }
 
 impl<T> Clone for PersistentVec<T> {
@@ -395,6 +422,86 @@ impl<T> PersistentVec<T> {
             (Some(left), Some(right)) => Arc::ptr_eq(left, right),
             _ => false,
         }
+    }
+
+    /// Number of radix/leaf nodes structurally reachable from this root.
+    #[must_use]
+    pub fn structural_node_count(&self) -> usize {
+        fn count<T>(node: &Arc<Node<T>>) -> usize {
+            match node.as_ref() {
+                Node::Leaf(_) => 1,
+                Node::Branch(children) => {
+                    1 + children
+                        .iter()
+                        .filter_map(Option::as_ref)
+                        .map(count)
+                        .sum::<usize>()
+                }
+            }
+        }
+        count(&self.root)
+    }
+
+    /// Exact pointer-identity sharing count for diagnostic retention tests.
+    #[must_use]
+    pub fn shared_structural_node_count_with(&self, other: &Self) -> usize {
+        fn collect<T>(node: &Arc<Node<T>>, ids: &mut BTreeSet<usize>) {
+            ids.insert(Arc::as_ptr(node) as usize);
+            if let Node::Branch(children) = node.as_ref() {
+                for child in children.iter().filter_map(Option::as_ref) {
+                    collect(child, ids);
+                }
+            }
+        }
+        fn count_shared<T>(node: &Arc<Node<T>>, ids: &BTreeSet<usize>) -> usize {
+            let own = usize::from(ids.contains(&(Arc::as_ptr(node) as usize)));
+            own + match node.as_ref() {
+                Node::Leaf(_) => 0,
+                Node::Branch(children) => children
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .map(|child| count_shared(child, ids))
+                    .sum(),
+            }
+        }
+
+        let mut ids = BTreeSet::new();
+        collect(&self.root, &mut ids);
+        count_shared(&other.root, &ids)
+    }
+
+    /// Weakly probes radix/leaf nodes owned by this snapshot but not shared
+    /// with `other`.
+    #[must_use]
+    pub fn unique_storage_probe_against(&self, other: &Self) -> PersistentVecStorageProbe<T> {
+        fn collect_ids<T>(node: &Arc<Node<T>>, ids: &mut BTreeSet<usize>) {
+            ids.insert(Arc::as_ptr(node) as usize);
+            if let Node::Branch(children) = node.as_ref() {
+                for child in children.iter().filter_map(Option::as_ref) {
+                    collect_ids(child, ids);
+                }
+            }
+        }
+        fn collect_unique<T>(
+            node: &Arc<Node<T>>,
+            shared: &BTreeSet<usize>,
+            into: &mut Vec<Weak<Node<T>>>,
+        ) {
+            if !shared.contains(&(Arc::as_ptr(node) as usize)) {
+                into.push(Arc::downgrade(node));
+            }
+            if let Node::Branch(children) = node.as_ref() {
+                for child in children.iter().filter_map(Option::as_ref) {
+                    collect_unique(child, shared, into);
+                }
+            }
+        }
+
+        let mut shared = BTreeSet::new();
+        collect_ids(&other.root, &mut shared);
+        let mut nodes = Vec::new();
+        collect_unique(&self.root, &shared, &mut nodes);
+        PersistentVecStorageProbe { nodes }
     }
 
     /// Returns the logical indexes whose values differ between two snapshots.

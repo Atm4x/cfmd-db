@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use crate::{
-    EquivalenceId, Error, ErrorKind, OrderComparison, OrderingId, PreparedQuery, Query,
-    ReadContext, RelationId, RelationResult, Result, Row, Type, Value,
+    EquivalenceId, Error, ErrorKind, OrderComparison, OrderDirection, OrderingId, PreparedQuery,
+    Query, ReadContext, RelationId, RelationResult, Result, Row, Type, Value,
 };
 
 /// Converts one scalar product value between Rust and the stable CFMD value protocol.
@@ -356,27 +356,83 @@ impl<R, V> Field<R, V> {
     pub const fn equivalence(self) -> EquivalenceId {
         self.equivalence
     }
+
+    pub(crate) const fn relation_id(self) -> RelationId {
+        self.relation
+    }
 }
 
 impl<R, V: ValueCodec> Field<R, V> {
     #[must_use]
-    pub fn eq(self, value: V) -> EqPredicate<R> {
+    pub fn eq<O>(self, other: O) -> EqPredicate<R>
+    where
+        O: EqOperand<R, V>,
+    {
+        other.into_predicate(self)
+    }
+
+    #[must_use]
+    pub fn ne<O>(self, other: O) -> NotPredicate<R, EqPredicate<R>>
+    where
+        O: EqOperand<R, V>,
+    {
+        self.eq(other).not()
+    }
+}
+
+#[doc(hidden)]
+pub trait EqOperand<R, V: ValueCodec> {
+    fn into_predicate(self, left: Field<R, V>) -> EqPredicate<R>;
+}
+
+impl<R, V: ValueCodec> EqOperand<R, V> for V {
+    fn into_predicate(self, left: Field<R, V>) -> EqPredicate<R> {
         EqPredicate {
-            relation: self.relation,
-            column: self.column,
-            equivalence: self.equivalence,
-            value: value.into_value(),
+            relation: left.relation,
+            kind: EqPredicateKind::Const {
+                column: left.column,
+                equivalence: left.equivalence,
+                value: self.into_value(),
+            },
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<R, V: ValueCodec> EqOperand<R, V> for Field<R, V> {
+    fn into_predicate(self, left: Field<R, V>) -> EqPredicate<R> {
+        EqPredicate {
+            relation: left.relation,
+            kind: EqPredicateKind::Columns {
+                right_relation: self.relation,
+                left_column: left.column,
+                right_column: self.column,
+                equivalence: left.equivalence,
+            },
             marker: PhantomData,
         }
     }
 }
 
 #[derive(Debug, Clone)]
+enum EqPredicateKind {
+    Const {
+        column: usize,
+        equivalence: EquivalenceId,
+        value: Value,
+    },
+    Columns {
+        right_relation: RelationId,
+        left_column: usize,
+        right_column: usize,
+        equivalence: EquivalenceId,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct EqPredicate<R> {
     relation: RelationId,
-    column: usize,
-    equivalence: EquivalenceId,
-    value: Value,
+    kind: EqPredicateKind,
     marker: PhantomData<fn() -> R>,
 }
 
@@ -384,8 +440,152 @@ pub struct EqPredicate<R> {
 pub trait ObjectPredicate<R> {
     #[track_caller]
     fn apply(self, input: Query, root: &Relation<R>) -> Result<Query>;
+
+    #[must_use]
+    fn and<P: ObjectPredicate<R>>(self, other: P) -> AndPredicate<R, Self, P>
+    where
+        Self: Sized,
+    {
+        AndPredicate {
+            left: self,
+            right: other,
+            marker: PhantomData,
+        }
+    }
+
+    #[must_use]
+    fn or<P: ObjectPredicate<R>>(self, other: P) -> OrPredicate<R, Self, P>
+    where
+        Self: Sized,
+    {
+        OrPredicate {
+            left: self,
+            right: other,
+            marker: PhantomData,
+        }
+    }
+
+    #[must_use]
+    fn not(self) -> NotPredicate<R, Self>
+    where
+        Self: Sized,
+    {
+        NotPredicate {
+            inner: self,
+            marker: PhantomData,
+        }
+    }
 }
 
+#[derive(Debug, Clone)]
+pub struct AndPredicate<R, L, P> {
+    left: L,
+    right: P,
+    marker: PhantomData<fn() -> R>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrPredicate<R, L, P> {
+    left: L,
+    right: P,
+    marker: PhantomData<fn() -> R>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotPredicate<R, P> {
+    inner: P,
+    marker: PhantomData<fn() -> R>,
+}
+
+impl<R, P> ObjectPredicate<R> for NotPredicate<R, P>
+where
+    P: ObjectPredicate<R>,
+{
+    #[track_caller]
+    fn apply(self, input: Query, root: &Relation<R>) -> Result<Query> {
+        let selected = self.inner.apply(input.clone(), root)?;
+        Ok(input.difference(selected))
+    }
+}
+
+impl<R, L, P> ObjectPredicate<R> for AndPredicate<R, L, P>
+where
+    L: ObjectPredicate<R>,
+    P: ObjectPredicate<R>,
+{
+    #[track_caller]
+    fn apply(self, input: Query, root: &Relation<R>) -> Result<Query> {
+        let input = self.left.apply(input, root)?;
+        self.right.apply(input, root)
+    }
+}
+
+impl<R, L, P> ObjectPredicate<R> for OrPredicate<R, L, P>
+where
+    L: ObjectPredicate<R>,
+    P: ObjectPredicate<R>,
+{
+    #[track_caller]
+    fn apply(self, input: Query, root: &Relation<R>) -> Result<Query> {
+        let left = self.left.apply(input.clone(), root)?;
+        let right = self.right.apply(input, root)?;
+        Ok(left.union(right))
+    }
+}
+
+macro_rules! impl_predicate_operators {
+    ([$($gen:ident),*] $self_ty:ty => $root:ty where [$($bounds:tt)*]) => {
+        impl<$($gen,)* Rhs> std::ops::BitAnd<Rhs> for $self_ty
+        where
+            Rhs: ObjectPredicate<$root>,
+            $($bounds)*
+        {
+            type Output = AndPredicate<$root, Self, Rhs>;
+
+            fn bitand(self, rhs: Rhs) -> Self::Output {
+                ObjectPredicate::and(self, rhs)
+            }
+        }
+
+        impl<$($gen,)* Rhs> std::ops::BitOr<Rhs> for $self_ty
+        where
+            Rhs: ObjectPredicate<$root>,
+            $($bounds)*
+        {
+            type Output = OrPredicate<$root, Self, Rhs>;
+
+            fn bitor(self, rhs: Rhs) -> Self::Output {
+                ObjectPredicate::or(self, rhs)
+            }
+        }
+
+        impl<$($gen),*> std::ops::Not for $self_ty
+        where
+            $($bounds)*
+        {
+            type Output = NotPredicate<$root, Self>;
+
+            fn not(self) -> Self::Output {
+                ObjectPredicate::not(self)
+            }
+        }
+    };
+}
+
+impl_predicate_operators!([R] EqPredicate<R> => R where []);
+impl_predicate_operators!([R] OrderPredicate<R> => R where []);
+impl_predicate_operators!([R] BetweenPredicate<R> => R where []);
+impl_predicate_operators!([R, L, P] AndPredicate<R, L, P> => R where [
+    L: ObjectPredicate<R>,
+    P: ObjectPredicate<R>,
+]);
+impl_predicate_operators!([R, L, P] OrPredicate<R, L, P> => R where [
+    L: ObjectPredicate<R>,
+    P: ObjectPredicate<R>,
+]);
+impl_predicate_operators!([R, P] NotPredicate<R, P> => R where [
+    P: ObjectPredicate<R>,
+]);
 impl<R> ObjectPredicate<R> for EqPredicate<R> {
     #[track_caller]
     fn apply(self, input: Query, root: &Relation<R>) -> Result<Query> {
@@ -395,7 +595,27 @@ impl<R> ObjectPredicate<R> for EqPredicate<R> {
                 "predicate belongs to a different relation handle",
             ));
         }
-        Ok(input.filter_eq(self.column, self.value, self.equivalence))
+        match self.kind {
+            EqPredicateKind::Const {
+                column,
+                equivalence,
+                value,
+            } => Ok(input.filter_eq(column, value, equivalence)),
+            EqPredicateKind::Columns {
+                right_relation,
+                left_column,
+                right_column,
+                equivalence,
+            } => {
+                if right_relation != root.id() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidPlan,
+                        "field equality compares columns from different relation handles",
+                    ));
+                }
+                Ok(input.filter_eq_columns(left_column, right_column, equivalence))
+            }
+        }
     }
 }
 
@@ -561,6 +781,48 @@ impl<R> RelationQuery<R> {
     }
 
     #[track_caller]
+    fn boundary_with_ties<V: crate::OrderedObjectValue>(
+        mut self,
+        field: Field<R, V>,
+        direction: OrderDirection,
+        k: usize,
+    ) -> Self {
+        if self.error.is_some() {
+            return self;
+        }
+        if field.relation != self.relation.id() {
+            self.error = Some(Error::new(
+                ErrorKind::InvalidPlan,
+                "ordered boundary field belongs to a different relation handle",
+            ));
+            return self;
+        }
+        let Some(ordering) = field.ordering else {
+            self.error = Some(Error::new(
+                ErrorKind::InvalidSchema,
+                "field has no declared canonical ordering",
+            ));
+            return self;
+        };
+        self.inner = self
+            .inner
+            .top_k_with_ties(field.column, ordering, direction, k);
+        self
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn top<V: crate::OrderedObjectValue>(self, field: Field<R, V>, k: usize) -> Self {
+        self.boundary_with_ties(field, OrderDirection::Descending, k)
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn bottom<V: crate::OrderedObjectValue>(self, field: Field<R, V>, k: usize) -> Self {
+        self.boundary_with_ties(field, OrderDirection::Ascending, k)
+    }
+
+    #[track_caller]
     #[must_use]
     pub fn select<P: Projection<R>>(self, projection: P) -> TypedQuery<R, P> {
         let mut error = self.error;
@@ -570,10 +832,22 @@ impl<R> RelationQuery<R> {
                 "typed projection mixes fields from a different relation handle",
             ));
         }
-        let inner = self.inner.project(projection.columns());
+        let columns = projection.columns();
+        let equivalences = columns
+            .iter()
+            .filter_map(|column| self.relation.equivalence_at(*column))
+            .collect::<Vec<_>>();
+        if equivalences.len() != columns.len() {
+            error = Some(Error::new(
+                ErrorKind::InvalidSchema,
+                "typed projection references a column without semantic equivalence",
+            ));
+        }
+        let inner = self.inner.project_preserving_multiplicity(columns);
         TypedQuery {
             inner,
             projection,
+            equivalences,
             error,
             marker: PhantomData,
         }
@@ -604,6 +878,110 @@ pub trait Projection<R>: Clone {
     fn decode(&self, row: &Row) -> Result<Self::Output>;
 }
 
+/// Typed key description for kernel-native grouping.
+///
+/// Application code normally obtains this implicitly by returning a field or tuple of fields
+/// from `group_by`; the trait keeps composite Γ keys in the query algebra rather than routing
+/// grouping through host-language maps.
+pub trait GroupKey<R>: Clone {
+    type Output;
+
+    fn belongs_to(&self, relation: RelationId) -> bool;
+    fn columns(&self) -> Vec<usize>;
+    fn equivalences(&self) -> Vec<EquivalenceId>;
+    fn decode(values: &[Value]) -> Result<Self::Output>;
+}
+
+impl<R, V: ValueCodec> GroupKey<R> for Field<R, V> {
+    type Output = V;
+
+    fn belongs_to(&self, relation: RelationId) -> bool {
+        self.relation == relation
+    }
+
+    fn columns(&self) -> Vec<usize> {
+        vec![self.column]
+    }
+
+    fn equivalences(&self) -> Vec<EquivalenceId> {
+        vec![self.equivalence]
+    }
+
+    fn decode(values: &[Value]) -> Result<Self::Output> {
+        let [value] = values else {
+            return Err(type_mismatch("one-column group key"));
+        };
+        V::from_value(value)
+    }
+}
+
+macro_rules! impl_group_key_tuple {
+    ($arity:literal; $( $ty:ident : $index:tt ),+ $(,)?) => {
+        impl<R, $( $ty: ValueCodec ),+> GroupKey<R> for ($( Field<R, $ty>, )+) {
+            type Output = ($( $ty, )+);
+
+            fn belongs_to(&self, relation: RelationId) -> bool {
+                true $( && self.$index.relation == relation )+
+            }
+
+            fn columns(&self) -> Vec<usize> {
+                vec![$( self.$index.column ),+]
+            }
+
+            fn equivalences(&self) -> Vec<EquivalenceId> {
+                vec![$( self.$index.equivalence ),+]
+            }
+
+            fn decode(values: &[Value]) -> Result<Self::Output> {
+                if values.len() != $arity {
+                    return Err(type_mismatch(concat!(stringify!($arity), "-column group key")));
+                }
+                Ok(($( $ty::from_value(&values[$index])?, )+))
+            }
+        }
+    };
+}
+
+impl_group_key_tuple!(2; A:0, B:1);
+impl_group_key_tuple!(3; A:0, B:1, C:2);
+impl_group_key_tuple!(4; A:0, B:1, C:2, D:3);
+impl_group_key_tuple!(5; A:0, B:1, C:2, D:3, E:4);
+impl_group_key_tuple!(6; A:0, B:1, C:2, D:3, E:4, F:5);
+impl_group_key_tuple!(7; A:0, B:1, C:2, D:3, E:4, F:5, G:6);
+impl_group_key_tuple!(8; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7);
+impl_group_key_tuple!(9; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8);
+impl_group_key_tuple!(10; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9);
+impl_group_key_tuple!(11; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10);
+impl_group_key_tuple!(12; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11);
+
+impl<R, V: ValueCodec, const N: usize> GroupKey<R> for [Field<R, V>; N] {
+    type Output = [V; N];
+
+    fn belongs_to(&self, relation: RelationId) -> bool {
+        self.iter().all(|field| field.relation == relation)
+    }
+
+    fn columns(&self) -> Vec<usize> {
+        self.iter().map(|field| field.column).collect()
+    }
+
+    fn equivalences(&self) -> Vec<EquivalenceId> {
+        self.iter().map(|field| field.equivalence).collect()
+    }
+
+    fn decode(values: &[Value]) -> Result<Self::Output> {
+        if values.len() != N {
+            return Err(type_mismatch("fixed-width array group key"));
+        }
+        values
+            .iter()
+            .map(V::from_value)
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| type_mismatch("fixed-width array group key"))
+    }
+}
+
 impl<R, V: ValueCodec> Projection<R> for Field<R, V> {
     type Output = V;
 
@@ -626,63 +1004,61 @@ impl<R, V: ValueCodec> Projection<R> for Field<R, V> {
     }
 }
 
-impl<R, A, B> Projection<R> for (Field<R, A>, Field<R, B>)
-where
-    A: ValueCodec,
-    B: ValueCodec,
-{
-    type Output = (A, B);
+macro_rules! impl_projection_tuple {
+    ($arity:literal; $( $ty:ident : $index:tt ),+ $(,)?) => {
+        impl<R, $( $ty: ValueCodec ),+> Projection<R> for ($( Field<R, $ty>, )+) {
+            type Output = ($( $ty, )+);
 
-    fn belongs_to(&self, relation: RelationId) -> bool {
-        self.0.relation == relation && self.1.relation == relation
-    }
+            fn belongs_to(&self, relation: RelationId) -> bool {
+                true $( && self.$index.relation == relation )+
+            }
 
-    fn columns(&self) -> Vec<usize> {
-        vec![self.0.column, self.1.column]
-    }
+            fn columns(&self) -> Vec<usize> {
+                vec![$( self.$index.column ),+]
+            }
 
-    fn decode(&self, row: &Row) -> Result<Self::Output> {
-        let left = row.first().ok_or_else(|| {
-            Error::new(ErrorKind::TypeMismatch, "projected row is missing column 0")
-        })?;
-        let right = row.get(1).ok_or_else(|| {
-            Error::new(ErrorKind::TypeMismatch, "projected row is missing column 1")
-        })?;
-        Ok((A::from_value(left)?, B::from_value(right)?))
-    }
+            fn decode(&self, row: &Row) -> Result<Self::Output> {
+                if row.len() != $arity {
+                    return Err(type_mismatch(concat!(stringify!($arity), "-column projection")));
+                }
+                Ok(($( $ty::from_value(&row[$index])?, )+))
+            }
+        }
+    };
 }
 
-impl<R, A, B, C> Projection<R> for (Field<R, A>, Field<R, B>, Field<R, C>)
-where
-    A: ValueCodec,
-    B: ValueCodec,
-    C: ValueCodec + Clone,
-{
-    type Output = (A, B, C);
+impl_projection_tuple!(2; A:0, B:1);
+impl_projection_tuple!(3; A:0, B:1, C:2);
+impl_projection_tuple!(4; A:0, B:1, C:2, D:3);
+impl_projection_tuple!(5; A:0, B:1, C:2, D:3, E:4);
+impl_projection_tuple!(6; A:0, B:1, C:2, D:3, E:4, F:5);
+impl_projection_tuple!(7; A:0, B:1, C:2, D:3, E:4, F:5, G:6);
+impl_projection_tuple!(8; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7);
+impl_projection_tuple!(9; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8);
+impl_projection_tuple!(10; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9);
+impl_projection_tuple!(11; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10);
+impl_projection_tuple!(12; A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7, I:8, J:9, K:10, L:11);
+
+impl<R, V: ValueCodec, const N: usize> Projection<R> for [Field<R, V>; N] {
+    type Output = [V; N];
 
     fn belongs_to(&self, relation: RelationId) -> bool {
-        self.0.relation == relation && self.1.relation == relation && self.2.relation == relation
+        self.iter().all(|field| field.relation == relation)
     }
 
     fn columns(&self) -> Vec<usize> {
-        vec![self.0.column, self.1.column, self.2.column]
+        self.iter().map(|field| field.column).collect()
     }
 
     fn decode(&self, row: &Row) -> Result<Self::Output> {
-        let first = row.first().ok_or_else(|| {
-            Error::new(ErrorKind::TypeMismatch, "projected row is missing column 0")
-        })?;
-        let second = row.get(1).ok_or_else(|| {
-            Error::new(ErrorKind::TypeMismatch, "projected row is missing column 1")
-        })?;
-        let third = row.get(2).ok_or_else(|| {
-            Error::new(ErrorKind::TypeMismatch, "projected row is missing column 2")
-        })?;
-        Ok((
-            A::from_value(first)?,
-            B::from_value(second)?,
-            C::from_value(third)?,
-        ))
+        if row.len() != N {
+            return Err(type_mismatch("fixed-width array projection"));
+        }
+        row.iter()
+            .map(V::from_value)
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| type_mismatch("fixed-width array projection"))
     }
 }
 
@@ -690,6 +1066,7 @@ where
 pub struct TypedQuery<R, P> {
     inner: Query,
     projection: P,
+    equivalences: Vec<EquivalenceId>,
     error: Option<Error>,
     marker: PhantomData<fn() -> R>,
 }
@@ -697,6 +1074,12 @@ pub struct TypedQuery<R, P> {
 impl<R, P: Projection<R>> TypedQuery<R, P> {
     pub(crate) const fn projection(&self) -> &P {
         &self.projection
+    }
+
+    #[must_use]
+    pub(crate) fn distinct(mut self) -> Self {
+        self.inner = self.inner.distinct(self.equivalences.clone());
+        self
     }
 
     pub fn prepare(&self, context: &ReadContext) -> Result<PreparedTypedQuery<R, P>> {

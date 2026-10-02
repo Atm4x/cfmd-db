@@ -1104,6 +1104,8 @@ fn ordered_view_advances_from_certified_materialization_output_delta() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let transition = prepare_runtime_revision(&runtime, 9_995_103, &mutations, &registry).unwrap();
     let output_delta = transition
@@ -1229,6 +1231,7 @@ fn baseline_lowering_is_exact_round_trip_for_every_operator_shape() {
             projects: 1,
             joins: 1,
             differences: 0,
+            unions: 0,
             anti_joins: 0,
             distincts: 1,
             groups: 1,
@@ -1509,6 +1512,8 @@ fn durable_commit_linearizes_before_runtime_publication_and_recovers_from_logica
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let target = target_revision_for(&runtime, 301, &mutations, &registry);
     let cell = RuntimeRevisionCell::new(runtime);
@@ -1559,6 +1564,8 @@ fn durable_recovery_replays_multiple_nonconsecutive_revision_ids_idempotently() 
     let mutations_a = [RevisionRelationMutation {
         relation,
         delta: &delta_a,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = cell.snapshot().unwrap();
     let target_a = target_revision_for(snapshot.root(), 400, &mutations_a, &registry);
@@ -1578,6 +1585,8 @@ fn durable_recovery_replays_multiple_nonconsecutive_revision_ids_idempotently() 
     let mutations_b = [RevisionRelationMutation {
         relation,
         delta: &delta_b,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = cell.snapshot().unwrap();
     let target_b = target_revision_for(snapshot.root(), 900, &mutations_b, &registry);
@@ -1628,6 +1637,8 @@ fn commit_durability_failure_after_seal_fail_stops_runtime_until_recovery() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let target = target_revision_for(&runtime, 321, &mutations, &registry);
     let cell = RuntimeRevisionCell::new(runtime);
@@ -1692,6 +1703,8 @@ fn stale_after_durable_prepare_leaves_only_uncommitted_wal_prepare() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let target = target_revision_for(&runtime, 331, &mutations, &registry);
     let cell = RuntimeRevisionCell::new(runtime);
@@ -1783,6 +1796,8 @@ fn resolved_leaf_delete_preserves_authoritative_scan_order() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let cell = RuntimeRevisionCell::new(runtime);
     let prepared = prepare_runtime_cell_revision(&cell, 601, &mutations, &registry).unwrap();
@@ -1902,6 +1917,8 @@ fn durable_runtime_owner_restarts_from_checkpoint_plus_wal_tail() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 501, &mutations, &registry);
@@ -1943,6 +1960,8 @@ fn durable_runtime_checkpoint_rotates_base_then_replays_only_new_tail() {
     let mutations_a = [RevisionRelationMutation {
         relation,
         delta: &delta_a,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target_a = target_revision_for(snapshot.root(), 511, &mutations_a, &registry);
@@ -1965,6 +1984,8 @@ fn durable_runtime_checkpoint_rotates_base_then_replays_only_new_tail() {
     let mutations_b = [RevisionRelationMutation {
         relation,
         delta: &delta_b,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target_b = target_revision_for(snapshot.root(), 512, &mutations_b, &registry);
@@ -2027,6 +2048,8 @@ fn durable_checkpoint_rebuilds_physical_index_recipes_on_reopen() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 516, &mutations, &registry);
@@ -2471,6 +2494,8 @@ fn wal_tail_replays_observable_atom_core_before_rehydration() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
+    object_field_writes: &[],
+    authorization: Default::default(),
     }];
     runtime
         .commit_derived_relation_data(

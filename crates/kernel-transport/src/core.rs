@@ -131,6 +131,7 @@ fn transport_expr(
             Box::new(transport_expr(identity, left)?),
             Box::new(transport_expr(identity, right)?),
         ),
+        Expr::I64ToF64(input) => Expr::I64ToF64(Box::new(transport_expr(identity, input)?)),
         Expr::If {
             condition,
             when_true,
@@ -281,6 +282,10 @@ pub fn transport_rel_expr(
             equivalence: *equivalence,
         },
         RelExpr::Difference { left, right } => RelExpr::Difference {
+            left: Box::new(transport_rel_expr(identity, left)?),
+            right: Box::new(transport_rel_expr(identity, right)?),
+        },
+        RelExpr::Union { left, right } => RelExpr::Union {
             left: Box::new(transport_rel_expr(identity, left)?),
             right: Box::new(transport_rel_expr(identity, right)?),
         },

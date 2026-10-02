@@ -8,7 +8,7 @@ The historical kernel backlog (#1–#22) is closed for the declared support scop
 
 `FROZEN` does not mean “bug-free forever”. It means kernel cleanup is no longer continued by inertia: reopen a frozen area only for a concrete correctness counterexample, proof/authority seam, measured complexity/performance regression, new R&D requirement, or public API/DX requirement.
 
-The active project phase is now **productization through a public Rust application facade over the universal runtime boundary**. Pass281 introduced `cfmd-runtime`; Pass337 adds the user-facing `cfmd` crate; the product line now includes object-first typed Rust DX, Plan/Candidate preview, durable history with exact mixed undo/redo, historical worlds through `db.at(revision)`, certified non-head undo/rebase, exact query-result watch, provider-neutral wake delivery, deterministic watch lifecycle/catch-up, and P299 hosted session/permission authority, P300 transport-neutral hosted protocol ingress, P301 exact hosted watch subscriptions, and P302 canonical transport-neutral wire framing/negotiation, P303 hosted server composition, P304 dynamic hosted security lifecycle, and P313 unified database construction/opening with parity-complete single-file storage as the default new-store path. Rust applications depend on `cfmd`; Python/.NET/Studio bind to the stable runtime protocol. None call `kernel-*` crates directly.
+The active project phase is now **productization through a public Rust application facade over the universal runtime boundary**. The ordinary adaptive transaction path now also carries `kernel-change` rebase certificates through durable residual publication for both relation-only and mixed/object commits, with stable client intent separated from the realized history/recovery effect. Pass281 introduced `cfmd-runtime`; Pass337 adds the user-facing `cfmd` crate; the product line now includes object-first typed Rust DX, Plan/Candidate preview, durable history with exact mixed undo/redo, historical worlds through `db.at(revision)`, certified non-head undo/rebase, exact query-result watch, provider-neutral wake delivery, deterministic watch lifecycle/catch-up, and P299 hosted session/permission authority, P300 transport-neutral hosted protocol ingress, P301 exact hosted watch subscriptions, and P302 canonical transport-neutral wire framing/negotiation, P303 hosted server composition, P304 dynamic hosted security lifecycle, and P313 unified database construction/opening with parity-complete single-file storage as the default new-store path. Rust applications depend on `cfmd`; Python/.NET/Studio bind to the stable runtime protocol. None call `kernel-*` crates directly.
 
 ## Product direction
 
@@ -133,15 +133,31 @@ Workspace crates declare `MIT OR Apache-2.0`. See `LICENSE-MIT` and `LICENSE-APA
 
 ## Object-first entity references (Pass285)
 
-The Rust product layer distinguishes value objects from identity-bearing entities. The normal P338 surface is `#[derive(CfmdEntity)]` with a stable `#[cfmd(key = "...")]` and explicit typed `#[cfmd(id)] Id<T>`; the older `cfmd_entity!` macro remains a transparent compatibility/advanced declaration path. `Ref<T>` fields generate symbolic deep-path accessors. Materialized references are inert Rust values and never perform hidden I/O; traversal lowers to the existing relation/Γ query IR. Strong references are validated against the final composed `Plan` state, and entity identities are unique within their object relation.
+The Rust product layer distinguishes value objects from identity-bearing entities. The normal P338 surface is `#[derive(CfmdEntity)]` with a stable `#[cfmd(key = "...")]` and explicit typed `#[cfmd(id)] Id<T>`; the older `cfmd_entity!` macro remains a transparent compatibility/advanced declaration path. P375 also makes database-owned field rules part of the entity descriptor itself: `#[cfmd(range(...))]`, `#[cfmd(length(...))]`, and `#[cfmd(one_of(...))]` lower into the same schema/validation authority used by every binding and by recovery. `Ref<T>` fields generate symbolic deep-path accessors. Materialized references are inert Rust values and never perform hidden I/O; traversal lowers to the existing relation/Γ query IR. Strong references are validated against the final composed `Plan` state, and entity identities are unique within their object relation. P380 makes authoritative entities strictly current and legacy-free. Persisted schema evolution is expressed by an explicit kernel/runtime migration model rather than `rename_from` metadata. A non-authoritative Context contract may keep any local spelling with `#[cfmd(bind = "persisted_name")]`; that binding is client-local and does not alter persisted schema authority.
+
+```rust
+#[derive(CfmdEntity)]
+#[cfmd(key = "app.user")]
+struct User {
+    #[cfmd(id)]
+    id: Id<User>,
+
+    #[cfmd(length(min = 3, max = 64))]
+    name: String,
+
+    #[cfmd(range(min = 0, max = 150))]
+    age: i64,
+
+    #[cfmd(one_of("user", "admin"))]
+    role: String,
+}
+```
+
+Rule bounds and membership values are literal schema data, not arbitrary Rust expressions or callbacks. The derive rejects incompatible rule/type combinations at compile time.
 
 ```rust
 let people = snapshot.objects::<Person>()?;
-let russian = people.where_(|person| {
-    person.passport().matches(|passport| {
-        passport.country().matches(|country| country.code().eq("RU".to_owned()))
-    })
-});
+let russian = people.where_(|person| person.passport().country().code().eq("RU".to_owned()));
 ```
 
 `Ref<T>` is required-one, `Option<Ref<T>>` is optional-one, and `Many<T>` is a first-class zero-to-many object relationship value. The object declaration is the public schema authority: `children: Many<Child>` does not require `Child` to carry an artificial backlink. `cfmd-runtime` lowers that object relationship into an internal typed edge relation used by query/Γ execution and lifecycle normalization.
@@ -154,6 +170,55 @@ Relationship selections stay first-class. `many.where_(...)` can `detach_all()` 
 
 
 Ordered object predicates are also Γ-native rather than Rust/SQL comparisons. Canonically ordered fields expose `greater_than`, `greater_than_or_equal`, `less_than`, `less_than_or_equal`, and inclusive `between`; object schema generation installs a stable per-field ordering identity and the matching semantic ordering module. The relational IR carries `FilterOrderConst`, query preparation pins/compiles that ordering, and maintained watches filter exact deltas directly. Optional/structural fields receive no ordering API until an explicit structural ordering contract exists.
+
+Query composition stays on the same exact relational calculus. Predicates can be conjoined with `ObjectPredicate::and`, disjoined with `ObjectPredicate::or`, and negated with `ObjectPredicate::not`. `or` is a first-class Γ-aware Union rather than a callback or a De Morgan expansion through multiple Difference nodes: Set queries union support classes, while Bag queries add multiplicities. Canonically ordered fields can then select exact Γ-order boundaries without materializing and sorting Rust objects:
+
+```rust
+use cfmd::prelude::*;
+
+let selected = children
+    .where_(|child| {
+        child
+            .score()
+            .greater_than(3)
+            .and(child.score().less_than_or_equal(10))
+    })
+    .top(5, |child| child.score());
+```
+
+`top` and `bottom` expose the existing maintained `TopKWithTies` semantics. Boundary-equivalent rows are retained, so the result may contain more than `k` rows; this is selection by the pinned Γ ordering, not a promise of physical result-row ordering. Exact watches use the same maintained ordered-boundary state.
+
+Object-first `select` preserves source multiplicity by lowering through the kernel-native bag law before projection. If four distinct objects project to `3, 7, 7, 11`, ordinary `select` returns four projected values. Semantic quotienting is explicit and still kernel-native:
+
+```rust
+let scores = children.select(|child| child.score());
+assert_eq!(scores.count()?, 4);
+
+let unique_scores = children.select(|child| child.score()).distinct();
+assert_eq!(unique_scores.count()?, 3);
+```
+
+This is not host-side bag emulation: the lowering is `Set<Object> -> PromoteToBag -> Project`, and `.distinct()` is the existing maintained `Distinct` operator using the projection's declared Γ equivalences. Exact watches preserve the same distinction: a duplicate source projection emits one bag insertion for ordinary `select`, while an explicit distinct watch suppresses it.
+
+Grouped aggregation also stays inside the same kernel calculus:
+
+```rust
+let counts = children.group_by(|child| child.score()).count();
+let regional_counts = users
+    .group_by(|user| (user.team(), user.region()))
+    .count();
+let sums = metrics.group_by(|metric| metric.bucket()).sum(|metric| metric.value());
+
+let current_counts = counts.all()?;
+let mut count_watch = counts.watch()?;
+
+let busiest = metrics
+    .group_by(|metric| metric.bucket())
+    .count()
+    .top(10);
+```
+
+`count()` and `sum(...)` build typed aggregate queries rather than immediately collapsing into a `Vec`. Exact reads and maintained watches therefore interpret the same kernel `Group` expression. `group_by` accepts either one field or a tuple of fields; tuple keys lower to the kernel's native `group_columns + group_equivalences` product key, so composite grouping is not implemented by host-side maps or arity-specific engines. `count()` uses kernel `ExactCount`; floating `sum(...)` uses kernel `ExactF64Sum`. Aggregate queries can continue into `top(k)` / `bottom(k)`, which order by the aggregate value after the complete key and preserve all Γ-equal boundary groups. This lowers directly to `Group -> TopKWithTies`, including Candidate and maintained-watch execution; there is no host-side sorting or exact-k truncation. Candidate reads expose the same typed aggregate result shape. No `group_by2`, `watch_count` / `watch_sum`, or host-side regrouping API exists.
 
 Detached construction is graph-first. `Many::new([Child { ... }, ...])` is accepted by generated `cfmd_new(...)`; insertion lowers the complete object graph into one `Plan` containing entity rows and internal edge facts. On update, a bound `Many<T>` returned unchanged means preserve that relationship, while assigning `Many::new(...)` / `Many::empty()` replaces it atomically. Endpoint deletion is lifecycle-safe: internal edge rows carry live endpoint witnesses, so kernel revision normalization removes dangling edge facts without SDK cascade scans.
 
@@ -173,7 +238,7 @@ Candidate now exposes a typed preview surface over the same exact proposed Revis
 
 ### Durable history + exact mixed inverse (P292–P293)
 
-`Database::history()` projects the authoritative durable causal effect ledger into product-facing `HistoryEntry` values with transaction identity, source/target revisions, causal prerequisites, exact relation changes and explicit reversibility. `HistoryEntry::undo_plan()` derives an ordinary `Plan`, so undo and redo preview and publish through the same `Candidate -> commit` pipeline as every other product write.
+`Database::history()` projects the authoritative durable causal effect ledger into product-facing `HistoryEntry` values with transaction identity, source/target revisions, causal prerequisites, exact relation changes and explicit reversibility. Ordinary application code feeds history back into the same visible transaction language as every other write: `db.undo(&mut tx, entry)` or `db.undo_latest(&mut tx)`, followed by `db.preview(&tx)` / `db.commit(&tx)`. The exact inverse is still an ordinary internal `Plan`; `HistoryEntry::undo_plan()` remains the explicit low-level/tooling escape hatch rather than a required application concept.
 
 P293 closes the mixed-object inversion gap for newly written durable transactions. Every mixed commit now persists the compact exact reverse `DurableModelDelta` beside its forward delta in WAL/idempotency authority (codec v11). Entity creation/deletion, lifecycle/carrier changes and reference-field rewrites therefore remain exactly undoable after close/reopen without storing a second full Revision and without a relation-only fallback. Older v10 mixed records remain readable and are still classified `ComplementRequired` when they lack that historical complement.
 
@@ -219,7 +284,7 @@ P345 freezes the runtime-neutral readiness/drain boundary. P346/P347 establish r
 
 Hosted composition now has a transport-independent security boundary. A trusted authentication/hosting layer maps an external identity to `PrincipalId` and constructs a `Session` with explicit `PermissionSet` grants. `Database::session(session)` returns `SessionDatabase`; permissions are then propagated through product values rather than checked only at endpoints.
 
-The current permission vocabulary is `Read`, `HistoricalRead`, `HistoryRead`, `Watch` and `Write`. Restricted `ReadContext` values retain their session authority, `Plan` carries the authority that created it, Candidate reads require `Read`, Candidate commit requires `Write`, and history inverse derivation requires `Write`. This closes facade escapes such as `ObjectQuery::watch()`, `HistoryEntry::undo_plan()` and `Plan::candidate().commit(...)`. Embedded `Database` remains an explicit unrestricted local capability; hosted adapters should expose `SessionDatabase`, not raw `Database`. Authentication protocols, networking and identity proof are intentionally outside this runtime boundary.
+Authorization is now semantic-coordinate based. Coarse `Read`/`Write` remain explicit whole-database grants, while relation/field/object/relationship grants authorize exact query/change footprints. `ModelRead` separately controls full authoritative schema inspection and `SchemaMigrate` separately controls schema publication; generic data read/write does not imply either. Named `Role` values are immutable DX bundles that flatten into the same `PermissionSet` law before a session is constructed—role names, hierarchy, and frontend policy do not participate in runtime enforcement. `ReadContext::schema_revision()` exposes only the schema epoch needed for compatibility decisions; full `schema()` metadata requires `ModelRead`. Embedded `Database` remains an explicit unrestricted local capability; hosted adapters should expose `SessionDatabase`, not raw `Database`.
 
 
 
@@ -233,7 +298,7 @@ P300 deliberately added no listener, codec, TCP/IPC or authentication mechanism.
 
 ### Exact hosted watch subscriptions (P301)
 
-`cfmd-protocol` protocol version 2 adds server-side exact watch subscriptions without introducing a protocol event log or polling loop. `OpenWatch` validates the protocol query and constructs the ordinary restricted-runtime `QueryWatch`; its response returns a protocol-owned `SubscriptionId` plus the exact initial result/revision. `NextWatch` is a blocking pull over `QueryWatch::recv()` and therefore emits one exact durable revision transition at a time, including revision advances whose result delta is empty.
+`cfmd-protocol` protocol version 2 adds server-side exact watch subscriptions without introducing a protocol event log or polling loop. `OpenWatch` validates the protocol query and constructs the ordinary restricted-runtime `QueryWatch`; its response returns a protocol-owned `SubscriptionId` plus the exact initial result/revision. `NextWatch` is a blocking pull over `QueryWatch::recv()`. Output-equivalent causal transitions are consumed internally but quotiented from the public stream, so the next observable event may span several durable revisions while still carrying exact source/target revisions and delta.
 
 `WatchStatus`, `CancelWatch`, and `CloseWatch` expose the P298 lifecycle without granting write authority. Cancellation is stored separately from the maintained query-state lock, so a transport can cancel a currently blocked consumer. A session-level watch-count limit bounds maintained subscription state, and only one consumer may hold a subscription at a time. `CloseSession` cancels every outstanding subscription so a future transport disconnect can deterministically release blocked server work. None of these protocol lifecycle operations can mutate authoritative Revision; Lean extends the wake-only theorem to protocol open/next/close/session-close.
 
@@ -310,17 +375,57 @@ Single-file physical compaction is also first-class. The backend relocates the c
 
 `DatabaseBuilder` is now the canonical product entry point. `Storage::Auto` resolves an existing file as single-file, an existing directory as directory-backed, and a new path as single-file; `Storage::Directory`/`SingleFile` remain explicit overrides. `Database::create/open` are thin sugar over this same builder path rather than separate construction semantics. Publication notification is a builder concern because it belongs to the opened runtime, while authentication/authorization remain hosted-service concerns. `cfmd-host` therefore exposes `DatabaseHostingExt`, allowing `db.host(authenticator, authorizer)` without adding a dependency from `cfmd-runtime` back to hosting.
 
-## Snapshot-bound Rust transactions (Pass351)
+## Database-owned Rust transaction control (Pass354–359)
 
-Multi-operation writes no longer require application code to manually coordinate an aggregate `Plan`, Candidate and transaction ID:
+A transaction is a passive atomic intent container. The database remains the visible authority for preview and publication:
 
 ```rust
-let mut tx = db.transaction(TransactionId::new(42))?;
-let todos = tx.objects::<Todo>()?;
-tx.apply(todos.insert(first)?)?;
-tx.apply(todos.insert(second)?)?;
-let preview = tx.preview()?;
-tx.commit()?;
+let mut tx = Transaction::new();
+
+db.objects::<Todo>()?.add(&mut tx, first)?;
+db.objects::<Todo>()?.add(&mut tx, second)?;
+
+let preview = db.preview(&tx)?;
+let outcome = db.commit(&tx)?;
 ```
 
-This is an exact optimistic transaction surface, not SQL-style lock emulation. Every operation is still an ordinary CFMD `Plan` and the transaction only composes plans from its pinned snapshot. Cross-snapshot plans fail `InvalidPlan`; a HEAD that advanced before publication fails `StaleRevision`. There is no hidden retry or rebase fallback.
+The terminal lines therefore state both pieces a reviewer needs: **which database** is being inspected or changed and **which transaction** is being inspected or published. `Transaction` cannot publish itself and `Candidate` cannot publish itself. Low-level tooling that intentionally constructs `Plan` values uses the explicit `db.commit_plan(&plan, transaction_id)` escape hatch.
+
+A normal `Transaction::new()` is a passive atomic intent container, not a child database and not a pinned global snapshot. The first mutation forms an exact internal effect against one read world; later compatible HEAD movement is handled automatically by the kernel change algebra and durable semantic-intent identity. `Transaction::from(db.snapshot()?)` is the explicit strict-snapshot form and never silently moves to a newer world. `Plan` and explicit `TransactionId` plumbing remain advanced tooling/protocol escape hatches, not ordinary CRUD.
+
+Relationship mutation follows the same rule. A materialized relationship names the concrete resource, `&mut tx` names the atomic intent being accumulated, and the target/selection names the payload:
+
+```rust
+owner.assets.attach(&mut tx, asset_id)?;
+owner.assets.move_to(&mut tx, asset_id, &other.assets)?;
+owner.assets
+    .where_(|asset| asset.archived().eq(true))?
+    .detach_all(&mut tx)?;
+```
+
+`Many<T>`, `OwnedMany<T>` and their filtered selections do not expose `Plan` in ordinary application mutation. Tooling that intentionally needs the exact low-level effect uses explicit `attach_plan`, `move_to_plan`, `detach_all_plan`, and related `*_plan` methods. Owned relation exclusivity, orphan deletion and `preview.derived()` remain Candidate/kernel laws rather than facade-side behavior.
+
+### Semantic transaction transport and durable retry identity (Pass355–357)
+
+`Database::transaction_readiness(&tx)` distinguishes `Ready`, `Rebasable`, and `Conflict`. `Database::preview(&tx)` and, from Pass357, ordinary `Database::commit(&tx)` may transport an exact proposed effect to current HEAD only when runtime causal history proves compatibility through Γ-canonical coordinates and action laws. Opaque, coordination-required or conflicting history fails closed.
+
+Pass357 also separates the *client semantic intent* from one concrete durable realization. Relation/mixed intents retain exact source/target lineage for recovery, but retry identity compares the canonical forward effect and pinned semantic authority. Therefore a transaction certified from an older source onto a newer HEAD can be retried after an uncertain response and still returns `AlreadyCommitted` for the actual published revision instead of becoming a different transaction merely because its realization revisions changed. No second retry ledger or intent hash was introduced: WAL/checkpoint already retain the canonical durable intent needed for this comparison.
+
+### Action-law-aware transaction transport (Pass356)
+
+Pass356 strengthens the P355 runtime bridge: exact causal footprints now retain `RewriteActionLaw` instead of collapsing every write to coordinate presence. Forward transaction transport therefore uses the same kernel-change action classifier as the rewrite layer: disjoint actions strongly commute, equal set-presence intents can be idempotent, opposite presence intents are definite conflicts, and unresolved overlapping laws require coordination. Set relation classes expose presence laws; bag classes remain opaque until exact multiplicity action semantics are carried. Object carrier membership also remains opaque so two writes to one entity identity cannot be incorrectly declared compatible merely because lifecycle presence agrees. Historical undo intentionally keeps its stricter overlap rule because undoing an earlier idempotent action must not erase a later independent intent.
+
+### Unified mutation/history DX + ordered hostile closure (Pass359–360)
+
+Ordinary entity, relationship and history mutation now use one accumulation shape: the concrete database/resource stays visible, `&mut Transaction` names the atomic intent container, and no `Plan` is required at the application call site. `Many<T>`, `OwnedMany<T>`, filtered relationship selections and history undo all lower to the same existing Plan/Candidate/kernel machinery internally. Undo-of-undo is redo; there is no separate redo engine.
+
+```rust
+let mut tx = Transaction::new();
+db.users.add(&mut tx, user)?;
+owner.assets.attach(&mut tx, asset_id)?;
+db.undo(&mut tx, history_entry)?;
+let preview = db.preview(&tx)?;
+db.commit(&tx)?;
+```
+
+The Γ-native `F64Total` object predicate path is hostile-checked at the public exact-query and maintained-watch surfaces for `NaN`, signed zero, and infinities. The ordering remains the pinned total-order semantic module; no Rust partial-order fallback, post-materialization filter, or watch recomputation path is introduced.

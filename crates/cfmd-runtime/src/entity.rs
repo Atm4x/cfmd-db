@@ -1,8 +1,8 @@
 use std::{hash::Hash, marker::PhantomData};
 
 use crate::{
-    EqPredicate, EquivalenceId, Object, ObjectEquivalence, ObjectPredicate, PrimitiveEquivalence,
-    Query, Relation, Result, ScalarType, Type, Value, ValueCodec,
+    EqPredicate, EquivalenceId, Object, ObjectEquivalence, ObjectPredicate, OrderComparison,
+    PrimitiveEquivalence, Query, Relation, Result, ScalarType, Type, Value, ValueCodec,
 };
 
 /// Stable typed identity of one object-first entity.
@@ -272,7 +272,14 @@ pub struct RefField<S: Object, T: Object> {
     source_width: usize,
     source_column: usize,
     equivalence: EquivalenceId,
+    source_equivalences: Vec<EquivalenceId>,
     marker: PhantomData<fn() -> (S, T)>,
+}
+
+impl<S: Object, T: Object> crate::ObjectPatchField<S, Ref<T>> for RefField<S, T> {
+    fn into_patch_field(self) -> Result<crate::Field<S, Ref<T>>> {
+        Ok(crate::Field::__from_parts(self.source_relation, self.source_column, self.equivalence))
+    }
 }
 
 impl<S: Object, T: Object> RefField<S, T> {
@@ -282,6 +289,7 @@ impl<S: Object, T: Object> RefField<S, T> {
             source_width: relation.width(),
             source_column: column,
             equivalence,
+            source_equivalences: relation.equivalences().to_vec(),
             marker: PhantomData,
         }
     }
@@ -313,8 +321,327 @@ impl<S: Object, T: Object> RefField<S, T> {
             marker: PhantomData,
         }
     }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __path(self) -> RefPath<S, T> {
+        RefPath::from_field(self)
+    }
 }
 
+impl<S: Object, T: Object> crate::ObjectPatchField<S, Ref<T>> for RefPath<S, T> {
+    fn into_patch_field(self) -> Result<crate::Field<S, Ref<T>>> {
+        let [hop] = self.hops.as_slice() else {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "only a direct reference field can be patched",
+            ));
+        };
+        Ok(crate::Field::__from_parts(
+            hop.source_relation,
+            hop.source_column,
+            hop.equivalence,
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RefPathHop {
+    source_relation: crate::RelationId,
+    source_width: usize,
+    source_column: usize,
+    source_equivalences: Vec<EquivalenceId>,
+    target_identity_column: usize,
+    equivalence: EquivalenceId,
+}
+
+/// Symbolic strong-reference path. Building or extending a path performs no object I/O.
+#[derive(Debug)]
+pub struct RefPath<S: Object, T: Object> {
+    hops: Vec<RefPathHop>,
+    marker: PhantomData<fn() -> (S, T)>,
+}
+
+impl<S: Object, T: Object> Clone for RefPath<S, T> {
+    fn clone(&self) -> Self {
+        Self {
+            hops: self.hops.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<S: Object, T: Object> RefPath<S, T> {
+    fn from_field(field: RefField<S, T>) -> Self {
+        let target_identity_column =
+            T::identity_column().expect("referenced CFMD object must have an identity field");
+        Self {
+            hops: vec![RefPathHop {
+                source_relation: field.source_relation,
+                source_width: field.source_width,
+                source_column: field.source_column,
+                source_equivalences: field.source_equivalences,
+                target_identity_column,
+                equivalence: field.equivalence,
+            }],
+            marker: PhantomData,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __field<V: crate::ObjectValue>(&self, name: &str) -> PathField<S, T, V> {
+        let relation = crate::object::symbolic_relation::<T>();
+        let fields = T::fields();
+        let column = fields
+            .iter()
+            .position(|field| field.name() == name)
+            .expect("generated CFMD path field must exist in its descriptor");
+        let equivalence = relation
+            .equivalence_at(column)
+            .expect("validated CFMD path field has equivalence semantics");
+        let ordering = fields[column].ordering().map(|_| {
+            crate::OrderingId::new(crate::object::__semantic_id(
+                "cfmd.object.field-ordering.v1",
+                T::KEY,
+                name,
+            ))
+        });
+        PathField {
+            path: self.clone(),
+            field: crate::Field::__from_semantics(relation.id(), column, equivalence, ordering),
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __ref<U: Object>(&self, name: &str) -> RefPath<S, U> {
+        let relation = crate::object::symbolic_relation::<T>();
+        let fields = T::fields();
+        let column = fields
+            .iter()
+            .position(|field| field.name() == name)
+            .expect("generated CFMD path reference must exist in its descriptor");
+        match fields[column].role() {
+            crate::ObjectFieldRole::Reference { target_type, .. }
+                if target_type == U::type_id() => {}
+            _ => panic!("generated CFMD path reference has incompatible target type"),
+        }
+        let equivalence = relation
+            .equivalence_at(column)
+            .expect("validated CFMD path reference has equivalence semantics");
+        let mut hops = self.hops.clone();
+        hops.push(RefPathHop {
+            source_relation: relation.id(),
+            source_width: relation.width(),
+            source_column: column,
+            source_equivalences: relation.equivalences().to_vec(),
+            target_identity_column: U::identity_column()
+                .expect("referenced CFMD object must have an identity field"),
+            equivalence,
+        });
+        RefPath {
+            hops,
+            marker: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub fn matches<F, P>(self, predicate: F) -> PathPredicate<S, T, P>
+    where
+        F: FnOnce(&T::Proxy) -> P,
+        P: ObjectPredicate<T>,
+    {
+        let relation = crate::object::symbolic_relation::<T>();
+        let proxy = T::proxy(relation);
+        PathPredicate {
+            path: self,
+            target: predicate(&proxy),
+        }
+    }
+
+    #[must_use]
+    pub fn eq(self, target: Id<T>) -> PathPredicate<S, T, EqPredicate<T>> {
+        let relation = crate::object::symbolic_relation::<T>();
+        let identity = T::identity_column().expect("referenced CFMD object must have identity");
+        let equivalence = relation
+            .equivalence_at(identity)
+            .expect("referenced CFMD identity has equivalence semantics");
+        let field = crate::Field::<T, Id<T>>::__from_parts(relation.id(), identity, equivalence);
+        PathPredicate {
+            path: self,
+            target: field.eq(target),
+        }
+    }
+}
+
+/// Leaf value reached through one or more strong-reference hops.
+#[derive(Debug, Clone)]
+pub struct PathField<S: Object, T: Object, V> {
+    path: RefPath<S, T>,
+    field: crate::Field<T, V>,
+}
+
+impl<S: Object, T: Object, V: ValueCodec> PathField<S, T, V> {
+    #[must_use]
+    pub fn eq(self, value: V) -> PathPredicate<S, T, EqPredicate<T>> {
+        PathPredicate {
+            path: self.path,
+            target: self.field.eq(value),
+        }
+    }
+
+    #[must_use]
+    pub fn ne(self, value: V) -> PathPredicate<S, T, crate::NotPredicate<T, EqPredicate<T>>> {
+        PathPredicate {
+            path: self.path,
+            target: self.field.ne(value),
+        }
+    }
+}
+
+impl<S: Object, T: Object, V: crate::OrderedObjectValue> PathField<S, T, V> {
+    #[must_use]
+    pub fn greater_than(self, value: V) -> PathPredicate<S, T, crate::OrderPredicate<T>> {
+        PathPredicate {
+            path: self.path,
+            target: self.field.greater_than(value),
+        }
+    }
+
+    #[must_use]
+    pub fn greater_than_or_equal(self, value: V) -> PathPredicate<S, T, crate::OrderPredicate<T>> {
+        PathPredicate {
+            path: self.path,
+            target: self.field.greater_than_or_equal(value),
+        }
+    }
+
+    #[must_use]
+    pub fn less_than(self, value: V) -> PathPredicate<S, T, crate::OrderPredicate<T>> {
+        PathPredicate {
+            path: self.path,
+            target: self.field.less_than(value),
+        }
+    }
+
+    #[must_use]
+    pub fn less_than_or_equal(self, value: V) -> PathPredicate<S, T, crate::OrderPredicate<T>> {
+        PathPredicate {
+            path: self.path,
+            target: self.field.less_than_or_equal(value),
+        }
+    }
+
+    #[must_use]
+    pub fn between(self, lower: V, upper: V) -> PathPredicate<S, T, crate::BetweenPredicate<T>> {
+        PathPredicate {
+            path: self.path,
+            target: self.field.between(lower, upper),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PathPredicate<S: Object, T: Object, P: ObjectPredicate<T>> {
+    path: RefPath<S, T>,
+    target: P,
+}
+
+impl<S: Object, T: Object, P: ObjectPredicate<T>> ObjectPredicate<S> for PathPredicate<S, T, P> {
+    #[track_caller]
+    fn apply(self, input: Query, root: &Relation<S>) -> Result<Query> {
+        let Some(first) = self.path.hops.first() else {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "empty reference path cannot form a predicate",
+            ));
+        };
+        if first.source_relation != root.id() || first.source_width != root.width() {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "reference path belongs to a different root relation",
+            ));
+        }
+
+        let target_relation = crate::object::symbolic_relation::<T>();
+        let mut selected = self
+            .target
+            .apply(Query::scan(T::relation_id()), &target_relation)?;
+        let mut root_input = Some(input);
+        for (index, hop) in self.path.hops.iter().enumerate().rev() {
+            let source = if index == 0 {
+                root_input.take().expect("root path input is consumed once")
+            } else {
+                Query::scan(hop.source_relation)
+            };
+            selected = source
+                .join_eq(
+                    selected,
+                    hop.source_column,
+                    hop.target_identity_column,
+                    hop.equivalence,
+                )
+                .project((0..hop.source_width).collect::<Vec<_>>())
+                .distinct(hop.source_equivalences.clone());
+        }
+        Ok(selected)
+    }
+}
+
+macro_rules! impl_entity_predicate_operators {
+    ([$($gen:ident),*] $self_ty:ty => $root:ty where [$($bounds:tt)*]) => {
+        impl<$($gen,)* Rhs> std::ops::BitAnd<Rhs> for $self_ty
+        where
+            Rhs: ObjectPredicate<$root>,
+            $($bounds)*
+        {
+            type Output = crate::AndPredicate<$root, Self, Rhs>;
+            fn bitand(self, rhs: Rhs) -> Self::Output { ObjectPredicate::and(self, rhs) }
+        }
+
+        impl<$($gen,)* Rhs> std::ops::BitOr<Rhs> for $self_ty
+        where
+            Rhs: ObjectPredicate<$root>,
+            $($bounds)*
+        {
+            type Output = crate::OrPredicate<$root, Self, Rhs>;
+            fn bitor(self, rhs: Rhs) -> Self::Output { ObjectPredicate::or(self, rhs) }
+        }
+
+        impl<$($gen),*> std::ops::Not for $self_ty
+        where
+            $($bounds)*
+        {
+            type Output = crate::NotPredicate<$root, Self>;
+            fn not(self) -> Self::Output { ObjectPredicate::not(self) }
+        }
+    };
+}
+
+impl_entity_predicate_operators!([S, T, P] RefPredicate<S, T, P> => S where [
+    S: Object,
+    T: Object,
+    P: ObjectPredicate<T>,
+]);
+impl_entity_predicate_operators!([S, T, P] PathPredicate<S, T, P> => S where [
+    S: Object,
+    T: Object,
+    P: ObjectPredicate<T>,
+]);
+impl_entity_predicate_operators!([S, T] OptionalRefIsSome<S, T> => S where [
+    S: Object,
+    T: Object,
+]);
+impl_entity_predicate_operators!([S, T, P] ManyPredicate<S, T, P> => S where [
+    S: Object,
+    T: Object,
+    P: ObjectPredicate<T>,
+]);
+impl_entity_predicate_operators!([S, T] ManyCountPredicate<S, T> => S where [
+    S: Object,
+    T: Object,
+]);
 #[derive(Debug, Clone)]
 pub struct RefPredicate<S: Object, T: Object, P: ObjectPredicate<T>> {
     source_width: usize,
@@ -357,6 +684,14 @@ pub struct OptionalRefField<S: Object, T: Object> {
     source_column: usize,
     equivalence: EquivalenceId,
     marker: PhantomData<fn() -> (S, T)>,
+}
+
+impl<S: Object, T: Object> crate::ObjectPatchField<S, Option<Ref<T>>>
+    for OptionalRefField<S, T>
+{
+    fn into_patch_field(self) -> Result<crate::Field<S, Option<Ref<T>>>> {
+        Ok(crate::Field::__from_parts(self.source_relation, self.source_column, self.equivalence))
+    }
 }
 
 impl<S: Object, T: Object> OptionalRefField<S, T> {
@@ -587,52 +922,202 @@ pub struct ManyCount<S: Object, T: Object> {
 
 impl<S: Object, T: Object> ManyCount<S, T> {
     #[must_use]
-    pub fn eq(self, expected: i64) -> ManyCountEq<S, T> {
-        ManyCountEq {
-            field: self.field,
+    pub fn eq(self, expected: i64) -> ManyCountPredicate<S, T> {
+        self.predicate(ManyCountCondition::Eq(expected))
+    }
+
+    #[must_use]
+    pub fn ne(self, expected: i64) -> ManyCountPredicate<S, T> {
+        self.predicate(ManyCountCondition::NotEq(expected))
+    }
+
+    #[must_use]
+    pub fn greater_than(self, expected: i64) -> ManyCountPredicate<S, T> {
+        self.predicate(ManyCountCondition::Order {
             expected,
+            comparison: OrderComparison::Greater,
+        })
+    }
+
+    #[must_use]
+    pub fn greater_than_or_equal(self, expected: i64) -> ManyCountPredicate<S, T> {
+        self.predicate(ManyCountCondition::Order {
+            expected,
+            comparison: OrderComparison::GreaterOrEqual,
+        })
+    }
+
+    #[must_use]
+    pub fn less_than(self, expected: i64) -> ManyCountPredicate<S, T> {
+        self.predicate(ManyCountCondition::Order {
+            expected,
+            comparison: OrderComparison::Less,
+        })
+    }
+
+    #[must_use]
+    pub fn less_than_or_equal(self, expected: i64) -> ManyCountPredicate<S, T> {
+        self.predicate(ManyCountCondition::Order {
+            expected,
+            comparison: OrderComparison::LessOrEqual,
+        })
+    }
+
+    #[must_use]
+    pub fn between(self, lower: i64, upper: i64) -> ManyCountPredicate<S, T> {
+        self.predicate(ManyCountCondition::Between { lower, upper })
+    }
+
+    fn predicate(self, condition: ManyCountCondition) -> ManyCountPredicate<S, T> {
+        ManyCountPredicate {
+            field: self.field,
+            condition,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ManyCountEq<S: Object, T: Object> {
+pub struct ManyCountPredicate<S: Object, T: Object> {
     field: ManyField<S, T>,
-    expected: i64,
+    condition: ManyCountCondition,
 }
 
-impl<S: Object, T: Object> ObjectPredicate<S> for ManyCountEq<S, T> {
+#[derive(Debug, Clone, Copy)]
+enum ManyCountCondition {
+    Eq(i64),
+    NotEq(i64),
+    Order {
+        expected: i64,
+        comparison: OrderComparison,
+    },
+    Between {
+        lower: i64,
+        upper: i64,
+    },
+}
+
+impl ManyCountCondition {
+    fn matches_zero(self) -> bool {
+        match self {
+            Self::Eq(expected) => expected == 0,
+            Self::NotEq(expected) => expected != 0,
+            Self::Order {
+                expected,
+                comparison,
+            } => match comparison {
+                OrderComparison::Less => 0 < expected,
+                OrderComparison::LessOrEqual => 0 <= expected,
+                OrderComparison::Greater => 0 > expected,
+                OrderComparison::GreaterOrEqual => 0 >= expected,
+            },
+            Self::Between { lower, upper } => lower <= 0 && 0 <= upper,
+        }
+    }
+
+    fn matching_positive(self, grouped: Query) -> Query {
+        match self {
+            Self::Eq(expected) => grouped.filter_eq(
+                1,
+                Value::I64(expected),
+                crate::object::count_equivalence_id(),
+            ),
+            Self::NotEq(expected) => {
+                let equal = grouped.clone().filter_eq(
+                    1,
+                    Value::I64(expected),
+                    crate::object::count_equivalence_id(),
+                );
+                grouped.difference(equal)
+            }
+            Self::Order {
+                expected,
+                comparison,
+            } => grouped.filter_order(
+                1,
+                Value::I64(expected),
+                crate::object::count_ordering_id(),
+                comparison,
+            ),
+            Self::Between { lower, upper } => grouped
+                .filter_order(
+                    1,
+                    Value::I64(lower),
+                    crate::object::count_ordering_id(),
+                    OrderComparison::GreaterOrEqual,
+                )
+                .filter_order(
+                    1,
+                    Value::I64(upper),
+                    crate::object::count_ordering_id(),
+                    OrderComparison::LessOrEqual,
+                ),
+        }
+    }
+
+    fn nonmatching_positive(self, grouped: Query) -> Query {
+        debug_assert!(self.matches_zero());
+        match self {
+            Self::Eq(0) => grouped,
+            Self::Eq(_) => unreachable!("non-zero equality does not match zero"),
+            Self::NotEq(expected) => grouped.filter_eq(
+                1,
+                Value::I64(expected),
+                crate::object::count_equivalence_id(),
+            ),
+            Self::Order {
+                expected,
+                comparison,
+            } => {
+                let complement = match comparison {
+                    OrderComparison::Less => OrderComparison::GreaterOrEqual,
+                    OrderComparison::LessOrEqual => OrderComparison::Greater,
+                    OrderComparison::Greater => OrderComparison::LessOrEqual,
+                    OrderComparison::GreaterOrEqual => OrderComparison::Less,
+                };
+                grouped.filter_order(
+                    1,
+                    Value::I64(expected),
+                    crate::object::count_ordering_id(),
+                    complement,
+                )
+            }
+            Self::Between { upper, .. } => grouped.filter_order(
+                1,
+                Value::I64(upper),
+                crate::object::count_ordering_id(),
+                OrderComparison::Greater,
+            ),
+        }
+    }
+}
+
+impl<S: Object, T: Object> ObjectPredicate<S> for ManyCountPredicate<S, T> {
     #[track_caller]
     fn apply(self, input: Query, root: &Relation<S>) -> Result<Query> {
         if let Some(error) = self.field.error {
             return Err(error);
         }
-        if self.expected < 0 {
-            return Ok(input.clone().difference(input));
-        }
         let edges = Query::scan(self.field.relation);
-        if self.expected == 0 {
+        let grouped = edges.group_count(
+            vec![0],
+            vec![self.field.source_equivalence],
+            crate::object::count_equivalence_id(),
+        );
+
+        if self.condition.matches_zero() {
+            let rejected = self.condition.nonmatching_positive(grouped);
             return Ok(input.anti_join(
-                edges,
+                rejected,
                 self.field.source_identity_column,
                 0,
                 self.field.source_equivalence,
             ));
         }
-        let grouped = edges
-            .group_count(
-                0,
-                self.field.source_equivalence,
-                crate::object::count_equivalence_id(),
-            )
-            .filter_eq(
-                1,
-                Value::I64(self.expected),
-                crate::object::count_equivalence_id(),
-            );
+
+        let accepted = self.condition.matching_positive(grouped);
         Ok(input
             .join_eq(
-                grouped,
+                accepted,
                 self.field.source_identity_column,
                 0,
                 self.field.source_equivalence,

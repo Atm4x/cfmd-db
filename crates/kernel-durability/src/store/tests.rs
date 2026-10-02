@@ -12,6 +12,7 @@ use kernel_auth::{
     SignedFreshnessCut, TrustRootSet, freshness_record_digest, key_id, sign_freshness_cut,
 };
 use kernel_model::{DatabaseState, Value};
+use kernel_realization::realize_database_state_factorized;
 use kernel_revision::Revision;
 use kernel_schema::{
     RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext, SemanticEnvironment,
@@ -1177,6 +1178,15 @@ fn schema_migration_wal_atomically_recovers_complement_authority() {
         store.migration_complements(),
         std::slice::from_ref(&complement)
     );
+    let anchor = store
+        .historical_epoch_anchors()
+        .values()
+        .next()
+        .copied()
+        .unwrap();
+    assert_eq!(anchor.source_revision, base.id());
+    assert_eq!(anchor.source_schema, base.semantic_revision().schema);
+    assert_eq!(anchor.generation, 1);
     drop(store);
 
     // No checkpoint rotation occurred after COMMIT. Reopen must recover
@@ -1187,12 +1197,703 @@ fn schema_migration_wal_atomically_recovers_complement_authority() {
         reopened.migration_complements(),
         std::slice::from_ref(&complement)
     );
+    let recovered_anchor = reopened
+        .historical_epoch_anchors()
+        .get(&anchor.effect_id)
+        .copied()
+        .unwrap();
+    assert_eq!(recovered_anchor, anchor);
     assert!(matches!(
         scan.transaction_intent(kernel_types::ClientTransactionId::new(9_203)),
         Some(crate::DurableTransactionIntent::SchemaMigrationExact { .. })
     ));
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn schema_migration_semantic_cutover_is_derived_from_checkpoint_frontier() {
+    let dir = test_dir("schema-migration-physical-frontier");
+    let (base, registry, _) = setup_revision(9_181, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(9_182),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(9_183),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_184)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_185)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    let receipt = store.durably_commit(prepared).unwrap();
+    assert_eq!(receipt.target_revision(), target.id());
+    let effect_id = store
+        .historical_epoch_anchors()
+        .values()
+        .next()
+        .expect("migration source anchor")
+        .effect_id;
+    let state = store.schema_migration_physical_states().unwrap();
+    assert_eq!(state.len(), 1);
+    assert_eq!(state[0].effect_id, effect_id);
+    assert_eq!(state[0].source_revision, base.id());
+    assert_eq!(state[0].target_revision, target.id());
+    assert!(matches!(
+        state[0].authority,
+        crate::MigrationPhysicalAuthority::WalForwardCutover {
+            source_generation: 1,
+            checkpoint_revision
+        } if checkpoint_revision == base.id()
+    ));
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert!(matches!(
+        reopened.schema_migration_physical_states().unwrap()[0].authority,
+        crate::MigrationPhysicalAuthority::WalForwardCutover { .. }
+    ));
+    let before_effect = reopened.revision_effect_record(effect_id).cloned().unwrap();
+    let generation = reopened
+        .materialize_pending_schema_migrations(&target)
+        .unwrap()
+        .expect("pending cutover must publish a native checkpoint")
+        .generation;
+    assert_eq!(generation, 2);
+    assert!(matches!(
+        reopened.schema_migration_physical_states().unwrap()[0].authority,
+        crate::MigrationPhysicalAuthority::NativeCheckpoint {
+            generation: 2,
+            checkpoint_revision
+        } if checkpoint_revision == target.id()
+    ));
+    assert_eq!(
+        reopened.revision_effect_record(effect_id),
+        Some(&before_effect),
+        "physical materialization must not append or rewrite semantic history"
+    );
+    assert!(
+        reopened
+            .materialize_pending_schema_migrations(&target)
+            .unwrap()
+            .is_none(),
+        "native checkpoint state must not churn generations"
+    );
+    drop(reopened);
+
+    let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.base_revision(), target.id());
+    assert!(matches!(
+        reopened.schema_migration_physical_states().unwrap()[0].authority,
+        crate::MigrationPhysicalAuthority::NativeCheckpoint {
+            generation: 2,
+            checkpoint_revision
+        } if checkpoint_revision == target.id()
+    ));
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn schema_migration_epoch_anchor_pins_source_generation_across_checkpoint_compaction() {
+    let dir = test_dir("schema-migration-epoch-anchor-compaction");
+    let (base, registry, _) = setup_revision(913, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(914),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let complement = crate::DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: base.semantic_revision().schema,
+            target_schema: target.semantic_revision().schema,
+            lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_211)),
+            semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_212)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        kernel_types::ClientTransactionId::new(9_213),
+        base.id(),
+        &target,
+        complement,
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    assert_eq!(anchor.generation, 1);
+
+    store.rotate_checkpoint(&target).unwrap();
+    assert_eq!(store.generation(), 2);
+    store.compact_obsolete_generations().unwrap();
+
+    assert!(super::generation_layout::manifest_path(&dir, 1).exists());
+    assert!(super::generation_layout::checkpoint_path(&dir, 1).exists());
+    assert!(super::generation_layout::wal_path(&dir, 1).exists());
+    assert!(super::generation_layout::metadata_path(&dir, 1).exists());
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(
+        reopened.historical_epoch_anchors().get(&anchor.effect_id),
+        Some(&anchor)
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_active_historical_epoch_survives_native_compaction() {
+    let dir = test_dir("single-file-active-migration-epoch-compaction");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(9_170, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(9_171),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(9_172),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_173)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_174)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    assert_eq!(anchor.generation, store.generation());
+
+    let material = store
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.generation(), 1);
+    assert_eq!(material.checkpoint().id(), base.id());
+    assert_eq!(material.recovery_scan().durable_revision(), target.id());
+
+    store.compact_obsolete_generations().unwrap();
+    let material = store
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.checkpoint().id(), base.id());
+    assert_eq!(material.recovery_scan().durable_revision(), target.id());
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    let material = reopened
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.checkpoint().id(), base.id());
+    assert_eq!(material.recovery_scan().durable_revision(), target.id());
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_historical_epoch_survives_checkpoint_rotations_and_compaction() {
+    let dir = test_dir("single-file-migration-epoch-archive");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(917, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(918),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(9_218),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_216)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_217)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    assert_eq!(anchor.generation, 1);
+
+    store.rotate_checkpoint(&target).unwrap();
+    assert_eq!(store.generation(), 2);
+    let material = store
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.generation(), 1);
+    assert_eq!(material.checkpoint().id(), base.id());
+    assert_eq!(material.recovery_scan().durable_revision(), target.id());
+
+    store.rotate_checkpoint(&target).unwrap();
+    assert_eq!(store.generation(), 3);
+    store.compact_obsolete_generations().unwrap();
+    let material = store
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.generation(), 1);
+    assert_eq!(material.checkpoint().id(), base.id());
+    assert_eq!(material.recovery_scan().durable_revision(), target.id());
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    let material = reopened
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.generation(), 1);
+    assert_eq!(material.checkpoint().id(), base.id());
+    assert_eq!(material.recovery_scan().durable_revision(), target.id());
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn encrypted_single_file_historical_epoch_survives_rotations_compaction_and_reopen() {
+    let dir = test_dir("encrypted-single-file-migration-epoch-archive");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(9_319, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(9_320),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(9_321),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_322)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_323)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+    let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+        crate::storage_encryption::StorageEncryptionKey::try_new([0x86; 32]).unwrap(),
+    );
+
+    let mut store = DurableRevisionStore::create_single_file_with_encryption(
+        &path,
+        &encryption,
+        &base,
+        &registry,
+    )
+    .unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+
+    store.rotate_checkpoint(&target).unwrap();
+    store.rotate_checkpoint(&target).unwrap();
+    store.compact_obsolete_generations().unwrap();
+    let material = store
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.generation(), 1);
+    assert_eq!(material.checkpoint().id(), base.id());
+    assert_eq!(material.recovery_scan().durable_revision(), target.id());
+    drop(store);
+
+    let (mut reopened, scan) =
+        DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    let material = reopened
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.generation(), 1);
+    assert_eq!(material.checkpoint().id(), base.id());
+    assert_eq!(material.recovery_scan().durable_revision(), target.id());
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn historical_epoch_closure_survives_torn_compaction_root_plaintext_and_encrypted() {
+    for encrypted in [false, true] {
+        for point in single_file_compaction_uncertain_root_points() {
+            let dir = test_dir(&format!("historical-epoch-torn-root-{encrypted}-{point:?}"));
+            let path = dir.join("database.cfmd");
+            let (base, registry, _) = setup_revision(9_324, &[1]);
+            let mut target_context = base.semantic_context().clone();
+            target_context.schema.revision = SchemaRevisionId::new(2);
+            let target = Revision::build(
+                RevisionId::new(9_325),
+                &target_context,
+                &registry,
+                base.state().clone(),
+            )
+            .unwrap();
+            let descriptor = DurableRevisionDescriptor::schema_migration(
+                ClientTransactionId::new(9_326),
+                base.id(),
+                &target,
+                crate::DurableMigrationComplement::from_capsule(
+                    kernel_lens::ComplementCapsule {
+                        source_schema: base.semantic_revision().schema,
+                        target_schema: target.semantic_revision().schema,
+                        lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_327)),
+                        semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_328)),
+                        encoding_version: 1,
+                        complement: Value::Unit,
+                    },
+                    kernel_lens::ComplementRetention::Forget,
+                ),
+                &registry,
+            )
+            .unwrap();
+            let encryption = crate::storage_encryption::StorageEncryption::aes256_gcm_siv(
+                crate::storage_encryption::StorageEncryptionKey::try_new([0x87; 32]).unwrap(),
+            );
+            let mut store = if encrypted {
+                DurableRevisionStore::create_single_file_with_encryption(
+                    &path,
+                    &encryption,
+                    &base,
+                    &registry,
+                )
+                .unwrap()
+            } else {
+                DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap()
+            };
+            let prepared = store.durably_prepare(&descriptor).unwrap();
+            store.durably_commit(prepared).unwrap();
+            let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+            store.rotate_checkpoint(&target).unwrap();
+            store.rotate_checkpoint(&target).unwrap();
+
+            let mut hook = TornSingleFileRootFault {
+                target: point,
+                path: path.clone(),
+            };
+            assert!(
+                store
+                    .test_compact_obsolete_generations_with_hook(&mut hook)
+                    .is_err(),
+                "{point:?} encrypted={encrypted}"
+            );
+            assert!(store.poisoned, "{point:?} encrypted={encrypted}");
+            drop(store);
+
+            let (mut reopened, scan) = if encrypted {
+                DurableRevisionStore::open_single_file_with_encryption(&path, &encryption).unwrap()
+            } else {
+                DurableRevisionStore::open_single_file(&path).unwrap()
+            };
+            assert_eq!(scan.durable_revision(), target.id());
+            let material = reopened
+                .historical_epoch_material(anchor.effect_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(material.generation(), 1);
+            assert_eq!(material.checkpoint().id(), base.id());
+            assert_eq!(material.recovery_scan().durable_revision(), target.id());
+            drop(reopened);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn releasing_historical_epoch_authority_drops_single_file_archive_on_publication() {
+    let dir = test_dir("single-file-release-migration-epoch-archive");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(9_330, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(9_331),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(9_332),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_333)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_334)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    store.rotate_checkpoint(&target).unwrap();
+    assert!(
+        store
+            .backend
+            .single_file_container()
+            .unwrap()
+            .has_historical_epoch_archive(anchor.generation)
+            .unwrap()
+    );
+
+    let receipt = store
+        .release_historical_epoch_authority(&target, anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.generation, 3);
+    assert!(
+        !store
+            .historical_epoch_anchors()
+            .contains_key(&anchor.effect_id)
+    );
+    assert!(
+        !store
+            .backend
+            .single_file_container()
+            .unwrap()
+            .has_historical_epoch_archive(anchor.generation)
+            .unwrap()
+    );
+    assert!(
+        store
+            .historical_epoch_material(anchor.effect_id)
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert!(
+        !reopened
+            .historical_epoch_anchors()
+            .contains_key(&anchor.effect_id)
+    );
+    assert!(
+        reopened
+            .historical_epoch_material(anchor.effect_id)
+            .unwrap()
+            .is_none()
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unpublished_historical_epoch_release_restores_anchor_in_memory() {
+    let dir = test_dir("historical-epoch-release-unpublished");
+    let (base, registry, _) = setup_revision(9_340, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(9_341),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(9_342),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_343)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_344)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    let mut hook = ErrorFault {
+        target: StoreFaultPoint::AfterCheckpointSync,
+    };
+    assert!(
+        store
+            .test_release_historical_epoch_authority_with_hook(
+                &target,
+                anchor.effect_id,
+                &mut hook,
+            )
+            .is_err()
+    );
+    assert!(!store.poisoned);
+    assert_eq!(
+        store.historical_epoch_anchors().get(&anchor.effect_id),
+        Some(&anchor)
+    );
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(
+        reopened.historical_epoch_anchors().get(&anchor.effect_id),
+        Some(&anchor)
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn uncertain_historical_epoch_release_requires_recovery_and_does_not_resurrect_anchor() {
+    for point in [
+        StoreFaultPoint::AfterManifestRename,
+        StoreFaultPoint::AfterManifestDirectorySync,
+    ] {
+        let dir = test_dir(&format!("historical-epoch-release-uncertain-{point:?}"));
+        let (base, registry, _) = setup_revision(9_350, &[1]);
+        let mut target_context = base.semantic_context().clone();
+        target_context.schema.revision = SchemaRevisionId::new(2);
+        let target = Revision::build(
+            RevisionId::new(9_351),
+            &target_context,
+            &registry,
+            base.state().clone(),
+        )
+        .unwrap();
+        let descriptor = DurableRevisionDescriptor::schema_migration(
+            ClientTransactionId::new(9_352),
+            base.id(),
+            &target,
+            crate::DurableMigrationComplement::from_capsule(
+                kernel_lens::ComplementCapsule {
+                    source_schema: base.semantic_revision().schema,
+                    target_schema: target.semantic_revision().schema,
+                    lens_spec: kernel_lens::LensSpecId(SemanticId::new(9_353)),
+                    semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(9_354)),
+                    encoding_version: 1,
+                    complement: Value::Unit,
+                },
+                kernel_lens::ComplementRetention::Forget,
+            ),
+            &registry,
+        )
+        .unwrap();
+
+        let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+        let prepared = store.durably_prepare(&descriptor).unwrap();
+        store.durably_commit(prepared).unwrap();
+        let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+        let mut hook = ErrorFault { target: point };
+        assert!(
+            store
+                .test_release_historical_epoch_authority_with_hook(
+                    &target,
+                    anchor.effect_id,
+                    &mut hook,
+                )
+                .is_err(),
+            "{point:?}"
+        );
+        assert!(store.poisoned, "{point:?}");
+        drop(store);
+
+        let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+        assert_eq!(scan.durable_revision(), target.id(), "{point:?}");
+        assert!(
+            !reopened
+                .historical_epoch_anchors()
+                .contains_key(&anchor.effect_id),
+            "{point:?}"
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[test]
@@ -1528,6 +2229,8 @@ fn committed_descriptor(
             relation,
             inserted: vec![vec![Value::I64(inserted)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         registry,
     )
@@ -1564,6 +2267,8 @@ fn transition_from(
             relation,
             inserted: vec![vec![Value::I64(inserted)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         registry,
     )
@@ -2199,6 +2904,8 @@ fn store_reopens_exact_checkpoint_and_committed_wal_tail() {
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
@@ -2260,6 +2967,8 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
                 relation,
                 inserted: vec![vec![Value::I64(inserted)]],
                 removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: Default::default(),
             }],
             &registry,
         )
@@ -2279,6 +2988,8 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
                 relation,
                 inserted: vec![vec![Value::I64(4)]],
                 removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: Default::default(),
             }],
             rewrite_intents: vec![crate::DurableRelationRewriteIntent {
                 relation,
@@ -2451,6 +3162,8 @@ fn checkpoint_rotation_publishes_new_generation_and_resets_wal_base() {
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
@@ -3252,6 +3965,8 @@ fn idempotency_epoch_reuse_survives_crash_before_checkpoint_without_causal_alias
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
@@ -3278,6 +3993,8 @@ fn idempotency_epoch_reuse_survives_crash_before_checkpoint_without_causal_alias
             relation,
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
@@ -3344,6 +4061,8 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
@@ -3370,6 +4089,8 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
             relation,
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
@@ -3519,6 +4240,8 @@ fn group_commit_rejects_provisional_local_target_reuse_before_wal_mutation() {
             relation,
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
+        object_field_writes: Vec::new(),
+        authorization: Default::default(),
         }],
         &registry,
     )
@@ -6437,6 +7160,431 @@ fn single_file_external_freshness_tracks_streaming_carry_forward() {
 }
 
 #[test]
+fn single_file_streaming_checkpoint_archives_pinned_historical_epoch() {
+    let dir = test_dir("single-file-streaming-historical-epoch");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(40_320, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(40_321),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(40_322),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(40_323)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(40_324)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    store
+        .begin_streaming_checkpoint_with_chunk_size(&target, 32)
+        .unwrap();
+    store.write_streaming_checkpoint_chunks(usize::MAX).unwrap();
+    store.finalize_streaming_checkpoint().unwrap();
+    assert_eq!(store.generation(), 2);
+    store.compact_obsolete_generations().unwrap();
+    let material = store
+        .historical_epoch_material(anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(material.generation(), 1);
+    assert_eq!(material.checkpoint().id(), base.id());
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(
+        reopened
+            .historical_epoch_material(anchor.effect_id)
+            .unwrap()
+            .unwrap()
+            .checkpoint()
+            .id(),
+        base.id()
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+
+#[test]
+fn directory_root_backed_history_releases_generation_pin_and_reopens_exact_source() {
+    let dir = test_dir("directory-root-backed-history");
+    let (base, registry, _) = setup_revision(40_360, &[1, 2, 3]);
+    let (base_atoms, base_root) =
+        realize_database_state_factorized(base.state(), base.semantic_context()).unwrap();
+
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(40_361),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(40_362),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(40_363)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(40_364)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    store
+        .rotate_checkpoint_with_factorized_realization(&base, &base_atoms, &base_root)
+        .unwrap();
+    let historical_generation = store.generation();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    assert_eq!(anchor.generation, historical_generation);
+
+    let (target_atoms, target_root) =
+        realize_database_state_factorized(target.state(), target.semantic_context()).unwrap();
+    store
+        .rotate_checkpoint_with_factorized_realization(&target, &target_atoms, &target_root)
+        .unwrap();
+    assert!(!store
+        .pinned_historical_generations()
+        .contains(&historical_generation));
+    assert_eq!(
+        store
+            .historical_revision_from_realization(anchor.effect_id)
+            .unwrap()
+            .unwrap(),
+        base
+    );
+
+    store.compact_obsolete_generations().unwrap();
+    assert!(!super::generation_layout::checkpoint_path(&dir, historical_generation).exists());
+    assert!(!super::generation_layout::manifest_path(&dir, historical_generation).exists());
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(
+        reopened
+            .historical_revision_from_realization(anchor.effect_id)
+            .unwrap()
+            .unwrap(),
+        base
+    );
+    reopened
+        .release_historical_epoch_authority(&target, anchor.effect_id)
+        .unwrap()
+        .unwrap();
+    assert!(reopened
+        .historical_revision_from_realization(anchor.effect_id)
+        .unwrap()
+        .is_none());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+
+#[test]
+fn aborted_streaming_complete_historical_root_never_supersedes_old_generation_authority() {
+    let dir = test_dir("aborted-streaming-complete-historical-root");
+    let (base, registry, _) = setup_revision(40_365, &[1, 2, 3]);
+    let (base_atoms, base_root) =
+        realize_database_state_factorized(base.state(), base.semantic_context()).unwrap();
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(40_366),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(40_367),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(40_368)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(40_369)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    store
+        .rotate_checkpoint_with_factorized_realization(&base, &base_atoms, &base_root)
+        .unwrap();
+    let historical_generation = store.generation();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    let (target_atoms, target_root) =
+        realize_database_state_factorized(target.state(), target.semantic_context()).unwrap();
+
+    store
+        .begin_streaming_checkpoint_with_factorized_realization_and_chunk_size(
+            &target,
+            &target_atoms,
+            &target_root,
+            32,
+        )
+        .unwrap();
+    store.write_streaming_checkpoint_chunks(1).unwrap();
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(reopened.durable_head(), target.id());
+    assert_eq!(reopened.checkpoint_revision().id(), base.id());
+    assert!(reopened
+        .historical_revision_from_realization(anchor.effect_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        reopened
+            .historical_epoch_material(anchor.effect_id)
+            .unwrap()
+            .unwrap()
+            .checkpoint()
+            .id(),
+        base.id()
+    );
+    assert!(reopened
+        .pinned_historical_generations()
+        .contains(&historical_generation));
+
+    reopened
+        .begin_streaming_checkpoint_with_factorized_realization_and_chunk_size(
+            &target,
+            &target_atoms,
+            &target_root,
+            32,
+        )
+        .unwrap();
+    reopened.write_streaming_checkpoint_chunks(usize::MAX).unwrap();
+    reopened.finalize_streaming_checkpoint().unwrap();
+    assert_eq!(
+        reopened
+            .historical_revision_from_realization(anchor.effect_id)
+            .unwrap()
+            .unwrap(),
+        base
+    );
+    assert!(!reopened
+        .pinned_historical_generations()
+        .contains(&historical_generation));
+    reopened.compact_obsolete_generations().unwrap();
+    assert!(!super::generation_layout::checkpoint_path(&dir, historical_generation).exists());
+    drop(reopened);
+
+    let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(
+        reopened
+            .historical_revision_from_realization(anchor.effect_id)
+            .unwrap()
+            .unwrap(),
+        base
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_root_backed_history_does_not_retain_generation_archive() {
+    let dir = test_dir("single-file-root-backed-history");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(40_370, &[1, 2, 3]);
+    let (base_atoms, base_root) =
+        realize_database_state_factorized(base.state(), base.semantic_context()).unwrap();
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(40_371),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(40_372),
+        base.id(),
+        &target,
+        crate::DurableMigrationComplement::from_capsule(
+            kernel_lens::ComplementCapsule {
+                source_schema: base.semantic_revision().schema,
+                target_schema: target.semantic_revision().schema,
+                lens_spec: kernel_lens::LensSpecId(SemanticId::new(40_373)),
+                semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(40_374)),
+                encoding_version: 1,
+                complement: Value::Unit,
+            },
+            kernel_lens::ComplementRetention::Forget,
+        ),
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    store
+        .rotate_checkpoint_with_factorized_realization(&base, &base_atoms, &base_root)
+        .unwrap();
+    let historical_generation = store.generation();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let anchor = *store.historical_epoch_anchors().values().next().unwrap();
+    let (target_atoms, target_root) =
+        realize_database_state_factorized(target.state(), target.semantic_context()).unwrap();
+    store
+        .rotate_checkpoint_with_factorized_realization(&target, &target_atoms, &target_root)
+        .unwrap();
+    store.compact_obsolete_generations().unwrap();
+    assert!(!store
+        .backend
+        .single_file_container()
+        .unwrap()
+        .has_historical_epoch_archive(historical_generation)
+        .unwrap());
+    assert_eq!(
+        store
+            .historical_revision_from_realization(anchor.effect_id)
+            .unwrap()
+            .unwrap(),
+        base
+    );
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), target.id());
+    assert_eq!(
+        reopened
+            .historical_revision_from_realization(anchor.effect_id)
+            .unwrap()
+            .unwrap(),
+        base
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_checkpoint_owns_and_reopens_factorized_realization() {
+    let dir = test_dir("single-file-checkpoint-factorized-realization");
+    let path = dir.join("database.cfmd");
+    let (base, registry, _) = setup_revision(40_280, &[1, 2, 3]);
+    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
+        .unwrap();
+    let expected_dependencies = root.dependencies();
+
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+    store
+        .rotate_checkpoint_with_factorized_realization(&base, &atoms, &root)
+        .unwrap();
+    let physical = store.checkpoint_factorized_realization().unwrap();
+    assert_eq!(physical.revision(), base.id());
+    assert_eq!(physical.root().dependencies(), expected_dependencies);
+    store.compact_obsolete_generations().unwrap();
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    let physical = reopened.checkpoint_factorized_realization().unwrap();
+    assert_eq!(physical.revision(), base.id());
+    assert_eq!(physical.root().dependencies(), expected_dependencies);
+    reopened.rotate_checkpoint(&base).unwrap();
+    assert_eq!(reopened.generation(), 3);
+    assert_eq!(
+        reopened
+            .checkpoint_factorized_realization()
+            .unwrap()
+            .root()
+            .dependencies(),
+        expected_dependencies
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn single_file_streaming_factorized_cut_carries_newer_wal_exactly() {
+    let dir = test_dir("single-file-streaming-factorized-carry-forward");
+    let path = dir.join("database.cfmd");
+    let (base, registry, relation) = setup_revision(40_290, &[1]);
+    let (r1, d1) = transition_from(&base, &registry, relation, 40_291, 291);
+    let (r2, d2) = transition_from(&r1, &registry, relation, 40_292, 292);
+    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
+        .unwrap();
+    let expected_dependencies = root.dependencies();
+    let mut store = DurableRevisionStore::create_single_file(&path, &base, &registry).unwrap();
+
+    store
+        .begin_streaming_checkpoint_with_factorized_realization_and_chunk_size(
+            &base, &atoms, &root, 16,
+        )
+        .unwrap();
+    store.write_streaming_checkpoint_chunks(1).unwrap();
+    let p1 = store.durably_prepare(&d1).unwrap();
+    store.durably_commit(p1).unwrap();
+    let p2 = store.durably_prepare(&d2).unwrap();
+    store.durably_commit(p2).unwrap();
+    store.write_streaming_checkpoint_chunks(usize::MAX).unwrap();
+    let receipt = store.finalize_streaming_checkpoint().unwrap();
+
+    assert_eq!(receipt.base_revision, base.id());
+    assert_eq!(store.durable_head(), r2.id());
+    assert_eq!(store.checkpoint_factorized_realization().unwrap().revision(), base.id());
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
+    assert_eq!(reopened.checkpoint_revision().id(), base.id());
+    assert_eq!(reopened.durable_head(), r2.id());
+    assert_eq!(scan.durable_revision(), r2.id());
+    let physical = reopened.checkpoint_factorized_realization().unwrap();
+    assert_eq!(physical.revision(), base.id());
+    assert_eq!(physical.root().dependencies(), expected_dependencies);
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn single_file_streaming_checkpoint_carries_exact_wal_and_replication_suffix() {
     let dir = test_dir("single-file-streaming-carry-forward");
     let path = dir.join("database.cfmd");
@@ -6491,5 +7639,102 @@ fn single_file_streaming_checkpoint_carries_exact_wal_and_replication_suffix() {
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["database.cfmd"]);
     drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn directory_checkpoint_owns_and_reopens_factorized_realization() {
+    let dir = test_dir("directory-checkpoint-factorized-realization");
+    let (base, registry, _) = setup_revision(40_310, &[1, 2, 3]);
+    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
+        .unwrap();
+    let expected_dependencies = root.dependencies();
+
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    store
+        .rotate_checkpoint_with_factorized_realization(&base, &atoms, &root)
+        .unwrap();
+    assert_eq!(store.generation(), 2);
+    let physical = store.checkpoint_factorized_realization().unwrap();
+    assert_eq!(physical.revision(), base.id());
+    assert_eq!(physical.root().dependencies(), expected_dependencies);
+    drop(store);
+
+    let (mut reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    let physical = reopened.checkpoint_factorized_realization().unwrap();
+    assert_eq!(physical.revision(), base.id());
+    assert_eq!(physical.root().dependencies(), expected_dependencies);
+    reopened.rotate_checkpoint(&base).unwrap();
+    assert_eq!(reopened.generation(), 3);
+    assert_eq!(
+        reopened
+            .checkpoint_factorized_realization()
+            .unwrap()
+            .root()
+            .dependencies(),
+        expected_dependencies
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn directory_streaming_factorized_cut_carries_newer_wal_exactly() {
+    let dir = test_dir("directory-streaming-factorized-carry-forward");
+    let (base, registry, relation) = setup_revision(40_320, &[1]);
+    let (r1, d1) = transition_from(&base, &registry, relation, 40_321, 321);
+    let (r2, d2) = transition_from(&r1, &registry, relation, 40_322, 322);
+    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
+        .unwrap();
+    let expected_dependencies = root.dependencies();
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+
+    store
+        .begin_streaming_checkpoint_with_factorized_realization_and_chunk_size(
+            &base, &atoms, &root, 16,
+        )
+        .unwrap();
+    store.write_streaming_checkpoint_chunks(1).unwrap();
+    let p1 = store.durably_prepare(&d1).unwrap();
+    store.durably_commit(p1).unwrap();
+    let p2 = store.durably_prepare(&d2).unwrap();
+    store.durably_commit(p2).unwrap();
+    store.write_streaming_checkpoint_chunks(usize::MAX).unwrap();
+    let receipt = store.finalize_streaming_checkpoint().unwrap();
+
+    assert_eq!(receipt.base_revision, base.id());
+    assert_eq!(store.durable_head(), r2.id());
+    assert_eq!(store.checkpoint_factorized_realization().unwrap().revision(), base.id());
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(reopened.checkpoint_revision().id(), base.id());
+    assert_eq!(reopened.durable_head(), r2.id());
+    assert_eq!(scan.durable_revision(), r2.id());
+    let physical = reopened.checkpoint_factorized_realization().unwrap();
+    assert_eq!(physical.revision(), base.id());
+    assert_eq!(physical.root().dependencies(), expected_dependencies);
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn directory_published_realization_missing_is_corruption() {
+    let dir = test_dir("directory-published-realization-missing");
+    let (base, registry, _) = setup_revision(40_330, &[1]);
+    let (atoms, root) = realize_database_state_factorized(base.state(), base.semantic_context())
+        .unwrap();
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    store
+        .rotate_checkpoint_with_factorized_realization(&base, &atoms, &root)
+        .unwrap();
+    let generation = store.generation();
+    drop(store);
+    fs::remove_file(generation_layout::realization_path(&dir, generation)).unwrap();
+    assert!(matches!(
+        DurableRevisionStore::open(&dir),
+        Err(DurabilityError::Corruption { .. })
+    ));
     fs::remove_dir_all(dir).unwrap();
 }

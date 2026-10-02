@@ -40,7 +40,7 @@ fn insert(database: &Database, relation: RelationId, value: i64, transaction: u1
     let mut plan = database.plan().expect("writer plan");
     plan.insert(relation, vec![Value::I64(value)]);
     database
-        .commit(&plan, TransactionId::new(transaction))
+        .commit_plan(&plan, TransactionId::new(transaction))
         .expect("writer commit");
 }
 

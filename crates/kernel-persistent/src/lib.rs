@@ -2,10 +2,12 @@ const PAGE: usize = 256;
 const BRANCH: usize = 32;
 
 mod ordered;
-pub use ordered::{PersistentOrdMap, PersistentOrdMapIter, PersistentOrdSet};
+pub use ordered::{
+    PersistentOrdMap, PersistentOrdMapIter, PersistentOrdMapStorageProbe, PersistentOrdSet,
+};
 
 mod vector;
-pub use vector::{PersistentVec, PersistentVecIter};
+pub use vector::{PersistentVec, PersistentVecIter, PersistentVecStorageProbe};
 
 #[cfg(test)]
 mod tests {

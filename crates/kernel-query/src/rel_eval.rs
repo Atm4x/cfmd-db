@@ -1,10 +1,14 @@
 use super::{
-    AggregateSpec, BTreeMap, BTreeSet, OrderComparison, OrderDirection, PreparedRelExpr, RelExpr,
-    RelQueryError, RelType, RelationValue, Row, Value, anti_join_relation_values,
-    difference_relation_values, distinct_rows, group_relation_value, query_types_compatible,
-    relation_column_equivalence, relation_column_equivalences, validate_query_equivalence,
-    value_shape_matches_type,
+    AggregateSpec, BTreeMap, BTreeSet, CanonicalRowKey, OrderComparison, OrderDirection,
+    PreparedRelExpr, RelExpr, RelQueryError, RelType, RelationValue, Row, Value,
+    anti_join_relation_values, canonical_row_key,
+    difference_relation_values, distinct_rows, distinct_rows_with_canonical_keys,
+    group_relation_value, project_rows, query_types_compatible,
+    relation_column_equivalence, relation_column_equivalences, union_relation_values,
+    validate_query_equivalence, value_shape_matches_type, RelationOccurrenceCertificate,
+    RelationScanOccurrenceSeed,
 };
+use crate::relation_state::CanonicalRowEvidence;
 
 pub(super) fn collect_rel_source_relations(
     query: &RelExpr,
@@ -24,6 +28,7 @@ pub(super) fn collect_rel_source_relations(
         | RelExpr::PromoteToBag(input) => collect_rel_source_relations(input, out),
         RelExpr::JoinEq { left, right, .. }
         | RelExpr::Difference { left, right }
+        | RelExpr::Union { left, right }
         | RelExpr::AntiJoin { left, right, .. } => {
             collect_rel_source_relations(left, out);
             collect_rel_source_relations(right, out);
@@ -50,6 +55,7 @@ fn collect_rel_orderings(query: &RelExpr, out: &mut BTreeSet<kernel_types::Seman
         | RelExpr::PromoteToBag(input) => collect_rel_orderings(input, out),
         RelExpr::JoinEq { left, right, .. }
         | RelExpr::Difference { left, right }
+        | RelExpr::Union { left, right }
         | RelExpr::AntiJoin { left, right, .. } => {
             collect_rel_orderings(left, out);
             collect_rel_orderings(right, out);
@@ -63,6 +69,7 @@ struct RelEvalContext<'a> {
     semantic: &'a kernel_schema::SemanticContext,
     registry: &'a kernel_semantics::SemanticRegistry,
     compiled_orderings: &'a BTreeMap<kernel_types::SemanticId, kernel_semantics::CompiledOrdering>,
+    scan_seeds: Option<&'a BTreeMap<kernel_types::SemanticId, RelationScanOccurrenceSeed>>,
 }
 
 pub(super) fn evaluate_prepared_expr(
@@ -77,8 +84,645 @@ pub(super) fn evaluate_prepared_expr(
         semantic,
         registry,
         compiled_orderings,
+        scan_seeds: None,
     };
     expr.evaluate_unchecked(&eval)
+}
+
+pub(super) fn evaluate_prepared_expr_with_occurrence_certificate(
+    expr: &RelExpr,
+    model: &kernel_model::FiniteModel,
+    semantic: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+    compiled_orderings: &BTreeMap<kernel_types::SemanticId, kernel_semantics::CompiledOrdering>,
+) -> Result<(RelationValue, RelationOccurrenceCertificate), RelQueryError> {
+    let eval = RelEvalContext {
+        model,
+        semantic,
+        registry,
+        compiled_orderings,
+        scan_seeds: None,
+    };
+    let (value, result_type, canonical_keys_by_row) =
+        evaluate_expr_with_canonical_keys(expr, &eval)?;
+    let certificate = RelationOccurrenceCertificate::from_dense_set_keys(
+        result_type,
+        semantic,
+        canonical_keys_by_row,
+    )?;
+    Ok((value, certificate))
+}
+
+pub(super) fn evaluate_prepared_expr_with_occurrence_certificate_seeded(
+    expr: &RelExpr,
+    model: &kernel_model::FiniteModel,
+    semantic: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+    compiled_orderings: &BTreeMap<kernel_types::SemanticId, kernel_semantics::CompiledOrdering>,
+    scan_seeds: &BTreeMap<kernel_types::SemanticId, RelationScanOccurrenceSeed>,
+) -> Result<(RelationValue, RelationOccurrenceCertificate), RelQueryError> {
+    let eval = RelEvalContext {
+        model,
+        semantic,
+        registry,
+        compiled_orderings,
+        scan_seeds: Some(scan_seeds),
+    };
+    let (value, result_type, canonical_keys_by_row) =
+        evaluate_expr_with_canonical_keys(expr, &eval)?;
+    let certificate = RelationOccurrenceCertificate::from_dense_set_keys(
+        result_type,
+        semantic,
+        canonical_keys_by_row,
+    )?;
+    Ok((value, certificate))
+}
+
+pub(super) fn evaluate_prepared_expr_seeded(
+    expr: &RelExpr,
+    model: &kernel_model::FiniteModel,
+    semantic: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+    compiled_orderings: &BTreeMap<kernel_types::SemanticId, kernel_semantics::CompiledOrdering>,
+    scan_seeds: &BTreeMap<kernel_types::SemanticId, RelationScanOccurrenceSeed>,
+) -> Result<RelationValue, RelQueryError> {
+    let eval = RelEvalContext {
+        model,
+        semantic,
+        registry,
+        compiled_orderings,
+        scan_seeds: Some(scan_seeds),
+    };
+    evaluate_expr_with_canonical_keys(expr, &eval).map(|(value, _, _)| value)
+}
+
+fn evaluate_expr_with_canonical_keys(
+    expr: &RelExpr,
+    eval: &RelEvalContext<'_>,
+) -> Result<(RelationValue, RelType, CanonicalRowEvidence), RelQueryError> {
+    let result_type = expr.typecheck(eval.semantic, eval.registry)?;
+    if !matches!(
+        result_type.semantics,
+        kernel_schema::RelationSemantics::Set { .. }
+    ) {
+        return Err(RelQueryError::CanonicalObservationUnavailable);
+    }
+
+    let (value, canonical_keys_by_row) = match expr {
+        RelExpr::Scan(relation) => {
+            let seed = eval
+                .scan_seeds
+                .and_then(|seeds| seeds.get(relation))
+                .ok_or(RelQueryError::CanonicalObservationUnavailable)?;
+            if seed.relation() != *relation
+                || seed.result_type() != &result_type
+                || seed.semantic_context() != eval.semantic
+            {
+                return Err(RelQueryError::StructuralRewriteBaseMismatch);
+            }
+            let value = RelExpr::eval_scan(*relation, eval)?;
+            if value.rows().len() != seed.row_count() {
+                return Err(RelQueryError::StructuralRewriteBaseMismatch);
+            }
+            (value, seed.canonical_keys_by_row())
+        }
+        RelExpr::Union { left, right } => {
+            let equivalences = relation_column_equivalences(&result_type).to_vec();
+            match (
+                evaluate_expr_with_canonical_keys(left, eval),
+                evaluate_expr_with_canonical_keys(right, eval),
+            ) {
+                (Ok((left_value, _, left_keys)), Ok((right_value, _, right_keys))) => {
+                    union_relation_values_from_canonical_keys(
+                        left_value,
+                        left_keys,
+                        right_value,
+                        right_keys,
+                        &equivalences,
+                    )?
+                }
+                (Err(RelQueryError::CanonicalObservationUnavailable), _)
+                | (_, Err(RelQueryError::CanonicalObservationUnavailable)) => {
+                    let left_value = left.evaluate_unchecked(eval)?;
+                    let right_value = right.evaluate_unchecked(eval)?;
+                    union_relation_values_with_canonical_keys(
+                        left_value,
+                        right_value,
+                        &equivalences,
+                        eval.semantic,
+                        eval.registry,
+                    )?
+                }
+                (Err(error), _) | (_, Err(error)) => return Err(error),
+            }
+        }
+        RelExpr::JoinEq {
+            left,
+            right,
+            left_column,
+            right_column,
+            equivalence,
+        } => {
+            let (left_value, _left_type, left_keys) =
+                evaluate_expr_with_canonical_keys(left, eval)?;
+            let (right_value, _right_type, right_keys) =
+                evaluate_expr_with_canonical_keys(right, eval)?;
+            join_relation_values_with_canonical_keys(
+                left_value,
+                left_keys,
+                right_value,
+                right_keys,
+                *left_column,
+                *right_column,
+                *equivalence,
+                eval.semantic,
+                eval.registry,
+            )?
+        }
+        RelExpr::Difference { left, right } => {
+            let equivalences = relation_column_equivalences(&result_type).to_vec();
+            match (
+                evaluate_expr_with_canonical_keys(left, eval),
+                evaluate_expr_with_canonical_keys(right, eval),
+            ) {
+                (Ok((left_value, _, left_keys)), Ok((right_value, _, right_keys))) => {
+                    difference_relation_values_from_canonical_keys(
+                        left_value,
+                        left_keys,
+                        right_value,
+                        right_keys,
+                        &equivalences,
+                    )?
+                }
+                (Err(RelQueryError::CanonicalObservationUnavailable), _)
+                | (_, Err(RelQueryError::CanonicalObservationUnavailable)) => {
+                    let left_value = left.evaluate_unchecked(eval)?;
+                    let right_value = right.evaluate_unchecked(eval)?;
+                    difference_relation_values_with_canonical_keys(
+                        left_value,
+                        right_value,
+                        &equivalences,
+                        eval.semantic,
+                        eval.registry,
+                    )?
+                }
+                (Err(error), _) | (_, Err(error)) => return Err(error),
+            }
+        }
+        RelExpr::AntiJoin {
+            left,
+            right,
+            left_column,
+            right_column,
+            equivalence,
+        } => {
+            let (left_value, left_type, left_keys) =
+                evaluate_expr_with_canonical_keys(left, eval)?;
+            if left_type != result_type {
+                return Err(RelQueryError::TypeMismatch);
+            }
+            let right_value = right.evaluate_unchecked(eval)?;
+            anti_join_relation_values_with_canonical_keys(
+                left_value,
+                left_keys,
+                &right_value,
+                *left_column,
+                *right_column,
+                *equivalence,
+                eval.semantic,
+                eval.registry,
+            )?
+        }
+        RelExpr::Distinct {
+            input,
+            column_equivalences,
+        } => match evaluate_expr_with_canonical_keys(input, eval) {
+            Ok((RelationValue::Set { rows, column_equivalences: input_equivalences }, _, keys))
+                if input_equivalences == *column_equivalences =>
+            {
+                (
+                    RelationValue::Set {
+                        rows,
+                        column_equivalences: input_equivalences,
+                    },
+                    keys,
+                )
+            }
+            Ok(_) | Err(RelQueryError::CanonicalObservationUnavailable) => {
+                let rows = input.evaluate_unchecked(eval)?.into_rows();
+                let (rows, canonical_keys) = distinct_rows_with_canonical_keys(
+                    rows,
+                    column_equivalences,
+                    eval.semantic,
+                    eval.registry,
+                )?;
+                (
+                    RelationValue::Set {
+                        rows,
+                        column_equivalences: column_equivalences.clone(),
+                    },
+                    CanonicalRowEvidence::from_dense(canonical_keys),
+                )
+            }
+            Err(error) => return Err(error),
+        },
+        RelExpr::Project { input, columns } => {
+            let equivalences = relation_column_equivalences(&result_type).to_vec();
+            match evaluate_expr_with_canonical_keys(input, eval) {
+                Ok((RelationValue::Set { rows, .. }, _, input_keys)) => {
+                    project_relation_value_from_canonical_keys(
+                        rows,
+                        input_keys,
+                        columns,
+                        equivalences,
+                    )?
+                }
+                Ok(_) | Err(RelQueryError::CanonicalObservationUnavailable) => {
+                    let input_value = input.evaluate_unchecked(eval)?;
+                    let RelationValue::Set { rows, .. } = input_value else {
+                        return Err(RelQueryError::CanonicalObservationUnavailable);
+                    };
+                    let rows = project_rows(rows, columns)?;
+                    let (rows, canonical_keys) = distinct_rows_with_canonical_keys(
+                        rows,
+                        &equivalences,
+                        eval.semantic,
+                        eval.registry,
+                    )?;
+                    (
+                        RelationValue::Set {
+                            rows,
+                            column_equivalences: equivalences,
+                        },
+                        CanonicalRowEvidence::from_dense(canonical_keys),
+                    )
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        _ => return Err(RelQueryError::CanonicalObservationUnavailable),
+    };
+
+    if canonical_keys_by_row.len() != value.rows().len() {
+        return Err(RelQueryError::InconsistentIncrementalDelta);
+    }
+    Ok((value, result_type, canonical_keys_by_row))
+}
+
+
+fn union_relation_values_from_canonical_keys(
+    left: RelationValue,
+    left_keys_by_row: CanonicalRowEvidence,
+    right: RelationValue,
+    right_keys_by_row: CanonicalRowEvidence,
+    column_equivalences: &[kernel_types::SemanticId],
+) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
+    let (
+        RelationValue::Set { rows: left_rows, column_equivalences: left_equivalences },
+        RelationValue::Set { rows: right_rows, column_equivalences: right_equivalences },
+    ) = (left, right) else {
+        return Err(RelQueryError::CanonicalObservationUnavailable);
+    };
+    if left_equivalences != column_equivalences
+        || right_equivalences != column_equivalences
+        || left_rows.len() != left_keys_by_row.len()
+        || right_rows.len() != right_keys_by_row.len()
+    {
+        return Err(RelQueryError::TypeMismatch);
+    }
+    let mut keyed_rows = Vec::with_capacity(left_rows.len() + right_rows.len());
+    keyed_rows.extend(left_rows.into_iter().zip(left_keys_by_row.iter().cloned()).map(|(row, key)| (key, row)));
+    keyed_rows.extend(right_rows.into_iter().zip(right_keys_by_row.iter().cloned()).map(|(row, key)| (key, row)));
+    keyed_rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    keyed_rows.dedup_by(|left, right| left.0 == right.0);
+    let mut rows = Vec::with_capacity(keyed_rows.len());
+    let mut keys = Vec::with_capacity(keyed_rows.len());
+    for (key, row) in keyed_rows {
+        keys.push(key);
+        rows.push(row);
+    }
+    Ok((
+        RelationValue::Set { rows, column_equivalences: column_equivalences.to_vec() },
+        CanonicalRowEvidence::from_dense(keys),
+    ))
+}
+
+fn difference_relation_values_from_canonical_keys(
+    left: RelationValue,
+    left_keys_by_row: CanonicalRowEvidence,
+    right: RelationValue,
+    right_keys_by_row: CanonicalRowEvidence,
+    column_equivalences: &[kernel_types::SemanticId],
+) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
+    let (
+        RelationValue::Set { rows: left_rows, column_equivalences: left_equivalences },
+        RelationValue::Set { rows: right_rows, column_equivalences: right_equivalences },
+    ) = (left, right) else {
+        return Err(RelQueryError::CanonicalObservationUnavailable);
+    };
+    if left_equivalences != column_equivalences
+        || right_equivalences != column_equivalences
+        || left_rows.len() != left_keys_by_row.len()
+        || right_rows.len() != right_keys_by_row.len()
+    {
+        return Err(RelQueryError::TypeMismatch);
+    }
+    let blocked = right_keys_by_row.iter().cloned().collect::<BTreeSet<_>>();
+    let mut rows = Vec::with_capacity(left_rows.len());
+    let mut keys = Vec::with_capacity(left_rows.len());
+    for (row, key) in left_rows.into_iter().zip(left_keys_by_row.iter()) {
+        if blocked.contains(key) {
+            continue;
+        }
+        rows.push(row);
+        keys.push(key.clone());
+    }
+    Ok((
+        RelationValue::Set { rows, column_equivalences: column_equivalences.to_vec() },
+        CanonicalRowEvidence::from_dense(keys),
+    ))
+}
+
+fn project_relation_value_from_canonical_keys(
+    rows: Vec<Row>,
+    input_keys_by_row: CanonicalRowEvidence,
+    columns: &[usize],
+    output_equivalences: Vec<kernel_types::SemanticId>,
+) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
+    if rows.len() != input_keys_by_row.len() || columns.len() != output_equivalences.len() {
+        return Err(RelQueryError::TypeMismatch);
+    }
+    let projected_rows = project_rows(rows, columns)?;
+    let mut keyed_rows = Vec::with_capacity(projected_rows.len());
+    for (row, input_key) in projected_rows.into_iter().zip(input_keys_by_row.iter()) {
+        let key = columns
+            .iter()
+            .map(|&column| input_key.get(column).cloned().ok_or(RelQueryError::ColumnOutOfBounds))
+            .collect::<Result<CanonicalRowKey, RelQueryError>>()?;
+        keyed_rows.push((key, row));
+    }
+    keyed_rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    keyed_rows.dedup_by(|left, right| left.0 == right.0);
+    let mut rows = Vec::with_capacity(keyed_rows.len());
+    let mut keys = Vec::with_capacity(keyed_rows.len());
+    for (key, row) in keyed_rows {
+        keys.push(key);
+        rows.push(row);
+    }
+    Ok((
+        RelationValue::Set { rows, column_equivalences: output_equivalences },
+        CanonicalRowEvidence::from_dense(keys),
+    ))
+}
+
+fn join_relation_values_with_canonical_keys(
+    left: RelationValue,
+    left_keys_by_row: CanonicalRowEvidence,
+    right: RelationValue,
+    right_keys_by_row: CanonicalRowEvidence,
+    left_column: usize,
+    right_column: usize,
+    equivalence: kernel_types::SemanticId,
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
+    let (
+        RelationValue::Set {
+            rows: left_rows,
+            column_equivalences: left_equivalences,
+        },
+        RelationValue::Set {
+            rows: right_rows,
+            column_equivalences: right_equivalences,
+        },
+    ) = (left, right)
+    else {
+        return Err(RelQueryError::CanonicalObservationUnavailable);
+    };
+    if left_keys_by_row.len() != left_rows.len() || right_keys_by_row.len() != right_rows.len() {
+        return Err(RelQueryError::InconsistentIncrementalDelta);
+    }
+
+    let mut right_buckets = BTreeMap::<
+        kernel_semantics::CanonicalEqKey,
+        Vec<(usize, &CanonicalRowKey)>,
+    >::new();
+    for ((right_index, right_row), right_full_key) in right_rows
+        .iter()
+        .enumerate()
+        .zip(right_keys_by_row.iter())
+    {
+        let right_key = right_row
+            .get(right_column)
+            .ok_or(RelQueryError::ColumnOutOfBounds)?;
+        let canonical = registry
+            .canonical_equivalence_key(context, equivalence, right_key)
+            .map_err(RelQueryError::from)?;
+        right_buckets
+            .entry(canonical)
+            .or_default()
+            .push((right_index, right_full_key));
+    }
+
+    let mut rows = Vec::new();
+    let mut canonical_keys = Vec::new();
+    for (left_row, left_full_key) in left_rows.iter().zip(left_keys_by_row.iter()) {
+        let left_key = left_row
+            .get(left_column)
+            .ok_or(RelQueryError::ColumnOutOfBounds)?;
+        let canonical = registry
+            .canonical_equivalence_key(context, equivalence, left_key)
+            .map_err(RelQueryError::from)?;
+        let Some(matches) = right_buckets.get(&canonical) else {
+            continue;
+        };
+        for (right_index, right_full_key) in matches {
+            let right_row = right_rows
+                .get(*right_index)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
+            joined.extend(left_row.iter().cloned());
+            joined.extend(right_row.iter().cloned());
+            rows.push(joined);
+
+            let mut joined_key = Vec::with_capacity(left_full_key.len() + right_full_key.len());
+            joined_key.extend(left_full_key.iter().cloned());
+            joined_key.extend(right_full_key.iter().cloned());
+            canonical_keys.push(joined_key);
+        }
+    }
+
+    Ok((
+        RelationValue::Set {
+            rows,
+            column_equivalences: left_equivalences
+                .into_iter()
+                .chain(right_equivalences)
+                .collect(),
+        },
+        CanonicalRowEvidence::from_dense(canonical_keys),
+    ))
+}
+
+fn anti_join_relation_values_with_canonical_keys(
+    left: RelationValue,
+    left_keys_by_row: CanonicalRowEvidence,
+    right: &RelationValue,
+    left_column: usize,
+    right_column: usize,
+    equivalence: kernel_types::SemanticId,
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
+    let RelationValue::Set {
+        rows: left_rows,
+        column_equivalences,
+    } = left
+    else {
+        return Err(RelQueryError::CanonicalObservationUnavailable);
+    };
+    if left_keys_by_row.len() != left_rows.len() {
+        return Err(RelQueryError::InconsistentIncrementalDelta);
+    }
+
+    let mut blocked = BTreeSet::new();
+    for row in right.rows() {
+        let value = row
+            .get(right_column)
+            .ok_or(RelQueryError::ColumnOutOfBounds)?;
+        blocked.insert(
+            registry
+                .canonical_equivalence_key(context, equivalence, value)
+                .map_err(RelQueryError::from)?,
+        );
+    }
+
+    let mut rows = Vec::with_capacity(left_rows.len());
+    let mut canonical_keys = Vec::with_capacity(left_rows.len());
+    for (row, full_key) in left_rows.into_iter().zip(left_keys_by_row.iter()) {
+        let value = row
+            .get(left_column)
+            .ok_or(RelQueryError::ColumnOutOfBounds)?;
+        let blocker_key = registry
+            .canonical_equivalence_key(context, equivalence, value)
+            .map_err(RelQueryError::from)?;
+        if blocked.contains(&blocker_key) {
+            continue;
+        }
+        rows.push(row);
+        canonical_keys.push(full_key.clone());
+    }
+
+    Ok((
+        RelationValue::Set {
+            rows,
+            column_equivalences,
+        },
+        CanonicalRowEvidence::from_dense(canonical_keys),
+    ))
+}
+
+fn difference_relation_values_with_canonical_keys(
+    left: RelationValue,
+    right: RelationValue,
+    column_equivalences: &[kernel_types::SemanticId],
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
+    let (
+        RelationValue::Set {
+            rows: left_rows,
+            column_equivalences: left_equivalences,
+        },
+        RelationValue::Set {
+            rows: right_rows,
+            column_equivalences: right_equivalences,
+        },
+    ) = (left, right)
+    else {
+        return Err(RelQueryError::CanonicalObservationUnavailable);
+    };
+    if left_equivalences != column_equivalences || right_equivalences != column_equivalences {
+        return Err(RelQueryError::TypeMismatch);
+    }
+
+    let mut blocked = BTreeSet::new();
+    for row in right_rows {
+        blocked.insert(canonical_row_key(
+            &row,
+            column_equivalences,
+            context,
+            registry,
+        )?);
+    }
+
+    let mut rows = Vec::new();
+    let mut canonical_keys = Vec::new();
+    for row in left_rows {
+        let key = canonical_row_key(&row, column_equivalences, context, registry)?;
+        if blocked.contains(&key) {
+            continue;
+        }
+        rows.push(row);
+        canonical_keys.push(key);
+    }
+    Ok((
+        RelationValue::Set {
+            rows,
+            column_equivalences: column_equivalences.to_vec(),
+        },
+        CanonicalRowEvidence::from_dense(canonical_keys),
+    ))
+}
+
+fn union_relation_values_with_canonical_keys(
+    left: RelationValue,
+    right: RelationValue,
+    column_equivalences: &[kernel_types::SemanticId],
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
+    let (
+        RelationValue::Set {
+            rows: left_rows,
+            column_equivalences: left_equivalences,
+        },
+        RelationValue::Set {
+            rows: right_rows,
+            column_equivalences: right_equivalences,
+        },
+    ) = (left, right)
+    else {
+        return Err(RelQueryError::CanonicalObservationUnavailable);
+    };
+    if left_equivalences != column_equivalences || right_equivalences != column_equivalences {
+        return Err(RelQueryError::TypeMismatch);
+    }
+
+    let mut keyed_rows = Vec::with_capacity(left_rows.len() + right_rows.len());
+    for row in left_rows.into_iter().chain(right_rows) {
+        let key = canonical_row_key(&row, column_equivalences, context, registry)?;
+        keyed_rows.push((key, row));
+    }
+    keyed_rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    let mut rows = Vec::with_capacity(keyed_rows.len());
+    let mut canonical_keys = Vec::with_capacity(keyed_rows.len());
+    for (key, row) in keyed_rows {
+        if canonical_keys.last().is_some_and(|last| *last == key) {
+            continue;
+        }
+        rows.push(row);
+        canonical_keys.push(key);
+    }
+
+    Ok((
+        RelationValue::Set {
+            rows,
+            column_equivalences: column_equivalences.to_vec(),
+        },
+        CanonicalRowEvidence::from_dense(canonical_keys),
+    ))
 }
 
 impl RelExpr {
@@ -170,6 +814,9 @@ impl RelExpr {
             Self::Difference { left, right } => {
                 Self::typecheck_difference(left, right, context, registry)
             }
+            Self::Union { left, right } => {
+                Self::typecheck_union(left, right, context, registry)
+            }
             Self::AntiJoin {
                 left,
                 right,
@@ -232,6 +879,20 @@ impl RelExpr {
                 column_equivalences,
             },
         })
+    }
+
+    fn typecheck_union(
+        left: &Self,
+        right: &Self,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelType, RelQueryError> {
+        let left_type = left.typecheck(context, registry)?;
+        let right_type = right.typecheck(context, registry)?;
+        if left_type != right_type {
+            return Err(RelQueryError::TypeMismatch);
+        }
+        Ok(left_type)
     }
 
     fn typecheck_difference(
@@ -626,6 +1287,16 @@ impl RelExpr {
             .evaluate(model, context, registry)
     }
 
+    pub fn evaluate_with_occurrence_certificate(
+        &self,
+        model: &kernel_model::FiniteModel,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(RelationValue, RelationOccurrenceCertificate), RelQueryError> {
+        self.prepare(context, registry)?
+            .evaluate_with_occurrence_certificate(model, context, registry)
+    }
+
     fn evaluate_unchecked(
         &self,
         eval: &RelEvalContext<'_>,
@@ -660,6 +1331,7 @@ impl RelExpr {
                 equivalence,
             } => Self::eval_join(left, right, *left_column, *right_column, *equivalence, eval),
             Self::Difference { left, right } => Self::eval_difference(left, right, eval),
+            Self::Union { left, right } => Self::eval_union(left, right, eval),
             Self::AntiJoin {
                 left,
                 right,
@@ -702,8 +1374,7 @@ impl RelExpr {
         let rows = eval
             .model
             .relations
-            .get(&relation)
-            .cloned()
+            .materialize_owned(&relation)
             .unwrap_or_default();
         Ok(match &definition.semantics {
             kernel_schema::RelationSemantics::Bag { .. } => RelationValue::Bag(rows),
@@ -932,6 +1603,23 @@ impl RelExpr {
             left_value,
             right_value,
             column_equivalences,
+            eval.semantic,
+            eval.registry,
+        )
+    }
+
+    fn eval_union(
+        left: &Self,
+        right: &Self,
+        eval: &RelEvalContext<'_>,
+    ) -> Result<RelationValue, RelQueryError> {
+        let left_type = left.typecheck(eval.semantic, eval.registry)?;
+        let left_value = left.evaluate_unchecked(eval)?;
+        let right_value = right.evaluate_unchecked(eval)?;
+        union_relation_values(
+            left_value,
+            right_value,
+            relation_column_equivalences(&left_type),
             eval.semantic,
             eval.registry,
         )

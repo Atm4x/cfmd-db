@@ -46,6 +46,10 @@ pub(super) fn metadata_path(directory: &Path, generation: u64) -> PathBuf {
     directory.join(format!("metadata-{generation:020}.cfdm"))
 }
 
+pub(super) fn realization_path(directory: &Path, generation: u64) -> PathBuf {
+    directory.join(format!("realization-{generation:020}.cfpr"))
+}
+
 pub(super) fn parse_generation_name(name: &str, prefix: &str, suffix: &str) -> Option<u64> {
     let raw = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
     (raw.len() == 20).then(|| raw.parse().ok()).flatten()
@@ -92,6 +96,7 @@ pub(super) fn next_generation(directory: &Path) -> Result<u64, DurabilityError> 
             .or_else(|| parse_generation_name(name, "checkpoint-", ".cfcp"))
             .or_else(|| parse_generation_name(name, "wal-", ".cfmw"))
             .or_else(|| parse_generation_name(name, "metadata-", ".cfdm"))
+            .or_else(|| parse_generation_name(name, "realization-", ".cfpr"))
             .or_else(|| parse_generation_name(name, "prepared-", ".cfpc"))
             .or_else(|| parse_checkpoint_chunk_generation(name))
             .or_else(|| parse_generation_name(name, "checkpoint-", "-stream.tmp"))

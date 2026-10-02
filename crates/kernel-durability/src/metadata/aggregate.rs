@@ -3,7 +3,7 @@ use std::io::Read;
 
 use kernel_change::RevisionEffectId;
 use kernel_semantics::BuiltinSemanticModuleSpec;
-use kernel_types::{ClientTransactionId, RevisionId};
+use kernel_types::{ClientTransactionId, RevisionId, SchemaRevisionId};
 
 use crate::binary_codec::{
     BinarySink, BinarySource, CountingBinarySink, Cursor, ReadBinarySource, StreamingBinarySink,
@@ -14,7 +14,7 @@ use crate::descriptor::{
 };
 use crate::domain::{
     DurableExternalFreshnessBinding, DurableMigrationComplement, DurableRevisionEffectRecord,
-    DurableTransactionIntent, DurableTransactionKey, IdempotencyEpoch,
+    DurableTransactionIntent, DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
 };
 use crate::runtime::{CodecError, DurabilityError};
 
@@ -28,7 +28,14 @@ use super::intent_codec::{
     encode_transaction_intent,
 };
 
-const METADATA_CODEC_VERSION: u16 = 15;
+const METADATA_CODEC_VERSION: u16 = 17;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableCheckpointRealizationBinding {
+    pub revision: RevisionId,
+    pub encoded_len: u64,
+    pub crc32c: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct DurableStoreMetadata {
@@ -39,11 +46,13 @@ pub(crate) struct DurableStoreMetadata {
     pub physical_artifacts: Vec<DurablePhysicalArtifactSpec>,
     pub artifact_cores: Vec<DurableArtifactCore>,
     pub migration_complements: Vec<DurableMigrationComplement>,
+    pub historical_epoch_anchors: BTreeMap<RevisionEffectId, HistoricalEpochAnchor>,
     pub committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
     pub semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     pub causal_coverage_root: Option<RevisionId>,
     pub revision_effects: BTreeMap<RevisionEffectId, DurableRevisionEffectRecord>,
     pub revision_effect_frontiers: BTreeMap<RevisionId, BTreeSet<RevisionEffectId>>,
+    pub checkpoint_realization: Option<DurableCheckpointRealizationBinding>,
 }
 
 type DecodedRevisionEffectState = (
@@ -88,6 +97,16 @@ pub(crate) fn encode_into(
     encode_physical_artifact_specs(out, &metadata.physical_artifacts)?;
     encode_artifact_cores(out, &metadata.artifact_cores)?;
     encode_migration_complements(out, &metadata.migration_complements)?;
+    push_len(out, metadata.historical_epoch_anchors.len())?;
+    for (effect_id, anchor) in &metadata.historical_epoch_anchors {
+        if effect_id != &anchor.effect_id {
+            return Err(CodecError::CollectionTooLarge);
+        }
+        push_u128(out, effect_id.0);
+        push_u64(out, anchor.source_revision.raw());
+        push_u64(out, anchor.source_schema.raw());
+        push_u64(out, anchor.generation);
+    }
     push_len(out, metadata.committed_transactions.len())?;
     for (key, intent) in &metadata.committed_transactions {
         if key.epoch < metadata.minimum_retry_epoch
@@ -113,6 +132,7 @@ pub(crate) fn encode_into(
         &metadata.revision_effect_frontiers,
     )?;
     encode_external_freshness(out, metadata.external_freshness);
+    encode_checkpoint_realization(out, metadata.checkpoint_realization);
     Ok(())
 }
 
@@ -170,6 +190,25 @@ fn decode_from_cursor(
     } else {
         Vec::new()
     };
+    let historical_epoch_anchors = if version >= 16 {
+        let count = cursor.len()?;
+        let mut anchors = BTreeMap::new();
+        for _ in 0..count {
+            let effect_id = RevisionEffectId(cursor.u128()?);
+            let anchor = HistoricalEpochAnchor {
+                effect_id,
+                source_revision: RevisionId::new(cursor.u64()?),
+                source_schema: SchemaRevisionId::new(cursor.u64()?),
+                generation: cursor.u64()?,
+            };
+            if anchors.insert(effect_id, anchor).is_some() {
+                return Err("historical epoch anchors are not unique by effect identity");
+            }
+        }
+        anchors
+    } else {
+        BTreeMap::new()
+    };
 
     let transaction_count = cursor.len()?;
     let mut committed_transactions = BTreeMap::new();
@@ -225,6 +264,11 @@ fn decode_from_cursor(
     } else {
         None
     };
+    let checkpoint_realization = if version >= 17 {
+        decode_checkpoint_realization(cursor)?
+    } else {
+        None
+    };
     cursor.finish()?;
     Ok(DurableStoreMetadata {
         external_freshness,
@@ -234,12 +278,42 @@ fn decode_from_cursor(
         physical_artifacts,
         artifact_cores,
         migration_complements,
+        historical_epoch_anchors,
         committed_transactions,
         semantic_modules,
         causal_coverage_root,
         revision_effects,
         revision_effect_frontiers,
+        checkpoint_realization,
     })
+}
+
+fn encode_checkpoint_realization(
+    out: &mut impl crate::binary_codec::BinarySink,
+    binding: Option<DurableCheckpointRealizationBinding>,
+) {
+    let Some(binding) = binding else {
+        out.push(0);
+        return;
+    };
+    out.push(1);
+    push_u64(out, binding.revision.raw());
+    push_u64(out, binding.encoded_len);
+    out.extend_from_slice(&binding.crc32c.to_le_bytes());
+}
+
+fn decode_checkpoint_realization(
+    cursor: &mut impl BinarySource,
+) -> Result<Option<DurableCheckpointRealizationBinding>, &'static str> {
+    match cursor.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(DurableCheckpointRealizationBinding {
+            revision: RevisionId::new(cursor.u64()?),
+            encoded_len: cursor.u64()?,
+            crc32c: cursor.u32()?,
+        })),
+        _ => Err("invalid checkpoint realization binding tag"),
+    }
 }
 
 fn encode_external_freshness(

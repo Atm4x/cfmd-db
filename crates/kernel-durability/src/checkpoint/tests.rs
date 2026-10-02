@@ -1,9 +1,9 @@
 use kernel_model::{DatabaseState, Value};
 use kernel_revision::Revision;
 use kernel_schema::{
-    CapabilityDef, FieldDef, RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext,
-    SemanticEnvironment, StructuralEquivalenceDef, StructuralOrderingDef, Symbol, SymbolKind,
-    TypeExpr, TypeVar,
+    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext,
+    RuleValueExpr, SemanticEnvironment, SemanticRuleExpr, StructuralEquivalenceDef, StructuralOrderingDef, Symbol, SymbolKind,
+    TextPattern, TypeExpr, TypeVar,
 };
 use kernel_semantics::{EquivalenceModule, OrderingModule, SemanticRegistry};
 use kernel_types::{EntityId, RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
@@ -76,6 +76,40 @@ fn complex_revision() -> (Revision, SemanticRegistry) {
             owner: entity_type,
             value: TypeExpr::Scalar(ScalarType::Text),
         })
+        .unwrap();
+    schema
+        .add_field_rule(
+            field,
+            FieldRule::TextMatches(TextPattern::concat([
+                TextPattern::literal("a"),
+                TextPattern::zero_or_more(TextPattern::AnyScalar),
+            ])),
+        )
+        .unwrap();
+    schema
+        .add_field_rule(
+            field,
+            FieldRule::Expr(SemanticRuleExpr::And(vec![
+                SemanticRuleExpr::TextLength {
+                    value: RuleValueExpr::Input,
+                    min: 1,
+                    max: Some(16),
+                },
+                SemanticRuleExpr::Not(Box::new(SemanticRuleExpr::False)),
+            ])),
+        )
+        .unwrap();
+    schema
+        .add_entity_rule(
+            entity_type,
+            SemanticRuleExpr::TextMatches {
+                value: RuleValueExpr::Field(field),
+                pattern: TextPattern::concat([
+                    TextPattern::literal("a"),
+                    TextPattern::zero_or_more(TextPattern::AnyScalar),
+                ]),
+            },
+        )
         .unwrap();
     schema
         .define_capability(CapabilityDef {

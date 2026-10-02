@@ -1,17 +1,24 @@
 use super::{
-    AdvisorTelemetry, AggregateSpec, ArtifactTelemetry, BTreeMap, BTreeSet, DurableRuntime, ExecutionStats, I64IndexBinding, LayoutBinding, LayoutId, OrderComparison, OrderDirection, PhysicalCapability, PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy, PhysicalRecoveryReport, PhysicalStore, PreparedPlan, RelExpr, RelQueryError, RelType, RelationValue, SemanticId, SemanticIndexBinding, TelemetryDecayPolicy, UnifiedAdvisorPolicy, UnifiedArtifactId, Value,
+    AdvisorTelemetry, AggregateSpec, ArtifactTelemetry, BTreeMap, BTreeSet, DurableRuntime,
+    ExecutionStats, I64IndexBinding, LayoutBinding, LayoutId, OrderComparison, OrderDirection,
+    PhysicalCapability, PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy,
+    PhysicalRecoveryReport, PhysicalStore, PreparedPlan, RelExpr, RelQueryError, RelType,
+    RelationValue, SemanticId, SemanticIndexBinding, TelemetryDecayPolicy, UnifiedAdvisorPolicy,
+    UnifiedArtifactId, Value,
 };
-use crate::native_relation::{native_column_count};
-use crate::semantic_rows::relation_value_from_rows;
+use crate::execution::{
+    OrderFilterSpec, execute_anti_join_plan, execute_difference_plan, execute_distinct_plan,
+    execute_filter_columns, execute_filter_const, execute_filter_order, execute_group_plan,
+    execute_join_plan, execute_project_plan, execute_top_k_plan, execute_union_plan, scan_rows,
+    try_execute_native_fast_path,
+};
 use crate::multiway::{
     PreparedAnchorPullbackProgram, PreparedSemanticQuotientProgram,
     prepared_quotient_acceleration_available, try_execute_anchor_pullback_join,
     try_execute_multiway_join, try_execute_nway_order_preserving_join,
 };
-use crate::execution::{
-    execute_anti_join_plan, execute_difference_plan, execute_distinct_plan, execute_filter_columns, execute_filter_const, execute_filter_order, execute_group_plan, execute_join_plan, execute_project_plan,
-    execute_top_k_plan, scan_rows, try_execute_native_fast_path, OrderFilterSpec,
-};
+use crate::native_relation::native_column_count;
+use crate::semantic_rows::relation_value_from_rows;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhysicalExecutionError {
@@ -50,6 +57,9 @@ pub enum PhysicalExecutionError {
     CandidateViolationStateNonZero,
     RepairObservationTransportMismatch,
     RepairTransport(kernel_transport::TransportError),
+    MigrationTransport(kernel_transport::TransportError),
+    MissingMigrationSourceRelation(SemanticId),
+    MissingMigrationTargetRelation(SemanticId),
     ResolutionRequiresSingleRelationRewrite,
     ResolutionCoherenceEndpointMismatch,
     Validation(kernel_validation::ValidationError),
@@ -198,6 +208,10 @@ pub enum Plan {
         equivalence: SemanticId,
     },
     Difference {
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+    Union {
         left: Box<Self>,
         right: Box<Self>,
     },
@@ -496,6 +510,7 @@ pub struct PlanShape {
     pub projects: usize,
     pub joins: usize,
     pub differences: usize,
+    pub unions: usize,
     pub anti_joins: usize,
     pub distincts: usize,
     pub groups: usize,
@@ -506,7 +521,12 @@ pub struct PlanShape {
 impl PlanShape {
     #[must_use]
     pub const fn stateful_operator_upper_bound(self) -> usize {
-        self.distincts + self.joins + self.differences + self.anti_joins + self.groups + self.top_k
+        self.distincts
+            + self.joins
+            + self.differences
+            + self.unions
+            + self.anti_joins
+            + self.groups
+            + self.top_k
     }
 }
-

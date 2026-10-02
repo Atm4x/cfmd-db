@@ -381,7 +381,9 @@ impl PhysicalStore {
                 resolved_delta,
                 physical_delta.removed.iter().map(|(id, _)| *id).collect(),
                 physical_delta.inserted.iter().map(|(id, _)| *id).collect(),
-            ),
+                context,
+                registry,
+            )?,
             physical_delta,
         ))
     }

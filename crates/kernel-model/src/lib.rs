@@ -296,19 +296,19 @@ mod tests {
         ));
         let original_stable = match &original.model.relations.0[&stable_relation].0 {
             SharedRelationRowsRepr::Materialized(rows) => rows,
-            SharedRelationRowsRepr::AppendPatch(_) => panic!("unexpected patch"),
+            SharedRelationRowsRepr::DeltaRoot(_) => panic!("unexpected patch"),
         };
         let candidate_stable = match &candidate.model.relations.0[&stable_relation].0 {
             SharedRelationRowsRepr::Materialized(rows) => rows,
-            SharedRelationRowsRepr::AppendPatch(_) => panic!("unexpected patch"),
+            SharedRelationRowsRepr::DeltaRoot(_) => panic!("unexpected patch"),
         };
         let original_changed = match &original.model.relations.0[&changed_relation].0 {
             SharedRelationRowsRepr::Materialized(rows) => rows,
-            SharedRelationRowsRepr::AppendPatch(_) => panic!("unexpected patch"),
+            SharedRelationRowsRepr::DeltaRoot(_) => panic!("unexpected patch"),
         };
         let candidate_changed = match &candidate.model.relations.0[&changed_relation].0 {
             SharedRelationRowsRepr::Materialized(rows) => rows,
-            SharedRelationRowsRepr::AppendPatch(_) => panic!("unexpected patch"),
+            SharedRelationRowsRepr::DeltaRoot(_) => panic!("unexpected patch"),
         };
         assert!(Arc::ptr_eq(original_stable, candidate_stable));
         assert!(!Arc::ptr_eq(original_changed, candidate_changed));
@@ -321,20 +321,20 @@ mod tests {
         let base = SharedRelationRows::from(vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
         let appended = base.append_persistent(vec![vec![Value::I64(3)]]);
 
-        let SharedRelationRowsRepr::AppendPatch(patch) = &appended.0 else {
-            panic!("append must create a persistent patch");
+        let SharedRelationRowsRepr::DeltaRoot(_) = &appended.0 else {
+            panic!("append must create a persistent delta root");
         };
-        assert!(patch.materialized.get().is_none());
-        assert_eq!(base.as_slice(), &[vec![Value::I64(1)], vec![Value::I64(2)]]);
+        assert!(!appended.has_materialized_projection());
+        assert_eq!(base.to_vec(), vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
         assert_eq!(
-            appended.as_slice(),
-            &[
+            appended.to_vec(),
+            vec![
                 vec![Value::I64(1)],
                 vec![Value::I64(2)],
                 vec![Value::I64(3)]
             ]
         );
-        assert!(patch.materialized.get().is_some());
+        assert!(!appended.has_materialized_projection());
     }
 
     #[test]

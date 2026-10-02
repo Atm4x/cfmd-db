@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+mod access;
 mod blocker;
 mod composition;
 mod delta_abi;
@@ -24,6 +25,7 @@ mod relation_state;
 mod relational_operators;
 mod scalar_query;
 mod topk;
+pub use access::RelReadFootprint;
 pub use delta_abi::{
     AdaptiveDelta, BinaryDeltaKernel, CompactDelta, CompiledDeltaEdgeIdentity, DeltaSink,
     DeltaView, ExactDelta, ExactDeltaSink, ExactDeltaView, ExactWeighted, InlineDelta,
@@ -71,10 +73,12 @@ use relation_oracles::{
     relation_values_semantically_equivalent, rows_as_multisets_equivalent_by_matching,
     unmatched_semantic_rows_by_matching,
 };
-pub use relational_operators::{anti_join_relation_values, difference_relation_values};
+pub use relational_operators::{
+    anti_join_relation_values, difference_relation_values, union_relation_values,
+};
 use relational_operators::{
-    distinct_rows, group_relation_value, query_types_compatible, relation_column_equivalence,
-    validate_query_equivalence, value_shape_matches_type,
+    distinct_rows, distinct_rows_with_canonical_keys, group_relation_value, query_types_compatible,
+    relation_column_equivalence, validate_query_equivalence, value_shape_matches_type,
 };
 pub use scalar_query::{
     ExactQuery, Expr, Impact, QueryError, QueryResult, QueryTypeError, derivative_by_recompute,
@@ -97,7 +101,8 @@ use kernel_change::{
 };
 use kernel_model::Value;
 pub use prepared_rel::PreparedRelExpr;
-use quotient::{CanonicalRowKey, CanonicalRowPositionIndex, canonical_row_key};
+pub use quotient::{CanonicalRowKey, canonical_row_key};
+use quotient::CanonicalRowPositionIndex;
 pub use recursive_query::{
     CompactRecursiveBag, FixpointCall, PositiveRecursiveRowAtom, PositiveRecursiveRowRule,
 };
@@ -111,8 +116,10 @@ use rel_model::{relation_column_equivalences, relation_value_from_rows};
 use relation_state::apply_relation_delta_to_value;
 use relation_state::validate_exact_delta_view_rows;
 pub use relation_state::{
-    MaterializedRelDeltaState, MaterializedSetSupportState, PreparedRelationRewrite,
-    RelationBaseWitness, RelationDelta, StorageResolvedRelationDelta,
+    CertifiedCanonicalRowKey, MaterializedRelDeltaState, MaterializedSetSupportState,
+    PreparedRelationRewrite, RelationBaseWitness, RelationDelta, RelationOccurrenceCertificate,
+    RelationRowCanonicalizer, RelationScanOccurrenceSeed, RelationWitnessStorageProbe,
+    RelationWitnessStorageStats, StorageResolvedRelationDelta,
 };
 pub use topk::MaterializedTopKDeltaState;
 

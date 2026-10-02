@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use kernel_change::RevisionEffectId;
 use kernel_revision::Revision;
 use kernel_types::SchemaRevisionId;
 
 use super::publication_protocol::{NoStoreFault, StoreFaultHook};
 use super::{DurableGenerationReceipt, DurableRevisionStore};
 use crate::domain::{
-    DurableMigrationComplement, HistoricalComplementError, LocalHistoricalComplementChain,
+    DurableMigrationComplement, HistoricalComplementError, HistoricalEpochAnchor,
+    LocalHistoricalComplementChain, MigrationPhysicalAuthority, SchemaMigrationPhysicalState,
 };
 use crate::runtime::DurabilityError;
 
@@ -213,6 +215,102 @@ impl DurableRevisionStore {
         &self.migration_complements
     }
 
+    #[must_use]
+    pub fn historical_epoch_anchors(&self) -> &BTreeMap<RevisionEffectId, HistoricalEpochAnchor> {
+        &self.historical_epoch_anchors
+    }
+
+    /// Returns physical progress for every committed schema migration without
+    /// consulting a second progress journal.  A migration is pending physical
+    /// materialization exactly while its target lives above the active
+    /// checkpoint frontier.
+    pub fn schema_migration_physical_states(
+        &self,
+    ) -> Result<Vec<SchemaMigrationPhysicalState>, DurabilityError> {
+        let checkpoint_revision = self.checkpoint.id();
+        let checkpoint_effects = self
+            .revision_effect_ideal(checkpoint_revision)?
+            .map(|ideal| ideal.events().keys().copied().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        let mut states = Vec::new();
+        for record in self.revision_effects.values() {
+            let Some(event) = record.semantic_change_event() else {
+                continue;
+            };
+            let authority = if checkpoint_effects.contains(&event.effect_id) {
+                MigrationPhysicalAuthority::NativeCheckpoint {
+                    generation: self.generation,
+                    checkpoint_revision,
+                }
+            } else {
+                let anchor = self.historical_epoch_anchors.get(&event.effect_id).ok_or(
+                    DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "pending schema migration is missing source epoch authority",
+                    },
+                )?;
+                MigrationPhysicalAuthority::WalForwardCutover {
+                    source_generation: anchor.generation,
+                    checkpoint_revision,
+                }
+            };
+            states.push(SchemaMigrationPhysicalState {
+                effect_id: event.effect_id,
+                source_revision: event.source_revision,
+                target_revision: event.target_revision,
+                source_schema: event.source_schema,
+                target_schema: event.target_schema,
+                authority,
+            });
+        }
+        Ok(states)
+    }
+
+    /// Materializes all currently pending semantic cutovers into one native
+    /// checkpoint.  This is storage maintenance only: no revision/effect is
+    /// appended.  Multiple pending migrations collapse into one checkpoint
+    /// publication rather than forcing one rewrite per semantic boundary.
+    pub fn materialize_pending_schema_migrations(
+        &mut self,
+        revision: &Revision,
+    ) -> Result<Option<DurableGenerationReceipt>, DurabilityError> {
+        let pending = self
+            .schema_migration_physical_states()?
+            .into_iter()
+            .any(|state| state.authority.is_pending());
+        if !pending {
+            return Ok(None);
+        }
+        self.rotate_checkpoint(revision).map(Some)
+    }
+
+    pub(super) fn pinned_historical_generations(&self) -> BTreeSet<u64> {
+        self.pinned_historical_generations_for(self.checkpoint_realization.as_ref())
+    }
+
+    pub(super) fn pinned_historical_generations_for(
+        &self,
+        realization: Option<&crate::realization::DurableFactorizedRealization>,
+    ) -> BTreeSet<u64> {
+        self.historical_epoch_anchors
+            .values()
+            .filter(|anchor| {
+                let Some(physical) = realization else {
+                    return true;
+                };
+                let Some(root) = physical.historical_root(anchor.effect_id) else {
+                    return true;
+                };
+                root.revision() != anchor.source_revision
+                    || root.semantic_context().is_none_or(|context| {
+                        context.revision().schema != anchor.source_schema
+                            || self.semantic_registry.validate_context(context).is_err()
+                    })
+            })
+            .map(|anchor| anchor.generation)
+            .collect()
+    }
+
     /// Resolves the exact locally-restorable complement chain between schema
     /// revisions. Retention policy is enforced here: released local payload,
     /// explicit Forget, and external-archive authority are never silently
@@ -273,6 +371,49 @@ impl DurableRevisionStore {
 }
 
 impl DurableRevisionStore {
+    /// Irreversibly releases the local physical authority retained for one
+    /// semantic migration boundary. The causal migration event and any
+    /// migration-complement record remain intact; only `db.at(...)` style
+    /// materialization through this anchor is retired.
+    ///
+    /// The release itself is published as a fresh checkpoint generation so
+    /// single-file historical closures stop being carried only after the new
+    /// root is authoritative. Unknown/already-released effects are a no-op.
+    pub fn release_historical_epoch_authority(
+        &mut self,
+        revision: &Revision,
+        effect_id: RevisionEffectId,
+    ) -> Result<Option<DurableGenerationReceipt>, DurabilityError> {
+        self.release_historical_epoch_authority_with_hook(revision, effect_id, &mut NoStoreFault)
+    }
+
+    fn release_historical_epoch_authority_with_hook(
+        &mut self,
+        revision: &Revision,
+        effect_id: RevisionEffectId,
+        hook: &mut impl StoreFaultHook,
+    ) -> Result<Option<DurableGenerationReceipt>, DurabilityError> {
+        if revision.id() != self.durable_head {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "historical epoch release revision does not match durable WAL head",
+            });
+        }
+        let Some(anchor) = self.historical_epoch_anchors.remove(&effect_id) else {
+            return Ok(None);
+        };
+        let previous_realization = self.checkpoint_realization.clone();
+        if let Some(realization) = self.checkpoint_realization.as_mut() {
+            realization.release_historical_root(effect_id);
+        }
+        let result = self.rotate_checkpoint_current_specs_with_hook(revision, hook);
+        if result.is_err() && !self.poisoned {
+            self.historical_epoch_anchors.insert(effect_id, anchor);
+            self.checkpoint_realization = previous_realization;
+        }
+        result.map(Some)
+    }
+
     /// Publishes one logical migration-complement step in a fresh checkpoint
     /// generation before the corresponding schema transition is committed.
     /// An interrupted later transition may leave an orphan step, but can never
@@ -364,6 +505,15 @@ impl DurableRevisionStore {
 
 #[cfg(test)]
 impl DurableRevisionStore {
+    pub(super) fn test_release_historical_epoch_authority_with_hook(
+        &mut self,
+        revision: &Revision,
+        effect_id: RevisionEffectId,
+        hook: &mut impl StoreFaultHook,
+    ) -> Result<Option<DurableGenerationReceipt>, DurabilityError> {
+        self.release_historical_epoch_authority_with_hook(revision, effect_id, hook)
+    }
+
     pub(super) fn test_stage_migration_complement_with_hook(
         &mut self,
         revision: &Revision,

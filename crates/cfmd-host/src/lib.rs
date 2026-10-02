@@ -483,12 +483,7 @@ where
             .refresh_permissions(grant.permissions().clone())
             .map_err(|_| host_internal())?;
         *connection.expires_at.lock().map_err(|_| host_internal())? = grant.expires_at();
-        if !grant
-            .permissions()
-            .contains(cfmd_runtime::Permission::Watch)
-        {
-            let _ = connection.wire.cancel_all_watches();
-        }
+        connection.wire.reauthorize_watches().map_err(|_| host_internal())?;
         Ok(())
     }
 

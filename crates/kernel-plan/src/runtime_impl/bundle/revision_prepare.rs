@@ -202,17 +202,20 @@ impl RuntimeRevisionBundle {
             let base = self.relation_bases.get(&mutation.relation).ok_or(
                 PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation),
             )?;
-            relation_bases.insert(
-                mutation.relation,
-                base.advance(target_revision, mutation.delta, request.registry)?,
-            );
+            let resolved_delta = resolved.get(&mutation.relation).ok_or(
+                PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation),
+            )?;
+            let next_base = base.advance_storage_resolved(target_revision, resolved_delta)?;
+            relation_bases.insert(mutation.relation, next_base);
         }
+        let mut candidate_revision = request.target_revision.clone();
+        candidate_revision.detach_relation_materialized_projections();
         let candidate = RuntimeRevisionBundle {
             root_identity: RuntimeRootIdentity {
                 root_id: self.root_identity.root_id,
                 version: RuntimeRootVersion(candidate_version),
             },
-            revision: request.target_revision.clone(),
+            revision: candidate_revision,
             violation_state,
             physical: candidate_store,
             relation_layouts: self.relation_layouts.clone(),
@@ -224,12 +227,14 @@ impl RuntimeRevisionBundle {
         };
         let descriptor = RevisionCommitDescriptor {
             source_revision,
-            target: Box::new(request.target_revision.clone()),
+            target: Box::new(candidate.revision.clone()),
             change: RevisionCommitChange::RelationData {
                 semantic_revision: self.revision.semantic_revision(),
                 relation_deltas,
             },
             rewrite_intents: BTreeMap::new(),
+            object_field_writes: request.mutations.iter().filter(|mutation| !mutation.object_field_writes.is_empty()).map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec())).collect(),
+            relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != Default::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
         };
         Ok(PreparedRuntimeRevisionTransition {
             descriptor,
@@ -278,6 +283,8 @@ impl RuntimeRevisionBundle {
             mutations.push(RevisionRelationMutation {
                 relation: relation_rewrite.relation,
                 delta: relation_rewrite.rewrite.delta(),
+                object_field_writes: &[],
+                authorization: Default::default(),
             });
             rewrite_intents.insert(
                 relation_rewrite.relation,
@@ -405,10 +412,11 @@ impl RuntimeRevisionBundle {
             let base = self.relation_bases.get(&mutation.relation).ok_or(
                 PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation),
             )?;
-            relation_bases.insert(
-                mutation.relation,
-                base.advance(target_revision, mutation.delta, request.registry)?,
-            );
+            let resolved_delta = resolved.get(&mutation.relation).ok_or(
+                PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation),
+            )?;
+            let next_base = base.advance_storage_resolved(target_revision, resolved_delta)?;
+            relation_bases.insert(mutation.relation, next_base);
         }
 
         let candidate = RuntimeRevisionBundle {
@@ -438,6 +446,8 @@ impl RuntimeRevisionBundle {
                     model_complement: Box::new(request.model_complement.clone()),
                 },
                 rewrite_intents: BTreeMap::new(),
+                object_field_writes: request.mutations.iter().filter(|mutation| !mutation.object_field_writes.is_empty()).map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec())).collect(),
+                relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != Default::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
             },
             source_identity: self.root_identity,
             candidate: Box::new(candidate),
@@ -477,8 +487,7 @@ impl RuntimeRevisionBundle {
                 .state()
                 .model
                 .relations
-                .get(&relation.id)
-                .cloned()
+                .materialize_owned(&relation.id)
                 .unwrap_or_default();
             physical.install(
                 relation.id,
@@ -513,6 +522,8 @@ impl RuntimeRevisionBundle {
                 target: Box::new(request.target_revision.clone()),
                 change: RevisionCommitChange::FullRevision,
                 rewrite_intents: BTreeMap::new(),
+                object_field_writes: BTreeMap::new(),
+                relation_authorizations: BTreeMap::new(),
             },
             source_identity: self.root_identity,
             candidate: Box::new(candidate),
@@ -552,8 +563,7 @@ impl RuntimeRevisionBundle {
                 .state()
                 .model
                 .relations
-                .get(&relation.id)
-                .cloned()
+                .materialize_owned(&relation.id)
                 .unwrap_or_default();
             physical.install(
                 relation.id,
@@ -581,6 +591,8 @@ impl RuntimeRevisionBundle {
                 target: Box::new(request.target_revision.clone()),
                 change: RevisionCommitChange::FullRevisionAndMaterializations { materializations },
                 rewrite_intents: BTreeMap::new(),
+                object_field_writes: BTreeMap::new(),
+                relation_authorizations: BTreeMap::new(),
             },
             source_identity: self.root_identity,
             candidate: Box::new(candidate),
@@ -609,11 +621,13 @@ impl RuntimeRevisionBundle {
             if materializations.contains_key(&spec.id) {
                 return Err(PhysicalExecutionError::DuplicateMaterialization(spec.id));
             }
-            let mut maintained = MaterializedRelPlanState::build(
+            let scan_seeds = Self::materialization_scan_seeds(&spec.query, &self.relation_bases)?;
+            let mut maintained = MaterializedRelPlanState::build_with_scan_seeds(
                 &spec.query,
                 &self.revision.state().model,
                 self.revision.semantic_context(),
                 registry,
+                &scan_seeds,
             )?;
             for relation in maintained.scan_relations() {
                 let layout = self.relation_layouts.get(&relation).copied().ok_or(
@@ -713,7 +727,7 @@ impl RuntimeRevisionBundle {
             let Some(expected_rows) = target.model.relations.get(&relation) else {
                 return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
             };
-            if actual.into_rows() != *expected_rows {
+            if *expected_rows != actual.into_rows() {
                 return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
             }
         }

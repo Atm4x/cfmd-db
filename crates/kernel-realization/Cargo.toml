@@ -1,0 +1,23 @@
+[package]
+name = "kernel-realization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-aggregate = { path = "../kernel-aggregate" }
+kernel-change = { path = "../kernel-change" }
+kernel-lifecycle = { path = "../kernel-lifecycle" }
+kernel-model = { path = "../kernel-model" }
+kernel-persistent = { path = "../kernel-persistent" }
+kernel-query = { path = "../kernel-query" }
+kernel-schema = { path = "../kernel-schema" }
+kernel-semantics = { path = "../kernel-semantics" }
+kernel-transport = { path = "../kernel-transport" }
+kernel-types = { path = "../kernel-types" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+kernel-revision = { path = "../kernel-revision" }

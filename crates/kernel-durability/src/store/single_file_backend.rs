@@ -12,6 +12,7 @@ use crate::descriptor::{
 use crate::domain::IdempotencyEpoch;
 use crate::metadata;
 use crate::replication::authority::ReplicationAuthorityJournal;
+use crate::realization::DurableFactorizedRealization;
 use crate::runtime::{DurabilityError, RecoveryScan};
 use crate::single_file::{
     SingleFileContainer, SingleFileSectionInput, SingleFileSectionKind, SingleFileSectionSource,
@@ -55,6 +56,23 @@ impl SingleFileSectionSource for MetadataSectionSource<'_> {
         emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
     ) -> Result<(), DurabilityError> {
         metadata::stream(self.0, emit)
+    }
+}
+
+pub(super) struct FactorizedRealizationSectionSource<'a>(
+    pub(super) &'a DurableFactorizedRealization,
+);
+
+impl SingleFileSectionSource for FactorizedRealizationSectionSource<'_> {
+    fn plaintext_len(&self) -> Result<u64, DurabilityError> {
+        self.0.encoded_len()
+    }
+
+    fn write_to(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+    ) -> Result<(), DurabilityError> {
+        self.0.stream(emit)
     }
 }
 
@@ -175,6 +193,7 @@ impl DurableRevisionStore {
             physical_artifacts: physical_artifact_specs.clone(),
             artifact_cores: artifact_cores.to_vec(),
             migration_complements: Vec::new(),
+            historical_epoch_anchors: BTreeMap::new(),
             committed_transactions: BTreeMap::new(),
             semantic_modules: registry
                 .builtin_modules_for_context(base_revision.semantic_context())
@@ -185,6 +204,7 @@ impl DurableRevisionStore {
             causal_coverage_root: Some(causal_coverage_root),
             revision_effects: revision_effects.clone(),
             revision_effect_frontiers: revision_effect_frontiers.clone(),
+            checkpoint_realization: None,
         };
         let checkpoint_source = RevisionSectionSource(base_revision);
         let metadata_source = MetadataSectionSource(&metadata_record);
@@ -214,8 +234,10 @@ impl DurableRevisionStore {
             semantic_registry: registry.clone(),
             materialization_specs: materialization_specs.to_vec(),
             physical_artifact_specs,
+            checkpoint_realization: None,
             artifact_cores: artifact_cores.to_vec(),
             migration_complements: Vec::new(),
+            historical_epoch_anchors: BTreeMap::new(),
             migration_complement_index: BTreeMap::new(),
             current_idempotency_epoch: IdempotencyEpoch::ZERO,
             minimum_retry_epoch: IdempotencyEpoch::ZERO,
@@ -327,11 +349,30 @@ impl DurableRevisionStore {
                 || Ok(PreparedCutCapsule::default()),
                 |bytes| decode_prepared_cut_capsule(&bytes),
             )?;
+        let checkpoint_realization = container
+            .with_section_reader(SingleFileSectionKind::PhysicalArtifact, 0, |reader, len| {
+                DurableFactorizedRealization::decode_from_reader(reader, len)
+            })?;
+        if checkpoint_realization
+            .as_ref()
+            .is_some_and(|physical| physical.revision() != checkpoint.id())
+        {
+            return Err(DurabilityError::Corruption {
+                offset: 0,
+                reason: "durable physical realization revision does not match checkpoint cut",
+            });
+        }
         let view = container.generation_view()?;
         let seeds = prepared_capsule.scan_seeds();
         let (wal, scan) =
             container.open_journal_recovered(checkpoint.id(), view.journal_first_lsn, &seeds)?;
-        let canonical = recover_canonical_state(metadata, checkpoint, &scan, legacy_registry)?;
+        let canonical = recover_canonical_state(
+            metadata,
+            checkpoint,
+            &scan,
+            view.generation,
+            legacy_registry,
+        )?;
         let replication =
             container.recover_replication_authority_journal(scan.replication_authority_frames())?;
         let prepared_transactions = PreparedTransactionLedger::from_recovery_scan(&scan);
@@ -342,6 +383,7 @@ impl DurableRevisionStore {
             replication,
         );
         store.prepared_transactions = prepared_transactions;
+        store.checkpoint_realization = checkpoint_realization;
         Ok((store, scan))
     }
 
@@ -351,6 +393,7 @@ impl DurableRevisionStore {
         materialization_specs: &[DurableMaterializationSpec],
         physical_artifact_specs: &[DurablePhysicalArtifactSpec],
         artifact_cores: &[DurableArtifactCore],
+        physical_realization: Option<&DurableFactorizedRealization>,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
         let physical_artifact_specs = canonical_physical_artifact_specs(physical_artifact_specs);
         let metadata_record = metadata::DurableStoreMetadata {
@@ -364,6 +407,7 @@ impl DurableRevisionStore {
             physical_artifacts: physical_artifact_specs.clone(),
             artifact_cores: artifact_cores.to_vec(),
             migration_complements: self.migration_complements.clone(),
+            historical_epoch_anchors: self.historical_epoch_anchors.clone(),
             committed_transactions: self.committed_transactions.clone(),
             semantic_modules: self
                 .semantic_registry
@@ -375,6 +419,7 @@ impl DurableRevisionStore {
             causal_coverage_root: Some(self.causal_coverage_root),
             revision_effects: self.revision_effects.clone(),
             revision_effect_frontiers: self.revision_effect_frontiers.clone(),
+            checkpoint_realization: None,
         };
         let checkpoint_source = RevisionSectionSource(revision);
         let metadata_source = MetadataSectionSource(&metadata_record);
@@ -387,7 +432,7 @@ impl DurableRevisionStore {
         let replication_frames = self
             .replication
             .single_file_live_frames_prefix(replication_live_count)?;
-        let sections = [
+        let mut sections = vec![
             SingleFileSectionInput::streaming(
                 SingleFileSectionKind::Checkpoint,
                 0,
@@ -400,9 +445,32 @@ impl DurableRevisionStore {
                 &prepared_bytes,
             ),
         ];
+        let physical_source = physical_realization.map(FactorizedRealizationSectionSource);
+        if let Some(source) = physical_source.as_ref() {
+            sections.push(SingleFileSectionInput::streaming(
+                SingleFileSectionKind::PhysicalArtifact,
+                0,
+                source,
+            ));
+        }
+        let retained_historical_generations =
+            self.pinned_historical_generations_for(physical_realization);
+        let archive_outgoing = retained_historical_generations
+            .contains(&self.generation)
+            .then_some(crate::single_file::HistoricalGenerationArchive {
+                generation: self.generation,
+                checkpoint_revision: self.checkpoint.id(),
+                durable_head: self.durable_head,
+            });
         let container = self.backend.single_file_container()?;
         let view = container
-            .publish_generation_after_active_wal(&mut self.wal, &sections, replication_frames)
+            .publish_generation_after_active_wal(
+                &mut self.wal,
+                &sections,
+                replication_frames,
+                archive_outgoing,
+                &retained_historical_generations,
+            )
             .inspect_err(|_| self.poisoned = true)?;
         let seeds = prepared_capsule.scan_seeds();
         let (wal, scan) = container
@@ -417,6 +485,7 @@ impl DurableRevisionStore {
         }
         self.generation = view.generation;
         self.checkpoint = revision.clone();
+        self.checkpoint_realization = physical_realization.cloned();
         self.wal = wal;
         self.replication.reset_single_file_generation();
         self.materialization_specs = materialization_specs.to_vec();

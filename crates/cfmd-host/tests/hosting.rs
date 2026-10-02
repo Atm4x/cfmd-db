@@ -355,7 +355,7 @@ fn channel_binding_is_explicit_and_authenticator_owned() {
 }
 
 #[test]
-fn authorization_refresh_revokes_watch_without_closing_session() {
+fn authorization_refresh_revokes_watch_when_exact_read_footprint_disappears() {
     let (directory, database, relation) = fixture();
     let grant = Arc::new(std::sync::Mutex::new(
         AuthorizationGrant::new(permissions()),
@@ -397,18 +397,13 @@ fn authorization_refresh_revokes_watch_without_closing_session() {
     assert_eq!(connection.in_flight_requests(), 1);
 
     *grant.lock().expect("grant lock") = AuthorizationGrant::new(PermissionSet::from([
-        Permission::Read,
+        Permission::Watch,
         Permission::HistoryRead,
     ]));
     server
         .refresh_authorization(&connection)
         .expect("refresh authorization");
-    assert!(
-        !connection
-            .permissions()
-            .expect("permissions")
-            .contains(Permission::Watch)
-    );
+    assert!(connection.permissions().expect("permissions").contains(Permission::Watch));
     assert!(!connection.is_closed());
 
     let response = waiter
@@ -417,9 +412,9 @@ fn authorization_refresh_revokes_watch_without_closing_session() {
         .expect("watch close response");
     let (_, response) = decode_response_frame(&response, wire_limits).expect("decode watch close");
     let WireResponse::Error { code, .. } = response else {
-        panic!("watch must terminate after Watch grant removal")
+        panic!("watch must terminate after exact read-footprint revocation")
     };
-    assert_eq!(code, ProtocolErrorCode::WatchClosed);
+    assert_eq!(code, ProtocolErrorCode::PermissionDenied);
 
     connection.close();
     drop(connection);

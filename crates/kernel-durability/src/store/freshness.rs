@@ -21,6 +21,7 @@ use super::checkpoint_storage::{
 use super::format_registry::{DurableFormatRegistry, LEGACY_CHECKPOINT_FORMAT_VERSION};
 use super::generation_layout::{
     checkpoint_chunk_path, checkpoint_path, manifest_path, metadata_path, prepared_capsule_path,
+    realization_path,
 };
 use super::{DurableGenerationReceipt, DurableRevisionStore};
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +344,13 @@ pub(super) fn generation_material_digest(
     if prepared.is_file() {
         material.push(1);
         material.extend_from_slice(&sha256_file(&prepared)?.0);
+    } else {
+        material.push(0);
+    }
+    let realization = realization_path(directory, generation);
+    if realization.is_file() {
+        material.push(1);
+        material.extend_from_slice(&sha256_file(&realization)?.0);
     } else {
         material.push(0);
     }

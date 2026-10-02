@@ -1,3 +1,93 @@
+## PASS379 — stable field identity across Rust renames
+
+- `#[cfmd(rename_from = "old_name")]` now separates the current Rust field name from the durable semantic field name used by CFMD equivalence/order/reference coordinates.
+- Partial Context projection, exact object binding, scalar patches, reference contracts and field orderings all resolve through the durable semantic name rather than the current identifier.
+- Old same-key readers using the previous field name can therefore read and patch a database created from the renamed authoritative entity; persisted Semantic Rules continue to govern the same coordinate.
+- Derive rejects duplicate durable field identities and invalid/redundant `rename_from` declarations. Field names remain the default semantic identity when no rename metadata is present.
+
+## PASS375 — entity-owned rule DX + schema composition R&D
+
+- `#[derive(CfmdEntity)]` now carries database-owned scalar rules directly on Rust fields through `#[cfmd(range(...))]`, `#[cfmd(length(...))]`, and `#[cfmd(one_of(...))]`.
+- Removed `SchemaBuilder::object_field_rule`; object rules no longer attach later through a string field name. Generated entity metadata installs them on the actual object-relation columns during schema assembly.
+- Rule attributes are deterministic schema literals rather than arbitrary Rust expressions, and incompatible field/rule combinations fail at derive time.
+- Schema-composition DX was reviewed separately from implementation; the preferred direction is an explicit user-selected schema root whose named `EntitySet<T>` fields are both membership declarations and the eventual typed collection facade. No global/autodiscovery registry is planned.
+
+## PASS374 — database-owned semantic field rules foundation
+
+- Added schema-authoritative typed value rules for `I64Range`, `TextLength`, and finite `TextOneOf` membership; rules attach to kernel fields or relation columns rather than living in application callbacks.
+- P374's temporary object-rule attachment API was superseded and removed by P375; entity derive metadata now maps field rules directly to their actual relation-column authority.
+- Candidate/commit validation rejects violating states through the existing revision validation boundary; dynamic VMF also exposes exact rule witnesses.
+- Checkpoint codec v3 persists field and relation-column rules; hostile public coverage proves a rule still rejects invalid candidates after reopen.
+- Regex remains OPEN until CFMD owns a deterministic pattern engine/module contract; no ad-hoc parser or host regex callback was introduced.
+
+## PASS373 — mixed/object certified residual commit
+
+- Extended dual durable client-intent vs realized-effect authority from relation-only commits to mixed/object transitions.
+- Certified stale object commits now rebuild from current HEAD, Γ-residualize relation effects, apply the certified model delta, and derive exact realized model delta/complement for history and recovery.
+- Durable `MixedRevisionResidualExact` keeps original relation/model intent stable for retries while WAL/history/recovery retain the realized transition.
+- Hostile regression covers independent first object inserts sharing carrier creation, retry idempotency, exact undo of only the residual realization, and reopen.
+
+## PASS372 — stable client intent + realized residual commit
+
+- Added durable `RelationDataResidualExact`, separating canonical client retry identity from the exact residual relation effect realized against a certified newer HEAD.
+- WAL/metadata/recovery retain both mutation sets; history consumes realized mutations while idempotency compares client mutations.
+- `Database::commit(&tx)` now residualizes certified pure relation-data Set effects by Γ-class and publishes even an empty residual as a durable no-op revision.
+- Hostile regression proves concurrent identical relationship attach, retry idempotency, single-edge state, and persistence reopen.
+
+## PASS369 — native Γ-aware Union and predicate disjunction
+
+- Added first-class relational `Union` across exact evaluation, maintained differential execution, execgraph state, transport, durable query encoding, and physical planning.
+- Set union is Γ-support union: rows selected by both branches remain one semantic row and are removed only when the final branch support disappears. Bag union is additive multiset union.
+- `ObjectPredicate::or(...)` now lowers directly to one native Union node instead of a De Morgan/Difference expansion or host callback.
+- Exact, Candidate and maintained-watch regression covers overlapping branches, matching insertions and irrelevant changes.
+
+## PASS368 — relationship cardinality predicates preserve zero-degree semantics
+
+- Replaced the facade-only `ManyCountEq` leaf with one `ManyCountPredicate` law while keeping `children.count().eq(n)` source syntax unchanged.
+- Relationship counts now support `ne`, `greater_than`, `greater_than_or_equal`, `less_than`, `less_than_or_equal`, and inclusive `between` through kernel Group/order/join/anti-join algebra.
+- Zero-degree owners are preserved mathematically rather than synthesized as fake aggregate rows: predicates rejecting zero join matching positive Group rows; predicates accepting zero anti-join only the positive groups that violate the predicate.
+- Exact, Candidate and maintained-watch regressions cover the zero-to-one transition without host-side maps, materialized relationship targets, or SQL-shaped fallback logic.
+
+## PASS367 — column equality + boolean negation + wide typed query shapes
+
+- `Field::eq(...)` now accepts either an ordinary value or another field of the same typed domain; field-to-field equality lowers directly to maintained `FilterEqColumns`.
+- `Field::ne(...)` and `ObjectPredicate::not()` use the existing maintained `Difference` algebra; no callback predicate or host-side filtering was introduced.
+- Typed `GroupKey` and projection tuples now extend beyond the former 3-column facade ceiling, with tuple support through arity 12 and const-generic homogeneous array keys/projections.
+- Exact, Candidate and watch regressions cover field equality; public tests also instantiate 4-column group/projection shapes and array projection.
+
+
+## PASS359 checkpoint 1 — transaction-owned relationship mutation DX
+
+- `Many<T>`, `OwnedMany<T>` and filtered relationship selections now write directly into `&mut Transaction`; ordinary relationship mutation no longer returns a user-visible `Plan`.
+- Advanced exact-plan construction remains available under explicit `*_plan` method names for tooling/protocol code.
+- Relationship mutations rebind evaluation to the transaction's single formation world, so one transaction cannot silently compose edge operations evaluated at different revisions.
+- Filtered selections are re-evaluated against that formation world without materializing target Rust objects merely to obtain identities.
+- Owned relationship mutation keeps exclusivity, orphan policy and derived preview effects on the same existing Plan/Candidate kernel path.
+
+## PASS358 — Passive transaction + database-owned CRUD DX
+
+- Ordinary writes now start with `Transaction::new()`; no database, revision, `Plan`, or `TransactionId` is required at construction.
+- `Database::objects::<T>()` / `SessionDatabase::objects::<T>()` expose current object collections directly.
+- `ObjectSet::add/remove` and `ObjectQuery::update/delete` write explicitly into `&mut Transaction`; plan construction remains internal.
+- `Transaction::from(snapshot)` is the explicit strict-snapshot mode and refuses silent transport after HEAD changes.
+- Adaptive transaction IDs are generated lazily from the operating-system CSPRNG on first exact mutation.
+- Deterministic transaction IDs remain a hidden protocol/testing escape hatch; `commit_plan` remains the explicit low-level publication path.
+
+## PASS357 — stable semantic transaction identity and automatic certified commit
+
+- separated client semantic intent identity from one concrete source/target durable realization without adding a second retry ledger or hash authority;
+- made relation/mixed durable intents compare canonical forward effect and pinned semantic authority for retry identity while retaining exact realization bytes for recovery;
+- enabled `Database::commit(&tx)` to certify and publish an older transaction on current HEAD when kernel-change/runtime history proves transport safe;
+- preserved fail-closed conflicts and made retry after transported commit return `AlreadyCommitted` with the actual published revision;
+- added durability regression proving revision-recertified intents remain the same client intent while different payloads do not.
+
+## PASS355 — semantic transaction readiness and merge-kernel bridge
+
+- Connected product transaction readiness/preview to Γ-canonical causal conflict certification.
+- Added runtime prospective transition rebase certificates and product `TransactionReadiness`.
+- Kept durable commit revision-pinned until transport-stable semantic intent identity exists.
+- Identified durable action-law loss (`EnsurePresent` collapsing to coordinate overlap) as the next merge-productization blocker.
+
 - P353: replaced abbreviated public ordered-predicate methods with `greater_than/greater_than_or_equal/less_than/less_than_or_equal`, removed the pre-release aliases, and mechanically split P352 ordered-query dispatch paths to restore strict Clippy without semantic changes.
 ## Pass350 — Python hostile/product validation
 - P352: added Γ-native ordered/range predicates (`greater_than/greater_than_or_equal/less_than/less_than_or_equal/between`) with exact maintained-watch deltas and stable per-field ordering identities.
@@ -328,3 +418,65 @@
 - Brought single-file bootstrap artifact-core handling to parity with directory bootstrap.
 - Kept publication notification as a database-runtime builder option and hosting/authentication outside database file creation.
 - Added `DatabaseHostingExt::{host, host_with_limits}` in `cfmd-host` for `db.host(...)` composition without a runtime→host dependency cycle.
+
+## Pass354 — database-owned transaction control surface
+
+- Superseded self-publishing `Transaction::preview/commit` with database-owned `Database::preview(&tx)` and `Database::commit(&tx)`.
+- Replaced `Transaction::apply(plan)` with `Transaction::add(plan)` to make composition read as mutation of the transaction container rather than mutation of the database.
+- Removed public `Candidate::commit`; Candidate is inspectable proposed state only.
+- Renamed the advanced raw-plan publication path to `Database::commit_plan` / `SessionDatabase::commit_plan`.
+- Added database-identity and session-authority checks at preview/publication control points.
+- Removed `Plan` from the ordinary `cfmd::prelude`; low-level plan construction remains available explicitly.
+- Added `docs/api/CFMD_DX_CONTROL_MODEL_RU.md` as the control-surface law for subsequent DX refactors.
+
+## Pass356
+
+- carried kernel-change `RewriteActionLaw` through runtime causal footprints for forward transaction transport;
+- added a coordinate-domain-independent action-map classifier in kernel-change;
+- set relation deltas now expose exact presence laws while bag deltas remain coordination-required until multiplicity laws are represented;
+- model carrier-presence and lifecycle facts retain presence laws, while entity carrier membership remains conservative to prevent same-identity/different-payload false merges;
+- transaction conflicts now distinguish definite conflict effects from exact effects that still require coordination;
+- added hostile regressions for independent first-object inserts and preserved same-identity conflict behavior.
+
+## Pass360 — unified history mutation DX + ordered hostile closure
+
+- Added database-owned `undo(&mut Transaction, &HistoryEntry)` and `undo_latest(&mut Transaction)`; normal history mutation no longer requires application code to construct or publish `Plan` directly.
+- Added the same undo surface to `SessionDatabase` with explicit write/history permission and session-authority checks.
+- Kept `HistoryEntry::undo_plan()` / raw Plan publication as the advanced tooling/protocol path; no second history mutation engine was added.
+- Restored and extended hostile public coverage for Γ `F64Total`: `NaN`, `-0.0`, `+0.0`, infinities, exact predicates, and maintained watch delta/no-empty-event behavior.
+- Preserved Pass359 relationship mutation DX: `Many`, `OwnedMany`, and filtered selections accumulate directly into `&mut Transaction` while ownership/orphan/derived-preview semantics remain kernel-backed.
+- Removed the obsolete short `Transaction::add(Plan)` alias from the ordinary public surface; explicit low-level composition is now only `add_plan`, while normal application mutation stays resource + `&mut Transaction` + payload.
+
+## Pass361 — composed predicates and ordered-boundary DX
+
+- Exposed maintained `TopKWithTies` through ordinary object queries and made conjunction composable without callback/materialization fallback.
+- Kept Γ ordering, boundary ties and watch maintenance identical between exact and incremental execution.
+
+## Pass362 — exact count and stronger ordered naming
+
+- Replaced SDK-side `rows/ids -> len()` count paths with kernel `Group + ExactCount`.
+- Collapsed ordered-boundary naming to ordinary `top` / `bottom`; their semantics remain tie-preserving rather than exact-k truncation.
+
+## Pass363 — multiplicity-preserving projection and grouped aggregates
+
+- Corrected object `select` to preserve source multiplicity using kernel-native `PromoteToBag -> Project`; explicit `.distinct()` applies maintained Γ quotienting.
+- Added typed `group_by(...).count()` and exact-f64 `group_by(...).sum(...)` over the existing kernel `Group`, with live/Candidate parity.
+
+## Pass364 — aggregate query values and maintained aggregate watches
+
+- Changed grouped `count` / exact-f64 `sum` from terminal materialization into typed aggregate query values.
+- The same aggregate expression now supports exact `.all()` and maintained `.watch()`; watch events are the exact Group delta, not recomputed snapshots.
+- Candidate grouped aggregates use the same result-shape abstraction without introducing a second aggregate engine.
+- `one_or_none()` cardinality checks now use kernel `ExactCount` before decoding an object/projection, avoiding full-result materialization merely to decide 0/1/>1.
+
+## Pass365 — aggregate ordered-boundary composition
+
+- Grouped `count()` and exact-f64 `sum(...)` queries can now continue into `top(k)` / `bottom(k)` without materialization.
+- Aggregate boundaries lower to the existing kernel `Group -> TopKWithTies` calculus and retain all Γ-equal groups at the boundary rather than truncating to exactly `k` rows.
+- Live exact reads, Candidate reads, and maintained watches share the same aggregate-boundary expression; no Rust-side aggregate sort or watch recomputation path was added.
+
+## Pass366 — composite Γ grouping
+
+- Generalized ordinary `group_by` from a single field to one typed group-key law; `(field_a, field_b)` and three-field tuple keys lower directly to kernel `Group { group_columns, group_equivalences }`.
+- Composite grouped count/sum keep exact, Candidate, maintained-watch, and `top`/`bottom` semantics on the same query expression; aggregate ordering uses the column after the complete group key.
+- No `group_by2/group_by3`, host-language map regrouping, or tuple-specific execution engine was introduced.

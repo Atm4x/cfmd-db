@@ -2557,7 +2557,7 @@ mod relational_tests {
                 let old = model_for(old_mask);
                 let change = Change::Replace(model_for(next_mask));
                 let old_projected = project_rows(
-                    old.relations.get(&relation).cloned().unwrap_or_default(),
+                    old.relations.materialize_owned(&relation).unwrap_or_default(),
                     &[0],
                 )
                 .unwrap();
@@ -5359,9 +5359,9 @@ mod relational_tests {
         ];
         for (left_delta, right_delta) in steps {
             let old_left =
-                RelationValue::Bag(old.relations.get(&left).cloned().unwrap_or_default());
+                RelationValue::Bag(old.relations.materialize_owned(&left).unwrap_or_default());
             let old_right =
-                RelationValue::Bag(old.relations.get(&right).cloned().unwrap_or_default());
+                RelationValue::Bag(old.relations.materialize_owned(&right).unwrap_or_default());
             let next_left =
                 apply_relation_delta_to_value(old_left, &left_delta, &context, &registry).unwrap();
             let next_right =
@@ -5531,7 +5531,10 @@ mod relational_tests {
                 slot: 1,
                 generation: 1,
             }],
-        );
+            &context,
+            &registry,
+        )
+        .unwrap();
         let mut resolved_next = old.clone();
         resolved_next.relations.get_mut(&left).unwrap().remove(1);
         resolved_next
@@ -5606,7 +5609,7 @@ mod relational_tests {
             deltas.insert(relation, delta.clone());
             let mut next = old.clone();
             let old_value =
-                RelationValue::Bag(next.relations.get(&relation).cloned().unwrap_or_default());
+                RelationValue::Bag(next.relations.materialize_owned(&relation).unwrap_or_default());
             next.relations.insert(
                 relation,
                 apply_relation_delta_to_value(old_value, &delta, &context, &registry)
@@ -5727,7 +5730,7 @@ mod relational_tests {
             let mut leaf = BTreeMap::new();
             leaf.insert(relation, delta.clone());
             let old_value =
-                RelationValue::Bag(old.relations.get(&relation).cloned().unwrap_or_default());
+                RelationValue::Bag(old.relations.materialize_owned(&relation).unwrap_or_default());
             let next_value =
                 apply_relation_delta_to_value(old_value, &delta, &context, &registry).unwrap();
             let mut next = old.clone();
@@ -5753,6 +5756,117 @@ mod relational_tests {
             );
             old = next;
         }
+    }
+
+    #[test]
+    fn maintained_scan_shares_factorized_relation_occurrence_witness_without_recanonicalization() {
+        let (context, registry, _, relation, _) = setup();
+        let rows = vec![
+            vec![Value::Text("Alpha".into()), Value::I64(1)],
+            vec![Value::Text("Beta".into()), Value::I64(2)],
+            vec![Value::Text("Gamma".into()), Value::I64(3)],
+        ];
+        let mut model = FiniteModel::default();
+        model.relations.insert(relation, rows.clone());
+        let query = RelExpr::Scan(relation);
+        let result_type = query.typecheck(&context, &registry).unwrap();
+        let witness = RelationBaseWitness::build(
+            RevisionId::new(0),
+            relation,
+            &rows,
+            result_type,
+            &context,
+            &registry,
+        )
+        .unwrap();
+        let storage_rows = rows
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(slot, row)| {
+                (
+                    kernel_types::StableRowHandle {
+                        slot,
+                        generation: 0,
+                    },
+                    row,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state =
+            MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        state
+            .attach_storage_rows_with_base_witness(relation, &storage_rows, &witness)
+            .unwrap();
+        let shared = state
+            .storage_relation_base_witness(relation)
+            .unwrap()
+            .unwrap();
+        assert!(witness.certifies_same_base(&shared));
+        assert!(witness.shares_occurrence_root_with(&shared));
+
+        let delta = RelationDelta {
+            inserted: vec![vec![Value::Text("Delta".into()), Value::I64(4)]],
+            removed: vec![rows[1].clone()],
+            result_type: query.typecheck(&context, &registry).unwrap(),
+        };
+        let resolved = StorageResolvedRelationDelta::from_parts(
+            relation,
+            delta.clone(),
+            vec![kernel_types::StableRowHandle {
+                slot: 1,
+                generation: 0,
+            }],
+            vec![kernel_types::StableRowHandle {
+                slot: 3,
+                generation: 0,
+            }],
+            &context,
+            &registry,
+        )
+        .unwrap();
+        state.bind_revision(RevisionId::new(90)).unwrap();
+        let (next_state, _) = state
+            .candidate_from_storage_resolved_deltas_for_revision(
+                RevisionId::new(91),
+                &BTreeMap::from([(relation, resolved)]),
+                &context,
+                &registry,
+            )
+            .unwrap();
+        let shared_after = next_state
+            .storage_relation_base_witness(relation)
+            .unwrap()
+            .unwrap();
+        let expected_after = witness
+            .advance(RevisionId::new(0), &delta, &registry)
+            .unwrap();
+        assert!(expected_after.certifies_same_base(&shared_after));
+        assert!(!witness.shares_occurrence_root_with(&shared_after));
+
+        let forged_handles = storage_rows
+            .iter()
+            .enumerate()
+            .map(|(slot, (_, row))| {
+                (
+                    kernel_types::StableRowHandle {
+                        slot: slot + 10,
+                        generation: 7,
+                    },
+                    row.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut rejected =
+            MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        assert_eq!(
+            rejected.attach_storage_rows_with_base_witness(
+                relation,
+                &forged_handles,
+                &witness,
+            ),
+            Err(RelQueryError::StructuralRewriteBaseMismatch)
+        );
     }
 
     #[test]
@@ -5799,7 +5913,10 @@ mod relational_tests {
             delta,
             vec![alpha_handle],
             Vec::new(),
-        );
+            &context,
+            &registry,
+        )
+        .unwrap();
         let map = BTreeMap::from([(relation, forged)]);
         state.bind_revision(RevisionId::new(9_101)).unwrap();
 
@@ -6193,6 +6310,13 @@ mod relational_tests {
 #[cfg(test)]
 mod positive_recursive_query_tests {
     use super::*;
+    use kernel_model::FiniteModel;
+    use kernel_schema::{
+        RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext, SemanticEnvironment,
+        TypeExpr,
+    };
+    use kernel_semantics::{EquivalenceModule, SemanticRegistry};
+    use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
 
     fn bag_type() -> RelType {
         RelType {
@@ -6294,4 +6418,1736 @@ mod positive_recursive_query_tests {
             Err(RelQueryError::RecursiveAtomOutsideCarrier)
         );
     }
+
+    #[test]
+    fn set_union_and_difference_execution_certificates_reuse_gamma_support_as_relation_witness() {
+        let eq = SemanticId::new(91_000);
+        let left = SemanticId::new(91_001);
+        let right = SemanticId::new(91_002);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(910));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(910));
+        for relation in [left, right] {
+            schema
+                .define_relation(RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                    semantics: RelationSemantics::Set {
+                        column_equivalences: vec![eq],
+                    },
+                })
+                .unwrap();
+        }
+        let context = SemanticContext { schema, environment };
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            left,
+            vec![vec![Value::Text("Alpha".into())], vec![Value::Text("beta".into())]],
+        );
+        model.relations.insert(
+            right,
+            vec![vec![Value::Text("ALPHA".into())], vec![Value::Text("Gamma".into())]],
+        );
+        let query = RelExpr::Union {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(right)),
+        };
+        let (value, certificate) = query
+            .evaluate_with_occurrence_certificate(&model, &context, &registry)
+            .unwrap();
+        assert_eq!(value.rows().len(), 3);
+        assert_eq!(certificate.row_count(), 3);
+        let witness = RelationBaseWitness::from_occurrence_certificate(
+            RevisionId::new(0),
+            SemanticId::new(91_003),
+            certificate.clone(),
+            query.typecheck(&context, &registry).unwrap(),
+            &context,
+            &registry,
+        )
+        .unwrap();
+        assert!(certificate.shares_occurrence_root_with(&witness));
+
+        let difference = RelExpr::Difference {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(right)),
+        }
+        .prepare(&context, &registry)
+        .unwrap();
+        assert!(difference.emits_occurrence_certificate());
+        let (value, certificate) = difference
+            .evaluate_with_occurrence_certificate(&model, &context, &registry)
+            .unwrap();
+        assert_eq!(value.rows(), &[vec![Value::Text("beta".into())]]);
+        let witness = RelationBaseWitness::from_occurrence_certificate(
+            RevisionId::new(0),
+            SemanticId::new(91_004),
+            certificate.clone(),
+            difference.result_type().clone(),
+            &context,
+            &registry,
+        )
+        .unwrap();
+        assert!(certificate.shares_occurrence_root_with(&witness));
+    }
+
+    #[test]
+    fn quotient_operators_emit_exact_occurrence_certificate_without_second_gamma_pass() {
+        let text_eq = SemanticId::new(91_020);
+        let i64_eq = SemanticId::new(91_021);
+        let set_relation = SemanticId::new(91_022);
+        let bag_relation = SemanticId::new(91_023);
+        let target = SemanticId::new(91_024);
+        let mut registry = SemanticRegistry::default();
+        let text_digest =
+            registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(912));
+        environment.pin_module(text_eq, text_digest);
+        environment.pin_module(i64_eq, i64_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(912));
+        schema
+            .define_relation(RelationDef {
+                id: set_relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::Text),
+                    TypeExpr::Scalar(ScalarType::I64),
+                ],
+                semantics: RelationSemantics::Set {
+                    column_equivalences: vec![text_eq, i64_eq],
+                },
+            })
+            .unwrap();
+        schema
+            .define_relation(RelationDef {
+                id: bag_relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::Text),
+                    TypeExpr::Scalar(ScalarType::I64),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![text_eq, i64_eq],
+                },
+            })
+            .unwrap();
+        let context = SemanticContext { schema, environment };
+        let mut model = FiniteModel::default();
+        let rows = vec![
+            vec![Value::Text("Alpha".into()), Value::I64(1)],
+            vec![Value::Text("ALPHA".into()), Value::I64(2)],
+            vec![Value::Text("Beta".into()), Value::I64(3)],
+        ];
+        model.relations.insert(set_relation, rows.clone());
+        model.relations.insert(bag_relation, rows);
+
+        let queries = [
+            RelExpr::Project {
+                input: Box::new(RelExpr::Scan(set_relation)),
+                columns: vec![0],
+            },
+            RelExpr::Distinct {
+                input: Box::new(RelExpr::Project {
+                    input: Box::new(RelExpr::Scan(bag_relation)),
+                    columns: vec![0],
+                }),
+                column_equivalences: vec![text_eq],
+            },
+        ];
+
+        for query in queries {
+            let prepared = query.prepare(&context, &registry).unwrap();
+            assert!(prepared.emits_occurrence_certificate());
+            let (value, certificate) = prepared
+                .evaluate_with_occurrence_certificate(&model, &context, &registry)
+                .unwrap();
+            assert_eq!(value.rows().len(), 2);
+            assert_eq!(certificate.row_count(), 2);
+            let witness = RelationBaseWitness::from_occurrence_certificate(
+                RevisionId::new(0),
+                target,
+                certificate.clone(),
+                prepared.result_type().clone(),
+                &context,
+                &registry,
+            )
+            .unwrap();
+            assert!(certificate.shares_occurrence_root_with(&witness));
+        }
+
+        let bag_projection = RelExpr::Project {
+            input: Box::new(RelExpr::Scan(bag_relation)),
+            columns: vec![0],
+        }
+        .prepare(&context, &registry)
+        .unwrap();
+        assert!(!bag_projection.emits_occurrence_certificate());
+        assert_eq!(
+            bag_projection
+                .evaluate_with_occurrence_certificate(&model, &context, &registry)
+                .unwrap_err(),
+            RelQueryError::CanonicalObservationUnavailable
+        );
+
+        let group = RelExpr::Group {
+            input: Box::new(RelExpr::Scan(bag_relation)),
+            group_columns: vec![0],
+            group_equivalences: vec![text_eq],
+            aggregate: AggregateSpec::Count {
+                result_equivalence: i64_eq,
+            },
+        }
+        .prepare(&context, &registry)
+        .unwrap();
+        assert!(!group.emits_occurrence_certificate());
+        assert_eq!(
+            group
+                .evaluate_with_occurrence_certificate(&model, &context, &registry)
+                .unwrap_err(),
+            RelQueryError::CanonicalObservationUnavailable
+        );
+    }
+
+    #[test]
+    fn set_join_composes_child_full_row_certificates_without_output_recanonicalization() {
+        let text_eq = SemanticId::new(91_080);
+        let i64_eq = SemanticId::new(91_081);
+        let left = SemanticId::new(91_082);
+        let right = SemanticId::new(91_083);
+        let target = SemanticId::new(91_084);
+        let mut registry = SemanticRegistry::default();
+        let text_digest =
+            registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916));
+        environment.pin_module(text_eq, text_digest);
+        environment.pin_module(i64_eq, i64_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916));
+        for relation in [left, right] {
+            schema
+                .define_relation(RelationDef {
+                    id: relation,
+                    columns: vec![
+                        TypeExpr::Scalar(ScalarType::Text),
+                        TypeExpr::Scalar(ScalarType::I64),
+                    ],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![text_eq, i64_eq],
+                    },
+                })
+                .unwrap();
+        }
+        let context = SemanticContext { schema, environment };
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            left,
+            vec![
+                vec![Value::Text("Alpha".into()), Value::I64(1)],
+                vec![Value::Text("Beta".into()), Value::I64(2)],
+            ],
+        );
+        model.relations.insert(
+            right,
+            vec![
+                vec![Value::Text("ALPHA".into()), Value::I64(10)],
+                vec![Value::Text("alpha".into()), Value::I64(11)],
+                vec![Value::Text("Gamma".into()), Value::I64(12)],
+            ],
+        );
+
+        let distinct = |relation| RelExpr::Distinct {
+            input: Box::new(RelExpr::Scan(relation)),
+            column_equivalences: vec![text_eq, i64_eq],
+        };
+        let query = RelExpr::JoinEq {
+            left: Box::new(distinct(left)),
+            right: Box::new(distinct(right)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        };
+        let prepared = query.prepare(&context, &registry).unwrap();
+        assert!(prepared.emits_occurrence_certificate());
+        let (value, certificate) = prepared
+            .evaluate_with_occurrence_certificate(&model, &context, &registry)
+            .unwrap();
+        assert_eq!(value.rows().len(), 2);
+        assert!(value.rows().iter().all(|row| {
+            matches!(&row[0], Value::Text(value) if value.eq_ignore_ascii_case("alpha"))
+                && matches!(&row[2], Value::Text(value) if value.eq_ignore_ascii_case("alpha"))
+        }));
+        assert_eq!(certificate.row_count(), 2);
+        let witness = RelationBaseWitness::from_occurrence_certificate(
+            RevisionId::new(0),
+            target,
+            certificate.clone(),
+            prepared.result_type().clone(),
+            &context,
+            &registry,
+        )
+        .unwrap();
+        assert!(certificate.shares_occurrence_root_with(&witness));
+
+        let unsupported = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(distinct(right)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        }
+        .prepare(&context, &registry)
+        .unwrap();
+        assert!(!unsupported.emits_occurrence_certificate());
+        assert_eq!(
+            unsupported
+                .evaluate_with_occurrence_certificate(&model, &context, &registry)
+                .unwrap_err(),
+            RelQueryError::CanonicalObservationUnavailable
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode compositional Set Join occurrence certificate benchmark"]
+    fn set_join_compositional_occurrence_certificate_scale_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let i64_eq = SemanticId::new(91_090);
+        let left = SemanticId::new(91_091);
+        let right = SemanticId::new(91_092);
+        let target = SemanticId::new(91_093);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(917));
+        environment.pin_module(i64_eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(917));
+        for relation in [left, right] {
+            schema
+                .define_relation(RelationDef {
+                    id: relation,
+                    columns: vec![
+                        TypeExpr::Scalar(ScalarType::I64),
+                        TypeExpr::Scalar(ScalarType::I64),
+                    ],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![i64_eq, i64_eq],
+                    },
+                })
+                .unwrap();
+        }
+        let context = SemanticContext { schema, environment };
+        let rows = 100_000usize;
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            left,
+            (0..rows)
+                .map(|index| vec![Value::I64(index as i64), Value::I64(index as i64)])
+                .collect(),
+        );
+        model.relations.insert(
+            right,
+            (0..rows)
+                .map(|index| {
+                    vec![
+                        Value::I64(index as i64),
+                        Value::I64((index as i64).wrapping_mul(3)),
+                    ]
+                })
+                .collect(),
+        );
+        let distinct = |relation| RelExpr::Distinct {
+            input: Box::new(RelExpr::Scan(relation)),
+            column_equivalences: vec![i64_eq, i64_eq],
+        };
+        let prepared = RelExpr::JoinEq {
+            left: Box::new(distinct(left)),
+            right: Box::new(distinct(right)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: i64_eq,
+        }
+        .prepare(&context, &registry)
+        .unwrap();
+        assert!(prepared.emits_occurrence_certificate());
+
+        for run in 1..=3 {
+            let baseline_start = Instant::now();
+            let value = prepared.evaluate(&model, &context, &registry).unwrap();
+            let witness = RelationBaseWitness::build(
+                RevisionId::new(0),
+                target,
+                value.rows(),
+                prepared.result_type().clone(),
+                &context,
+                &registry,
+            )
+            .unwrap();
+            let baseline = baseline_start.elapsed();
+            drop(witness);
+
+            let certified_start = Instant::now();
+            let (value, certificate) = prepared
+                .evaluate_with_occurrence_certificate(&model, &context, &registry)
+                .unwrap();
+            let witness = RelationBaseWitness::from_occurrence_certificate(
+                RevisionId::new(0),
+                target,
+                certificate,
+                prepared.result_type().clone(),
+                &context,
+                &registry,
+            )
+            .unwrap();
+            let certified = certified_start.elapsed();
+            black_box((value, witness));
+
+            eprintln!(
+                "SET_JOIN_COMPOSED_OCC_CERT_PERF run={run} rows={rows} baseline_ms={:.3} certified_ms={:.3} ratio={:.3}x",
+                baseline.as_secs_f64() * 1_000.0,
+                certified.as_secs_f64() * 1_000.0,
+                certified.as_secs_f64() / baseline.as_secs_f64(),
+            );
+        }
+    }
+
+    #[test]
+    fn anti_join_composes_left_occurrence_certificate_without_full_row_recanonicalization() {
+        let text_eq = SemanticId::new(91_060);
+        let i64_eq = SemanticId::new(91_061);
+        let source_bag = SemanticId::new(91_062);
+        let direct_set = SemanticId::new(91_063);
+        let blockers = SemanticId::new(91_064);
+        let blockers_second = SemanticId::new(91_065);
+        let target = SemanticId::new(91_066);
+        let mut registry = SemanticRegistry::default();
+        let text_digest =
+            registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(914));
+        environment.pin_module(text_eq, text_digest);
+        environment.pin_module(i64_eq, i64_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(914));
+        schema
+            .define_relation(RelationDef {
+                id: source_bag,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::Text),
+                    TypeExpr::Scalar(ScalarType::I64),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![text_eq, i64_eq],
+                },
+            })
+            .unwrap();
+        schema
+            .define_relation(RelationDef {
+                id: direct_set,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::Text),
+                    TypeExpr::Scalar(ScalarType::I64),
+                ],
+                semantics: RelationSemantics::Set {
+                    column_equivalences: vec![text_eq, i64_eq],
+                },
+            })
+            .unwrap();
+        for relation in [blockers, blockers_second] {
+            schema
+                .define_relation(RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                    semantics: RelationSemantics::Set {
+                        column_equivalences: vec![text_eq],
+                    },
+                })
+                .unwrap();
+        }
+        let context = SemanticContext { schema, environment };
+        let mut model = FiniteModel::default();
+        let source_rows = vec![
+            vec![Value::Text("Alpha".into()), Value::I64(1)],
+            vec![Value::Text("ALPHA".into()), Value::I64(2)],
+            vec![Value::Text("Beta".into()), Value::I64(3)],
+            vec![Value::Text("Gamma".into()), Value::I64(4)],
+        ];
+        model.relations.insert(source_bag, source_rows.clone());
+        model.relations.insert(direct_set, source_rows);
+        model
+            .relations
+            .insert(blockers, vec![vec![Value::Text("alpha".into())]]);
+        model
+            .relations
+            .insert(blockers_second, vec![vec![Value::Text("GAMMA".into())]]);
+
+        let left = RelExpr::Distinct {
+            input: Box::new(RelExpr::Scan(source_bag)),
+            column_equivalences: vec![text_eq, i64_eq],
+        };
+        let first = RelExpr::AntiJoin {
+            left: Box::new(left),
+            right: Box::new(RelExpr::Scan(blockers)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        };
+        let prepared = first.prepare(&context, &registry).unwrap();
+        assert!(prepared.emits_occurrence_certificate());
+        let baseline = prepared.evaluate(&model, &context, &registry).unwrap();
+        let (certified, certificate) = prepared
+            .evaluate_with_occurrence_certificate(&model, &context, &registry)
+            .unwrap();
+        assert_eq!(certified, baseline);
+        assert_eq!(
+            certified.rows(),
+            &[
+                vec![Value::Text("Beta".into()), Value::I64(3)],
+                vec![Value::Text("Gamma".into()), Value::I64(4)],
+            ]
+        );
+        let witness = RelationBaseWitness::from_occurrence_certificate(
+            RevisionId::new(0),
+            target,
+            certificate.clone(),
+            prepared.result_type().clone(),
+            &context,
+            &registry,
+        )
+        .unwrap();
+        assert!(certificate.shares_occurrence_root_with(&witness));
+
+        let nested = RelExpr::AntiJoin {
+            left: Box::new(first),
+            right: Box::new(RelExpr::Scan(blockers_second)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        }
+        .prepare(&context, &registry)
+        .unwrap();
+        assert!(nested.emits_occurrence_certificate());
+        let (nested_value, nested_certificate) = nested
+            .evaluate_with_occurrence_certificate(&model, &context, &registry)
+            .unwrap();
+        assert_eq!(
+            nested_value.rows(),
+            &[vec![Value::Text("Beta".into()), Value::I64(3)]]
+        );
+        assert_eq!(nested_certificate.row_count(), 1);
+
+        let unsupported_direct_scan = RelExpr::AntiJoin {
+            left: Box::new(RelExpr::Scan(direct_set)),
+            right: Box::new(RelExpr::Scan(blockers)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        }
+        .prepare(&context, &registry)
+        .unwrap();
+        assert!(!unsupported_direct_scan.emits_occurrence_certificate());
+        assert_eq!(
+            unsupported_direct_scan
+                .evaluate_with_occurrence_certificate(&model, &context, &registry)
+                .unwrap_err(),
+            RelQueryError::CanonicalObservationUnavailable
+        );
+    }
+
+    #[test]
+    fn physical_scan_witness_seeds_compositional_join_and_antijoin_without_recanonicalization() {
+        let text_eq = SemanticId::new(91_067);
+        let i64_eq = SemanticId::new(91_068);
+        let source = SemanticId::new(91_069);
+        let blockers = SemanticId::new(91_069_1);
+        let mut registry = SemanticRegistry::default();
+        let text_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(915));
+        environment.pin_module(text_eq, text_digest);
+        environment.pin_module(i64_eq, i64_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(915));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::Text), TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Set { column_equivalences: vec![text_eq, i64_eq] },
+        }).unwrap();
+        schema.define_relation(RelationDef {
+            id: blockers,
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Set { column_equivalences: vec![text_eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let source_rows = vec![
+            vec![Value::Text("Alpha".into()), Value::I64(1)],
+            vec![Value::Text("Beta".into()), Value::I64(2)],
+            vec![Value::Text("Gamma".into()), Value::I64(3)],
+        ];
+        let mut model = FiniteModel::default();
+        model.relations.insert(source, source_rows.clone());
+        model.relations.insert(blockers, vec![vec![Value::Text("ALPHA".into())]]);
+        let source_type = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &source_rows, source_type, &context, &registry,
+        ).unwrap();
+        let handles = (0..source_rows.len()).map(|slot| kernel_types::StableRowHandle { slot, generation: 0 }).collect::<Vec<_>>();
+        let seed = witness.scan_occurrence_seed(&handles).unwrap();
+        let scan_seeds = BTreeMap::from([(source, seed)]);
+        let seeded_relations = BTreeSet::from([source]);
+
+        let anti = RelExpr::AntiJoin {
+            left: Box::new(RelExpr::Scan(source)),
+            right: Box::new(RelExpr::Scan(blockers)),
+            left_column: 0, right_column: 0, equivalence: text_eq,
+        }.prepare(&context, &registry).unwrap();
+        assert!(!anti.emits_occurrence_certificate());
+        assert!(anti.emits_occurrence_certificate_with_scan_seeds(&seeded_relations));
+        let baseline = anti.evaluate(&model, &context, &registry).unwrap();
+        let (certified, cert) = anti.evaluate_with_occurrence_certificate_seeded(
+            &model, &context, &registry, &scan_seeds,
+        ).unwrap();
+        assert_eq!(certified, baseline);
+        assert_eq!(cert.row_count(), 2);
+
+        let join = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(source)),
+            right: Box::new(RelExpr::Scan(source)),
+            left_column: 0, right_column: 0, equivalence: text_eq,
+        }.prepare(&context, &registry).unwrap();
+        assert!(!join.emits_occurrence_certificate());
+        assert!(join.emits_occurrence_certificate_with_scan_seeds(&seeded_relations));
+        let baseline = join.evaluate(&model, &context, &registry).unwrap();
+        let (certified, cert) = join.evaluate_with_occurrence_certificate_seeded(
+            &model, &context, &registry, &scan_seeds,
+        ).unwrap();
+        assert_eq!(certified, baseline);
+        assert_eq!(cert.row_count(), 3);
+    }
+
+    #[test]
+    fn scan_occurrence_seed_advances_in_logical_survivor_order_without_recanonicalizing_base() {
+        let text_eq = SemanticId::new(91_069_10);
+        let source = SemanticId::new(91_069_11);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_1));
+        environment.pin_module(text_eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916_1));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Set { column_equivalences: vec![text_eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = vec![
+            vec![Value::Text("Alpha".into())],
+            vec![Value::Text("Beta".into())],
+            vec![Value::Text("Gamma".into())],
+        ];
+        let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &rows, ty.clone(), &context, &registry,
+        ).unwrap();
+        let handles = (0..rows.len())
+            .map(|slot| kernel_types::StableRowHandle { slot, generation: 0 })
+            .collect::<Vec<_>>();
+        let seed = witness.scan_occurrence_seed(&handles).unwrap();
+        let delta = RelationDelta {
+            removed: vec![vec![Value::Text("BETA".into())]],
+            inserted: vec![vec![Value::Text("Delta".into())]],
+            result_type: ty,
+        };
+        let next = seed.advance_logical_delta(&delta, &context, &registry).unwrap();
+
+        let mut model = FiniteModel::default();
+        model.relations.insert(source, vec![rows[0].clone(), rows[2].clone(), delta.inserted[0].clone()]);
+        let prepared = RelExpr::Distinct {
+            input: Box::new(RelExpr::Scan(source)),
+            column_equivalences: vec![text_eq],
+        }.prepare(&context, &registry).unwrap();
+        let seeded = BTreeMap::from([(source, next)]);
+        let value = prepared.evaluate_seeded(&model, &context, &registry, &seeded).unwrap();
+        assert_eq!(value.rows(), model.relations[&source].to_vec().as_slice());
+    }
+
+    #[test]
+    fn bag_base_witness_fifo_occurrences_match_logical_survivor_order() {
+        let text_eq = SemanticId::new(91_069_120);
+        let source = SemanticId::new(91_069_121);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_31));
+        environment.pin_module(text_eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916_31));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Bag { column_equivalences: vec![text_eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = vec![
+            vec![Value::Text("Alpha".into())],
+            vec![Value::Text("Beta".into())],
+            vec![Value::Text("ALPHA".into())],
+            vec![Value::Text("Gamma".into())],
+        ];
+        let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &rows, ty.clone(), &context, &registry,
+        ).unwrap();
+        let delta = RelationDelta {
+            removed: vec![vec![Value::Text("alpha".into())]],
+            inserted: vec![vec![Value::Text("Delta".into())]],
+            result_type: ty,
+        };
+        let next_witness = witness.advance(RevisionId::new(1), &delta, &registry).unwrap();
+        let seed = next_witness.logical_scan_occurrence_seed().unwrap();
+        let expected_rows = vec![
+            rows[1].clone(),
+            rows[2].clone(),
+            rows[3].clone(),
+            delta.inserted[0].clone(),
+        ];
+        let expected = expected_rows.iter()
+            .map(|row| canonical_row_key(row, &[text_eq], &context, &registry).unwrap())
+            .collect::<Vec<_>>();
+        let actual = seed.canonical_keys_by_row().iter().cloned().collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn bag_fifo_occurrence_bucket_survives_head_compaction() {
+        let eq = SemanticId::new(91_069_122);
+        let source = SemanticId::new(91_069_123);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_32));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916_32));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Bag { column_equivalences: vec![eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = (0..192).flat_map(|i| [vec![Value::I64(0)], vec![Value::I64(i + 1)]]).collect::<Vec<_>>();
+        let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &rows, ty.clone(), &context, &registry,
+        ).unwrap();
+        let delta = RelationDelta {
+            removed: (0..128).map(|_| vec![Value::I64(0)]).collect(),
+            inserted: vec![vec![Value::I64(10_000)]],
+            result_type: ty,
+        };
+        let next = witness.advance(RevisionId::new(1), &delta, &registry).unwrap();
+        let seed = next.logical_scan_occurrence_seed().unwrap();
+        let mut removals = 128usize;
+        let mut expected_rows = Vec::new();
+        for row in &rows {
+            if row == &vec![Value::I64(0)] && removals != 0 {
+                removals -= 1;
+            } else {
+                expected_rows.push(row.clone());
+            }
+        }
+        expected_rows.push(vec![Value::I64(10_000)]);
+        let expected = expected_rows.iter()
+            .map(|row| canonical_row_key(row, &[eq], &context, &registry).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(seed.canonical_keys_by_row().iter().cloned().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    #[ignore = "manual release-mode Bag witness-owned Scan evidence publication benchmark"]
+    fn bag_runtime_scan_seed_publication_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let eq = SemanticId::new(91_069_124);
+        let source = SemanticId::new(91_069_125);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_33));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916_33));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Bag { column_equivalences: vec![eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = (0..100_000usize).map(|i| vec![Value::I64((i % 1024) as i64)]).collect::<Vec<_>>();
+        let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &rows, ty.clone(), &context, &registry,
+        ).unwrap();
+        let handles = (0..rows.len()).map(|slot| kernel_types::StableRowHandle { slot, generation: 0 }).collect::<Vec<_>>();
+        let dense = witness.scan_occurrence_seed(&handles).unwrap();
+        let delta = RelationDelta {
+            removed: vec![vec![Value::I64(7)]],
+            inserted: vec![vec![Value::I64(2048)]],
+            result_type: ty,
+        };
+        for run in 0..5 {
+            let started = Instant::now();
+            let next = black_box(&dense).advance_logical_delta(black_box(&delta), &context, &registry).unwrap();
+            eprintln!("bag_dense_seed_publish run={run} ms={:.3} rows={}", started.elapsed().as_secs_f64()*1e3, next.row_count());
+        }
+        for run in 0..5 {
+            let started = Instant::now();
+            let next = black_box(&witness).advance(RevisionId::new(1), black_box(&delta), &registry).unwrap();
+            let seed = next.logical_scan_occurrence_seed().unwrap();
+            eprintln!("bag_witness_seed_publish run={run} ms={:.3} rows={}", started.elapsed().as_secs_f64()*1e3, seed.row_count());
+        }
+    }
+
+    #[test]
+    fn bag_seed_group_churn_keeps_witness_maintained_and_exact_views_coherent() {
+        let text_eq = SemanticId::new(91_069_126);
+        let i64_eq = SemanticId::new(91_069_127);
+        let source = SemanticId::new(91_069_128);
+        let mut registry = SemanticRegistry::default();
+        let text_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_34));
+        environment.pin_module(text_eq, text_digest);
+        environment.pin_module(i64_eq, i64_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916_34));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::Text), TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Bag { column_equivalences: vec![text_eq, i64_eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let query = RelExpr::Group {
+            input: Box::new(RelExpr::Scan(source)),
+            group_columns: vec![0],
+            group_equivalences: vec![text_eq],
+            aggregate: AggregateSpec::Count { result_equivalence: i64_eq },
+        };
+        let output_ty = query.typecheck(&context, &registry).unwrap();
+        let mut model = FiniteModel::default();
+        model.relations.insert(source, (0..192usize).map(|i| {
+            let name = match i % 3 { 0 => "Alpha", 1 => "BETA", _ => "gamma" };
+            vec![Value::Text(name.into()), Value::I64(i as i64)]
+        }).collect());
+        let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let source_rows = model.relations[&source].to_vec();
+        let mut witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &source_rows, ty.clone(), &context, &registry,
+        ).unwrap();
+        let seeds = BTreeMap::from([(source, witness.logical_scan_occurrence_seed().unwrap())]);
+        let mut maintained = MaterializedRelPlanState::build_with_scan_seeds(
+            &query, &model, &context, &registry, &seeds,
+        ).unwrap();
+
+        for step in 0..128usize {
+            let removed = model.relations.get_mut(&source).unwrap().remove(0);
+            let name = match step % 3 { 0 => "ALPHA", 1 => "beta", _ => "Gamma" };
+            let inserted = vec![Value::Text(name.into()), Value::I64((10_000 + step) as i64)];
+            model.relations.get_mut(&source).unwrap().push(inserted.clone());
+            let delta = RelationDelta {
+                removed: vec![removed],
+                inserted: vec![inserted],
+                result_type: ty.clone(),
+            };
+            witness = witness.advance(RevisionId::new((step + 1) as u64), &delta, &registry).unwrap();
+            maintained.apply_relation_deltas(
+                &BTreeMap::from([(source, delta)]), &context, &registry,
+            ).unwrap();
+            let maintained_value = maintained.output_value(&context, &registry).unwrap();
+            let exact_value = query.evaluate(&model, &context, &registry).unwrap();
+            assert!(relation_values_semantically_equivalent(
+                &maintained_value, &exact_value, &output_ty, &context, &registry,
+            ).unwrap());
+        }
+
+        let seed = witness.logical_scan_occurrence_seed().unwrap();
+        let expected = model.relations[&source].iter().map(|row| {
+            canonical_row_key(row, &[text_eq, i64_eq], &context, &registry).unwrap()
+        }).collect::<Vec<_>>();
+        assert_eq!(seed.canonical_keys_by_row().iter().cloned().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn set_base_witness_owns_logical_scan_evidence_across_bounded_delta() {
+        let text_eq = SemanticId::new(91_069_12);
+        let source = SemanticId::new(91_069_13);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_3));
+        environment.pin_module(text_eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916_3));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Set { column_equivalences: vec![text_eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = vec![
+            vec![Value::Text("Alpha".into())],
+            vec![Value::Text("Beta".into())],
+            vec![Value::Text("Gamma".into())],
+        ];
+        let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &rows, ty.clone(), &context, &registry,
+        ).unwrap();
+        let delta = RelationDelta {
+            removed: vec![vec![Value::Text("BETA".into())]],
+            inserted: vec![vec![Value::Text("Delta".into())]],
+            result_type: ty,
+        };
+        let next_witness = witness.advance(RevisionId::new(1), &delta, &registry).unwrap();
+        let seed = next_witness.logical_scan_occurrence_seed().unwrap();
+
+        let mut model = FiniteModel::default();
+        model.relations.insert(source, vec![rows[0].clone(), rows[2].clone(), delta.inserted[0].clone()]);
+        let prepared = RelExpr::Distinct {
+            input: Box::new(RelExpr::Scan(source)),
+            column_equivalences: vec![text_eq],
+        }.prepare(&context, &registry).unwrap();
+        let seeded = BTreeMap::from([(source, seed)]);
+        let value = prepared.evaluate_seeded(&model, &context, &registry, &seeded).unwrap();
+        assert_eq!(value.rows(), model.relations[&source].to_vec().as_slice());
+    }
+
+    #[test]
+    #[ignore = "manual release-mode seeded physical Scan certificate benchmark"]
+    fn seeded_physical_scan_join_occurrence_certificate_scale_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let eq = SemanticId::new(91_069_2);
+        let source = SemanticId::new(91_069_3);
+        let target = SemanticId::new(91_069_4);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Set { column_equivalences: vec![eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = (0..100_000).map(|raw| vec![Value::I64(raw)]).collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(source, rows.clone());
+        let source_type = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let source_witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &rows, source_type, &context, &registry,
+        ).unwrap();
+        let handles = (0..rows.len()).map(|slot| kernel_types::StableRowHandle { slot, generation: 0 }).collect::<Vec<_>>();
+        let query = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(source)),
+            right: Box::new(RelExpr::Scan(source)),
+            left_column: 0, right_column: 0, equivalence: eq,
+        }.prepare(&context, &registry).unwrap();
+        let target_type = query.result_type().clone();
+        let seeded_relations = BTreeSet::from([source]);
+        assert!(query.emits_occurrence_certificate_with_scan_seeds(&seeded_relations));
+        let shared_seed = source_witness.scan_occurrence_seed(&handles).unwrap();
+
+        for run in 0..4 {
+            let started = Instant::now();
+            let baseline_value = query.evaluate(black_box(&model), &context, &registry).unwrap();
+            let baseline_rows = baseline_value.into_rows();
+            let _baseline_witness = RelationBaseWitness::build(
+                RevisionId::new(0), target, &baseline_rows, target_type.clone(), &context, &registry,
+            ).unwrap();
+            let baseline = started.elapsed();
+
+            let started = Instant::now();
+            let seed = source_witness.scan_occurrence_seed(black_box(&handles)).unwrap();
+            let seed_cost = started.elapsed();
+            let scan_seeds = BTreeMap::from([(source, seed)]);
+            let eval_started = Instant::now();
+            let (_certified_value, certificate) = query.evaluate_with_occurrence_certificate_seeded(
+                black_box(&model), &context, &registry, &scan_seeds,
+            ).unwrap();
+            let _eval_cost = eval_started.elapsed();
+            let adopt_started = Instant::now();
+            let _certified_witness = RelationBaseWitness::from_occurrence_certificate(
+                RevisionId::new(0), target, certificate, target_type.clone(), &context, &registry,
+            ).unwrap();
+            let _adopt_cost = adopt_started.elapsed();
+            let certified = started.elapsed();
+
+            let shared_started = Instant::now();
+            let shared_scan_seeds = BTreeMap::from([(source, shared_seed.clone())]);
+            let shared_clone_cost = shared_started.elapsed();
+            let shared_eval_started = Instant::now();
+            let (_shared_value, shared_certificate) = query.evaluate_with_occurrence_certificate_seeded(
+                black_box(&model), &context, &registry, &shared_scan_seeds,
+            ).unwrap();
+            let shared_eval_cost = shared_eval_started.elapsed();
+            let shared_adopt_started = Instant::now();
+            let _shared_witness = RelationBaseWitness::from_occurrence_certificate(
+                RevisionId::new(0), target, shared_certificate, target_type.clone(), &context, &registry,
+            ).unwrap();
+            let shared_adopt_cost = shared_adopt_started.elapsed();
+            let shared_total = shared_started.elapsed();
+            eprintln!(
+                "seeded_scan_join run={run} baseline_ms={:.3} rebuilt_seed_ms={:.3} rebuilt_total_ms={:.3} rebuilt_ratio={:.3} shared_clone_ms={:.3} shared_eval_ms={:.3} shared_adopt_ms={:.3} shared_total_ms={:.3} shared_ratio={:.3}",
+                baseline.as_secs_f64() * 1e3, seed_cost.as_secs_f64() * 1e3, certified.as_secs_f64() * 1e3,
+                certified.as_secs_f64() / baseline.as_secs_f64(),
+                shared_clone_cost.as_secs_f64() * 1e3, shared_eval_cost.as_secs_f64() * 1e3,
+                shared_adopt_cost.as_secs_f64() * 1e3, shared_total.as_secs_f64() * 1e3,
+                shared_total.as_secs_f64() / baseline.as_secs_f64(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode runtime Scan seed publication benchmark"]
+    fn runtime_scan_seed_logical_delta_publication_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let eq = SemanticId::new(91_069_20);
+        let source = SemanticId::new(91_069_21);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_2));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(916_2));
+        schema.define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Set { column_equivalences: vec![eq] },
+        }).unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = (0..100_000).map(|raw| vec![Value::I64(raw)]).collect::<Vec<_>>();
+        let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+        let witness = RelationBaseWitness::build(
+            RevisionId::new(0), source, &rows, ty.clone(), &context, &registry,
+        ).unwrap();
+        let handles = (0..rows.len())
+            .map(|slot| kernel_types::StableRowHandle { slot, generation: 0 })
+            .collect::<Vec<_>>();
+        let seed = witness.scan_occurrence_seed(&handles).unwrap();
+        let delta = RelationDelta {
+            removed: vec![vec![Value::I64(7)]],
+            inserted: vec![vec![Value::I64(100_001)]],
+            result_type: ty,
+        };
+        for run in 0..5 {
+            let started = Instant::now();
+            let next = black_box(&seed)
+                .advance_logical_delta(black_box(&delta), &context, &registry)
+                .unwrap();
+            eprintln!(
+                "runtime_scan_seed_publish run={run} ms={:.3} rows={}",
+                started.elapsed().as_secs_f64() * 1e3,
+                next.row_count(),
+            );
+        }
+
+        for run in 0..5 {
+            let started = Instant::now();
+            let next_witness = black_box(&witness)
+                .advance(RevisionId::new(1), black_box(&delta), &registry)
+                .unwrap();
+            let seed = next_witness.logical_scan_occurrence_seed().unwrap();
+            eprintln!(
+                "runtime_witness_owned_seed_publish run={run} ms={:.3} rows={}",
+                started.elapsed().as_secs_f64() * 1e3,
+                seed.row_count(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode compositional AntiJoin occurrence certificate benchmark"]
+    fn anti_join_compositional_occurrence_certificate_scale_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let text_eq = SemanticId::new(91_070);
+        let i64_eq = SemanticId::new(91_071);
+        let source = SemanticId::new(91_072);
+        let blockers = SemanticId::new(91_073);
+        let target = SemanticId::new(91_074);
+        let mut registry = SemanticRegistry::default();
+        let text_digest =
+            registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(915));
+        environment.pin_module(text_eq, text_digest);
+        environment.pin_module(i64_eq, i64_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(915));
+        schema
+            .define_relation(RelationDef {
+                id: source,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::Text),
+                    TypeExpr::Scalar(ScalarType::I64),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![text_eq, i64_eq],
+                },
+            })
+            .unwrap();
+        schema
+            .define_relation(RelationDef {
+                id: blockers,
+                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                semantics: RelationSemantics::Set {
+                    column_equivalences: vec![text_eq],
+                },
+            })
+            .unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = 100_000usize;
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            source,
+            (0..rows)
+                .map(|index| {
+                    vec![
+                        Value::Text(format!("Key{index}")),
+                        Value::I64(index as i64),
+                    ]
+                })
+                .collect(),
+        );
+        model.relations.insert(
+            blockers,
+            (0..rows)
+                .step_by(10)
+                .map(|index| vec![Value::Text(format!("KEY{index}"))])
+                .collect(),
+        );
+
+        let query = RelExpr::AntiJoin {
+            left: Box::new(RelExpr::Distinct {
+                input: Box::new(RelExpr::Scan(source)),
+                column_equivalences: vec![text_eq, i64_eq],
+            }),
+            right: Box::new(RelExpr::Scan(blockers)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        };
+        let prepared = query.prepare(&context, &registry).unwrap();
+        assert!(prepared.emits_occurrence_certificate());
+
+        for run in 1..=3 {
+            let baseline_start = Instant::now();
+            let value = prepared.evaluate(&model, &context, &registry).unwrap();
+            let witness = RelationBaseWitness::build(
+                RevisionId::new(0),
+                target,
+                value.rows(),
+                prepared.result_type().clone(),
+                &context,
+                &registry,
+            )
+            .unwrap();
+            let baseline = baseline_start.elapsed();
+            drop(witness);
+
+            let certified_start = Instant::now();
+            let (value, certificate) = prepared
+                .evaluate_with_occurrence_certificate(&model, &context, &registry)
+                .unwrap();
+            let witness = RelationBaseWitness::from_occurrence_certificate(
+                RevisionId::new(0),
+                target,
+                certificate,
+                prepared.result_type().clone(),
+                &context,
+                &registry,
+            )
+            .unwrap();
+            let certified = certified_start.elapsed();
+            black_box((value, witness));
+
+            eprintln!(
+                "ANTI_JOIN_COMPOSED_OCC_CERT_PERF run={run} rows={rows} baseline_ms={:.3} certified_ms={:.3} ratio={:.3}x",
+                baseline.as_secs_f64() * 1_000.0,
+                certified.as_secs_f64() * 1_000.0,
+                certified.as_secs_f64() / baseline.as_secs_f64(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode quotient occurrence certificate benchmark"]
+    fn quotient_operator_occurrence_certificate_scale_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let eq = SemanticId::new(91_040);
+        let set_relation = SemanticId::new(91_041);
+        let bag_relation = SemanticId::new(91_042);
+        let target = SemanticId::new(91_043);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(913));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(913));
+        schema
+            .define_relation(RelationDef {
+                id: set_relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::I64),
+                    TypeExpr::Scalar(ScalarType::I64),
+                ],
+                semantics: RelationSemantics::Set {
+                    column_equivalences: vec![eq, eq],
+                },
+            })
+            .unwrap();
+        schema
+            .define_relation(RelationDef {
+                id: bag_relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::I64),
+                    TypeExpr::Scalar(ScalarType::I64),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![eq, eq],
+                },
+            })
+            .unwrap();
+        let context = SemanticContext { schema, environment };
+        let rows = 100_000usize;
+        let values = (0..rows)
+            .map(|index| {
+                vec![
+                    Value::I64((index % 50_000) as i64),
+                    Value::I64(index as i64),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(set_relation, values.clone());
+        model.relations.insert(bag_relation, values);
+
+        let queries = [
+            (
+                "project_set",
+                RelExpr::Project {
+                    input: Box::new(RelExpr::Scan(set_relation)),
+                    columns: vec![0],
+                },
+            ),
+            (
+                "distinct",
+                RelExpr::Distinct {
+                    input: Box::new(RelExpr::Project {
+                        input: Box::new(RelExpr::Scan(bag_relation)),
+                        columns: vec![0],
+                    }),
+                    column_equivalences: vec![eq],
+                },
+            ),
+            (
+                "difference_set",
+                RelExpr::Difference {
+                    left: Box::new(RelExpr::Scan(set_relation)),
+                    right: Box::new(RelExpr::FilterEqConst {
+                        input: Box::new(RelExpr::Scan(set_relation)),
+                        column: 0,
+                        value: Value::I64(0),
+                        equivalence: eq,
+                    }),
+                },
+            ),
+        ];
+
+        for (label, query) in queries {
+            let result_type = query.typecheck(&context, &registry).unwrap();
+            for run in 1..=3 {
+                let baseline_start = Instant::now();
+                let value = query.evaluate(&model, &context, &registry).unwrap();
+                let witness = RelationBaseWitness::build(
+                    RevisionId::new(0),
+                    target,
+                    value.rows(),
+                    result_type.clone(),
+                    &context,
+                    &registry,
+                )
+                .unwrap();
+                let baseline = baseline_start.elapsed();
+                drop(witness);
+
+                let certified_start = Instant::now();
+                let (value, certificate) = query
+                    .evaluate_with_occurrence_certificate(&model, &context, &registry)
+                    .unwrap();
+                let witness = RelationBaseWitness::from_occurrence_certificate(
+                    RevisionId::new(0),
+                    target,
+                    certificate,
+                    result_type.clone(),
+                    &context,
+                    &registry,
+                )
+                .unwrap();
+                let certified = certified_start.elapsed();
+                black_box((value, witness));
+
+                eprintln!(
+                    "QUOTIENT_OCC_CERT_PERF op={label} run={run} rows={rows} baseline_ms={:.3} certified_ms={:.3} ratio={:.3}x",
+                    baseline.as_secs_f64() * 1_000.0,
+                    certified.as_secs_f64() * 1_000.0,
+                    certified.as_secs_f64() / baseline.as_secs_f64(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode execution occurrence certificate benchmark"]
+    fn union_set_execution_certificate_scale_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let eq = SemanticId::new(91_100);
+        let left = SemanticId::new(91_101);
+        let right = SemanticId::new(91_102);
+        let target = SemanticId::new(91_103);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(911));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(911));
+        for relation in [left, right] {
+            schema
+                .define_relation(RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                    semantics: RelationSemantics::Set {
+                        column_equivalences: vec![eq],
+                    },
+                })
+                .unwrap();
+        }
+        let context = SemanticContext { schema, environment };
+        let mut model = FiniteModel::default();
+        let side = 50_000usize;
+        model.relations.insert(
+            left,
+            (0..side).map(|v| vec![Value::I64(v as i64)]).collect(),
+        );
+        model.relations.insert(
+            right,
+            (side..side * 2).map(|v| vec![Value::I64(v as i64)]).collect(),
+        );
+        let query = RelExpr::Union {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(right)),
+        };
+        let result_type = query.typecheck(&context, &registry).unwrap();
+
+        let baseline_start = Instant::now();
+        let baseline_value = query.evaluate(&model, &context, &registry).unwrap();
+        let baseline_witness = RelationBaseWitness::build(
+            RevisionId::new(0),
+            target,
+            baseline_value.rows(),
+            result_type.clone(),
+            &context,
+            &registry,
+        )
+        .unwrap();
+        let baseline = baseline_start.elapsed();
+        black_box(baseline_witness);
+
+        let certified_start = Instant::now();
+        let (certified_value, certificate) = query
+            .evaluate_with_occurrence_certificate(&model, &context, &registry)
+            .unwrap();
+        let certified_witness = RelationBaseWitness::from_occurrence_certificate(
+            RevisionId::new(0),
+            target,
+            certificate,
+            result_type,
+            &context,
+            &registry,
+        )
+        .unwrap();
+        let certified = certified_start.elapsed();
+        black_box((certified_value, certified_witness));
+
+        eprintln!(
+            "UNION_SET_OCC_CERT_PERF rows={} baseline_ms={:.3} certified_ms={:.3} ratio={:.3}x",
+            side * 2,
+            baseline.as_secs_f64() * 1_000.0,
+            certified.as_secs_f64() * 1_000.0,
+            certified.as_secs_f64() / baseline.as_secs_f64(),
+        );
+    }
+
+    #[test]
+    fn nested_set_tree_reuses_scan_and_child_gamma_evidence_without_recanonicalization() {
+        let eq = SemanticId::new(91_080);
+        let left = SemanticId::new(91_081);
+        let right = SemanticId::new(91_082);
+        let blockers = SemanticId::new(91_083);
+        let target = SemanticId::new(91_084);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(918));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(918));
+        for relation in [left, right, blockers] {
+            schema.define_relation(RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: RelationSemantics::Set { column_equivalences: vec![eq] },
+            }).unwrap();
+        }
+        let context = SemanticContext { schema, environment };
+        let left_rows = vec![vec![Value::I64(1)], vec![Value::I64(2)], vec![Value::I64(3)]];
+        let right_rows = vec![vec![Value::I64(3)], vec![Value::I64(4)], vec![Value::I64(5)]];
+        let blocker_rows = vec![vec![Value::I64(2)], vec![Value::I64(5)]];
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, left_rows.clone());
+        model.relations.insert(right, right_rows.clone());
+        model.relations.insert(blockers, blocker_rows.clone());
+
+        let one_col_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
+        let seed_for = |relation, rows: &[Row]| {
+            let witness = RelationBaseWitness::build(
+                RevisionId::new(0), relation, rows, one_col_type.clone(), &context, &registry,
+            ).unwrap();
+            let handles = (0..rows.len())
+                .map(|slot| kernel_types::StableRowHandle { slot, generation: 0 })
+                .collect::<Vec<_>>();
+            witness.scan_occurrence_seed(&handles).unwrap()
+        };
+        let scan_seeds = BTreeMap::from([
+            (left, seed_for(left, &left_rows)),
+            (right, seed_for(right, &right_rows)),
+            (blockers, seed_for(blockers, &blocker_rows)),
+        ]);
+        let seeded_relations = BTreeSet::from([left, right, blockers]);
+
+        let joined_left = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(left)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: eq,
+        };
+        let projected_left = RelExpr::Project {
+            input: Box::new(joined_left),
+            columns: vec![0],
+        };
+        let filtered_right = RelExpr::AntiJoin {
+            left: Box::new(RelExpr::Scan(right)),
+            right: Box::new(RelExpr::Scan(blockers)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: eq,
+        };
+        let union = RelExpr::Union {
+            left: Box::new(projected_left),
+            right: Box::new(filtered_right),
+        };
+        let difference = RelExpr::Difference {
+            left: Box::new(union),
+            right: Box::new(RelExpr::Scan(blockers)),
+        };
+        let query = RelExpr::Distinct {
+            input: Box::new(RelExpr::Project {
+                input: Box::new(difference),
+                columns: vec![0],
+            }),
+            column_equivalences: vec![eq],
+        }.prepare(&context, &registry).unwrap();
+
+        assert!(query.emits_occurrence_certificate_with_scan_seeds(&seeded_relations));
+        let baseline = query.evaluate(&model, &context, &registry).unwrap();
+        let (certified, certificate) = query.evaluate_with_occurrence_certificate_seeded(
+            &model, &context, &registry, &scan_seeds,
+        ).unwrap();
+        assert_eq!(certified, baseline);
+        assert_eq!(certificate.row_count(), certified.rows().len());
+        let witness = RelationBaseWitness::from_occurrence_certificate(
+            RevisionId::new(0), target, certificate, query.result_type().clone(), &context, &registry,
+        ).unwrap();
+        drop(witness);
+    }
+
+    #[test]
+    #[ignore = "manual release-mode nested compositional occurrence certificate benchmark"]
+    fn nested_set_tree_occurrence_certificate_scale_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let eq = SemanticId::new(91_085);
+        let left = SemanticId::new(91_086);
+        let right = SemanticId::new(91_087);
+        let blockers = SemanticId::new(91_088);
+        let target = SemanticId::new(91_089);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(919));
+        environment.pin_module(eq, digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(919));
+        for relation in [left, right, blockers] {
+            schema.define_relation(RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: RelationSemantics::Set { column_equivalences: vec![eq] },
+            }).unwrap();
+        }
+        let context = SemanticContext { schema, environment };
+        let n = 100_000usize;
+        let left_rows = (0..n).map(|v| vec![Value::I64(v as i64)]).collect::<Vec<_>>();
+        let right_rows = (n / 2..n + n / 2).map(|v| vec![Value::I64(v as i64)]).collect::<Vec<_>>();
+        let blocker_rows = (0..n).step_by(8).map(|v| vec![Value::I64(v as i64)]).collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, left_rows.clone());
+        model.relations.insert(right, right_rows.clone());
+        model.relations.insert(blockers, blocker_rows.clone());
+        let one_col_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
+        let seed_for = |relation, rows: &[Row]| {
+            let witness = RelationBaseWitness::build(
+                RevisionId::new(0), relation, rows, one_col_type.clone(), &context, &registry,
+            ).unwrap();
+            let handles = (0..rows.len()).map(|slot| kernel_types::StableRowHandle { slot, generation: 0 }).collect::<Vec<_>>();
+            witness.scan_occurrence_seed(&handles).unwrap()
+        };
+        let scan_seeds = BTreeMap::from([
+            (left, seed_for(left, &left_rows)),
+            (right, seed_for(right, &right_rows)),
+            (blockers, seed_for(blockers, &blocker_rows)),
+        ]);
+        let query = RelExpr::Distinct {
+            input: Box::new(RelExpr::Project {
+                input: Box::new(RelExpr::Difference {
+                    left: Box::new(RelExpr::Union {
+                        left: Box::new(RelExpr::Project {
+                            input: Box::new(RelExpr::JoinEq {
+                                left: Box::new(RelExpr::Scan(left)),
+                                right: Box::new(RelExpr::Scan(left)),
+                                left_column: 0,
+                                right_column: 0,
+                                equivalence: eq,
+                            }),
+                            columns: vec![0],
+                        }),
+                        right: Box::new(RelExpr::AntiJoin {
+                            left: Box::new(RelExpr::Scan(right)),
+                            right: Box::new(RelExpr::Scan(blockers)),
+                            left_column: 0,
+                            right_column: 0,
+                            equivalence: eq,
+                        }),
+                    }),
+                    right: Box::new(RelExpr::Scan(blockers)),
+                }),
+                columns: vec![0],
+            }),
+            column_equivalences: vec![eq],
+        }.prepare(&context, &registry).unwrap();
+        let target_type = query.result_type().clone();
+
+        for run in 0..4 {
+            let baseline_started = Instant::now();
+            let baseline_value = query.evaluate(black_box(&model), &context, &registry).unwrap();
+            let baseline_witness = RelationBaseWitness::build(
+                RevisionId::new(0), target, baseline_value.rows(), target_type.clone(), &context, &registry,
+            ).unwrap();
+            black_box(baseline_witness);
+            let baseline = baseline_started.elapsed();
+
+            let certified_started = Instant::now();
+            let (certified_value, certificate) = query.evaluate_with_occurrence_certificate_seeded(
+                black_box(&model), &context, &registry, black_box(&scan_seeds),
+            ).unwrap();
+            let certified_witness = RelationBaseWitness::from_occurrence_certificate(
+                RevisionId::new(0), target, certificate, target_type.clone(), &context, &registry,
+            ).unwrap();
+            black_box((certified_value, certified_witness));
+            let certified = certified_started.elapsed();
+            eprintln!(
+                "nested_occ_cert run={run} baseline_ms={:.3} certified_ms={:.3} ratio={:.3}",
+                baseline.as_secs_f64() * 1e3,
+                certified.as_secs_f64() * 1e3,
+                certified.as_secs_f64() / baseline.as_secs_f64(),
+            );
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod p420_retention_tests {
+use kernel_schema::{
+    RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext, SemanticEnvironment,
+    TypeExpr,
+};
+use kernel_semantics::{EquivalenceModule, SemanticRegistry};
+use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
+use super::*;
+
+#[test]
+fn pinned_set_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_nodes() {
+    let eq = SemanticId::new(91_070_420);
+    let source = SemanticId::new(91_070_421);
+    let mut registry = SemanticRegistry::default();
+    let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+    let mut environment = SemanticEnvironment::new(SemanticEnvId::new(917_420));
+    environment.pin_module(eq, digest);
+    let mut schema = Schema::new(SchemaRevisionId::new(917_420));
+    schema
+        .define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Set {
+                column_equivalences: vec![eq],
+            },
+        })
+        .unwrap();
+    let context = SemanticContext { schema, environment };
+    let mut rows = (0..4_096_i64)
+        .map(|value| vec![Value::I64(value)])
+        .collect::<Vec<_>>();
+    let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+    let mut lineage = vec![
+        RelationBaseWitness::build(
+            RevisionId::new(0),
+            source,
+            &rows,
+            ty.clone(),
+            &context,
+            &registry,
+        )
+        .unwrap(),
+    ];
+
+    for step in 0..64_usize {
+        let removed = rows.remove(0);
+        let inserted = vec![Value::I64(10_000 + step as i64)];
+        rows.push(inserted.clone());
+        let next = lineage
+            .last()
+            .unwrap()
+            .advance(
+                RevisionId::new((step + 1) as u64),
+                &RelationDelta {
+                    inserted: vec![inserted],
+                    removed: vec![removed],
+                    result_type: ty.clone(),
+                },
+                &registry,
+            )
+            .unwrap();
+        lineage.push(next);
+    }
+
+    let baseline = lineage[0].storage_stats().total_nodes();
+    let newly_retained = lineage
+        .windows(2)
+        .map(|pair| pair[1].structural_nodes_new_since(&pair[0]))
+        .sum::<usize>();
+    let retained_union = baseline + newly_retained;
+    let naive_full_copy = baseline * lineage.len();
+    eprintln!(
+        "P420_SET_RETENTION baseline_nodes={baseline} snapshots={} newly_retained_nodes={newly_retained} retained_union_nodes={retained_union} naive_full_copy_nodes={naive_full_copy} union_to_naive={:.6}",
+        lineage.len(),
+        retained_union as f64 / naive_full_copy as f64,
+    );
+    assert!(baseline > 8_000, "fixture must exercise a non-trivial persistent tree");
+    assert!(
+        retained_union * 16 < naive_full_copy,
+        "pinned snapshots retained too much structural storage: union={retained_union} naive={naive_full_copy}"
+    );
+
+    let probe = lineage[0].unique_storage_probe_against(&lineage[1]);
+    assert!(probe.total_nodes() > 0);
+    assert_eq!(probe.live_nodes(), probe.total_nodes());
+    let oldest = lineage.remove(0);
+    drop(oldest);
+    assert!(
+        probe.is_fully_reclaimed(),
+        "nodes unique to the dropped oldest witness remained retained"
+    );
+}
+
+#[test]
+fn pinned_bag_fifo_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_nodes() {
+    let eq = SemanticId::new(91_070_422);
+    let source = SemanticId::new(91_070_423);
+    let mut registry = SemanticRegistry::default();
+    let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+    let mut environment = SemanticEnvironment::new(SemanticEnvId::new(917_421));
+    environment.pin_module(eq, digest);
+    let mut schema = Schema::new(SchemaRevisionId::new(917_421));
+    schema
+        .define_relation(RelationDef {
+            id: source,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Bag {
+                column_equivalences: vec![eq],
+            },
+        })
+        .unwrap();
+    let context = SemanticContext { schema, environment };
+    let rows = (0..4_096_i64)
+        .map(|value| vec![Value::I64(value % 64)])
+        .collect::<Vec<_>>();
+    let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
+    let mut lineage = vec![
+        RelationBaseWitness::build(
+            RevisionId::new(0),
+            source,
+            &rows,
+            ty.clone(),
+            &context,
+            &registry,
+        )
+        .unwrap(),
+    ];
+
+    for step in 0..64_usize {
+        let value = (step % 64) as i64;
+        let row = vec![Value::I64(value)];
+        let next = lineage
+            .last()
+            .unwrap()
+            .advance(
+                RevisionId::new((step + 1) as u64),
+                &RelationDelta {
+                    inserted: vec![row.clone()],
+                    removed: vec![row],
+                    result_type: ty.clone(),
+                },
+                &registry,
+            )
+            .unwrap();
+        lineage.push(next);
+    }
+
+    let baseline = lineage[0].storage_stats().total_nodes();
+    let newly_retained = lineage
+        .windows(2)
+        .map(|pair| pair[1].structural_nodes_new_since(&pair[0]))
+        .sum::<usize>();
+    let retained_union = baseline + newly_retained;
+    let naive_full_copy = baseline * lineage.len();
+    eprintln!(
+        "P420_BAG_RETENTION baseline_nodes={baseline} snapshots={} newly_retained_nodes={newly_retained} retained_union_nodes={retained_union} naive_full_copy_nodes={naive_full_copy} union_to_naive={:.6}",
+        lineage.len(),
+        retained_union as f64 / naive_full_copy as f64,
+    );
+    assert!(
+        retained_union * 8 < naive_full_copy,
+        "FIFO bag churn retained too much structural storage: union={retained_union} naive={naive_full_copy}"
+    );
+
+    let probe = lineage[0].unique_storage_probe_against(&lineage[1]);
+    assert!(probe.total_nodes() > 0);
+    let oldest = lineage.remove(0);
+    drop(oldest);
+    assert!(probe.is_fully_reclaimed());
+}
 }

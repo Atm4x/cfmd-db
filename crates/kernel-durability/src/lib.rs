@@ -7,6 +7,7 @@ mod metadata;
 mod platform_assurance;
 mod replication;
 mod replication_transport;
+mod realization;
 mod runtime;
 mod single_file;
 mod storage_encryption;
@@ -24,12 +25,14 @@ pub use descriptor::{
 pub use domain::{
     DurableCarrierPatch, DurableEffectCoordinationClass, DurableEffectKind,
     DurableExternalFreshnessBinding, DurableFieldPatch, DurableKeepsAlivePatch,
-    DurableMigrationComplement, DurableModelDelta, DurableRelationMutation,
+    DurableMigrationComplement, DurableModelDelta, DurableObjectFieldWrite,
+    DurableRelationAuthorization, DurableRelationMutation,
     DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
     DurableRevisionEffectRecord, DurableTransactionIntent, DurableTransactionKey,
-    HistoricalComplementError, HistoricalLensImplementation, HistoricalLensImplementationKey,
-    HistoricalLensRegistry, HistoricalRestoreError, IdempotencyEpoch,
-    LocalHistoricalComplementChain,
+    HistoricalBoundaryAuthority, HistoricalComplementError, HistoricalEpochAnchor,
+    HistoricalLensImplementation, HistoricalLensImplementationKey, HistoricalLensRegistry,
+    HistoricalRestoreError, IdempotencyEpoch, LocalHistoricalComplementChain,
+    MigrationPhysicalAuthority, SchemaMigrationPhysicalState, SemanticChangeEvent,
 };
 pub use freshness_tcp::{TcpExternalFreshnessAuthority, TcpExternalFreshnessAuthorityServer};
 pub use wal_frame::{FORMAT_VERSION, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN};
@@ -69,6 +72,10 @@ pub use replication_transport::{
     replication_lock_frontier_digest, replication_transport_signing_message,
     validate_replication_anti_entropy_chunk,
 };
+pub use realization::{
+    DurableFactorizedReadSnapshot, DurableFactorizedRealization, DurableHistoricalRealizationRoot,
+    decode_factorized_realization, encode_factorized_realization,
+};
 
 pub use runtime::{
     CodecError, CommittedRevision, DurabilityError, DurableCommitReceipt, DurableFormatComponent,
@@ -86,7 +93,8 @@ pub use storage_encryption::{
 pub use store::{
     DurableBatchEnqueueOutcome, DurableCommitBatchPolicy, DurableCommitBatcher,
     DurableGenerationReceipt, DurableRevisionStore, ExternalFreshnessAuthority,
-    ExternalFreshnessConfig, PreparedCutCapsule, StreamingCheckpointProgress,
+    ExternalFreshnessConfig, HistoricalEpochMaterial, PreparedCutCapsule,
+    StreamingCheckpointProgress,
 };
 pub use wal::{FileRevisionWal, SimulatedRevisionWal, scan_wal};
 

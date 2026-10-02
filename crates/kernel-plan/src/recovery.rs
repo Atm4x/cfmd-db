@@ -22,10 +22,31 @@ pub fn replay_durable_revisions(
     scan: &RecoveryScan,
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<kernel_revision::Revision, RuntimeRecoveryError> {
+    replay_durable_revisions_to(base_revision, scan, registry, None)
+}
+
+pub fn replay_durable_revisions_until(
+    base_revision: &kernel_revision::Revision,
+    scan: &RecoveryScan,
+    registry: &kernel_semantics::SemanticRegistry,
+    target_revision: RevisionId,
+) -> Result<kernel_revision::Revision, RuntimeRecoveryError> {
+    replay_durable_revisions_to(base_revision, scan, registry, Some(target_revision))
+}
+
+fn replay_durable_revisions_to(
+    base_revision: &kernel_revision::Revision,
+    scan: &RecoveryScan,
+    registry: &kernel_semantics::SemanticRegistry,
+    target_revision: Option<RevisionId>,
+) -> Result<kernel_revision::Revision, RuntimeRecoveryError> {
     if scan.base_revision() != base_revision.id() {
         return Err(RuntimeRecoveryError::BaseRevisionMismatch);
     }
     let mut current = base_revision.clone();
+    if target_revision == Some(current.id()) {
+        return Ok(current);
+    }
     for committed in scan.committed() {
         let descriptor = &committed.descriptor;
         if descriptor.source_revision != current.id() {
@@ -103,6 +124,14 @@ pub fn replay_durable_revisions(
                     state,
                 )?;
             }
+            DurableRevisionChange::SchemaMigration { program } => {
+                let transport = program
+                    .verify(current.semantic_context(), registry)
+                    .map_err(RuntimeRecoveryError::MigrationTransport)?;
+                current = transport
+                    .transport_revision(&current, descriptor.target_revision, registry)
+                    .map_err(RuntimeRecoveryError::MigrationTransport)?;
+            }
             DurableRevisionChange::FullRevision { .. }
             | DurableRevisionChange::FullRevisionAndMaterializations { .. } => {
                 current = descriptor.decode_full_revision(registry)?.ok_or(
@@ -113,8 +142,15 @@ pub fn replay_durable_revisions(
                 )?;
             }
         }
+        if target_revision == Some(current.id()) {
+            return Ok(current);
+        }
     }
-    Ok(current)
+    if target_revision.is_some() {
+        Err(RuntimeRecoveryError::DurableHeadMismatch)
+    } else {
+        Ok(current)
+    }
 }
 
 /// Reconstructs a reader-visible runtime root from an exact base revision and
@@ -192,8 +228,7 @@ pub(super) fn recover_runtime_bundle_with_policy_and_cores(
             .state()
             .model
             .relations
-            .get(&relation.id)
-            .cloned()
+            .materialize_owned(&relation.id)
             .unwrap_or_default();
         let recovered = recovered_relation_layout_recipe(relation.id, physical_artifact_specs)
             .and_then(|(layout, kind)| {
@@ -353,8 +388,7 @@ fn replay_durable_artifact_core(
         .state()
         .model
         .relations
-        .get(relation)
-        .cloned()
+        .materialize_owned(relation)
         .unwrap_or_default();
     if rows.len() != encoded_keys_by_ordinal.len() {
         return Err(PhysicalExecutionError::PhysicalTypeMismatch);

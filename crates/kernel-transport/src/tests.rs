@@ -499,8 +499,8 @@ fn typed_relation_transport_reuses_relational_query_ir() {
             .state()
             .model
             .relations
-            .get(&target_relation),
-        Some(&vec![
+            .materialize_owned(&target_relation),
+        Some(vec![
             vec![kernel_model::Value::I64(1)],
             vec![kernel_model::Value::I64(2)],
         ])
@@ -880,7 +880,7 @@ fn impact_commutes_with_bijective_identity_transport() {
     use kernel_change::Change;
     use kernel_model::Value;
     use kernel_query::{ExactQuery, Expr};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     let entity_type = SemanticId::new(9900);
     let source_ids = BTreeSet::from([
@@ -1128,5 +1128,521 @@ fn semantic_environment_transport_is_generic_across_ordering_modules() {
     assert_eq!(
         EquivalentSemanticEnvironmentTransport::verify(&source, &changed_law, &registry),
         Err(TransportError::SemanticContractChanged(ordering))
+    );
+}
+
+#[test]
+fn schema_migration_transport_supports_merge_split_create_and_drop_in_one_verified_step() {
+    use std::collections::BTreeSet;
+
+    let entity_type = SemanticId::new(20_000);
+    let old_left = SemanticId::new(20_001);
+    let old_right = SemanticId::new(20_002);
+    let new_sum = SemanticId::new(20_003);
+    let new_copy = SemanticId::new(20_004);
+    let new_default = SemanticId::new(20_005);
+    let entity = kernel_types::EntityId::new(7);
+    let registry = SemanticRegistry::default();
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(200));
+    for field in [old_left, old_right] {
+        source_schema
+            .define_field(FieldDef {
+                id: field,
+                owner: entity_type,
+                value: TypeExpr::Scalar(ScalarType::I64),
+            })
+            .unwrap();
+    }
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: SemanticEnvironment::new(SemanticEnvId::new(200)),
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(201));
+    for field in [new_sum, new_copy, new_default] {
+        target_schema
+            .define_field(FieldDef {
+                id: field,
+                owner: entity_type,
+                value: TypeExpr::Scalar(ScalarType::I64),
+            })
+            .unwrap();
+    }
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: SemanticEnvironment::new(SemanticEnvId::new(201)),
+    };
+
+    let pick = |field| {
+        ExactQuery::new(kernel_query::Expr::ProductField {
+            input: Box::new(kernel_query::Expr::Input),
+            field,
+        })
+    };
+    let sum = ExactQuery::new(kernel_query::Expr::AddI64(
+        Box::new(kernel_query::Expr::ProductField {
+            input: Box::new(kernel_query::Expr::Input),
+            field: old_left,
+        }),
+        Box::new(kernel_query::Expr::ProductField {
+            input: Box::new(kernel_query::Expr::Input),
+            field: old_right,
+        }),
+    ));
+    let default = ExactQuery::new(kernel_query::Expr::TypedConst {
+        value: kernel_model::Value::I64(99),
+        ty: TypeExpr::Scalar(ScalarType::I64),
+    });
+    let migration = SchemaMigrationTransport::verify(
+        &source,
+        &target,
+        &registry,
+        vec![
+            MigrationFieldRewrite {
+                source_fields: vec![old_left, old_right],
+                target_field: new_sum,
+                transform: sum,
+            },
+            MigrationFieldRewrite {
+                source_fields: vec![old_left],
+                target_field: new_copy,
+                transform: pick(old_left),
+            },
+            MigrationFieldRewrite {
+                source_fields: vec![],
+                target_field: new_default,
+                transform: default,
+            },
+        ],
+        vec![],
+    )
+    .unwrap();
+
+    let mut state = DatabaseState::default();
+    state.lifecycle.entities.insert(entity);
+    state.lifecycle.roots.insert(entity);
+    state
+        .model
+        .carriers
+        .insert(entity_type, BTreeSet::from([entity]));
+    state
+        .model
+        .fields
+        .insert((old_left, entity), kernel_model::Value::I64(4));
+    state
+        .model
+        .fields
+        .insert((old_right, entity), kernel_model::Value::I64(6));
+    let source_revision = kernel_revision::Revision::build(
+        kernel_types::RevisionId::new(1),
+        &source,
+        &registry,
+        state,
+    )
+    .unwrap();
+    let migrated = migration
+        .transport_revision(
+            &source_revision,
+            kernel_types::RevisionId::new(2),
+            &registry,
+        )
+        .unwrap();
+
+    let fields = &migrated.state().model.fields;
+    assert_eq!(
+        fields.get(&(new_sum, entity)),
+        Some(&kernel_model::Value::I64(10))
+    );
+    assert_eq!(
+        fields.get(&(new_copy, entity)),
+        Some(&kernel_model::Value::I64(4))
+    );
+    assert_eq!(
+        fields.get(&(new_default, entity)),
+        Some(&kernel_model::Value::I64(99))
+    );
+    assert!(!fields.contains_key(&(old_left, entity)));
+    assert!(!fields.contains_key(&(old_right, entity)));
+    assert_eq!(fields.len(), 3);
+    assert_eq!(migrated.semantic_context(), &target);
+}
+
+#[test]
+fn schema_migration_row_rewrite_changes_relation_column_type_without_host_callback() {
+    let relation = SemanticId::new(21_000);
+    let eq_i64 = SemanticId::new(21_001);
+    let eq_f64 = SemanticId::new(21_002);
+    let mut registry = SemanticRegistry::default();
+    let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+    let f64_digest = registry.install_equivalence(EquivalenceModule::F64Bitwise);
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(210));
+    source_schema
+        .define_relation(kernel_schema::RelationDef {
+            id: relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: kernel_schema::RelationSemantics::Set {
+                column_equivalences: vec![eq_i64],
+            },
+        })
+        .unwrap();
+    let mut source_environment = SemanticEnvironment::new(SemanticEnvId::new(210));
+    source_environment.pin_module(eq_i64, i64_digest);
+    source_environment.pin_module(eq_f64, f64_digest);
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: source_environment,
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(211));
+    target_schema
+        .define_relation(kernel_schema::RelationDef {
+            id: relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::F64)],
+            semantics: kernel_schema::RelationSemantics::Set {
+                column_equivalences: vec![eq_f64],
+            },
+        })
+        .unwrap();
+    let mut target_environment = SemanticEnvironment::new(SemanticEnvId::new(210));
+    target_environment.pin_module(eq_i64, i64_digest);
+    target_environment.pin_module(eq_f64, f64_digest);
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: target_environment,
+    };
+
+    let input_column = source.schema.relation_column_id(relation, 0).unwrap();
+    let target_column = target.schema.relation_column_id(relation, 0).unwrap();
+    let migration = SchemaMigrationTransport::verify(
+        &source,
+        &target,
+        &registry,
+        vec![],
+        vec![MigrationRelationRewrite::Rows(MigrationRowRewrite {
+            source_relation: relation,
+            target_relation: relation,
+            columns: vec![MigrationColumnRewrite {
+                source_columns: vec![input_column],
+                target_column,
+                transform: ExactQuery::new(kernel_query::Expr::I64ToF64(Box::new(
+                    kernel_query::Expr::ProductField {
+                        input: Box::new(kernel_query::Expr::Input),
+                        field: input_column,
+                    },
+                ))),
+            }],
+        })],
+    )
+    .unwrap();
+
+    let mut state = DatabaseState::default();
+    state
+        .model
+        .relations
+        .insert(relation, vec![vec![kernel_model::Value::I64(7)]]);
+    let source_revision = kernel_revision::Revision::build(
+        kernel_types::RevisionId::new(1),
+        &source,
+        &registry,
+        state,
+    )
+    .unwrap();
+    let migrated = migration
+        .transport_revision(
+            &source_revision,
+            kernel_types::RevisionId::new(2),
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(
+        migrated.state().model.relations.materialize_owned(&relation),
+        Some(vec![vec![kernel_model::Value::F64Bits(7.0_f64.to_bits())]])
+    );
+}
+
+#[test]
+fn schema_migration_exposes_independent_row_local_physical_slice() {
+    let relation = SemanticId::new(22_000);
+    let eq_i64 = SemanticId::new(22_001);
+    let eq_f64 = SemanticId::new(22_002);
+    let mut registry = SemanticRegistry::default();
+    let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+    let f64_digest = registry.install_equivalence(EquivalenceModule::F64Bitwise);
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(220));
+    source_schema
+        .define_relation(kernel_schema::RelationDef {
+            id: relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: kernel_schema::RelationSemantics::Set {
+                column_equivalences: vec![eq_i64],
+            },
+        })
+        .unwrap();
+    let mut source_environment = SemanticEnvironment::new(SemanticEnvId::new(220));
+    source_environment.pin_module(eq_i64, i64_digest);
+    source_environment.pin_module(eq_f64, f64_digest);
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: source_environment,
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(221));
+    target_schema
+        .define_relation(kernel_schema::RelationDef {
+            id: relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::F64)],
+            semantics: kernel_schema::RelationSemantics::Set {
+                column_equivalences: vec![eq_f64],
+            },
+        })
+        .unwrap();
+    let mut target_environment = SemanticEnvironment::new(SemanticEnvId::new(220));
+    target_environment.pin_module(eq_i64, i64_digest);
+    target_environment.pin_module(eq_f64, f64_digest);
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: target_environment,
+    };
+
+    let input_column = source.schema.relation_column_id(relation, 0).unwrap();
+    let target_column = target.schema.relation_column_id(relation, 0).unwrap();
+    let migration = SchemaMigrationTransport::verify(
+        &source,
+        &target,
+        &registry,
+        vec![],
+        vec![MigrationRelationRewrite::Rows(MigrationRowRewrite {
+            source_relation: relation,
+            target_relation: relation,
+            columns: vec![MigrationColumnRewrite {
+                source_columns: vec![input_column],
+                target_column,
+                transform: ExactQuery::new(kernel_query::Expr::I64ToF64(Box::new(
+                    kernel_query::Expr::ProductField {
+                        input: Box::new(kernel_query::Expr::Input),
+                        field: input_column,
+                    },
+                ))),
+            }],
+        })],
+    )
+    .unwrap();
+
+    assert_eq!(
+        migration.relation_slice(relation),
+        Some(MigrationRelationSlice::RowLocal {
+            source_relation: relation,
+            target_relation: relation,
+        })
+    );
+
+    let mut state = DatabaseState::default();
+    state.model.relations.insert(
+        relation,
+        vec![
+            vec![kernel_model::Value::I64(7)],
+            vec![kernel_model::Value::I64(11)],
+        ],
+    );
+    assert_eq!(
+        migration
+            .materialize_relation_slice(&state, relation, &registry)
+            .unwrap(),
+        vec![
+            vec![kernel_model::Value::F64Bits(7.0_f64.to_bits())],
+            vec![kernel_model::Value::F64Bits(11.0_f64.to_bits())],
+        ]
+    );
+    assert_eq!(
+        migration
+            .transform_row_local_slice(relation, &vec![kernel_model::Value::I64(13)])
+            .unwrap(),
+        vec![kernel_model::Value::F64Bits(13.0_f64.to_bits())]
+    );
+}
+
+#[test]
+fn schema_migration_query_slice_declares_exact_source_dependency_set() {
+    let left = SemanticId::new(23_000);
+    let right = SemanticId::new(23_001);
+    let target_relation = SemanticId::new(23_002);
+    let eq = SemanticId::new(23_003);
+    let mut registry = SemanticRegistry::default();
+    let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+
+    let relation_def = |id| kernel_schema::RelationDef {
+        id,
+        columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+        semantics: kernel_schema::RelationSemantics::Set {
+            column_equivalences: vec![eq],
+        },
+    };
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(230));
+    source_schema.define_relation(relation_def(left)).unwrap();
+    source_schema.define_relation(relation_def(right)).unwrap();
+    let mut source_environment = SemanticEnvironment::new(SemanticEnvId::new(230));
+    source_environment.pin_module(eq, digest);
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: source_environment,
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(231));
+    target_schema.define_relation(relation_def(left)).unwrap();
+    target_schema.define_relation(relation_def(right)).unwrap();
+    target_schema
+        .define_relation(relation_def(target_relation))
+        .unwrap();
+    let mut target_environment = SemanticEnvironment::new(SemanticEnvId::new(230));
+    target_environment.pin_module(eq, digest);
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: target_environment,
+    };
+
+    let migration = SchemaMigrationTransport::verify(
+        &source,
+        &target,
+        &registry,
+        vec![],
+        vec![MigrationRelationRewrite::Query(RelationRewrite {
+            target_relation,
+            transform: RelExpr::Union {
+                left: Box::new(RelExpr::Scan(left)),
+                right: Box::new(RelExpr::Scan(right)),
+            },
+        })],
+    )
+    .unwrap();
+
+    assert_eq!(
+        migration.relation_slice(target_relation),
+        Some(MigrationRelationSlice::Query {
+            target_relation,
+            source_relations: BTreeSet::from([left, right]),
+        })
+    );
+
+    let mut state = DatabaseState::default();
+    state
+        .model
+        .relations
+        .insert(left, vec![vec![kernel_model::Value::I64(1)]]);
+    state.model.relations.insert(
+        right,
+        vec![
+            vec![kernel_model::Value::I64(2)],
+            vec![kernel_model::Value::I64(3)],
+        ],
+    );
+    assert_eq!(
+        migration
+            .materialize_relation_slice(&state, target_relation, &registry)
+            .unwrap(),
+        vec![
+            vec![kernel_model::Value::I64(1)],
+            vec![kernel_model::Value::I64(2)],
+            vec![kernel_model::Value::I64(3)],
+        ]
+    );
+    assert_eq!(
+        migration.transform_row_local_slice(target_relation, &vec![kernel_model::Value::I64(1)]),
+        Err(TransportError::MigrationSliceNotRowLocal(target_relation))
+    );
+}
+
+#[test]
+fn mixed_migration_source_retention_frontier_is_dependency_exact_and_monotone() {
+    let source_a = SemanticId::new(24_000);
+    let source_b = SemanticId::new(24_001);
+    let target_ab = SemanticId::new(24_002);
+    let target_b = SemanticId::new(24_003);
+    let eq = SemanticId::new(24_004);
+    let mut registry = SemanticRegistry::default();
+    let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+    let relation_def = |id| kernel_schema::RelationDef {
+        id,
+        columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+        semantics: kernel_schema::RelationSemantics::Set {
+            column_equivalences: vec![eq],
+        },
+    };
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(240));
+    source_schema
+        .define_relation(relation_def(source_a))
+        .unwrap();
+    source_schema
+        .define_relation(relation_def(source_b))
+        .unwrap();
+    let mut source_environment = SemanticEnvironment::new(SemanticEnvId::new(240));
+    source_environment.pin_module(eq, digest);
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: source_environment,
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(241));
+    target_schema
+        .define_relation(relation_def(source_a))
+        .unwrap();
+    target_schema
+        .define_relation(relation_def(source_b))
+        .unwrap();
+    target_schema
+        .define_relation(relation_def(target_ab))
+        .unwrap();
+    target_schema
+        .define_relation(relation_def(target_b))
+        .unwrap();
+    let mut target_environment = SemanticEnvironment::new(SemanticEnvId::new(240));
+    target_environment.pin_module(eq, digest);
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: target_environment,
+    };
+
+    let migration = SchemaMigrationTransport::verify(
+        &source,
+        &target,
+        &registry,
+        vec![],
+        vec![
+            MigrationRelationRewrite::Query(RelationRewrite {
+                target_relation: target_ab,
+                transform: RelExpr::Union {
+                    left: Box::new(RelExpr::Scan(source_a)),
+                    right: Box::new(RelExpr::Scan(source_b)),
+                },
+            }),
+            MigrationRelationRewrite::Query(RelationRewrite {
+                target_relation: target_b,
+                transform: RelExpr::Scan(source_b),
+            }),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        migration
+            .required_source_relations(&BTreeSet::new())
+            .unwrap(),
+        BTreeSet::from([source_a, source_b])
+    );
+    assert_eq!(
+        migration
+            .required_source_relations(&BTreeSet::from([source_a, source_b, target_ab]))
+            .unwrap(),
+        BTreeSet::from([source_b])
+    );
+    assert_eq!(
+        migration
+            .required_source_relations(&BTreeSet::from([source_a, source_b, target_ab, target_b,]))
+            .unwrap(),
+        BTreeSet::new()
     );
 }

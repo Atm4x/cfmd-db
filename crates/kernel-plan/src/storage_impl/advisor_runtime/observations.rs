@@ -195,6 +195,7 @@ fn collect_semantic_index_advice_observations(
         ),
         Plan::JoinEq { left, right, .. }
         | Plan::Difference { left, right }
+        | Plan::Union { left, right }
         | Plan::AntiJoin { left, right, .. } => {
             collect_semantic_index_advice_observations(
                 left,

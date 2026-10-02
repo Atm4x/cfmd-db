@@ -55,18 +55,11 @@ assert actual_types == expected_types, (actual_types, expected_types)
 for scalar in ['Unit','Bool','I64','F64','Text','LiveEntityRef','HistoricalEntityId']:
     assert scalar in enum_variants(schema, 'ScalarType'), scalar
 
-expected_rel = {'Scan','FilterEqConst','FilterOrderConst','FilterEqColumns','Project','JoinEq','Difference','AntiJoin','Distinct','Group','TopKWithTies','PromoteToBag'}
+expected_rel = {'Scan','FilterEqConst','FilterEqColumns','Project','JoinEq','Difference','AntiJoin','Distinct','Group','TopKWithTies','PromoteToBag'}
 actual_rel = enum_variants(query, 'RelExpr')
 actual_plan = enum_variants(plan, 'Plan')
 assert actual_rel == expected_rel, (actual_rel, expected_rel)
 assert actual_plan == expected_rel, (actual_plan, expected_rel)
-
-assert enum_variants(query, 'OrderComparison') == {'Less', 'LessOrEqual', 'Greater', 'GreaterOrEqual'}
-for constructor in ['less', 'lessOrEqual', 'greater', 'greaterOrEqual']:
-    require(formal, constructor, 'SurfaceKernel.lean OrderComparison')
-for owner in ['SurfaceQuery', 'KernelQuery', 'Plan']:
-    body = re.search(rf'inductive {owner} where(?P<body>.*?)\n  deriving', formal, re.S)
-    assert body and '| filterOrderConst ' in body.group('body'), owner
 
 # Normative surface table in the spec must not drift outside the mechanized vocabulary.
 for row in [

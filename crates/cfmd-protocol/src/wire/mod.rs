@@ -156,6 +156,10 @@ impl WireHostedSession {
         self.hosted.cancel_all_watches()
     }
 
+    pub fn reauthorize_watches(&self) -> Result<()> {
+        self.hosted.reauthorize_watches()
+    }
+
     pub fn close(&self) -> Result<()> {
         self.hosted.close()
     }

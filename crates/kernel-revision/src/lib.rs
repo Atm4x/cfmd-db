@@ -70,6 +70,56 @@ impl From<ModelError> for RevisionError {
     }
 }
 
+/// Certified semantic authority for a revision identity without claiming that
+/// its entire logical `DatabaseState` is materialized in one representation.
+///
+/// This is the ownership seam used by mixed physical migration views: schema
+/// and semantic environment can become authoritative atomically while relation
+/// coordinates remain physically split across source and target epochs. A full
+/// [`Revision`] remains the stronger certificate that additionally owns and
+/// validates a complete materialized state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionSemanticHead {
+    id: RevisionId,
+    semantics: SemanticRevision,
+    semantic_context: SemanticContext,
+}
+
+impl RevisionSemanticHead {
+    pub fn build(
+        id: RevisionId,
+        context: &SemanticContext,
+        registry: &SemanticRegistry,
+    ) -> Result<Self, RevisionError> {
+        context
+            .validate()
+            .map_err(ModelError::InvalidSemanticContext)?;
+        registry
+            .validate_context(context)
+            .map_err(RevisionError::InvalidSemantics)?;
+        Ok(Self {
+            id,
+            semantics: context.revision(),
+            semantic_context: context.clone(),
+        })
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> RevisionId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn semantic_revision(&self) -> SemanticRevision {
+        self.semantics
+    }
+
+    #[must_use]
+    pub fn semantic_context(&self) -> &SemanticContext {
+        &self.semantic_context
+    }
+}
+
 /// Dense revision-local validation basis whose value depends only on the
 /// entity universe, lifecycle graph and pinned schema -- never on relation
 /// tuples. Relation-data-only revisions therefore share this root exactly;
@@ -114,6 +164,24 @@ impl RelationUpdateCandidate<'_> {
         self.touched_relations.insert(relation);
     }
 
+    pub fn patch_relation_rows(
+        &mut self,
+        relation: kernel_types::SemanticId,
+        removed_positions: &[usize],
+        inserted: Vec<Vec<kernel_model::Value>>,
+    ) -> Result<(), RevisionError> {
+        if !self
+            .state
+            .model
+            .relations
+            .patch_persistent(relation, removed_positions, inserted)
+        {
+            return Err(RevisionError::InvalidRelationOnlyTransition);
+        }
+        self.touched_relations.insert(relation);
+        Ok(())
+    }
+
     pub fn build(
         mut self,
         id: RevisionId,
@@ -124,13 +192,33 @@ impl RelationUpdateCandidate<'_> {
             .map_err(RevisionError::InvalidSemantics)?;
         let live = &self.source.state.lifecycle.entities;
         for relation in &self.touched_relations {
-            let Some(rows) = self.state.model.relations.get_mut(relation) else {
-                continue;
-            };
-            rows.retain(|row| {
-                row.iter()
-                    .all(|value| value.first_dangling_live_ref(live).is_none())
-            });
+            let has_dangling = self
+                .state
+                .model
+                .relations
+                .get_shared(relation)
+                .is_some_and(|rows| {
+                    rows.iter().any(|row| {
+                        row.iter()
+                            .any(|value| value.first_dangling_live_ref(live).is_some())
+                    })
+                });
+            if has_dangling {
+                let filtered = self
+                    .state
+                    .model
+                    .relations
+                    .get_shared(relation)
+                    .expect("relation checked above")
+                    .iter()
+                    .filter(|row| {
+                        row.iter()
+                            .all(|value| value.first_dangling_live_ref(live).is_none())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.state.model.relations.insert(*relation, filtered);
+            }
         }
         validate_relations_with_extents(
             &self.source.semantic_context,
@@ -235,6 +323,10 @@ impl Revision {
         })
     }
 
+    pub fn detach_relation_materialized_projections(&mut self) {
+        self.state.detach_relation_materialized_projections();
+    }
+
     #[must_use]
     pub fn relation_update_candidate(&self) -> RelationUpdateCandidate<'_> {
         RelationUpdateCandidate {
@@ -332,6 +424,15 @@ impl Revision {
     #[must_use]
     pub fn semantic_context(&self) -> &SemanticContext {
         &self.semantic_context
+    }
+
+    #[must_use]
+    pub fn semantic_head(&self) -> RevisionSemanticHead {
+        RevisionSemanticHead {
+            id: self.id,
+            semantics: self.semantics,
+            semantic_context: self.semantic_context.clone(),
+        }
     }
 
     #[must_use]

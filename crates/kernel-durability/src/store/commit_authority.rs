@@ -8,7 +8,7 @@ use super::migration_history::{MigrationCommitOverlay, publish_prepared_migratio
 use crate::descriptor::DurableRevisionDescriptor;
 use crate::domain::{
     DurableMigrationComplement, DurableRevisionEffectRecord, DurableTransactionIntent,
-    DurableTransactionKey,
+    DurableTransactionKey, HistoricalEpochAnchor,
 };
 use crate::runtime::DurabilityError;
 
@@ -16,6 +16,7 @@ use crate::runtime::DurabilityError;
 pub(super) struct PreparedCommitAuthority {
     durable_head: RevisionId,
     migration_appends: Vec<DurableMigrationComplement>,
+    historical_anchor_appends: Vec<HistoricalEpochAnchor>,
     retry_appends: Vec<(DurableTransactionKey, DurableTransactionIntent)>,
     revision_effect_appends: Vec<DurableRevisionEffectRecord>,
 }
@@ -34,6 +35,7 @@ impl PreparedCommitAuthority {
             CausalCommitOverlay::new(&store.revision_effects, &store.revision_effect_frontiers);
         let mut retry_overlay = BTreeMap::new();
         let mut durable_head = store.durable_head;
+        let mut historical_anchor_appends = Vec::new();
 
         for descriptor in descriptors {
             if let DurableTransactionIntent::SchemaMigrationExact {
@@ -42,6 +44,18 @@ impl PreparedCommitAuthority {
             } = &descriptor.intent
             {
                 migrations.prepare_append(migration_complement)?;
+                let effect_id =
+                    descriptor
+                        .revision_effect_id
+                        .unwrap_or(kernel_change::RevisionEffectId(
+                            descriptor.transaction_id.raw(),
+                        ));
+                historical_anchor_appends.push(HistoricalEpochAnchor {
+                    effect_id,
+                    source_revision: descriptor.source_revision,
+                    source_schema: migration_complement.source_schema,
+                    generation: store.generation,
+                });
             }
 
             let key =
@@ -68,6 +82,7 @@ impl PreparedCommitAuthority {
         Ok(Self {
             durable_head,
             migration_appends: migrations.into_appends(),
+            historical_anchor_appends,
             retry_appends: retry_overlay.into_iter().collect(),
             revision_effect_appends: causal.into_effects(),
         })
@@ -79,6 +94,14 @@ impl PreparedCommitAuthority {
             &mut store.migration_complement_index,
             self.migration_appends,
         );
+        for anchor in self.historical_anchor_appends {
+            if let Some(existing) = store
+                .historical_epoch_anchors
+                .insert(anchor.effect_id, anchor)
+            {
+                debug_assert_eq!(existing, anchor);
+            }
+        }
         for (key, intent) in self.retry_appends {
             debug_assert!(!store.committed_transactions.contains_key(&key));
             store.committed_transactions.insert(key, intent);

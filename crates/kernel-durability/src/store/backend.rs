@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
@@ -64,6 +65,16 @@ impl DurabilityBackend {
                 external_freshness: true,
                 physical_compaction: true,
             },
+        }
+    }
+
+    pub(super) fn historical_directory_root(&self) -> Result<&Path, DurabilityError> {
+        match self {
+            Self::Directory(backend) => Ok(&backend.root),
+            Self::SingleFile(_) => Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "historical epoch materialization is not yet representable by the single-file backend",
+            }),
         }
     }
 
@@ -166,6 +177,7 @@ impl DurabilityBackend {
         generation: u64,
         checkpoint_revision: RevisionId,
         durable_head: RevisionId,
+        pinned_historical_generations: &BTreeSet<u64>,
         hook: &mut impl StoreFaultHook,
         compaction_io: &mut impl SingleFileCompactionIo,
     ) -> Result<(), DurabilityError> {
@@ -206,6 +218,13 @@ impl DurabilityBackend {
                                 )
                             })
                             .or_else(|| {
+                                super::generation_layout::parse_generation_name(
+                                    name,
+                                    "realization-",
+                                    ".cfpr",
+                                )
+                            })
+                            .or_else(|| {
                                 super::generation_layout::parse_checkpoint_chunk_generation(name)
                             })
                             .or_else(|| {
@@ -221,9 +240,11 @@ impl DurabilityBackend {
                         ".tmp",
                     )
                     .is_some();
-                    if is_pending
-                        || obsolete_generation.is_some_and(|candidate| candidate != generation)
-                    {
+                    let removable_obsolete = obsolete_generation.is_some_and(|candidate| {
+                        candidate != generation
+                            && !pinned_historical_generations.contains(&candidate)
+                    });
+                    if is_pending || removable_obsolete {
                         hook.hit(StoreFaultPoint::BeforeCompactionRemove)?;
                         fs::remove_file(entry.path())?;
                         hook.hit(StoreFaultPoint::AfterCompactionRemove)?;
@@ -234,6 +255,16 @@ impl DurabilityBackend {
                 Ok(())
             }
             Self::SingleFile(backend) => {
+                for &pinned in pinned_historical_generations {
+                    if pinned != generation
+                        && !backend.container.has_historical_epoch_archive(pinned)?
+                    {
+                        return Err(DurabilityError::Protocol {
+                            offset: 0,
+                            reason: "single-file compaction is missing archived historical epoch authority",
+                        });
+                    }
+                }
                 if backend.container.generation() != generation {
                     return Err(DurabilityError::Protocol {
                         offset: 0,

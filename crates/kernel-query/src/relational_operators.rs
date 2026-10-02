@@ -3,6 +3,53 @@ use super::{
     Value, canonical_row_key, relation_column_equivalences,
 };
 
+/// Exact semantic union under the supplied row equivalences.
+///
+/// Set inputs use Γ-support union. Bag inputs use additive multiset union.
+/// The operator never delegates duplicate semantics to host-language equality.
+pub fn union_relation_values(
+    left: RelationValue,
+    right: RelationValue,
+    column_equivalences: &[kernel_types::SemanticId],
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<RelationValue, RelQueryError> {
+    match (left, right) {
+        (
+            RelationValue::Set {
+                rows: left_rows,
+                column_equivalences: left_equivalences,
+            },
+            RelationValue::Set {
+                rows: right_rows,
+                column_equivalences: right_equivalences,
+            },
+        ) => {
+            if left_equivalences != column_equivalences || right_equivalences != column_equivalences
+            {
+                return Err(RelQueryError::TypeMismatch);
+            }
+            let mut seen = BTreeSet::new();
+            let mut rows = Vec::with_capacity(left_rows.len() + right_rows.len());
+            for row in left_rows.into_iter().chain(right_rows) {
+                let key = canonical_row_key(&row, column_equivalences, context, registry)?;
+                if seen.insert(key) {
+                    rows.push(row);
+                }
+            }
+            Ok(RelationValue::Set {
+                rows,
+                column_equivalences: column_equivalences.to_vec(),
+            })
+        }
+        (RelationValue::Bag(mut left_rows), RelationValue::Bag(right_rows)) => {
+            left_rows.extend(right_rows);
+            Ok(RelationValue::Bag(left_rows))
+        }
+        _ => Err(RelQueryError::TypeMismatch),
+    }
+}
+
 /// Exact semantic difference under the supplied row equivalences.
 ///
 /// Set inputs use support subtraction. Bag inputs use truncated natural
@@ -383,4 +430,29 @@ pub(super) fn distinct_rows(
         }
     }
     Ok(out)
+}
+
+pub(super) fn distinct_rows_with_canonical_keys(
+    rows: Vec<Row>,
+    column_equivalences: &[kernel_types::SemanticId],
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
+) -> Result<(Vec<Row>, Vec<CanonicalRowKey>), RelQueryError> {
+    let mut keyed_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key = canonical_row_key(&row, column_equivalences, context, registry)?;
+        keyed_rows.push((key, row));
+    }
+    keyed_rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    let mut out = Vec::with_capacity(keyed_rows.len());
+    let mut canonical_keys = Vec::with_capacity(keyed_rows.len());
+    for (key, row) in keyed_rows {
+        if canonical_keys.last().is_some_and(|last| *last == key) {
+            continue;
+        }
+        out.push(row);
+        canonical_keys.push(key);
+    }
+    Ok((out, canonical_keys))
 }

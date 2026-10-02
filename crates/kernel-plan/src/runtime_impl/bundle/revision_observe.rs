@@ -32,6 +32,17 @@ impl RuntimeRevisionBundle {
         self.relation_bases.get(&relation)
     }
 
+    pub fn relation_scan_occurrence_seed(
+        &self,
+        relation: SemanticId,
+    ) -> Result<Option<kernel_query::RelationScanOccurrenceSeed>, PhysicalExecutionError> {
+        self.relation_bases
+            .get(&relation)
+            .map(RelationBaseWitness::logical_scan_occurrence_seed)
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Captures one exact OFC observation fiber against this immutable runtime
     /// root. The returned guard is root/revision bound and can later classify
     /// prepared transitions without trusting caller-provided dependency sets.
@@ -70,6 +81,8 @@ impl RuntimeRevisionBundle {
                     .map(|mutation| RevisionRelationMutation {
                         relation: mutation.relation,
                         delta: &mutation.delta,
+                    object_field_writes: &[],
+                    authorization: Default::default(),
                     })
                     .collect::<Vec<_>>();
                 (

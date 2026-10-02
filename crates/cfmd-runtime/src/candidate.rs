@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    CommitOutcome, Error, ErrorKind, Object, ObjectPredicate, Plan, Projection, Query, Relation,
-    RelationId, RelationQuery, RelationResult, Result, RevisionId, Row, TransactionId, TypedQuery,
+    Error, ErrorKind, GroupKey, Object, ObjectPredicate, Plan, Projection, Query, Relation,
+    RelationId, RelationQuery, RelationResult, Result, RevisionId, Row, TypedQuery,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +145,8 @@ impl CandidatePreview {
 ///
 /// Candidate owns no second database authority: its target Revision is derived from the Plan's
 /// pinned source snapshot and exact deltas, then validated by the same kernel revision machinery
-/// used by commit. Nothing is published until `commit` succeeds.
+/// used by publication. A Candidate is inspectable future state only; publication belongs to the
+/// originating [`crate::Database`] / [`crate::SessionDatabase`] control surface.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     plan: Plan,
@@ -157,7 +158,7 @@ fn relation_len(
     relations: &kernel_model::RelationStore,
     relation: kernel_types::SemanticId,
 ) -> usize {
-    relations.get(&relation).map_or(0, Vec::len)
+    relations.get(&relation).map_or(0, kernel_model::SharedRelationRows::len)
 }
 
 fn expected_relation_len(plan: &Plan, relation: RelationId) -> usize {
@@ -301,11 +302,14 @@ impl Candidate {
     }
 
     pub fn execute(&self, query: &Query) -> Result<RelationResult> {
-        self.plan.authority.require(crate::Permission::Read)?;
         let prepared = query
             .inner
             .prepare(self.target.semantic_context(), &self.plan.registry)
             .map_err(|error| crate::query::query_error_at(query, &error))?;
+        let footprint = prepared
+            .read_footprint()
+            .map_err(|error| crate::query::query_error_at(query, &error))?;
+        self.plan.authority.require_read_footprint(&footprint)?;
         prepared
             .evaluate(
                 &self.target.state().model,
@@ -317,7 +321,7 @@ impl Candidate {
     }
 
     pub fn objects<E: Object>(&self) -> Result<CandidateObjectSet<E>> {
-        self.plan.authority.require(crate::Permission::Read)?;
+        self.plan.authority.require_read_entry()?;
         let schema = crate::SchemaView::from_kernel(&self.target.semantic_context().schema);
         let relation_schema = schema.relation(E::relation_id()).ok_or_else(|| {
             Error::new(
@@ -327,18 +331,6 @@ impl Candidate {
         })?;
         let relation = Relation::from_schema(relation_schema);
         CandidateObjectSet::new(self.clone(), relation)
-    }
-
-    pub fn commit(&self, transaction: TransactionId) -> Result<CommitOutcome> {
-        {
-            let runtime = self.plan.runtime.upgrade().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Recovery,
-                    "candidate database runtime is no longer open",
-                )
-            })?;
-            crate::runtime::commit_bound_plan(&runtime, &self.plan, transaction)
-        }
     }
 }
 
@@ -384,8 +376,50 @@ impl<E: Object> CandidateObjectSet<E> {
         self.query().where_(predicate)
     }
 
+    #[track_caller]
+    #[must_use]
+    pub fn top<F, V>(&self, k: usize, field: F) -> CandidateObjectQuery<E>
+    where
+        F: FnOnce(&E::Proxy) -> crate::Field<E, V>,
+        V: crate::OrderedObjectValue,
+    {
+        self.query().top(k, field)
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn bottom<F, V>(&self, k: usize, field: F) -> CandidateObjectQuery<E>
+    where
+        F: FnOnce(&E::Proxy) -> crate::Field<E, V>,
+        V: crate::OrderedObjectValue,
+    {
+        self.query().bottom(k, field)
+    }
+
+    #[must_use]
+    pub fn select<F, P>(&self, projection: F) -> CandidateProjectionQuery<E, P>
+    where
+        F: FnOnce(&E::Proxy) -> P,
+        P: Projection<E>,
+    {
+        self.query().select(projection)
+    }
+
+    #[must_use]
+    pub fn group_by<F, G>(&self, key: F) -> CandidateObjectGroupQuery<E, G>
+    where
+        F: FnOnce(&E::Proxy) -> G,
+        G: GroupKey<E>,
+    {
+        self.query().group_by(key)
+    }
+
     pub fn all(&self) -> Result<Vec<E>> {
         self.query().all()
+    }
+
+    pub fn count(&self) -> Result<usize> {
+        self.query().count()
     }
 
     pub fn get(&self, id: crate::Id<E>) -> Result<Option<E>> {
@@ -425,6 +459,30 @@ impl<E: Object> CandidateObjectQuery<E> {
         self
     }
 
+    #[track_caller]
+    #[must_use]
+    pub fn top<F, V>(mut self, k: usize, field: F) -> Self
+    where
+        F: FnOnce(&E::Proxy) -> crate::Field<E, V>,
+        V: crate::OrderedObjectValue,
+    {
+        let proxy = E::proxy(self.relation.clone());
+        self.inner = self.inner.top(field(&proxy), k);
+        self
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn bottom<F, V>(mut self, k: usize, field: F) -> Self
+    where
+        F: FnOnce(&E::Proxy) -> crate::Field<E, V>,
+        V: crate::OrderedObjectValue,
+    {
+        let proxy = E::proxy(self.relation.clone());
+        self.inner = self.inner.bottom(field(&proxy), k);
+        self
+    }
+
     #[must_use]
     pub fn select<F, P>(self, projection: F) -> CandidateProjectionQuery<E, P>
     where
@@ -438,9 +496,36 @@ impl<E: Object> CandidateObjectQuery<E> {
         }
     }
 
+    #[must_use]
+    pub fn group_by<F, G>(self, key: F) -> CandidateObjectGroupQuery<E, G>
+    where
+        F: FnOnce(&E::Proxy) -> G,
+        G: GroupKey<E>,
+    {
+        let proxy = E::proxy(self.relation.clone());
+        let key = key(&proxy);
+        let error = (!key.belongs_to(self.relation.id())).then(|| {
+            Error::new(
+                ErrorKind::InvalidPlan,
+                "candidate group key belongs to a different relation handle",
+            )
+        });
+        CandidateObjectGroupQuery {
+            candidate: self.candidate,
+            relation: self.relation,
+            inner: self.inner.raw(),
+            key,
+            error,
+        }
+    }
+
     pub fn all(&self) -> Result<Vec<E>> {
         let result = self.candidate.execute(&self.inner.clone().raw())?;
         result.rows().iter().map(E::from_row).collect()
+    }
+
+    pub fn count(&self) -> Result<usize> {
+        candidate_exact_count(&self.candidate, self.inner.clone().raw())
     }
 
     pub fn first_or_none(&self) -> Result<Option<E>> {
@@ -449,10 +534,12 @@ impl<E: Object> CandidateObjectQuery<E> {
     }
 
     pub fn one_or_none(&self) -> Result<Option<E>> {
-        let mut values = self.all()?;
-        match values.len() {
+        match self.count()? {
             0 => Ok(None),
-            1 => Ok(values.pop()),
+            1 => {
+                let mut values = self.all()?;
+                Ok(values.pop())
+            }
             count => Err(Error::new(
                 ErrorKind::Cardinality,
                 format!("expected at most one candidate object, query returned {count}"),
@@ -471,15 +558,144 @@ impl<E: Object> CandidateObjectQuery<E> {
 }
 
 #[derive(Debug, Clone)]
+pub struct CandidateObjectGroupQuery<E: Object, G: GroupKey<E>> {
+    candidate: Candidate,
+    relation: Relation<E>,
+    inner: Query,
+    key: G,
+    error: Option<Error>,
+}
+
+impl<E: Object, G: GroupKey<E>> CandidateObjectGroupQuery<E, G> {
+    #[must_use]
+    pub fn count(self) -> CandidateGroupedAggregateQuery<G::Output, usize> {
+        let key_width = self.key.columns().len();
+        let query = self.inner.clone().group_count(
+            self.key.columns(),
+            self.key.equivalences(),
+            crate::object::count_equivalence_id(),
+        );
+        CandidateGroupedAggregateQuery {
+            candidate: self.candidate,
+            inner: query,
+            decode: crate::object::decode_group_count_row::<E, G>,
+            aggregate_column: key_width,
+            ordering: crate::object::count_ordering_id(),
+            error: self.error,
+        }
+    }
+
+    #[must_use]
+    pub fn sum<F>(self, value: F) -> CandidateGroupedAggregateQuery<G::Output, f64>
+    where
+        F: FnOnce(&E::Proxy) -> crate::Field<E, f64>,
+    {
+        let proxy = E::proxy(self.relation.clone());
+        let value = value(&proxy);
+        let error = self.error.or_else(|| {
+            (value.relation_id() != self.relation.id()).then(|| {
+                Error::new(
+                    ErrorKind::InvalidPlan,
+                    "candidate group aggregate field belongs to a different relation handle",
+                )
+            })
+        });
+        let key_width = self.key.columns().len();
+        let query = self.inner.clone().group_exact_f64_sum(
+            self.key.columns(),
+            self.key.equivalences(),
+            value.column(),
+            value.equivalence(),
+        );
+        CandidateGroupedAggregateQuery {
+            candidate: self.candidate,
+            inner: query,
+            decode: crate::object::decode_group_sum_row::<E, G>,
+            aggregate_column: key_width,
+            ordering: crate::object::exact_f64_sum_ordering_id(),
+            error,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateGroupedAggregateQuery<K, A> {
+    candidate: Candidate,
+    inner: Query,
+    decode: fn(&Row) -> Result<(K, A)>,
+    aggregate_column: usize,
+    ordering: crate::OrderingId,
+    error: Option<Error>,
+}
+
+impl<K, A> CandidateGroupedAggregateQuery<K, A> {
+    #[track_caller]
+    #[must_use]
+    pub fn top(mut self, k: usize) -> Self {
+        self.inner = self.inner.top_k_with_ties(
+            self.aggregate_column,
+            self.ordering,
+            crate::OrderDirection::Descending,
+            k,
+        );
+        self
+    }
+
+    #[track_caller]
+    #[must_use]
+    pub fn bottom(mut self, k: usize) -> Self {
+        self.inner = self.inner.top_k_with_ties(
+            self.aggregate_column,
+            self.ordering,
+            crate::OrderDirection::Ascending,
+            k,
+        );
+        self
+    }
+
+    pub fn all(&self) -> Result<Vec<(K, A)>> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        self.candidate
+            .execute(&self.inner)?
+            .rows()
+            .iter()
+            .map(self.decode)
+            .collect()
+    }
+
+    #[must_use]
+    pub const fn node_id(&self) -> crate::QueryNodeId {
+        self.inner.node_id()
+    }
+
+    #[must_use]
+    pub fn source(&self) -> crate::QuerySource {
+        self.inner.source()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CandidateProjectionQuery<E: Object, P: Projection<E>> {
     candidate: Candidate,
     inner: TypedQuery<E, P>,
 }
 
 impl<E: Object, P: Projection<E>> CandidateProjectionQuery<E, P> {
+    #[must_use]
+    pub fn distinct(mut self) -> Self {
+        self.inner = self.inner.distinct();
+        self
+    }
+
     pub fn all(&self) -> Result<Vec<P::Output>> {
         let result = self.candidate.execute(self.inner.raw())?;
         self.inner.decode_result(&result)
+    }
+
+    pub fn count(&self) -> Result<usize> {
+        candidate_exact_count(&self.candidate, self.inner.raw().clone())
     }
 
     pub fn first_or_none(&self) -> Result<Option<P::Output>> {
@@ -488,10 +704,12 @@ impl<E: Object, P: Projection<E>> CandidateProjectionQuery<E, P> {
     }
 
     pub fn one_or_none(&self) -> Result<Option<P::Output>> {
-        let mut values = self.all()?;
-        match values.len() {
+        match self.count()? {
             0 => Ok(None),
-            1 => Ok(values.pop()),
+            1 => {
+                let mut values = self.all()?;
+                Ok(values.pop())
+            }
             count => Err(Error::new(
                 ErrorKind::Cardinality,
                 format!("expected at most one candidate projection, query returned {count}"),
@@ -507,6 +725,29 @@ impl<E: Object, P: Projection<E>> CandidateProjectionQuery<E, P> {
             )
         })
     }
+}
+
+fn candidate_exact_count(candidate: &Candidate, query: Query) -> Result<usize> {
+    let query = query.count(crate::object::count_equivalence_id());
+    let result = candidate.execute(&query)?;
+    let [row] = result.rows() else {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "exact candidate count aggregate did not return exactly one row",
+        ));
+    };
+    let [crate::Value::I64(count)] = row.as_slice() else {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "exact candidate count aggregate returned an invalid row shape",
+        ));
+    };
+    usize::try_from(*count).map_err(|_| {
+        Error::new(
+            ErrorKind::InvariantViolation,
+            "exact candidate count aggregate cannot be represented as usize",
+        )
+    })
 }
 
 fn identity_query<E: Object>(

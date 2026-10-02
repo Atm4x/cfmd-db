@@ -164,6 +164,10 @@ pub enum RelExpr {
         left: Box<Self>,
         right: Box<Self>,
     },
+    Union {
+        left: Box<Self>,
+        right: Box<Self>,
+    },
     AntiJoin {
         left: Box<Self>,
         right: Box<Self>,

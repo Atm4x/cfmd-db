@@ -2805,3 +2805,139 @@ Open product/backend obligation: current strong-reference metadata is owned by `
 Pass351 adds a snapshot-bound Rust `Transaction` product composer over the existing Plan/Candidate/commit authority. A transaction owns one exact live base view and accepts only mutation Plans from that same database snapshot and authority; stale publication and cross-snapshot composition fail closed. Publication is retryable with the same durable transaction identity and preserves the existing idempotent `AlreadyCommitted` outcome. No second mutation engine, implicit rebase, retry loop, lock model or SQL transaction semantics are introduced.
 
 P351 hostile R&D also fixes the next query-surface direction: ordered predicates are to be expressed as a native Γ-ordering relational primitive, prepared and maintained in `kernel-query`, then surfaced through typed Fields. Generic callback/post-filter fallbacks are explicitly rejected for this path.
+
+## Productization delta — Pass361
+
+**[QUERY COMPOSITION LAW]** Product predicate conjunction is relational composition, not a callback/post-materialization evaluator. `ObjectPredicate::and` applies the left and right exact predicates to the same root query in sequence, so equality, Γ-order and deep relationship predicates continue to lower into the existing kernel-query calculus and maintained differential program.
+
+**[ORDERED BOUNDARY LAW]** Object-first `top(k, field)` / `bottom(k, field)` are admitted only for fields carrying a declared canonical ordering. They lower directly to the existing `TopKWithTies { column, ordering, direction, k }` relation primitive. Boundary-equivalent rows are retained even when result cardinality exceeds `k`; no physical row ordering is promised. Materialize-then-sort, SQL-shaped ordering fallback, full-query recomputation and error-driven routing are forbidden for this surface.
+
+**[WORLD PARITY]** Current object queries and Candidate object queries share the same typed ordered-boundary lowering. Exact watches consume the same maintained ordered-cut state; no watch-specific query interpretation is introduced.
+
+## Productization delta — Pass362
+
+**[MULTIPLICITY-PRESERVING PROJECTION LAW]** Ordinary object-first `select` preserves one projected occurrence per selected source row. The lowering MUST remain kernel-native: a set-shaped object query is promoted by `PromoteToBag` before `Project`, so projection does not collapse equal projected values merely because the source relation has set authority. Host-side `Vec` duplication, SQL emulation, provenance-table fallback, or post-materialization expansion are forbidden.
+
+**[EXPLICIT Γ-DISTINCT LAW]** `select(...).distinct()` is the explicit semantic quotient. It lowers to the existing maintained kernel `Distinct` with the exact declared equivalences of the projected columns. Thus `select(...).count()` counts projected occurrences, while `select(...).distinct().count()` counts Γ-equivalence classes. No second deduplication engine is permitted.
+
+**[EXACT COUNT LAW]** Product `count()` over object sets, object queries, typed projections and relationship selections lowers to the kernel `Group` aggregate with an empty group key and exact `Count`. Host-side `all().len()`, projected-row `len()`, identity-vector `len()`, or recompute fallback are forbidden for the ordinary count surface.
+
+**[TYPED GROUP LAW]** `group_by(key).count()` lowers directly to kernel `Group` with the key field's declared Γ equivalence and `ExactCount`. `group_by(key).sum(f64_field)` lowers to the same `Group` operator with `ExactF64Sum`; host floating accumulation and separate aggregate routing are forbidden. Live and Candidate reads MUST share this lowering and result-shape semantics.
+
+**[BOUNDARY NAME LAW]** `top(k, field)` and `bottom(k, field)` are the product names for CFMD's strongest admitted ordered-boundary semantics. They retain every row equivalent at the k-th Γ boundary class. The product layer MUST NOT add a weaker arbitrary exact-k variant merely to mimic conventional collection APIs; the kernel name `TopKWithTies` remains an implementation/dynamic detail.
+
+**[PROJECTION WATCH LAW]** Maintained ordinary projection watches observe exact bag multiplicity deltas after `PromoteToBag -> Project`; inserting another source row with the same projected value emits that projected insertion. Maintained distinct projection watches observe semantic classes and therefore suppress source multiplicity changes that do not create or remove a Γ-equivalence class. Neither path may recompute or deduplicate in the product layer.
+
+## Pass395 normative addendum — Physical Realization reference boundary
+
+**[ARCHITECTURE]** Physical representation is not semantic/schema authority. The target storage law factors current logical state through a certified realization root `ρ : PhysicalAtoms -> finite Model`. A migration `M : A -> B` changes current semantic authority atomically and should compile the next realization compositionally as `ρ_B = normalize(M ∘ ρ_A)`. Retained atoms created under earlier physical layouts do not keep schema A alive as a current semantic world.
+
+**[REFERENCE IMPLEMENTATION]** `kernel-realization` now provides the non-durable in-memory reference calculus: explicit atom identity/codec, direct/constant/exact-scalar field realizations, full `DatabaseState` evaluation as the oracle, extensional rewrite certification, semantic-coordinate dependency graphs and current+historical reachability. This crate is intentionally below `kernel-plan`; it must not become planner-specific routing state.
+
+**[MATERIALIZATION LAW]** A representation-only rewrite may publish different physical atoms/root under the same semantic revision only after proving extensional equality of the realized logical state. The reference law is `evaluate(ρ_before) = evaluate(ρ_after)`. This is not a database revision and MUST NOT create a semantic/history event.
+
+**[GC LAW]** Physical progress is graph reachability, not a migration-progress bitmap. An atom is reclaimable only when unreachable from every current or retained historical realization root (and from any future durable/recovery authority once those are integrated).
+
+**[NON-CLAIM]** P395 does not change checkpoint/WAL authority. `Revision=(S,Γ,M)` remains the durable oracle, and current `PhysicalStore` artifacts remain reconstructible. Durable physical atoms/realization roots are deferred until migration composition and representation-rewrite laws are closed in-memory.
+
+## Pass396 normative addendum — migration composition and realization performance law
+
+**[COMPOSITION LAW]** A verified migration `M : A -> B` may compile the current physical realization compositionally as `ρ_B = normalize(M ∘ ρ_A)` without making semantic schema A a current runtime authority. Field merge/split/default/drop and row-local relation rewrites must reuse the existing deterministic query/transport algebra; unsupported global relational rewrites fail closed rather than falling back to an A-schema runtime branch.
+
+**[PERFORMANCE LAW]** A derived realization is a correctness-preserving bridge, not automatically an acceptable steady-state hot representation. Measurements on the P396 reference evaluator show a generic scalar transform at roughly 12-13x the cost of a direct in-memory atom read, while materialized direct realization returns to native baseline. Production scheduling must therefore permit hot/on-access coordinates to converge to native physical realization without changing semantic revision.
+
+**[FACTORIZATION LAW]** The per-value `PhysicalAtom` / `(FieldId,EntityId)->RealizationExpr` representation in P395/P396 is a reference oracle only. Production semantic cutover MUST NOT require O(number of stored values) realization metadata construction. Realization programs must be factorized over physical columns/segments/chunks or an equivalently bounded structural coordinate so migration cutover metadata is proportional to schema/layout structure rather than database cardinality.
+
+**[NON-CLAIM]** P396 does not make realization durable authority and does not authorize the current per-cell reference representation for production storage. Full `Revision=(S,Γ,M)` remains the durable semantic oracle until factorized realization has equivalent correctness and measured performance.
+
+## Pass397 normative addendum — factorized realization and compiled transform law
+
+**[FACTORIZED FIELD LAW]** A production field realization is keyed by stable semantic field identity and applies to a physical column/segment containing many entity values. Semantic migration cutover MUST NOT allocate one realization expression per entity value when the same structural rule applies to the whole column/segment.
+
+**[CUTOVER COMPLEXITY LAW]** For a migration whose field mapping is structurally uniform, `ρ_B = normalize(M ∘ ρ_A)` must construct metadata proportional to schema/layout structure, not database cardinality. P397 demonstrates 100,000 migrated values with three physical atoms and three target dependencies; row count is payload cardinality, not realization-program cardinality.
+
+**[NORMALIZATION LAW]** Verified deterministic migration expressions should normalize into compiled physical realization rules when their semantics admit it. Direct alias/copy may reuse the existing column atom, constants may remain virtual, and direct `i64 -> f64` over one source column may execute as a specialized column rule without constructing generic product values on every read. Generic `ExactQuery` remains the semantic oracle/fallback representation only where no equivalent compiled realization rule exists; it must not be silently substituted for an unsupported factorized relation migration.
+
+**[HOT-PATH PERFORMANCE LAW]** A factorized derived representation is acceptable on the hot read path only when its measured cost is near the corresponding native physical read or when policy guarantees bounded convergence to native materialization. P397 warm release measurements for normalized `i64 -> f64` are 0.85-0.98x the direct point-read time; the earlier generic 12-13x path is therefore not the accepted implementation for this primitive.
+
+**[MATERIALIZATION LAW]** Materializing a factorized field column is a representation-only publication under the same semantic revision: one derived column rule may be replaced by one native physical column atom after extensional equivalence. Full-column materialization cost is physical maintenance work, not semantic migration work.
+
+**[RELATION NON-CLAIM]** P397 factorizes entity fields only. Any `SchemaMigrationProgram` containing relation rewrites fails closed in the factorized compiler until stable relation-column/segment realization is implemented. The runtime must not route such a migration through the superseded mixed-current-world or per-row factorized fallback.
+
+## Pass399 normative addendum — bounded chunk realization law
+
+**[CHUNKING LAW]** Physical chunk subdivision is a representation detail under one semantic coordinate. Materializing a bounded range of a factorized column MUST NOT create a semantic revision, schema epoch, alternate current schema, or migration-progress record. The current semantic relation/column remains unchanged while its realization may contain a derived base plus sparse native chunks.
+
+**[SPARSE PROGRESS LAW]** Chunk convergence is represented by physical reachability. The realization root may retain a base expression plus only the native chunks that have actually been materialized. A dense row/cardinality-sized progress bitmap is not part of semantic or durable migration authority.
+
+**[GC LAW]** A base physical atom remains reachable while any current chunk still depends on it. Once every chunk covered by the realization is native, the current realization root MUST cease retaining the base atom. Historical realization roots may still pin it independently.
+
+**[BOUNDED MATERIALIZATION LAW]** On-access or maintenance-driven materialization may rewrite one bounded chunk without rewriting the rest of the column. Reads from both native and still-derived chunks MUST realize the same current semantic values.
+
+**[PERFORMANCE LAW]** Chunk routing must not reintroduce a large steady-state hot-read penalty. P399 measures 100k-row relation columns with 4096-row chunks; whole-column partial-materialization scans remain near the direct/native cost class, while chunk materialization itself is bounded to the selected range. Planner/executor scan lowering SHOULD resolve chunk routing at range granularity rather than perform generic migration dispatch per value.
+
+**[NON-CLAIM]** P399 implements bounded subdivision for factorized relation columns only. Entity-field chunking requires an explicit physical carrier/segment coordinate and MUST NOT be approximated by arbitrary `EntityId` numeric ranges. Durable realization authority is still deferred.
+
+## Pass401 normative addendum — exact prepared general relations and B-native writes
+
+**[GENERAL RELATION PREPARATION LAW]** A verified general relational migration rewrite must not revive schema A as a current-world query authority. Let `D(q)` be the exact source-relation scan closure of the verified `RelExpr q`. CFMD may prepare `q` against `rho_A | D(q)` before cutover and publish native target-B relation-column atoms. The semantic cutover then installs direct B realization rules in metadata proportional to target schema/layout, while all data-cardinality work remains explicit preparation.
+
+**[FAIL-CLOSED LAW]** `compose_schema_migration_factorized` without the required prepared relation remains fail-closed. No generic current-schema-A read route, SQL-shaped fallback, or per-row migration realization may be selected implicitly.
+
+**[DEPENDENCY LAW]** General-relation preparation records exact semantic scan dependencies and the physical atoms reachable from those source relation rules. Unrelated relations are not preparation inputs. After cutover, the prepared target relation depends on native B atoms; source atoms remain live only through other current or retained historical roots.
+
+**[B-WRITE LAW]** A write in the current schema B over a derived realization must never require inverse migration. Once semantic write authority is certified by the change layer, the physical layer may materialize the bounded B segment containing the coordinate and replace that value/cell by publishing a new immutable B-native overlay atom. Migration realization does not define independent conflict/rebase semantics.
+
+**[GLOBAL WRITE NON-CLAIM]** An arbitrary general-query result is not assumed to have a stable writable row identity. `Union`, `Distinct`, `Group`, bag multiplicity and other global operators may destroy source-row identity. Local physical row ordinals therefore are not universal semantic write coordinates. A B-native relation-delta/endpoint overlay over existing kernel-change/query coordinates remains the required general law.
+
+**[PERFORMANCE GATE]** On the PASS401 100k-row two-source bag-Union fixture, exact preparation measured 27.471–28.930 ms across three warm release runs while root cutover measured 39.769–43.053 us. The accepted complexity boundary is O(data touched by the general query) before cutover and O(schema/layout) at semantic cutover.
+
+## Pass402 normative addendum — post-migration current-B relation write law
+
+**[CURRENT-B AUTHORITY LAW]** A migration query used to construct a target relation does not remain a writable-view obligation after semantic cutover. Once schema B is current, the target relation is a B semantic coordinate. Exact writes are expressed as B-native relation rewrites under the existing Γ/`kernel-change`/`kernel-query` laws; they MUST NOT require locating or mutating a source-schema A row.
+
+**[PREPARED ENDPOINT LAW]** A physical realization rewrite may consume an exact `PreparedRelationRewrite` bound to the current B relation support and materialize its extensional endpoint into native B atoms. The realization layer MUST reject a prepared rewrite whose certified base no longer matches the current realized B support. This operation introduces no migration-specific conflict engine.
+
+**[QUERY-KIND INDEPENDENCE LAW]** `Union`, `Distinct`, `Group`, bag multiplicity, and other migration-query operators do not select different write semantics after cutover. Their provenance affects preparation of the initial B value, not the meaning of later B writes. No SQL-style writable-view router or inverse-migration fallback is permitted.
+
+**[PERFORMANCE NON-CLAIM]** Full relation endpoint detachment is a correctness/reference lowering only. PASS402 measures roughly 92.9–98.9 ms to detach a one-row write on a 100k-row bag relation. Production current-B writes therefore require a bounded Γ-class/multiplicity delta-overlay lowering so write cost does not scale with whole relation cardinality; full endpoint detachment MUST NOT become the ordinary hot write path.
+
+### Bounded current-relation delta realization (PASS403)
+
+For a current semantic relation with an exact prepared relation rewrite, physical mutation MAY be represented by a persistent B-native delta overlay over immutable base realization. Set occurrence resolution MUST use pinned Γ canonical classes; Bag occurrence resolution MUST preserve exact multiplicity. The overlay MUST NOT infer source-schema provenance, invert a migration, or use semantic meaning from physical row ordinals. Snapshot/root cloning MUST be structurally shared. Missing bounded-write preparation MUST fail closed rather than route to O(data) endpoint reconstruction. Compaction is a same-revision extensional rewrite and MUST preserve the exact relation value while replacing base+overlay dependencies with native factorized columns.
+
+### Runtime current-relation Scan evidence (P416)
+
+A live runtime revision root MAY retain row-aligned Γ-canonical Scan evidence as part of the same immutable publication unit as its logical revision, physical store and relation base authority. Such evidence is not an independently mutable cache: it is derived at bootstrap from the exact relation authority and a target root is published only with evidence advanced by the same accepted relation transition. Exact query execution may consume structurally shared evidence only when the prepared relational algebra proves that seeded canonical evidence composes for that expression. Historical Watch replay MUST NOT treat current physical row handles as historical authority unless the causal-history transition itself carries storage-resolved identity evidence; semantic-history watches instead require semantic persistent evidence advanced by their retained deltas.
+
+### Witness-owned logical Scan evidence (P417)
+
+For a Set relation, the current semantic occurrence authority assigns stable occurrence slots monotonically: initial occurrences receive the initial logical order, deletion removes an occurrence without renumbering survivors, and insertion allocates a strictly later slot. Therefore ordering live Set occurrences by semantic stable handle is exactly the logical relation law `survivor-order + append`.
+
+The authoritative `RelationBaseWitness` may maintain both `Γ class -> stable occurrences` and `stable occurrence -> canonical row key` as persistent projections of the same immutable transition. These are one authority: every delta advances both projections in one sealed support transition. Runtime exact Scan evidence is an O(1) view of the second projection; it is not rebuilt from all live rows and is not a separately mutable Γ index.
+
+This law is Set-specific. Bag duplicate occurrences require a separate proof of logical occurrence order and must not reuse the Set stable-slot argument by assumption.
+
+Watch bootstrap may consume semantic Scan evidence to construct maintained canonical lookup, but historical Watch evolution remains semantic delta replay. Current physical row handles are not historical semantic authority.
+
+## Pass439 — semantic data-authorization coordinates
+
+**[DATABASE-OWNED ENFORCEMENT]** Product authorization is enforced inside the shared runtime/query/change authority, not by `Context` shape and not independently by Rust, Python, host, transport or other frontends. An external host authorizer may establish principal grants, but executing a database observation/change checks those grants again at the database semantic boundary.
+
+**[READ FOOTPRINT LAW]** A relational observation is authorized from a finite semantic footprint over stable relation and relation-column identities. The footprint includes both returned coordinates and coordinates whose values can influence the observation through filtering, ordering, grouping, equality/deduplication, joins, anti-joins or set/bag operators. It is derived structurally from `RelExpr`; it does not scan data and does not route on physical realization.
+
+**[FIELD IDENTITY LAW]** Object relation columns use the same stable semantic field identity already carried by durable P438 object-field writes. Authorization therefore binds semantic coordinates that survive source-language naming and physical/ordinal layout changes; ordinal column positions are lowering coordinates only.
+
+**[PUBLICATION RECHECK]** A plan does not freeze authority. Commit rechecks the current shared session authority against the exact write coordinates carried by the plan, so grant refresh/revocation reaches already-formed plans. Whole-relation write authority and exact field-write authority are distinct.
+
+**[OPEN]** Object create/delete and relationship attach/detach/move still require an exact action classifier over existing lifecycle/relationship semantics before dedicated public grants are admitted. History undo/redo must authorize the coordinates of the effect being materialized. Field-only writers must eventually be able to form a patch without gaining read authority over unrelated hidden fields.
+
+## Pass442 — role composition and explicit model/schema authority
+
+**[ROLE LAW]** A product `Role` is an immutable named bundle of `Permission` values. Role composition MUST flatten into the ordinary `PermissionSet` before runtime enforcement. Role names, role hierarchy, and frontend/provider policy MUST NOT form a second authorization semantics layer.
+
+**[MODEL DISCLOSURE]** Full authoritative schema inspection requires `ModelRead`. Ordinary data-read grants do not imply model disclosure. The narrow schema revision/epoch identifier remains observable independently so schema-compatible readers can select a local binding policy without receiving the full model.
+
+**[SCHEMA PUBLICATION]** Restricted schema migration requires `SchemaMigrate`; generic data `Write` is insufficient. Expensive deterministic migration preparation need not hold session authority locks, but the durable publication boundary MUST execute under current migration authority so refresh/revocation linearizes with publication.
+
+**[WATCH TERMINATION]** A blocked watch awakened by cancellation revalidates current session/query authority before returning ordinary `WatchClosed`. Session revocation maps to hosted `SessionClosed`; exact read-authority loss maps to `PermissionDenied`. Output-equivalent causal revisions remain quotiented from the public watch stream.

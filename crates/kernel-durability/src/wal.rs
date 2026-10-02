@@ -4,8 +4,8 @@ mod simulated;
 
 pub use file::FileRevisionWal;
 pub(crate) use file::WalRegionRecovery;
-pub(crate) use recovery::WalRegionScanSpec;
 pub use recovery::scan_wal;
+pub(crate) use recovery::{WalRegionScanSpec, scan_wal_stream_seeded};
 pub use simulated::SimulatedRevisionWal;
 
 pub(crate) const WAL_FRESHNESS_PREFIX_DOMAIN: &[u8] = b"CFMD-WAL-FRESHNESS-PREFIX-v1\0";

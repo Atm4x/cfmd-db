@@ -85,14 +85,16 @@ impl RuntimeRevisionCell {
         &self,
         transaction_id: ClientTransactionId,
         request: &FullRevisionTransitionRequest<'_>,
+        migration_program: &kernel_transport::SchemaMigrationProgram,
         migration_complement: &DurableMigrationComplement,
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
         let prepared = self.prepare_full_revision(request)?;
-        let descriptor = DurableRevisionDescriptor::schema_migration(
+        let descriptor = DurableRevisionDescriptor::schema_migration_program(
             transaction_id,
             prepared.descriptor().source_revision(),
-            prepared.descriptor().target(),
+            prepared.descriptor().target().id(),
+            migration_program.clone(),
             migration_complement.clone(),
             request.registry,
         )
@@ -161,6 +163,125 @@ impl RuntimeRevisionCell {
             } else {
                 RuntimePublicationEffect::Incremental(output_deltas)
             },
+        })
+    }
+
+    fn commit_prepared_relation_residual_durable<D: RevisionDurability>(
+        &self,
+        transaction_id: ClientTransactionId,
+        prepared: PreparedRuntimeRevisionTransition,
+        client_mutations: Vec<DurableRelationMutation>,
+        registry: &kernel_semantics::SemanticRegistry,
+        durability: &mut D,
+    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+        let mut durable_descriptor = prepared
+            .descriptor()
+            .durable_descriptor(transaction_id, registry)
+            .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let (semantic_revision, realized_mutations) = match &durable_descriptor.change {
+            DurableRevisionChange::RelationData {
+                semantic_revision,
+                relation_mutations,
+            } => (*semantic_revision, relation_mutations.clone()),
+            _ => {
+                return Err(DurableRuntimeCommitError::PrepareDurability(
+                    DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "relation residual publication requires relation-data change",
+                    },
+                ));
+            }
+        };
+        durable_descriptor.intent = DurableTransactionIntent::relation_data_residual(
+            durable_descriptor.source_revision,
+            prepared.descriptor().target(),
+            semantic_revision,
+            client_mutations,
+            realized_mutations,
+            registry,
+        )
+        .map_err(DurabilityError::Encode)
+        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let durable_prepare = durability
+            .durably_prepare(&durable_descriptor)
+            .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let sealed = prepared.seal(self)?;
+        let durable = match durability.durably_commit(durable_prepare) {
+            Ok(durable) => durable,
+            Err(error) => {
+                sealed.require_recovery();
+                return Err(DurableRuntimeCommitError::CommitDurabilityUncertain(error));
+            }
+        };
+        let output_deltas = sealed.publish();
+        Ok(DurableRuntimeCommitReceipt {
+            durable,
+            publication: RuntimePublicationEffect::Incremental(output_deltas),
+        })
+    }
+
+    pub(crate) fn commit_prepared_mixed_residual_durable<D: RevisionDurability>(
+        &self,
+        transaction_id: ClientTransactionId,
+        prepared: PreparedRuntimeRevisionTransition,
+        client_relation_mutations: Vec<DurableRelationMutation>,
+        client_model_delta: DurableModelDelta,
+        realized_model_complement: DurableModelDelta,
+        registry: &kernel_semantics::SemanticRegistry,
+        durability: &mut D,
+    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+        let mut durable_descriptor = prepared
+            .descriptor()
+            .durable_descriptor(transaction_id, registry)
+            .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let (semantic_revision, realized_relation_mutations, realized_model_delta) =
+            match &durable_descriptor.change {
+                DurableRevisionChange::MixedRevision {
+                    semantic_revision,
+                    relation_mutations,
+                    model_delta,
+                } => (
+                    *semantic_revision,
+                    relation_mutations.clone(),
+                    model_delta.clone(),
+                ),
+                _ => {
+                    return Err(DurableRuntimeCommitError::PrepareDurability(
+                        DurabilityError::Protocol {
+                            offset: 0,
+                            reason: "mixed residual publication requires mixed revision change",
+                        },
+                    ));
+                }
+            };
+        durable_descriptor.intent = DurableTransactionIntent::mixed_revision_residual(
+            durable_descriptor.source_revision,
+            prepared.descriptor().target(),
+            semantic_revision,
+            client_relation_mutations,
+            client_model_delta,
+            realized_relation_mutations,
+            realized_model_delta,
+            realized_model_complement,
+            registry,
+        )
+        .map_err(DurabilityError::Encode)
+        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let durable_prepare = durability
+            .durably_prepare(&durable_descriptor)
+            .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let sealed = prepared.seal(self)?;
+        let durable = match durability.durably_commit(durable_prepare) {
+            Ok(durable) => durable,
+            Err(error) => {
+                sealed.require_recovery();
+                return Err(DurableRuntimeCommitError::CommitDurabilityUncertain(error));
+            }
+        };
+        let output_deltas = sealed.publish();
+        Ok(DurableRuntimeCommitReceipt {
+            durable,
+            publication: RuntimePublicationEffect::Incremental(output_deltas),
         })
     }
 
@@ -247,5 +368,4 @@ impl RuntimeRevisionCell {
         *state = RuntimeRevisionCellState::RecoveryRequired;
         Ok(())
     }
-
 }

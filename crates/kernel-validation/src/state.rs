@@ -7,6 +7,7 @@ use kernel_semantics::{SemanticError, SemanticRegistry};
 use kernel_types::SemanticId;
 
 use crate::{DenseTypeExtents, ValidationError, relation_uniqueness_violation_measure};
+
 pub fn validate_state(
     context: &SemanticContext,
     registry: &SemanticRegistry,
@@ -38,6 +39,7 @@ pub fn validate_state_with_extents(
     state: &DatabaseState,
     entity_types: &DenseTypeExtents,
 ) -> Result<(), ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
     validate_capability_required_fields(context, registry, state, entity_types)?;
 
     for (&(field_id, owner), value) in &state.model.fields {
@@ -60,6 +62,31 @@ pub fn validate_state_with_extents(
             entity_types,
             &BTreeMap::new(),
         )?;
+        for (rule_index, rule) in compiled_rules.field_rules(field_id).iter().enumerate() {
+            if !rule.matches(value).map_err(|_| {
+                ValidationError::FieldRuleTypeMismatch { field: field_id }
+            })? {
+                return Err(ValidationError::FieldRuleViolation {
+                    field: field_id,
+                    entity: owner,
+                    rule_index,
+                });
+            }
+        }
+    }
+
+    for owner in compiled_rules.entity_rule_owners() {
+        for entity in entity_types.entities(owner) {
+            for (rule_index, rule) in compiled_rules.entity_rules(owner).iter().enumerate() {
+                let matches = rule.matches(&|coordinate| match coordinate {
+                    kernel_schema::RuleValueExpr::Input => None,
+                    kernel_schema::RuleValueExpr::Field(field) => state.model.fields.get(&(*field, entity)),
+                }).unwrap_or(false);
+                if !matches {
+                    return Err(ValidationError::EntityRuleViolation { owner, entity, rule_index });
+                }
+            }
+        }
     }
 
     for (&relation_id, tuples) in &state.model.relations {
@@ -67,7 +94,7 @@ pub fn validate_state_with_extents(
             .schema
             .relation(relation_id)
             .ok_or(ValidationError::UnknownRelation(relation_id))?;
-        for tuple in tuples {
+        for (row_index, tuple) in tuples.iter().enumerate() {
             if tuple.len() != relation.columns.len() {
                 return Err(ValidationError::RelationArityMismatch {
                     relation: relation_id,
@@ -75,7 +102,7 @@ pub fn validate_state_with_extents(
                     actual: tuple.len(),
                 });
             }
-            for (value, expected) in tuple.iter().zip(&relation.columns) {
+            for (column, (value, expected)) in tuple.iter().zip(&relation.columns).enumerate() {
                 validate_value(
                     value,
                     expected,
@@ -85,6 +112,22 @@ pub fn validate_state_with_extents(
                     entity_types,
                     &BTreeMap::new(),
                 )?;
+                for (rule_index, rule) in compiled_rules
+                    .relation_column_rules(context, relation_id, column)
+                    .iter()
+                    .enumerate()
+                {
+                    if !rule.matches(value).map_err(|_|
+                        ValidationError::FieldRuleTypeMismatch { field: relation_id },
+                    )? {
+                        return Err(ValidationError::RelationColumnRuleViolation {
+                            relation: relation_id,
+                            row: row_index,
+                            column,
+                            rule_index,
+                        });
+                    }
+                }
             }
         }
         if let RelationSemantics::Set {
@@ -94,7 +137,7 @@ pub fn validate_state_with_extents(
             for (column, equivalence) in relation.columns.iter().zip(column_equivalences) {
                 validate_equivalence_type(*equivalence, column, context, registry)?;
             }
-            ensure_relation_rows_unique(tuples, column_equivalences, context, registry)?;
+            ensure_relation_rows_unique(&tuples.materialize_owned(), column_equivalences, context, registry)?;
         }
     }
 
@@ -155,19 +198,20 @@ pub fn validate_relations_with_extents(
     entity_types: &DenseTypeExtents,
     relation_ids: &BTreeSet<SemanticId>,
 ) -> Result<(), ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
     let mut semantic_subset = FiniteModel::default();
     for &relation_id in relation_ids {
         let relation = context
             .schema
             .relation(relation_id)
             .ok_or(ValidationError::UnknownRelation(relation_id))?;
-        let tuples = state
+        let tuples_owned = state
             .model
             .relations
-            .get(&relation_id)
-            .map(Vec::as_slice)
+            .materialize_owned(&relation_id)
             .unwrap_or_default();
-        for tuple in tuples {
+        let tuples = tuples_owned.as_slice();
+        for (row_index, tuple) in tuples.iter().enumerate() {
             if tuple.len() != relation.columns.len() {
                 return Err(ValidationError::RelationArityMismatch {
                     relation: relation_id,
@@ -175,7 +219,7 @@ pub fn validate_relations_with_extents(
                     actual: tuple.len(),
                 });
             }
-            for (value, expected) in tuple.iter().zip(&relation.columns) {
+            for (column, (value, expected)) in tuple.iter().zip(&relation.columns).enumerate() {
                 validate_value(
                     value,
                     expected,
@@ -185,6 +229,22 @@ pub fn validate_relations_with_extents(
                     entity_types,
                     &BTreeMap::new(),
                 )?;
+                for (rule_index, rule) in compiled_rules
+                    .relation_column_rules(context, relation_id, column)
+                    .iter()
+                    .enumerate()
+                {
+                    if !rule.matches(value).map_err(|_|
+                        ValidationError::FieldRuleTypeMismatch { field: relation_id },
+                    )? {
+                        return Err(ValidationError::RelationColumnRuleViolation {
+                            relation: relation_id,
+                            row: row_index,
+                            column,
+                            rule_index,
+                        });
+                    }
+                }
             }
         }
         if let RelationSemantics::Set {
@@ -196,8 +256,8 @@ pub fn validate_relations_with_extents(
             }
             ensure_relation_rows_unique(tuples, column_equivalences, context, registry)?;
         }
-        if let Some(rows) = state.model.relations.get(&relation_id) {
-            semantic_subset.relations.insert(relation_id, rows.clone());
+        if state.model.relations.get_shared(&relation_id).is_some() {
+            semantic_subset.relations.insert(relation_id, tuples_owned);
         }
     }
     registry.validate_model(context, &semantic_subset)?;

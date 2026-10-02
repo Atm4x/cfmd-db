@@ -43,16 +43,33 @@ impl DurableRuntime {
         &self,
         transaction_id: ClientTransactionId,
         request: &FullRevisionTransitionRequest<'_>,
+        migration_program: &kernel_transport::SchemaMigrationProgram,
         migration_complement: &DurableMigrationComplement,
     ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+        let source = self.cell.snapshot()?.revision().clone();
+        let transport = migration_program
+            .verify(source.semantic_context(), &self.registry)
+            .map_err(DurableRuntimeCommitError::MigrationTransport)?;
+        let certified_target = transport
+            .transport_revision(&source, request.target_revision.id(), &self.registry)
+            .map_err(DurableRuntimeCommitError::MigrationTransport)?;
+        if &certified_target != request.target_revision {
+            return Err(DurableRuntimeCommitError::PrepareDurability(
+                DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "migration program does not produce requested target revision",
+                },
+            ));
+        }
         let mut durability = self.durability.lock().map_err(|_| {
             let _ = self.cell.force_recovery_required();
             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
         })?;
-        let source_revision = self.cell.snapshot()?.revision().id();
+        let source_revision = source.id();
         let requested_intent = DurableTransactionIntent::schema_migration(
             source_revision,
-            request.target_revision,
+            request.target_revision.id(),
+            migration_program.clone(),
             migration_complement.clone(),
             &self.registry,
         )
@@ -78,6 +95,7 @@ impl DurableRuntime {
             .commit_schema_migration_durable(
                 transaction_id,
                 &authorized_request,
+                migration_program,
                 migration_complement,
                 &mut *durability,
             )
@@ -196,5 +214,4 @@ impl DurableRuntime {
         sealed.publish();
         Ok(DurableMaterializationConfigOutcome::Applied(receipt))
     }
-
 }

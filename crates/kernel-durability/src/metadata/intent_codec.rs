@@ -74,6 +74,23 @@ pub(crate) fn encode_transaction_intent(
             encode_relation_mutations(out, relation_mutations)?;
             encode_semantic_module_specs(out, semantic_modules)?;
         }
+        DurableTransactionIntent::RelationDataResidualExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            client_mutations,
+            realized_mutations,
+            semantic_modules,
+        } => {
+            out.push(8);
+            push_u64(out, source_revision.raw());
+            push_u64(out, target_revision.raw());
+            push_u64(out, semantic_revision.schema.raw());
+            push_u64(out, semantic_revision.environment.raw());
+            encode_relation_mutations(out, client_mutations)?;
+            encode_relation_mutations(out, realized_mutations)?;
+            encode_semantic_module_specs(out, semantic_modules)?;
+        }
         DurableTransactionIntent::MixedRevisionExact {
             source_revision,
             target_revision,
@@ -93,6 +110,29 @@ pub(crate) fn encode_transaction_intent(
             if let Some(complement) = model_complement {
                 super::model_delta_codec::encode_model_delta(out, complement)?;
             }
+            encode_semantic_module_specs(out, semantic_modules)?;
+        }
+        DurableTransactionIntent::MixedRevisionResidualExact {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            client_relation_mutations,
+            client_model_delta,
+            realized_relation_mutations,
+            realized_model_delta,
+            realized_model_complement,
+            semantic_modules,
+        } => {
+            out.push(9);
+            push_u64(out, source_revision.raw());
+            push_u64(out, target_revision.raw());
+            push_u64(out, semantic_revision.schema.raw());
+            push_u64(out, semantic_revision.environment.raw());
+            encode_relation_mutations(out, client_relation_mutations)?;
+            super::model_delta_codec::encode_model_delta(out, client_model_delta)?;
+            encode_relation_mutations(out, realized_relation_mutations)?;
+            super::model_delta_codec::encode_model_delta(out, realized_model_delta)?;
+            super::model_delta_codec::encode_model_delta(out, realized_model_complement)?;
             encode_semantic_module_specs(out, semantic_modules)?;
         }
         DurableTransactionIntent::Exact {
@@ -116,14 +156,14 @@ pub(crate) fn encode_transaction_intent(
         DurableTransactionIntent::SchemaMigrationExact {
             source_revision,
             target_revision,
-            encoded_target_revision,
+            program,
             migration_complement,
             semantic_modules,
         } => {
             out.push(4);
             push_u64(out, source_revision.raw());
             push_u64(out, target_revision.raw());
-            push_bytes(out, encoded_target_revision)?;
+            super::migration_program_codec::encode_schema_migration_program(out, program)?;
             encode_migration_complements(out, std::slice::from_ref(migration_complement))?;
             encode_semantic_module_specs(out, semantic_modules)?;
         }
@@ -199,8 +239,7 @@ pub(crate) fn decode_transaction_intent(
         4 => {
             let source_revision = RevisionId::new(cursor.u64()?);
             let target_revision = RevisionId::new(cursor.u64()?);
-            let len = cursor.len()?;
-            let encoded_target_revision = cursor.take_owned(len)?;
+            let program = super::migration_program_codec::decode_schema_migration_program(cursor)?;
             let mut complements = decode_migration_complements(cursor)?;
             if complements.len() != 1 {
                 return Err("schema migration intent must carry exactly one complement");
@@ -208,13 +247,40 @@ pub(crate) fn decode_transaction_intent(
             Ok(DurableTransactionIntent::SchemaMigrationExact {
                 source_revision,
                 target_revision,
-                encoded_target_revision,
+                program,
                 migration_complement: complements.remove(0),
                 semantic_modules: decode_semantic_module_specs(cursor)?,
             })
         }
         5 => decode_relation_resolution_intent(cursor),
         6 | 7 => decode_mixed_revision_intent(cursor, tag == 7),
+        8 => Ok(DurableTransactionIntent::RelationDataResidualExact {
+            source_revision: RevisionId::new(cursor.u64()?),
+            target_revision: RevisionId::new(cursor.u64()?),
+            semantic_revision: SemanticRevision::new(
+                kernel_types::SchemaRevisionId::new(cursor.u64()?),
+                kernel_types::SemanticEnvId::new(cursor.u64()?),
+            ),
+            client_mutations: decode_relation_mutations(cursor)?,
+            realized_mutations: decode_relation_mutations(cursor)?,
+            semantic_modules: decode_semantic_module_specs(cursor)?,
+        }),
+        9 => Ok(DurableTransactionIntent::MixedRevisionResidualExact {
+            source_revision: RevisionId::new(cursor.u64()?),
+            target_revision: RevisionId::new(cursor.u64()?),
+            semantic_revision: SemanticRevision::new(
+                kernel_types::SchemaRevisionId::new(cursor.u64()?),
+                kernel_types::SemanticEnvId::new(cursor.u64()?),
+            ),
+            client_relation_mutations: decode_relation_mutations(cursor)?,
+            client_model_delta: super::model_delta_codec::decode_model_delta(cursor)?,
+            realized_relation_mutations: decode_relation_mutations(cursor)?,
+            realized_model_delta: super::model_delta_codec::decode_model_delta(cursor)?,
+            realized_model_complement: Box::new(super::model_delta_codec::decode_model_delta(
+                cursor,
+            )?),
+            semantic_modules: decode_semantic_module_specs(cursor)?,
+        }),
         _ => Err("invalid transaction intent tag"),
     }
 }
@@ -482,6 +548,27 @@ pub(crate) fn encode_relation_mutations(
         push_u128(out, mutation.relation.raw());
         encode_rows(out, &mutation.inserted)?;
         encode_rows(out, &mutation.removed)?;
+        push_len(out, mutation.object_field_writes.len())?;
+        let mut previous_field = None;
+        for write in &mutation.object_field_writes {
+            let key = (write.owner, write.field);
+            if previous_field.is_some_and(|previous| previous >= key) {
+                return Err(CodecError::CollectionTooLarge);
+            }
+            previous_field = Some(key);
+            push_u128(out, write.owner.raw());
+            push_u128(out, write.field.raw());
+            encode_rows(out, &[vec![write.value.clone()]])?;
+        }
+        let authorization = mutation.authorization;
+        out.push(
+            u8::from(authorization.relation_write)
+                | (u8::from(authorization.object_create) << 1)
+                | (u8::from(authorization.object_delete) << 2)
+                | (u8::from(authorization.relationship_attach) << 3)
+                | (u8::from(authorization.relationship_detach) << 4)
+                | (u8::from(authorization.relationship_move) << 5),
+        );
     }
     Ok(())
 }
@@ -525,6 +612,29 @@ pub(crate) fn decode_relation_rewrite_intents(
     Ok(rewrite_intents)
 }
 
+pub(crate) fn decode_relation_mutations_legacy(
+    cursor: &mut impl BinarySource,
+) -> Result<Vec<DurableRelationMutation>, &'static str> {
+    let count = cursor.len()?;
+    let mut relation_mutations = Vec::with_capacity(cursor.bounded_capacity(count));
+    let mut previous = None;
+    for _ in 0..count {
+        let relation = SemanticId::new(cursor.u128()?);
+        if previous.is_some_and(|id: SemanticId| id >= relation) {
+            return Err("relation mutations are not strictly sorted and unique");
+        }
+        previous = Some(relation);
+        relation_mutations.push(DurableRelationMutation {
+            relation,
+            inserted: cursor.rows(0)?,
+            removed: cursor.rows(0)?,
+            object_field_writes: Vec::new(),
+            authorization: Default::default(),
+        });
+    }
+    Ok(relation_mutations)
+}
+
 pub(crate) fn decode_relation_mutations(
     cursor: &mut impl BinarySource,
 ) -> Result<Vec<DurableRelationMutation>, &'static str> {
@@ -539,10 +649,40 @@ pub(crate) fn decode_relation_mutations(
         previous = Some(relation);
         let inserted = cursor.rows(0)?;
         let removed = cursor.rows(0)?;
+        let field_count = cursor.len()?;
+        let mut object_field_writes = Vec::with_capacity(cursor.bounded_capacity(field_count));
+        let mut previous_field = None;
+        for _ in 0..field_count {
+            let owner = kernel_types::EntityId::new(cursor.u128()?);
+            let field = SemanticId::new(cursor.u128()?);
+            let rows = cursor.rows(1)?;
+            if rows.len() != 1 || rows[0].len() != 1 { return Err("invalid object field write value"); }
+            let value = rows[0][0].clone();
+            let key = (owner, field);
+            if previous_field.is_some_and(|previous| previous >= key) {
+                return Err("object field writes are not strictly sorted and unique");
+            }
+            previous_field = Some(key);
+            object_field_writes.push(crate::DurableObjectFieldWrite { owner, field, value });
+        }
+        let authorization_bits = cursor.u8()?;
+        if authorization_bits & !0b00_111111 != 0 {
+            return Err("invalid relation authorization bits");
+        }
+        let authorization = crate::DurableRelationAuthorization {
+            relation_write: authorization_bits & (1 << 0) != 0,
+            object_create: authorization_bits & (1 << 1) != 0,
+            object_delete: authorization_bits & (1 << 2) != 0,
+            relationship_attach: authorization_bits & (1 << 3) != 0,
+            relationship_detach: authorization_bits & (1 << 4) != 0,
+            relationship_move: authorization_bits & (1 << 5) != 0,
+        };
         relation_mutations.push(DurableRelationMutation {
             relation,
             inserted,
             removed,
+            object_field_writes,
+            authorization,
         });
     }
     Ok(relation_mutations)

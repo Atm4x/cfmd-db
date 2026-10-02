@@ -15,7 +15,7 @@ fn corrupt(reason: &'static str) -> DurabilityError {
     DurabilityError::Corruption { offset: 0, reason }
 }
 
-pub(super) fn encode_state(
+pub(crate) fn encode_state(
     out: &mut impl crate::binary_codec::BinarySink,
     state: &DatabaseState,
 ) -> Result<(), CodecError> {
@@ -55,12 +55,12 @@ pub(super) fn encode_state(
     push_len(out, state.model.relations.len())?;
     for (relation, rows) in &state.model.relations {
         push_u128(out, relation.raw());
-        encode_rows(out, rows)?;
+        encode_rows(out, &rows.materialize_owned())?;
     }
     Ok(())
 }
 
-pub(super) fn decode_state(
+pub(crate) fn decode_state(
     cursor: &mut impl BinarySource,
 ) -> Result<DatabaseState, DurabilityError> {
     let mut state = DatabaseState::default();
@@ -153,7 +153,7 @@ pub(super) fn decode_state(
     Ok(state)
 }
 
-pub(super) fn encode_type_expr(
+pub(crate) fn encode_type_expr(
     out: &mut impl crate::binary_codec::BinarySink,
     ty: &TypeExpr,
     depth: usize,
@@ -221,7 +221,7 @@ pub(super) fn encode_type_expr(
     Ok(())
 }
 
-pub(super) fn decode_type_expr(
+pub(crate) fn decode_type_expr(
     cursor: &mut impl BinarySource,
     depth: usize,
 ) -> Result<TypeExpr, DurabilityError> {

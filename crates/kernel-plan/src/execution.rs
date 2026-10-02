@@ -23,6 +23,7 @@ use crate::storage_impl::{I64IndexCapability, SemanticFiberCapability, SemanticF
 include!("execution/typed.rs");
 include!("execution/filter.rs");
 include!("execution/fallback.rs");
+include!("execution/union.rs");
 include!("execution/join.rs");
 include!("execution/row_ops.rs");
 include!("execution/helpers.rs");

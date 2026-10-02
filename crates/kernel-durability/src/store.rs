@@ -24,7 +24,7 @@ use crate::descriptor::{
 };
 use crate::domain::{
     DurableMigrationComplement, DurableRevisionEffectRecord, DurableTransactionIntent,
-    DurableTransactionKey, IdempotencyEpoch,
+    DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
 };
 use crate::replication::authority::ReplicationAuthorityJournal;
 use crate::wal::FileRevisionWal;
@@ -64,9 +64,11 @@ pub struct DurableRevisionStore {
     semantic_registry: SemanticRegistry,
     materialization_specs: Vec<DurableMaterializationSpec>,
     physical_artifact_specs: Vec<DurablePhysicalArtifactSpec>,
+    checkpoint_realization: Option<crate::realization::DurableFactorizedRealization>,
     artifact_cores: Vec<DurableArtifactCore>,
     migration_complements: Vec<DurableMigrationComplement>,
     migration_complement_index: MigrationComplementIndex,
+    historical_epoch_anchors: BTreeMap<RevisionEffectId, HistoricalEpochAnchor>,
     current_idempotency_epoch: IdempotencyEpoch,
     minimum_retry_epoch: IdempotencyEpoch,
     committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
@@ -100,7 +102,9 @@ mod prepare_validation;
 mod prepared_capsule;
 mod prepared_lifecycle;
 mod publication_protocol;
+mod realization_storage;
 mod recovery;
+pub use recovery::HistoricalEpochMaterial;
 mod replication_facade;
 mod retry_history;
 mod semantic_deployment;

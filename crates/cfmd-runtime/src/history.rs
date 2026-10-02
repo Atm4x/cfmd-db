@@ -23,6 +23,63 @@ pub enum HistoryReversibility {
     NonPlanTransition,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryBoundaryAuthority {
+    LocalComplement,
+    ExternalArchive { proof: u128 },
+    ExplicitlyForgotten,
+    LocalPayloadReleased,
+}
+
+impl HistoryBoundaryAuthority {
+    #[must_use]
+    pub const fn retains_history_authority(self) -> bool {
+        matches!(self, Self::LocalComplement | Self::ExternalArchive { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistorySemanticChange {
+    source_schema: u64,
+    target_schema: u64,
+    migration_spec: u128,
+    semantic_manifest: u128,
+    encoding_version: u32,
+    historical_authority: HistoryBoundaryAuthority,
+}
+
+impl HistorySemanticChange {
+    #[must_use]
+    pub const fn source_schema(&self) -> u64 {
+        self.source_schema
+    }
+
+    #[must_use]
+    pub const fn target_schema(&self) -> u64 {
+        self.target_schema
+    }
+
+    #[must_use]
+    pub const fn migration_spec(&self) -> u128 {
+        self.migration_spec
+    }
+
+    #[must_use]
+    pub const fn semantic_manifest(&self) -> u128 {
+        self.semantic_manifest
+    }
+
+    #[must_use]
+    pub const fn encoding_version(&self) -> u32 {
+        self.encoding_version
+    }
+
+    #[must_use]
+    pub const fn historical_authority(&self) -> HistoryBoundaryAuthority {
+        self.historical_authority
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryUndoReadiness {
     Ready,
@@ -48,6 +105,8 @@ pub struct HistoryRelationChange {
     relation: RelationId,
     inserted: Vec<Row>,
     removed: Vec<Row>,
+    object_field_writes: Vec<kernel_durability::DurableObjectFieldWrite>,
+    authorization: kernel_durability::DurableRelationAuthorization,
 }
 
 impl HistoryRelationChange {
@@ -76,6 +135,7 @@ pub struct HistoryEntry {
     target_revision: RevisionId,
     kind: HistoryEffectKind,
     reversibility: HistoryReversibility,
+    semantic_change: Option<HistorySemanticChange>,
     changes: Vec<HistoryRelationChange>,
     model_complement: Option<kernel_plan::DurableModelDelta>,
     runtime: Weak<kernel_plan::DurableRuntime>,
@@ -117,6 +177,11 @@ impl HistoryEntry {
     #[must_use]
     pub const fn reversibility(&self) -> HistoryReversibility {
         self.reversibility
+    }
+
+    #[must_use]
+    pub const fn semantic_change(&self) -> Option<&HistorySemanticChange> {
+        self.semantic_change.as_ref()
     }
 
     #[must_use]
@@ -166,7 +231,7 @@ impl HistoryEntry {
     /// Non-head entries are transported only when the kernel proves that their
     /// inverse strongly commutes with every intervening exact effect.
     pub fn undo_plan(&self) -> Result<Plan> {
-        self.authority.require(crate::Permission::Write)?;
+        self.authority.require_write_entry()?;
         if self.reversibility != HistoryReversibility::ExactPlanInverse {
             let reason = match self.reversibility {
                 HistoryReversibility::ComplementRequired => {
@@ -230,6 +295,17 @@ impl HistoryEntry {
             for row in &change.removed {
                 plan.insert(change.relation, row.clone());
             }
+            let authorization = invert_history_authorization(change.authorization);
+            let fields = change
+                .object_field_writes
+                .iter()
+                .map(|write| crate::RelationColumnId::new(write.field.raw()))
+                .collect::<Vec<_>>();
+            if authorization != kernel_durability::DurableRelationAuthorization::default()
+                || !fields.is_empty()
+            {
+                plan.register_history_authorization(change.relation, authorization, fields);
+            }
         }
         plan.model_delta.clone_from(&self.model_complement);
         if plan.is_empty() && plan.model_delta.is_none() {
@@ -273,67 +349,95 @@ impl History {
         let weak = Arc::downgrade(runtime);
         let mut entries = effects
             .into_iter()
-            .map(|effect| HistoryEntry {
-                effect_id: effect.effect_id,
-                prerequisites: effect.prerequisites,
-                transaction: TransactionId::new(effect.transaction_id.raw()),
-                source_revision: effect.source_revision.into(),
-                target_revision: effect.target_revision.into(),
-                kind: match effect.kind {
-                    kernel_plan::RuntimeHistoryEffectKind::RelationData => {
-                        HistoryEffectKind::RelationData
-                    }
-                    kernel_plan::RuntimeHistoryEffectKind::RelationRewrite => {
-                        HistoryEffectKind::RelationRewrite
-                    }
-                    kernel_plan::RuntimeHistoryEffectKind::RelationResolution => {
-                        HistoryEffectKind::RelationResolution
-                    }
-                    kernel_plan::RuntimeHistoryEffectKind::MixedRevision => {
-                        HistoryEffectKind::MixedRevision
-                    }
-                    kernel_plan::RuntimeHistoryEffectKind::FullRevision => {
-                        HistoryEffectKind::FullRevision
-                    }
-                    kernel_plan::RuntimeHistoryEffectKind::SchemaMigration => {
-                        HistoryEffectKind::SchemaMigration
-                    }
-                    kernel_plan::RuntimeHistoryEffectKind::LegacyTargetOnly => {
-                        HistoryEffectKind::LegacyTargetOnly
-                    }
-                },
-                reversibility: match effect.reversibility {
-                    kernel_plan::RuntimeHistoryReversibility::ExactPlanInverse => {
-                        HistoryReversibility::ExactPlanInverse
-                    }
-                    kernel_plan::RuntimeHistoryReversibility::ComplementRequired => {
-                        HistoryReversibility::ComplementRequired
-                    }
-                    kernel_plan::RuntimeHistoryReversibility::NonPlanTransition => {
-                        HistoryReversibility::NonPlanTransition
-                    }
-                },
-                model_complement: effect.model_complement,
-                changes: effect
-                    .relation_mutations
-                    .into_iter()
-                    .map(|mutation| HistoryRelationChange {
-                        relation: RelationId::new(mutation.relation.raw()),
-                        inserted: mutation
-                            .inserted
-                            .into_iter()
-                            .map(|row| row.into_iter().map(Into::into).collect())
-                            .collect(),
-                        removed: mutation
-                            .removed
-                            .into_iter()
-                            .map(|row| row.into_iter().map(Into::into).collect())
-                            .collect(),
-                    })
-                    .collect(),
-                runtime: weak.clone(),
-                database_identity,
-                authority: authority.clone(),
+            .map(|effect| {
+                let semantic_change = effect.semantic_change.map(|change| HistorySemanticChange {
+                    source_schema: change.source_schema.raw(),
+                    target_schema: change.target_schema.raw(),
+                    migration_spec: change.lens_spec.0.raw(),
+                    semantic_manifest: change.semantic_pins.0.raw(),
+                    encoding_version: change.encoding_version,
+                    historical_authority: match change.historical_authority {
+                        kernel_durability::HistoricalBoundaryAuthority::LocalComplement => {
+                            HistoryBoundaryAuthority::LocalComplement
+                        }
+                        kernel_durability::HistoricalBoundaryAuthority::ExternalArchive(proof) => {
+                            HistoryBoundaryAuthority::ExternalArchive {
+                                proof: proof.0.raw(),
+                            }
+                        }
+                        kernel_durability::HistoricalBoundaryAuthority::ExplicitlyForgotten => {
+                            HistoryBoundaryAuthority::ExplicitlyForgotten
+                        }
+                        kernel_durability::HistoricalBoundaryAuthority::LocalPayloadReleased => {
+                            HistoryBoundaryAuthority::LocalPayloadReleased
+                        }
+                    },
+                });
+                HistoryEntry {
+                    effect_id: effect.effect_id,
+                    prerequisites: effect.prerequisites,
+                    transaction: TransactionId::new(effect.transaction_id.raw()),
+                    source_revision: effect.source_revision.into(),
+                    target_revision: effect.target_revision.into(),
+                    kind: match effect.kind {
+                        kernel_plan::RuntimeHistoryEffectKind::RelationData => {
+                            HistoryEffectKind::RelationData
+                        }
+                        kernel_plan::RuntimeHistoryEffectKind::RelationRewrite => {
+                            HistoryEffectKind::RelationRewrite
+                        }
+                        kernel_plan::RuntimeHistoryEffectKind::RelationResolution => {
+                            HistoryEffectKind::RelationResolution
+                        }
+                        kernel_plan::RuntimeHistoryEffectKind::MixedRevision => {
+                            HistoryEffectKind::MixedRevision
+                        }
+                        kernel_plan::RuntimeHistoryEffectKind::FullRevision => {
+                            HistoryEffectKind::FullRevision
+                        }
+                        kernel_plan::RuntimeHistoryEffectKind::SchemaMigration => {
+                            HistoryEffectKind::SchemaMigration
+                        }
+                        kernel_plan::RuntimeHistoryEffectKind::LegacyTargetOnly => {
+                            HistoryEffectKind::LegacyTargetOnly
+                        }
+                    },
+                    reversibility: match effect.reversibility {
+                        kernel_plan::RuntimeHistoryReversibility::ExactPlanInverse => {
+                            HistoryReversibility::ExactPlanInverse
+                        }
+                        kernel_plan::RuntimeHistoryReversibility::ComplementRequired => {
+                            HistoryReversibility::ComplementRequired
+                        }
+                        kernel_plan::RuntimeHistoryReversibility::NonPlanTransition => {
+                            HistoryReversibility::NonPlanTransition
+                        }
+                    },
+                    semantic_change,
+                    model_complement: effect.model_complement,
+                    changes: effect
+                        .relation_mutations
+                        .into_iter()
+                        .map(|mutation| HistoryRelationChange {
+                            relation: RelationId::new(mutation.relation.raw()),
+                            inserted: mutation
+                                .inserted
+                                .into_iter()
+                                .map(|row| row.into_iter().map(Into::into).collect())
+                                .collect(),
+                            removed: mutation
+                                .removed
+                                .into_iter()
+                                .map(|row| row.into_iter().map(Into::into).collect())
+                                .collect(),
+                            object_field_writes: mutation.object_field_writes,
+                            authorization: mutation.authorization,
+                        })
+                        .collect(),
+                    runtime: weak.clone(),
+                    database_identity,
+                    authority: authority.clone(),
+                }
             })
             .collect::<Vec<_>>();
         topological_history_order(&mut entries)?;
@@ -364,6 +468,19 @@ impl History {
                 Error::new(ErrorKind::NotFound, "history has no transition at its head")
             })?
             .undo_plan()
+    }
+}
+
+fn invert_history_authorization(
+    forward: kernel_durability::DurableRelationAuthorization,
+) -> kernel_durability::DurableRelationAuthorization {
+    kernel_durability::DurableRelationAuthorization {
+        relation_write: forward.relation_write,
+        object_create: forward.object_delete,
+        object_delete: forward.object_create,
+        relationship_attach: forward.relationship_detach,
+        relationship_detach: forward.relationship_attach,
+        relationship_move: forward.relationship_move,
     }
 }
 
