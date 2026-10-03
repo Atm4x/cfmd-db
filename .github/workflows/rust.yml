@@ -65,4 +65,7 @@ jobs:
             exit 1
           fi
       - name: Rust gates
-        run: bash ./scripts/ci-rust.sh
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ripgrep
+          bash ./scripts/ci-rust.sh

@@ -23,8 +23,8 @@ use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
 };
 use crate::domain::{
-    DurableMigrationComplement, DurableRevisionEffectRecord, DurableTransactionIntent, DurableCommittedTransaction,
-    DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
+    DurableCommittedTransaction, DurableMigrationComplement, DurableRevisionEffectRecord,
+    DurableTransactionIntent, DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
 };
 use crate::replication::authority::ReplicationAuthorityJournal;
 use crate::wal::FileRevisionWal;

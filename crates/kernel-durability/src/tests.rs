@@ -163,7 +163,10 @@ fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
         historical_epoch_anchors: BTreeMap::new(),
         committed_transactions: BTreeMap::from([(
             DurableTransactionKey::new(IdempotencyEpoch::ZERO, descriptor.transaction_id),
-            DurableCommittedTransaction::from_descriptor_intent(descriptor.target_revision, &descriptor.intent),
+            DurableCommittedTransaction::from_descriptor_intent(
+                descriptor.target_revision,
+                &descriptor.intent,
+            ),
         )]),
         semantic_modules: Vec::new(),
         next_revision_effect_id: 0,
@@ -320,7 +323,10 @@ fn mixed_revision_intent_roundtrips_compactly_and_reconstructs_exact_target() {
         historical_epoch_anchors: BTreeMap::new(),
         committed_transactions: BTreeMap::from([(
             DurableTransactionKey::new(IdempotencyEpoch::ZERO, descriptor.transaction_id),
-            DurableCommittedTransaction::from_descriptor_intent(descriptor.target_revision, &descriptor.intent),
+            DurableCommittedTransaction::from_descriptor_intent(
+                descriptor.target_revision,
+                &descriptor.intent,
+            ),
         )]),
         semantic_modules: Vec::new(),
         next_revision_effect_id: 0,
@@ -402,7 +408,6 @@ fn relation_rewrite_prepare_roundtrips_and_old_relation_data_format_is_rejected(
         decode_prepare_payload(target.id(), &payload).unwrap(),
         resolution
     );
-
 }
 
 #[test]

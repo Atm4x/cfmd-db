@@ -23,9 +23,9 @@ use kernel_types::{ClientTransactionId, RevisionId, SchemaRevisionId, SemanticEn
 
 use super::*;
 use crate::{
-    DurableRelationMutation, DurableRevisionChange, DurableRevisionDescriptor, DurableSequencerOrder, ReplicaId,
-    ReplicatedEffectEnvelope, ReplicationAntiEntropyRequest, ReplicationBranchId,
-    ReplicationDecisionLock, ReplicationDecisionVote, ReplicationEffectStage,
+    DurableRelationMutation, DurableRevisionChange, DurableRevisionDescriptor,
+    DurableSequencerOrder, ReplicaId, ReplicatedEffectEnvelope, ReplicationAntiEntropyRequest,
+    ReplicationBranchId, ReplicationDecisionLock, ReplicationDecisionVote, ReplicationEffectStage,
     ReplicationEffectVote, ReplicationFailureDetector, ReplicationHeartbeat,
     ReplicationIngestOutcome, ReplicationJointMembershipAck, ReplicationJointMembershipCertificate,
     ReplicationLeaderCertificate, ReplicationLeaderVote, ReplicationLockSummary,
@@ -1210,7 +1210,10 @@ fn schema_migration_wal_atomically_recovers_complement_authority() {
     assert_eq!(recovered_anchor, anchor);
     assert!(matches!(
         scan.transaction_intent(kernel_types::ClientTransactionId::new(9_203)),
-        Some(crate::DurableCommittedTransaction { intent: crate::DurableClientIntent::SchemaMigration { .. }, .. })
+        Some(crate::DurableCommittedTransaction {
+            intent: crate::DurableClientIntent::SchemaMigration { .. },
+            ..
+        })
     ));
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
@@ -3309,7 +3312,9 @@ fn pre_release_historical_metadata_is_rejected_instead_of_migrated() {
     payload.extend_from_slice(&crate::PHYSICAL_ARTIFACT_RECIPE_TAG.to_le_bytes());
     push_len(&mut payload, 0).unwrap();
     push_len(&mut payload, 0).unwrap();
-    let modules = registry.builtin_modules_for_context(base.semantic_context()).unwrap();
+    let modules = registry
+        .builtin_modules_for_context(base.semantic_context())
+        .unwrap();
     metadata::encode_semantic_module_specs(&mut payload, &modules).unwrap();
 
     let payload_crc = crc32c(&payload);

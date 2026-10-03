@@ -694,14 +694,13 @@ impl ScanState {
                 .descriptor;
             let transaction_key =
                 DurableTransactionKey::new(descriptor.idempotency_epoch, descriptor.transaction_id);
-            let previous =
-                committed_transactions.insert(
-                    transaction_key,
-                    crate::domain::DurableCommittedTransaction::from_descriptor_intent(
-                        descriptor.target_revision,
-                        &descriptor.intent,
-                    ),
-                );
+            let previous = committed_transactions.insert(
+                transaction_key,
+                crate::domain::DurableCommittedTransaction::from_descriptor_intent(
+                    descriptor.target_revision,
+                    &descriptor.intent,
+                ),
+            );
             debug_assert!(previous.is_none());
             committed.push(CommittedRevision {
                 descriptor,

@@ -48,14 +48,18 @@ pub(super) fn install_intent_semantic_modules(
     intent: &DurableTransactionIntent,
 ) -> Result<(), DurabilityError> {
     let semantic_modules = match intent {
-        DurableTransactionIntent::RelationData { semantic_modules, .. }
+        DurableTransactionIntent::RelationData {
+            semantic_modules, ..
+        }
         | DurableTransactionIntent::RelationRewrite {
             semantic_modules, ..
         }
         | DurableTransactionIntent::RelationResolution {
             semantic_modules, ..
         }
-        | DurableTransactionIntent::MixedRevision { semantic_modules, .. }
+        | DurableTransactionIntent::MixedRevision {
+            semantic_modules, ..
+        }
         | DurableTransactionIntent::FullRevision {
             semantic_modules, ..
         }

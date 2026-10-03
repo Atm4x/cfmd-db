@@ -268,7 +268,6 @@ impl DurableRevisionStore {
         Self::open_single_file_inner(path.as_ref(), false, encryption)
     }
 
-
     pub fn open_single_file_with_external_freshness(
         path: impl AsRef<Path>,
         config: ExternalFreshnessConfig,
@@ -356,12 +355,7 @@ impl DurableRevisionStore {
         let seeds = prepared_capsule.scan_seeds();
         let (wal, scan) =
             container.open_journal_recovered(checkpoint.id(), view.journal_first_lsn, &seeds)?;
-        let canonical = recover_canonical_state(
-            metadata,
-            checkpoint,
-            &scan,
-            view.generation,
-        )?;
+        let canonical = recover_canonical_state(metadata, checkpoint, &scan, view.generation)?;
         let replication =
             container.recover_replication_authority_journal(scan.replication_authority_frames())?;
         let prepared_transactions = PreparedTransactionLedger::from_recovery_scan(&scan);
