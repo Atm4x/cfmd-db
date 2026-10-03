@@ -6,6 +6,7 @@ impl DurableRuntime {
     /// lifecycle and relation effects require their own certified migration provenance.
     /// Ordinary history inside old epochs is checked from the authoritative durable
     /// transition lineage; the current epoch uses the P462 coordinate index.
+    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn commit_schema_aware_field_intent(
         &self,
         transaction_id: ClientTransactionId,
@@ -53,9 +54,7 @@ impl DurableRuntime {
             })
             .collect::<Vec<_>>();
         let mut context = retained_epochs
-            .first()
-            .map(|epoch| epoch.source_context.clone())
-            .unwrap_or_else(|| head_snapshot.revision().semantic_context().clone());
+            .first().map_or_else(|| head_snapshot.revision().semantic_context().clone(), |epoch| epoch.source_context.clone());
         if context.revision() != request.formation_semantic_revision {
             return Err(DurableRuntimeCommitError::Runtime(
                 PhysicalExecutionError::InvalidRevisionTransition,

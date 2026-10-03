@@ -210,6 +210,7 @@ impl DurableRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments, reason = "Keep explicit semantic and durability inputs at this boundary.")]
     pub(crate) fn commit_mixed_revision_residual_guarded_with_client_semantics_and_dependencies(
         &self,
         transaction_id: ClientTransactionId,
@@ -535,7 +536,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: Default::default(),
+            authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -607,7 +608,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: Default::default(),
+            authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -831,7 +832,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: Default::default(),
+            authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         let target =

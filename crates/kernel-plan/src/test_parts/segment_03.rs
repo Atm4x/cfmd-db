@@ -9,13 +9,13 @@ fn multi_relation_revision_publishes_one_coherent_join_snapshot() {
             relation: left,
             delta: &left_delta,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         },
         RevisionRelationMutation {
             relation: right,
             delta: &right_delta,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         },
     ];
     let before = runtime.clone_for_test();
@@ -65,13 +65,13 @@ fn failure_in_second_relation_of_batch_leaves_live_bundle_unchanged() {
             relation: left,
             delta: &left_delta,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         },
         RevisionRelationMutation {
             relation: right,
             delta: &invalid_right_delta,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         },
     ];
     let target = revision_with_same_state(&runtime, 211, &registry);
@@ -99,13 +99,13 @@ fn duplicate_relation_in_revision_batch_is_rejected_before_prepare() {
             relation,
             delta: &first,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         },
         RevisionRelationMutation {
             relation,
             delta: &second,
         object_field_writes: &[],
-        authorization: Default::default(),
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
         },
     ];
     let target = revision_with_same_state(&runtime, 221, &registry);

@@ -33,6 +33,10 @@ pub fn validate_state_with_ids(
     validate_state_with_extents(context, registry, state, &entity_types)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub fn validate_state_with_extents(
     context: &SemanticContext,
     registry: &SemanticRegistry,

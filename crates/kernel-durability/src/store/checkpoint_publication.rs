@@ -225,6 +225,10 @@ impl DurableRevisionStore {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep explicit semantic and durability inputs at this boundary."
+    )]
     fn rotate_checkpoint_with_hook(
         &mut self,
         revision: &Revision,

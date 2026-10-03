@@ -61,35 +61,11 @@ impl<K, V> Default for PersistentOrdMap<K, V> {
 impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
     #[must_use]
     pub fn from_sorted_unique(entries: Vec<(K, V)>) -> Option<Self> {
-        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-            return None;
-        }
-        fn build<K: Clone, V: Clone>(entries: &[(K, V)]) -> Option<Arc<MapNode<K, V>>> {
-            if entries.is_empty() {
-                return None;
-            }
-            let mid = entries.len() / 2;
-            let left = build(&entries[..mid]);
-            let right = build(&entries[mid + 1..]);
-            Some(map_node(
-                entries[mid].0.clone(),
-                entries[mid].1.clone(),
-                left,
-                right,
-            ))
-        }
-        let len = entries.len();
-        Some(Self {
-            root: build(&entries),
-            len,
-        })
+        Self::from_sorted_unique_owned(entries)
     }
 
     #[must_use]
     pub fn from_sorted_unique_owned(entries: Vec<(K, V)>) -> Option<Self> {
-        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-            return None;
-        }
         fn build<K, V>(
             entries: &mut std::vec::IntoIter<(K, V)>,
             len: usize,
@@ -102,6 +78,9 @@ impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
             let (key, value) = entries.next().expect("validated owned bulk map length");
             let right = build(entries, len - left_len - 1);
             Some(map_node(key, value, left, right))
+        }
+        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return None;
         }
         let len = entries.len();
         let mut entries = entries.into_iter();

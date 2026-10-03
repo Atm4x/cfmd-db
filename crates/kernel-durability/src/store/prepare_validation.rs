@@ -84,6 +84,10 @@ struct SchemaMigrationPrepare<'a> {
     semantic_modules: &'a [kernel_semantics::BuiltinSemanticModuleSpec],
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn validate_schema_migration_prepare_intent(
     store: &DurableRevisionStore,
     registry: &mut SemanticRegistry,

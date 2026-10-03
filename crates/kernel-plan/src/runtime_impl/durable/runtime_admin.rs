@@ -153,17 +153,14 @@ impl DurableRuntime {
                         removed: mutation.removed.clone(),
                         result_type,
                     };
-                    match next.advance_relation_delta(
+                    if let Ok(advanced) = next.advance_relation_delta(
                         effect.target_revision,
                         mutation.relation,
                         &delta,
                         &self.registry,
-                    ) {
-                        Ok(advanced) => next = advanced,
-                        Err(_) => {
-                            valid = false;
-                            break;
-                        }
+                    ) { next = advanced } else {
+                        valid = false;
+                        break;
                     }
                 }
                 if valid && let Some(model_delta) = &effect.model_delta {
@@ -180,6 +177,7 @@ impl DurableRuntime {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn revision_at(
         &self,
         revision: RevisionId,

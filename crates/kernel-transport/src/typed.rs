@@ -1,3 +1,8 @@
+type FieldTransportChanges = (
+    Vec<(kernel_types::SemanticId, EntityId, Option<Value>)>,
+    BTreeSet<(kernel_types::SemanticId, EntityId)>,
+);
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_model::{DatabaseState, FiniteModel, Value};
@@ -399,6 +404,10 @@ struct PreparedMigrationColumnRewrite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations."
+)]
 enum PreparedMigrationRelationRewrite {
     Query {
         rewrite: PreparedRelationRewrite,
@@ -549,6 +558,10 @@ pub struct SchemaMigrationTransport {
 }
 
 impl SchemaMigrationTransport {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn verify(
         source: &SemanticContext,
         target: &SemanticContext,
@@ -987,13 +1000,7 @@ impl SchemaMigrationTransport {
         &self,
         source_state: &DatabaseState,
         updates: &[(kernel_types::SemanticId, EntityId, Option<Value>)],
-    ) -> Result<
-        (
-            Vec<(kernel_types::SemanticId, EntityId, Option<Value>)>,
-            BTreeSet<(kernel_types::SemanticId, EntityId)>,
-        ),
-        TransportError,
-    > {
+    ) -> Result<FieldTransportChanges, TransportError> {
         self.transport_field_updates_from_root_exact(&source_state.model.fields, updates)
     }
 
@@ -1004,13 +1011,7 @@ impl SchemaMigrationTransport {
         &self,
         source_fields: &kernel_model::CowMap<(kernel_types::SemanticId, EntityId), Value>,
         updates: &[(kernel_types::SemanticId, EntityId, Option<Value>)],
-    ) -> Result<
-        (
-            Vec<(kernel_types::SemanticId, EntityId, Option<Value>)>,
-            BTreeSet<(kernel_types::SemanticId, EntityId)>,
-        ),
-        TransportError,
-    > {
+    ) -> Result<FieldTransportChanges, TransportError> {
         let updates_by_key = updates
             .iter()
             .map(|(field, owner, value)| ((*field, *owner), value.clone()))

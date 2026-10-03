@@ -499,6 +499,10 @@ fn relation_semantics(value: &RelationSemantics) -> kernel_schema::RelationSeman
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub(crate) fn compile_schema(
     definition: Schema,
 ) -> Result<(
@@ -1247,6 +1251,10 @@ fn build_explicit_model_target(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub(crate) fn build_plan_target(plan: &Plan) -> Result<kernel_revision::Revision> {
     let target_revision = plan_target_revision_id(plan)?;
     let registry = &plan.registry;
@@ -1271,13 +1279,13 @@ pub(crate) fn build_plan_target(plan: &Plan) -> Result<kernel_revision::Revision
                 })?;
             let mut matching_position = None;
             for (position, row) in rows.iter().enumerate() {
-                if row.get(patch.identity_column) == Some(&identity) {
-                    if matching_position.replace(position).is_some() {
-                        return Err(Error::new(
-                            ErrorKind::Cardinality,
-                            "object field patch identity matched more than one row",
-                        ));
-                    }
+                if row.get(patch.identity_column) == Some(&identity)
+                    && matching_position.replace(position).is_some()
+                {
+                    return Err(Error::new(
+                        ErrorKind::Cardinality,
+                        "object field patch identity matched more than one row",
+                    ));
                 }
             }
             let position = matching_position.ok_or_else(|| {
@@ -1346,7 +1354,7 @@ pub(crate) fn build_plan_target(plan: &Plan) -> Result<kernel_revision::Revision
                 relation: *relation,
                 delta,
                 object_field_writes: &[],
-                authorization: Default::default(),
+                authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         plan.source
@@ -1483,7 +1491,7 @@ fn plan_object_field_writes(
         );
     for ((relation, _), patch) in &plan.object_field_patches {
         let writes = field_writes.entry((*relation).into()).or_default();
-        for (_column, (value, field)) in &patch.fields {
+        for (value, field) in patch.fields.values() {
             writes.push(kernel_durability::DurableObjectFieldWrite {
                 owner: patch.owner,
                 field: *field,
@@ -1626,8 +1634,7 @@ fn certify_plan_rebase(
             object_field_writes: effect
                 .field_writes
                 .get(relation)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+                .map_or(&[][..], Vec::as_slice),
             authorization: effect
                 .authorizations
                 .get(relation)
@@ -1671,7 +1678,7 @@ fn exact_rebased_plan(
         rebased.object_field_patches = plan.object_field_patches.clone();
         rebased.object_contracts = plan.object_contracts.clone();
         rebased.owned_relations = plan.owned_relations.clone();
-        rebased.model_delta = plan.model_delta.clone();
+        rebased.model_delta.clone_from(&plan.model_delta);
         for (relation, mutation) in &plan.mutations {
             let target = rebased.mutations.entry(*relation).or_default();
             target.inserted.extend(mutation.inserted.clone());
@@ -1694,6 +1701,10 @@ fn exact_rebased_plan(
     Ok(rebased)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn commit_certified_relation_residual(
     runtime: &Arc<kernel_plan::DurableRuntime>,
     plan: &Plan,
@@ -1750,8 +1761,7 @@ fn commit_certified_relation_residual(
             object_field_writes: effect
                 .field_writes
                 .get(relation)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+                .map_or(&[][..], Vec::as_slice),
             authorization: effect
                 .authorizations
                 .get(relation)
@@ -1768,8 +1778,7 @@ fn commit_certified_relation_residual(
             object_field_writes: effect
                 .field_writes
                 .get(relation)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+                .map_or(&[][..], Vec::as_slice),
             authorization: effect
                 .authorizations
                 .get(relation)
@@ -1825,6 +1834,10 @@ fn commit_certified_relation_residual(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn commit_certified_field_reapply_residual(
     runtime: &Arc<kernel_plan::DurableRuntime>,
     plan: &Plan,
@@ -1851,7 +1864,7 @@ fn commit_certified_field_reapply_residual(
     rebased.object_field_patches = plan.object_field_patches.clone();
     rebased.object_contracts = plan.object_contracts.clone();
     rebased.owned_relations = plan.owned_relations.clone();
-    rebased.model_delta = plan.model_delta.clone();
+    rebased.model_delta.clone_from(&plan.model_delta);
     for (relation, mutation) in &plan.mutations {
         let target = rebased.mutations.entry(*relation).or_default();
         target.inserted.extend(mutation.inserted.clone());
@@ -1869,8 +1882,7 @@ fn commit_certified_field_reapply_residual(
             object_field_writes: effect
                 .field_writes
                 .get(relation)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+                .map_or(&[][..], Vec::as_slice),
             authorization: effect
                 .authorizations
                 .get(relation)
@@ -1887,8 +1899,7 @@ fn commit_certified_field_reapply_residual(
             object_field_writes: effect
                 .field_writes
                 .get(relation)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+                .map_or(&[][..], Vec::as_slice),
             authorization: effect
                 .authorizations
                 .get(relation)
@@ -1942,6 +1953,10 @@ fn commit_certified_field_reapply_residual(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn commit_certified_mixed_residual(
     runtime: &Arc<kernel_plan::DurableRuntime>,
     effect: &RebasablePlanEffect,
@@ -2025,8 +2040,7 @@ fn commit_certified_mixed_residual(
             object_field_writes: effect
                 .field_writes
                 .get(relation)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+                .map_or(&[][..], Vec::as_slice),
             authorization: effect
                 .authorizations
                 .get(relation)
@@ -2043,8 +2057,7 @@ fn commit_certified_mixed_residual(
             object_field_writes: effect
                 .field_writes
                 .get(relation)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+                .map_or(&[][..], Vec::as_slice),
             authorization: effect
                 .authorizations
                 .get(relation)
@@ -2141,6 +2154,10 @@ impl Database {
         self.migrate_with_authority(model, transaction, history, &RuntimeAuthority::Unrestricted)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub(crate) fn migrate_with_authority(
         &self,
         model: &crate::MigrationModel,
@@ -2824,6 +2841,10 @@ impl Database {
     /// historical Γ-support. A stale effect is published only after the same Γ-coordinate
     /// transition certificate used by local adaptive transactions.
     #[doc(hidden)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub(crate) fn commit_exact_relation_intent(
         &self,
         formation_revision: RevisionId,
@@ -2872,7 +2893,7 @@ impl Database {
                     .map(|row| row.into_iter().map(Into::into).collect())
                     .collect(),
                 object_field_writes: Vec::new(),
-                authorization: Default::default(),
+                authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         let current_revision = self.current_revision()?;
@@ -2976,7 +2997,7 @@ impl Database {
                 relation: *relation,
                 delta,
                 object_field_writes: &[],
-                authorization: Default::default(),
+                authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
 
@@ -3050,7 +3071,7 @@ impl Database {
                 relation: *relation,
                 delta,
                 object_field_writes: &[],
-                authorization: Default::default(),
+                authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
         let target_revision = current
@@ -3246,6 +3267,10 @@ pub(crate) fn commit_bound_plan(
     commit_bound_plan_authorized(runtime, plan, transaction, client_guard_digest)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn commit_bound_plan_authorized(
     runtime: &kernel_plan::DurableRuntime,
     plan: &Plan,
@@ -3270,7 +3295,7 @@ fn commit_bound_plan_authorized(
             .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
                 relation: *relation,
                 delta,
-                object_field_writes: field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+                object_field_writes: field_writes.get(relation).map_or(&[][..], Vec::as_slice),
                 authorization: authorizations.get(relation).copied().unwrap_or_default(),
             })
             .collect::<Vec<_>>();
@@ -3294,7 +3319,7 @@ fn commit_bound_plan_authorized(
             .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
                 relation: *relation,
                 delta,
-                object_field_writes: field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+                object_field_writes: field_writes.get(relation).map_or(&[][..], Vec::as_slice),
                 authorization: authorizations.get(relation).copied().unwrap_or_default(),
             })
             .collect::<Vec<_>>();
@@ -3313,7 +3338,7 @@ fn commit_bound_plan_authorized(
             .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
                 relation: *relation,
                 delta,
-                object_field_writes: field_writes.get(relation).map(Vec::as_slice).unwrap_or(&[]),
+                object_field_writes: field_writes.get(relation).map_or(&[][..], Vec::as_slice),
                 authorization: authorizations.get(relation).copied().unwrap_or_default(),
             })
             .collect::<Vec<_>>();

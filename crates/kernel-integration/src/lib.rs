@@ -672,6 +672,10 @@ fn synthesize_lossy_project_deletion_source_rewrite_for_commit<I: Clone>(
 /// snapshot; only the unique case is handed to the existing durable
 /// `RelationRewrite` path, which re-derives the target and re-runs DTC, VMF
 /// and freshness validation before publication.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the typed commit error API."
+)]
 pub fn commit_unique_relational_view_rewrite<I: Clone + PartialEq>(
     runtime: &DurableRuntime,
     transaction_id: ClientTransactionId,
@@ -696,6 +700,10 @@ pub fn commit_unique_relational_view_rewrite<I: Clone + PartialEq>(
 /// a lossy projection. The constructor is used only when the requested visible
 /// Γ-class has no source preimage; existing classes still use determinant-
 /// revalidated source representatives.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the typed commit error API."
+)]
 pub fn commit_unique_relational_view_rewrite_with_project_constructor<I: Clone + PartialEq>(
     runtime: &DurableRuntime,
     transaction_id: ClientTransactionId,
@@ -804,6 +812,10 @@ fn prepare_rel_writable_lift_strategy(
     Err(RelRewriteLiftError::CandidateGenerationUnsupported)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the typed commit error API."
+)]
 fn commit_unique_relational_view_rewrite_inner<I: Clone + PartialEq>(
     runtime: &DurableRuntime,
     transaction_id: ClientTransactionId,

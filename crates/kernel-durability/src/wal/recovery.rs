@@ -761,7 +761,7 @@ mod tests {
                 inserted: vec![vec![value]],
                 removed: Vec::new(),
                 object_field_writes: Vec::new(),
-                authorization: Default::default(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             &registry,
         )

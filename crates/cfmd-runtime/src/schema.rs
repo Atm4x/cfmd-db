@@ -635,6 +635,10 @@ pub(crate) fn semantic_rule_to_kernel(rule: SemanticRuleExpr) -> kernel_schema::
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Preserve the existing value-taking boundary contract."
+)]
 fn rule_value_to_kernel(value: RuleValueExpr) -> kernel_schema::RuleValueExpr {
     match value {
         RuleValueExpr::Input => kernel_schema::RuleValueExpr::Input,

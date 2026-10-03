@@ -2800,6 +2800,10 @@ fn provider_rotation_rewraps_dmk_without_rewriting_database_ciphertext() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     use cfmd_runtime::{
         ErrorKind, Id, Object, Permission, PermissionSet, PrincipalId, Query, RowCodec, Session,
@@ -2878,12 +2882,7 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
         .with_idempotency_key(TransactionId::new(9_202))
         .expect("field transaction");
     countries
-        .set(
-            &mut tx,
-            Id::new(1),
-            |country| country.code(),
-            "DE".to_owned(),
-        )
+        .set(&mut tx, Id::new(1), CountryFields::code, "DE".to_owned())
         .expect("authorized semantic field patch");
     field_writer.commit(&tx).expect("field-only commit");
 

@@ -101,7 +101,7 @@ impl RuntimeRevisionCell {
         let prepared = prepared.bind_committed_schema_migration_history_effect(
             transaction_id.raw(),
             migration_program,
-        )?;
+        );
         let descriptor = DurableRevisionDescriptor::schema_migration_program(
             transaction_id,
             prepared.descriptor().source_revision(),
@@ -250,6 +250,7 @@ impl RuntimeRevisionCell {
         })
     }
 
+    #[allow(clippy::too_many_arguments, reason = "Keep explicit semantic and durability inputs at this boundary.")]
     pub(crate) fn commit_prepared_mixed_residual_durable<D: RevisionDurability>(
         &self,
         transaction_id: ClientTransactionId,

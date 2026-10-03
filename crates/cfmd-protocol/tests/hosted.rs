@@ -199,6 +199,10 @@ fn commit_i64(
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn protocol_dispatches_through_restricted_product_authority() {
     let (directory, database, relation, equivalence) = fixture();
     let hosted = full_session(&database);

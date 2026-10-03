@@ -370,6 +370,10 @@ impl DurableRevisionStore {
         Ok((store, scan))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub(super) fn rotate_single_file_checkpoint(
         &mut self,
         revision: &Revision,

@@ -352,6 +352,10 @@ impl DurableRevisionStore {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn begin_streaming_checkpoint_with_chunk_size_and_physical(
         &mut self,
         revision: &Revision,
@@ -396,7 +400,7 @@ impl DurableRevisionStore {
             &self.prepared_transactions,
             self.durable_head,
         );
-        let mut metadata_record = self.streaming_metadata_record()?;
+        let mut metadata_record = self.streaming_metadata_record();
         let (generation, physical) = if self.backend.is_single_file() {
             let generation = planned_generation;
             let carry_start_offset = self.wal.current_end_offset()?;
@@ -468,8 +472,8 @@ impl DurableRevisionStore {
         self.streaming_checkpoint_progress()
     }
 
-    fn streaming_metadata_record(&self) -> Result<metadata::DurableStoreMetadata, DurabilityError> {
-        Ok(metadata::DurableStoreMetadata {
+    fn streaming_metadata_record(&self) -> metadata::DurableStoreMetadata {
+        metadata::DurableStoreMetadata {
             external_freshness: self
                 .external_freshness
                 .as_ref()
@@ -488,7 +492,7 @@ impl DurableRevisionStore {
             revision_effects: self.revision_effects.clone(),
             revision_effect_frontiers: self.revision_effect_frontiers.clone(),
             checkpoint_realization: None,
-        })
+        }
     }
 
     pub fn write_streaming_checkpoint_chunks(
@@ -625,6 +629,10 @@ impl DurableRevisionStore {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep explicit semantic and durability inputs at this boundary."
+    )]
     fn finalize_directory_streaming_checkpoint(
         &mut self,
         job: StreamingCheckpointJob,
@@ -725,6 +733,10 @@ impl DurableRevisionStore {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn finalize_single_file_streaming_checkpoint(
         &mut self,
         job: StreamingCheckpointJob,

@@ -192,6 +192,10 @@ pub fn evaluate_relation_expr_factorized(
     Ok(rows)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn execute_expr(
     source: &dyn RelExecutionSource,
     expr: &RelExpr,
@@ -639,6 +643,10 @@ fn execute_expr(
 /// row so the physical witness can adopt it instead of canonicalizing output a
 /// second time. `Ok(false)` means this expression has no such lowering; the
 /// caller may use the ordinary one-shot executor, never the legacy evaluator.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn execute_certified_output(
     source: &dyn RelExecutionSource,
     expr: &RelExpr,
@@ -926,7 +934,7 @@ fn execute_direct_bag_union_columnar(
         for relation in [*left_relation, *right_relation] {
             let mut push = |value| {
                 sink.push_column_value(ordinal, value)
-                    .expect("validated one-shot sink arity")
+                    .expect("validated one-shot sink arity");
             };
             source.visit_relation_column(relation, ordinal, &mut push)?;
         }
@@ -1372,10 +1380,18 @@ mod executor_tests {
         let (context, registry, left, right, eq) = context(false, 1);
         let rows = 100_000usize;
         let left_rows = (0..rows)
-            .map(|i| vec![Value::I64(i as i64)])
+            .map(|i| {
+                vec![Value::I64(
+                    i64::try_from(i).expect("fixture value fits i64"),
+                )]
+            })
             .collect::<Vec<_>>();
         let right_rows = (0..rows)
-            .map(|i| vec![Value::I64(i as i64)])
+            .map(|i| {
+                vec![Value::I64(
+                    i64::try_from(i).expect("fixture value fits i64"),
+                )]
+            })
             .collect::<Vec<_>>();
         let source = MockSource {
             rows: BTreeMap::from([(left, left_rows.clone()), (right, right_rows.clone())]),

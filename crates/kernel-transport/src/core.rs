@@ -229,6 +229,10 @@ pub fn transport_model_change(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub fn transport_rel_expr(
     identity: &IdentityTransport,
     expr: &RelExpr,

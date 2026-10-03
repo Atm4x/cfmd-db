@@ -206,6 +206,14 @@ impl Plan {
         Ok(self.remove(relation.id(), row))
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve the existing value-taking boundary contract."
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep explicit semantic and durability inputs at this boundary."
+    )]
     pub(crate) fn patch_object_field(
         &mut self,
         relation: RelationId,
@@ -289,6 +297,10 @@ impl Plan {
     ///
     /// Composition is structural: no hidden retry, rebase, or read of a newer HEAD occurs.
     /// A plan from any other snapshot fails closed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn extend(&mut self, other: Self) -> crate::Result<&mut Self> {
         if self.database_identity != other.database_identity
             || self.source != other.source

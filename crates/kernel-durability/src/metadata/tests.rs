@@ -1,7 +1,5 @@
-use super::artifact_codec::{
-    decode_physical_artifact_specs, encode_physical_artifact_specs, encode_semantic_artifact_key,
-};
-use crate::binary_codec::{Cursor, push_len, push_u64, push_u128};
+use super::artifact_codec::{decode_physical_artifact_specs, encode_physical_artifact_specs};
+use crate::binary_codec::{Cursor, push_len};
 use crate::*;
 use kernel_change::RevisionEffectId;
 use kernel_model::Value;
@@ -36,7 +34,7 @@ fn current_test_transactions() -> BTreeMap<DurableTransactionKey, DurableCommitt
                     inserted: vec![vec![kernel_model::Value::I64(5)]],
                     removed: Vec::new(),
                     object_field_writes: Vec::new(),
-                    authorization: Default::default(),
+                    authorization: crate::DurableRelationAuthorization::default(),
                 }],
                 client_guard_digest: None,
                 semantic_modules: Vec::new(),
@@ -149,7 +147,7 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
             inserted: vec![vec![kernel_model::Value::I64(6)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         rewrite_intents: vec![crate::DurableRelationRewriteIntent {
             relation: SemanticId::new(10),
@@ -191,7 +189,7 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
                         inserted: vec![vec![kernel_model::Value::I64(6)]],
                         removed: Vec::new(),
                         object_field_writes: Vec::new(),
-                        authorization: Default::default(),
+                        authorization: crate::DurableRelationAuthorization::default(),
                     }],
                 },
                 intent,

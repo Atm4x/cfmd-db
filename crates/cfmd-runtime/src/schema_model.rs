@@ -70,6 +70,10 @@ where
 /// formation world.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations."
+)]
 pub enum ContextSource {
     Current(Arc<Database>),
     Snapshot(ReadContext),
@@ -224,7 +228,7 @@ impl<S: CfmdSchema> std::fmt::Debug for Snapshot<S> {
             .debug_struct("Snapshot")
             .field("revision", &self.revision())
             .field("schema", &std::any::type_name::<S>())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -251,7 +255,7 @@ impl<S: CfmdSchema> std::fmt::Debug for Context<S> {
             .debug_struct("Context")
             .field("database", &self.database)
             .field("schema", &std::any::type_name::<S>())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -321,7 +325,7 @@ impl<S: CfmdSchema> std::fmt::Debug for SchemaDatabaseBuilder<S> {
             .debug_struct("SchemaDatabaseBuilder")
             .field("database", &self.inner)
             .field("schema", &std::any::type_name::<S>())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -378,7 +382,7 @@ impl<S: CfmdSchema> std::fmt::Debug for SchemaDatabase<S> {
             .debug_struct("SchemaDatabase")
             .field("database", &self.database)
             .field("schema", &std::any::type_name::<S>())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

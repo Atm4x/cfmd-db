@@ -2238,7 +2238,7 @@ fn committed_descriptor(
             inserted: vec![vec![Value::I64(inserted)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         registry,
     )
@@ -2276,7 +2276,7 @@ fn transition_from(
             inserted: vec![vec![Value::I64(inserted)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         registry,
     )
@@ -2913,7 +2913,7 @@ fn store_reopens_exact_checkpoint_and_committed_wal_tail() {
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -2976,7 +2976,7 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
                 inserted: vec![vec![Value::I64(inserted)]],
                 removed: Vec::new(),
                 object_field_writes: Vec::new(),
-                authorization: Default::default(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             &registry,
         )
@@ -2997,7 +2997,7 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
                 inserted: vec![vec![Value::I64(4)]],
                 removed: Vec::new(),
                 object_field_writes: Vec::new(),
-                authorization: Default::default(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             rewrite_intents: vec![crate::DurableRelationRewriteIntent {
                 relation,
@@ -3201,7 +3201,7 @@ fn checkpoint_rotation_publishes_new_generation_and_resets_wal_base() {
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -3980,7 +3980,7 @@ fn idempotency_epoch_reuse_survives_crash_before_checkpoint_without_causal_alias
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -4008,7 +4008,7 @@ fn idempotency_epoch_reuse_survives_crash_before_checkpoint_without_causal_alias
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -4076,7 +4076,7 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -4104,7 +4104,7 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -4260,7 +4260,7 @@ fn group_commit_rejects_provisional_local_target_reuse_before_wal_mutation() {
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -7336,6 +7336,10 @@ fn directory_root_backed_history_releases_generation_pin_and_reopens_exact_sourc
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn aborted_streaming_complete_historical_root_never_supersedes_old_generation_authority() {
     let dir = test_dir("aborted-streaming-complete-historical-root");
     let (base, registry, _) = setup_revision(40_365, &[1, 2, 3]);
@@ -7798,7 +7802,7 @@ fn causal_history_release_publishes_head_root_and_preserves_effect_id_high_water
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -7833,7 +7837,7 @@ fn causal_history_release_publishes_head_root_and_preserves_effect_id_high_water
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )

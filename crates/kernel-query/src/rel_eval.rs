@@ -155,6 +155,10 @@ pub(super) fn evaluate_prepared_expr_seeded(
     evaluate_expr_with_canonical_keys(expr, &eval).map(|(value, _, _)| value)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn evaluate_expr_with_canonical_keys(
     expr: &RelExpr,
     eval: &RelEvalContext<'_>,
@@ -370,6 +374,10 @@ fn evaluate_expr_with_canonical_keys(
     Ok((value, result_type, canonical_keys_by_row))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Preserve the existing value-taking boundary contract."
+)]
 fn union_relation_values_from_canonical_keys(
     left: RelationValue,
     left_keys_by_row: CanonicalRowEvidence,
@@ -427,6 +435,10 @@ fn union_relation_values_from_canonical_keys(
     ))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Preserve the existing value-taking boundary contract."
+)]
 fn difference_relation_values_from_canonical_keys(
     left: RelationValue,
     left_keys_by_row: CanonicalRowEvidence,
@@ -473,6 +485,10 @@ fn difference_relation_values_from_canonical_keys(
     ))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Preserve the existing value-taking boundary contract."
+)]
 fn project_relation_value_from_canonical_keys(
     rows: Vec<Row>,
     input_keys_by_row: CanonicalRowEvidence,
@@ -513,6 +529,14 @@ fn project_relation_value_from_canonical_keys(
     ))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Preserve the existing value-taking boundary contract."
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep explicit semantic and durability inputs at this boundary."
+)]
 fn join_relation_values_with_canonical_keys(
     left: RelationValue,
     left_keys_by_row: CanonicalRowEvidence,
@@ -598,6 +622,14 @@ fn join_relation_values_with_canonical_keys(
     ))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Preserve the existing value-taking boundary contract."
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep explicit semantic and durability inputs at this boundary."
+)]
 fn anti_join_relation_values_with_canonical_keys(
     left: RelationValue,
     left_keys_by_row: CanonicalRowEvidence,

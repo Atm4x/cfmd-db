@@ -94,6 +94,10 @@ fn corrupt(reason: &'static str) -> DurabilityError {
     DurabilityError::Corruption { offset: 0, reason }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 pub(crate) fn encode_context(
     out: &mut impl crate::binary_codec::BinarySink,
     context: &SemanticContext,
@@ -545,7 +549,7 @@ fn encode_optional_i64(out: &mut impl BinarySink, value: Option<i64>) {
     match value {
         Some(value) => {
             out.push(1);
-            push_u64(out, value as u64);
+            push_u64(out, value.cast_unsigned());
         }
         None => out.push(0),
     }
@@ -554,7 +558,7 @@ fn encode_optional_i64(out: &mut impl BinarySink, value: Option<i64>) {
 fn decode_optional_i64(cursor: &mut impl BinarySource) -> Result<Option<i64>, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(None),
-        1 => Ok(Some(cursor.u64().map_err(corrupt)? as i64)),
+        1 => Ok(Some((cursor.u64().map_err(corrupt)?).cast_signed())),
         _ => Err(corrupt("invalid optional i64 rule tag")),
     }
 }

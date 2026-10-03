@@ -187,28 +187,28 @@ impl SemanticRuleExpr {
             }
             Self::Not(rule) => rule.validate_values(resolve),
             Self::I64Range { value, min, max } => {
-                require_type(resolve(value)?, ScalarType::I64)?;
+                require_type(&resolve(value)?, ScalarType::I64)?;
                 if min.zip(*max).is_some_and(|(min, max)| min > max) {
                     return Err(SemanticRuleTypeError::InvalidBounds);
                 }
                 Ok(())
             }
             Self::TextLength { value, min, max } => {
-                require_type(resolve(value)?, ScalarType::Text)?;
+                require_type(&resolve(value)?, ScalarType::Text)?;
                 if max.is_some_and(|max| *min > max) {
                     return Err(SemanticRuleTypeError::InvalidBounds);
                 }
                 Ok(())
             }
             Self::TextOneOf { value, .. } | Self::TextMatches { value, .. } => {
-                require_type(resolve(value)?, ScalarType::Text)
+                require_type(&resolve(value)?, ScalarType::Text)
             }
         }
     }
 }
 
-fn require_type(input: TypeExpr, expected: ScalarType) -> Result<(), SemanticRuleTypeError> {
-    if input == TypeExpr::Scalar(expected) {
+fn require_type(input: &TypeExpr, expected: ScalarType) -> Result<(), SemanticRuleTypeError> {
+    if *input == TypeExpr::Scalar(expected) {
         Ok(())
     } else {
         Err(SemanticRuleTypeError::TypeMismatch)

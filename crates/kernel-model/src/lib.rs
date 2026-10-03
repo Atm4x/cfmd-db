@@ -428,6 +428,10 @@ mod tests {
 
     #[test]
     #[ignore = "diagnostic release benchmark"]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+    )]
     fn benchmark_live_ref_sensitivity_sparse_dense_exact_delta_scaling() {
         use std::{hint::black_box, time::Instant};
 
@@ -451,11 +455,13 @@ mod tests {
                             id: target,
                         }]
                     } else {
-                        vec![Value::I64((position & 1) as i64)]
+                        vec![Value::I64(
+                            i64::try_from(position & 1).expect("fixture value fits i64"),
+                        )]
                     }
                 })
                 .collect::<Vec<_>>();
-            let expected_consumers = (row_count + stride - 1) / stride;
+            let expected_consumers = row_count.div_ceil(stride);
             let mut model = FiniteModel::default();
             model.relations.insert(relation, rows);
             let sensitivity = LiveRefSensitivityIndex::compile(&model, &ids);

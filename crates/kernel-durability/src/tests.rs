@@ -39,7 +39,7 @@ fn descriptor(source: u64, target: u64, value: Value) -> DurableRevisionDescript
             inserted: vec![vec![value]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -145,7 +145,7 @@ fn relation_data_intent_and_prepare_scale_with_delta_not_target_snapshot() {
             inserted: vec![vec![Value::I64(7)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: Default::default(),
+            authorization: crate::DurableRelationAuthorization::default(),
         }],
         &registry,
     )
@@ -218,7 +218,7 @@ fn schema_migration_prepare_carries_program_not_target_snapshot() {
             source_schema: SchemaRevisionId::new(380),
             target_schema: SchemaRevisionId::new(381),
             lens_spec: LensSpecId(SemanticId::new(380_381)),
-            semantic_pins: SemanticManifestId(SemanticId::new(0xCF4D_3803_81)),
+            semantic_pins: SemanticManifestId(SemanticId::new(0x00CF_4D38_0381)),
             encoding_version: 1,
             complement: Value::Unit,
         },
@@ -358,7 +358,7 @@ fn relation_rewrite_prepare_roundtrips_and_old_relation_data_format_is_rejected(
         inserted: vec![vec![Value::I64(7)]],
         removed: Vec::new(),
         object_field_writes: Vec::new(),
-        authorization: Default::default(),
+        authorization: crate::DurableRelationAuthorization::default(),
     };
     let rewrite = DurableRevisionDescriptor::relation_rewrites(
         ClientTransactionId::new(0x701),
@@ -391,7 +391,7 @@ fn relation_rewrite_prepare_roundtrips_and_old_relation_data_format_is_rejected(
                 inserted: vec![vec![Value::I64(8)]],
                 removed: Vec::new(),
                 object_field_writes: Vec::new(),
-                authorization: Default::default(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             rewrite_intents: vec![DurableRelationRewriteIntent {
                 relation: SemanticId::new(11),

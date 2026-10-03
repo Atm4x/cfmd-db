@@ -49,6 +49,7 @@ impl RuntimeHistoricalDerivedIndex {
         self.floor_opaque_effect = opaque_effect;
     }
 
+    #[allow(clippy::too_many_arguments, reason = "Keep explicit semantic and durability inputs at this boundary.")]
     fn seal_schema_epoch(
         &mut self,
         source_revision: RevisionId,
@@ -312,7 +313,7 @@ impl PreparedRuntimeRevisionTransition {
         mut self,
         effect_id: u128,
         program: &kernel_transport::SchemaMigrationProgram,
-    ) -> Result<Self, PhysicalExecutionError> {
+    ) -> Self {
         let source_revision = self.descriptor.source_revision();
         let target_revision = self.descriptor.target_revision();
         self.candidate.historical.seal_schema_epoch(
@@ -324,7 +325,7 @@ impl PreparedRuntimeRevisionTransition {
             program.clone(),
             &self.candidate.relation_bases,
         );
-        Ok(self)
+        self
     }
 
     fn bind_committed_history_effect(

@@ -350,6 +350,10 @@ pub fn model_rule_violation_measure_for_relation_mutation(
     Ok(measure)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep explicit semantic and durability inputs at this boundary."
+)]
 fn relation_dynamic_violation_measure_with_plan(
     context: &SemanticContext,
     registry: &SemanticRegistry,

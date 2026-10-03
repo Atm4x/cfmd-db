@@ -27,8 +27,7 @@ impl MigrationValueExpr {
             Self::Field(field) => {
                 output.insert(*field);
             }
-            Self::Column(_) => {}
-            Self::Constant { .. } => {}
+            Self::Column(_) | Self::Constant { .. } => {}
             Self::AddI64(left, right) => {
                 left.source_fields(output);
                 right.source_fields(output);

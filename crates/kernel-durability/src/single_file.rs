@@ -1330,6 +1330,10 @@ impl SingleFileContainer {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn prepare_historical_publication_sources(
         &mut self,
         old_journal_end: u64,
@@ -1544,6 +1548,10 @@ impl SingleFileContainer {
         self.publish_next_generation_with_authority(&all_sections, replication_authority)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub(crate) fn publish_generation_with_carried_wal(
         &mut self,
         wal: &mut FileRevisionWal,
@@ -4288,7 +4296,7 @@ mod tests {
                 inserted: vec![vec![Value::I64(value)]],
                 removed: Vec::new(),
                 object_field_writes: Vec::new(),
-                authorization: Default::default(),
+                authorization: crate::DurableRelationAuthorization::default(),
             }],
             &registry,
         )

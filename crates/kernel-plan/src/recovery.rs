@@ -34,6 +34,10 @@ pub fn replay_durable_revisions_until(
     replay_durable_revisions_to(base_revision, scan, registry, Some(target_revision))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn replay_durable_revisions_to(
     base_revision: &kernel_revision::Revision,
     scan: &RecoveryScan,

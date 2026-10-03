@@ -99,6 +99,10 @@ impl DurableFactorizedReadSnapshot {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn advance_model_delta(
         &self,
         target_revision: RevisionId,
@@ -116,7 +120,10 @@ impl DurableFactorizedReadSnapshot {
             || !delta.lifecycle_roots_removed.is_empty()
             || !delta.lifecycle_keeps_alive.is_empty()
         {
-            let mut lifecycle = match atoms.get(direct.lifecycle).map(|atom| atom.payload()) {
+            let mut lifecycle = match atoms
+                .get(direct.lifecycle)
+                .map(kernel_realization::PhysicalAtom::payload)
+            {
                 Some(PhysicalAtomPayload::Lifecycle(graph)) => graph.clone(),
                 _ => return Err(protocol("historical factorized lifecycle atom is invalid")),
             };
@@ -147,7 +154,10 @@ impl DurableFactorizedReadSnapshot {
 
         for patch in &delta.carriers {
             let mut entities = match direct.carriers.get(&patch.carrier).copied() {
-                Some(atom) => match atoms.get(atom).map(|atom| atom.payload()) {
+                Some(atom) => match atoms
+                    .get(atom)
+                    .map(kernel_realization::PhysicalAtom::payload)
+                {
                     Some(PhysicalAtomPayload::EntityOrder(entities)) => {
                         entities.iter().copied().collect::<BTreeSet<_>>()
                     }
@@ -175,7 +185,10 @@ impl DurableFactorizedReadSnapshot {
         }
         for (field, patches) in field_patches {
             let mut entries = match direct.fields.get(&field) {
-                Some(field_root) => match atoms.get(field_root.atom).map(|atom| atom.payload()) {
+                Some(field_root) => match atoms
+                    .get(field_root.atom)
+                    .map(kernel_realization::PhysicalAtom::payload)
+                {
                     Some(PhysicalAtomPayload::FieldColumnSegment(column)) => column
                         .iter()
                         .map(|(entity, value)| (entity, value.clone()))
@@ -522,8 +535,10 @@ fn encode_atom_payload(
         }
         PhysicalAtomPayload::Lifecycle(graph) => {
             out.push(6);
-            let mut state = DatabaseState::default();
-            state.lifecycle = graph.clone().into();
+            let state = DatabaseState {
+                lifecycle: graph.clone().into(),
+                ..DatabaseState::default()
+            };
             let mut encoded = Vec::new();
             encode_state(&mut encoded, &state)?;
             push_bytes(out, &encoded)?;
@@ -1113,7 +1128,7 @@ mod tests {
             .carriers
             .insert(entity_type, [first].into_iter().collect());
         source.model.fields.insert((field, first), Value::I64(1));
-        source.model.relations.insert(relation, vec![vec![]].into());
+        source.model.relations.insert(relation, vec![vec![]]);
 
         let mut target = source.clone();
         target.lifecycle.entities.insert(second);
@@ -1128,7 +1143,7 @@ mod tests {
         target
             .model
             .relations
-            .insert(relation, vec![vec![], vec![]].into());
+            .insert(relation, vec![vec![], vec![]]);
 
         let (atoms, root) = realize_database_state_factorized(&source, &context).unwrap();
         let snapshot = super::DurableFactorizedReadSnapshot {
@@ -1245,7 +1260,11 @@ mod tests {
         let mut direct = base_root.to_direct_durable_root().unwrap();
         for index in 0..64_u64 {
             let atom = lineage_atoms.insert(PhysicalAtomPayload::FieldColumnSegment(
-                FieldColumnSegment::new([(entity, Value::I64(100 + index as i64))]).unwrap(),
+                FieldColumnSegment::new([(
+                    entity,
+                    Value::I64(100 + i64::try_from(index).expect("fixture value fits i64")),
+                )])
+                .unwrap(),
             ));
             direct.fields.get_mut(&field).unwrap().atom = atom;
             let root = FactorizedRealizationRoot::from_direct_durable_root(direct.clone());

@@ -73,6 +73,10 @@ impl Expr {
         Ok(self.evaluate_internal(input)?.into_owned())
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+    )]
     fn evaluate_internal<'a>(&self, input: &'a Value) -> Result<EvalValue<'a>, QueryError> {
         match self {
             Self::Input => Ok(EvalValue::Borrowed(input)),

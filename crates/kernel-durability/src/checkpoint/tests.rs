@@ -17,6 +17,14 @@ fn sid(raw: u128) -> SemanticId {
     SemanticId::new(raw)
 }
 
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn complex_revision() -> (Revision, SemanticRegistry) {
     let entity_type = sid(1);
     let subtype = sid(2);

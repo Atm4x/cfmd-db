@@ -277,6 +277,10 @@ pub struct DurableObjectFieldWrite {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "These flags record independent transaction validation facts."
+)]
 pub struct DurableRelationAuthorization {
     pub relation_write: bool,
     pub object_create: bool,
@@ -314,6 +318,10 @@ pub struct DurableRelationResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations."
+)]
 pub enum DurableRevisionChange {
     RelationData {
         semantic_revision: SemanticRevision,
@@ -344,6 +352,10 @@ pub enum DurableRevisionChange {
 /// lineage plus the exact typed delta instead of duplicating the complete target
 /// Revision. Full-revision replacements still retain canonical target bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations."
+)]
 pub enum DurableTransactionIntent {
     RelationData {
         source_revision: RevisionId,
@@ -400,6 +412,10 @@ pub enum DurableTransactionIntent {
 /// ids and executable deployment artifacts are intentionally absent.  They are
 /// proof/recovery authorities, not part of the client request identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations."
+)]
 pub enum DurableClientIntent {
     RelationData {
         semantic_revision: SemanticRevision,

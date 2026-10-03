@@ -1264,6 +1264,10 @@ fn derive_many_is_first_class_object_relation() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn many_count_predicates_preserve_zero_degree_in_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -2060,21 +2064,21 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
     );
     assert_eq!(
         ids(children
-            .top(2, |child| child.score())
+            .top(2, ChildFields::score)
             .all()
             .expect("top boundary")),
         vec![2, 3, 4]
     );
     assert_eq!(
         ids(children
-            .bottom(2, |child| child.score())
+            .bottom(2, ChildFields::score)
             .all()
             .expect("bottom boundary")),
         vec![1, 2, 3]
     );
 
     let mut watch = children
-        .top(2, |child| child.score())
+        .top(2, ChildFields::score)
         .watch()
         .expect("boundary watch");
     assert_eq!(ids(watch.initial().to_vec()), vec![2, 3, 4]);
@@ -2103,6 +2107,10 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -2400,20 +2408,20 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
     database.commit(&seed).expect("seed commit");
 
     let children = database.objects::<Child>().expect("children");
-    let projection = children.select(|child| child.score());
+    let projection = children.select(ChildFields::score);
     let mut scores = projection.all().expect("projected scores");
     scores.sort_unstable();
     assert_eq!(scores, vec![3, 7, 7, 11]);
     assert_eq!(projection.count().expect("projection count"), 4);
 
-    let distinct = children.select(|child| child.score()).distinct();
+    let distinct = children.select(ChildFields::score).distinct();
     let mut unique_scores = distinct.all().expect("distinct scores");
     unique_scores.sort_unstable();
     assert_eq!(unique_scores, vec![3, 7, 11]);
     assert_eq!(distinct.count().expect("distinct count"), 3);
 
     let mut grouped = children
-        .group_by(|child| child.score())
+        .group_by(ChildFields::score)
         .count()
         .all()
         .expect("grouped count");
@@ -2443,7 +2451,7 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
     assert!(event.removed().is_empty());
 
     let mut distinct_watch = children
-        .select(|child| child.score())
+        .select(ChildFields::score)
         .distinct()
         .watch()
         .expect("distinct projection watch");
@@ -2511,14 +2519,14 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
     database.commit(&seed).expect("seed commit");
 
     let metrics = database.objects::<GroupedMetric>().expect("metrics");
-    let count_query = metrics.group_by(|metric| metric.bucket()).count();
+    let count_query = metrics.group_by(GroupedMetricFields::bucket).count();
     let mut counts = count_query.all().expect("group counts");
     counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(counts, vec![(1, 2), (2, 1)]);
 
     let sum_query = metrics
-        .group_by(|metric| metric.bucket())
-        .sum(|metric| metric.value());
+        .group_by(GroupedMetricFields::bucket)
+        .sum(GroupedMetricFields::value);
     let mut sums = sum_query.all().expect("group sums");
     sums.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(sums, vec![(1, 4.0), (2, 10.0)]);
@@ -2546,7 +2554,7 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
         .expect("candidate metrics");
 
     let mut future_counts = candidate_metrics
-        .group_by(|metric| metric.bucket())
+        .group_by(GroupedMetricFields::bucket)
         .count()
         .all()
         .expect("candidate group counts");
@@ -2554,8 +2562,8 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
     assert_eq!(future_counts, vec![(1, 3), (2, 1)]);
 
     let mut future_sums = candidate_metrics
-        .group_by(|metric| metric.bucket())
-        .sum(|metric| metric.value())
+        .group_by(GroupedMetricFields::bucket)
+        .sum(GroupedMetricFields::value)
         .all()
         .expect("candidate group sums");
     future_sums.sort_unstable_by_key(|(bucket, _)| *bucket);
@@ -2598,6 +2606,10 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -2633,13 +2645,13 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     database.commit(&seed).expect("seed commit");
 
     let metrics = database.objects::<GroupedMetric>().expect("metrics");
-    let count_top = metrics.group_by(|metric| metric.bucket()).count().top(1);
+    let count_top = metrics.group_by(GroupedMetricFields::bucket).count().top(1);
     let mut top_counts = count_top.all().expect("top grouped counts");
     top_counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(top_counts, vec![(1, 2), (2, 2)]);
     assert_eq!(
         metrics
-            .group_by(|metric| metric.bucket())
+            .group_by(GroupedMetricFields::bucket)
             .count()
             .bottom(1)
             .all()
@@ -2648,8 +2660,8 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     );
 
     let sum_top = metrics
-        .group_by(|metric| metric.bucket())
-        .sum(|metric| metric.value())
+        .group_by(GroupedMetricFields::bucket)
+        .sum(GroupedMetricFields::value)
         .top(1);
     let mut top_sums = sum_top.all().expect("top grouped sums");
     top_sums.sort_unstable_by_key(|(bucket, _)| *bucket);
@@ -2677,7 +2689,7 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
         .objects::<GroupedMetric>()
         .expect("candidate metrics");
     let mut candidate_counts = candidate_metrics
-        .group_by(|metric| metric.bucket())
+        .group_by(GroupedMetricFields::bucket)
         .count()
         .top(1)
         .all()
@@ -2685,8 +2697,8 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     candidate_counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(candidate_counts, vec![(1, 2), (2, 2), (3, 2)]);
     let mut candidate_sums = candidate_metrics
-        .group_by(|metric| metric.bucket())
-        .sum(|metric| metric.value())
+        .group_by(GroupedMetricFields::bucket)
+        .sum(GroupedMetricFields::value)
         .top(1)
         .all()
         .expect("candidate top sums");
@@ -3004,7 +3016,7 @@ fn composite_group_keys_use_kernel_group_for_exact_candidate_and_watch() {
 
     let top_sum = metrics
         .group_by(|metric| (metric.bucket(), metric.value()))
-        .sum(|metric| metric.value())
+        .sum(GroupedMetricFields::value)
         .top(1);
     let top_sum_exact = top_sum.all().expect("composite top sums");
     assert_eq!(top_sum_exact.len(), 2);
@@ -3034,7 +3046,7 @@ fn composite_group_keys_use_kernel_group_for_exact_candidate_and_watch() {
         .objects::<GroupedMetric>()
         .expect("candidate metrics")
         .group_by(|metric| (metric.bucket(), metric.value()))
-        .sum(|metric| metric.value())
+        .sum(GroupedMetricFields::value)
         .top(1)
         .all()
         .expect("candidate composite top sums");
@@ -3395,7 +3407,7 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
     let users = database.objects::<RuleUser>().expect("users");
     let mut invalid = Transaction::new();
     users
-        .set(&mut invalid, id, |user| user.age(), 17)
+        .set(&mut invalid, id, RuleUserFields::age, 17)
         .expect("patch intent");
     invalid
         .require::<RuleUser>(id, adult.clone())
@@ -3407,7 +3419,7 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
 
     let mut valid = Transaction::new();
     users
-        .set(&mut valid, id, |user| user.age(), 20)
+        .set(&mut valid, id, RuleUserFields::age, 20)
         .expect("valid patch intent");
     valid
         .require::<RuleUser>(id, adult)
@@ -3432,6 +3444,10 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete transaction identity scenario together."
+)]
 fn external_transaction_id_retains_canonical_requirement_identity() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -3478,7 +3494,12 @@ fn external_transaction_id_retains_canonical_requirement_identity() {
         .expect("external transaction");
     assert_eq!(first.origin_revision(), None);
     users
-        .set(&mut first, entity, |user| user.name(), "Guarded".to_owned())
+        .set(
+            &mut first,
+            entity,
+            RuleUserFields::name,
+            "Guarded".to_owned(),
+        )
         .expect("first mutation");
     first
         .require::<RuleUser>(entity, adult.clone())
@@ -3489,7 +3510,12 @@ fn external_transaction_id_retains_canonical_requirement_identity() {
         .with_idempotency_key(transaction_id)
         .expect("same external transaction");
     users
-        .set(&mut same, entity, |user| user.name(), "Guarded".to_owned())
+        .set(
+            &mut same,
+            entity,
+            RuleUserFields::name,
+            "Guarded".to_owned(),
+        )
         .expect("same mutation");
     same.require::<RuleUser>(entity, adult)
         .expect("same requirement");
@@ -3501,7 +3527,7 @@ fn external_transaction_id_retains_canonical_requirement_identity() {
         .set(
             &mut different,
             entity,
-            |user| user.name(),
+            RuleUserFields::name,
             "Guarded".to_owned(),
         )
         .expect("same mutation for conflicting requirement");
@@ -3569,7 +3595,7 @@ fn generated_transaction_key_does_not_rotate_when_requirements_change() {
         .set(
             &mut transaction,
             entity,
-            |user| user.name(),
+            RuleUserFields::name,
             "Stable".to_owned(),
         )
         .expect("mutation");
@@ -3651,14 +3677,19 @@ fn transaction_require_is_rechecked_on_the_rebased_candidate() {
 
     let mut survives = Transaction::new();
     users
-        .set(&mut survives, id, |user| user.name(), "survives".to_owned())
+        .set(
+            &mut survives,
+            id,
+            RuleUserFields::name,
+            "survives".to_owned(),
+        )
         .expect("name intent");
     survives
         .require::<RuleUser>(id, adult.clone())
         .expect("adult requirement");
     let mut raise_age = Transaction::new();
     users
-        .set(&mut raise_age, id, |user| user.age(), 21)
+        .set(&mut raise_age, id, RuleUserFields::age, 21)
         .expect("raise age");
     database.commit(&raise_age).expect("independent age commit");
     database
@@ -3675,14 +3706,14 @@ fn transaction_require_is_rechecked_on_the_rebased_candidate() {
     let fresh = database.objects::<RuleUser>().expect("users after rebase");
     let mut rejected = Transaction::new();
     fresh
-        .set(&mut rejected, id, |user| user.name(), "reject".to_owned())
+        .set(&mut rejected, id, RuleUserFields::name, "reject".to_owned())
         .expect("name intent");
     rejected
         .require::<RuleUser>(id, adult)
         .expect("adult requirement");
     let mut lower_age = Transaction::new();
     fresh
-        .set(&mut lower_age, id, |user| user.age(), 17)
+        .set(&mut lower_age, id, RuleUserFields::age, 17)
         .expect("lower age");
     database
         .commit(&lower_age)
@@ -3750,7 +3781,7 @@ fn transaction_require_uses_current_read_authority_at_preview_and_commit() {
     restricted
         .objects::<RuleUser>()
         .expect("restricted users")
-        .set(&mut tx, id, |user| user.name(), "auth".to_owned())
+        .set(&mut tx, id, RuleUserFields::name, "auth".to_owned())
         .expect("write-only name patch");
     tx.require::<RuleUser>(id, adult).expect("require intent");
     restricted
@@ -3914,7 +3945,7 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         .set(
             &mut partial_tx,
             Id::new(378_001),
-            |account| account.doctor_note(),
+            HostileReaderAccountFields::doctor_note,
             "changed-by-reader".to_owned(),
         )
         .expect("semantic scalar patch");
@@ -3935,7 +3966,7 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         .set(
             &mut invalid_tx,
             Id::new(378_001),
-            |account| account.doctor_note(),
+            HostileReaderAccountFields::doctor_note,
             "x".repeat(64),
         )
         .expect("reader can form a patch without knowing the hidden authoritative rule");
@@ -3960,6 +3991,10 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
 fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema() {
     let path = temp_path();
     let db = RenamedAccountSchema::database(&path)
@@ -3992,7 +4027,7 @@ fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema()
         .set(
             &mut patch,
             Id::new(379_001),
-            |row| row.doctor_note(),
+            LegacyRenameAccountFields::doctor_note,
             "changed-through-old-name".to_owned(),
         )
         .expect("legacy patch resolves through the explicit client-side bind");
@@ -4010,7 +4045,7 @@ fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema()
         .set(
             &mut invalid,
             Id::new(379_001),
-            |row| row.doctor_note(),
+            LegacyRenameAccountFields::doctor_note,
             "x".repeat(64),
         )
         .expect("legacy client can form patch without copying authoritative rules");
@@ -4068,6 +4103,10 @@ fn client_bind_can_keep_old_reference_name_without_authoritative_alias() {
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
 fn partial_context_patches_required_and_optional_references_without_hidden_row_rewrite() {
     let path = temp_path();
     let db = AppSchema::database(&path)
@@ -4106,7 +4145,7 @@ fn partial_context_patches_required_and_optional_references_without_hidden_row_r
         .set(
             &mut patch,
             Id::new(438_010),
-            |task| task.owner(),
+            PartialTaskFields::owner,
             cfmd::Ref::new(bob.id),
         )
         .expect("required reference patch");
@@ -4114,7 +4153,7 @@ fn partial_context_patches_required_and_optional_references_without_hidden_row_r
         .set(
             &mut patch,
             Id::new(438_010),
-            |task| task.reviewer(),
+            PartialTaskFields::reviewer,
             Some(cfmd::Ref::new(alice.id)),
         )
         .expect("optional reference patch");
@@ -4189,6 +4228,10 @@ fn partial_context_many_mutation_preserves_hidden_owner_fields() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field() {
     let path = temp_path();
     let db = AppSchema::database(&path)
@@ -4227,7 +4270,7 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         .set(
             &mut title_tx,
             Id::new(438_110),
-            |task| task.title(),
+            TaskFields::title,
             "title-a".to_string(),
         )
         .expect("title patch");
@@ -4237,7 +4280,7 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         .set(
             &mut owner_tx,
             Id::new(438_110),
-            |task| task.owner(),
+            PartialTaskFields::owner,
             cfmd::Ref::new(bob.id),
         )
         .expect("owner patch");
@@ -4256,7 +4299,7 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         .set(
             &mut left,
             Id::new(438_110),
-            |task| task.title(),
+            TaskFields::title,
             "left".to_string(),
         )
         .expect("left title");
@@ -4265,7 +4308,7 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         .set(
             &mut right,
             Id::new(438_110),
-            |task| task.title(),
+            TaskFields::title,
             "right".to_string(),
         )
         .expect("right title");

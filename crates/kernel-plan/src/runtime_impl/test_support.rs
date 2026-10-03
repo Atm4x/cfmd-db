@@ -225,8 +225,7 @@ pub(crate) fn benchmark_retained_epoch_first_conflict_for_test(
         field: SemanticId::new(99_001),
         owner: kernel_types::EntityId::new(99_002),
     };
-    let mut index = RuntimeRetainedEpochIndex::default();
-    index.lineage_floor = Some(RevisionId::new(1));
+    let mut index = RuntimeRetainedEpochIndex { lineage_floor: Some(RevisionId::new(1)), ..RuntimeRetainedEpochIndex::default() };
     let mut timeline = PersistentOrdMap::default();
     for revision in 2..=depth + 1 {
         timeline.insert(

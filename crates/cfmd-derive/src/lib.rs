@@ -173,6 +173,10 @@ enum FieldRuleSpec {
     TextOneOf(Vec<LitStr>),
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -187,16 +191,15 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let entity_fields = classify_fields(name, fields)?;
     validate_identity_count(name, &entity_fields)?;
     validate_semantic_field_names(&entity_fields)?;
-    if options.authoritative {
-        if let Some(bound) = entity_fields
+    if options.authoritative
+        && let Some(bound) = entity_fields
             .iter()
             .find(|field| field.semantic_name.is_some())
-        {
-            return Err(syn::Error::new_spanned(
-                bound.field,
-                "#[cfmd(bind = ...)] is not permitted on an authoritative entity; authoritative entities must match the current persisted schema exactly and schema evolution must use a migration",
-            ));
-        }
+    {
+        return Err(syn::Error::new_spanned(
+            bound.field,
+            "#[cfmd(bind = ...)] is not permitted on an authoritative entity; authoritative entities must match the current persisted schema exactly and schema evolution must use a migration",
+        ));
     }
     let stored_fields = entity_fields
         .iter()
@@ -967,7 +970,7 @@ fn classify_fields<'a>(
             if bind.value().is_empty() {
                 return Err(syn::Error::new_spanned(bind, "bind cannot be empty"));
             }
-            if bind.value() == ident.to_string() {
+            if *ident == bind.value() {
                 return Err(syn::Error::new_spanned(
                     bind,
                     "bind must name a different persisted field name",
@@ -994,6 +997,10 @@ struct FieldOptions {
     rules: Vec<FieldRuleSpec>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn parse_field_options(field: &Field) -> syn::Result<FieldOptions> {
     let mut id = false;
     let mut via = None;
@@ -1090,7 +1097,7 @@ fn parse_field_options(field: &Field) -> syn::Result<FieldOptions> {
                 let content;
                 syn::parenthesized!(content in meta.input);
                 let values = content
-                    .parse_terminated(|input| input.parse::<LitStr>(), syn::Token![,])?
+                    .parse_terminated(syn::parse::ParseBuffer::parse::<LitStr>, syn::Token![,])?
                     .into_iter()
                     .collect::<Vec<_>>();
                 if values.is_empty() {

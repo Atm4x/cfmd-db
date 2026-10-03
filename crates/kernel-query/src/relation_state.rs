@@ -367,6 +367,10 @@ impl RelationOccurrenceCertificate {
         )
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve the existing value-taking boundary contract."
+    )]
     pub(crate) fn from_dense_set_keys(
         result_type: RelType,
         context: &kernel_schema::SemanticContext,
@@ -1446,8 +1450,7 @@ impl RelationBaseWitness {
         target_revision: kernel_types::RevisionId,
         resolved: &StorageResolvedRelationDelta,
     ) -> Result<Self, RelQueryError> {
-        if resolved.relation != self.relation
-            || &resolved.semantic_context != &self.semantic_context
+        if resolved.relation != self.relation || resolved.semantic_context != self.semantic_context
         {
             return Err(RelQueryError::StructuralRewriteBaseMismatch);
         }
@@ -1807,6 +1810,10 @@ struct CanonicalRelationMutationKeys {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Preserve inline state ownership without adding allocations."
+)]
 pub(super) enum MaintainedScanCommitPatch {
     Semantic(RelationMutationPlan),
     StorageResolved(StorageResolvedScanPatch),
@@ -2052,8 +2059,8 @@ impl RelationDelta {
         let mut inserted = Vec::new();
         for row in &self.inserted {
             let key = canonical_row_key(row, equivalences, context, registry)?;
-            if !current_by_key.contains_key(&key) {
-                current_by_key.insert(key, row.clone());
+            if let std::collections::btree_map::Entry::Vacant(e) = current_by_key.entry(key) {
+                e.insert(row.clone());
                 inserted.push(row.clone());
             }
         }

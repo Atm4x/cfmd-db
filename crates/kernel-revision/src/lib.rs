@@ -195,6 +195,10 @@ impl RelationUpdateCandidate<'_> {
         )
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve the existing value-taking boundary contract."
+    )]
     pub fn patch_relation_rows_with_footprint(
         &mut self,
         relation: kernel_types::SemanticId,

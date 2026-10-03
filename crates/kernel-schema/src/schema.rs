@@ -30,14 +30,14 @@ pub struct Schema {
 fn validate_field_rule_type(rule: &FieldRule, ty: &TypeExpr) -> Result<(), SchemaError> {
     match rule.expression().validate_for_input(ty) {
         Ok(()) => Ok(()),
-        Err(crate::SemanticRuleTypeError::TypeMismatch) => Err(SchemaError::FieldRuleTypeMismatch),
         Err(crate::SemanticRuleTypeError::InvalidBounds) => {
             Err(SchemaError::InvalidFieldRuleBounds)
         }
-        Err(crate::SemanticRuleTypeError::UnknownField(_))
-        | Err(crate::SemanticRuleTypeError::FieldOutsideOwner { .. }) => {
-            Err(SchemaError::FieldRuleTypeMismatch)
-        }
+        Err(
+            crate::SemanticRuleTypeError::TypeMismatch
+            | crate::SemanticRuleTypeError::UnknownField(_)
+            | crate::SemanticRuleTypeError::FieldOutsideOwner { .. },
+        ) => Err(SchemaError::FieldRuleTypeMismatch),
     }
 }
 

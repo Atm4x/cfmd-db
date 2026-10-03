@@ -459,7 +459,7 @@ impl CompiledModelRule {
                     .model
                     .relations
                     .get_shared(&dependency.relation)
-                    .map_or(0, |rows| rows.len());
+                    .map_or(0, kernel_model::SharedRelationRows::len);
                 Ok(ModelRuleWitness::RelationCardinality {
                     count: u64::try_from(count).map_err(|_| RuleEvaluationError::TypeMismatch)?,
                 })
@@ -470,7 +470,7 @@ impl CompiledModelRule {
             } => {
                 let mut matching = 0u64;
                 if let Some(rows) = state.model.relations.get_shared(&dependency.relation) {
-                    for row in rows.iter() {
+                    for row in rows {
                         if predicate.matches(row)? {
                             matching = matching
                                 .checked_add(1)
@@ -486,7 +486,7 @@ impl CompiledModelRule {
             } => {
                 let mut violating = 0u64;
                 if let Some(rows) = state.model.relations.get_shared(&dependency.relation) {
-                    for row in rows.iter() {
+                    for row in rows {
                         if !predicate.matches(row)? {
                             violating = violating
                                 .checked_add(1)
@@ -639,7 +639,7 @@ impl CompiledModelRule {
     ) -> Result<kernel_aggregate::ExactF64Sum, RuleEvaluationError> {
         let mut sum = kernel_aggregate::ExactF64Sum::default();
         if let Some(rows) = state.model.relations.get_shared(&relation) {
-            for row in rows.iter() {
+            for row in rows {
                 let Some(Value::F64Bits(bits)) = row.get(column_ordinal) else {
                     return Err(RuleEvaluationError::TypeMismatch);
                 };
@@ -664,7 +664,7 @@ impl CompiledModelRule {
                     .model
                     .relations
                     .get_shared(&dependency.relation)
-                    .map_or(0, |rows| rows.len());
+                    .map_or(0, kernel_model::SharedRelationRows::len);
                 let count = u64::try_from(count).map_err(|_| RuleEvaluationError::TypeMismatch)?;
                 Ok(count >= *min && max.is_none_or(|max| count <= max))
             }
@@ -675,7 +675,7 @@ impl CompiledModelRule {
                 let Some(rows) = state.model.relations.get_shared(&dependency.relation) else {
                     return Ok(false);
                 };
-                for row in rows.iter() {
+                for row in rows {
                     if predicate.matches(row)? {
                         return Ok(true);
                     }
@@ -689,7 +689,7 @@ impl CompiledModelRule {
                 let Some(rows) = state.model.relations.get_shared(&dependency.relation) else {
                     return Ok(true);
                 };
-                for row in rows.iter() {
+                for row in rows {
                     if !predicate.matches(row)? {
                         return Ok(false);
                     }
@@ -704,23 +704,21 @@ impl CompiledModelRule {
             } => {
                 use std::cmp::Ordering;
                 let sum = Self::exact_f64_sum(state, dependency.relation, *column_ordinal)?;
-                if let Some(min) = min {
-                    if sum
+                if let Some(min) = min
+                    && sum
                         .cmp_f64_exact(min.value())
                         .map_err(|_| RuleEvaluationError::TypeMismatch)?
                         == Ordering::Less
-                    {
-                        return Ok(false);
-                    }
+                {
+                    return Ok(false);
                 }
-                if let Some(max) = max {
-                    if sum
+                if let Some(max) = max
+                    && sum
                         .cmp_f64_exact(max.value())
                         .map_err(|_| RuleEvaluationError::TypeMismatch)?
                         == Ordering::Greater
-                    {
-                        return Ok(false);
-                    }
+                {
+                    return Ok(false);
                 }
                 Ok(true)
             }
@@ -741,7 +739,7 @@ impl CompiledModelRule {
                     .model
                     .relations
                     .get_shared(&dependency.relation)
-                    .map_or(0, |rows| rows.len());
+                    .map_or(0, kernel_model::SharedRelationRows::len);
                 let count = u64::try_from(count).map_err(|_| RuleEvaluationError::TypeMismatch)?;
                 if count < *min {
                     Ok(*min - count)
@@ -758,7 +756,7 @@ impl CompiledModelRule {
                 let Some(rows) = state.model.relations.get_shared(&dependency.relation) else {
                     return Ok(1);
                 };
-                for row in rows.iter() {
+                for row in rows {
                     if predicate.matches(row)? {
                         return Ok(0);
                     }
@@ -773,7 +771,7 @@ impl CompiledModelRule {
                     return Ok(0);
                 };
                 let mut mass = 0u64;
-                for row in rows.iter() {
+                for row in rows {
                     if !predicate.matches(row)? {
                         mass = mass
                             .checked_add(1)

@@ -315,6 +315,14 @@ fn migration_program_composes_into_current_realization_without_old_semantic_worl
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn row_local_migration_composes_as_relation_realization_over_old_atom() {
     use kernel_schema::{
         RelationDef, RelationSemantics, ScalarType, Schema, SemanticEnvironment, TypeExpr,
@@ -427,6 +435,10 @@ fn row_local_migration_composes_as_relation_realization_over_old_atom() {
 
 #[test]
 #[ignore = "manual release-mode realization microbenchmark"]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+)]
 fn realization_transform_hot_path_benchmark() {
     use std::hint::black_box;
     use std::time::Instant;
@@ -538,10 +550,10 @@ fn migration_composition_scale_benchmark() {
             .entry(entity_type)
             .or_default()
             .insert(entity);
-        state
-            .model
-            .fields
-            .insert((old_age, entity), Value::I64(raw as i64));
+        state.model.fields.insert(
+            (old_age, entity),
+            Value::I64(i64::try_from(raw).expect("fixture value fits i64")),
+        );
     }
     let (atoms, root) = realize_database_state(&state);
     let start = Instant::now();
@@ -649,6 +661,18 @@ fn current_schema_field_write_installs_native_overlay_without_inverse_migration(
 
 #[test]
 #[ignore = "manual release-mode factorized realization benchmark"]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+)]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn factorized_realization_scale_and_hot_path_benchmark() {
     use kernel_schema::{FieldDef, ScalarType, Schema, SemanticEnvironment, TypeExpr};
     use kernel_types::{SchemaRevisionId, SemanticEnvId};
@@ -708,10 +732,10 @@ fn factorized_realization_scale_and_hot_path_benchmark() {
             .entry(entity_type)
             .or_default()
             .insert(entity);
-        state
-            .model
-            .fields
-            .insert((old_age, entity), Value::I64(raw as i64));
+        state.model.fields.insert(
+            (old_age, entity),
+            Value::I64(i64::try_from(raw).expect("fixture value fits i64")),
+        );
     }
     let (mut atoms, source_root) = realize_database_state_factorized(&state, &source).unwrap();
     let probe = EntityId::new(u128::from(count / 2));
@@ -767,6 +791,10 @@ fn factorized_realization_scale_and_hot_path_benchmark() {
     );
 }
 
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
 fn factorized_relation_migration_fixture(
     row_count: usize,
 ) -> (
@@ -859,7 +887,11 @@ fn factorized_relation_migration_fixture(
     state.model.relations.insert(
         relation,
         (0..row_count)
-            .map(|raw| vec![Value::I64(raw as i64)])
+            .map(|raw| {
+                vec![Value::I64(
+                    i64::try_from(raw).expect("fixture value fits i64"),
+                )]
+            })
             .collect(),
     );
     (
@@ -1228,13 +1260,21 @@ fn factorized_general_union_fixture(
     state.model.relations.insert(
         left,
         (0..rows_per_side)
-            .map(|raw| vec![Value::I64(raw as i64)])
+            .map(|raw| {
+                vec![Value::I64(
+                    i64::try_from(raw).expect("fixture value fits i64"),
+                )]
+            })
             .collect(),
     );
     state.model.relations.insert(
         right,
         (0..rows_per_side)
-            .map(|raw| vec![Value::I64((rows_per_side + raw) as i64)])
+            .map(|raw| {
+                vec![Value::I64(
+                    i64::try_from(rows_per_side + raw).expect("fixture value fits i64"),
+                )]
+            })
             .collect(),
     );
     (
@@ -1478,6 +1518,10 @@ fn one_shot_filter_eq_const_is_supported_without_whole_row_fallback() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn general_relation_current_b_write_detaches_to_native_endpoint_without_inverse() {
     use kernel_change::{RewriteLawSetId, RewriteSpec, RewriteSpecId};
     use kernel_query::{RelExpr, RelationDelta, RelationValue};
@@ -1593,6 +1637,14 @@ fn general_relation_current_b_write_detaches_to_native_endpoint_without_inverse(
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn general_relation_current_b_write_uses_bounded_delta_overlay_then_compacts() {
     use kernel_change::{RewriteLawSetId, RewriteSpec, RewriteSpecId};
     use kernel_query::{RelExpr, RelationDelta};
@@ -1706,6 +1758,10 @@ fn general_relation_current_b_write_uses_bounded_delta_overlay_then_compacts() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn bounded_relation_delta_overlay_routes_set_removal_by_gamma_class() {
     use kernel_change::{RewriteLawSetId, RewriteSpec, RewriteSpecId};
     use kernel_query::{RelExpr, RelationDelta};
@@ -1835,7 +1891,7 @@ fn bounded_relation_delta_overlay_routes_set_removal_by_gamma_class() {
     let mut rows = target_root.evaluate(&atoms).unwrap().model.relations[&target_relation]
         .iter()
         .map(|row| match row.as_slice() {
-            [Value::Text(value)] => value.to_string(),
+            [Value::Text(value)] => value.clone(),
             _ => panic!("unexpected row"),
         })
         .collect::<Vec<_>>();
@@ -1923,7 +1979,7 @@ fn bounded_relation_delta_overlay_routes_set_removal_by_gamma_class() {
     let mut current_rows = target_root.evaluate(&atoms).unwrap().model.relations[&target_relation]
         .iter()
         .map(|row| match row.as_slice() {
-            [Value::Text(value)] => value.to_string(),
+            [Value::Text(value)] => value.clone(),
             _ => panic!("unexpected row"),
         })
         .collect::<Vec<_>>();
@@ -1932,7 +1988,7 @@ fn bounded_relation_delta_overlay_routes_set_removal_by_gamma_class() {
     let mut old_rows = first_snapshot.evaluate(&atoms).unwrap().model.relations[&target_relation]
         .iter()
         .map(|row| match row.as_slice() {
-            [Value::Text(value)] => value.to_string(),
+            [Value::Text(value)] => value.clone(),
             _ => panic!("unexpected row"),
         })
         .collect::<Vec<_>>();
@@ -1941,6 +1997,14 @@ fn bounded_relation_delta_overlay_routes_set_removal_by_gamma_class() {
 }
 
 #[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn repeated_bag_overlay_lifecycle_preserves_old_roots_and_rejects_semantic_stale_rewrites() {
     use kernel_change::{RewriteLawSetId, RewriteSpec, RewriteSpecId};
     use kernel_query::{RelExpr, RelationDelta};
@@ -1991,7 +2055,7 @@ fn repeated_bag_overlay_lifecycle_preserves_old_roots_and_rejects_semantic_stale
 
     for step in 0..48usize {
         let remove = expected[step % expected.len()];
-        let insert = 10_000_i64 + step as i64;
+        let insert = 10_000_i64 + i64::try_from(step).expect("fixture value fits i64");
         let delta = RelationDelta {
             removed: vec![vec![Value::I64(remove)]],
             inserted: vec![vec![Value::I64(insert)]],
@@ -2073,6 +2137,10 @@ fn repeated_bag_overlay_lifecycle_preserves_old_roots_and_rejects_semantic_stale
 
 #[test]
 #[ignore = "manual release-mode bounded current-B relation overlay benchmark"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn general_relation_current_b_bounded_overlay_benchmark() {
     use std::hint::black_box;
     use std::time::Instant;
@@ -2112,7 +2180,9 @@ fn general_relation_current_b_bounded_overlay_benchmark() {
         .unwrap();
     let delta = RelationDelta {
         removed: vec![],
-        inserted: vec![vec![Value::I64(total as i64)]],
+        inserted: vec![vec![Value::I64(
+            i64::try_from(total).expect("fixture value fits i64"),
+        )]],
         result_type,
     };
     let spec = RewriteSpec {
@@ -2208,6 +2278,14 @@ fn general_relation_current_b_bounded_overlay_benchmark() {
 
 #[test]
 #[ignore = "manual release-mode repeated current-B overlay depth benchmark"]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn repeated_relation_delta_overlay_depth_benchmark() {
     use std::hint::black_box;
     use std::time::Instant;
@@ -2299,8 +2377,12 @@ fn repeated_relation_delta_overlay_depth_benchmark() {
     for target_depth in [1usize, 16, 128, 1_024] {
         while applied < target_depth {
             let delta = RelationDelta {
-                removed: vec![vec![Value::I64(applied as i64)]],
-                inserted: vec![vec![Value::I64((total + applied) as i64)]],
+                removed: vec![vec![Value::I64(
+                    i64::try_from(applied).expect("fixture value fits i64"),
+                )]],
+                inserted: vec![vec![Value::I64(
+                    i64::try_from(total + applied).expect("fixture value fits i64"),
+                )]],
                 result_type: result_type.clone(),
             };
             let spec = RewriteSpec {
@@ -2439,7 +2521,8 @@ fn repeated_relation_delta_overlay_depth_benchmark() {
     let break_even_scans = if incremental_scan.is_zero() {
         f64::INFINITY
     } else {
-        compact_elapsed.as_secs_f64() / (incremental_scan.as_secs_f64() / scan_repetitions as f64)
+        compact_elapsed.as_secs_f64()
+            / (incremental_scan.as_secs_f64() / f64::from(scan_repetitions))
     };
     eprintln!(
         "REL_OVERLAY_DEPTH_COMPACT rows={total} depth={applied} compact_ms={:.3} break_even_future_full_scans={break_even_scans:.1}",
@@ -2486,7 +2569,9 @@ fn general_relation_current_b_write_detachment_benchmark() {
         .unwrap();
     let delta = RelationDelta {
         removed: vec![],
-        inserted: vec![vec![Value::I64(total as i64)]],
+        inserted: vec![vec![Value::I64(
+            i64::try_from(total).expect("fixture value fits i64"),
+        )]],
         result_type,
     };
     let spec = RewriteSpec {
@@ -2570,6 +2655,10 @@ fn factorized_general_relation_preparation_scale_benchmark() {
 }
 
 #[test]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+)]
 fn factorized_relation_chunk_materialization_is_bounded_and_releases_base_after_full_coverage() {
     let count = 10_usize;
     let chunk_rows = 4_usize;
@@ -2641,6 +2730,10 @@ fn factorized_relation_chunk_materialization_is_bounded_and_releases_base_after_
 
 #[test]
 #[ignore = "manual release-mode chunked relation realization benchmark"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn factorized_relation_chunked_access_benchmark() {
     use std::hint::black_box;
     use std::time::Instant;
@@ -2837,10 +2930,10 @@ fn factorized_sparse_field_migration_fixture(
             .entry(entity_type)
             .or_default()
             .insert(entity);
-        state
-            .model
-            .fields
-            .insert((source_field, entity), Value::I64(index as i64));
+        state.model.fields.insert(
+            (source_field, entity),
+            Value::I64(i64::try_from(index).expect("fixture value fits i64")),
+        );
     }
     (
         source,
@@ -2855,6 +2948,10 @@ fn factorized_sparse_field_migration_fixture(
 }
 
 #[test]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+)]
 fn factorized_field_chunk_uses_carrier_ordinal_segments_not_entity_id_ranges() {
     let count = 10_usize;
     let chunk_entities = 4_usize;
@@ -2915,6 +3012,10 @@ fn factorized_field_chunk_uses_carrier_ordinal_segments_not_entity_id_ranges() {
 
 #[test]
 #[ignore = "manual release-mode chunked field realization benchmark"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn factorized_field_chunked_access_benchmark() {
     use std::hint::black_box;
     use std::time::Instant;

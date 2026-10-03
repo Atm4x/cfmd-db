@@ -45,7 +45,7 @@ impl DurableRuntime {
                 inserted: rewrite.rewrite.delta().inserted.clone(),
                 removed: rewrite.rewrite.delta().removed.clone(),
                 object_field_writes: Vec::new(),
-                authorization: Default::default(),
+                authorization: kernel_durability::DurableRelationAuthorization::default(),
             });
             intents.push(DurableRelationRewriteIntent {
                 relation: rewrite.relation,
@@ -289,6 +289,7 @@ impl DurableRuntime {
         )
     }
 
+    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn open_with_storage_options_recovery_policy_and_revision_publication_notifier(
         path: impl AsRef<std::path::Path>,
         storage: &RuntimeStorageOptions,

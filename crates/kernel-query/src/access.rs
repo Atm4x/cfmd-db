@@ -31,6 +31,10 @@ pub(crate) fn read_footprint(
     Ok(footprint)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn collect(
     expr: &RelExpr,
     context: &kernel_schema::SemanticContext,
