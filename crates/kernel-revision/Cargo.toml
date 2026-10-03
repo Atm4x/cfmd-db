@@ -8,6 +8,7 @@ license.workspace = true
 kernel-identity = { path = "../kernel-identity" }
 kernel-lifecycle = { path = "../kernel-lifecycle" }
 kernel-model = { path = "../kernel-model" }
+kernel-query = { path = "../kernel-query" }
 kernel-schema = { path = "../kernel-schema" }
 kernel-semantics = { path = "../kernel-semantics" }
 kernel-types = { path = "../kernel-types" }

@@ -415,7 +415,7 @@ impl Encoder {
 
     fn commit_request(&mut self, request: &CommitRequest, depth: u16) -> Result<()> {
         self.u64(request.base_revision)?;
-        self.u128(request.transaction)?;
+        self.u128(request.idempotency_key.raw())?;
         self.collection_len(request.mutations.len())?;
         for mutation in &request.mutations {
             self.u128(mutation.relation)?;
@@ -542,7 +542,7 @@ impl Encoder {
         for prerequisite in &entry.prerequisites {
             self.u128(*prerequisite)?;
         }
-        self.u128(entry.transaction)?;
+        self.u128(entry.idempotency_key.raw())?;
         self.u64(entry.source_revision)?;
         self.u64(entry.target_revision)?;
         self.u8(history_kind_tag(entry.kind))?;
@@ -928,7 +928,7 @@ impl<'a> Decoder<'a> {
 
     fn commit_request(&mut self, depth: u16) -> Result<CommitRequest> {
         let base_revision = self.u64()?;
-        let transaction = self.u128()?;
+        let idempotency_key = crate::IdempotencyKey::new(self.u128()?);
         let len = self.collection_len()?;
         let mut mutations = Vec::with_capacity(len);
         for _ in 0..len {
@@ -940,7 +940,7 @@ impl<'a> Decoder<'a> {
         }
         Ok(CommitRequest {
             base_revision,
-            transaction,
+            idempotency_key,
             mutations,
         })
     }
@@ -1035,7 +1035,7 @@ impl<'a> Decoder<'a> {
         for _ in 0..prerequisite_len {
             prerequisites.push(self.u128()?);
         }
-        let transaction = self.u128()?;
+        let idempotency_key = crate::IdempotencyKey::new(self.u128()?);
         let source_revision = self.u64()?;
         let target_revision = self.u64()?;
         let kind = history_kind_from_tag(self.u8()?)?;
@@ -1052,7 +1052,7 @@ impl<'a> Decoder<'a> {
         Ok(HistoryEntryDto {
             effect_id,
             prerequisites,
-            transaction,
+            idempotency_key,
             source_revision,
             target_revision,
             kind,
@@ -1108,7 +1108,6 @@ const fn history_kind_tag(kind: HistoryKind) -> u8 {
         HistoryKind::MixedRevision => 3,
         HistoryKind::FullRevision => 4,
         HistoryKind::SchemaMigration => 5,
-        HistoryKind::LegacyTargetOnly => 6,
     }
 }
 
@@ -1120,7 +1119,6 @@ fn history_kind_from_tag(tag: u8) -> Result<HistoryKind> {
         3 => Ok(HistoryKind::MixedRevision),
         4 => Ok(HistoryKind::FullRevision),
         5 => Ok(HistoryKind::SchemaMigration),
-        6 => Ok(HistoryKind::LegacyTargetOnly),
         _ => Err(wire_error("unknown history kind")),
     }
 }

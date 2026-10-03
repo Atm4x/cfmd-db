@@ -370,7 +370,7 @@ impl RelationOccurrenceCertificate {
     pub(crate) fn from_dense_set_keys(
         result_type: RelType,
         context: &kernel_schema::SemanticContext,
-        canonical_keys_by_row: &CanonicalRowEvidence,
+        canonical_keys_by_row: CanonicalRowEvidence,
     ) -> Result<Self, RelQueryError> {
         let row_count = canonical_keys_by_row.len();
         let strictly_sorted = canonical_keys_by_row
@@ -478,6 +478,77 @@ pub struct RelationBaseWitness {
     authority: Arc<()>,
 }
 
+/// Restricted Γ-support authority projected from a [`RelationBaseWitness`].
+///
+/// This carrier deliberately does not expose scan-order/physical-position
+/// evidence.  That distinction matters when historical support is recovered
+/// by reversing exact deltas: multiplicity/equivalence support is exactly
+/// reversible, while the old stable-handle order is not reconstructible from
+/// a value-only durable delta.  Formation-world delta validation needs only
+/// the former.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationSupportWitness {
+    witness: RelationBaseWitness,
+}
+
+impl RelationSupportWitness {
+    #[must_use]
+    pub const fn relation(&self) -> kernel_types::SemanticId {
+        self.witness.relation
+    }
+
+    #[must_use]
+    pub const fn result_type(&self) -> &RelType {
+        &self.witness.result_type
+    }
+
+    #[must_use]
+    pub const fn semantic_context(&self) -> &kernel_schema::SemanticContext {
+        &self.witness.semantic_context
+    }
+
+    /// Applies an exact value delta to support only.  The successor remains a
+    /// restricted support witness; synthesized handles never escape as scan
+    /// evidence.
+    pub fn advance_exact(
+        &self,
+        target_revision: kernel_types::RevisionId,
+        delta: &RelationDelta,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        Ok(Self {
+            witness: self.witness.advance(target_revision, delta, registry)?,
+        })
+    }
+
+    /// Reverses one exact durable relation delta at Γ-support level.
+    pub fn rewind_exact(
+        &self,
+        source_revision: kernel_types::RevisionId,
+        forward_delta: &RelationDelta,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        let inverse = RelationDelta {
+            inserted: forward_delta.removed.clone(),
+            removed: forward_delta.inserted.clone(),
+            result_type: forward_delta.result_type.clone(),
+        };
+        self.advance_exact(source_revision, &inverse, registry)
+    }
+
+    /// Checks that an exact delta is defined in this Γ-support world without
+    /// constructing or materializing a relation value.
+    pub fn validate_exact_delta(
+        &self,
+        delta: &RelationDelta,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(), RelQueryError> {
+        self.witness
+            .apply_delta_supports(delta, registry)
+            .map(|_| ())
+    }
+}
+
 /// Structural persistent-node accounting for one relation witness. This is a
 /// kernel diagnostic used by retention/GC hostile tests; it deliberately
 /// counts persistent data-structure nodes rather than attempting allocator
@@ -487,6 +558,33 @@ pub struct RelationWitnessStorageStats {
     pub occurrence_map_nodes: usize,
     pub ordered_map_nodes: usize,
     pub bucket_vector_nodes: usize,
+}
+
+/// Exact persistent-source patch derived from a relation base witness and one
+/// semantic delta. Removal ordinals are expressed in the source logical row
+/// order; the successor witness is the same Γ-canonical support authority
+/// advanced by that delta.
+#[derive(Debug, Clone)]
+pub struct RelationBaseDeltaAdvance {
+    removed_positions: Vec<usize>,
+    successor: RelationBaseWitness,
+}
+
+impl RelationBaseDeltaAdvance {
+    #[must_use]
+    pub fn removed_positions(&self) -> &[usize] {
+        &self.removed_positions
+    }
+
+    #[must_use]
+    pub const fn successor(&self) -> &RelationBaseWitness {
+        &self.successor
+    }
+
+    #[must_use]
+    pub fn into_successor(self) -> RelationBaseWitness {
+        self.successor
+    }
 }
 
 impl RelationWitnessStorageStats {
@@ -565,6 +663,97 @@ impl PartialEq for RelationBaseWitness {
 impl Eq for RelationBaseWitness {}
 
 impl RelationBaseWitness {
+    /// O(1) restricted projection of this persistent Γ occurrence root for
+    /// support-only validation/history transport.
+    #[must_use]
+    pub fn support_witness(&self) -> RelationSupportWitness {
+        RelationSupportWitness {
+            witness: self.clone(),
+        }
+    }
+
+    /// Residualizes a certified stale Set intent against this current Γ root
+    /// without scanning/materializing the relation. Exact current row values
+    /// needed by removals are fetched only for the touched Γ classes through
+    /// `row_at_logical_position`.
+    pub fn residualize_delta_against_support<F>(
+        &self,
+        delta: &RelationDelta,
+        mut row_at_logical_position: F,
+    ) -> Result<RelationDelta, RelQueryError>
+    where
+        F: FnMut(usize) -> Option<Row>,
+    {
+        if delta.result_type != self.result_type {
+            return Err(RelQueryError::TypeMismatch);
+        }
+        if !matches!(
+            self.result_type.semantics,
+            kernel_schema::RelationSemantics::Set { .. }
+        ) {
+            return Ok(delta.clone());
+        }
+
+        let removed_keys = delta
+            .removed
+            .iter()
+            .map(|row| self.canonical_key(row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let inserted_keys = delta
+            .inserted
+            .iter()
+            .map(|row| self.canonical_key(row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let removed_set = removed_keys.iter().cloned().collect::<BTreeSet<_>>();
+        let inserted_set = inserted_keys.iter().cloned().collect::<BTreeSet<_>>();
+        if !removed_set.is_disjoint(&inserted_set) {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+
+        let mut class_state = BTreeMap::<CanonicalRowKey, bool>::new();
+        let mut removed = Vec::new();
+        for key in removed_keys {
+            let present = *class_state
+                .entry(key.clone())
+                .or_insert_with(|| self.occurrences.contains_key(&key));
+            if !present {
+                continue;
+            }
+            let handle = self
+                .occurrences
+                .get(&key)
+                .and_then(|bucket| bucket.iter().next().copied())
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let position = self
+                .ordered_occurrences
+                .rank_of(&handle)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            removed.push(
+                row_at_logical_position(position)
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?,
+            );
+            class_state.insert(key, false);
+        }
+
+        let mut inserted = Vec::new();
+        for (row, key) in delta.inserted.iter().zip(inserted_keys) {
+            let present = *class_state
+                .entry(key.clone())
+                .or_insert_with(|| self.occurrences.contains_key(&key));
+            if present {
+                continue;
+            }
+            inserted.push(row.clone());
+            class_state.insert(key, true);
+        }
+
+        Ok(RelationDelta {
+            inserted,
+            removed,
+            result_type: self.result_type.clone(),
+        })
+    }
+
     /// Rebinds this exact semantic relation to a fresh dense generation-zero
     /// storage-handle domain in the exact physical row order certified by
     /// `seed`, without canonicalizing any row again.
@@ -1207,8 +1396,35 @@ impl RelationBaseWitness {
         delta: &RelationDelta,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, RelQueryError> {
+        Ok(self
+            .advance_with_source_positions(target_revision, delta, registry)?
+            .into_successor())
+    }
+
+    /// Advances this exact support witness and simultaneously resolves every
+    /// removed occurrence to its source logical ordinal in O(delta log N).
+    /// No relation row buffer is materialized or scanned.
+    pub fn advance_with_source_positions(
+        &self,
+        target_revision: kernel_types::RevisionId,
+        delta: &RelationDelta,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelationBaseDeltaAdvance, RelQueryError> {
         let transition = self.apply_delta_supports(delta, registry)?;
-        Ok(Self {
+        let mut removed_positions = transition
+            .removed_handles
+            .iter()
+            .map(|handle| {
+                self.ordered_occurrences
+                    .rank_of(handle)
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        removed_positions.sort_unstable();
+        if removed_positions.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        let successor = Self {
             revision: target_revision,
             relation: self.relation,
             result_type: self.result_type.clone(),
@@ -1218,6 +1434,10 @@ impl RelationBaseWitness {
             ordered_occurrences: transition.ordered_occurrences,
             next_occurrence_slot: transition.next_occurrence_slot,
             authority: Arc::new(()),
+        };
+        Ok(RelationBaseDeltaAdvance {
+            removed_positions,
+            successor,
         })
     }
 
@@ -1226,7 +1446,8 @@ impl RelationBaseWitness {
         target_revision: kernel_types::RevisionId,
         resolved: &StorageResolvedRelationDelta,
     ) -> Result<Self, RelQueryError> {
-        if resolved.relation != self.relation || resolved.semantic_context != self.semantic_context
+        if resolved.relation != self.relation
+            || &resolved.semantic_context != &self.semantic_context
         {
             return Err(RelQueryError::StructuralRewriteBaseMismatch);
         }
@@ -1586,10 +1807,6 @@ struct CanonicalRelationMutationKeys {
 }
 
 #[derive(Debug)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Preserve inline state ownership without adding allocations to this representation."
-)]
 pub(super) enum MaintainedScanCommitPatch {
     Semantic(RelationMutationPlan),
     StorageResolved(StorageResolvedScanPatch),
@@ -1835,8 +2052,8 @@ impl RelationDelta {
         let mut inserted = Vec::new();
         for row in &self.inserted {
             let key = canonical_row_key(row, equivalences, context, registry)?;
-            if let std::collections::btree_map::Entry::Vacant(e) = current_by_key.entry(key) {
-                e.insert(row.clone());
+            if !current_by_key.contains_key(&key) {
+                current_by_key.insert(key, row.clone());
                 inserted.push(row.clone());
             }
         }

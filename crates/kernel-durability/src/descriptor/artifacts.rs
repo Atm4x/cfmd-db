@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use kernel_types::{MaterializationId, RevisionId, SemanticId};
 
-pub const PHYSICAL_ARTIFACT_RECIPE_VERSION: u16 = 3;
+pub const PHYSICAL_ARTIFACT_RECIPE_TAG: u16 = 0xCF52;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableMaterializationSpec {
@@ -43,11 +43,6 @@ pub enum DurablePhysicalArtifactSpec {
         relation: SemanticId,
         key_column: usize,
         equivalence: SemanticId,
-        advisor_managed: bool,
-    },
-    SemanticIndex {
-        relation: SemanticId,
-        key_parts: Vec<DurableSemanticKeyPart>,
         advisor_managed: bool,
     },
     SemanticQuotientFactor {
@@ -95,10 +90,6 @@ enum DurablePhysicalArtifactKey {
         key_column: usize,
         equivalence: SemanticId,
     },
-    Index {
-        relation: SemanticId,
-        key_parts: Vec<DurableSemanticKeyPart>,
-    },
     QuotientFactor {
         relation: SemanticId,
         key_parts: Vec<DurableSemanticKeyPart>,
@@ -137,17 +128,6 @@ fn physical_artifact_key(spec: &DurablePhysicalArtifactSpec) -> (DurablePhysical
                 relation: *relation,
                 key_column: *key_column,
                 equivalence: *equivalence,
-            },
-            *advisor_managed,
-        ),
-        DurablePhysicalArtifactSpec::SemanticIndex {
-            relation,
-            key_parts,
-            advisor_managed,
-        } => (
-            DurablePhysicalArtifactKey::Index {
-                relation: *relation,
-                key_parts: key_parts.clone(),
             },
             *advisor_managed,
         ),
@@ -209,14 +189,6 @@ fn physical_artifact_spec_from_key(
             relation,
             key_column,
             equivalence,
-            advisor_managed,
-        },
-        DurablePhysicalArtifactKey::Index {
-            relation,
-            key_parts,
-        } => DurablePhysicalArtifactSpec::SemanticIndex {
-            relation,
-            key_parts,
             advisor_managed,
         },
         DurablePhysicalArtifactKey::QuotientFactor {

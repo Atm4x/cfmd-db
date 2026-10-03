@@ -5759,7 +5759,6 @@ mod relational_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn maintained_scan_shares_factorized_relation_occurrence_witness_without_recanonicalization() {
         let (context, registry, _, relation, _) = setup();
         let rows = vec![
@@ -6495,7 +6494,6 @@ mod positive_recursive_query_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn quotient_operators_emit_exact_occurrence_certificate_without_second_gamma_pass() {
         let text_eq = SemanticId::new(91_020);
         let i64_eq = SemanticId::new(91_021);
@@ -6744,7 +6742,7 @@ mod positive_recursive_query_tests {
         model.relations.insert(
             left,
             (0..rows)
-                .map(|index| vec![Value::I64(i64::try_from(index).expect("fixture value fits i64")), Value::I64(i64::try_from(index).expect("fixture value fits i64"))])
+                .map(|index| vec![Value::I64(index as i64), Value::I64(index as i64)])
                 .collect(),
         );
         model.relations.insert(
@@ -6752,7 +6750,7 @@ mod positive_recursive_query_tests {
             (0..rows)
                 .map(|index| {
                     vec![
-                        Value::I64(i64::try_from(index).expect("fixture value fits i64")),
+                        Value::I64(index as i64),
                         Value::I64((index as i64).wrapping_mul(3)),
                     ]
                 })
@@ -6814,7 +6812,6 @@ mod positive_recursive_query_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn anti_join_composes_left_occurrence_certificate_without_full_row_recanonicalization() {
         let text_eq = SemanticId::new(91_060);
         let i64_eq = SemanticId::new(91_061);
@@ -6961,7 +6958,7 @@ mod positive_recursive_query_tests {
         let text_eq = SemanticId::new(91_067);
         let i64_eq = SemanticId::new(91_068);
         let source = SemanticId::new(91_069);
-        let blockers = SemanticId::new(910_691);
+        let blockers = SemanticId::new(91_069_1);
         let mut registry = SemanticRegistry::default();
         let text_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
         let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
@@ -7028,13 +7025,13 @@ mod positive_recursive_query_tests {
 
     #[test]
     fn scan_occurrence_seed_advances_in_logical_survivor_order_without_recanonicalizing_base() {
-        let text_eq = SemanticId::new(9_106_910);
-        let source = SemanticId::new(9_106_911);
+        let text_eq = SemanticId::new(91_069_10);
+        let source = SemanticId::new(91_069_11);
         let mut registry = SemanticRegistry::default();
         let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
-        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(9_161));
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_1));
         environment.pin_module(text_eq, digest);
-        let mut schema = Schema::new(SchemaRevisionId::new(9_161));
+        let mut schema = Schema::new(SchemaRevisionId::new(916_1));
         schema.define_relation(RelationDef {
             id: source,
             columns: vec![TypeExpr::Scalar(ScalarType::Text)],
@@ -7078,9 +7075,9 @@ mod positive_recursive_query_tests {
         let source = SemanticId::new(91_069_121);
         let mut registry = SemanticRegistry::default();
         let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
-        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(91_631));
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_31));
         environment.pin_module(text_eq, digest);
-        let mut schema = Schema::new(SchemaRevisionId::new(91_631));
+        let mut schema = Schema::new(SchemaRevisionId::new(916_31));
         schema.define_relation(RelationDef {
             id: source,
             columns: vec![TypeExpr::Scalar(ScalarType::Text)],
@@ -7104,10 +7101,12 @@ mod positive_recursive_query_tests {
         };
         let next_witness = witness.advance(RevisionId::new(1), &delta, &registry).unwrap();
         let seed = next_witness.logical_scan_occurrence_seed().unwrap();
-        let expected_rows = [rows[1].clone(),
+        let expected_rows = vec![
+            rows[1].clone(),
             rows[2].clone(),
             rows[3].clone(),
-            delta.inserted[0].clone()];
+            delta.inserted[0].clone(),
+        ];
         let expected = expected_rows.iter()
             .map(|row| canonical_row_key(row, &[text_eq], &context, &registry).unwrap())
             .collect::<Vec<_>>();
@@ -7121,9 +7120,9 @@ mod positive_recursive_query_tests {
         let source = SemanticId::new(91_069_123);
         let mut registry = SemanticRegistry::default();
         let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
-        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(91_632));
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_32));
         environment.pin_module(eq, digest);
-        let mut schema = Schema::new(SchemaRevisionId::new(91_632));
+        let mut schema = Schema::new(SchemaRevisionId::new(916_32));
         schema.define_relation(RelationDef {
             id: source,
             columns: vec![TypeExpr::Scalar(ScalarType::I64)],
@@ -7167,16 +7166,16 @@ mod positive_recursive_query_tests {
         let source = SemanticId::new(91_069_125);
         let mut registry = SemanticRegistry::default();
         let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
-        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(91_633));
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_33));
         environment.pin_module(eq, digest);
-        let mut schema = Schema::new(SchemaRevisionId::new(91_633));
+        let mut schema = Schema::new(SchemaRevisionId::new(916_33));
         schema.define_relation(RelationDef {
             id: source,
             columns: vec![TypeExpr::Scalar(ScalarType::I64)],
             semantics: RelationSemantics::Bag { column_equivalences: vec![eq] },
         }).unwrap();
         let context = SemanticContext { schema, environment };
-        let rows = (0..100_000usize).map(|i| vec![Value::I64(i64::try_from(i % 1024).expect("fixture value fits i64"))]).collect::<Vec<_>>();
+        let rows = (0..100_000usize).map(|i| vec![Value::I64((i % 1024) as i64)]).collect::<Vec<_>>();
         let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
         let witness = RelationBaseWitness::build(
             RevisionId::new(0), source, &rows, ty.clone(), &context, &registry,
@@ -7209,10 +7208,10 @@ mod positive_recursive_query_tests {
         let mut registry = SemanticRegistry::default();
         let text_digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
         let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
-        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(91_634));
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_34));
         environment.pin_module(text_eq, text_digest);
         environment.pin_module(i64_eq, i64_digest);
-        let mut schema = Schema::new(SchemaRevisionId::new(91_634));
+        let mut schema = Schema::new(SchemaRevisionId::new(916_34));
         schema.define_relation(RelationDef {
             id: source,
             columns: vec![TypeExpr::Scalar(ScalarType::Text), TypeExpr::Scalar(ScalarType::I64)],
@@ -7229,7 +7228,7 @@ mod positive_recursive_query_tests {
         let mut model = FiniteModel::default();
         model.relations.insert(source, (0..192usize).map(|i| {
             let name = match i % 3 { 0 => "Alpha", 1 => "BETA", _ => "gamma" };
-            vec![Value::Text(name.into()), Value::I64(i64::try_from(i).expect("fixture value fits i64"))]
+            vec![Value::Text(name.into()), Value::I64(i as i64)]
         }).collect());
         let ty = RelExpr::Scan(source).typecheck(&context, &registry).unwrap();
         let source_rows = model.relations[&source].to_vec();
@@ -7244,7 +7243,7 @@ mod positive_recursive_query_tests {
         for step in 0..128usize {
             let removed = model.relations.get_mut(&source).unwrap().remove(0);
             let name = match step % 3 { 0 => "ALPHA", 1 => "beta", _ => "Gamma" };
-            let inserted = vec![Value::Text(name.into()), Value::I64(i64::try_from(10_000 + step).expect("fixture value fits i64"))];
+            let inserted = vec![Value::Text(name.into()), Value::I64((10_000 + step) as i64)];
             model.relations.get_mut(&source).unwrap().push(inserted.clone());
             let delta = RelationDelta {
                 removed: vec![removed],
@@ -7271,13 +7270,13 @@ mod positive_recursive_query_tests {
 
     #[test]
     fn set_base_witness_owns_logical_scan_evidence_across_bounded_delta() {
-        let text_eq = SemanticId::new(9_106_912);
-        let source = SemanticId::new(9_106_913);
+        let text_eq = SemanticId::new(91_069_12);
+        let source = SemanticId::new(91_069_13);
         let mut registry = SemanticRegistry::default();
         let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
-        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(9_163));
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_3));
         environment.pin_module(text_eq, digest);
-        let mut schema = Schema::new(SchemaRevisionId::new(9_163));
+        let mut schema = Schema::new(SchemaRevisionId::new(916_3));
         schema.define_relation(RelationDef {
             id: source,
             columns: vec![TypeExpr::Scalar(ScalarType::Text)],
@@ -7318,9 +7317,9 @@ mod positive_recursive_query_tests {
         use std::hint::black_box;
         use std::time::Instant;
 
-        let eq = SemanticId::new(910_692);
-        let source = SemanticId::new(910_693);
-        let target = SemanticId::new(910_694);
+        let eq = SemanticId::new(91_069_2);
+        let source = SemanticId::new(91_069_3);
+        let target = SemanticId::new(91_069_4);
         let mut registry = SemanticRegistry::default();
         let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
         let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916));
@@ -7406,13 +7405,13 @@ mod positive_recursive_query_tests {
         use std::hint::black_box;
         use std::time::Instant;
 
-        let eq = SemanticId::new(9_106_920);
-        let source = SemanticId::new(9_106_921);
+        let eq = SemanticId::new(91_069_20);
+        let source = SemanticId::new(91_069_21);
         let mut registry = SemanticRegistry::default();
         let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
-        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(9_162));
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(916_2));
         environment.pin_module(eq, digest);
-        let mut schema = Schema::new(SchemaRevisionId::new(9_162));
+        let mut schema = Schema::new(SchemaRevisionId::new(916_2));
         schema.define_relation(RelationDef {
             id: source,
             columns: vec![TypeExpr::Scalar(ScalarType::I64)],
@@ -7461,7 +7460,6 @@ mod positive_recursive_query_tests {
 
     #[test]
     #[ignore = "manual release-mode compositional AntiJoin occurrence certificate benchmark"]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn anti_join_compositional_occurrence_certificate_scale_benchmark() {
         use std::hint::black_box;
         use std::time::Instant;
@@ -7509,7 +7507,7 @@ mod positive_recursive_query_tests {
                 .map(|index| {
                     vec![
                         Value::Text(format!("Key{index}")),
-                        Value::I64(i64::try_from(index).expect("fixture value fits i64")),
+                        Value::I64(index as i64),
                     ]
                 })
                 .collect(),
@@ -7577,7 +7575,6 @@ mod positive_recursive_query_tests {
 
     #[test]
     #[ignore = "manual release-mode quotient occurrence certificate benchmark"]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn quotient_operator_occurrence_certificate_scale_benchmark() {
         use std::hint::black_box;
         use std::time::Instant;
@@ -7620,8 +7617,8 @@ mod positive_recursive_query_tests {
         let values = (0..rows)
             .map(|index| {
                 vec![
-                    Value::I64(i64::try_from(index % 50_000).expect("fixture value fits i64")),
-                    Value::I64(i64::try_from(index).expect("fixture value fits i64")),
+                    Value::I64((index % 50_000) as i64),
+                    Value::I64(index as i64),
                 ]
             })
             .collect::<Vec<_>>();
@@ -7735,11 +7732,11 @@ mod positive_recursive_query_tests {
         let side = 50_000usize;
         model.relations.insert(
             left,
-            (0..side).map(|v| vec![Value::I64(i64::try_from(v).expect("fixture value fits i64"))]).collect(),
+            (0..side).map(|v| vec![Value::I64(v as i64)]).collect(),
         );
         model.relations.insert(
             right,
-            (side..side * 2).map(|v| vec![Value::I64(i64::try_from(v).expect("fixture value fits i64"))]).collect(),
+            (side..side * 2).map(|v| vec![Value::I64(v as i64)]).collect(),
         );
         let query = RelExpr::Union {
             left: Box::new(RelExpr::Scan(left)),
@@ -7903,9 +7900,9 @@ mod positive_recursive_query_tests {
         }
         let context = SemanticContext { schema, environment };
         let n = 100_000usize;
-        let left_rows = (0..n).map(|v| vec![Value::I64(i64::try_from(v).expect("fixture value fits i64"))]).collect::<Vec<_>>();
-        let right_rows = (n / 2..n + n / 2).map(|v| vec![Value::I64(i64::try_from(v).expect("fixture value fits i64"))]).collect::<Vec<_>>();
-        let blocker_rows = (0..n).step_by(8).map(|v| vec![Value::I64(i64::try_from(v).expect("fixture value fits i64"))]).collect::<Vec<_>>();
+        let left_rows = (0..n).map(|v| vec![Value::I64(v as i64)]).collect::<Vec<_>>();
+        let right_rows = (n / 2..n + n / 2).map(|v| vec![Value::I64(v as i64)]).collect::<Vec<_>>();
+        let blocker_rows = (0..n).step_by(8).map(|v| vec![Value::I64(v as i64)]).collect::<Vec<_>>();
         let mut model = FiniteModel::default();
         model.relations.insert(left, left_rows.clone());
         model.relations.insert(right, right_rows.clone());
@@ -7993,7 +7990,6 @@ use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
 use super::*;
 
 #[test]
-#[allow(clippy::cast_precision_loss, reason = "This operation explicitly uses IEEE-754 conversion or diagnostic floating-point ratios.")]
 fn pinned_set_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_nodes() {
     let eq = SemanticId::new(91_070_420);
     let source = SemanticId::new(91_070_421);
@@ -8030,7 +8026,7 @@ fn pinned_set_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_no
 
     for step in 0..64_usize {
         let removed = rows.remove(0);
-        let inserted = vec![Value::I64(10_000 + i64::try_from(step).expect("fixture value fits i64"))];
+        let inserted = vec![Value::I64(10_000 + step as i64)];
         rows.push(inserted.clone());
         let next = lineage
             .last()
@@ -8078,7 +8074,6 @@ fn pinned_set_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_no
 }
 
 #[test]
-#[allow(clippy::cast_precision_loss, reason = "This operation explicitly uses IEEE-754 conversion or diagnostic floating-point ratios.")]
 fn pinned_bag_fifo_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_nodes() {
     let eq = SemanticId::new(91_070_422);
     let source = SemanticId::new(91_070_423);
@@ -8114,7 +8109,7 @@ fn pinned_bag_fifo_witness_lineage_retains_path_copy_nodes_and_reclaims_old_uniq
     ];
 
     for step in 0..64_usize {
-        let value = i64::try_from(step % 64).expect("fixture value fits i64");
+        let value = (step % 64) as i64;
         let row = vec![Value::I64(value)];
         let next = lineage
             .last()

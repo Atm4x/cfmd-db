@@ -1,10 +1,8 @@
 use crate::runtime::{DurabilityError, DurableFormatComponent};
 
-pub(super) const LEGACY_MANIFEST_FORMAT_VERSION: u16 = 2;
-pub(super) const MANIFEST_FORMAT_VERSION: u16 = 3;
-pub(super) const LEGACY_CHECKPOINT_FORMAT_VERSION: u16 = 1;
-pub(super) const CHECKPOINT_FORMAT_VERSION: u16 = 2;
-pub(super) const METADATA_FILE_VERSION: u16 = 1;
+pub(super) const MANIFEST_FORMAT_TAG: u16 = 3;
+pub(super) const CHECKPOINT_FORMAT_TAG: u16 = 2;
+pub(super) const METADATA_FILE_TAG: u16 = 1;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DurableFormatRegistry;
@@ -14,7 +12,7 @@ impl DurableFormatRegistry {
         Self::require(
             DurableFormatComponent::Manifest,
             version,
-            &[LEGACY_MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION],
+            &[MANIFEST_FORMAT_TAG],
         )
     }
 
@@ -22,15 +20,7 @@ impl DurableFormatRegistry {
         Self::require(
             DurableFormatComponent::CheckpointFile,
             version,
-            &[CHECKPOINT_FORMAT_VERSION],
-        )
-    }
-
-    pub(super) fn require_checkpoint_legacy(version: u16) -> Result<(), DurabilityError> {
-        Self::require(
-            DurableFormatComponent::CheckpointFile,
-            version,
-            &[LEGACY_CHECKPOINT_FORMAT_VERSION],
+            &[CHECKPOINT_FORMAT_TAG],
         )
     }
 
@@ -38,7 +28,7 @@ impl DurableFormatRegistry {
         Self::require(
             DurableFormatComponent::MetadataFile,
             version,
-            &[METADATA_FILE_VERSION],
+            &[METADATA_FILE_TAG],
         )
     }
 

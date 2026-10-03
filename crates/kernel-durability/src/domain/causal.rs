@@ -5,7 +5,9 @@ use kernel_types::{ClientTransactionId, RevisionId};
 
 use super::{
     historical::SemanticChangeEvent,
-    transaction::{DurableEffectKind, DurableTransactionIntent, IdempotencyEpoch},
+    transaction::{
+        DurableEffectKind, DurableRevisionChange, DurableTransactionIntent, IdempotencyEpoch,
+    },
 };
 
 /// Durable causal identity for one exact committed transition.
@@ -21,6 +23,8 @@ pub struct DurableRevisionEffectRecord {
     pub transaction_epoch: IdempotencyEpoch,
     pub transaction_id: ClientTransactionId,
     pub intent: DurableTransactionIntent,
+    /// Exact realized publication/recovery authority. Client intent never substitutes for this.
+    pub change: DurableRevisionChange,
     pub source_revision: RevisionId,
     pub target_revision: RevisionId,
 }
@@ -50,7 +54,7 @@ impl DurableRevisionEffectRecord {
     /// `None`.
     #[must_use]
     pub fn semantic_change_event(&self) -> Option<SemanticChangeEvent> {
-        let DurableTransactionIntent::SchemaMigrationExact {
+        let DurableTransactionIntent::SchemaMigration {
             source_revision,
             target_revision,
             migration_complement,

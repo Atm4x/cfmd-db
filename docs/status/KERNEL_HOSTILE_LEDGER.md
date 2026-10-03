@@ -65,3 +65,28 @@ Any future `PAYER`/`RESIDUE` must be reflected in this ledger before a kernel ca
 ## P327 — authenticated immutable replication-authority objects
 
 **OPEN — P326 security blocker closed at the object layer; physical activation remains.** The rejected P326 candidate demonstrated O(new-delta) `CFAS` + linked locator publication but would have placed external authority payloads outside AE v1. P327 adds a dedicated HKDF-separated `ImmutableObject` AE domain and bounded 64 KiB `CFAO` object stream. AAD binds object kind, plaintext `SegmentId`, parent `SegmentId`, plaintext length and chunk identity while excluding physical location, so compaction can relocate exact authenticated bytes without decrypt/re-encrypt. Encrypted/plaintext object modes are fail-closed rather than fallback routes. `ReplicationAuthoritySegmentId` remains nonce/relocation invariant and object replay still feeds the maintained two-pass segment verifier/evaluator. The P323 archive-copy product path remains authoritative until P328 restores linked locator/root publication and segment-aware compaction on top of this boundary.
+
+## P455 — live-ref exact-delta revalidation
+
+Evidence reopened `kernel-model` / `kernel-revision` under the P454 live-ref optimization. One correctness seam was found and closed: append-only Bag revisions must advance compact live-ref row-coordinate authority even for non-ref appended rows, otherwise a later ref-bearing delta can receive a stale logical ordinal. Regression coverage now fixes this law. Sparse/dense release diagnostics show no O(total relation rows) payer in ordinary exact-delta maintenance. `kernel-plan --lib` returns to 297 passed / 7 ignored. The live-ref optimization line is FROZEN again unless new correctness or measured scaling evidence appears.
+
+## PASS471 — pre-release compatibility hostile sweep
+- CLOSED: Rust `DatabaseContext` alias removed; `Context<M>` is canonical concrete product type.
+- CLOSED: obsolete Many backlink declaration/metadata (`via_field`) removed.
+- CLOSED: retirement-only semantic-statistics advisor removed; manual statistics capability remains independent.
+- FINDING: `MaterializedSemanticIndexState` / `LegacyIndex` is not a harmless compatibility adapter. It is a complete superseded physical execution family with advisor, persistence recipe, maintenance and runtime capability fallback. Partial removal would create dead/mixed architecture. Remove end-to-end in P472; do not add new consumers.
+
+
+## PASS472 — legacy semantic-index family removed
+- CLOSED: `MaterializedSemanticIndexState` / `LegacyIndex` was removed end-to-end rather than retained behind routing.
+- CLOSED: old semantic-index advisor, durable artifact recipe, delta maintenance and capability fallback removed.
+- VERIFIED: SAMF/`ObservableAtom` is the only persisted semantic-fiber execution family; exact active-crate symbol sweep finds no `LegacyIndex`, `UnifiedArtifactId::SemanticIndex`, `DurablePhysicalArtifactSpec::SemanticIndex`, `install_semantic_index` or `semantic_index(...)` execution path.
+- HOSTILE TEST FIXTURE LAW: ObservableAtom has a durable canonical-key core and therefore rehydrates; deferred/rebuild policy tests must use rebuild-only surviving artifacts when they intend to measure rebuild work.
+- NEXT PAYER: P465 source-epoch proof remains O(old-epoch history depth) across schema boundaries because P462 structural support/action roots are current-epoch only.
+
+## P473 — schema-epoch stale-intent hostile closure
+- CLOSED: O(old-epoch history depth) field-intent proof via `revision_transition_records_back_to` + linear `certify_old_epoch_field_segment`.
+- CLOSED: old-schema `revision_at()` reconstruction on the field-intent commit hot path.
+- SELECTED: one retained immutable P462 epoch root (support/action timelines + structurally shared field-value root) under the existing historical owner.
+- REJECTED: mutable witness cache, serialized compatibility cache, old-schema query fallback/router, duplicated merge/conflict engine.
+- OPEN: row-local relation exact effects and then general query/auth provenance.

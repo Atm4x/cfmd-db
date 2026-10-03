@@ -1,11 +1,10 @@
 // HOSTILE[P170][TEST-ONLY][CLEAN:P169.T]: legacy root tests cross the storage owner only through this cfg(test) facade; production internals stay private.
 use super::{
     Arc, I64IndexBinding, InstalledRelation, LayoutId, MaterializedI64IndexState,
-    MaterializedObservableAtomState, MaterializedSemanticIndexState,
-    MaterializedSemanticQuotientFactorState, MaterializedSemanticQuotientSupportState,
-    PersistentOrdMap, PersistentOrdSet, PhysicalExecutionError, PhysicalRowId, PhysicalStore,
-    RevisionId, SemanticId, SemanticIndexBinding, SemanticQuotientSupportBinding,
-    UnifiedArtifactId,
+    MaterializedObservableAtomState, MaterializedSemanticQuotientFactorState,
+    MaterializedSemanticQuotientSupportState, PersistentOrdMap, PersistentOrdSet,
+    PhysicalExecutionError, PhysicalStore, RevisionId, SemanticId, SemanticIndexBinding,
+    SemanticQuotientSupportBinding, UnifiedArtifactId,
 };
 
 /// Test-only access to storage-owner internals that were historically reachable because
@@ -20,9 +19,6 @@ pub(crate) trait PhysicalStoreTestExt {
     fn i64_indexes_for_test(
         &self,
     ) -> &PersistentOrdMap<I64IndexBinding, Arc<MaterializedI64IndexState>>;
-    fn semantic_indexes_for_test(
-        &self,
-    ) -> &PersistentOrdMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>>;
     fn semantic_quotient_factors_for_test(
         &self,
     ) -> &PersistentOrdMap<SemanticIndexBinding, Arc<MaterializedSemanticQuotientFactorState>>;
@@ -33,7 +29,6 @@ pub(crate) trait PhysicalStoreTestExt {
         Arc<MaterializedSemanticQuotientSupportState>,
     >;
     fn has_semantic_statistics_for_test(&self, binding: &SemanticIndexBinding) -> bool;
-    fn semantic_statistics_empty_for_test(&self) -> bool;
     fn shares_semantic_statistics_root_for_test(&self, other: &PhysicalStore) -> bool;
     fn observable_atom_states_for_test(
         &self,
@@ -58,7 +53,6 @@ pub(crate) trait PhysicalStoreTestExt {
 
     fn i64_index(&self, binding: I64IndexBinding) -> Option<&MaterializedI64IndexState>;
     fn remove_i64_index(&mut self, binding: I64IndexBinding);
-    fn remove_semantic_index(&mut self, binding: &SemanticIndexBinding);
     fn remove_semantic_statistics(&mut self, binding: &SemanticIndexBinding);
     fn remove_observable_atom_state(&mut self, binding: &SemanticIndexBinding);
     fn set_semantic_statistics_row_count(
@@ -66,11 +60,6 @@ pub(crate) trait PhysicalStoreTestExt {
         binding: &SemanticIndexBinding,
         row_count: usize,
     );
-
-    fn semantic_index(
-        &self,
-        index: &SemanticIndexBinding,
-    ) -> Option<&MaterializedSemanticIndexState>;
 
     fn semantic_quotient_factor(
         &self,
@@ -97,12 +86,6 @@ impl PhysicalStoreTestExt for PhysicalStore {
         &self.i64_indexes
     }
 
-    fn semantic_indexes_for_test(
-        &self,
-    ) -> &PersistentOrdMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>> {
-        &self.semantic_indexes
-    }
-
     fn semantic_quotient_factors_for_test(
         &self,
     ) -> &PersistentOrdMap<SemanticIndexBinding, Arc<MaterializedSemanticQuotientFactorState>> {
@@ -120,10 +103,6 @@ impl PhysicalStoreTestExt for PhysicalStore {
 
     fn has_semantic_statistics_for_test(&self, binding: &SemanticIndexBinding) -> bool {
         self.semantic_statistics.contains_key(binding)
-    }
-
-    fn semantic_statistics_empty_for_test(&self) -> bool {
-        self.semantic_statistics.is_empty()
     }
 
     fn shares_semantic_statistics_root_for_test(&self, other: &PhysicalStore) -> bool {
@@ -197,10 +176,6 @@ impl PhysicalStoreTestExt for PhysicalStore {
         self.i64_indexes_mut_internal().remove(&binding);
     }
 
-    fn remove_semantic_index(&mut self, binding: &SemanticIndexBinding) {
-        self.semantic_indexes_mut_internal().remove(binding);
-    }
-
     fn remove_semantic_statistics(&mut self, binding: &SemanticIndexBinding) {
         self.semantic_statistics_mut_internal().remove(binding);
     }
@@ -221,40 +196,11 @@ impl PhysicalStoreTestExt for PhysicalStore {
         Arc::make_mut(state).row_count = row_count;
     }
 
-    fn semantic_index(
-        &self,
-        index: &SemanticIndexBinding,
-    ) -> Option<&MaterializedSemanticIndexState> {
-        self.semantic_indexes.get(index).map(Arc::as_ref)
-    }
-
     fn semantic_quotient_factor(
         &self,
         index: &SemanticIndexBinding,
     ) -> Option<&MaterializedSemanticQuotientFactorState> {
         self.semantic_quotient_factors.get(index).map(Arc::as_ref)
-    }
-}
-
-/// Test-only semantic-index probing without widening the production index API.
-pub(crate) trait SemanticIndexStateTestExt {
-    fn probe_value(
-        &self,
-        value: &kernel_model::Value,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<Option<&kernel_semantic_index::SemanticBucket<PhysicalRowId>>, PhysicalExecutionError>;
-}
-
-impl SemanticIndexStateTestExt for MaterializedSemanticIndexState {
-    fn probe_value(
-        &self,
-        value: &kernel_model::Value,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<Option<&kernel_semantic_index::SemanticBucket<PhysicalRowId>>, PhysicalExecutionError>
-    {
-        self.probe_values(&[value], context, registry)
     }
 }
 
@@ -280,12 +226,6 @@ pub(crate) fn build_i64_index_state_for_test(
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<MaterializedI64IndexState, PhysicalExecutionError> {
     MaterializedI64IndexState::build(binding, relation, context, registry)
-}
-
-pub(crate) fn semantic_index_estimated_retained_bytes(
-    state: &MaterializedSemanticIndexState,
-) -> usize {
-    super::semantic_index_estimated_retained_bytes(state)
 }
 
 pub(crate) fn native_semantic_column_work_units(

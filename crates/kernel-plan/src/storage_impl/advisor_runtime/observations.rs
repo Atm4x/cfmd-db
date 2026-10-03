@@ -1,17 +1,17 @@
-fn semantic_index_state_for_advice<'a>(
+fn observable_atom_state_for_advice<'a>(
     store: &'a PhysicalStore,
     binding: &SemanticIndexBinding,
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-) -> Result<std::borrow::Cow<'a, MaterializedSemanticIndexState>, PhysicalExecutionError> {
-    if let Some(existing) = store.semantic_indexes.get(binding)
+) -> Result<std::borrow::Cow<'a, MaterializedObservableAtomState>, PhysicalExecutionError> {
+    if let Some(existing) = store.observable_atom_states.get(binding)
         && existing.compatible_with(context, registry)?
     {
         return Ok(std::borrow::Cow::Borrowed(existing));
     }
     let relation = store.installed(binding.relation, binding.layout)?;
     Ok(std::borrow::Cow::Owned(
-        MaterializedSemanticIndexState::build(binding.clone(), relation, context, registry)?,
+        MaterializedObservableAtomState::build(binding.clone(), relation, context, registry)?,
     ))
 }
 
@@ -36,7 +36,7 @@ fn semantic_index_filter_advice_observation(
     store: &PhysicalStore,
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<SemanticIndexAdviceObservation>, PhysicalExecutionError> {
+) -> Result<Option<ObservableAtomAdviceObservation>, PhysicalExecutionError> {
     let Some((relation, layout, predicates)) = collect_direct_filter_chain(plan) else {
         return Ok(None);
     };
@@ -63,7 +63,7 @@ fn semantic_index_filter_advice_observation(
     let installed = store.installed(relation, layout)?;
     let row_count = native_row_count(&installed.data);
     let key_cells = row_count.saturating_mul(binding.key_parts.len());
-    let state = semantic_index_state_for_advice(store, &binding, context, registry)?;
+    let state = observable_atom_state_for_advice(store, &binding, context, registry)?;
     let values = binding
         .key_parts
         .iter()
@@ -79,11 +79,11 @@ fn semantic_index_filter_advice_observation(
         .collect::<Result<Vec<_>, _>>()?;
     let matching_rows = state
         .probe_values(&values, context, registry)?
-        .map_or(0, kernel_semantic_index::SemanticBucket::len);
-    let estimated_bytes = semantic_index_estimated_retained_bytes(&state);
+        .map_or(0, |rows| rows.len());
+    let estimated_bytes = observable_atom_estimated_retained_bytes(&state);
     let scan_work = row_count as u128;
     let index_work = 1_u128.saturating_add(matching_rows as u128);
-    Ok(Some(SemanticIndexAdviceObservation {
+    Ok(Some(ObservableAtomAdviceObservation {
         binding,
         savings_per_execution: scan_work.saturating_sub(index_work),
         key_cells,
@@ -96,7 +96,7 @@ fn semantic_index_join_advice_observation(
     store: &PhysicalStore,
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Option<SemanticIndexAdviceObservation>, PhysicalExecutionError> {
+) -> Result<Option<ObservableAtomAdviceObservation>, PhysicalExecutionError> {
     let Some((left, right, keys)) = direct_join_advice_summary(plan, store)? else {
         return Ok(None);
     };
@@ -121,11 +121,11 @@ fn semantic_index_join_advice_observation(
     let left_rows = native_row_count(&left_installed.data);
     let right_rows = native_row_count(&right_installed.data);
     let key_cells = right_rows.saturating_mul(binding.key_parts.len());
-    let state = semantic_index_state_for_advice(store, &binding, context, registry)?;
+    let state = observable_atom_state_for_advice(store, &binding, context, registry)?;
     let distinct = state.distinct_key_count();
-    let estimated_bytes = semantic_index_estimated_retained_bytes(&state);
+    let estimated_bytes = observable_atom_estimated_retained_bytes(&state);
     if left_rows == 0 || right_rows == 0 || distinct == 0 {
-        return Ok(Some(SemanticIndexAdviceObservation {
+        return Ok(Some(ObservableAtomAdviceObservation {
             binding,
             savings_per_execution: 0,
             key_cells,
@@ -140,7 +140,7 @@ fn semantic_index_join_advice_observation(
     let indexed_work =
         SemanticAccessCostModel::persisted_join_access_work(left_rows, binding.key_parts.len())
             as u128;
-    Ok(Some(SemanticIndexAdviceObservation {
+    Ok(Some(ObservableAtomAdviceObservation {
         binding,
         savings_per_execution: fallback_work.saturating_sub(indexed_work),
         key_cells,
@@ -153,7 +153,7 @@ fn semantic_index_advice_observations(
     store: &PhysicalStore,
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-) -> Result<Vec<SemanticIndexAdviceObservation>, PhysicalExecutionError> {
+) -> Result<Vec<ObservableAtomAdviceObservation>, PhysicalExecutionError> {
     let mut observations = Vec::new();
     collect_semantic_index_advice_observations(plan, store, context, registry, &mut observations)?;
     Ok(observations)
@@ -164,7 +164,7 @@ fn collect_semantic_index_advice_observations(
     store: &PhysicalStore,
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-    observations: &mut Vec<SemanticIndexAdviceObservation>,
+    observations: &mut Vec<ObservableAtomAdviceObservation>,
 ) -> Result<(), PhysicalExecutionError> {
     if let Some(observation) =
         semantic_index_filter_advice_observation(plan, store, context, registry)?

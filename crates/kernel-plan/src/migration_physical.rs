@@ -433,7 +433,7 @@ impl<'a> MixedMigrationRevisionView<'a> {
             .migration
             .relation_slice(target_relation)
             .map(MixedMigrationRelationCoordinate::ForwardFromSource)
-            .ok_or({
+            .ok_or_else(|| {
                 PhysicalExecutionError::MigrationTransport(
                     kernel_transport::TransportError::UnknownTargetRelation(target_relation),
                 )
@@ -552,10 +552,6 @@ mod tests {
 
     use super::*;
 
-    #[allow(
-        clippy::similar_names,
-        reason = "Names distinguish the before and after states of the same operation."
-    )]
     fn row_local_fixture() -> (
         SemanticRegistry,
         SchemaMigrationTransport,
@@ -811,7 +807,8 @@ mod tests {
             &migration,
             &registry,
         )
-        .expect_err("certificate must bind exact program image");
+        .err()
+        .expect("certificate must bind exact program image");
         assert_eq!(err, PhysicalExecutionError::LogicalRevisionMutationMismatch);
     }
 

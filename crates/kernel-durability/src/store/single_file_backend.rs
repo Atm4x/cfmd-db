@@ -201,6 +201,7 @@ impl DurableRevisionStore {
                     offset: 0,
                     reason: "base revision requires unavailable semantic implementation",
                 })?,
+            next_revision_effect_id: 1,
             causal_coverage_root: Some(causal_coverage_root),
             revision_effects: revision_effects.clone(),
             revision_effect_frontiers: revision_effect_frontiers.clone(),
@@ -257,27 +258,16 @@ impl DurableRevisionStore {
     pub fn open_single_file(
         path: impl AsRef<Path>,
     ) -> Result<(Self, RecoveryScan), DurabilityError> {
-        Self::open_single_file_inner(path.as_ref(), None, false, &StorageEncryption::None)
+        Self::open_single_file_inner(path.as_ref(), false, &StorageEncryption::None)
     }
 
     pub fn open_single_file_with_encryption(
         path: impl AsRef<Path>,
         encryption: &StorageEncryption,
     ) -> Result<(Self, RecoveryScan), DurabilityError> {
-        Self::open_single_file_inner(path.as_ref(), None, false, encryption)
+        Self::open_single_file_inner(path.as_ref(), false, encryption)
     }
 
-    pub fn open_single_file_with_legacy_registry(
-        path: impl AsRef<Path>,
-        legacy_registry: &SemanticRegistry,
-    ) -> Result<(Self, RecoveryScan), DurabilityError> {
-        Self::open_single_file_inner(
-            path.as_ref(),
-            Some(legacy_registry),
-            false,
-            &StorageEncryption::None,
-        )
-    }
 
     pub fn open_single_file_with_external_freshness(
         path: impl AsRef<Path>,
@@ -305,7 +295,7 @@ impl DurableRevisionStore {
             )?;
         let (mut freshness, pending_advance) =
             ExternalFreshnessState::recover_preflight(&material, config, authority)?;
-        let (mut store, scan) = Self::open_single_file_inner(path, None, true, encryption)?;
+        let (mut store, scan) = Self::open_single_file_inner(path, true, encryption)?;
         freshness.complete_recovery_advance(pending_advance)?;
         store.external_freshness = Some(freshness);
         Ok((store, scan))
@@ -313,7 +303,6 @@ impl DurableRevisionStore {
 
     fn open_single_file_inner(
         path: &Path,
-        legacy_registry: Option<&SemanticRegistry>,
         allow_external_freshness: bool,
         encryption: &StorageEncryption,
     ) -> Result<(Self, RecoveryScan), DurabilityError> {
@@ -334,7 +323,7 @@ impl DurableRevisionStore {
                 reason: "externally anchored store requires freshness-aware open",
             });
         }
-        let registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
+        let registry = rebuild_semantic_registry(&metadata)?;
         let checkpoint = container
             .with_section_reader(SingleFileSectionKind::Checkpoint, 0, |reader, len| {
                 checkpoint::decode_revision_from_reader(reader, len, &registry)
@@ -372,7 +361,6 @@ impl DurableRevisionStore {
             checkpoint,
             &scan,
             view.generation,
-            legacy_registry,
         )?;
         let replication =
             container.recover_replication_authority_journal(scan.replication_authority_frames())?;
@@ -388,10 +376,6 @@ impl DurableRevisionStore {
         Ok((store, scan))
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     pub(super) fn rotate_single_file_checkpoint(
         &mut self,
         revision: &Revision,
@@ -414,13 +398,8 @@ impl DurableRevisionStore {
             migration_complements: self.migration_complements.clone(),
             historical_epoch_anchors: self.historical_epoch_anchors.clone(),
             committed_transactions: self.committed_transactions.clone(),
-            semantic_modules: self
-                .semantic_registry
-                .builtin_modules_for_context(revision.semantic_context())
-                .map_err(|_| DurabilityError::Protocol {
-                    offset: 0,
-                    reason: "checkpoint revision requires unavailable semantic implementation",
-                })?,
+            semantic_modules: self.semantic_registry.builtin_module_specs(),
+            next_revision_effect_id: self.next_revision_effect_id,
             causal_coverage_root: Some(self.causal_coverage_root),
             revision_effects: self.revision_effects.clone(),
             revision_effect_frontiers: self.revision_effect_frontiers.clone(),

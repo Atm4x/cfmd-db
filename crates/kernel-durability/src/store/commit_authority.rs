@@ -7,8 +7,8 @@ use super::causal_ledger::{CausalCommitOverlay, publish_prepared_revision_effect
 use super::migration_history::{MigrationCommitOverlay, publish_prepared_migration_complements};
 use crate::descriptor::DurableRevisionDescriptor;
 use crate::domain::{
-    DurableMigrationComplement, DurableRevisionEffectRecord, DurableTransactionIntent,
-    DurableTransactionKey, HistoricalEpochAnchor,
+    DurableCommittedTransaction, DurableMigrationComplement, DurableRevisionEffectRecord,
+    DurableTransactionIntent, DurableTransactionKey, HistoricalEpochAnchor,
 };
 use crate::runtime::DurabilityError;
 
@@ -17,7 +17,7 @@ pub(super) struct PreparedCommitAuthority {
     durable_head: RevisionId,
     migration_appends: Vec<DurableMigrationComplement>,
     historical_anchor_appends: Vec<HistoricalEpochAnchor>,
-    retry_appends: Vec<(DurableTransactionKey, DurableTransactionIntent)>,
+    retry_appends: Vec<(DurableTransactionKey, DurableCommittedTransaction)>,
     revision_effect_appends: Vec<DurableRevisionEffectRecord>,
 }
 
@@ -38,7 +38,7 @@ impl PreparedCommitAuthority {
         let mut historical_anchor_appends = Vec::new();
 
         for descriptor in descriptors {
-            if let DurableTransactionIntent::SchemaMigrationExact {
+            if let DurableTransactionIntent::SchemaMigration {
                 migration_complement,
                 ..
             } = &descriptor.intent
@@ -65,14 +65,20 @@ impl PreparedCommitAuthority {
                 .get(&key)
                 .or_else(|| retry_overlay.get(&key))
             {
-                if existing != &descriptor.intent {
+                if !existing.same_client_intent(&descriptor.intent) {
                     return Err(DurabilityError::Protocol {
                         offset: 0,
                         reason: "committed transaction id changed exact intent",
                     });
                 }
             } else {
-                retry_overlay.insert(key, descriptor.intent.clone());
+                retry_overlay.insert(
+                    key,
+                    DurableCommittedTransaction::from_descriptor_intent(
+                        descriptor.target_revision,
+                        &descriptor.intent,
+                    ),
+                );
             }
 
             causal.prepare_append(descriptor)?;

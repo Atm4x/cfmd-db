@@ -79,7 +79,10 @@ impl DurableRuntime {
         revision: RevisionId,
     ) -> Result<Option<kernel_durability::DurableFactorizedReadSnapshot>, DurabilityError> {
         {
-            let durability = self.durability.lock().map_err(|_| DurabilityError::Poisoned)?;
+            let durability = self
+                .durability
+                .lock()
+                .map_err(|_| DurabilityError::Poisoned)?;
             if let Some(snapshot) = durability.historical_factorized_read_snapshot(revision) {
                 return Ok(Some(snapshot));
             }
@@ -104,7 +107,10 @@ impl DurableRuntime {
                 continue;
             }
             let snapshot = {
-                let durability = self.durability.lock().map_err(|_| DurabilityError::Poisoned)?;
+                let durability = self
+                    .durability
+                    .lock()
+                    .map_err(|_| DurabilityError::Poisoned)?;
                 durability.historical_factorized_read_snapshot(effect.source_revision)
             };
             if let Some(snapshot) = snapshot {
@@ -133,7 +139,8 @@ impl DurableRuntime {
                     )
             }) {
                 let mut next = snapshot.clone();
-                let mut valid = !effect.relation_mutations.is_empty() || effect.model_delta.is_some();
+                let mut valid =
+                    !effect.relation_mutations.is_empty() || effect.model_delta.is_some();
                 for mutation in &effect.relation_mutations {
                     let Ok(result_type) = RelExpr::Scan(mutation.relation)
                         .typecheck(next.semantic_context(), &self.registry)
@@ -146,14 +153,17 @@ impl DurableRuntime {
                         removed: mutation.removed.clone(),
                         result_type,
                     };
-                    if let Ok(advanced) = next.advance_relation_delta(
+                    match next.advance_relation_delta(
                         effect.target_revision,
                         mutation.relation,
                         &delta,
                         &self.registry,
-                    ) { next = advanced } else {
-                        valid = false;
-                        break;
+                    ) {
+                        Ok(advanced) => next = advanced,
+                        Err(_) => {
+                            valid = false;
+                            break;
+                        }
                     }
                 }
                 if valid && let Some(model_delta) = &effect.model_delta {
@@ -170,7 +180,6 @@ impl DurableRuntime {
         Ok(None)
     }
 
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn revision_at(
         &self,
         revision: RevisionId,
@@ -304,6 +313,34 @@ impl DurableRuntime {
         Ok(current)
     }
 
+    /// Validates one exact relation delta in its historical formation world
+    /// using only retained Γ-support plus exact durable deltas.
+    ///
+    /// The current `RelationBaseWitness` is projected to a support-only
+    /// authority in O(1), then rewound along the exact reversible causal path.
+    /// No historical relation rows are materialized or Γ-canonicalized again.
+    /// Schema/non-plan boundaries fail closed because support transport across
+    /// a semantic-context change requires an explicit bridge law.
+    pub fn validate_relation_delta_at(
+        &self,
+        revision: RevisionId,
+        relation: SemanticId,
+        delta: &RelationDelta,
+    ) -> Result<(), RuntimeHistoricalSnapshotError> {
+        let snapshot = self.snapshot()?;
+        let support = snapshot
+            .root()
+            .historical_support_at(revision, relation)
+            .ok_or(RuntimeHistoricalSnapshotError::Unavailable { revision })?;
+        if support.result_type() != &delta.result_type {
+            return Err(RuntimeHistoricalSnapshotError::Unavailable { revision });
+        }
+        support
+            .validate_exact_delta(delta, &self.registry)
+            .map_err(PhysicalExecutionError::from)
+            .map_err(Into::into)
+    }
+
     /// Certifies transport of one historical inverse from its original target
     /// revision to the current durable head.
     ///
@@ -354,8 +391,11 @@ impl DurableRuntime {
             .collect::<BTreeSet<_>>();
 
         let target_source = self.revision_at(target.source_revision)?;
-        let target_footprint =
-            runtime_history_effect_footprint(target, &target_source, &self.registry)?;
+        let target_footprint = runtime_history_effect_footprint(
+            target,
+            target_source.semantic_context(),
+            &self.registry,
+        )?;
         let mut intervening_effects = Vec::new();
         let mut conflicting_effects = BTreeSet::new();
         let mut conflict_coordinates = BTreeSet::new();
@@ -371,7 +411,11 @@ impl DurableRuntime {
                 continue;
             }
             let source = self.revision_at(effect.source_revision)?;
-            let footprint = runtime_history_effect_footprint(effect, &source, &self.registry)?;
+            let footprint = runtime_history_effect_footprint(
+                effect,
+                source.semantic_context(),
+                &self.registry,
+            )?;
             let overlap = target_footprint
                 .writes
                 .keys()
@@ -411,7 +455,6 @@ impl DurableRuntime {
     /// intervening exact effect must be disjoint, while opaque/full/schema boundaries fail
     /// closed. This is the product-facing bridge to Γ-aware stale-intent transport; it does not
     /// synthesize a merge endpoint for overlapping writes.
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn certify_transition_rebase(
         &self,
         source_revision: RevisionId,
@@ -419,96 +462,86 @@ impl DurableRuntime {
         model_delta: Option<&DurableModelDelta>,
         model_complement: Option<&DurableModelDelta>,
     ) -> Result<RuntimeTransitionRebaseOutcome, RuntimeHistoricalSnapshotError> {
-        let head = self.snapshot()?.revision().clone();
+        let snapshot = self.snapshot()?;
+        let head = snapshot.revision();
+        let historical = &snapshot.root().historical;
         if source_revision == head.id() {
             return Ok(RuntimeTransitionRebaseOutcome::Certified(
                 RuntimeTransitionRebaseCertificate {
                     source_revision,
                     current_revision: head.id(),
-                    intervening_effects: Vec::new(),
+                    intervening_effect_count: 0,
                 },
             ));
         }
-
-        let anchored = self.revision_history(source_revision)?.ok_or(
-            RuntimeHistoricalSnapshotError::Unavailable {
+        if source_revision > head.id() {
+            return Err(RuntimeHistoricalSnapshotError::Unavailable {
                 revision: source_revision,
-            },
-        )?;
-        let head_effects = self.revision_history(head.id())?.ok_or(
-            RuntimeHistoricalSnapshotError::Unavailable {
-                revision: head.id(),
-            },
-        )?;
-        let anchored_ids = anchored
-            .iter()
-            .map(|effect| effect.effect_id)
-            .collect::<BTreeSet<_>>();
-        let head_ids = head_effects
-            .iter()
-            .map(|effect| effect.effect_id)
-            .collect::<BTreeSet<_>>();
-        if !anchored_ids.is_subset(&head_ids) {
+            });
+        }
+        if historical
+            .lineage_floor
+            .is_some_and(|floor| source_revision < floor)
+        {
+            if historical.floor_opaque_effect.is_none() {
+                return Err(RuntimeHistoricalSnapshotError::Unavailable {
+                    revision: source_revision,
+                });
+            }
+            return Ok(RuntimeTransitionRebaseOutcome::Conflict(
+                RuntimeTransitionRebaseConflict {
+                    source_revision,
+                    current_revision: head.id(),
+                    conflicting_effects: Vec::new(),
+                    coordination_effects: Vec::new(),
+                    coordinates: Vec::new(),
+                    opaque_effects: historical.floor_opaque_effect.into_iter().collect(),
+                },
+            ));
+        }
+        if !historical.contains_revision(source_revision) {
             return Err(RuntimeHistoricalSnapshotError::Unavailable {
                 revision: source_revision,
             });
         }
 
-        let source = self.revision_at(source_revision)?;
         let proposed = proposed_transition_footprint(
-            &source,
+            source_revision,
+            head.semantic_context(),
             mutations,
             model_delta,
             model_complement,
             &self.registry,
         )?;
-
-        let mut intervening_effects = Vec::new();
         let mut conflicting_effects = BTreeSet::new();
         let mut coordination_effects = BTreeSet::new();
         let mut conflict_coordinates = BTreeSet::new();
-        let mut opaque_effects = BTreeSet::new();
-        for effect in &head_effects {
-            if anchored_ids.contains(&effect.effect_id) {
-                continue;
-            }
-            intervening_effects.push(effect.effect_id);
-            if effect.reversibility != RuntimeHistoryReversibility::ExactPlanInverse {
-                opaque_effects.insert(effect.effect_id);
-                continue;
-            }
-            let effect_source = self.revision_at(effect.source_revision)?;
-            let footprint =
-                runtime_history_effect_footprint(effect, &effect_source, &self.registry)?;
-            let overlap = proposed
-                .writes
-                .keys()
-                .filter(|coordinate| footprint.writes.contains_key(*coordinate))
-                .cloned()
-                .collect::<Vec<_>>();
-            let explicit_field_overlap = overlap.iter().any(|coordinate| matches!(coordinate, RuntimeHistoryCoordinate::ObjectField { .. }));
-            match if explicit_field_overlap {
-                kernel_change::PairRewriteLaw::DefiniteIntentConflict
-            } else {
-                kernel_change::infer_write_action_law(&proposed.writes, &footprint.writes)
-            } {
-                kernel_change::PairRewriteLaw::StrongCommute
-                | kernel_change::PairRewriteLaw::SameIdempotentIntent => {}
-                kernel_change::PairRewriteLaw::DefiniteIntentConflict => {
-                    conflicting_effects.insert(effect.effect_id);
-                    conflict_coordinates.extend(overlap);
-                }
-                kernel_change::PairRewriteLaw::Unknown => {
-                    coordination_effects.insert(effect.effect_id);
-                    conflict_coordinates.extend(overlap);
+
+        for (coordinate, proposed_action) in &proposed.writes {
+            for indexed in historical.actions_after(source_revision, coordinate) {
+                let law = if matches!(coordinate, RuntimeHistoryCoordinate::ObjectField { .. }) {
+                    kernel_change::PairRewriteLaw::DefiniteIntentConflict
+                } else {
+                    let left = BTreeMap::from([((), proposed_action.clone())]);
+                    let right = BTreeMap::from([((), indexed.action.clone())]);
+                    kernel_change::infer_write_action_law(&left, &right)
+                };
+                match law {
+                    kernel_change::PairRewriteLaw::StrongCommute
+                    | kernel_change::PairRewriteLaw::SameIdempotentIntent => {}
+                    kernel_change::PairRewriteLaw::DefiniteIntentConflict => {
+                        conflicting_effects.insert(indexed.effect_id);
+                        conflict_coordinates.insert(coordinate.clone());
+                    }
+                    kernel_change::PairRewriteLaw::Unknown => {
+                        coordination_effects.insert(indexed.effect_id);
+                        conflict_coordinates.insert(coordinate.clone());
+                    }
                 }
             }
         }
 
-        if !conflicting_effects.is_empty()
-            || !coordination_effects.is_empty()
-            || !opaque_effects.is_empty()
-        {
+        if !conflicting_effects.is_empty() || !coordination_effects.is_empty() {
             return Ok(RuntimeTransitionRebaseOutcome::Conflict(
                 RuntimeTransitionRebaseConflict {
                     source_revision,
@@ -516,7 +549,7 @@ impl DurableRuntime {
                     conflicting_effects: conflicting_effects.into_iter().collect(),
                     coordination_effects: coordination_effects.into_iter().collect(),
                     coordinates: conflict_coordinates.into_iter().collect(),
-                    opaque_effects: opaque_effects.into_iter().collect(),
+                    opaque_effects: Vec::new(),
                 },
             ));
         }
@@ -525,7 +558,7 @@ impl DurableRuntime {
             RuntimeTransitionRebaseCertificate {
                 source_revision,
                 current_revision: head.id(),
-                intervening_effects,
+                intervening_effect_count: historical.exact_effect_count_after(source_revision),
             },
         ))
     }
@@ -688,6 +721,40 @@ impl DurableRuntime {
         self.cell.checkpoint_durable(&mut durability)
     }
 
+    /// Irreversibly expires local causal replay before the current head and
+    /// publishes the new causal coverage root. The P462 derived Γ-support and
+    /// coordinate timelines are reset in the same runtime publication so they
+    /// cannot retain authority that durability has released.
+    pub fn release_causal_history_before_head(
+        &self,
+    ) -> Result<Option<DurableGenerationReceipt>, DurableRuntimeCheckpointError> {
+        let snapshot = self
+            .snapshot()
+            .map_err(DurableRuntimeCheckpointError::Runtime)?;
+        let revision = snapshot.revision().clone();
+        drop(snapshot);
+        let mut durability = self.durability.lock().map_err(|_| {
+            let _ = self.cell.force_recovery_required();
+            DurableRuntimeCheckpointError::DurabilityUncertain(DurabilityError::Poisoned)
+        })?;
+        let receipt = durability
+            .release_causal_history_before_head(&revision)
+            .map_err(|error| {
+                if durability.requires_recovery() {
+                    let _ = self.cell.force_recovery_required();
+                    DurableRuntimeCheckpointError::DurabilityUncertain(error)
+                } else {
+                    DurableRuntimeCheckpointError::Durability(error)
+                }
+            })?;
+        if receipt.is_some() {
+            self.cell
+                .reset_historical_derived_to_current()
+                .map_err(DurableRuntimeCheckpointError::Runtime)?;
+        }
+        Ok(receipt)
+    }
+
     pub fn compact_obsolete_generations(&self) -> Result<(), DurableRuntimeCheckpointError> {
         let mut durability = self.durability.lock().map_err(|_| {
             let _ = self.cell.force_recovery_required();
@@ -706,29 +773,12 @@ impl DurableRuntime {
         self.cell.install_i64_index(index, registry)
     }
 
-    pub fn install_semantic_index(
-        &self,
-        index: SemanticIndexBinding,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<(), PhysicalExecutionError> {
-        self.cell.install_semantic_index(index, registry)
-    }
-
     pub fn install_observable_atom_state(
         &self,
         binding: SemanticIndexBinding,
     ) -> Result<(), PhysicalExecutionError> {
         self.cell
             .install_observable_atom_state(binding, &self.registry)
-    }
-
-    pub fn advise_semantic_indexes(
-        &self,
-        workload: &[SemanticIndexWorkloadSample],
-        policy: SemanticIndexAdvisorPolicy,
-    ) -> Result<SemanticIndexAdvisorReport, PhysicalExecutionError> {
-        self.cell
-            .advise_semantic_indexes(workload, policy, &self.registry)
     }
 
     pub fn advise_i64_indexes(
@@ -739,16 +789,6 @@ impl DurableRuntime {
         self.cell
             .advise_i64_indexes(workload, policy, &self.registry)
     }
-
-    pub fn advise_semantic_statistics(
-        &self,
-        workload: &[SemanticIndexWorkloadSample],
-        policy: PhysicalArtifactAdvisorPolicy,
-    ) -> Result<SemanticStatisticsAdvisorReport, PhysicalExecutionError> {
-        self.cell
-            .advise_semantic_statistics(workload, policy, &self.registry)
-    }
-
     pub(crate) fn advise_unified_observable_atoms(
         &self,
         workload: &[SemanticIndexWorkloadSample],
@@ -765,6 +805,84 @@ impl DurableRuntime {
             pressure_sample,
             &self.registry,
         )
+    }
+}
+
+impl RuntimeRevisionSnapshot {
+    /// Certifies that every passive guard/read dependency remained untouched
+    /// between `source_revision` and this exact immutable snapshot. Unlike
+    /// write/write rebase, any later action on a dependency invalidates the
+    /// observation; there is deliberately no idempotent-write escape hatch.
+    ///
+    /// Callers that prepare a transition from this same snapshot inherit an
+    /// atomic freshness seal: `PreparedRuntimeRevisionTransition::seal` rejects
+    /// publication if the live root advanced after this proof.
+    pub fn certify_read_dependencies_stable(
+        &self,
+        observation: &RuntimeGuardObservationFootprint,
+    ) -> Result<RuntimeTransitionRebaseOutcome, RuntimeHistoricalSnapshotError> {
+        let source_revision = observation.source_revision();
+        let dependencies = observation.coordinates();
+        let head = self.revision();
+        let historical = &self.root().historical;
+        if source_revision == head.id() {
+            return Ok(RuntimeTransitionRebaseOutcome::Certified(
+                RuntimeTransitionRebaseCertificate {
+                    source_revision,
+                    current_revision: head.id(),
+                    intervening_effect_count: 0,
+                },
+            ));
+        }
+        if source_revision > head.id() {
+            return Err(RuntimeHistoricalSnapshotError::Unavailable { revision: source_revision });
+        }
+        if historical.lineage_floor.is_some_and(|floor| source_revision < floor) {
+            if historical.floor_opaque_effect.is_none() {
+                return Err(RuntimeHistoricalSnapshotError::Unavailable { revision: source_revision });
+            }
+            return Ok(RuntimeTransitionRebaseOutcome::Conflict(
+                RuntimeTransitionRebaseConflict {
+                    source_revision,
+                    current_revision: head.id(),
+                    conflicting_effects: Vec::new(),
+                    coordination_effects: Vec::new(),
+                    coordinates: dependencies.to_vec(),
+                    opaque_effects: historical.floor_opaque_effect.into_iter().collect(),
+                },
+            ));
+        }
+        if !historical.contains_revision(source_revision) {
+            return Err(RuntimeHistoricalSnapshotError::Unavailable { revision: source_revision });
+        }
+
+        let mut conflicting_effects = BTreeSet::new();
+        let mut conflict_coordinates = BTreeSet::new();
+        for coordinate in dependencies {
+            for indexed in historical.actions_after(source_revision, coordinate) {
+                conflicting_effects.insert(indexed.effect_id);
+                conflict_coordinates.insert(coordinate.clone());
+            }
+        }
+        if !conflicting_effects.is_empty() {
+            return Ok(RuntimeTransitionRebaseOutcome::Conflict(
+                RuntimeTransitionRebaseConflict {
+                    source_revision,
+                    current_revision: head.id(),
+                    conflicting_effects: conflicting_effects.into_iter().collect(),
+                    coordination_effects: Vec::new(),
+                    coordinates: conflict_coordinates.into_iter().collect(),
+                    opaque_effects: Vec::new(),
+                },
+            ));
+        }
+        Ok(RuntimeTransitionRebaseOutcome::Certified(
+            RuntimeTransitionRebaseCertificate {
+                source_revision,
+                current_revision: head.id(),
+                intervening_effect_count: historical.exact_effect_count_after(source_revision),
+            },
+        ))
     }
 }
 
@@ -837,7 +955,8 @@ fn apply_runtime_history_effect(
 }
 
 fn proposed_transition_footprint(
-    source: &kernel_revision::Revision,
+    source_revision: RevisionId,
+    semantic_context: &kernel_schema::SemanticContext,
     mutations: &[RevisionRelationMutation<'_>],
     model_delta: Option<&DurableModelDelta>,
     model_complement: Option<&DurableModelDelta>,
@@ -861,7 +980,7 @@ fn proposed_transition_footprint(
         }
         let footprint = mutation
             .delta
-            .rewrite_footprint(mutation.relation, source.semantic_context(), registry)
+            .rewrite_footprint(mutation.relation, semantic_context, registry)
             .map_err(PhysicalExecutionError::from)?;
         for (coordinate, action) in &footprint.writes {
             let kernel_change::SemanticWriteCoordinate::RelationClass {
@@ -870,7 +989,7 @@ fn proposed_transition_footprint(
             } = coordinate
             else {
                 return Err(RuntimeHistoricalSnapshotError::Unavailable {
-                    revision: source.id(),
+                    revision: source_revision,
                 });
             };
             insert_runtime_history_action(
@@ -891,7 +1010,7 @@ fn proposed_transition_footprint(
 
 fn runtime_history_effect_footprint(
     effect: &RuntimeHistoryEffect,
-    source: &kernel_revision::Revision,
+    semantic_context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<RuntimeHistoryFootprint, RuntimeHistoricalSnapshotError> {
     let mut writes = BTreeMap::new();
@@ -912,7 +1031,7 @@ fn runtime_history_effect_footprint(
         }
         let relation = RelExpr::Scan(mutation.relation);
         let result_type = relation
-            .typecheck(source.semantic_context(), registry)
+            .typecheck(semantic_context, registry)
             .map_err(PhysicalExecutionError::from)?;
         let delta = RelationDelta {
             inserted: mutation.inserted.clone(),
@@ -920,7 +1039,7 @@ fn runtime_history_effect_footprint(
             result_type,
         };
         let footprint = delta
-            .rewrite_footprint(mutation.relation, source.semantic_context(), registry)
+            .rewrite_footprint(mutation.relation, semantic_context, registry)
             .map_err(PhysicalExecutionError::from)?;
         for (coordinate, action) in &footprint.writes {
             match coordinate {

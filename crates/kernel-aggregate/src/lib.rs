@@ -137,6 +137,21 @@ impl ExactF64Sum {
         self.add_signed(other.negative, &other.magnitude);
     }
 
+    pub fn cmp_f64_exact(&self, rhs: f64) -> Result<Ordering, AggregateError> {
+        if !rhs.is_finite() {
+            return Err(AggregateError::NonFiniteInput);
+        }
+        let mut delta = self.clone();
+        delta.remove(rhs)?;
+        if delta.magnitude.is_zero() {
+            Ok(Ordering::Equal)
+        } else if delta.negative {
+            Ok(Ordering::Less)
+        } else {
+            Ok(Ordering::Greater)
+        }
+    }
+
     #[must_use]
     pub fn finish(&self) -> f64 {
         if self.magnitude.is_zero() {
@@ -350,5 +365,15 @@ mod tests {
             sum.remove(value).unwrap();
             assert_eq!(sum.finish().to_bits(), 0.0_f64.to_bits());
         }
+    }
+    #[test]
+    fn exact_sum_compares_against_finite_bound_without_rounding_loss() {
+        let mut sum = ExactF64Sum::default();
+        sum.add(1.0e16).unwrap();
+        sum.add(1.0).unwrap();
+        sum.add(-1.0e16).unwrap();
+        assert_eq!(sum.cmp_f64_exact(1.0), Ok(Ordering::Equal));
+        assert_eq!(sum.cmp_f64_exact(2.0), Ok(Ordering::Less));
+        assert_eq!(sum.cmp_f64_exact(0.0), Ok(Ordering::Greater));
     }
 }

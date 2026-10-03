@@ -51,7 +51,6 @@ pub enum RuntimeHistoryEffectKind {
     MixedRevision,
     FullRevision,
     SchemaMigration,
-    LegacyTargetOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +126,44 @@ pub enum RuntimeHistoryCoordinate {
     },
 }
 
+/// Canonical passive observation footprint owned by one formation revision.
+///
+/// This is deliberately distinct from `ClientIntentGuardDigest`: the digest is
+/// durable retry identity, while this value is executable proof material used
+/// to establish that the observation supporting a guard remained stable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeGuardObservationFootprint {
+    source_revision: RevisionId,
+    coordinates: Box<[RuntimeHistoryCoordinate]>,
+}
+
+impl RuntimeGuardObservationFootprint {
+    #[must_use]
+    pub fn new(
+        source_revision: RevisionId,
+        coordinates: impl IntoIterator<Item = RuntimeHistoryCoordinate>,
+    ) -> Option<Self> {
+        let coordinates = coordinates.into_iter().collect::<BTreeSet<_>>();
+        if coordinates.is_empty() {
+            return None;
+        }
+        Some(Self {
+            source_revision,
+            coordinates: coordinates.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+        })
+    }
+
+    #[must_use]
+    pub const fn source_revision(&self) -> RevisionId {
+        self.source_revision
+    }
+
+    #[must_use]
+    pub fn coordinates(&self) -> &[RuntimeHistoryCoordinate] {
+        &self.coordinates
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeHistoryFootprint {
     pub writes: BTreeMap<RuntimeHistoryCoordinate, kernel_change::RewriteActionLaw>,
@@ -159,7 +196,7 @@ pub enum RuntimeHistoryRebaseOutcome {
 pub struct RuntimeTransitionRebaseCertificate {
     pub source_revision: RevisionId,
     pub current_revision: RevisionId,
-    pub intervening_effects: Vec<u128>,
+    pub intervening_effect_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,97 +226,47 @@ fn durable_model_delta_is_empty(delta: &DurableModelDelta) -> bool {
 }
 
 impl RuntimeHistoryEffect {
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn from_durable(record: &DurableRevisionEffectRecord) -> Self {
         let semantic_change = record.semantic_change_event();
-        let (kind, reversibility, relation_mutations, model_delta, model_complement) =
-            match &record.intent {
-                DurableTransactionIntent::RelationDataExact {
-                    relation_mutations, ..
-                } => (
-                    RuntimeHistoryEffectKind::RelationData,
-                    RuntimeHistoryReversibility::ExactPlanInverse,
-                    relation_mutations.as_slice(),
-                    None,
-                    None,
-                ),
-                DurableTransactionIntent::RelationDataResidualExact {
-                    realized_mutations, ..
-                } => (
-                    RuntimeHistoryEffectKind::RelationData,
-                    RuntimeHistoryReversibility::ExactPlanInverse,
-                    realized_mutations.as_slice(),
-                    None,
-                    None,
-                ),
-                DurableTransactionIntent::RelationRewriteExact {
-                    relation_mutations, ..
-                } => (
-                    RuntimeHistoryEffectKind::RelationRewrite,
-                    RuntimeHistoryReversibility::ExactPlanInverse,
-                    relation_mutations.as_slice(),
-                    None,
-                    None,
-                ),
-                DurableTransactionIntent::RelationResolutionExact {
-                    relation_mutations, ..
-                } => (
-                    RuntimeHistoryEffectKind::RelationResolution,
-                    RuntimeHistoryReversibility::ExactPlanInverse,
-                    relation_mutations.as_slice(),
-                    None,
-                    None,
-                ),
-                DurableTransactionIntent::MixedRevisionExact {
-                    relation_mutations,
-                    model_delta,
-                    model_complement,
-                    ..
-                } => (
-                    RuntimeHistoryEffectKind::MixedRevision,
-                    if durable_model_delta_is_empty(model_delta) || model_complement.is_some() {
-                        RuntimeHistoryReversibility::ExactPlanInverse
-                    } else {
-                        RuntimeHistoryReversibility::ComplementRequired
-                    },
-                    relation_mutations.as_slice(),
-                    Some(model_delta.clone()),
-                    model_complement.as_deref().cloned(),
-                ),
-                DurableTransactionIntent::MixedRevisionResidualExact {
-                    realized_relation_mutations,
-                    realized_model_delta,
-                    realized_model_complement,
-                    ..
-                } => (
-                    RuntimeHistoryEffectKind::MixedRevision,
-                    RuntimeHistoryReversibility::ExactPlanInverse,
-                    realized_relation_mutations.as_slice(),
-                    Some(realized_model_delta.clone()),
-                    Some(realized_model_complement.as_ref().clone()),
-                ),
-                DurableTransactionIntent::Exact { .. } => (
-                    RuntimeHistoryEffectKind::FullRevision,
-                    RuntimeHistoryReversibility::NonPlanTransition,
-                    &[] as &[DurableRelationMutation],
-                    None,
-                    None,
-                ),
-                DurableTransactionIntent::SchemaMigrationExact { .. } => (
-                    RuntimeHistoryEffectKind::SchemaMigration,
-                    RuntimeHistoryReversibility::NonPlanTransition,
-                    &[] as &[DurableRelationMutation],
-                    None,
-                    None,
-                ),
-                DurableTransactionIntent::LegacyTargetOnly { .. } => (
-                    RuntimeHistoryEffectKind::LegacyTargetOnly,
-                    RuntimeHistoryReversibility::NonPlanTransition,
-                    &[] as &[DurableRelationMutation],
-                    None,
-                    None,
-                ),
-            };
+        let kind = match &record.intent {
+            DurableTransactionIntent::RelationData { .. } => RuntimeHistoryEffectKind::RelationData,
+            DurableTransactionIntent::RelationRewrite { .. } => RuntimeHistoryEffectKind::RelationRewrite,
+            DurableTransactionIntent::RelationResolution { .. } => RuntimeHistoryEffectKind::RelationResolution,
+            DurableTransactionIntent::MixedRevision { .. } => RuntimeHistoryEffectKind::MixedRevision,
+            DurableTransactionIntent::FullRevision { .. } => RuntimeHistoryEffectKind::FullRevision,
+            DurableTransactionIntent::SchemaMigration { .. } => RuntimeHistoryEffectKind::SchemaMigration,
+        };
+        let (relation_mutations, model_delta, model_complement) = match &record.change {
+            kernel_durability::DurableRevisionChange::RelationData { relation_mutations, .. } =>
+                (relation_mutations.as_slice(), None, None),
+            kernel_durability::DurableRevisionChange::MixedRevision {
+                relation_mutations, model_delta, model_complement, ..
+            } => (
+                relation_mutations.as_slice(),
+                Some(model_delta.clone()),
+                model_complement.as_deref().cloned(),
+            ),
+            kernel_durability::DurableRevisionChange::FullRevision { .. }
+            | kernel_durability::DurableRevisionChange::FullRevisionAndMaterializations { .. }
+            | kernel_durability::DurableRevisionChange::SchemaMigration { .. } =>
+                (&[] as &[DurableRelationMutation], None, None),
+        };
+        let reversibility = match kind {
+            RuntimeHistoryEffectKind::RelationData
+            | RuntimeHistoryEffectKind::RelationRewrite
+            | RuntimeHistoryEffectKind::RelationResolution => RuntimeHistoryReversibility::ExactPlanInverse,
+            RuntimeHistoryEffectKind::MixedRevision => {
+                let delta = model_delta.as_ref().expect("mixed durable change has model delta");
+                if durable_model_delta_is_empty(delta) || model_complement.is_some() {
+                    RuntimeHistoryReversibility::ExactPlanInverse
+                } else {
+                    RuntimeHistoryReversibility::ComplementRequired
+                }
+            }
+            RuntimeHistoryEffectKind::FullRevision
+            | RuntimeHistoryEffectKind::SchemaMigration
+            => RuntimeHistoryReversibility::NonPlanTransition,
+        };
         debug_assert_eq!(
             record.kind(),
             match kind {
@@ -290,7 +277,6 @@ impl RuntimeHistoryEffect {
                 RuntimeHistoryEffectKind::MixedRevision => DurableEffectKind::MixedRevision,
                 RuntimeHistoryEffectKind::FullRevision => DurableEffectKind::FullRevision,
                 RuntimeHistoryEffectKind::SchemaMigration => DurableEffectKind::SchemaMigration,
-                RuntimeHistoryEffectKind::LegacyTargetOnly => DurableEffectKind::LegacyTargetOnly,
             }
         );
         Self {
@@ -373,6 +359,21 @@ pub struct RevisionRelationMutation<'a> {
     pub delta: &'a RelationDelta,
     pub object_field_writes: &'a [kernel_durability::DurableObjectFieldWrite],
     pub authorization: kernel_durability::DurableRelationAuthorization,
+}
+
+impl RevisionRelationMutation<'_> {
+    #[must_use]
+    pub fn validation_footprint(&self) -> kernel_validation::RelationMutationFootprint {
+        if !self.object_field_writes.is_empty()
+            && self.authorization == kernel_durability::DurableRelationAuthorization::default()
+            && self.delta.removed.len() == self.delta.inserted.len()
+        {
+            return kernel_validation::RelationMutationFootprint::fields(
+                self.object_field_writes.iter().map(|write| write.field),
+            );
+        }
+        kernel_validation::RelationMutationFootprint::full()
+    }
 }
 
 /// Failure while deriving an exact logical target Revision from one immutable
@@ -667,6 +668,20 @@ impl RevisionCommitDescriptor {
     }
 }
 
+/// Exact field/model intent formed in one semantic epoch and eligible for
+/// certified transport through one or more durable schema migrations.
+///
+/// `formation_semantic_revision` is part of client identity, while the guard
+/// footprint is executable proof material and is deliberately separate from
+/// `client_guard_digest`.
+pub struct SchemaAwareFieldTransitionRequest<'a> {
+    pub formation_revision: RevisionId,
+    pub formation_semantic_revision: kernel_types::SemanticRevision,
+    pub client_model_delta: &'a DurableModelDelta,
+    pub guard_observation: Option<&'a RuntimeGuardObservationFootprint>,
+    pub client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+}
+
 #[derive(Debug)]
 pub enum DurableRuntimeCommitError {
     Runtime(PhysicalExecutionError),
@@ -679,7 +694,11 @@ pub enum DurableRuntimeCommitError {
         committed_target: RevisionId,
         requested_target: RevisionId,
     },
+    GuardDependencyConflict(RuntimeTransitionRebaseConflict),
+    SchemaAwareTransitionConflict(RuntimeTransitionRebaseConflict),
+    SchemaAwareTransitionUnavailable { revision: RevisionId },
 }
+
 
 impl From<PhysicalExecutionError> for DurableRuntimeCommitError {
     fn from(value: PhysicalExecutionError) -> Self {
@@ -1044,6 +1063,7 @@ pub struct RuntimeViolationState {
     revision: RevisionId,
     semantic_revision: kernel_types::SemanticRevision,
     measure: kernel_violation::ViolationMeasure<kernel_validation::DynamicViolationWitness>,
+    pub(crate) model_rule_witnesses: kernel_validation::ModelRuleWitnessState,
 }
 
 impl RuntimeViolationState {
@@ -1209,6 +1229,19 @@ impl RuntimeObservationGuard {
 }
 
 impl RuntimeViolationState {
+    fn from_measure(
+        revision: &kernel_revision::Revision,
+        measure: kernel_violation::ViolationMeasure<kernel_validation::DynamicViolationWitness>,
+        model_rule_witnesses: kernel_validation::ModelRuleWitnessState,
+    ) -> Self {
+        Self {
+            revision: revision.id(),
+            semantic_revision: revision.semantic_revision(),
+            measure,
+            model_rule_witnesses,
+        }
+    }
+
     fn build(
         revision: &kernel_revision::Revision,
         registry: &kernel_semantics::SemanticRegistry,
@@ -1219,17 +1252,19 @@ impl RuntimeViolationState {
             revision.state(),
             revision.dense_type_extents(),
         )?;
+        let model_rule_witnesses = revision.model_rule_witnesses().clone();
         Ok(Self {
             revision: revision.id(),
             semantic_revision: revision.semantic_revision(),
             measure,
+            model_rule_witnesses,
         })
     }
 
     fn candidate_for_relation_transition(
         source: &Self,
         target: &kernel_revision::Revision,
-        changed_relations: impl IntoIterator<Item = SemanticId>,
+        mutations: &[RevisionRelationMutation<'_>],
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, PhysicalExecutionError> {
         source.require_zero()?;
@@ -1237,14 +1272,18 @@ impl RuntimeViolationState {
             return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
         }
 
+        let model_rule_witnesses = target.model_rule_witnesses().clone();
+        let compiled_rules = kernel_validation::CompiledRulePlan::compile(target.semantic_context());
         let mut measure = kernel_violation::ViolationMeasure::new();
-        for relation in changed_relations.into_iter().collect::<BTreeSet<_>>() {
-            let relation_measure = kernel_validation::relation_dynamic_violation_measure(
+        for mutation in mutations {
+            let footprint = mutation.validation_footprint();
+            let relation_measure = kernel_validation::relation_dynamic_violation_measure_selective_without_model_rules(
                 target.semantic_context(),
                 registry,
                 target.state(),
                 target.dense_type_extents(),
-                relation,
+                mutation.relation,
+                &footprint,
             )?;
             for (witness, mass) in relation_measure.iter() {
                 measure.add(witness.clone(), mass).map_err(|error| {
@@ -1253,28 +1292,29 @@ impl RuntimeViolationState {
                     )
                 })?;
             }
+            for (rule_index, _) in compiled_rules.model_rules_for_mutation(mutation.relation, &footprint) {
+                let mass = model_rule_witnesses
+                    .violation_mass(target.semantic_context(), rule_index)
+                    .map_err(|_| PhysicalExecutionError::Validation(
+                        kernel_validation::ValidationError::ModelRuleEvaluation,
+                    ))?;
+                if mass != 0 {
+                    measure
+                        .add(kernel_validation::DynamicViolationWitness::ModelRule { rule_index }, mass)
+                        .map_err(|error| PhysicalExecutionError::Validation(
+                            kernel_validation::ValidationError::ViolationMeasure(error),
+                        ))?;
+                }
+            }
         }
         Ok(Self {
             revision: target.id(),
             semantic_revision: target.semantic_revision(),
             measure,
+            model_rule_witnesses,
         })
     }
 
-    fn transport_zero_to_relation_target(
-        source: &Self,
-        target: &kernel_revision::Revision,
-    ) -> Result<Self, PhysicalExecutionError> {
-        source.require_zero()?;
-        if source.semantic_revision != target.semantic_revision() {
-            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
-        }
-        Ok(Self {
-            revision: target.id(),
-            semantic_revision: target.semantic_revision(),
-            measure: kernel_violation::ViolationMeasure::new(),
-        })
-    }
 
     #[must_use]
     pub fn is_zero(&self) -> bool {

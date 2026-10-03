@@ -70,10 +70,6 @@ where
 /// formation world.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Preserve inline state ownership without adding allocations to this representation."
-)]
 pub enum ContextSource {
     Current(Arc<Database>),
     Snapshot(ReadContext),
@@ -195,7 +191,7 @@ impl<E: Object> EntitySet<E> {
 
 /// One exact immutable semantic world projected through the same typed consumer surface.
 ///
-/// Ordinary reads should use [`DatabaseContext`] directly. A snapshot is explicit only when the
+/// Ordinary reads should use [`Context`] directly. A snapshot is explicit only when the
 /// caller needs several operations to share one committed revision, or selects a historical world
 /// through `Context::at`. Authorization remains owned by the database/session rather than by the
 /// snapshot token.
@@ -228,7 +224,7 @@ impl<S: CfmdSchema> std::fmt::Debug for Snapshot<S> {
             .debug_struct("Snapshot")
             .field("revision", &self.revision())
             .field("schema", &std::any::type_name::<S>())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -244,26 +240,22 @@ impl<S: CfmdSchema> Deref for Snapshot<S> {
 ///
 /// Unlike database-definition authority, the context surface may describe only the semantic
 /// fields known to this consumer. Binding is by durable field semantics, not by ordinal columns.
-pub struct DatabaseContext<S: CfmdSchema> {
+pub struct Context<S: CfmdSchema> {
     database: Arc<Database>,
     surface: S,
 }
 
-/// Canonical typed application/reader context. `DatabaseContext` remains the concrete type name
-/// for source compatibility while the public DX uses `Context<M>`.
-pub type Context<S> = DatabaseContext<S>;
-
-impl<S: CfmdSchema> std::fmt::Debug for DatabaseContext<S> {
+impl<S: CfmdSchema> std::fmt::Debug for Context<S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("DatabaseContext")
+            .debug_struct("Context")
             .field("database", &self.database)
             .field("schema", &std::any::type_name::<S>())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
-impl<S: CfmdSchema> DatabaseContext<S> {
+impl<S: CfmdSchema> Context<S> {
     fn bind(database: Database) -> Result<Self> {
         let database = Arc::new(database);
         let surface = S::__bind(Arc::new(ContextSource::Current(Arc::clone(&database))))?;
@@ -300,7 +292,7 @@ impl<S: CfmdSchema> DatabaseContext<S> {
     }
 }
 
-impl<S: CfmdSchema> Deref for DatabaseContext<S> {
+impl<S: CfmdSchema> Deref for Context<S> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
@@ -312,7 +304,7 @@ impl Database {
     /// Binds a typed consumer contract to this already-open database. The contract is allowed to
     /// omit persisted fields; every declared local field must match one durable semantic field.
     pub fn context<S: CfmdSchema>(&self) -> Result<Context<S>> {
-        DatabaseContext::bind(self.clone())
+        Context::bind(self.clone())
     }
 }
 
@@ -329,7 +321,7 @@ impl<S: CfmdSchema> std::fmt::Debug for SchemaDatabaseBuilder<S> {
             .debug_struct("SchemaDatabaseBuilder")
             .field("database", &self.inner)
             .field("schema", &std::any::type_name::<S>())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -386,7 +378,7 @@ impl<S: CfmdSchema> std::fmt::Debug for SchemaDatabase<S> {
             .debug_struct("SchemaDatabase")
             .field("database", &self.database)
             .field("schema", &std::any::type_name::<S>())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 

@@ -63,8 +63,8 @@ fn wal_core_replay_uses_relation_semantics_for_coarse_first_match_removal() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     runtime
         .commit_derived_relation_data(
@@ -125,7 +125,7 @@ fn bounded_physical_recovery_prioritizes_manual_pin_over_advisor_recipe() {
         scan_runtime_bundle(5_175, 9_175, &(1_i64..=16).collect::<Vec<_>>());
     let semantic = SemanticIndexBinding::single(relation, layout, 0, sid(101));
     root.physical_store_mut_for_test()
-        .install_semantic_index(semantic.clone(), &context, &registry)
+        .install_observable_atom_state(semantic.clone(), &context, &registry)
         .unwrap();
     let i64 = I64IndexBinding {
         relation,
@@ -156,17 +156,11 @@ fn bounded_physical_recovery_prioritizes_manual_pin_over_advisor_recipe() {
             .observable_atom_state(&semantic)
             .is_some()
     );
-    assert!(
-        snapshot
-            .physical_store()
-            .semantic_index(&semantic)
-            .is_none()
-    );
     assert!(snapshot.physical_store().i64_index(i64).is_none());
-    assert_eq!(report.rebuilt.len(), 1);
+    assert!(report.rebuilt.is_empty());
     assert!(matches!(
-        report.rebuilt.as_slice(),
-        [DurablePhysicalArtifactSpec::SemanticIndex {
+        report.rehydrated.as_slice(),
+        [DurablePhysicalArtifactSpec::ObservableAtom {
             advisor_managed: false,
             ..
         }]
@@ -179,7 +173,7 @@ fn bounded_physical_recovery_prioritizes_manual_pin_over_advisor_recipe() {
             ..
         }]
     ));
-    assert_eq!(report.attempted_rebuild_key_evaluations, 16);
+    assert_eq!(report.attempted_rebuild_key_evaluations, 0);
     assert_eq!(report.advisor_rebuild_key_evaluations, 0);
     assert_eq!(snapshot.revision_id(), RevisionId::new(5_175));
     drop(snapshot);
@@ -194,11 +188,11 @@ fn physical_recovery_byte_budget_drops_optional_artifact_but_keeps_revision() {
         scan_runtime_bundle(5_176, 9_176, &[1, 2, 3, 4]);
     let semantic = SemanticIndexBinding::single(relation, layout, 0, sid(101));
     root.physical_store_mut_for_test()
-        .install_semantic_index(semantic.clone(), &context, &registry)
+        .install_observable_atom_state(semantic.clone(), &context, &registry)
         .unwrap();
     root.physical_store_mut_for_test()
         .advisor_managed_artifacts_mut()
-        .insert(UnifiedArtifactId::SemanticIndex(semantic.clone()));
+        .insert(UnifiedArtifactId::ObservableAtom(semantic.clone()));
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
 
     let (reopened, report) = DurableRuntime::open_with_recovery_policy(
@@ -214,12 +208,12 @@ fn physical_recovery_byte_budget_drops_optional_artifact_but_keeps_revision() {
     assert!(
         snapshot
             .physical_store()
-            .semantic_index(&semantic)
+            .observable_atom_state(&semantic)
             .is_none()
     );
     assert!(report.rebuilt.is_empty());
     assert_eq!(report.skipped_estimated_byte_budget.len(), 1);
-    assert_eq!(report.attempted_rebuild_key_evaluations, 4);
+    assert_eq!(report.attempted_rebuild_key_evaluations, 0);
     assert!(report.total_estimated_bytes_after > 0);
     drop(snapshot);
     drop(reopened);
@@ -231,13 +225,13 @@ fn supervisor_reuses_bounded_physical_recovery_policy_on_reopen() {
     let dir = durable_test_dir("bounded-supervisor-recovery-policy");
     let (context, registry, relation, layout, mut root) =
         scan_runtime_bundle(5_177, 9_177, &[1, 2, 3, 4]);
-    let semantic = SemanticIndexBinding::single(relation, layout, 0, sid(101));
+    let i64 = I64IndexBinding { relation, layout, key_column: 0, equivalence: sid(101) };
     root.physical_store_mut_for_test()
-        .install_semantic_index(semantic.clone(), &context, &registry)
+        .install_i64_index(i64, &context, &registry)
         .unwrap();
     root.physical_store_mut_for_test()
         .advisor_managed_artifacts_mut()
-        .insert(UnifiedArtifactId::SemanticIndex(semantic.clone()));
+        .insert(UnifiedArtifactId::I64Index(i64));
     let policy = PhysicalRecoveryPolicy {
         max_advisor_rebuild_key_evaluations: 0,
         ..PhysicalRecoveryPolicy::default()
@@ -253,7 +247,7 @@ fn supervisor_reuses_bounded_physical_recovery_policy_on_reopen() {
             .snapshot()
             .unwrap()
             .physical_store()
-            .semantic_index(&semantic)
+            .i64_index(i64)
             .is_none()
     );
     let second = supervisor.recover_with_report().unwrap();
@@ -263,7 +257,7 @@ fn supervisor_reuses_bounded_physical_recovery_policy_on_reopen() {
             .snapshot()
             .unwrap()
             .physical_store()
-            .semantic_index(&semantic)
+            .i64_index(i64)
             .is_none()
     );
     drop(supervisor);
@@ -275,13 +269,13 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
     let dir = durable_test_dir("deferred-physical-recovery-resume");
     let (context, registry, relation, layout, mut root) =
         scan_runtime_bundle(5_178, 9_178, &[1, 2, 3, 4]);
-    let semantic = SemanticIndexBinding::single(relation, layout, 0, sid(101));
+    let i64 = I64IndexBinding { relation, layout, key_column: 0, equivalence: sid(101) };
     root.physical_store_mut_for_test()
-        .install_semantic_index(semantic.clone(), &context, &registry)
+        .install_i64_index(i64, &context, &registry)
         .unwrap();
     root.physical_store_mut_for_test()
         .advisor_managed_artifacts_mut()
-        .insert(UnifiedArtifactId::SemanticIndex(semantic.clone()));
+        .insert(UnifiedArtifactId::I64Index(i64));
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
 
     let (runtime, initial) = DurableRuntime::open_with_recovery_policy(
@@ -296,7 +290,7 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
     let before = runtime.snapshot().unwrap();
     let source_version = before.root_version();
     assert_eq!(before.revision_id(), RevisionId::new(5_178));
-    assert!(before.physical_store().semantic_index(&semantic).is_none());
+    assert!(before.physical_store().i64_index(i64).is_none());
     drop(before);
 
     let resumed = runtime
@@ -310,15 +304,14 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
     assert!(
         after
             .physical_store()
-            .observable_atom_state(&semantic)
+            .i64_index(i64)
             .is_some()
     );
-    assert!(after.physical_store().semantic_index(&semantic).is_none());
     assert!(
         after
             .physical_store()
             .advisor_managed_artifacts_for_test()
-            .contains(&UnifiedArtifactId::ObservableAtom(semantic.clone()))
+            .contains(&UnifiedArtifactId::I64Index(i64))
     );
     drop(after);
 
@@ -326,10 +319,7 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
     drop(runtime);
     let (reopened, second) = DurableRuntime::open_with_recovery_policy(
         &dir,
-        PhysicalRecoveryPolicy {
-            max_advisor_rebuild_key_evaluations: 0,
-            ..PhysicalRecoveryPolicy::default()
-        },
+        PhysicalRecoveryPolicy::default(),
     )
     .unwrap();
     assert!(second.deferred_advisor_artifacts().is_empty());
@@ -337,14 +327,8 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
     assert!(
         reopened_snapshot
             .physical_store()
-            .observable_atom_state(&semantic)
+            .i64_index(i64)
             .is_some()
-    );
-    assert!(
-        reopened_snapshot
-            .physical_store()
-            .semantic_index(&semantic)
-            .is_none()
     );
     drop(reopened);
     std::fs::remove_dir_all(dir).unwrap();
@@ -353,27 +337,9 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
 #[test]
 fn deferred_recovery_uses_live_telemetry_to_rank_optional_rebuilds() {
     let dir = durable_test_dir("deferred-recovery-live-benefit-ranking");
-    let (context, registry, relation, layout, mut root) =
-        scan_runtime_bundle(5_179, 9_179, &(1_i64..=16).collect::<Vec<_>>());
-    let semantic = SemanticIndexBinding::single(relation, layout, 0, sid(101));
-    let i64 = I64IndexBinding {
-        relation,
-        layout,
-        key_column: 0,
-        equivalence: sid(101),
-    };
-    root.physical_store_mut_for_test()
-        .install_semantic_index(semantic.clone(), &context, &registry)
-        .unwrap();
-    root.physical_store_mut_for_test()
-        .install_i64_index(i64, &context, &registry)
-        .unwrap();
-    root.physical_store_mut_for_test()
-        .advisor_managed_artifacts_mut()
-        .extend([
-            UnifiedArtifactId::SemanticIndex(semantic.clone()),
-            UnifiedArtifactId::I64Index(i64),
-        ]);
+    let values = (1_i64..=16).collect::<Vec<_>>();
+    let (registry, preferred, other, root) =
+        advisor_i64_recovery_bundle(5_179, &values, &values);
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
 
     let (runtime, initial) = DurableRuntime::open_with_recovery_policy(
@@ -392,7 +358,7 @@ fn deferred_recovery_uses_live_telemetry_to_rank_optional_rebuilds() {
         PhysicalPressurePolicy::default(),
     );
     controller.observe(
-        PhysicalArtifactTelemetryTarget::SemanticIndex(semantic.clone()),
+        PhysicalArtifactTelemetryTarget::I64Index(preferred),
         ArtifactTelemetry {
             read_work_saved: 10_000,
             maintenance_work: 0,
@@ -412,26 +378,15 @@ fn deferred_recovery_uses_live_telemetry_to_rank_optional_rebuilds() {
 
     assert!(matches!(
         resumed.rebuilt.as_slice(),
-        [DurablePhysicalArtifactSpec::SemanticIndex { .. }]
+        [DurablePhysicalArtifactSpec::I64Index { relation, .. }] if *relation == preferred.relation
     ));
     assert!(matches!(
         resumed.skipped_key_evaluation_budget.as_slice(),
-        [DurablePhysicalArtifactSpec::I64Index { .. }]
+        [DurablePhysicalArtifactSpec::I64Index { relation, .. }] if *relation == other.relation
     ));
     let snapshot = runtime.snapshot().unwrap();
-    assert!(
-        snapshot
-            .physical_store()
-            .observable_atom_state(&semantic)
-            .is_some()
-    );
-    assert!(
-        snapshot
-            .physical_store()
-            .semantic_index(&semantic)
-            .is_none()
-    );
-    assert!(snapshot.physical_store().i64_index(i64).is_none());
+    assert!(snapshot.physical_store().i64_index(preferred).is_some());
+    assert!(snapshot.physical_store().i64_index(other).is_none());
     drop(snapshot);
     drop(runtime);
     std::fs::remove_dir_all(dir).unwrap();
@@ -494,20 +449,16 @@ fn recovery_semantic_work_budget_distinguishes_same_cell_count_by_payload_size()
     )
     .unwrap();
     let snapshot = reopened.snapshot().unwrap();
-    assert!(
-        snapshot
-            .physical_store()
-            .observable_atom_state(&short)
-            .is_some()
-    );
-    assert!(snapshot.physical_store().semantic_index(&short).is_none());
-    assert!(snapshot.physical_store().semantic_index(&long).is_none());
+    assert!(snapshot
+        .physical_store()
+        .has_semantic_statistics_for_test(&short));
+    assert!(!snapshot.physical_store().has_semantic_statistics_for_test(&long));
     assert_eq!(report.advisor_rebuild_key_evaluations, 2);
     assert_eq!(report.advisor_rebuild_semantic_work_units, 4);
     assert_eq!(report.skipped_semantic_work_budget.len(), 1);
     assert!(matches!(
         report.skipped_semantic_work_budget.as_slice(),
-        [DurablePhysicalArtifactSpec::SemanticIndex { key_parts, .. }]
+        [DurablePhysicalArtifactSpec::SemanticStatistics { key_parts, .. }]
             if key_parts.as_slice() == [DurableSemanticKeyPart {
                 column: 1,
                 equivalence: long.key_parts[0].equivalence,
@@ -539,12 +490,12 @@ fn deferred_recovery_never_replays_manual_or_incompatible_recipes() {
         scan_runtime_bundle(5_179, 9_179, &[1, 2, 3]);
     let manual = SemanticIndexBinding::single(relation, layout, 0, sid(101));
     root.physical_store_mut_for_test()
-        .install_semantic_index(manual.clone(), &context, &registry)
+        .install_observable_atom_state(manual.clone(), &context, &registry)
         .unwrap();
     let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
     let before = runtime.snapshot().unwrap().root_version();
     let fabricated = PhysicalRecoveryReport {
-        skipped_key_evaluation_budget: vec![DurablePhysicalArtifactSpec::SemanticIndex {
+        skipped_key_evaluation_budget: vec![DurablePhysicalArtifactSpec::ObservableAtom {
             relation,
             key_parts: vec![DurableSemanticKeyPart {
                 column: 0,
@@ -552,7 +503,7 @@ fn deferred_recovery_never_replays_manual_or_incompatible_recipes() {
             }],
             advisor_managed: false,
         }],
-        skipped_estimated_byte_budget: vec![DurablePhysicalArtifactSpec::SemanticIndex {
+        skipped_estimated_byte_budget: vec![DurablePhysicalArtifactSpec::ObservableAtom {
             relation: sid(0xdead),
             key_parts: vec![DurableSemanticKeyPart {
                 column: 0,
@@ -571,7 +522,7 @@ fn deferred_recovery_never_replays_manual_or_incompatible_recipes() {
     assert_eq!(report.dropped_incompatible.len(), 1);
     let after = runtime.snapshot().unwrap();
     assert_eq!(after.root_version(), before);
-    assert!(after.physical_store().semantic_index(&manual).is_some());
+    assert!(after.physical_store().observable_atom_state(&manual).is_some());
     drop(after);
     drop(runtime);
     std::fs::remove_dir_all(dir).unwrap();
@@ -582,13 +533,13 @@ fn supervisor_can_resume_deferred_recovery_without_reopen() {
     let dir = durable_test_dir("deferred-supervisor-recovery-resume");
     let (context, registry, relation, layout, mut root) =
         scan_runtime_bundle(5_180, 9_180, &[1, 2, 3, 4]);
-    let semantic = SemanticIndexBinding::single(relation, layout, 0, sid(101));
+    let i64 = I64IndexBinding { relation, layout, key_column: 0, equivalence: sid(101) };
     root.physical_store_mut_for_test()
-        .install_semantic_index(semantic.clone(), &context, &registry)
+        .install_i64_index(i64, &context, &registry)
         .unwrap();
     root.physical_store_mut_for_test()
         .advisor_managed_artifacts_mut()
-        .insert(UnifiedArtifactId::SemanticIndex(semantic.clone()));
+        .insert(UnifiedArtifactId::I64Index(i64));
     let supervisor = DurableRuntimeSupervisor::create_with_recovery_policy(
         root,
         &dir,
@@ -609,14 +560,8 @@ fn supervisor_can_resume_deferred_recovery_without_reopen() {
     assert!(
         snapshot
             .physical_store()
-            .observable_atom_state(&semantic)
+            .i64_index(i64)
             .is_some()
-    );
-    assert!(
-        snapshot
-            .physical_store()
-            .semantic_index(&semantic)
-            .is_none()
     );
     drop(supervisor);
     std::fs::remove_dir_all(dir).unwrap();
@@ -627,7 +572,7 @@ fn stale_durable_physical_recipe_never_blocks_logical_recovery() {
     let dir = durable_test_dir("stale-physical-recipe");
     let (_, registry, _, _, root) = scan_runtime_bundle(517, 1217, &[1, 2]);
     let materializations = root.durable_materialization_specs();
-    let stale = DurablePhysicalArtifactSpec::SemanticIndex {
+    let stale = DurablePhysicalArtifactSpec::ObservableAtom {
         relation: sid(0xdead),
         key_parts: vec![DurableSemanticKeyPart {
             column: 0,
@@ -653,7 +598,7 @@ fn stale_durable_physical_recipe_never_blocks_logical_recovery() {
     assert!(
         snapshot
             .physical_store()
-            .semantic_indexes_for_test()
+            .observable_atom_states_for_test()
             .is_empty()
     );
     assert_eq!(report.dropped_incompatible, vec![stale]);
@@ -841,7 +786,7 @@ fn structural_durable_index_fixture() -> (
         .install(relation, layout, NativeRelation::row_store(rows))
         .unwrap();
     physical
-        .install_semantic_index(
+        .install_observable_atom_state(
             SemanticIndexBinding::single(relation, layout, 0, structural),
             &context,
             &registry,
@@ -859,7 +804,7 @@ fn structural_durable_index_fixture() -> (
 }
 
 #[test]
-fn durable_structural_semantic_index_rebuilds_and_serves_after_reopen() {
+fn durable_structural_observable_atom_rebuilds_and_serves_after_reopen() {
     let dir = durable_test_dir("structural-physical-recipe");
     let (registry, context, root, relation, structural) = structural_durable_index_fixture();
     let layout = root.relation_layout(relation).unwrap();
@@ -873,12 +818,6 @@ fn durable_structural_semantic_index_rebuilds_and_serves_after_reopen() {
             .physical_store()
             .observable_atom_state(&recovered_binding)
             .is_some()
-    );
-    assert!(
-        snapshot
-            .physical_store()
-            .semantic_index(&recovered_binding)
-            .is_none()
     );
     let mut catalog = PhysicalCatalog::default();
     catalog.bind_relation(relation, layout);
@@ -935,8 +874,8 @@ fn subprocess_commit_durable_before_publish_recovers_target_revision() {
     let retry_mutations = [RevisionRelationMutation {
         relation,
         delta: &retry_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let retry_target = target_revision_for(&root, 531, &retry_mutations, &registry);
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
@@ -1009,8 +948,8 @@ fn crash_worker_commit_durable_before_publish() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let target = target_revision_for(&root, 531, &mutations, &registry);
     let (durability, scan) = kernel_durability::DurableRevisionStore::open(&dir).unwrap();
@@ -1042,8 +981,8 @@ fn client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent() 
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 541, &mutations, &registry);
@@ -1106,8 +1045,8 @@ fn client_transaction_identity_survives_checkpoint_and_makes_retry_idempotent() 
     let next_mutations = [RevisionRelationMutation {
         relation,
         delta: &next_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let live = reopened.snapshot().unwrap();
     let next_target = target_revision_for(live.root(), 542, &next_mutations, &registry);
@@ -1140,8 +1079,8 @@ fn supervisor_recovers_fail_stopped_runtime_and_retries_same_transaction() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let snapshot = supervisor.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 551, &mutations, &registry);
@@ -1385,8 +1324,8 @@ fn durable_mixed_revision_updates_lifecycle_and_relations_incrementally() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let model_delta = DurableModelDelta::between(source.state(), target.state());
     let model_complement = DurableModelDelta::between(target.state(), source.state());
@@ -1785,8 +1724,8 @@ fn committed_transaction_id_rejects_same_revision_id_with_different_revision_con
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 861, &mutations, &registry);
@@ -1846,8 +1785,8 @@ fn exact_transaction_intent_survives_later_heads_checkpoint_compaction_and_reope
     let first_mutations = [RevisionRelationMutation {
         relation,
         delta: &first_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let first_target = target_revision_for(snapshot.root(), 866, &first_mutations, &registry);
@@ -1867,8 +1806,8 @@ fn exact_transaction_intent_survives_later_heads_checkpoint_compaction_and_reope
     let second_mutations = [RevisionRelationMutation {
         relation,
         delta: &second_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let second_target = target_revision_for(snapshot.root(), 867, &second_mutations, &registry);
@@ -1948,8 +1887,8 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
     let first_mutations = [RevisionRelationMutation {
         relation,
         delta: &first_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let first_request = DerivedRelationTransitionRequest {
         source_revision: RevisionId::new(875),
@@ -1967,8 +1906,8 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
     let second_mutations = [RevisionRelationMutation {
         relation,
         delta: &second_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     runtime
         .commit_derived_relation_data(
@@ -1998,8 +1937,8 @@ fn derived_relation_commit_is_compact_exact_and_survives_compaction_retry() {
     let conflicting_mutations = [RevisionRelationMutation {
         relation,
         delta: &conflicting_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     assert!(matches!(
         reopened.commit_derived_relation_data(
@@ -2030,7 +1969,7 @@ fn assert_relation_rewrite_causal_identity(
     let payload = &causal.events().values().next().unwrap().payload;
     assert!(matches!(
         payload,
-        DurableTransactionIntent::RelationRewriteExact {
+        DurableTransactionIntent::RelationRewrite {
             source_revision,
             target_revision,
             rewrite_intents,
@@ -2240,7 +2179,6 @@ fn assert_reopened_effect_prerequisites(
 }
 
 #[test]
-#[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
 fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
     let dir = durable_test_dir("multi-parent-coherent-resolution");
     let (context, registry, relation, _, root) = scan_runtime_bundle(900, 1320, &[1]);
@@ -2254,8 +2192,8 @@ fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
         let mutations = [RevisionRelationMutation {
             relation,
             delta: &delta,
-        object_field_writes: &[],
-        authorization: kernel_durability::DurableRelationAuthorization::default(),
+            object_field_writes: &[],
+            authorization: Default::default(),
         }];
         runtime
             .commit_derived_relation_data(
@@ -2316,8 +2254,8 @@ fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
         runtime.with_durability_for_test(|durability| {
             assert!(matches!(
                 durability.transaction_intent(transaction_id),
-                Some(DurableTransactionIntent::RelationResolutionExact {
-                    causal_parents,
+                Some(kernel_durability::DurableCommittedTransaction {
+                    intent: kernel_durability::DurableClientIntent::RelationResolution { causal_parents, .. },
                     ..
                 }) if causal_parents == &vec![RevisionId::new(901), RevisionId::new(902)]
             ));
@@ -2368,8 +2306,8 @@ fn derived_relation_commit_matches_authoritative_target_and_rejects_stale_source
     let first_mutations = [RevisionRelationMutation {
         relation,
         delta: &first_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let source = runtime.snapshot().unwrap();
     let expected = target_revision_for(source.root(), 879, &first_mutations, &registry);
@@ -2384,14 +2322,24 @@ fn derived_relation_commit_matches_authoritative_target_and_rejects_stale_source
             },
         )
         .unwrap();
-    assert_eq!(runtime.snapshot().unwrap().revision(), &expected);
+    let committed = runtime.snapshot().unwrap();
+    assert_eq!(committed.revision().id(), expected.id());
+    assert_eq!(
+        committed.revision().semantic_context(),
+        expected.semantic_context()
+    );
+    assert_eq!(committed.revision().state(), expected.state());
+    assert_eq!(
+        committed.revision().model_rule_witnesses(),
+        expected.model_rule_witnesses()
+    );
 
     let stale_delta = scan_delta(relation, &[3], &[], &context, &registry);
     let stale_mutations = [RevisionRelationMutation {
         relation,
         delta: &stale_delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let stale_transaction = ClientTransactionId::new(0x8782);
     let stale_request = DerivedRelationTransitionRequest {
@@ -2440,8 +2388,8 @@ fn revision_and_materialization_registry_commit_and_recover_atomically() {
     let mutations = [RevisionRelationMutation {
         relation,
         delta: &delta,
-    object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+        object_field_writes: &[],
+        authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 869, &mutations, &registry);
@@ -2621,4 +2569,469 @@ fn invalid_materialization_reconfiguration_is_rejected_before_durable_publicatio
     );
     drop(reopened);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn causal_history_release_reclaims_p462_derived_timeline_and_reopens_at_new_floor() {
+    let dir = durable_test_dir("causal-history-release-p462-derived");
+    let (context, registry, relation, _, root) = scan_runtime_bundle(9_100, 13_100, &[1]);
+    let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+    let delta = scan_delta(relation, &[2], &[], &context, &registry);
+    let mutations = [RevisionRelationMutation {
+        relation,
+        delta: &delta,
+        object_field_writes: &[],
+        authorization: Default::default(),
+    }];
+    runtime
+        .commit_derived_relation_data(
+            ClientTransactionId::new(0x4631),
+            &DerivedRelationTransitionRequest {
+                source_revision: RevisionId::new(9_100),
+                target_revision: RevisionId::new(9_101),
+                mutations: &mutations,
+            },
+        )
+        .unwrap();
+
+    let retained = runtime.snapshot().unwrap();
+    assert_eq!(retained.historical_exact_effect_count_for_test(), 1);
+    let probe = retained.historical_exact_effect_storage_probe_for_test();
+    assert!(probe.total_nodes() > 0);
+
+    assert!(
+        runtime
+            .release_causal_history_before_head()
+            .unwrap()
+            .is_some()
+    );
+    let current = runtime.snapshot().unwrap();
+    assert_eq!(
+        current.historical_lineage_floor_for_test(),
+        Some(RevisionId::new(9_101))
+    );
+    assert_eq!(current.historical_exact_effect_count_for_test(), 0);
+    assert!(matches!(
+        runtime.certify_transition_rebase(RevisionId::new(9_100), &mutations, None, None),
+        Err(RuntimeHistoricalSnapshotError::Unavailable { revision }) if revision == RevisionId::new(9_100)
+    ));
+    assert!(!probe.is_fully_reclaimed());
+    drop(retained);
+    assert!(probe.is_fully_reclaimed());
+    drop(current);
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    assert_eq!(
+        reopened.causal_coverage_root().unwrap(),
+        RevisionId::new(9_101)
+    );
+    assert!(
+        reopened
+            .revision_effect_ideal(RevisionId::new(9_101))
+            .unwrap()
+            .unwrap()
+            .events()
+            .is_empty()
+    );
+    assert!(matches!(
+        reopened.certify_transition_rebase(RevisionId::new(9_100), &mutations, None, None),
+        Err(RuntimeHistoricalSnapshotError::Unavailable { revision }) if revision == RevisionId::new(9_100)
+    ));
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn security_guard_dependency_is_sealed_with_residual_publication() {
+    let dir = durable_test_dir("security-guard-dependency-seal");
+    let relation = sid(9_801);
+    let equivalence = sid(9_802);
+    let entity_type = sid(9_803);
+    let field = sid(9_804);
+    let entity = EntityId::new(9801);
+    let mut registry = SemanticRegistry::default();
+    let digest = registry.install_equivalence_revision(EquivalenceModule::TextExact, 11);
+    let context = migration_context(9801, 9801, relation, equivalence, entity_type, field, digest);
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(9801),
+        &context,
+        &registry,
+        migration_state(entity_type, field, relation, &[(entity, 7)], &["A"]),
+    )
+    .unwrap();
+    let runtime = create_migration_runtime(&dir, relation, source.clone(), "A", &registry);
+
+    let mut guard_changed_state = source.state().clone();
+    guard_changed_state.lifecycle.roots.remove(&entity);
+    let guard_changed = kernel_revision::Revision::build(
+        RevisionId::new(9802),
+        &context,
+        &registry,
+        guard_changed_state,
+    )
+    .unwrap();
+    let guard_delta = DurableModelDelta::between(source.state(), guard_changed.state());
+    let guard_complement = DurableModelDelta::between(guard_changed.state(), source.state());
+    runtime
+        .commit_mixed_revision(
+            ClientTransactionId::new(0x9802),
+            &MixedRevisionTransitionRequest {
+                source_revision: source.id(),
+                target_revision: &guard_changed,
+                mutations: &[],
+                model_delta: &guard_delta,
+                model_complement: &guard_complement,
+                registry: &registry,
+            },
+        )
+        .unwrap();
+
+    let mut effect_state = guard_changed.state().clone();
+    effect_state
+        .model
+        .fields
+        .insert((field, entity), Value::I64(8));
+    let effect_target = kernel_revision::Revision::build(
+        RevisionId::new(9803),
+        &context,
+        &registry,
+        effect_state,
+    )
+    .unwrap();
+    let effect_delta = DurableModelDelta::between(guard_changed.state(), effect_target.state());
+    let effect_complement = DurableModelDelta::between(effect_target.state(), guard_changed.state());
+    let request = MixedRevisionTransitionRequest {
+        source_revision: guard_changed.id(),
+        target_revision: &effect_target,
+        mutations: &[],
+        model_delta: &effect_delta,
+        model_complement: &effect_complement,
+        registry: &registry,
+    };
+    let guard_digest = kernel_durability::ClientIntentGuardDigest::canonical(b"root-present");
+    let guard_observation = RuntimeGuardObservationFootprint::new(
+        source.id(),
+        [
+            RuntimeHistoryCoordinate::LifecycleRoot { entity },
+            RuntimeHistoryCoordinate::LifecycleRoot { entity },
+        ],
+    )
+    .unwrap();
+    assert_eq!(guard_observation.source_revision(), source.id());
+    assert_eq!(guard_observation.coordinates().len(), 1);
+    let result = runtime.commit_mixed_revision_residual_guarded_with_dependencies(
+        ClientTransactionId::new(0x9803),
+        &request,
+        &[],
+        &effect_delta,
+        Some(guard_digest),
+        Some(&guard_observation),
+    );
+    assert!(matches!(
+        result,
+        Err(DurableRuntimeCommitError::GuardDependencyConflict(_))
+    ));
+    assert_eq!(runtime.snapshot().unwrap().revision().id(), guard_changed.id());
+
+    drop(runtime);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn p465_security_contexts(
+    source_schema_revision: u64,
+    target_schema_revision: u64,
+    relation: SemanticId,
+    equivalence: SemanticId,
+    entity_type: SemanticId,
+    source_fields: [SemanticId; 3],
+    target_fields: [SemanticId; 3],
+    registry: &mut SemanticRegistry,
+) -> (SemanticContext, SemanticContext, kernel_transport::SchemaMigrationProgram) {
+    let digest = registry.install_equivalence(kernel_semantics::EquivalenceModule::TextExact);
+    let mut source_schema = Schema::new(SchemaRevisionId::new(source_schema_revision));
+    for field in source_fields {
+        source_schema.define_field(FieldDef {
+            id: field,
+            owner: entity_type,
+            value: TypeExpr::Scalar(ScalarType::I64),
+        }).unwrap();
+    }
+    source_schema.define_relation(RelationDef {
+        id: relation,
+        columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+        semantics: RelationSemantics::Bag { column_equivalences: vec![equivalence] },
+    }).unwrap();
+    let mut source_environment = SemanticEnvironment::new(SemanticEnvId::new(source_schema_revision));
+    source_environment.pin_module(equivalence, digest);
+    let source = SemanticContext { schema: source_schema, environment: source_environment };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(target_schema_revision));
+    for field in target_fields {
+        target_schema.define_field(FieldDef {
+            id: field,
+            owner: entity_type,
+            value: TypeExpr::Scalar(ScalarType::I64),
+        }).unwrap();
+    }
+    target_schema.define_relation(RelationDef {
+        id: relation,
+        columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+        semantics: RelationSemantics::Bag { column_equivalences: vec![equivalence] },
+    }).unwrap();
+    let mut target_environment = SemanticEnvironment::new(SemanticEnvId::new(target_schema_revision));
+    target_environment.pin_module(equivalence, digest);
+    let target = SemanticContext { schema: target_schema, environment: target_environment };
+
+    let rewrites = source_fields.into_iter().zip(target_fields).map(|(source_field, target_field)| {
+        kernel_transport::MigrationFieldRewrite {
+            source_fields: vec![source_field],
+            target_field,
+            transform: kernel_query::ExactQuery::new(kernel_query::Expr::ProductField {
+                input: Box::new(kernel_query::Expr::Input),
+                field: source_field,
+            }),
+        }
+    }).collect();
+    let program = kernel_transport::SchemaMigrationProgram::new(target.clone(), rewrites, Vec::new());
+    (source, target, program)
+}
+
+fn p465_security_state(
+    entity_type: SemanticId,
+    fields: [SemanticId; 3],
+    relation: SemanticId,
+    entity: EntityId,
+    values: [i64; 3],
+) -> kernel_model::DatabaseState {
+    let mut state = kernel_model::DatabaseState::default();
+    state.lifecycle.entities.insert(entity);
+    state.lifecycle.roots.insert(entity);
+    state.model.carriers.entry(entity_type).or_default().insert(entity);
+    for (field, value) in fields.into_iter().zip(values) {
+        state.model.fields.insert((field, entity), Value::I64(value));
+    }
+    state.model.relations.insert(relation, vec![vec![Value::Text("security-anchor".into())]]);
+    state
+}
+
+#[test]
+fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
+    let dir = durable_test_dir("p465-schema-aware-field-walker");
+    let relation = sid(9_801);
+    let equivalence = sid(9_802);
+    let entity_type = sid(9_803);
+    let source_fields = [sid(9_804), sid(9_805), sid(9_806)];
+    let target_fields = [sid(9_814), sid(9_815), sid(9_816)];
+    let final_fields = [sid(9_824), sid(9_825), sid(9_826)];
+    let entity = EntityId::new(9800);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, target_context, program) = p465_security_contexts(
+        9800, 9801, relation, equivalence, entity_type, source_fields, target_fields, &mut registry,
+    );
+    let (second_source_context, _, second_program) = p465_security_contexts(
+        9801, 9802, relation, equivalence, entity_type, target_fields, final_fields, &mut registry,
+    );
+    assert_eq!(second_source_context, target_context);
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(9800),
+        &source_context,
+        &registry,
+        p465_security_state(entity_type, source_fields, relation, entity, [100, 0, 7]),
+    ).unwrap();
+    let runtime = create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+
+    let mut source_after_state = source.state().clone();
+    source_after_state.model.fields.insert((source_fields[0], entity), Value::I64(200));
+    source_after_state.model.fields.insert((source_fields[1], entity), Value::I64(1));
+    let source_after = kernel_revision::Revision::build(
+        RevisionId::new(98_099), &source_context, &registry, source_after_state,
+    ).unwrap();
+    let client_delta = DurableModelDelta::between(source.state(), source_after.state());
+    let guard = RuntimeGuardObservationFootprint::new(
+        source.id(),
+        [RuntimeHistoryCoordinate::Field { field: source_fields[2], owner: entity }],
+    ).unwrap();
+
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport.transport_revision(&source, RevisionId::new(9801), &registry).unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_817)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_818)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime.migrate_schema(
+        ClientTransactionId::new(0x9800),
+        &FullRevisionTransitionRequest { target_revision: &migrated, registry: &registry },
+        &program,
+        &complement,
+    ).unwrap();
+
+    let digest = kernel_durability::ClientIntentGuardDigest::canonical(b"security-generation==7");
+    let tx = ClientTransactionId::new(0x9801);
+    let request = SchemaAwareFieldTransitionRequest {
+        formation_revision: source.id(),
+        formation_semantic_revision: source_context.revision(),
+        client_model_delta: &client_delta,
+        guard_observation: Some(&guard),
+        client_guard_digest: Some(digest),
+    };
+    let outcome = runtime.commit_schema_aware_field_intent(tx, &request).unwrap();
+    assert!(matches!(outcome, DurableRuntimeCommitOutcome::Committed(_)));
+    let head = runtime.snapshot().unwrap();
+    assert_eq!(head.revision().state().model.fields[&(target_fields[0], entity)], Value::I64(200));
+    assert_eq!(head.revision().state().model.fields[&(target_fields[1], entity)], Value::I64(1));
+    assert_eq!(head.revision().state().model.fields[&(target_fields[2], entity)], Value::I64(7));
+    drop(head);
+
+    // Advance the realized world through another schema epoch. Retry identity must
+    // remain the original A intent and must not be rebound to B or C semantics.
+    let current = runtime.snapshot().unwrap().revision().clone();
+    let second_transport = second_program.verify(&second_source_context, &registry).unwrap();
+    let migrated_again = second_transport
+        .transport_revision(&current, RevisionId::new(9803), &registry)
+        .unwrap();
+    let second_complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: second_source_context.schema.revision,
+            target_schema: second_program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_827)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_828)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime.migrate_schema(
+        ClientTransactionId::new(0x9802),
+        &FullRevisionTransitionRequest { target_revision: &migrated_again, registry: &registry },
+        &second_program,
+        &second_complement,
+    ).unwrap();
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+
+    // Fresh A intent after restart must use retained per-epoch action roots, not
+    // replay the A/B causal segments. It changes a coordinate untouched by the
+    // earlier transported intent, so the exact transport is admissible.
+    let mut late_source_state = source.state().clone();
+    late_source_state
+        .model
+        .fields
+        .insert((source_fields[2], entity), Value::I64(9));
+    let late_delta = DurableModelDelta::between(source.state(), &late_source_state);
+    let late = reopened
+        .commit_schema_aware_field_intent(
+            ClientTransactionId::new(0x9803),
+            &SchemaAwareFieldTransitionRequest {
+                formation_revision: source.id(),
+                formation_semantic_revision: source_context.revision(),
+                client_model_delta: &late_delta,
+                guard_observation: None,
+                client_guard_digest: None,
+            },
+        )
+        .unwrap();
+    assert!(matches!(late, DurableRuntimeCommitOutcome::Committed(_)));
+    assert_eq!(
+        reopened.snapshot().unwrap().revision().state().model.fields[&(final_fields[2], entity)],
+        Value::I64(9),
+    );
+
+    let retry = reopened.commit_schema_aware_field_intent(tx, &request).unwrap();
+    assert!(matches!(retry, DurableRuntimeCommitOutcome::AlreadyCommitted { .. }));
+    assert_eq!(
+        reopened.snapshot().unwrap().revision().id(),
+        RevisionId::new(migrated_again.id().raw() + 1),
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn p465_schema_aware_field_walker_rejects_guard_only_target_change() {
+    let dir = durable_test_dir("p465-schema-aware-field-guard-conflict");
+    let relation = sid(9_821);
+    let equivalence = sid(9_822);
+    let entity_type = sid(9_823);
+    let source_fields = [sid(9_824), sid(9_825), sid(9_826)];
+    let target_fields = [sid(9_834), sid(9_835), sid(9_836)];
+    let entity = EntityId::new(9820);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, _, program) = p465_security_contexts(
+        9820, 9821, relation, equivalence, entity_type, source_fields, target_fields, &mut registry,
+    );
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(9820), &source_context, &registry,
+        p465_security_state(entity_type, source_fields, relation, entity, [100, 0, 7]),
+    ).unwrap();
+    let runtime = create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+    let mut source_after_state = source.state().clone();
+    source_after_state.model.fields.insert((source_fields[0], entity), Value::I64(200));
+    source_after_state.model.fields.insert((source_fields[1], entity), Value::I64(1));
+    let source_after = kernel_revision::Revision::build(RevisionId::new(98_299), &source_context, &registry, source_after_state).unwrap();
+    let client_delta = DurableModelDelta::between(source.state(), source_after.state());
+    let guard = RuntimeGuardObservationFootprint::new(
+        source.id(), [RuntimeHistoryCoordinate::Field { field: source_fields[2], owner: entity }],
+    ).unwrap();
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport.transport_revision(&source, RevisionId::new(9821), &registry).unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_837)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_838)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime.migrate_schema(ClientTransactionId::new(0x9820), &FullRevisionTransitionRequest { target_revision: &migrated, registry: &registry }, &program, &complement).unwrap();
+
+    let current = runtime.snapshot().unwrap().revision().clone();
+    let mut changed_state = current.state().clone();
+    changed_state.model.fields.insert((target_fields[2], entity), Value::I64(8));
+    let changed = kernel_revision::Revision::build(RevisionId::new(9822), current.semantic_context(), &registry, changed_state).unwrap();
+    let changed_delta = DurableModelDelta::between(current.state(), changed.state());
+    let changed_complement = DurableModelDelta::between(changed.state(), current.state());
+    runtime.commit_mixed_revision(
+        ClientTransactionId::new(0x9821),
+        &MixedRevisionTransitionRequest {
+            source_revision: current.id(), target_revision: &changed, mutations: &[],
+            model_delta: &changed_delta, model_complement: &changed_complement, registry: &registry,
+        },
+    ).unwrap();
+
+    let result = runtime.commit_schema_aware_field_intent(
+        ClientTransactionId::new(0x9822),
+        &SchemaAwareFieldTransitionRequest {
+            formation_revision: source.id(), formation_semantic_revision: source_context.revision(),
+            client_model_delta: &client_delta, guard_observation: Some(&guard),
+            client_guard_digest: Some(kernel_durability::ClientIntentGuardDigest::canonical(b"security-generation==7")),
+        },
+    );
+    assert!(matches!(result, Err(DurableRuntimeCommitError::GuardDependencyConflict(_))));
+    assert_eq!(runtime.snapshot().unwrap().revision().id(), changed.id());
+    drop(runtime);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "diagnostic retained-epoch index benchmark"]
+fn benchmark_p473_retained_epoch_first_conflict_is_history_depth_flat() {
+    let iterations = 50_000_u64;
+    let shallow = benchmark_retained_epoch_first_conflict_for_test(1_000, iterations);
+    let deep = benchmark_retained_epoch_first_conflict_for_test(100_000, iterations);
+    eprintln!(
+        "P473 retained epoch first-conflict lookup: depth=1k {:?}, depth=100k {:?}, iterations={}",
+        shallow, deep, iterations,
+    );
 }

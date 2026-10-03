@@ -574,6 +574,7 @@ dependencies = [
  "kernel-identity",
  "kernel-lifecycle",
  "kernel-model",
+ "kernel-query",
  "kernel-schema",
  "kernel-semantics",
  "kernel-types",
@@ -632,8 +633,10 @@ version = "0.1.0"
 name = "kernel-validation"
 version = "0.1.0"
 dependencies = [
+ "kernel-aggregate",
  "kernel-identity",
  "kernel-model",
+ "kernel-query",
  "kernel-schema",
  "kernel-semantics",
  "kernel-types",

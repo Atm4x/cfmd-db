@@ -5,7 +5,6 @@ impl Plan {
     }
 
     #[must_use]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn lower_with_catalog(expr: &RelExpr, catalog: &PhysicalCatalog) -> Self {
         match expr {
             RelExpr::Scan(relation) => Self::Scan {

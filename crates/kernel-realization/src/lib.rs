@@ -436,10 +436,8 @@ impl RealizationRoot {
             }
         };
 
-        let mut state = DatabaseState {
-            lifecycle: lifecycle.into(),
-            ..DatabaseState::default()
-        };
+        let mut state = DatabaseState::default();
+        state.lifecycle = lifecycle.into();
 
         for (&semantic, &atom) in &self.carriers {
             match atom_payload(atoms, atom)? {
@@ -626,7 +624,6 @@ pub enum RealizationError {
     SemanticMismatch,
 }
 
-#[must_use]
 pub fn realize_database_state(state: &DatabaseState) -> (PhysicalAtomStore, RealizationRoot) {
     let mut atoms = PhysicalAtomStore::default();
     let lifecycle = atoms.insert(PhysicalAtomPayload::Lifecycle((*state.lifecycle).clone()));
@@ -672,10 +669,6 @@ pub fn realize_database_state(state: &DatabaseState) -> (PhysicalAtomStore, Real
     )
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 pub fn compose_schema_migration(
     atoms: &PhysicalAtomStore,
     source_root: &RealizationRoot,

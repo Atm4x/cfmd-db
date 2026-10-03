@@ -18,9 +18,8 @@ use super::native_relation::{
 use super::recovery::recover_runtime_bundle_with_policy_and_cores;
 use super::storage_impl::UnifiedObservableAdvisorInputs;
 use super::storage_impl::test_support::{
-    I64IndexStateTestExt as _, PhysicalStoreTestExt as _, SemanticIndexStateTestExt as _,
-    build_i64_index_state_for_test, native_semantic_column_work_units,
-    semantic_index_estimated_retained_bytes,
+    I64IndexStateTestExt as _, PhysicalStoreTestExt as _, build_i64_index_state_for_test,
+    native_semantic_column_work_units,
 };
 
 // Mechanical Pass167 test decomposition: textual includes preserve one shared test namespace.

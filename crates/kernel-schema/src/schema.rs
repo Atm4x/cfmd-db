@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_types::{SchemaRevisionId, SemanticId};
 
 use crate::{
-    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, RuleValueExpr,
-    SemanticRuleExpr, SemanticRuleTypeError, StructuralEquivalenceDef, StructuralOrderingDef,
-    SubtypeClosure, Symbol, TypeError, TypeExpr,
+    CapabilityDef, FieldDef, FieldRule, ModelRuleExpr, RelationDef, RelationSemantics,
+    RuleValueExpr, SemanticRuleExpr, SemanticRuleTypeError, StructuralEquivalenceDef,
+    StructuralOrderingDef, SubtypeClosure, Symbol, TypeError, TypeExpr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub struct Schema {
     field_rules: BTreeMap<SemanticId, Vec<FieldRule>>,
     relation_column_rules: BTreeMap<(SemanticId, SemanticId), Vec<FieldRule>>,
     entity_rules: BTreeMap<SemanticId, Vec<SemanticRuleExpr>>,
+    model_rules: Vec<ModelRuleExpr>,
     relation_column_ids: BTreeMap<SemanticId, Vec<SemanticId>>,
     relations: BTreeMap<SemanticId, RelationDef>,
     structural_equivalences: BTreeMap<SemanticId, StructuralEquivalenceDef>,
@@ -29,14 +30,14 @@ pub struct Schema {
 fn validate_field_rule_type(rule: &FieldRule, ty: &TypeExpr) -> Result<(), SchemaError> {
     match rule.expression().validate_for_input(ty) {
         Ok(()) => Ok(()),
+        Err(crate::SemanticRuleTypeError::TypeMismatch) => Err(SchemaError::FieldRuleTypeMismatch),
         Err(crate::SemanticRuleTypeError::InvalidBounds) => {
             Err(SchemaError::InvalidFieldRuleBounds)
         }
-        Err(
-            crate::SemanticRuleTypeError::TypeMismatch
-            | crate::SemanticRuleTypeError::UnknownField(_)
-            | crate::SemanticRuleTypeError::FieldOutsideOwner { .. },
-        ) => Err(SchemaError::FieldRuleTypeMismatch),
+        Err(crate::SemanticRuleTypeError::UnknownField(_))
+        | Err(crate::SemanticRuleTypeError::FieldOutsideOwner { .. }) => {
+            Err(SchemaError::FieldRuleTypeMismatch)
+        }
     }
 }
 
@@ -52,6 +53,7 @@ impl Schema {
             field_rules: BTreeMap::new(),
             relation_column_rules: BTreeMap::new(),
             entity_rules: BTreeMap::new(),
+            model_rules: Vec::new(),
             relation_column_ids: BTreeMap::new(),
             relations: BTreeMap::new(),
             structural_equivalences: BTreeMap::new(),
@@ -151,6 +153,60 @@ impl Schema {
         self.entity_rules
             .iter()
             .flat_map(|(&owner, rules)| rules.iter().map(move |rule| (owner, rule)))
+    }
+
+    pub fn add_model_rule(&mut self, rule: ModelRuleExpr) -> Result<(), SchemaError> {
+        match &rule {
+            ModelRuleExpr::RelationCardinality { relation, min, max } => {
+                if self.relation(*relation).is_none() {
+                    return Err(SchemaError::UnknownRelationForRule(*relation));
+                }
+                if max.is_some_and(|max| max < *min) {
+                    return Err(SchemaError::InvalidFieldRuleBounds);
+                }
+            }
+            ModelRuleExpr::RelationExists {
+                relation,
+                predicate,
+            }
+            | ModelRuleExpr::RelationAll {
+                relation,
+                predicate,
+            } => {
+                if self.relation(*relation).is_none() {
+                    return Err(SchemaError::UnknownRelationForRule(*relation));
+                }
+                self.validate_relation_row_rule(*relation, predicate)?;
+            }
+            ModelRuleExpr::RelationExactF64SumRange {
+                relation,
+                column,
+                min,
+                max,
+            } => {
+                if self.relation(*relation).is_none() {
+                    return Err(SchemaError::UnknownRelationForRule(*relation));
+                }
+                if self.relation_column_type(*relation, *column)
+                    != Some(&TypeExpr::Scalar(crate::ScalarType::F64))
+                {
+                    return Err(SchemaError::EntityRuleTypeMismatch);
+                }
+                if min
+                    .zip(*max)
+                    .is_some_and(|(min, max)| min.value() > max.value())
+                {
+                    return Err(SchemaError::InvalidFieldRuleBounds);
+                }
+            }
+        }
+        self.model_rules.push(rule);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn model_rules(&self) -> &[ModelRuleExpr] {
+        &self.model_rules
     }
 
     pub fn validate_relation_row_rule(

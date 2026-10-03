@@ -9,13 +9,13 @@ fn multi_relation_revision_publishes_one_coherent_join_snapshot() {
             relation: left,
             delta: &left_delta,
         object_field_writes: &[],
-        authorization: kernel_durability::DurableRelationAuthorization::default(),
+        authorization: Default::default(),
         },
         RevisionRelationMutation {
             relation: right,
             delta: &right_delta,
         object_field_writes: &[],
-        authorization: kernel_durability::DurableRelationAuthorization::default(),
+        authorization: Default::default(),
         },
     ];
     let before = runtime.clone_for_test();
@@ -65,13 +65,13 @@ fn failure_in_second_relation_of_batch_leaves_live_bundle_unchanged() {
             relation: left,
             delta: &left_delta,
         object_field_writes: &[],
-        authorization: kernel_durability::DurableRelationAuthorization::default(),
+        authorization: Default::default(),
         },
         RevisionRelationMutation {
             relation: right,
             delta: &invalid_right_delta,
         object_field_writes: &[],
-        authorization: kernel_durability::DurableRelationAuthorization::default(),
+        authorization: Default::default(),
         },
     ];
     let target = revision_with_same_state(&runtime, 211, &registry);
@@ -99,13 +99,13 @@ fn duplicate_relation_in_revision_batch_is_rejected_before_prepare() {
             relation,
             delta: &first,
         object_field_writes: &[],
-        authorization: kernel_durability::DurableRelationAuthorization::default(),
+        authorization: Default::default(),
         },
         RevisionRelationMutation {
             relation,
             delta: &second,
         object_field_writes: &[],
-        authorization: kernel_durability::DurableRelationAuthorization::default(),
+        authorization: Default::default(),
         },
     ];
     let target = revision_with_same_state(&runtime, 221, &registry);
@@ -748,7 +748,7 @@ fn text_semantic_index_fixture() -> (
         )
         .unwrap();
     store
-        .install_semantic_index(
+        .install_observable_atom_state(
             SemanticIndexBinding::single(relation, binding, 0, equivalence),
             &context,
             &registry,
@@ -758,7 +758,7 @@ fn text_semantic_index_fixture() -> (
 }
 
 #[test]
-fn observable_atom_state_matches_legacy_semantic_index_and_statistics_views() {
+fn observable_atom_state_matches_statistics_view() {
     let (context, registry, relation, equivalence, layout, mut store) =
         text_semantic_index_fixture();
     let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
@@ -770,21 +770,10 @@ fn observable_atom_state_matches_legacy_semantic_index_and_statistics_views() {
         .unwrap();
 
     let value = Value::Text("a".into());
-    let mut legacy = store
-        .semantic_index(&binding)
-        .unwrap()
-        .probe_value(&value, &context, &registry)
-        .unwrap()
-        .unwrap()
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
-    let mut atom_rows = store
+    let atom_rows = store
         .observable_atom_probe_value(&binding, 0, &value, &context, &registry)
         .unwrap();
-    legacy.sort_unstable();
-    atom_rows.sort_unstable();
-    assert_eq!(atom_rows, legacy);
+    assert_eq!(atom_rows.len(), 2);
     assert_eq!(
         store
             .observable_atom_count_value(&binding, 0, &value, &context, &registry)
@@ -798,9 +787,8 @@ fn observable_atom_state_matches_legacy_semantic_index_and_statistics_views() {
     assert_eq!(violations.witness_count(), 1);
     assert_eq!(violations.iter().next().map(|(_, mass)| mass), Some(1));
 
-    // SAMF is now an execution capability in its own right. Legacy index/statistics
-    // objects remain independent adapters/oracles rather than owners of the SAMF state.
-    store.remove_semantic_index(&binding);
+    // SAMF remains the execution capability and can serve the exact statistics view
+    // after the independently materialized statistics summary is removed.
     store.remove_semantic_statistics(&binding);
     assert_eq!(
         store
@@ -906,7 +894,6 @@ fn observable_atom_state_rejects_gamma_drift_before_relation_mutation() {
     store
         .install_observable_atom_state(binding.clone(), &context, &registry)
         .unwrap();
-    store.remove_semantic_index(&binding);
     let before = store.clone();
 
     let mut changed = context.clone();
@@ -1015,7 +1002,7 @@ fn semantic_statistics_are_invalidated_by_gamma_change() {
     let (context, mut registry, relation, equivalence, layout, mut store) =
         text_semantic_index_fixture();
     let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
-    store.remove_semantic_index(&binding);
+    store.remove_observable_atom_state(&binding);
     let statistics = store
         .install_semantic_statistics(binding.clone(), &context, &registry)
         .unwrap();
@@ -1233,7 +1220,7 @@ fn join_project_reuses_persisted_semantic_index_before_building_ephemeral_i64() 
         )
         .unwrap();
     store
-        .install_semantic_index(
+        .install_observable_atom_state(
             SemanticIndexBinding::single(relation, layout, 0, equivalence),
             &context,
             &registry,

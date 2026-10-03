@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use kernel_model::{DatabaseState, FiniteModel};
-use kernel_query::{ExactQuery, QueryTypeError, RelExpr, RelQueryError};
+use kernel_model::{DatabaseState, FiniteModel, Value};
+use kernel_query::{ExactQuery, QueryTypeError, RelExpr, RelQueryError, RelationDelta};
 use kernel_schema::SemanticContext;
 use kernel_semantics::SemanticRegistry;
+use kernel_types::EntityId;
 
 use crate::TransportError;
 
@@ -398,10 +399,6 @@ struct PreparedMigrationColumnRewrite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Preserve inline state ownership without adding allocations to this representation."
-)]
 enum PreparedMigrationRelationRewrite {
     Query {
         rewrite: PreparedRelationRewrite,
@@ -552,10 +549,6 @@ pub struct SchemaMigrationTransport {
 }
 
 impl SchemaMigrationTransport {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     pub fn verify(
         source: &SemanticContext,
         target: &SemanticContext,
@@ -833,13 +826,256 @@ impl SchemaMigrationTransport {
             })
     }
 
-    /// Computes the exact source-epoch relation set that must remain readable
-    /// while the supplied target relations are already present natively.
-    ///
-    /// `native_target_relations` is intentionally an input from physical
-    /// authority rather than state owned by the migration calculus. This keeps
-    /// migration progress derivable from actual stored coordinates and avoids
-    /// a second mutable progress journal.
+    /// Transports passive field-observation dependencies through the verified
+    /// migration provenance. A source field maps to every target field whose
+    /// deterministic rewrite reads it; definitionally unchanged fields map to
+    /// themselves. Dropped/unobservable dependencies fail closed.
+    pub fn transport_field_dependencies_exact(
+        &self,
+        source_fields: &BTreeSet<kernel_types::SemanticId>,
+    ) -> Result<BTreeSet<kernel_types::SemanticId>, TransportError> {
+        let mut target_fields = BTreeSet::new();
+        for source_field in source_fields {
+            if self.source.schema.field(*source_field).is_none() {
+                return Err(TransportError::UnknownSourceField(*source_field));
+            }
+            let mut represented = false;
+            if self.field_passthrough.contains(source_field) {
+                target_fields.insert(*source_field);
+                represented = true;
+            }
+            for rewrite in &self.field_rewrites {
+                if rewrite.source_fields.contains(source_field) {
+                    target_fields.insert(rewrite.target_field);
+                    represented = true;
+                }
+            }
+            if !represented {
+                return Err(TransportError::UnrepresentableSourceFieldDependency(
+                    *source_field,
+                ));
+            }
+        }
+        Ok(target_fields)
+    }
+
+    /// Coordinate-preserving form of `transport_field_dependencies_exact`.
+    /// Entity identity is semantic identity, so a field dependency fan-out
+    /// keeps the same owner while only the verified field coordinate changes.
+    pub fn transport_field_coordinate_dependencies_exact(
+        &self,
+        source_coordinates: &BTreeSet<(kernel_types::SemanticId, EntityId)>,
+    ) -> Result<BTreeSet<(kernel_types::SemanticId, EntityId)>, TransportError> {
+        let mut target_coordinates = BTreeSet::new();
+        for (source_field, owner) in source_coordinates {
+            for target_field in
+                self.transport_field_dependencies_exact(&BTreeSet::from([*source_field]))?
+            {
+                target_coordinates.insert((target_field, *owner));
+            }
+        }
+        Ok(target_coordinates)
+    }
+
+    /// Transports one exact relation delta without materializing either source
+    /// or target relation. Passthrough relations remain identical; row-local
+    /// rewrites transform only inserted/removed rows. Any general relational
+    /// rewrite depending on the source relation fails closed because its output
+    /// delta may depend on the wider source world.
+    pub fn transport_relation_delta_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+        delta: &RelationDelta,
+        registry: &SemanticRegistry,
+    ) -> Result<Vec<(kernel_types::SemanticId, RelationDelta)>, TransportError> {
+        let source_type = RelExpr::Scan(source_relation)
+            .typecheck(&self.source, registry)
+            .map_err(TransportError::RelationTransformType)?;
+        if source_type != delta.result_type {
+            return Err(TransportError::SourceRelationDeltaTypeMismatch(
+                source_relation,
+            ));
+        }
+        if self.relation_passthrough.contains(&source_relation) {
+            return Ok(vec![(source_relation, delta.clone())]);
+        }
+
+        for rewrite in &self.relation_rewrites {
+            if let PreparedMigrationRelationRewrite::Query {
+                rewrite,
+                source_relations,
+            } = rewrite
+                && source_relations.contains(&source_relation)
+            {
+                return Err(TransportError::MigrationSliceNotRowLocal(
+                    rewrite.target_relation,
+                ));
+            }
+        }
+
+        let mut out = Vec::new();
+        for rewrite in &self.relation_rewrites {
+            let PreparedMigrationRelationRewrite::Rows {
+                source_relation: rewrite_source,
+                target_relation,
+                columns,
+            } = rewrite
+            else {
+                continue;
+            };
+            if *rewrite_source != source_relation {
+                continue;
+            }
+            let transform_row =
+                |source_row: &kernel_query::Row| -> Result<kernel_query::Row, TransportError> {
+                    let mut target_row = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        let mut input = BTreeMap::new();
+                        for (source_column_id, source_ordinal) in &column.source_columns {
+                            let value = source_row.get(*source_ordinal).ok_or(
+                                TransportError::UnknownSourceMigrationColumn(
+                                    source_relation,
+                                    *source_column_id,
+                                ),
+                            )?;
+                            input.insert(*source_column_id, value.clone());
+                        }
+                        target_row.push(
+                            column
+                                .transform
+                                .evaluate(&Value::Product(input))
+                                .map_err(TransportError::TransformExecution)?,
+                        );
+                    }
+                    Ok(target_row)
+                };
+            let inserted = delta
+                .inserted
+                .iter()
+                .map(transform_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            let removed = delta
+                .removed
+                .iter()
+                .map(transform_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            let result_type = RelExpr::Scan(*target_relation)
+                .typecheck(&self.target, registry)
+                .map_err(TransportError::RelationTransformType)?;
+            out.push((
+                *target_relation,
+                RelationDelta {
+                    inserted,
+                    removed,
+                    result_type,
+                },
+            ));
+        }
+        if out.is_empty() {
+            return Err(TransportError::UnrepresentableSourceRelationEffect(
+                source_relation,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Transports exact field assignments with bounded work over only affected
+    /// rewrite inputs. Returned dependencies are untouched source fields whose
+    /// values were read to evaluate a merge/rewrite and therefore must remain
+    /// observation-stable until the migration boundary.
+    pub fn transport_field_updates_exact(
+        &self,
+        source_state: &DatabaseState,
+        updates: &[(kernel_types::SemanticId, EntityId, Option<Value>)],
+    ) -> Result<
+        (
+            Vec<(kernel_types::SemanticId, EntityId, Option<Value>)>,
+            BTreeSet<(kernel_types::SemanticId, EntityId)>,
+        ),
+        TransportError,
+    > {
+        self.transport_field_updates_from_root_exact(&source_state.model.fields, updates)
+    }
+
+    /// Root-preserving counterpart of `transport_field_updates_exact`. The
+    /// immutable COW field map is sufficient proof material for field transport;
+    /// callers do not need to resurrect a full historical `DatabaseState`.
+    pub fn transport_field_updates_from_root_exact(
+        &self,
+        source_fields: &kernel_model::CowMap<(kernel_types::SemanticId, EntityId), Value>,
+        updates: &[(kernel_types::SemanticId, EntityId, Option<Value>)],
+    ) -> Result<
+        (
+            Vec<(kernel_types::SemanticId, EntityId, Option<Value>)>,
+            BTreeSet<(kernel_types::SemanticId, EntityId)>,
+        ),
+        TransportError,
+    > {
+        let updates_by_key = updates
+            .iter()
+            .map(|(field, owner, value)| ((*field, *owner), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut target = BTreeMap::new();
+        let mut dependencies = BTreeSet::new();
+
+        for ((field, owner), value) in &updates_by_key {
+            if self.field_passthrough.contains(field) {
+                target.insert((*field, *owner), value.clone());
+            }
+        }
+
+        for rewrite in &self.field_rewrites {
+            let owners = updates_by_key
+                .keys()
+                .filter_map(|(field, owner)| {
+                    rewrite.source_fields.contains(field).then_some(*owner)
+                })
+                .collect::<BTreeSet<_>>();
+            for owner in owners {
+                let mut input = BTreeMap::new();
+                for source_field in &rewrite.source_fields {
+                    let value = if let Some(value) = updates_by_key.get(&(*source_field, owner)) {
+                        value
+                            .clone()
+                            .ok_or(TransportError::MissingMigrationSourceValue(*source_field))?
+                    } else {
+                        dependencies.insert((*source_field, owner));
+                        source_fields
+                            .get(&(*source_field, owner))
+                            .cloned()
+                            .ok_or(TransportError::MissingMigrationSourceValue(*source_field))?
+                    };
+                    input.insert(*source_field, value);
+                }
+                let value = rewrite
+                    .transform
+                    .evaluate(&Value::Product(input))
+                    .map_err(TransportError::TransformExecution)?;
+                target.insert((rewrite.target_field, owner), Some(value));
+            }
+        }
+
+        for (field, owner, _) in updates {
+            let represented = self.field_passthrough.contains(field)
+                || self
+                    .field_rewrites
+                    .iter()
+                    .any(|rewrite| rewrite.source_fields.contains(field));
+            if !represented {
+                return Err(TransportError::UnrepresentableSourceFieldDependency(*field));
+            }
+            let _ = owner;
+        }
+
+        Ok((
+            target
+                .into_iter()
+                .map(|((field, owner), value)| (field, owner, value))
+                .collect(),
+            dependencies,
+        ))
+    }
+
     pub fn required_source_relations(
         &self,
         native_target_relations: &BTreeSet<kernel_types::SemanticId>,

@@ -36,6 +36,155 @@ pub(crate) struct TransactionRequirement {
     pub(crate) expression: SemanticRuleExpr,
 }
 
+fn push_len(out: &mut Vec<u8>, len: usize) {
+    out.extend_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+}
+
+fn push_text(out: &mut Vec<u8>, text: &str) {
+    push_len(out, text.len());
+    out.extend_from_slice(text.as_bytes());
+}
+
+fn encode_rule_value(out: &mut Vec<u8>, value: &crate::RuleValueExpr) {
+    match value {
+        crate::RuleValueExpr::Input => out.push(0),
+        crate::RuleValueExpr::Field(field) => {
+            out.push(1);
+            out.extend_from_slice(&field.raw().to_le_bytes());
+        }
+    }
+}
+
+fn encode_text_pattern(out: &mut Vec<u8>, pattern: &crate::TextPattern) {
+    match pattern {
+        crate::TextPattern::Never => out.push(0),
+        crate::TextPattern::Empty => out.push(1),
+        crate::TextPattern::Literal(text) => {
+            out.push(2);
+            push_text(out, text);
+        }
+        crate::TextPattern::AnyScalar => out.push(3),
+        crate::TextPattern::Concat(parts) => {
+            out.push(4);
+            push_len(out, parts.len());
+            for part in parts {
+                encode_text_pattern(out, part);
+            }
+        }
+        crate::TextPattern::Alternate(parts) => {
+            out.push(5);
+            let mut frames = parts
+                .iter()
+                .map(|part| {
+                    let mut frame = Vec::new();
+                    encode_text_pattern(&mut frame, part);
+                    frame
+                })
+                .collect::<Vec<_>>();
+            frames.sort();
+            frames.dedup();
+            push_len(out, frames.len());
+            for frame in frames {
+                push_len(out, frame.len());
+                out.extend_from_slice(&frame);
+            }
+        }
+        crate::TextPattern::ZeroOrMore(pattern) => {
+            out.push(6);
+            encode_text_pattern(out, pattern);
+        }
+    }
+}
+
+fn encode_rule_expr(out: &mut Vec<u8>, expression: &SemanticRuleExpr) {
+    match expression {
+        SemanticRuleExpr::True => out.push(0),
+        SemanticRuleExpr::False => out.push(1),
+        SemanticRuleExpr::And(rules) | SemanticRuleExpr::Or(rules) => {
+            out.push(if matches!(expression, SemanticRuleExpr::And(_)) {
+                2
+            } else {
+                3
+            });
+            let mut frames = rules
+                .iter()
+                .map(|rule| {
+                    let mut frame = Vec::new();
+                    encode_rule_expr(&mut frame, rule);
+                    frame
+                })
+                .collect::<Vec<_>>();
+            frames.sort();
+            frames.dedup();
+            push_len(out, frames.len());
+            for frame in frames {
+                push_len(out, frame.len());
+                out.extend_from_slice(&frame);
+            }
+        }
+        SemanticRuleExpr::Not(rule) => {
+            out.push(4);
+            encode_rule_expr(out, rule);
+        }
+        SemanticRuleExpr::I64Range { value, min, max } => {
+            out.push(5);
+            encode_rule_value(out, value);
+            match min {
+                None => out.push(0),
+                Some(value) => {
+                    out.push(1);
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            match max {
+                None => out.push(0),
+                Some(value) => {
+                    out.push(1);
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        SemanticRuleExpr::TextLength { value, min, max } => {
+            out.push(6);
+            encode_rule_value(out, value);
+            out.extend_from_slice(&u64::try_from(*min).unwrap_or(u64::MAX).to_le_bytes());
+            match max {
+                None => out.push(0),
+                Some(value) => {
+                    out.push(1);
+                    out.extend_from_slice(&u64::try_from(*value).unwrap_or(u64::MAX).to_le_bytes());
+                }
+            }
+        }
+        SemanticRuleExpr::TextOneOf { value, allowed } => {
+            out.push(7);
+            encode_rule_value(out, value);
+            push_len(out, allowed.len());
+            for text in allowed {
+                push_text(out, text);
+            }
+        }
+        SemanticRuleExpr::TextMatches { value, pattern } => {
+            out.push(8);
+            encode_rule_value(out, value);
+            encode_text_pattern(out, pattern);
+        }
+    }
+}
+
+fn encode_requirement(requirement: &TransactionRequirement) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&requirement.relation.raw().to_le_bytes());
+    out.extend_from_slice(&requirement.entity.to_le_bytes());
+    out.extend_from_slice(
+        &u64::try_from(requirement.identity_column)
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    encode_rule_expr(&mut out, &requirement.expression);
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionReadiness {
     Unbound,
@@ -45,7 +194,7 @@ pub enum TransactionReadiness {
     Rebasable {
         base_revision: RevisionId,
         current_revision: RevisionId,
-        intervening_effects: Vec<u128>,
+        intervening_effect_count: usize,
     },
     SnapshotChanged {
         snapshot_revision: RevisionId,
@@ -96,18 +245,24 @@ impl Transaction {
         }
     }
 
-    pub(crate) fn from_context_with_id(context: ReadContext, id: TransactionId) -> Result<Self> {
-        let plan = context.plan()?;
-        Ok(Self {
-            id: Some(id),
-            context: Some(context),
-            plan: Some(plan),
-            requirements: Vec::new(),
-            basis: TransactionBasis::Adaptive,
-        })
+    /// Selects a caller-stable durable idempotency key before semantic intent is formed.
+    ///
+    /// The key is an orthogonal namespace identity: exact effects and passive requirements remain
+    /// independently compared under it. Configuring a key does not bind an adaptive transaction to
+    /// a database or revision; its first mutation still establishes formation provenance. The same
+    /// configurator is valid for `Transaction::from(snapshot)` before any effect/requirement is added.
+    pub fn with_idempotency_key(mut self, id: TransactionId) -> Result<Self> {
+        if self.id.is_some() || self.plan.is_some() || !self.requirements.is_empty() {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "transaction idempotency key must be selected before effects or requirements are added",
+            ));
+        }
+        self.id = Some(id);
+        Ok(self)
     }
 
-    /// Returns the durable client identity once this transaction contains an exact effect.
+    /// Returns the durable idempotency key once selected/generated.
     #[must_use]
     pub const fn id(&self) -> Option<TransactionId> {
         self.id
@@ -154,16 +309,33 @@ impl Transaction {
             identity_value: entity.into_value(),
             expression,
         });
-        // Requirements are part of client intent even though they are publication guards rather
-        // than durable effects. Rotating the opaque identity prevents a post-build requirement
-        // change from aliasing an earlier retry identity.
-        self.id = None;
-        self.ensure_identity()?;
         Ok(self)
     }
 
     pub(crate) fn requirements(&self) -> &[TransactionRequirement] {
         &self.requirements
+    }
+
+    pub(crate) fn client_guard_digest(&self) -> Option<kernel_durability::ClientIntentGuardDigest> {
+        if self.requirements.is_empty() {
+            return None;
+        }
+        let mut encoded = self
+            .requirements
+            .iter()
+            .map(encode_requirement)
+            .collect::<Vec<_>>();
+        encoded.sort();
+        encoded.dedup();
+        let mut canonical = b"CFMD-TX-REQUIREMENTS-v1\0".to_vec();
+        push_len(&mut canonical, encoded.len());
+        for requirement in encoded {
+            push_len(&mut canonical, requirement.len());
+            canonical.extend_from_slice(&requirement);
+        }
+        Some(kernel_durability::ClientIntentGuardDigest::canonical(
+            &canonical,
+        ))
     }
 
     /// Object-first access to the transaction's bound formation world.

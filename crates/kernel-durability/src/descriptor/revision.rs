@@ -133,13 +133,14 @@ impl DurableRevisionDescriptor {
                 semantic_revision,
                 relation_mutations.clone(),
                 model_delta.clone(),
-                model_complement,
+                model_complement.clone(),
                 registry,
             )?,
             change: DurableRevisionChange::MixedRevision {
                 semantic_revision,
                 relation_mutations,
                 model_delta,
+                model_complement: Some(Box::new(model_complement)),
             },
         })
     }
@@ -224,7 +225,7 @@ impl DurableRevisionDescriptor {
             materializations,
             registry,
         )?;
-        let DurableTransactionIntent::Exact {
+        let DurableTransactionIntent::FullRevision {
             encoded_target_revision,
             materializations: Some(materializations),
             ..

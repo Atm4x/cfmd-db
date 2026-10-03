@@ -1,7 +1,7 @@
 use kernel_types::ClientTransactionId;
 
 use super::DurableRevisionStore;
-use crate::domain::{DurableTransactionIntent, DurableTransactionKey, IdempotencyEpoch};
+use crate::domain::{DurableCommittedTransaction, DurableTransactionKey, IdempotencyEpoch};
 use crate::runtime::{DurabilityError, DurableTransactionOutcome};
 
 impl DurableRevisionStore {
@@ -35,7 +35,7 @@ impl DurableRevisionStore {
     pub fn transaction_intent(
         &self,
         transaction_id: ClientTransactionId,
-    ) -> Option<&DurableTransactionIntent> {
+    ) -> Option<&DurableCommittedTransaction> {
         self.transaction_intent_at(self.current_idempotency_epoch, transaction_id)
     }
 
@@ -44,7 +44,7 @@ impl DurableRevisionStore {
         &self,
         epoch: IdempotencyEpoch,
         transaction_id: ClientTransactionId,
-    ) -> Option<&DurableTransactionIntent> {
+    ) -> Option<&DurableCommittedTransaction> {
         if epoch < self.minimum_retry_epoch {
             return None;
         }

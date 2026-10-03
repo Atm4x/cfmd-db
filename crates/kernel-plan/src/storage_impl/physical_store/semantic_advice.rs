@@ -1,25 +1,4 @@
 impl PhysicalStore {
-    pub fn install_semantic_index(
-        &mut self,
-        index: SemanticIndexBinding,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<(), PhysicalExecutionError> {
-        let relation = self.installed(index.relation, index.layout)?;
-        let state =
-            MaterializedSemanticIndexState::build(index.clone(), relation, context, registry)?;
-        let next_epoch = self
-            .transition_epoch
-            .checked_add(1)
-            .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
-        self.advisor_managed_artifacts_mut()
-            .remove(&UnifiedArtifactId::SemanticIndex(index.clone()));
-        self.semantic_indexes_mut_internal().insert(index, Arc::new(state));
-        self.transition_epoch = next_epoch;
-        self.state_identity = Arc::new(());
-        Ok(())
-    }
-
     pub fn install_observable_atom_state(
         &mut self,
         binding: SemanticIndexBinding,
@@ -72,19 +51,13 @@ impl PhysicalStore {
             )?)
         };
 
-        let retire_legacy_index = self
-            .advisor_managed_artifacts
-            .contains(&UnifiedArtifactId::SemanticIndex(binding.clone()));
         let retire_legacy_statistics = self
             .advisor_managed_artifacts
             .contains(&UnifiedArtifactId::SemanticStatistics(binding.clone()));
         let retire_legacy_quotient = self
             .advisor_managed_artifacts
             .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()));
-        let changed = prepared.is_some()
-            || retire_legacy_index
-            || retire_legacy_statistics
-            || retire_legacy_quotient;
+        let changed = prepared.is_some() || retire_legacy_statistics || retire_legacy_quotient;
         let next_epoch = if changed {
             Some(
                 self.transition_epoch
@@ -121,12 +94,6 @@ impl PhysicalStore {
                 .insert(UnifiedArtifactId::ObservableAtom(binding.clone()));
         }
 
-        if retire_legacy_index {
-            self.semantic_indexes_mut_internal().remove(&binding);
-            self.advisor_managed_artifacts_mut()
-                .remove(&UnifiedArtifactId::SemanticIndex(binding.clone()));
-            report.retired_legacy_indexes.push(binding.clone());
-        }
         if retire_legacy_statistics {
             self.semantic_statistics_mut_internal().remove(&binding);
             self.advisor_managed_artifacts_mut()
@@ -215,82 +182,6 @@ impl PhysicalStore {
         self.observable_atom_states.get(binding).map(Arc::as_ref)
     }
 
-    pub fn advise_semantic_indexes(
-        &mut self,
-        workload: &[SemanticIndexWorkloadSample],
-        policy: SemanticIndexAdvisorPolicy,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<SemanticIndexAdvisorReport, PhysicalExecutionError> {
-        let (selected, managed_key_cells, managed_estimated_bytes, mut report) =
-            semantic_index_advisor_selection(self, workload, policy, context, registry)?;
-        let prepared_states =
-            self.prepare_advised_semantic_indexes(&selected, context, registry)?;
-        let prepared_bindings = prepared_states
-            .iter()
-            .map(|(binding, _)| binding.clone())
-            .collect::<BTreeSet<_>>();
-        let evicted = self
-            .advisor_managed_artifacts
-            .iter()
-            .filter_map(|artifact| match artifact {
-                UnifiedArtifactId::SemanticIndex(binding) if !selected.contains(binding) => {
-                    Some(binding.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let changed = !evicted.is_empty() || !prepared_states.is_empty();
-        let next_epoch = if changed {
-            Some(
-                self.transition_epoch
-                    .checked_add(1)
-                    .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?,
-            )
-        } else {
-            None
-        };
-
-        for binding in &evicted {
-            self.semantic_indexes_mut_internal().remove(binding);
-            self.advisor_managed_artifacts_mut()
-                .remove(&UnifiedArtifactId::SemanticIndex(binding.clone()));
-            report.evicted.push(binding.clone());
-        }
-        for (binding, state) in prepared_states {
-            let existed = self.semantic_indexes.contains_key(&binding);
-            self.semantic_indexes_mut_internal()
-                .insert(binding.clone(), Arc::new(state));
-            self.advisor_managed_artifacts_mut()
-                .insert(UnifiedArtifactId::SemanticIndex(binding.clone()));
-            if existed {
-                report.rebuilt.push(binding);
-            } else {
-                report.created.push(binding);
-            }
-        }
-        for binding in selected {
-            if prepared_bindings.contains(&binding) {
-                continue;
-            }
-            if self
-                .advisor_managed_artifacts
-                .contains(&UnifiedArtifactId::SemanticIndex(binding.clone()))
-            {
-                report.retained.push(binding);
-            } else {
-                report.reused_existing.push(binding);
-            }
-        }
-        if let Some(next_epoch) = next_epoch {
-            self.transition_epoch = next_epoch;
-            self.state_identity = Arc::new(());
-        }
-        report.managed_key_cells = managed_key_cells;
-        report.managed_estimated_bytes = managed_estimated_bytes;
-        Ok(report)
-    }
-
     /// Advises reconstructible Γ-QCN endpoint factors for prepared plans whose current
     /// physical cost model already selects the quotient execution path. This intentionally
     /// does not speculate that building a factor will itself make a currently rejected QCN
@@ -376,34 +267,15 @@ impl PhysicalStore {
         Ok(report)
     }
 
-    fn prepare_advised_semantic_indexes(
-        &self,
-        selected: &BTreeSet<SemanticIndexBinding>,
+    pub(crate) fn ensure_relation_write_occurrence_atom(
+        &mut self,
+        relation: SemanticId,
+        layout: LayoutBinding,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<Vec<(SemanticIndexBinding, MaterializedSemanticIndexState)>, PhysicalExecutionError>
-    {
-        let mut prepared = Vec::new();
-        for binding in selected {
-            let compatible = match self.semantic_indexes.get(binding) {
-                Some(state) => state.compatible_with(context, registry)?,
-                None => false,
-            };
-            if compatible {
-                continue;
-            }
-            let relation = self.installed(binding.relation, binding.layout)?;
-            prepared.push((
-                binding.clone(),
-                MaterializedSemanticIndexState::build(
-                    binding.clone(),
-                    relation,
-                    context,
-                    registry,
-                )?,
-            ));
-        }
-        Ok(prepared)
+    ) -> Result<(), PhysicalExecutionError> {
+        let binding = full_row_occurrence_binding(relation, layout, context)?;
+        self.ensure_full_row_occurrence_atom(&binding, context, registry)
     }
 
     fn ensure_full_row_occurrence_atom(

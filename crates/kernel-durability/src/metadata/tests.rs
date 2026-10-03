@@ -11,11 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 
-fn current_test_transactions() -> BTreeMap<DurableTransactionKey, DurableTransactionIntent> {
+fn current_test_transactions() -> BTreeMap<DurableTransactionKey, DurableCommittedTransaction> {
     [
         (
             DurableTransactionKey::new(IdempotencyEpoch::ZERO, ClientTransactionId::new(11)),
-            DurableTransactionIntent::Exact {
+            DurableTransactionIntent::FullRevision {
                 target_revision: RevisionId::new(12),
                 encoded_target_revision: vec![1, 2, 3],
                 materializations: None,
@@ -24,7 +24,7 @@ fn current_test_transactions() -> BTreeMap<DurableTransactionKey, DurableTransac
         ),
         (
             DurableTransactionKey::new(IdempotencyEpoch::ZERO, ClientTransactionId::new(13)),
-            DurableTransactionIntent::RelationDataExact {
+            DurableTransactionIntent::RelationData {
                 source_revision: RevisionId::new(12),
                 target_revision: RevisionId::new(14),
                 semantic_revision: kernel_types::SemanticRevision::new(
@@ -36,13 +36,22 @@ fn current_test_transactions() -> BTreeMap<DurableTransactionKey, DurableTransac
                     inserted: vec![vec![kernel_model::Value::I64(5)]],
                     removed: Vec::new(),
                     object_field_writes: Vec::new(),
-                    authorization: crate::DurableRelationAuthorization::default(),
+                    authorization: Default::default(),
                 }],
+                client_guard_digest: None,
                 semantic_modules: Vec::new(),
             },
         ),
     ]
-    .into()
+    .into_iter()
+    .map(|(key, intent)| {
+        let target = intent.target_revision();
+        (
+            key,
+            DurableCommittedTransaction::from_descriptor_intent(target, &intent),
+        )
+    })
+    .collect()
 }
 
 #[test]
@@ -128,7 +137,7 @@ fn metadata_roundtrip_covers_all_current_query_variants_and_transactions() {
 #[test]
 fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
     let transaction_id = ClientTransactionId::new(15);
-    let intent = DurableTransactionIntent::RelationRewriteExact {
+    let intent = DurableTransactionIntent::RelationRewrite {
         source_revision: RevisionId::new(14),
         target_revision: RevisionId::new(16),
         semantic_revision: kernel_types::SemanticRevision::new(
@@ -140,7 +149,7 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
             inserted: vec![vec![kernel_model::Value::I64(6)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         rewrite_intents: vec![crate::DurableRelationRewriteIntent {
             relation: SemanticId::new(10),
@@ -160,9 +169,10 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
         historical_epoch_anchors: BTreeMap::new(),
         committed_transactions: BTreeMap::from([(
             DurableTransactionKey::new(IdempotencyEpoch::ZERO, transaction_id),
-            intent.clone(),
+            DurableCommittedTransaction::from_descriptor_intent(RevisionId::new(16), &intent),
         )]),
         semantic_modules: Vec::new(),
+        next_revision_effect_id: 0,
         causal_coverage_root: Some(RevisionId::new(14)),
         revision_effects: BTreeMap::from([(
             RevisionEffectId(transaction_id.raw()),
@@ -171,6 +181,19 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
                 prerequisites: BTreeSet::new(),
                 transaction_epoch: IdempotencyEpoch::ZERO,
                 transaction_id,
+                change: crate::DurableRevisionChange::RelationData {
+                    semantic_revision: kernel_types::SemanticRevision::new(
+                        kernel_types::SchemaRevisionId::new(3),
+                        kernel_types::SemanticEnvId::new(4),
+                    ),
+                    relation_mutations: vec![crate::DurableRelationMutation {
+                        relation: SemanticId::new(10),
+                        inserted: vec![vec![kernel_model::Value::I64(6)]],
+                        removed: Vec::new(),
+                        object_field_writes: Vec::new(),
+                        authorization: Default::default(),
+                    }],
+                },
                 intent,
                 source_revision: RevisionId::new(14),
                 target_revision: RevisionId::new(16),
@@ -190,7 +213,7 @@ fn relation_rewrite_transaction_intent_roundtrips_in_metadata() {
 }
 
 fn current_physical_artifact_specs(eq: SemanticId) -> Vec<DurablePhysicalArtifactSpec> {
-    vec![
+    let mut specs = vec![
         DurablePhysicalArtifactSpec::RelationLayout {
             relation: SemanticId::new(1),
             layout_id: 0x1234,
@@ -202,7 +225,7 @@ fn current_physical_artifact_specs(eq: SemanticId) -> Vec<DurablePhysicalArtifac
             equivalence: eq,
             advisor_managed: false,
         },
-        DurablePhysicalArtifactSpec::SemanticIndex {
+        DurablePhysicalArtifactSpec::ObservableAtom {
             relation: SemanticId::new(1),
             key_parts: vec![DurableSemanticKeyPart {
                 column: 0,
@@ -234,65 +257,22 @@ fn current_physical_artifact_specs(eq: SemanticId) -> Vec<DurablePhysicalArtifac
             }],
             advisor_managed: false,
         },
-    ]
+    ];
+    specs.sort();
+    specs
 }
 
 #[test]
-fn physical_artifact_recipe_v1_remains_decodable() {
-    let relation = SemanticId::new(41);
-    let equivalence = SemanticId::new(42);
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    push_len(&mut bytes, 1).unwrap();
-    bytes.push(0);
-    encode_semantic_artifact_key(
-        &mut bytes,
-        relation,
-        &[DurableSemanticKeyPart {
-            column: 3,
-            equivalence,
-        }],
-        true,
-    )
-    .unwrap();
-
-    let decoded = decode_physical_artifact_specs(&mut Cursor::new(&bytes)).unwrap();
-    assert_eq!(
-        decoded,
-        vec![DurablePhysicalArtifactSpec::SemanticIndex {
-            relation,
-            key_parts: vec![DurableSemanticKeyPart {
-                column: 3,
-                equivalence,
-            }],
-            advisor_managed: true,
-        }]
-    );
-}
-
-#[test]
-fn physical_artifact_recipe_v2_remains_decodable_after_observable_atom_recipe() {
-    let relation = SemanticId::new(51);
-    let equivalence = SemanticId::new(52);
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&2_u16.to_le_bytes());
-    push_len(&mut bytes, 1).unwrap();
-    bytes.push(4);
-    push_u128(&mut bytes, relation.raw());
-    push_u64(&mut bytes, 2);
-    push_u128(&mut bytes, equivalence.raw());
-    bytes.push(1);
-
-    let decoded = decode_physical_artifact_specs(&mut Cursor::new(&bytes)).unwrap();
-    assert_eq!(
-        decoded,
-        vec![DurablePhysicalArtifactSpec::I64Index {
-            relation,
-            key_column: 2,
-            equivalence,
-            advisor_managed: true,
-        }]
-    );
+fn pre_release_physical_artifact_recipe_tags_are_rejected() {
+    for old_tag in [1_u16, 2_u16] {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&old_tag.to_le_bytes());
+        push_len(&mut bytes, 0).unwrap();
+        assert_eq!(
+            decode_physical_artifact_specs(&mut Cursor::new(&bytes)),
+            Err("unsupported physical artifact recipe tag")
+        );
+    }
 }
 
 #[test]
@@ -302,7 +282,7 @@ fn physical_artifact_recipe_collapse_preserves_manual_pin() {
     encode_physical_artifact_specs(
         &mut bytes,
         &[
-            DurablePhysicalArtifactSpec::SemanticIndex {
+            DurablePhysicalArtifactSpec::ObservableAtom {
                 relation: SemanticId::new(77),
                 key_parts: vec![DurableSemanticKeyPart {
                     column: 0,
@@ -310,7 +290,7 @@ fn physical_artifact_recipe_collapse_preserves_manual_pin() {
                 }],
                 advisor_managed: true,
             },
-            DurablePhysicalArtifactSpec::SemanticIndex {
+            DurablePhysicalArtifactSpec::ObservableAtom {
                 relation: SemanticId::new(77),
                 key_parts: vec![DurableSemanticKeyPart {
                     column: 0,
@@ -326,7 +306,7 @@ fn physical_artifact_recipe_collapse_preserves_manual_pin() {
     cursor.finish().unwrap();
     assert_eq!(
         decoded,
-        vec![DurablePhysicalArtifactSpec::SemanticIndex {
+        vec![DurablePhysicalArtifactSpec::ObservableAtom {
             relation: SemanticId::new(77),
             key_parts: vec![DurableSemanticKeyPart {
                 column: 0,
@@ -373,44 +353,41 @@ fn i64_recipe_collapse_preserves_manual_pin() {
 }
 
 #[test]
-fn metadata_v4_decodes_without_physical_artifact_manifest() {
+fn pre_release_metadata_v4_is_rejected() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&4_u16.to_le_bytes());
     encode_materialization_specs(&mut bytes, &[]).unwrap();
     push_len(&mut bytes, 0).unwrap();
     push_len(&mut bytes, 0).unwrap();
-    let decoded = decode(&bytes).unwrap();
-    assert!(decoded.materializations.is_empty());
-    assert!(decoded.physical_artifacts.is_empty());
-    assert!(decoded.committed_transactions.is_empty());
-    assert!(decoded.semantic_modules.is_empty());
+    assert_eq!(
+        decode(&bytes),
+        Err("unsupported pre-release durable metadata format")
+    );
 }
 
 #[test]
-fn metadata_v6_decodes_without_migration_complement_ledger() {
+fn pre_release_metadata_v6_is_rejected() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&6_u16.to_le_bytes());
     encode_materialization_specs(&mut bytes, &[]).unwrap();
     encode_physical_artifact_specs(&mut bytes, &[]).unwrap();
     push_len(&mut bytes, 0).unwrap();
     push_len(&mut bytes, 0).unwrap();
-    let decoded = decode(&bytes).unwrap();
-    assert!(decoded.materializations.is_empty());
-    assert!(decoded.physical_artifacts.is_empty());
-    assert!(decoded.migration_complements.is_empty());
-    assert!(decoded.committed_transactions.is_empty());
-    assert!(decoded.semantic_modules.is_empty());
+    assert_eq!(
+        decode(&bytes),
+        Err("unsupported pre-release durable metadata format")
+    );
 }
 
 #[test]
-fn physical_artifact_recipe_version_is_fail_closed() {
+fn physical_artifact_recipe_tag_is_fail_closed() {
     let mut bytes = Vec::new();
     encode_physical_artifact_specs(&mut bytes, &[]).unwrap();
-    bytes[..2].copy_from_slice(&(PHYSICAL_ARTIFACT_RECIPE_VERSION + 1).to_le_bytes());
+    bytes[..2].copy_from_slice(&(PHYSICAL_ARTIFACT_RECIPE_TAG + 1).to_le_bytes());
     let mut cursor = Cursor::new(&bytes);
     assert_eq!(
         decode_physical_artifact_specs(&mut cursor),
-        Err("unsupported physical artifact recipe version")
+        Err("unsupported physical artifact recipe tag")
     );
 }
 

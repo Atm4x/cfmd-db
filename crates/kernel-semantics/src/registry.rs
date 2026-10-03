@@ -91,6 +91,42 @@ impl SemanticRegistry {
     /// Collects the exact builtin implementations pinned by one semantic
     /// context, sorted by digest and deduplicated.  This is the deployment
     /// manifest persisted by the durability layer.
+    /// Returns every builtin semantic implementation currently installed in
+    /// this registry, canonically ordered by digest. Durability persists this
+    /// deployment authority independently of any one current semantic context.
+    #[must_use]
+    pub fn builtin_module_specs(&self) -> Vec<BuiltinSemanticModuleSpec> {
+        let mut by_digest = BTreeMap::new();
+        for (&digest, implementation) in &self.equivalences {
+            by_digest.insert(
+                digest,
+                BuiltinSemanticModuleSpec::Equivalence {
+                    module: implementation.contract,
+                    implementation_revision: implementation.implementation_revision,
+                },
+            );
+        }
+        for (&digest, implementation) in &self.tokenizers {
+            by_digest.insert(
+                digest,
+                BuiltinSemanticModuleSpec::Tokenizer {
+                    module: implementation.contract,
+                    implementation_revision: implementation.implementation_revision,
+                },
+            );
+        }
+        for (&digest, implementation) in &self.orderings {
+            by_digest.insert(
+                digest,
+                BuiltinSemanticModuleSpec::Ordering {
+                    module: implementation.contract,
+                    implementation_revision: implementation.implementation_revision,
+                },
+            );
+        }
+        by_digest.into_values().collect()
+    }
+
     pub fn builtin_modules_for_context(
         &self,
         context: &SemanticContext,

@@ -68,14 +68,14 @@ impl FiniteModel {
                     relation_rows_to_remove
                         .entry(relation)
                         .or_default()
-                        .extend(rows.iter().copied());
+                        .extend(sensitivity.row_positions(rows));
                 }
             }
             for rows in sensitivity.unresolved.values() {
                 relation_rows_to_remove
                     .entry(relation)
                     .or_default()
-                    .extend(rows.iter().copied());
+                    .extend(sensitivity.row_positions(rows));
             }
         }
 

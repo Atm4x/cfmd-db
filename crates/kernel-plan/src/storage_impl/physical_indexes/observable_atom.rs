@@ -515,17 +515,14 @@ impl MaterializedObservableAtomState {
                 .intern_product_class(candidate.product_observable, classes.clone())
                 .map_err(observable_error_to_physical)?;
             candidate
+                .projection
+                .extend_product_projection_class(&candidate.catalog, atom_class, &classes)
+                .map_err(observable_error_to_physical)?;
+            candidate
                 .fabric
                 .insert(&candidate.catalog, *row_id, atom_class, &classes)
                 .map_err(support_atom_error_to_physical)?;
         }
-        candidate.projection =
-            kernel_semantics::observable::CertifiedSemanticMorphism::product_projection(
-                &candidate.catalog,
-                candidate.product_observable,
-                (0..candidate.observables.len()).collect(),
-            )
-            .map_err(observable_error_to_physical)?;
         *self = candidate;
         Ok(())
     }
@@ -605,129 +602,94 @@ fn support_atom_error_to_physical<RowId>(
     }
 }
 
-// HOSTILE[P161][ACTIVE][MIXED]: primary observable fibers first; LegacyIndex is compatibility.
-pub(super) enum SemanticFiberCapability<'a> {
-    ObservableAtom(&'a MaterializedObservableAtomState),
-    LegacyIndex(&'a MaterializedSemanticIndexState),
-}
+// HOSTILE[P472][ACTIVE][PRIMARY]: SAMF/observable atoms are the only semantic-fiber
+// execution authority. No legacy bucket-index routing remains.
+pub(super) struct SemanticFiberCapability<'a>(&'a MaterializedObservableAtomState);
 
-// HOSTILE[P185][ACTIVE][CLEAN]: persisted semantic probes borrow maintained fibers directly;
-// execution hot paths do not allocate/copy row-id vectors per probe.
-pub(super) enum SemanticFiberProbe<'a> {
-    Observable(
-        <&'a kernel_persistent::PersistentOrdSet<PhysicalRowId> as IntoIterator>::IntoIter,
-    ),
-    Legacy(
-        <&'a kernel_semantic_index::SemanticBucket<PhysicalRowId> as IntoIterator>::IntoIter,
-    ),
-}
+pub(super) struct SemanticFiberProbe<'a>(
+    <&'a kernel_persistent::PersistentOrdSet<PhysicalRowId> as IntoIterator>::IntoIter,
+);
 
 #[derive(Default)]
 pub(super) struct SemanticFiberProbeScratch {
     observable_classes: Vec<kernel_types::EqClassId>,
-    canonical_keys: Vec<kernel_semantics::CanonicalEqKey>,
 }
 
 impl Iterator for SemanticFiberProbe<'_> {
     type Item = PhysicalRowId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Observable(rows) => rows.next().copied(),
-            Self::Legacy(rows) => rows.next().copied(),
-        }
+        self.0.next().copied()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Observable(rows) => rows.size_hint(),
-            Self::Legacy(rows) => rows.size_hint(),
-        }
+        self.0.size_hint()
     }
 }
 
 impl DoubleEndedIterator for SemanticFiberProbe<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Observable(rows) => rows.next_back().copied(),
-            Self::Legacy(rows) => rows.next_back().copied(),
-        }
+        self.0.next_back().copied()
     }
 }
 
 impl ExactSizeIterator for SemanticFiberProbe<'_> {}
 
-impl SemanticFiberCapability<'_> {
+impl<'a> SemanticFiberCapability<'a> {
+    pub(super) const fn new(state: &'a MaterializedObservableAtomState) -> Self {
+        Self(state)
+    }
+
     fn row_count(&self) -> usize {
-        match self {
-            Self::ObservableAtom(state) => state.row_count(),
-            Self::LegacyIndex(state) => state.row_count(),
-        }
+        self.0.row_count()
     }
 
     pub(super) fn distinct_key_count(&self) -> usize {
-        match self {
-            Self::ObservableAtom(state) => state.distinct_key_count(),
-            Self::LegacyIndex(state) => state.distinct_key_count(),
-        }
+        self.0.distinct_key_count()
     }
 
-    // HOSTILE[P189][ACTIVE][CLEAN]: repeated execution probes may reuse the observable
-    // class/canonical-key buffers while preserving borrowed row-id fibers.
-    pub(super) fn probe_values_with_scratch<'a>(
-        &'a self,
+    pub(super) fn probe_values_with_scratch<'s>(
+        &'s self,
         values: &[&Value],
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
         scratch: &mut SemanticFiberProbeScratch,
-    ) -> Result<Option<SemanticFiberProbe<'a>>, PhysicalExecutionError> {
-        match self {
-            Self::ObservableAtom(state) => Ok(state
-                .probe_fiber_iter(
-                    values.iter().copied(),
-                    context,
-                    registry,
-                    &mut scratch.observable_classes,
-                )?
-                .map(|rows| SemanticFiberProbe::Observable(rows.into_iter()))),
-            Self::LegacyIndex(state) => Ok(state
-                .probe_values_with_scratch(values, &mut scratch.canonical_keys)?
-                .map(|bucket| SemanticFiberProbe::Legacy(bucket.into_iter()))),
-        }
+    ) -> Result<Option<SemanticFiberProbe<'s>>, PhysicalExecutionError> {
+        Ok(self
+            .0
+            .probe_fiber_iter(
+                values.iter().copied(),
+                context,
+                registry,
+                &mut scratch.observable_classes,
+            )?
+            .map(|rows| SemanticFiberProbe(rows.into_iter())))
     }
 
-    pub(super) fn probe_row_columns_with_scratch<'a, I>(
-        &'a self,
+    pub(super) fn probe_row_columns_with_scratch<'s, I>(
+        &'s self,
         row: &[Value],
         columns: I,
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
         scratch: &mut SemanticFiberProbeScratch,
-    ) -> Result<Option<SemanticFiberProbe<'a>>, PhysicalExecutionError>
+    ) -> Result<Option<SemanticFiberProbe<'s>>, PhysicalExecutionError>
     where
         I: ExactSizeIterator<Item = usize>,
     {
-        match self {
-            Self::ObservableAtom(state) => Ok(state
-                .probe_row_columns_with_scratch(
-                    row,
-                    columns,
-                    context,
-                    registry,
-                    &mut scratch.observable_classes,
-                )?
-                .map(|rows| SemanticFiberProbe::Observable(rows.into_iter()))),
-            Self::LegacyIndex(state) => Ok(state
-                .probe_row_columns_with_scratch(row, columns, &mut scratch.canonical_keys)?
-                .map(|bucket| SemanticFiberProbe::Legacy(bucket.into_iter()))),
-        }
+        Ok(self
+            .0
+            .probe_row_columns_with_scratch(
+                row,
+                columns,
+                context,
+                registry,
+                &mut scratch.observable_classes,
+            )?
+            .map(|rows| SemanticFiberProbe(rows.into_iter())))
     }
 
     fn single_key_for(&self, row_id: PhysicalRowId) -> Option<kernel_semantics::CanonicalEqKey> {
-        match self {
-            Self::ObservableAtom(state) => state.single_key_for(row_id),
-            Self::LegacyIndex(state) => state.single_key_for(row_id),
-        }
+        self.0.single_key_for(row_id)
     }
 }
-

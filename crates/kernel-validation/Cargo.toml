@@ -5,12 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+kernel-aggregate = { path = "../kernel-aggregate" }
 kernel-identity = { path = "../kernel-identity" }
 kernel-model = { path = "../kernel-model" }
 kernel-schema = { path = "../kernel-schema" }
 kernel-semantics = { path = "../kernel-semantics" }
 kernel-types = { path = "../kernel-types" }
 kernel-violation = { path = "../kernel-violation" }
+
+[dev-dependencies]
+kernel-query = { path = "../kernel-query" }
 
 [lints]
 workspace = true

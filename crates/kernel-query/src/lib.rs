@@ -118,8 +118,8 @@ use relation_state::validate_exact_delta_view_rows;
 pub use relation_state::{
     CertifiedCanonicalRowKey, MaterializedRelDeltaState, MaterializedSetSupportState,
     PreparedRelationRewrite, RelationBaseWitness, RelationDelta, RelationOccurrenceCertificate,
-    RelationRowCanonicalizer, RelationScanOccurrenceSeed, RelationWitnessStorageProbe,
-    RelationWitnessStorageStats, StorageResolvedRelationDelta,
+    RelationRowCanonicalizer, RelationScanOccurrenceSeed, RelationSupportWitness,
+    RelationWitnessStorageProbe, RelationWitnessStorageStats, StorageResolvedRelationDelta,
 };
 pub use topk::MaterializedTopKDeltaState;
 

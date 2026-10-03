@@ -237,6 +237,45 @@ mod tests {
     }
 
     #[test]
+    fn relation_sensitivity_delta_maintains_stable_tokens_and_current_ranks() {
+        let target = EntityId::new(2);
+        let entity_type = SemanticId::new(10);
+        let relation = SemanticId::new(12);
+        let ids = DenseEntityIds::compile(&BTreeSet::from([target])).unwrap();
+        let live_ref = || Value::LiveEntityRef {
+            entity_type,
+            id: target,
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            relation,
+            vec![vec![live_ref()], vec![Value::I64(7)], vec![live_ref()]],
+        );
+
+        let original = LiveRefSensitivityIndex::compile(&model, &ids);
+        let updated = original
+            .with_relation_delta(relation, &[0], &[vec![live_ref()]], &ids)
+            .unwrap();
+
+        assert_eq!(
+            original
+                .consumers(ids.local(target).unwrap())
+                .unwrap()
+                .relation_rows()
+                .get(&relation),
+            Some(&BTreeSet::from([0, 2]))
+        );
+        assert_eq!(
+            updated
+                .consumers(ids.local(target).unwrap())
+                .unwrap()
+                .relation_rows()
+                .get(&relation),
+            Some(&BTreeSet::from([1, 2]))
+        );
+    }
+
+    #[test]
     fn database_state_clone_path_copies_only_the_mutated_relation() {
         let stable_relation = SemanticId::new(700);
         let changed_relation = SemanticId::new(701);
@@ -338,6 +377,128 @@ mod tests {
             ]
         );
         assert!(!appended.has_materialized_projection());
+    }
+
+    #[test]
+    fn relation_sensitivity_dense_delta_preserves_snapshot_and_exact_consumer_positions() {
+        let target = EntityId::new(2);
+        let entity_type = SemanticId::new(10);
+        let relation = SemanticId::new(12);
+        let ids = DenseEntityIds::compile(&BTreeSet::from([target])).unwrap();
+        let live_ref = || Value::LiveEntityRef {
+            entity_type,
+            id: target,
+        };
+        let mut model = FiniteModel::default();
+        model
+            .relations
+            .insert(relation, (0..4_096).map(|_| vec![live_ref()]).collect());
+
+        let original = LiveRefSensitivityIndex::compile(&model, &ids);
+        let updated = original
+            .with_relation_delta(
+                relation,
+                &[0, 2_048, 4_095],
+                &[vec![live_ref()], vec![Value::I64(7)], vec![live_ref()]],
+                &ids,
+            )
+            .unwrap();
+
+        let original_rows = original
+            .consumers(ids.local(target).unwrap())
+            .unwrap()
+            .relation_rows()[&relation]
+            .clone();
+        let updated_rows = updated
+            .consumers(ids.local(target).unwrap())
+            .unwrap()
+            .relation_rows()[&relation]
+            .clone();
+
+        assert_eq!(original_rows.len(), 4_096);
+        assert_eq!(original_rows.first().copied(), Some(0));
+        assert_eq!(original_rows.last().copied(), Some(4_095));
+        assert_eq!(updated_rows.len(), 4_095);
+        assert_eq!(updated_rows.first().copied(), Some(0));
+        assert_eq!(updated_rows.last().copied(), Some(4_095));
+        assert!(updated_rows.contains(&4_093));
+        assert!(!updated_rows.contains(&4_094));
+        assert!(updated_rows.contains(&4_095));
+    }
+
+    #[test]
+    #[ignore = "diagnostic release benchmark"]
+    fn benchmark_live_ref_sensitivity_sparse_dense_exact_delta_scaling() {
+        use std::{hint::black_box, time::Instant};
+
+        let target = EntityId::new(2);
+        let entity_type = SemanticId::new(10);
+        let relation = SemanticId::new(12);
+        let ids = DenseEntityIds::compile(&BTreeSet::from([target])).unwrap();
+        let target_local = ids.local(target).unwrap();
+
+        for (label, row_count, stride) in [
+            ("sparse-100k", 100_000usize, 1_000usize),
+            ("sparse-500k", 500_000usize, 1_000usize),
+            ("dense-100k", 100_000usize, 1usize),
+            ("dense-500k", 500_000usize, 1usize),
+        ] {
+            let rows = (0..row_count)
+                .map(|position| {
+                    if position % stride == 0 {
+                        vec![Value::LiveEntityRef {
+                            entity_type,
+                            id: target,
+                        }]
+                    } else {
+                        vec![Value::I64((position & 1) as i64)]
+                    }
+                })
+                .collect::<Vec<_>>();
+            let expected_consumers = (row_count + stride - 1) / stride;
+            let mut model = FiniteModel::default();
+            model.relations.insert(relation, rows);
+            let sensitivity = LiveRefSensitivityIndex::compile(&model, &ids);
+
+            let removed = if stride == 1 { row_count / 2 } else { 0 };
+            let inserted = [vec![Value::LiveEntityRef {
+                entity_type,
+                id: target,
+            }]];
+            let warm_delta = sensitivity
+                .with_relation_delta(relation, &[removed], &inserted, &ids)
+                .unwrap();
+            black_box(warm_delta);
+            let warm_consumers = sensitivity.consumers(target_local).unwrap();
+            black_box(warm_consumers);
+
+            let iterations = 128usize;
+            let delta_started = Instant::now();
+            for _ in 0..iterations {
+                let next = black_box(&sensitivity)
+                    .with_relation_delta(relation, &[removed], black_box(&inserted), &ids)
+                    .unwrap();
+                black_box(next);
+            }
+            let delta_elapsed = delta_started.elapsed();
+            let delta_us = delta_elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+
+            let consumer_iterations = 8usize;
+            let consumer_started = Instant::now();
+            for _ in 0..consumer_iterations {
+                let consumers = black_box(&sensitivity).consumers(target_local).unwrap();
+                let rows = consumers.relation_rows().get(&relation).unwrap();
+                assert_eq!(rows.len(), expected_consumers);
+                black_box(consumers);
+            }
+            let consumer_elapsed = consumer_started.elapsed();
+            let consumer_us =
+                consumer_elapsed.as_secs_f64() * 1_000_000.0 / consumer_iterations as f64;
+
+            eprintln!(
+                "P455_LIVE_REF_SCALING case={label} rows={row_count} refs={expected_consumers} delta_us={delta_us:.3} consumers_us={consumer_us:.3}",
+            );
+        }
     }
 
     #[test]

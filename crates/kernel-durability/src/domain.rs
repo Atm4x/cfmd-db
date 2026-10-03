@@ -12,8 +12,9 @@ pub use historical::{
     MigrationPhysicalAuthority, SchemaMigrationPhysicalState, SemanticChangeEvent,
 };
 pub use transaction::{
-    DurableCarrierPatch, DurableEffectKind, DurableFieldPatch, DurableKeepsAlivePatch,
-    DurableModelDelta, DurableObjectFieldWrite, DurableRelationAuthorization,
-    DurableRelationMutation, DurableRelationResolution, DurableRelationRewriteIntent,
-    DurableRevisionChange, DurableTransactionIntent, DurableTransactionKey, IdempotencyEpoch,
+    ClientIntentGuardDigest, DurableCarrierPatch, DurableClientIntent, DurableCommittedTransaction,
+    DurableEffectKind, DurableFieldPatch, DurableKeepsAlivePatch, DurableModelDelta,
+    DurableObjectFieldWrite, DurableRelationAuthorization, DurableRelationMutation,
+    DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
+    DurableTransactionIntent, DurableTransactionKey, IdempotencyEpoch,
 };

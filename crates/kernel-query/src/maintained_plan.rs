@@ -206,10 +206,6 @@ enum FlatMaintainedRelPlanNodeKind {
 
 #[derive(Debug)]
 #[cfg(debug_assertions)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Preserve inline state ownership without adding allocations to this representation."
-)]
 enum MaintainedRelPlanPatch {
     Scan(Option<MaintainedScanCommitPatch>),
     Unary(Box<MaintainedRelPlanPatch>),
@@ -247,10 +243,6 @@ enum MaintainedRelPlanPatch {
 }
 
 #[derive(Debug)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Preserve inline state ownership without adding allocations to this representation."
-)]
 enum GraphNodePatch {
     Scan(MaintainedScanCommitPatch),
     SetSupport(SetSupportPatch),
@@ -1411,10 +1403,6 @@ impl MaterializedRelPlanState {
         self.output_value_from_arena(root, context, registry)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     fn output_value_from_arena(
         &self,
         node_id: NodeId,
@@ -1563,10 +1551,6 @@ impl MaterializedRelPlanState {
     }
 
     #[cfg(debug_assertions)]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     fn output_value_recursive(
         &self,
         context: &kernel_schema::SemanticContext,
@@ -1663,8 +1647,7 @@ impl MaterializedRelPlanState {
                 Ok(relation_value_from_rows(rows, &self.result_type))
             }
             MaintainedRelPlanNode::ProjectSet { supports, .. }
-            | MaintainedRelPlanNode::Distinct { supports, .. }
-            | MaintainedRelPlanNode::UnionSet { supports, .. } => Ok(supports.output_value()),
+            | MaintainedRelPlanNode::Distinct { supports, .. } => Ok(supports.output_value()),
             MaintainedRelPlanNode::PromoteToBag { input } => Ok(RelationValue::Bag(
                 input.output_value_recursive(context, registry)?.into_rows(),
             )),
@@ -1673,6 +1656,7 @@ impl MaterializedRelPlanState {
                 rows.extend(right.output_value_recursive(context, registry)?.into_rows());
                 Ok(RelationValue::Bag(rows))
             }
+            MaintainedRelPlanNode::UnionSet { supports, .. } => Ok(supports.output_value()),
             MaintainedRelPlanNode::Blocker { state, .. } => state.output_value(),
             MaintainedRelPlanNode::Join { state, .. } => state.output_value(context, registry),
             MaintainedRelPlanNode::Group { state, .. } => state.output_value(),
@@ -2169,10 +2153,6 @@ impl MaterializedRelPlanState {
     /// planner, but seals Scan publication to already-resolved stable handles.
     /// All operator state above Scan therefore goes through one immutable
     /// plan/commit semantics regardless of the source delta representation.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     fn validate_resolved_leaf_frames(
         &self,
         deltas: &BTreeMap<kernel_types::SemanticId, StorageResolvedRelationDelta>,
@@ -2571,10 +2551,6 @@ impl MaterializedRelPlanState {
         })
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     fn plan_execgraph_node(
         state: &FlatMaintainedRelPlanNode,
         mut inbox: NodeInbox<MaintainedDelta>,
@@ -2860,10 +2836,6 @@ impl MaterializedRelPlanState {
     }
 
     #[cfg(debug_assertions)]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     fn plan_relation_deltas_inner(
         &self,
         plan: &mut RelationDeltaPlanContext<'_>,
@@ -3204,10 +3176,6 @@ impl MaterializedRelPlanState {
     }
 
     #[cfg(debug_assertions)]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     fn commit_relation_plan(&mut self, patch: MaintainedRelPlanPatch) {
         match (
             Arc::make_mut(
@@ -3227,7 +3195,7 @@ impl MaterializedRelPlanState {
                 },
                 MaintainedRelPlanPatch::Scan(Some(plan)),
             ) => {
-                Self::commit_debug_scan_patch(value, handles, base_witness, canonical_lookup, plan);
+                Self::commit_debug_scan_patch(value, handles, base_witness, canonical_lookup, plan)
             }
             (MaintainedRelPlanNode::Scan { .. }, MaintainedRelPlanPatch::Scan(None)) => {}
             (

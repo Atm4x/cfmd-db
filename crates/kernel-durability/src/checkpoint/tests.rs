@@ -1,9 +1,10 @@
 use kernel_model::{DatabaseState, Value};
 use kernel_revision::Revision;
 use kernel_schema::{
-    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, RuleValueExpr, ScalarType,
-    Schema, SemanticContext, SemanticEnvironment, SemanticRuleExpr, StructuralEquivalenceDef,
-    StructuralOrderingDef, Symbol, SymbolKind, TextPattern, TypeExpr, TypeVar,
+    CapabilityDef, FieldDef, FieldRule, FiniteF64, ModelRuleExpr, RelationDef, RelationSemantics,
+    RuleValueExpr, ScalarType, Schema, SemanticContext, SemanticEnvironment, SemanticRuleExpr,
+    StructuralEquivalenceDef, StructuralOrderingDef, Symbol, SymbolKind, TextPattern, TypeExpr,
+    TypeVar,
 };
 use kernel_semantics::{EquivalenceModule, OrderingModule, SemanticRegistry};
 use kernel_types::{EntityId, RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
@@ -16,15 +17,12 @@ fn sid(raw: u128) -> SemanticId {
     SemanticId::new(raw)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn complex_revision() -> (Revision, SemanticRegistry) {
     let entity_type = sid(1);
     let subtype = sid(2);
     let field = sid(3);
     let relation = sid(4);
+    let sum_relation = sid(9);
     let capability = sid(5);
     let recursive_type = sid(6);
     let structural = sid(7);
@@ -32,6 +30,7 @@ fn complex_revision() -> (Revision, SemanticRegistry) {
     let eq_i64 = sid(20);
     let eq_text = sid(21);
     let order_i64 = sid(22);
+    let eq_f64 = sid(23);
 
     let mut registry = SemanticRegistry::default();
     let mut environment = SemanticEnvironment::new(SemanticEnvId::new(9));
@@ -46,6 +45,10 @@ fn complex_revision() -> (Revision, SemanticRegistry) {
     environment.pin_module(
         order_i64,
         registry.install_ordering(OrderingModule::I64Ascending),
+    );
+    environment.pin_module(
+        eq_f64,
+        registry.install_equivalence(EquivalenceModule::F64Bitwise),
     );
 
     let mut schema = Schema::new(SchemaRevisionId::new(8));
@@ -134,6 +137,53 @@ fn complex_revision() -> (Revision, SemanticRegistry) {
         })
         .unwrap();
     schema
+        .add_model_rule(ModelRuleExpr::RelationCardinality {
+            relation,
+            min: 0,
+            max: Some(8),
+        })
+        .unwrap();
+    let text_column = schema.relation_column_id(relation, 1).unwrap();
+    schema
+        .add_model_rule(ModelRuleExpr::RelationExists {
+            relation,
+            predicate: SemanticRuleExpr::TextLength {
+                value: RuleValueExpr::Field(text_column),
+                min: 1,
+                max: None,
+            },
+        })
+        .unwrap();
+    schema
+        .add_model_rule(ModelRuleExpr::RelationAll {
+            relation,
+            predicate: SemanticRuleExpr::TextLength {
+                value: RuleValueExpr::Field(text_column),
+                min: 1,
+                max: Some(32),
+            },
+        })
+        .unwrap();
+    schema
+        .define_relation(RelationDef {
+            id: sum_relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::F64)],
+            semantics: RelationSemantics::Bag {
+                column_equivalences: vec![eq_f64],
+            },
+        })
+        .unwrap();
+    let sum_column = schema.relation_column_id(sum_relation, 0).unwrap();
+    let zero = FiniteF64::new(0.0).unwrap();
+    schema
+        .add_model_rule(ModelRuleExpr::RelationExactF64SumRange {
+            relation: sum_relation,
+            column: sum_column,
+            min: Some(zero),
+            max: Some(zero),
+        })
+        .unwrap();
+    schema
         .define_structural_equivalence(
             structural,
             StructuralEquivalenceDef::Seq { element: eq_i64 },
@@ -152,7 +202,8 @@ fn complex_revision() -> (Revision, SemanticRegistry) {
         schema,
         environment,
     };
-    let state = complex_state(entity_type, field, relation);
+    let mut state = complex_state(entity_type, field, relation);
+    state.model.relations.insert(sum_relation, Vec::new());
     (
         Revision::build(RevisionId::new(44), &context, &registry, state).unwrap(),
         registry,

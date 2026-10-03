@@ -4,16 +4,6 @@ CFMD has frozen the Pass280 global kernel hostile/refactor campaign and is now i
 
 ## Required local gates
 
-Before running the gates, stage the intended changes and rebuild the manifest
-from Git's staged bytes. This avoids line-ending differences and includes every
-vendored dependency in the committed snapshot.
-
-```bash
-git add <changed-files>
-python3 scripts/update-repository-manifest.py
-git add REPOSITORY_MANIFEST.sha256
-```
-
 ```bash
 bash ./scripts/ci-rust.sh
 bash ./scripts/ci-formal.sh   # when Lean is installed / proof-relevant files changed

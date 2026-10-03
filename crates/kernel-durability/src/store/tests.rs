@@ -23,7 +23,7 @@ use kernel_types::{ClientTransactionId, RevisionId, SchemaRevisionId, SemanticEn
 
 use super::*;
 use crate::{
-    DurableRelationMutation, DurableRevisionDescriptor, DurableSequencerOrder, ReplicaId,
+    DurableRelationMutation, DurableRevisionChange, DurableRevisionDescriptor, DurableSequencerOrder, ReplicaId,
     ReplicatedEffectEnvelope, ReplicationAntiEntropyRequest, ReplicationBranchId,
     ReplicationDecisionLock, ReplicationDecisionVote, ReplicationEffectStage,
     ReplicationEffectVote, ReplicationFailureDetector, ReplicationHeartbeat,
@@ -478,7 +478,7 @@ fn failed_prepare_validation_does_not_publish_semantic_modules() {
         &registry,
     )
     .unwrap();
-    let DurableTransactionIntent::Exact {
+    let DurableTransactionIntent::FullRevision {
         encoded_target_revision,
         semantic_modules,
         ..
@@ -515,15 +515,20 @@ fn failed_replicated_ingest_does_not_publish_semantic_modules() {
             prerequisites: BTreeSet::new(),
             transaction_epoch: IdempotencyEpoch::ZERO,
             transaction_id: ClientTransactionId::new(id.0),
-            intent: DurableTransactionIntent::RelationDataExact {
+            intent: DurableTransactionIntent::RelationData {
                 source_revision: base.id(),
                 target_revision: RevisionId::new(13),
                 semantic_revision: base.semantic_revision(),
                 relation_mutations: Vec::new(),
+                client_guard_digest: None,
                 semantic_modules: vec![BuiltinSemanticModuleSpec::Equivalence {
                     module: EquivalenceModule::TextExact,
                     implementation_revision: 1,
                 }],
+            },
+            change: DurableRevisionChange::RelationData {
+                semantic_revision: base.semantic_revision(),
+                relation_mutations: Vec::new(),
             },
             source_revision: base.id(),
             target_revision: RevisionId::new(13),
@@ -677,7 +682,7 @@ fn external_freshness_rejects_same_generation_fork_and_wal_truncation() {
         .adopt_external_freshness(config.clone(), authority.boxed())
         .unwrap();
     drop(store);
-    let checkpoint = checkpoint_path(&fork_dir, 2);
+    let checkpoint = checkpoint_chunk_path(&fork_dir, 2, 0);
     let mut bytes = fs::read(&checkpoint).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 0x01;
@@ -907,7 +912,7 @@ fn hostile_chunked_checkpoint_rejects_oversized_logical_length_before_allocation
     let generation = 7;
     let mut root = vec![0_u8; CHECKPOINT_HEADER_LEN];
     root[..4].copy_from_slice(&CHECKPOINT_MAGIC);
-    root[4..6].copy_from_slice(&CHECKPOINT_FORMAT_VERSION.to_le_bytes());
+    root[4..6].copy_from_slice(&CHECKPOINT_FORMAT_TAG.to_le_bytes());
     root[6..8].copy_from_slice(&0_u16.to_le_bytes());
     root[8..16].copy_from_slice(&(u64::try_from(MAX_CHECKPOINT_LEN).unwrap() + 1).to_le_bytes());
     root[16..24].copy_from_slice(&revision.id().raw().to_le_bytes());
@@ -941,7 +946,7 @@ fn hostile_sparse_metadata_file_is_rejected_without_reading_physical_length() {
     let path = dir.join("hostile.cfdm");
     let mut header = [0_u8; METADATA_HEADER_LEN];
     header[..4].copy_from_slice(&METADATA_MAGIC);
-    header[4..6].copy_from_slice(&METADATA_FILE_VERSION.to_le_bytes());
+    header[4..6].copy_from_slice(&METADATA_FILE_TAG.to_le_bytes());
     header[16..20].copy_from_slice(&crc32c(&[]).to_le_bytes());
     let mut file = File::create(&path).unwrap();
     file.write_all(&header).unwrap();
@@ -963,7 +968,7 @@ fn hostile_sparse_checkpoint_root_is_rejected_without_reading_physical_length() 
     let path = dir.join("hostile.cfcp");
     let mut header = [0_u8; CHECKPOINT_HEADER_LEN];
     header[..4].copy_from_slice(&CHECKPOINT_MAGIC);
-    header[4..6].copy_from_slice(&CHECKPOINT_FORMAT_VERSION.to_le_bytes());
+    header[4..6].copy_from_slice(&CHECKPOINT_FORMAT_TAG.to_le_bytes());
     header[24..28].copy_from_slice(&crc32c(&[]).to_le_bytes());
     let header_crc = crc32c(&header[..28]);
     header[28..32].copy_from_slice(&header_crc.to_le_bytes());
@@ -1205,7 +1210,7 @@ fn schema_migration_wal_atomically_recovers_complement_authority() {
     assert_eq!(recovered_anchor, anchor);
     assert!(matches!(
         scan.transaction_intent(kernel_types::ClientTransactionId::new(9_203)),
-        Some(crate::DurableTransactionIntent::SchemaMigrationExact { .. })
+        Some(crate::DurableCommittedTransaction { intent: crate::DurableClientIntent::SchemaMigration { .. }, .. })
     ));
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
@@ -2230,7 +2235,7 @@ fn committed_descriptor(
             inserted: vec![vec![Value::I64(inserted)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         registry,
     )
@@ -2268,7 +2273,7 @@ fn transition_from(
             inserted: vec![vec![Value::I64(inserted)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         registry,
     )
@@ -2905,7 +2910,7 @@ fn store_reopens_exact_checkpoint_and_committed_wal_tail() {
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         &registry,
     )
@@ -2968,7 +2973,7 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
                 inserted: vec![vec![Value::I64(inserted)]],
                 removed: Vec::new(),
                 object_field_writes: Vec::new(),
-                authorization: crate::DurableRelationAuthorization::default(),
+                authorization: Default::default(),
             }],
             &registry,
         )
@@ -2989,7 +2994,7 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
                 inserted: vec![vec![Value::I64(4)]],
                 removed: Vec::new(),
                 object_field_writes: Vec::new(),
-                authorization: crate::DurableRelationAuthorization::default(),
+                authorization: Default::default(),
             }],
             rewrite_intents: vec![crate::DurableRelationRewriteIntent {
                 relation,
@@ -3035,8 +3040,8 @@ fn multi_parent_resolution_derives_exact_causal_cut_and_recovers_it() {
     assert_eq!(scan.durable_revision(), RevisionId::new(33));
     assert!(matches!(
         reopened.transaction_intent(ClientTransactionId::new(0x3033)),
-        Some(crate::DurableTransactionIntent::RelationResolutionExact {
-            causal_parents,
+        Some(crate::DurableCommittedTransaction {
+            intent: crate::DurableClientIntent::RelationResolution { causal_parents, .. },
             ..
         }) if causal_parents == &vec![RevisionId::new(31), RevisionId::new(32)]
     ));
@@ -3148,6 +3153,36 @@ fn manifest_publication_failure_requires_recovery() {
 }
 
 #[test]
+fn synchronous_directory_checkpoints_use_only_current_chunked_representation() {
+    let dir = test_dir("synchronous-current-chunked-checkpoint");
+    let (base, registry, _) = setup_revision(39_001, &[1, 2, 3]);
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+
+    for generation in [1_u64, 2_u64] {
+        if generation == 2 {
+            store.rotate_checkpoint(&base).unwrap();
+        }
+        let root = read_checkpoint_root_bounded(&checkpoint_path(&dir, generation)).unwrap();
+        assert_eq!(read_u16(&root[4..6]), CHECKPOINT_FORMAT_TAG);
+        let chunk_count = usize::from(read_u16(&root[6..8]));
+        assert!(chunk_count > 0);
+        assert_eq!(
+            root.len(),
+            CHECKPOINT_HEADER_LEN
+                + chunk_count * checkpoint_storage::CHECKPOINT_CHUNK_DESCRIPTOR_LEN
+        );
+        for ordinal in 0..chunk_count {
+            assert!(checkpoint_chunk_path(&dir, generation, ordinal).is_file());
+        }
+    }
+
+    drop(store);
+    let (_, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), base.id());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn checkpoint_rotation_publishes_new_generation_and_resets_wal_base() {
     let dir = test_dir("rotate");
     let (base, registry, relation) = setup_revision(20, &[1]);
@@ -3163,7 +3198,7 @@ fn checkpoint_rotation_publishes_new_generation_and_resets_wal_base() {
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         &registry,
     )
@@ -3247,8 +3282,8 @@ fn unsupported_highest_manifest_format_never_falls_back() {
     let path = manifest_path(&dir, 2);
     let mut bytes = fs::read(&path).unwrap();
     bytes[4..6].copy_from_slice(&99_u16.to_le_bytes());
-    let checksum = crc32c(&bytes[..32]);
-    bytes[32..36].copy_from_slice(&checksum.to_le_bytes());
+    let checksum = crc32c(&bytes[..60]);
+    bytes[60..64].copy_from_slice(&checksum.to_le_bytes());
     fs::write(path, bytes).unwrap();
 
     assert!(matches!(
@@ -3262,31 +3297,25 @@ fn unsupported_highest_manifest_format_never_falls_back() {
 }
 
 #[test]
-fn canonical_format_migration_republishes_historical_metadata_without_loss() {
-    let dir = test_dir("canonical-format-migration");
+fn pre_release_historical_metadata_is_rejected_instead_of_migrated() {
+    let dir = test_dir("pre-release-format-rejected");
     let (base, registry, _) = setup_revision(42, &[1]);
     let store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
     drop(store);
 
-    // Re-express generation 1 with the historical metadata-v6 semantics.
-    // V6 predates migration complements, causal state, artifact cores and
-    // idempotency epochs; their unique historical meaning is empty/zero.
     let mut payload = Vec::new();
     payload.extend_from_slice(&6_u16.to_le_bytes());
     metadata::encode_materialization_specs(&mut payload, &[]).unwrap();
-    payload.extend_from_slice(&crate::PHYSICAL_ARTIFACT_RECIPE_VERSION.to_le_bytes());
+    payload.extend_from_slice(&crate::PHYSICAL_ARTIFACT_RECIPE_TAG.to_le_bytes());
     push_len(&mut payload, 0).unwrap();
     push_len(&mut payload, 0).unwrap();
-    let modules = registry
-        .builtin_modules_for_context(base.semantic_context())
-        .unwrap();
+    let modules = registry.builtin_modules_for_context(base.semantic_context()).unwrap();
     metadata::encode_semantic_module_specs(&mut payload, &modules).unwrap();
 
     let payload_crc = crc32c(&payload);
     let mut header = [0_u8; METADATA_HEADER_LEN];
     header[0..4].copy_from_slice(&METADATA_MAGIC);
-    header[4..6].copy_from_slice(&METADATA_FILE_VERSION.to_le_bytes());
-    header[6..8].copy_from_slice(&0_u16.to_le_bytes());
+    header[4..6].copy_from_slice(&METADATA_FILE_TAG.to_le_bytes());
     header[8..16].copy_from_slice(&(payload.len() as u64).to_le_bytes());
     header[16..20].copy_from_slice(&payload_crc.to_le_bytes());
     let mut historical_file = Vec::new();
@@ -3299,27 +3328,7 @@ fn canonical_format_migration_republishes_historical_metadata_without_loss() {
     manifest.metadata_crc32c = crc32c(&historical_file);
     fs::write(&manifest_path, encode_manifest(manifest)).unwrap();
 
-    let (mut reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
-    assert_eq!(scan.durable_revision(), base.id());
-    assert_eq!(reopened.current_idempotency_epoch, IdempotencyEpoch::ZERO);
-    assert_eq!(reopened.minimum_retry_epoch, IdempotencyEpoch::ZERO);
-    assert!(reopened.migration_complements.is_empty());
-    assert!(reopened.revision_effects.is_empty());
-
-    let receipt = reopened.migrate_to_current_format(&base).unwrap();
-    assert_eq!(receipt.generation, 2);
-    drop(reopened);
-
-    let current_metadata = fs::read(metadata_path(&dir, 2)).unwrap();
-    assert_ne!(
-        read_u16(&current_metadata[METADATA_HEADER_LEN..METADATA_HEADER_LEN + 2]),
-        6
-    );
-    let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
-    assert_eq!(reopened.generation(), 2);
-    assert_eq!(scan.durable_revision(), base.id());
-    assert_eq!(reopened.current_idempotency_epoch, IdempotencyEpoch::ZERO);
-    assert_eq!(reopened.minimum_retry_epoch, IdempotencyEpoch::ZERO);
+    assert!(DurableRevisionStore::open(&dir).is_err());
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -3966,7 +3975,7 @@ fn idempotency_epoch_reuse_survives_crash_before_checkpoint_without_causal_alias
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         &registry,
     )
@@ -3994,7 +4003,7 @@ fn idempotency_epoch_reuse_survives_crash_before_checkpoint_without_causal_alias
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         &registry,
     )
@@ -4062,7 +4071,7 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         &registry,
     )
@@ -4090,7 +4099,7 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
             inserted: vec![vec![Value::I64(3)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         &registry,
     )
@@ -4163,12 +4172,17 @@ macro_rules! replicated_relation_effect {
                 prerequisites: $deps,
                 transaction_epoch: IdempotencyEpoch::ZERO,
                 transaction_id: ClientTransactionId::new(id.0),
-                intent: DurableTransactionIntent::RelationDataExact {
+                intent: DurableTransactionIntent::RelationData {
                     source_revision: $source,
                     target_revision: $target,
                     semantic_revision: $semantic,
                     relation_mutations: Vec::new(),
+                    client_guard_digest: None,
                     semantic_modules: Vec::new(),
+                },
+                change: DurableRevisionChange::RelationData {
+                    semantic_revision: $semantic,
+                    relation_mutations: Vec::new(),
                 },
                 source_revision: $source,
                 target_revision: $target,
@@ -4241,7 +4255,7 @@ fn group_commit_rejects_provisional_local_target_reuse_before_wal_mutation() {
             inserted: vec![vec![Value::I64(2)]],
             removed: Vec::new(),
             object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
         }],
         &registry,
     )
@@ -7317,10 +7331,6 @@ fn directory_root_backed_history_releases_generation_pin_and_reopens_exact_sourc
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn aborted_streaming_complete_historical_root_never_supersedes_old_generation_authority() {
     let dir = test_dir("aborted-streaming-complete-historical-root");
     let (base, registry, _) = setup_revision(40_365, &[1, 2, 3]);
@@ -7764,5 +7774,71 @@ fn directory_published_realization_missing_is_corruption() {
         DurableRevisionStore::open(&dir),
         Err(DurabilityError::Corruption { .. })
     ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn causal_history_release_publishes_head_root_and_preserves_effect_id_high_watermark() {
+    let dir = test_dir("causal-history-release-high-watermark");
+    let (base, registry, relation) = setup_revision(10_000, &[1]);
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    let (next, _, _) = setup_revision(10_001, &[1, 2]);
+    let descriptor = DurableRevisionDescriptor::relation_data(
+        ClientTransactionId::new(0xCA11),
+        base.id(),
+        &next,
+        base.semantic_revision(),
+        vec![DurableRelationMutation {
+            relation,
+            inserted: vec![vec![Value::I64(2)]],
+            removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: Default::default(),
+        }],
+        &registry,
+    )
+    .unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    assert_eq!(store.next_revision_effect_id, 2);
+    assert!(
+        store
+            .release_causal_history_before_head(&next)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.causal_coverage_root(), next.id());
+    assert!(store.revision_effects.is_empty());
+    assert_eq!(store.next_revision_effect_id, 2);
+    drop(store);
+
+    let (mut reopened, _) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(reopened.causal_coverage_root(), next.id());
+    assert!(reopened.revision_effects.is_empty());
+    assert_eq!(reopened.next_revision_effect_id, 2);
+
+    let (third, _, _) = setup_revision(10_002, &[1, 2, 3]);
+    let descriptor = DurableRevisionDescriptor::relation_data(
+        ClientTransactionId::new(0xCA12),
+        next.id(),
+        &third,
+        next.semantic_revision(),
+        vec![DurableRelationMutation {
+            relation,
+            inserted: vec![vec![Value::I64(3)]],
+            removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: Default::default(),
+        }],
+        &registry,
+    )
+    .unwrap();
+    let prepared = reopened.durably_prepare(&descriptor).unwrap();
+    reopened.durably_commit(prepared).unwrap();
+    assert_eq!(
+        reopened.revision_effect_frontier(third.id()),
+        Some(&BTreeSet::from([RevisionEffectId(2)]))
+    );
+    drop(reopened);
     fs::remove_dir_all(dir).unwrap();
 }

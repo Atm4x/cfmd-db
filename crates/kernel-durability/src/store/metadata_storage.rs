@@ -6,7 +6,7 @@ use crate::binary_codec::{crc32c, crc32c_update, read_u16, read_u32, read_u64};
 use crate::metadata;
 
 use super::file_io::{read_exact_file_payload, read_exact_or_corruption, require_file_eof};
-use super::format_registry::{DurableFormatRegistry, METADATA_FILE_VERSION};
+use super::format_registry::{DurableFormatRegistry, METADATA_FILE_TAG};
 use super::generation_layout::metadata_path;
 use super::manifest::ManifestRecord;
 use crate::runtime::DurabilityError;
@@ -112,7 +112,7 @@ pub(super) fn write_metadata_file(
     let payload_crc = !payload_crc_state;
     let mut header = [0_u8; METADATA_HEADER_LEN];
     header[0..4].copy_from_slice(&METADATA_MAGIC);
-    header[4..6].copy_from_slice(&METADATA_FILE_VERSION.to_le_bytes());
+    header[4..6].copy_from_slice(&METADATA_FILE_TAG.to_le_bytes());
     header[6..8].copy_from_slice(&0_u16.to_le_bytes());
     header[8..16].copy_from_slice(&payload_len.to_le_bytes());
     header[16..20].copy_from_slice(&payload_crc.to_le_bytes());

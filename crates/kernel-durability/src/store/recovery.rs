@@ -32,8 +32,8 @@ use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
 };
 use crate::domain::{
-    DurableMigrationComplement, DurableRevisionEffectRecord, DurableTransactionIntent,
-    DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
+    DurableCommittedTransaction, DurableMigrationComplement, DurableRevisionEffectRecord,
+    DurableTransactionIntent, DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
 };
 use crate::metadata;
 use crate::platform_assurance::{
@@ -86,7 +86,7 @@ pub(super) struct CanonicalDurableState {
     historical_epoch_anchors: BTreeMap<RevisionEffectId, HistoricalEpochAnchor>,
     current_idempotency_epoch: IdempotencyEpoch,
     minimum_retry_epoch: IdempotencyEpoch,
-    committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+    committed_transactions: BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
     next_revision_effect_id: u128,
     causal_coverage_root: RevisionId,
     revision_effects: BTreeMap<RevisionEffectId, DurableRevisionEffectRecord>,
@@ -144,7 +144,7 @@ fn merge_wal_migration_complements(
         .map_or(checkpoint_schema, |first| first.source_schema);
     let mut index = migration_complement_index(&complements, base_schema)?;
     for committed in scan.committed() {
-        if let DurableTransactionIntent::SchemaMigrationExact {
+        if let DurableTransactionIntent::SchemaMigration {
             migration_complement,
             ..
         } = &committed.descriptor.intent
@@ -162,33 +162,24 @@ fn merge_wal_migration_complements(
 
 pub(super) fn rebuild_semantic_registry(
     metadata: &metadata::DurableStoreMetadata,
-    legacy_registry: Option<&SemanticRegistry>,
 ) -> Result<SemanticRegistry, DurabilityError> {
-    let mut registry = if metadata.semantic_modules.is_empty() {
-        legacy_registry.cloned().ok_or(DurabilityError::Protocol {
-            offset: 0,
-            reason: "durable semantic deployment manifest is missing",
-        })?
-    } else {
-        let mut registry = SemanticRegistry::default();
-        install_semantic_module_packages(&mut registry, &metadata.semantic_modules)?;
-        registry
-    };
-    for intent in metadata.committed_transactions.values() {
-        install_intent_semantic_modules(&mut registry, intent)?;
-    }
+    let mut registry = SemanticRegistry::default();
+    install_semantic_module_packages(&mut registry, &metadata.semantic_modules)?;
     Ok(registry)
 }
 
 fn merge_committed_transaction_intents(
-    mut committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+    mut committed_transactions: BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
     scan: &RecoveryScan,
     registry: &mut SemanticRegistry,
-) -> Result<BTreeMap<DurableTransactionKey, DurableTransactionIntent>, DurabilityError> {
-    for (&transaction_id, intent) in scan.committed_transactions() {
-        install_intent_semantic_modules(registry, intent)?;
-        if let Some(existing) = committed_transactions.insert(transaction_id, intent.clone())
-            && existing != *intent
+) -> Result<BTreeMap<DurableTransactionKey, DurableCommittedTransaction>, DurabilityError> {
+    // Semantic deployment belongs to committed WAL descriptors, not the retry ledger.
+    for committed_revision in scan.committed() {
+        install_intent_semantic_modules(registry, &committed_revision.descriptor.intent)?;
+    }
+    for (&transaction_id, committed) in scan.committed_transactions() {
+        if let Some(existing) = committed_transactions.insert(transaction_id, committed.clone())
+            && existing != *committed
         {
             return Err(DurabilityError::Protocol {
                 offset: 0,
@@ -314,14 +305,14 @@ fn scan_published_generation_read_only(
 }
 
 fn recover_retry_ledger(
-    committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+    committed_transactions: BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
     current: IdempotencyEpoch,
     minimum: IdempotencyEpoch,
     scan: &RecoveryScan,
     registry: &mut SemanticRegistry,
 ) -> Result<
     (
-        BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+        BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
         IdempotencyEpoch,
     ),
     DurabilityError,
@@ -347,9 +338,8 @@ pub(super) fn recover_canonical_state(
     checkpoint: Revision,
     scan: &RecoveryScan,
     generation: u64,
-    legacy_registry: Option<&SemanticRegistry>,
 ) -> Result<CanonicalDurableState, DurabilityError> {
-    let mut registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
+    let mut registry = rebuild_semantic_registry(&metadata)?;
     let minimum_retry_epoch = metadata.minimum_retry_epoch;
     let (committed_transactions, current_idempotency_epoch) = recover_retry_ledger(
         metadata.committed_transactions,
@@ -417,7 +407,7 @@ pub(super) fn recover_canonical_state(
                 generation,
             });
     }
-    let next_revision_effect_id = revision_effects
+    let recovered_next_revision_effect_id = revision_effects
         .keys()
         .map(|id| id.0)
         .max()
@@ -427,6 +417,15 @@ pub(super) fn recover_canonical_state(
             offset: 0,
             reason: "revision effect identity space is exhausted",
         })?;
+    let next_revision_effect_id = metadata
+        .next_revision_effect_id
+        .max(recovered_next_revision_effect_id);
+    if next_revision_effect_id > u128::from(u64::MAX) + 1 {
+        return Err(DurabilityError::Protocol {
+            offset: 0,
+            reason: "revision effect identity high-watermark is outside the local namespace",
+        });
+    }
     Ok(CanonicalDurableState {
         checkpoint,
         durable_head: scan.durable_revision(),
@@ -479,10 +478,6 @@ fn validate_replicated_authority(
 }
 
 impl DurableRevisionStore {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     pub fn historical_epoch_material(
         &mut self,
         effect_id: RevisionEffectId,
@@ -515,7 +510,7 @@ impl DurableRevisionStore {
                         offset: 0,
                         reason: "single-file historical metadata section is missing",
                     })?;
-                let initial_registry = rebuild_semantic_registry(&metadata, None)?;
+                let initial_registry = rebuild_semantic_registry(&metadata)?;
                 let checkpoint = container
                     .with_section_reader(
                         crate::single_file::SingleFileSectionKind::Checkpoint,
@@ -554,7 +549,7 @@ impl DurableRevisionStore {
                         offset: 0,
                         reason: "single-file historical epoch archive is missing metadata authority",
                     })?;
-                let initial_registry = rebuild_semantic_registry(&metadata, None)?;
+                let initial_registry = rebuild_semantic_registry(&metadata)?;
                 let checkpoint = container
                     .with_historical_epoch_section_reader(
                         anchor.generation,
@@ -588,15 +583,14 @@ impl DurableRevisionStore {
             let directory = self.backend.historical_directory_root()?;
             let manifest = read_manifest_generation(directory, anchor.generation)?;
             let metadata = read_published_metadata(directory, manifest)?;
-            let initial_registry = rebuild_semantic_registry(&metadata, None)?;
+            let initial_registry = rebuild_semantic_registry(&metadata)?;
             let (checkpoint, scan) =
                 scan_published_generation_read_only(directory, manifest, &initial_registry)?;
             (manifest.generation, metadata, checkpoint, scan)
         };
 
-        let initial_registry = rebuild_semantic_registry(&metadata, None)?;
-        let _canonical =
-            recover_canonical_state(metadata, checkpoint.clone(), &scan, generation, None)?;
+        let initial_registry = rebuild_semantic_registry(&metadata)?;
+        let _canonical = recover_canonical_state(metadata, checkpoint.clone(), &scan, generation)?;
         let mut historical_registry = initial_registry;
         let mut source_present = anchor.source_revision == checkpoint.id();
         if !source_present {
@@ -637,14 +631,7 @@ impl DurableRevisionStore {
     }
 
     pub fn open(directory: impl AsRef<Path>) -> Result<(Self, RecoveryScan), DurabilityError> {
-        Self::open_inner(directory.as_ref(), None, false)
-    }
-
-    pub fn open_with_legacy_registry(
-        directory: impl AsRef<Path>,
-        legacy_registry: &SemanticRegistry,
-    ) -> Result<(Self, RecoveryScan), DurabilityError> {
-        Self::open_inner(directory.as_ref(), Some(legacy_registry), false)
+        Self::open_inner(directory.as_ref(), false)
     }
 
     pub fn open_with_external_freshness_on_supported_platform(
@@ -667,7 +654,7 @@ impl DurableRevisionStore {
         let material = super::backend::DurabilityBackend::probe_directory_freshness(directory)?;
         let (mut freshness, pending_advance) =
             ExternalFreshnessState::recover_preflight(&material, config, authority)?;
-        let (mut store, scan) = Self::open_inner(directory, None, true)?;
+        let (mut store, scan) = Self::open_inner(directory, true)?;
         freshness.complete_recovery_advance(pending_advance)?;
         store.external_freshness = Some(freshness);
         Ok((store, scan))
@@ -675,7 +662,6 @@ impl DurableRevisionStore {
 
     fn open_inner(
         directory: &Path,
-        legacy_registry: Option<&SemanticRegistry>,
         allow_external_freshness: bool,
     ) -> Result<(Self, RecoveryScan), DurabilityError> {
         let directory = directory.to_path_buf();
@@ -690,15 +676,10 @@ impl DurableRevisionStore {
                 reason: "externally anchored store requires freshness-aware open",
             });
         }
-        let registry = rebuild_semantic_registry(&metadata, legacy_registry)?;
+        let registry = rebuild_semantic_registry(&metadata)?;
         let (checkpoint, wal, scan) = open_published_generation(&directory, manifest, &registry)?;
-        let mut canonical = recover_canonical_state(
-            metadata,
-            checkpoint,
-            &scan,
-            manifest.generation,
-            legacy_registry,
-        )?;
+        let mut canonical =
+            recover_canonical_state(metadata, checkpoint, &scan, manifest.generation)?;
         let replication =
             ReplicationAuthorityJournal::open_or_create(directory.join("replication.cfre"))?;
         validate_replicated_authority(&mut canonical, &replication)?;

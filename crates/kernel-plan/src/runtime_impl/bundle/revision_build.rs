@@ -1,5 +1,5 @@
 impl RuntimeRevisionBundle {
-    fn relation_base_witnesses(
+    pub(crate) fn relation_base_witnesses(
         revision: &kernel_revision::Revision,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<PersistentOrdMap<SemanticId, RelationBaseWitness>, PhysicalExecutionError> {
@@ -84,57 +84,31 @@ impl RuntimeRevisionBundle {
         affected
     }
 
-    fn is_append_only_live_ref_free_bag_transition(
-        &self,
-        mutations: &[RevisionRelationMutation<'_>],
-    ) -> bool {
-        mutations.iter().all(|mutation| {
-            mutation.delta.removed.is_empty()
-                && self
-                    .revision
-                    .semantic_context()
-                    .schema
-                    .relation(mutation.relation)
-                    .is_some_and(|definition| {
-                        matches!(
-                            definition.semantics,
-                            kernel_schema::RelationSemantics::Bag { .. }
-                        )
-                    })
-                && !self
-                    .revision
-                    .live_ref_sensitivity()
-                    .relation_has_live_refs(mutation.relation)
-                && !mutation
-                    .delta
-                    .inserted
-                    .iter()
-                    .flatten()
-                    .any(Value::contains_live_ref)
-        })
-    }
+
 
     fn candidate_violation_state_for_relation_transition(
         &self,
         request: &RevisionTransitionRequest<'_>,
-        changed_relations: impl IntoIterator<Item = SemanticId>,
         validate_target_endpoint: bool,
     ) -> Result<RuntimeViolationState, PhysicalExecutionError> {
-        if !validate_target_endpoint
-            && self.is_append_only_live_ref_free_bag_transition(request.mutations)
-        {
-            RuntimeViolationState::transport_zero_to_relation_target(
-                &self.violation_state,
+        if !validate_target_endpoint {
+            // `ExactDerived` targets are built from this validated source by
+            // the revision-level exact-delta certificate path. Their structural
+            // and model-rule validity has already been paid at construction, so
+            // rebuilding a row-level VMF here would duplicate O(N) work.
+            self.violation_state.require_zero()?;
+            return Ok(RuntimeViolationState::from_measure(
                 request.target_revision,
-            )
-        } else {
-            RuntimeViolationState::candidate_for_relation_transition(
-                &self.violation_state,
-                request.target_revision,
-                changed_relations,
-                request.registry,
-            )
+                kernel_violation::ViolationMeasure::new(),
+                request.target_revision.model_rule_witnesses().clone(),
+            ));
         }
+        RuntimeViolationState::candidate_for_relation_transition(
+            &self.violation_state,
+            request.target_revision,
+            request.mutations,
+            request.registry,
+        )
     }
 
     /// Returns a revision-bound Γ-VMF invariant-closure certificate only when
@@ -180,6 +154,18 @@ impl RuntimeRevisionBundle {
         let violation_state = RuntimeViolationState::build(&revision, registry)?;
         violation_state.require_zero()?;
         let relation_bases = Self::relation_base_witnesses(&revision, registry)?;
+        // Removal-heavy commits must not pay an O(N) first-write index build.
+        // The full-row occurrence directory is reconstructible write-acceleration
+        // authority, so build/restore it once with the runtime root and maintain
+        // it incrementally thereafter.
+        for (&relation, &layout) in &relation_layouts {
+            physical.ensure_relation_write_occurrence_atom(
+                relation,
+                layout,
+                revision.semantic_context(),
+                registry,
+            )?;
+        }
         physical.bind_revision(revision.id())?;
 
         let mut materializations = PersistentOrdMap::default();
@@ -210,6 +196,7 @@ impl RuntimeRevisionBundle {
 
         let (materialization_dependencies, materializations_by_relation) =
             Self::materialization_dependency_indexes(&materialization_spec_map);
+        let historical = RuntimeHistoricalDerivedIndex::default();
         Ok(Self {
             root_identity,
             revision,
@@ -217,6 +204,7 @@ impl RuntimeRevisionBundle {
             physical,
             relation_layouts: relation_layouts.into_iter().collect(),
             relation_bases,
+            historical,
             materialization_specs: materialization_spec_map,
             materializations,
             materialization_dependencies,

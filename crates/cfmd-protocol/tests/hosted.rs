@@ -2,13 +2,14 @@ use std::{
     fs,
     sync::{Arc, Barrier},
     thread,
+    time::Instant,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use cfmd_protocol::{
-    CommitRequest, CommitResponse, HostedRequest, HostedResponse, HostedSession, OpenWatchRequest,
-    ProtocolErrorCode, ProtocolLimits, ProtocolQuery, ProtocolValue, QueryRequest,
-    RelationMutation, SnapshotTarget, WatchStatusDto,
+    CommitRequest, CommitResponse, HostedRequest, HostedResponse, HostedSession, IdempotencyKey,
+    OpenWatchRequest, ProtocolErrorCode, ProtocolLimits, ProtocolQuery, ProtocolValue,
+    QueryRequest, RelationMutation, SnapshotTarget, WatchStatusDto,
 };
 use cfmd_runtime::{
     Database, EquivalenceId, Permission, PermissionSet, PrimitiveEquivalence, PrincipalId,
@@ -48,17 +49,146 @@ fn full_session(database: &Database) -> HostedSession {
     HostedSession::new(database.session(Session::new(PrincipalId::new(7), permissions)))
 }
 
+#[test]
+fn stale_set_removal_uses_historical_gamma_support_and_current_exact_representative() {
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("fixture directory");
+    let relation = RelationId::new(130);
+    let equivalence = EquivalenceId::new(131);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::TextAsciiCaseInsensitive)
+        .relation(RelationSchema::set(relation, [Type::text()], [equivalence]))
+        .build()
+        .expect("schema");
+    let database = Database::create(&directory, schema).expect("database");
+    let hosted = full_session(&database);
+
+    let commit = |base_revision, key, inserted: &[&str], removed: &[&str]| {
+        hosted.execute(HostedRequest::Commit(CommitRequest {
+            base_revision,
+            idempotency_key: IdempotencyKey::new(key),
+            mutations: vec![RelationMutation {
+                relation: relation.raw(),
+                inserted: inserted
+                    .iter()
+                    .map(|value| vec![ProtocolValue::Text((*value).into())])
+                    .collect(),
+                removed: removed
+                    .iter()
+                    .map(|value| vec![ProtocolValue::Text((*value).into())])
+                    .collect(),
+            }],
+        }))
+    };
+
+    assert_eq!(
+        commit(1, 700, &["Alpha"], &[]).expect("seed set"),
+        HostedResponse::Commit(CommitResponse::Committed { revision: 2 })
+    );
+    assert_eq!(
+        commit(2, 701, &["Beta"], &[]).expect("concurrent set insert"),
+        HostedResponse::Commit(CommitResponse::Committed { revision: 3 })
+    );
+    assert_eq!(
+        commit(2, 702, &[], &["aLpHa"]).expect("stale Γ-equivalent removal"),
+        HostedResponse::Commit(CommitResponse::Committed { revision: 4 })
+    );
+
+    let result = hosted
+        .execute(HostedRequest::Query(QueryRequest {
+            target: SnapshotTarget::Head,
+            query: ProtocolQuery::Scan {
+                relation: relation.raw(),
+            },
+        }))
+        .expect("query set after stale removal");
+    let HostedResponse::Query(result) = result else {
+        panic!("query response")
+    };
+    assert_eq!(result.revision, 4);
+    assert_eq!(result.rows, vec![vec![ProtocolValue::Text("Beta".into())]]);
+
+    drop(hosted);
+    drop(database);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+#[ignore = "diagnostic release benchmark for stale exact-effect history depth"]
+fn benchmark_stale_exact_effect_history_depth() {
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("fixture directory");
+    let relation = RelationId::new(132);
+    let equivalence = EquivalenceId::new(133);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("schema");
+    let database = Database::create(&directory, schema).expect("database");
+    let hosted = full_session(&database);
+
+    let mut head = 1_u64;
+    let depths = [32_u64, 128, 512, 2048];
+    for depth in depths {
+        while head < depth + 1 {
+            let value = i64::try_from(head).expect("benchmark value");
+            let response = hosted
+                .execute(HostedRequest::Commit(CommitRequest {
+                    base_revision: head,
+                    idempotency_key: IdempotencyKey::new(u128::from(head) + 10_000),
+                    mutations: vec![RelationMutation {
+                        relation: relation.raw(),
+                        inserted: vec![vec![ProtocolValue::I64(value)]],
+                        removed: vec![],
+                    }],
+                }))
+                .expect("history append");
+            let HostedResponse::Commit(CommitResponse::Committed { revision }) = response else {
+                panic!("history append must commit")
+            };
+            head = revision;
+        }
+
+        let started = Instant::now();
+        let response = hosted
+            .execute(HostedRequest::Commit(CommitRequest {
+                base_revision: 1,
+                idempotency_key: IdempotencyKey::new(u128::from(depth) + 1_000_000),
+                mutations: vec![RelationMutation {
+                    relation: relation.raw(),
+                    inserted: vec![vec![ProtocolValue::I64(-i64::try_from(depth).unwrap())]],
+                    removed: vec![],
+                }],
+            }))
+            .expect("stale exact effect");
+        let elapsed = started.elapsed();
+        let HostedResponse::Commit(CommitResponse::Committed { revision }) = response else {
+            panic!("stale exact effect must commit")
+        };
+        head = revision;
+        eprintln!(
+            "stale_history_depth={depth} elapsed_ns={}",
+            elapsed.as_nanos()
+        );
+    }
+
+    drop(hosted);
+    drop(database);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
 fn commit_i64(
     hosted: &HostedSession,
     relation: RelationId,
     base_revision: u64,
-    transaction: u128,
+    idempotency_key: u128,
     value: i64,
 ) {
     hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision,
-            transaction,
+            idempotency_key: IdempotencyKey::new(idempotency_key),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
                 inserted: vec![vec![ProtocolValue::I64(value)]],
@@ -85,7 +215,7 @@ fn protocol_dispatches_through_restricted_product_authority() {
     let committed = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
-            transaction: 500,
+            idempotency_key: IdempotencyKey::new(500),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
                 inserted: vec![vec![ProtocolValue::I64(1)], vec![ProtocolValue::I64(2)]],
@@ -97,6 +227,35 @@ fn protocol_dispatches_through_restricted_product_authority() {
         committed,
         HostedResponse::Commit(CommitResponse::Committed { revision: 2 })
     );
+
+    let retry = hosted
+        .execute(HostedRequest::Commit(CommitRequest {
+            base_revision: 1,
+            idempotency_key: IdempotencyKey::new(500),
+            mutations: vec![RelationMutation {
+                relation: relation.raw(),
+                inserted: vec![vec![ProtocolValue::I64(1)], vec![ProtocolValue::I64(2)]],
+                removed: vec![],
+            }],
+        }))
+        .expect("uncertain hosted retry");
+    assert_eq!(
+        retry,
+        HostedResponse::Commit(CommitResponse::AlreadyCommitted { revision: 2 })
+    );
+
+    let changed_retry = hosted
+        .execute(HostedRequest::Commit(CommitRequest {
+            base_revision: 1,
+            idempotency_key: IdempotencyKey::new(500),
+            mutations: vec![RelationMutation {
+                relation: relation.raw(),
+                inserted: vec![vec![ProtocolValue::I64(9)]],
+                removed: vec![],
+            }],
+        }))
+        .expect_err("same hosted key with a different effect must conflict");
+    assert_eq!(changed_retry.code(), ProtocolErrorCode::TransactionConflict);
 
     let query = ProtocolQuery::Scan {
         relation: relation.raw(),
@@ -144,22 +303,38 @@ fn protocol_dispatches_through_restricted_product_authority() {
     };
     assert_eq!(anchor_revision, 2);
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].transaction, 500);
+    assert_eq!(entries[0].idempotency_key.raw(), 500);
     assert_eq!(entries[0].source_revision, 1);
     assert_eq!(entries[0].target_revision, 2);
 
-    let stale = hosted
+    let transported = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
-            transaction: 501,
+            idempotency_key: IdempotencyKey::new(501),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
                 inserted: vec![vec![ProtocolValue::I64(3)]],
                 removed: vec![],
             }],
         }))
-        .expect_err("stale base must fail closed");
-    assert_eq!(stale.code(), ProtocolErrorCode::StaleRevision);
+        .expect("disjoint stale relation intent must transport through exact history");
+    assert_eq!(
+        transported,
+        HostedResponse::Commit(CommitResponse::Committed { revision: 3 })
+    );
+
+    let overlapping = hosted
+        .execute(HostedRequest::Commit(CommitRequest {
+            base_revision: 1,
+            idempotency_key: IdempotencyKey::new(502),
+            mutations: vec![RelationMutation {
+                relation: relation.raw(),
+                inserted: vec![vec![ProtocolValue::I64(1)]],
+                removed: vec![],
+            }],
+        }))
+        .expect_err("overlapping stale bag intent requires coordination");
+    assert_eq!(overlapping.code(), ProtocolErrorCode::TransactionConflict);
 
     drop(hosted);
     drop(database);
@@ -177,7 +352,7 @@ fn protocol_cannot_expand_session_grants() {
     let denied = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
-            transaction: 600,
+            idempotency_key: IdempotencyKey::new(600),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
                 inserted: vec![vec![ProtocolValue::I64(1)]],

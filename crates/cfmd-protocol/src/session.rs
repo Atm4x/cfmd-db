@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, TryLockError},
 };
 
-use cfmd_runtime::{RevisionId, SessionDatabase, TransactionId};
+use cfmd_runtime::{ExactRelationMutation, RevisionId, SessionDatabase, TransactionId};
 
 use crate::{
     HistoryEntryDto, OpenWatchRequest, OpenWatchResponse, ProtocolError, ProtocolErrorCode,
@@ -12,6 +12,25 @@ use crate::{
 };
 
 pub const PROTOCOL_VERSION: u16 = 2;
+
+/// Transport-neutral durable idempotency namespace selected by the caller.
+///
+/// This is not a protocol-local transaction identity: hosted/binding requests lower it into the
+/// same runtime `TransactionId` authority used by local Rust transactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IdempotencyKey(u128);
+
+impl IdempotencyKey {
+    #[must_use]
+    pub const fn new(raw: u128) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u128 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolLimits {
@@ -48,7 +67,7 @@ pub struct RelationMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRequest {
     pub base_revision: u64,
-    pub transaction: u128,
+    pub idempotency_key: IdempotencyKey,
     pub mutations: Vec<RelationMutation>,
 }
 
@@ -406,35 +425,35 @@ impl HostedSession {
 
     fn commit(&self, request: CommitRequest) -> Result<CommitResponse> {
         validate_commit(&request, self.limits)?;
-        let mut plan = self.database.plan()?;
-        if plan.base_revision().raw() != request.base_revision {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::StaleRevision,
-                format!(
-                    "commit base revision {} is stale; current revision is {}",
-                    request.base_revision,
-                    plan.base_revision().raw()
-                ),
-            ));
-        }
         if request.mutations.is_empty() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
                 "commit requires at least one relation mutation",
             ));
         }
-        for mutation in request.mutations {
-            let relation = cfmd_runtime::RelationId::new(mutation.relation);
-            for row in mutation.removed {
-                plan.remove(relation, row.into_iter().map(Into::into).collect());
-            }
-            for row in mutation.inserted {
-                plan.insert(relation, row.into_iter().map(Into::into).collect());
-            }
-        }
-        let outcome = self
-            .database
-            .commit_plan(&plan, TransactionId::new(request.transaction))?;
+        let transaction_id = TransactionId::new(request.idempotency_key.raw());
+        let mutations = request
+            .mutations
+            .into_iter()
+            .map(|mutation| ExactRelationMutation {
+                relation: cfmd_runtime::RelationId::new(mutation.relation),
+                inserted: mutation
+                    .inserted
+                    .into_iter()
+                    .map(|row| row.into_iter().map(Into::into).collect())
+                    .collect(),
+                removed: mutation
+                    .removed
+                    .into_iter()
+                    .map(|row| row.into_iter().map(Into::into).collect())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let outcome = self.database.commit_exact_relation_intent(
+            RevisionId::new(request.base_revision),
+            transaction_id,
+            &mutations,
+        )?;
         Ok(match outcome {
             cfmd_runtime::CommitOutcome::Committed { revision } => CommitResponse::Committed {
                 revision: revision.raw(),

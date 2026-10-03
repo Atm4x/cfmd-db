@@ -352,10 +352,6 @@ impl DurableRevisionStore {
         )
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     fn begin_streaming_checkpoint_with_chunk_size_and_physical(
         &mut self,
         revision: &Revision,
@@ -400,7 +396,7 @@ impl DurableRevisionStore {
             &self.prepared_transactions,
             self.durable_head,
         );
-        let mut metadata_record = self.streaming_metadata_record(revision)?;
+        let mut metadata_record = self.streaming_metadata_record()?;
         let (generation, physical) = if self.backend.is_single_file() {
             let generation = planned_generation;
             let carry_start_offset = self.wal.current_end_offset()?;
@@ -472,10 +468,7 @@ impl DurableRevisionStore {
         self.streaming_checkpoint_progress()
     }
 
-    fn streaming_metadata_record(
-        &self,
-        revision: &Revision,
-    ) -> Result<metadata::DurableStoreMetadata, DurabilityError> {
+    fn streaming_metadata_record(&self) -> Result<metadata::DurableStoreMetadata, DurabilityError> {
         Ok(metadata::DurableStoreMetadata {
             external_freshness: self
                 .external_freshness
@@ -489,13 +482,8 @@ impl DurableRevisionStore {
             migration_complements: self.migration_complements.clone(),
             historical_epoch_anchors: self.historical_epoch_anchors.clone(),
             committed_transactions: self.committed_transactions.clone(),
-            semantic_modules: self
-                .semantic_registry
-                .builtin_modules_for_context(revision.semantic_context())
-                .map_err(|_| DurabilityError::Protocol {
-                    offset: 0,
-                    reason: "checkpoint revision requires unavailable semantic implementation",
-                })?,
+            semantic_modules: self.semantic_registry.builtin_module_specs(),
+            next_revision_effect_id: self.next_revision_effect_id,
             causal_coverage_root: Some(self.causal_coverage_root),
             revision_effects: self.revision_effects.clone(),
             revision_effect_frontiers: self.revision_effect_frontiers.clone(),
@@ -637,10 +625,6 @@ impl DurableRevisionStore {
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Keep the explicit semantic and durability inputs at this boundary."
-    )]
     fn finalize_directory_streaming_checkpoint(
         &mut self,
         job: StreamingCheckpointJob,
@@ -741,10 +725,6 @@ impl DurableRevisionStore {
         })
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     fn finalize_single_file_streaming_checkpoint(
         &mut self,
         job: StreamingCheckpointJob,

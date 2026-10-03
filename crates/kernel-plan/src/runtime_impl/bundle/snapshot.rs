@@ -25,7 +25,6 @@ impl RuntimeRevisionSnapshot {
     /// immutable source snapshot. This is read-only authority shared by product preview and the
     /// durable derived-relation commit path, so preview and publication cannot disagree about the
     /// logical endpoint.
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     pub fn derive_relation_target_revision(
         &self,
         target_revision: RevisionId,
@@ -81,55 +80,17 @@ impl RuntimeRevisionSnapshot {
             }) {
                 return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch.into());
             }
-            let definition = source
-                .semantic_context()
-                .schema
-                .relation(mutation.relation)
-                .ok_or(PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation))?;
-            let source_rows = source
-                .state()
-                .model
-                .relations
-                .materialize_owned(&mutation.relation)
-                .unwrap_or_default();
-            let old = relation_value_from_rows(
-                source_rows.clone(),
-                &RelType {
-                    columns: definition.columns.clone(),
-                    semantics: definition.semantics.clone(),
-                },
-                source.semantic_context(),
-                registry,
+            let base = self.relation_bases.get(&mutation.relation).ok_or(
+                PhysicalExecutionError::MissingRuntimeRelationBinding(mutation.relation),
             )?;
-            let next = mutation
-                .delta
-                .apply_to_value(old, source.semantic_context(), registry)
-                .map_err(PhysicalExecutionError::from)?;
-            let next_rows = next.into_rows();
-            let survivor_count = next_rows
-                .len()
-                .checked_sub(mutation.delta.inserted.len())
-                .ok_or(PhysicalExecutionError::LogicalRevisionMutationMismatch)?;
-            let survivors = &next_rows[..survivor_count];
-            let mut survivor = 0_usize;
-            let mut removed_positions = Vec::with_capacity(mutation.delta.removed.len());
-            for (position, row) in source_rows.iter().enumerate() {
-                if survivor < survivors.len() && row == &survivors[survivor] {
-                    survivor += 1;
-                } else {
-                    removed_positions.push(position);
-                }
-            }
-            if survivor != survivors.len()
-                || removed_positions.len() != mutation.delta.removed.len()
-            {
-                return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch.into());
-            }
             candidate
-                .patch_relation_rows(
+                .patch_relation_delta_with_witness(
                     mutation.relation,
-                    &removed_positions,
-                    mutation.delta.inserted.clone(),
+                    target_revision,
+                    mutation.delta,
+                    base,
+                    mutation.validation_footprint(),
+                    registry,
                 )
                 .map_err(RuntimeRevisionDerivationError::from)?;
         }

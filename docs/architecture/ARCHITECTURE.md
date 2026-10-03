@@ -94,3 +94,8 @@ generation header
 Section ciphertext digests are accumulated while each final byte is written. The descriptor table is therefore a footer, not a prefix requiring ciphertext materialization. The generation SHA-256 is accumulated over the exact physical byte stream during publication; no post-write whole-generation reread is required. Root authority remains unchanged and is published only after the complete generation is synced.
 
 This closes payload-proportional *additional* encryption memory in the physical writer. Higher codecs may still own caller-side plaintext buffers (for example checkpoint/metadata encoding); eliminating those buffers is a separate upstream streaming-codec concern rather than a reason to reintroduce ciphertext staging.
+
+
+## Pre-release compatibility discipline
+
+Until CFMD declares its first released compatibility boundary, unreleased repository history is design evidence, not a compatibility contract. Active code must converge on one current architecture: pass-era codecs, enum variants, aliases, API adapters, migration shims, and behavior fallbacks are removed when superseded rather than carried forward. Obsolete/Legacy material may remain outside active execution paths as reference. Physical format markers are retained only as fail-closed type/corruption discriminators; they do not imply support for earlier development snapshots.

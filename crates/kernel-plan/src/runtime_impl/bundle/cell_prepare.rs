@@ -17,6 +17,43 @@ impl RuntimeRevisionCell {
         Ok(RuntimeRevisionSnapshot { root: root.clone() })
     }
 
+    fn reset_historical_derived_to_current(&self) -> Result<(), PhysicalExecutionError> {
+        let mut state = self
+            .root
+            .write()
+            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
+        let RuntimeRevisionCellState::Serving(live) = &*state else {
+            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
+        };
+        let next_version = live
+            .root_identity
+            .version
+            .0
+            .checked_add(1)
+            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
+        let candidate = RuntimeRevisionBundle {
+            root_identity: RuntimeRootIdentity {
+                root_id: live.root_identity.root_id,
+                version: RuntimeRootVersion(next_version),
+            },
+            revision: live.revision.clone(),
+            violation_state: live.violation_state.clone(),
+            physical: live.physical.clone(),
+            relation_layouts: live.relation_layouts.clone(),
+            relation_bases: live.relation_bases.clone(),
+            historical: RuntimeHistoricalDerivedIndex::from_current(
+                live.revision.id(),
+                &live.relation_bases,
+            ),
+            materialization_specs: live.materialization_specs.clone(),
+            materializations: live.materializations.clone(),
+            materialization_dependencies: live.materialization_dependencies.clone(),
+            materializations_by_relation: live.materializations_by_relation.clone(),
+        };
+        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
+        Ok(())
+    }
+
     pub fn prepare_revision(
         &self,
         request: &RevisionTransitionRequest<'_>,
@@ -71,5 +108,4 @@ impl RuntimeRevisionCell {
         self.snapshot()?
             .prepare_materialization_configuration(specs, registry)
     }
-
 }

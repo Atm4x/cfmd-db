@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use kernel_identity::DenseEntityIds;
 use kernel_lifecycle::DenseLifecycleProjection;
@@ -7,7 +10,11 @@ use kernel_schema::{RelationSemantics, SemanticContext};
 use kernel_semantics::{SemanticError, SemanticRegistry};
 use kernel_types::{RevisionId, SemanticRevision};
 use kernel_validation::{
-    DenseTypeExtents, ValidationError, validate_relations_with_extents, validate_state_with_extents,
+    DenseTypeExtents, ModelRuleWitnessState, RelationMutationFootprint, ValidationError,
+    validate_model_rule_witnesses_for_relation_mutations,
+    validate_relation_delta_insertions_with_extents,
+    validate_relations_structural_with_extents_selective,
+    validate_relations_with_extents_selective, validate_state_with_extents,
 };
 
 #[derive(Debug, Clone)]
@@ -139,6 +146,7 @@ pub struct Revision {
     state: DatabaseState,
     dense_basis: Arc<RevisionDenseBasis>,
     live_ref_sensitivity: LiveRefSensitivityIndex,
+    model_rule_witnesses: ModelRuleWitnessState,
     relation_only_provenance: RelationOnlyProvenance,
 }
 
@@ -147,6 +155,11 @@ pub struct RelationUpdateCandidate<'a> {
     source: &'a Revision,
     state: DatabaseState,
     touched_relations: BTreeSet<kernel_types::SemanticId>,
+    validation_footprints: BTreeMap<kernel_types::SemanticId, RelationMutationFootprint>,
+    model_rule_witnesses: Option<ModelRuleWitnessState>,
+    delta_structurally_certified: BTreeSet<kernel_types::SemanticId>,
+    live_ref_sensitivity: LiveRefSensitivityIndex,
+    live_ref_recompile_relations: BTreeSet<kernel_types::SemanticId>,
 }
 
 impl RelationUpdateCandidate<'_> {
@@ -162,6 +175,10 @@ impl RelationUpdateCandidate<'_> {
     ) {
         self.state.model.relations.insert(relation, rows);
         self.touched_relations.insert(relation);
+        self.validation_footprints
+            .insert(relation, RelationMutationFootprint::full());
+        self.model_rule_witnesses = None;
+        self.live_ref_recompile_relations.insert(relation);
     }
 
     pub fn patch_relation_rows(
@@ -170,16 +187,123 @@ impl RelationUpdateCandidate<'_> {
         removed_positions: &[usize],
         inserted: Vec<Vec<kernel_model::Value>>,
     ) -> Result<(), RevisionError> {
-        if !self
-            .state
-            .model
-            .relations
-            .patch_persistent(relation, removed_positions, inserted)
+        self.patch_relation_rows_with_footprint(
+            relation,
+            removed_positions,
+            inserted,
+            RelationMutationFootprint::full(),
+        )
+    }
+
+    pub fn patch_relation_rows_with_footprint(
+        &mut self,
+        relation: kernel_types::SemanticId,
+        removed_positions: &[usize],
+        inserted: Vec<Vec<kernel_model::Value>>,
+        footprint: RelationMutationFootprint,
+    ) -> Result<(), RevisionError> {
+        let removed = if removed_positions.is_empty() {
+            Vec::new()
+        } else {
+            let rows = self
+                .state
+                .model
+                .relations
+                .get_shared(&relation)
+                .ok_or(RevisionError::InvalidRelationOnlyTransition)?;
+            removed_positions
+                .iter()
+                .map(|position| {
+                    rows.get(*position)
+                        .cloned()
+                        .ok_or(RevisionError::InvalidRelationOnlyTransition)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !self.state.model.relations.patch_persistent(
+            relation,
+            removed_positions,
+            inserted.clone(),
+        ) {
+            return Err(RevisionError::InvalidRelationOnlyTransition);
+        }
+        if let Some(witnesses) = &self.model_rule_witnesses {
+            self.model_rule_witnesses = Some(
+                witnesses
+                    .apply_relation_delta(
+                        &self.source.semantic_context,
+                        relation,
+                        &footprint,
+                        &removed,
+                        &inserted,
+                    )
+                    .map_err(|_| {
+                        RevisionError::InvalidTypedModel(ValidationError::ModelRuleEvaluation)
+                    })?,
+            );
+        }
+        self.touched_relations.insert(relation);
+        self.validation_footprints
+            .entry(relation)
+            .and_modify(|existing| {
+                if *existing != footprint {
+                    *existing = RelationMutationFootprint::full();
+                }
+            })
+            .or_insert(footprint);
+        self.live_ref_recompile_relations.insert(relation);
+        Ok(())
+    }
+
+    /// Applies one exact semantic relation delta against the Γ-canonical
+    /// support witness of this source revision. Removals resolve to persistent
+    /// logical ordinals in O(delta log N); inserted rows alone pay structural
+    /// type/rule validation.
+    pub fn patch_relation_delta_with_witness(
+        &mut self,
+        relation: kernel_types::SemanticId,
+        target_revision: RevisionId,
+        delta: &kernel_query::RelationDelta,
+        witness: &kernel_query::RelationBaseWitness,
+        footprint: RelationMutationFootprint,
+        registry: &SemanticRegistry,
+    ) -> Result<kernel_query::RelationBaseWitness, RevisionError> {
+        if witness.relation() != relation
+            || witness.semantic_context() != &self.source.semantic_context
         {
             return Err(RevisionError::InvalidRelationOnlyTransition);
         }
-        self.touched_relations.insert(relation);
-        Ok(())
+        let advance = witness
+            .advance_with_source_positions(target_revision, delta, registry)
+            .map_err(|_| RevisionError::InvalidRelationOnlyTransition)?;
+        validate_relation_delta_insertions_with_extents(
+            &self.source.semantic_context,
+            registry,
+            &self.state,
+            &self.source.dense_basis.type_extents,
+            relation,
+            &delta.inserted,
+        )
+        .map_err(RevisionError::InvalidTypedModel)?;
+        let next_live_ref_sensitivity = self
+            .live_ref_sensitivity
+            .with_relation_delta(
+                relation,
+                advance.removed_positions(),
+                &delta.inserted,
+                &self.source.dense_basis.entities,
+            )
+            .ok_or(RevisionError::InvalidRelationOnlyTransition)?;
+        self.patch_relation_rows_with_footprint(
+            relation,
+            advance.removed_positions(),
+            delta.inserted.clone(),
+            footprint,
+        )?;
+        self.live_ref_sensitivity = next_live_ref_sensitivity;
+        self.live_ref_recompile_relations.remove(&relation);
+        self.delta_structurally_certified.insert(relation);
+        Ok(advance.into_successor())
     }
 
     pub fn build(
@@ -191,7 +315,10 @@ impl RelationUpdateCandidate<'_> {
             .validate_context(&self.source.semantic_context)
             .map_err(RevisionError::InvalidSemantics)?;
         let live = &self.source.state.lifecycle.entities;
-        for relation in &self.touched_relations {
+        for relation in self
+            .touched_relations
+            .difference(&self.delta_structurally_certified)
+        {
             let has_dangling =
                 self.state
                     .model
@@ -220,19 +347,43 @@ impl RelationUpdateCandidate<'_> {
                 self.state.model.relations.insert(*relation, filtered);
             }
         }
-        validate_relations_with_extents(
+        let full_structural_relations = self
+            .touched_relations
+            .difference(&self.delta_structurally_certified)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if !full_structural_relations.is_empty() {
+            validate_relations_structural_with_extents_selective(
+                &self.source.semantic_context,
+                registry,
+                &self.state,
+                &self.source.dense_basis.type_extents,
+                &full_structural_relations,
+            )
+            .map_err(RevisionError::InvalidTypedModel)?;
+        }
+        let model_rule_witnesses = match self.model_rule_witnesses {
+            Some(witnesses) => witnesses,
+            None => ModelRuleWitnessState::build(&self.source.semantic_context, &self.state)
+                .map_err(|_| {
+                    RevisionError::InvalidTypedModel(ValidationError::ModelRuleEvaluation)
+                })?,
+        };
+        validate_model_rule_witnesses_for_relation_mutations(
             &self.source.semantic_context,
-            registry,
-            &self.state,
-            &self.source.dense_basis.type_extents,
-            &self.touched_relations,
+            &model_rule_witnesses,
+            &self.validation_footprints,
         )
         .map_err(RevisionError::InvalidTypedModel)?;
-        let live_ref_sensitivity = self.source.live_ref_sensitivity.with_relations_recompiled(
-            &self.state.model,
-            &self.source.dense_basis.entities,
-            &self.touched_relations,
-        );
+        let live_ref_sensitivity = if self.live_ref_recompile_relations.is_empty() {
+            self.live_ref_sensitivity
+        } else {
+            self.live_ref_sensitivity.with_relations_recompiled(
+                &self.state.model,
+                &self.source.dense_basis.entities,
+                &self.live_ref_recompile_relations,
+            )
+        };
         Ok(Revision {
             id,
             semantics: self.source.semantics,
@@ -240,6 +391,7 @@ impl RelationUpdateCandidate<'_> {
             state: self.state,
             dense_basis: Arc::clone(&self.source.dense_basis),
             live_ref_sensitivity,
+            model_rule_witnesses,
             relation_only_provenance: RelationOnlyProvenance::derived(
                 &self.source.relation_only_provenance,
                 self.touched_relations,
@@ -293,29 +445,66 @@ impl Revision {
                 .relations
                 .insert(*relation, inserted.clone());
         }
-        validate_relations_with_extents(
+        let structural_footprints = touched
+            .iter()
+            .copied()
+            .map(|relation| (relation, RelationMutationFootprint::fields([])))
+            .collect();
+        validate_relations_with_extents_selective(
             &source.semantic_context,
             registry,
             &validation_state,
             &source.dense_basis.type_extents,
             &touched,
+            &structural_footprints,
         )
         .map_err(RevisionError::InvalidTypedModel)?;
 
         let mut state = source.state.clone();
+        let mut live_ref_sensitivity = source.live_ref_sensitivity.clone();
+        let mut model_rule_witnesses = source.model_rule_witnesses.clone();
+        let mut model_rule_footprints = BTreeMap::new();
         for (relation, inserted) in appends {
             state
                 .model
                 .relations
                 .append_persistent(*relation, inserted.clone());
+            // Even a non-reference append changes future logical row coordinates. The
+            // compact live-ref index therefore advances its tail coordinate authority
+            // for every exact append while still storing reverse targets only for
+            // ref-bearing rows. Skipping this made a later live-ref append resolve to
+            // the pre-append ordinal.
+            live_ref_sensitivity = live_ref_sensitivity
+                .with_relation_delta(*relation, &[], inserted, &source.dense_basis.entities)
+                .ok_or(RevisionError::InvalidRelationOnlyTransition)?;
+            let footprint = RelationMutationFootprint::full();
+            model_rule_witnesses = model_rule_witnesses
+                .apply_relation_delta(
+                    &source.semantic_context,
+                    *relation,
+                    &footprint,
+                    &[],
+                    inserted,
+                )
+                .map_err(|_| {
+                    RevisionError::InvalidTypedModel(ValidationError::ModelRuleEvaluation)
+                })?;
+            model_rule_footprints.insert(*relation, footprint);
         }
+        validate_model_rule_witnesses_for_relation_mutations(
+            &source.semantic_context,
+            &model_rule_witnesses,
+            &model_rule_footprints,
+        )
+        .map_err(RevisionError::InvalidTypedModel)?;
         Ok(Self {
             id,
             semantics: source.semantics,
             semantic_context: source.semantic_context.clone(),
             state,
             dense_basis: Arc::clone(&source.dense_basis),
-            live_ref_sensitivity: source.live_ref_sensitivity.clone(),
+            live_ref_sensitivity,
+            model_rule_witnesses,
             relation_only_provenance: RelationOnlyProvenance::derived(
                 &source.relation_only_provenance,
                 touched,
@@ -333,6 +522,11 @@ impl Revision {
             source: self,
             state: self.state.clone(),
             touched_relations: BTreeSet::new(),
+            validation_footprints: BTreeMap::new(),
+            model_rule_witnesses: Some(self.model_rule_witnesses.clone()),
+            delta_structurally_certified: BTreeSet::new(),
+            live_ref_sensitivity: self.live_ref_sensitivity.clone(),
+            live_ref_recompile_relations: BTreeSet::new(),
         }
     }
 
@@ -355,6 +549,8 @@ impl Revision {
             DenseTypeExtents::compile_with_ids(&state.model, &context.schema, &dense_entities);
         validate_state_with_extents(context, registry, &state, &dense_type_extents)
             .map_err(RevisionError::InvalidTypedModel)?;
+        let model_rule_witnesses = ModelRuleWitnessState::build(context, &state)
+            .map_err(|_| RevisionError::InvalidTypedModel(ValidationError::ModelRuleEvaluation))?;
         let dense_lifecycle =
             DenseLifecycleProjection::compile_with_ids(&state.lifecycle, &dense_entities);
         let live_ref_sensitivity = normalized.live_ref_sensitivity;
@@ -369,6 +565,7 @@ impl Revision {
                 type_extents: dense_type_extents,
             }),
             live_ref_sensitivity,
+            model_rule_witnesses,
             relation_only_provenance: RelationOnlyProvenance::root(),
         })
     }
@@ -380,6 +577,21 @@ impl Revision {
         state: DatabaseState,
         touched_relations: &BTreeSet<kernel_types::SemanticId>,
     ) -> Result<Self, RevisionError> {
+        let footprints = touched_relations
+            .iter()
+            .copied()
+            .map(|relation| (relation, RelationMutationFootprint::full()))
+            .collect();
+        Self::build_relation_update_selective(id, source, registry, state, &footprints)
+    }
+
+    pub fn build_relation_update_selective(
+        id: RevisionId,
+        source: &Self,
+        registry: &SemanticRegistry,
+        state: DatabaseState,
+        footprints: &BTreeMap<kernel_types::SemanticId, RelationMutationFootprint>,
+    ) -> Result<Self, RevisionError> {
         registry
             .validate_context(&source.semantic_context)
             .map_err(RevisionError::InvalidSemantics)?;
@@ -389,6 +601,7 @@ impl Revision {
         {
             return Err(RevisionError::InvalidRelationOnlyTransition);
         }
+        let touched_relations = footprints.keys().copied().collect::<BTreeSet<_>>();
         let source_untouched = source
             .state
             .model
@@ -407,6 +620,11 @@ impl Revision {
             source,
             state,
             touched_relations: touched_relations.clone(),
+            validation_footprints: footprints.clone(),
+            model_rule_witnesses: None,
+            delta_structurally_certified: BTreeSet::new(),
+            live_ref_sensitivity: source.live_ref_sensitivity.clone(),
+            live_ref_recompile_relations: touched_relations,
         }
         .build(id, registry)
     }
@@ -433,6 +651,11 @@ impl Revision {
             semantics: self.semantics,
             semantic_context: self.semantic_context.clone(),
         }
+    }
+
+    #[must_use]
+    pub const fn model_rule_witnesses(&self) -> &ModelRuleWitnessState {
+        &self.model_rule_witnesses
     }
 
     #[must_use]
@@ -479,7 +702,9 @@ impl Revision {
 #[cfg(test)]
 mod tests {
     use kernel_model::{DatabaseState, FiniteModel, Value};
-    use kernel_schema::{FieldDef, ScalarType, Schema, SemanticEnvironment, TypeExpr};
+    use kernel_schema::{
+        FieldDef, ScalarType, Schema, SemanticEnvironment, StructuralEquivalenceDef, TypeExpr,
+    };
     use kernel_semantics::{EquivalenceModule, SemanticRegistry};
     use kernel_types::{EntityId, SchemaRevisionId, SemanticEnvId, SemanticId};
 
@@ -655,6 +880,191 @@ mod tests {
             ),
             Err(RevisionError::InvalidRelationOnlyTransition),
         );
+    }
+
+    #[test]
+    fn append_only_bag_fast_path_still_enforces_model_rules_on_full_target() {
+        let relation = SemanticId::new(180);
+        let equivalence = SemanticId::new(181);
+        let mut context = empty_context();
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        context.environment.pin_module(equivalence, digest);
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: kernel_schema::RelationSemantics::Bag {
+                    column_equivalences: vec![equivalence],
+                },
+            })
+            .unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationCardinality {
+                relation,
+                min: 0,
+                max: Some(1),
+            })
+            .unwrap();
+        let mut state = DatabaseState::default();
+        state
+            .model
+            .relations
+            .insert(relation, vec![vec![Value::I64(1)]]);
+        let source = Revision::build(RevisionId::new(1), &context, &registry, state).unwrap();
+        assert!(matches!(
+            Revision::build_append_only_bag_relations(
+                RevisionId::new(2),
+                &source,
+                &registry,
+                &[(relation, vec![vec![Value::I64(2)]])],
+            ),
+            Err(RevisionError::InvalidTypedModel(
+                ValidationError::ModelRuleViolation { rule_index: 0 }
+            ))
+        ));
+    }
+
+    #[test]
+    fn append_only_bag_fast_path_advances_future_live_ref_row_coordinates() {
+        let person = SemanticId::new(182);
+        let relation = SemanticId::new(183);
+        let inner_equivalence = SemanticId::new(184);
+        let option_equivalence = SemanticId::new(185);
+        let target = EntityId::new(10);
+        let mut context = empty_context();
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::LiveEntityIdExact(person));
+        context.environment.pin_module(inner_equivalence, digest);
+        context
+            .schema
+            .define_structural_equivalence(
+                option_equivalence,
+                StructuralEquivalenceDef::Option {
+                    inner: inner_equivalence,
+                },
+            )
+            .unwrap();
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Option(Box::new(TypeExpr::Scalar(
+                    ScalarType::LiveEntityRef(person),
+                )))],
+                semantics: kernel_schema::RelationSemantics::Bag {
+                    column_equivalences: vec![option_equivalence],
+                },
+            })
+            .unwrap();
+
+        let mut state = DatabaseState::default();
+        state.lifecycle.entities.insert(target);
+        state.lifecycle.roots.insert(target);
+        state
+            .model
+            .carriers
+            .insert(person, BTreeSet::from([target]));
+        state
+            .model
+            .relations
+            .insert(relation, vec![vec![Value::Option(None)]]);
+        let source = Revision::build(RevisionId::new(1), &context, &registry, state).unwrap();
+        let appended = Revision::build_append_only_bag_relations(
+            RevisionId::new(2),
+            &source,
+            &registry,
+            &[(relation, vec![vec![Value::Option(None)]])],
+        )
+        .unwrap();
+
+        let inserted = vec![vec![Value::Option(Some(Box::new(Value::LiveEntityRef {
+            entity_type: person,
+            id: target,
+        })))]];
+        let advanced = appended
+            .live_ref_sensitivity
+            .with_relation_delta(relation, &[], &inserted, &appended.dense_basis.entities)
+            .unwrap();
+        let target_local = appended.dense_basis.entities.local(target).unwrap();
+        assert_eq!(
+            advanced
+                .consumers(target_local)
+                .unwrap()
+                .relation_rows()
+                .get(&relation),
+            Some(&BTreeSet::from([2]))
+        );
+    }
+
+    #[test]
+    fn relation_candidate_maintains_model_rule_witnesses_from_exact_delta() {
+        let relation = SemanticId::new(185);
+        let equivalence = SemanticId::new(186);
+        let mut context = empty_context();
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        context.environment.pin_module(equivalence, digest);
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: kernel_schema::RelationSemantics::Bag {
+                    column_equivalences: vec![equivalence],
+                },
+            })
+            .unwrap();
+        let column = context.schema.relation_column_id(relation, 0).unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
+                relation,
+                predicate: kernel_schema::SemanticRuleExpr::I64Range {
+                    value: kernel_schema::RuleValueExpr::Field(column),
+                    min: Some(0),
+                    max: Some(10),
+                },
+            })
+            .unwrap();
+        let mut state = DatabaseState::default();
+        state
+            .model
+            .relations
+            .insert(relation, vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
+        let source = Revision::build(RevisionId::new(1), &context, &registry, state).unwrap();
+
+        let mut candidate = source.relation_update_candidate();
+        candidate
+            .patch_relation_rows_with_footprint(
+                relation,
+                &[1],
+                vec![vec![Value::I64(3)]],
+                RelationMutationFootprint::fields([column]),
+            )
+            .unwrap();
+        let target = candidate.build(RevisionId::new(2), &registry).unwrap();
+        let rebuilt =
+            kernel_validation::ModelRuleWitnessState::build(&context, target.state()).unwrap();
+        assert_eq!(target.model_rule_witnesses(), &rebuilt);
+
+        let mut invalid = target.relation_update_candidate();
+        invalid
+            .patch_relation_rows_with_footprint(
+                relation,
+                &[1],
+                vec![vec![Value::I64(99)]],
+                RelationMutationFootprint::fields([column]),
+            )
+            .unwrap();
+        assert!(matches!(
+            invalid.build(RevisionId::new(3), &registry),
+            Err(RevisionError::InvalidTypedModel(
+                ValidationError::ModelRuleViolation { rule_index: 0 }
+            ))
+        ));
     }
 
     #[test]

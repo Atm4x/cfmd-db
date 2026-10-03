@@ -13,7 +13,6 @@ pub enum HistoryEffectKind {
     MixedRevision,
     FullRevision,
     SchemaMigration,
-    LegacyTargetOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,10 +324,6 @@ pub struct History {
 }
 
 impl History {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     pub(crate) fn from_runtime_at(
         runtime: &Arc<kernel_plan::DurableRuntime>,
         database_identity: u64,
@@ -401,9 +396,6 @@ impl History {
                         }
                         kernel_plan::RuntimeHistoryEffectKind::SchemaMigration => {
                             HistoryEffectKind::SchemaMigration
-                        }
-                        kernel_plan::RuntimeHistoryEffectKind::LegacyTargetOnly => {
-                            HistoryEffectKind::LegacyTargetOnly
                         }
                     },
                     reversibility: match effect.reversibility {

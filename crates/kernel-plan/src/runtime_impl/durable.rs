@@ -5,3 +5,5 @@ include!("durable/runtime_admin.rs");
 include!("durable/supervisor.rs");
 include!("durable/materialization_config.rs");
 include!("durable/transition.rs");
+
+include!("durable/schema_walker.rs");

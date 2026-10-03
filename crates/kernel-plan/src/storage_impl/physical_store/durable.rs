@@ -12,15 +12,6 @@ impl PhysicalStore {
                     .contains(&UnifiedArtifactId::I64Index(*binding)),
             });
         }
-        for binding in self.semantic_indexes.keys() {
-            specs.push(DurablePhysicalArtifactSpec::SemanticIndex {
-                relation: binding.relation,
-                key_parts: durable_semantic_key_parts(binding),
-                advisor_managed: self
-                    .advisor_managed_artifacts
-                    .contains(&UnifiedArtifactId::SemanticIndex(binding.clone())),
-            });
-        }
         for binding in self.semantic_quotient_factors.keys() {
             specs.push(DurablePhysicalArtifactSpec::SemanticQuotientFactor {
                 relation: binding.relation,
@@ -282,8 +273,7 @@ impl PhysicalStore {
     ) -> BTreeSet<PhysicalCapability> {
         match spec {
             DurablePhysicalArtifactSpec::RelationLayout { .. } => BTreeSet::new(),
-            DurablePhysicalArtifactSpec::I64Index { .. }
-            | DurablePhysicalArtifactSpec::SemanticIndex { .. } => {
+            DurablePhysicalArtifactSpec::I64Index { .. } => {
                 BTreeSet::from([PhysicalCapability::PointLookup])
             }
             DurablePhysicalArtifactSpec::SemanticQuotientFactor { .. } => {
@@ -320,17 +310,6 @@ impl PhysicalStore {
                 key_column: *key_column,
                 equivalence: *equivalence,
             })),
-            DurablePhysicalArtifactSpec::SemanticIndex {
-                relation,
-                key_parts,
-                ..
-            } => Some(UnifiedArtifactId::SemanticIndex(
-                recovered_semantic_index_binding(
-                    *relation,
-                    recovered_layout(*relation)?,
-                    key_parts,
-                )?,
-            )),
             DurablePhysicalArtifactSpec::SemanticQuotientFactor {
                 relation,
                 key_parts,
@@ -450,12 +429,7 @@ impl PhysicalStore {
                     semantic_work_units,
                 });
             }
-            DurablePhysicalArtifactSpec::SemanticIndex {
-                relation,
-                key_parts,
-                ..
-            }
-            | DurablePhysicalArtifactSpec::SemanticQuotientFactor {
+            DurablePhysicalArtifactSpec::SemanticQuotientFactor {
                 relation,
                 key_parts,
                 ..
@@ -521,27 +495,6 @@ impl PhysicalStore {
                 if *advisor_managed {
                     self.advisor_managed_artifacts_mut()
                         .insert(UnifiedArtifactId::I64Index(binding));
-                }
-            }
-            DurablePhysicalArtifactSpec::SemanticIndex {
-                relation,
-                key_parts,
-                advisor_managed,
-            } => {
-                let layout = relation_layouts.get(relation).copied().ok_or(
-                    PhysicalExecutionError::MissingRuntimeRelationBinding(*relation),
-                )?;
-                let binding = recovered_semantic_index_binding(*relation, layout, key_parts)?;
-                // Legacy durable semantic-index recipes are accepted for backward
-                // compatibility, but recovery converges them immediately onto the
-                // current SAMF/observable-atom representation.  The logical
-                // capability is the same Γ-keyed lookup; recreating the legacy
-                // runtime state would only keep an obsolete execution family alive
-                // after every restart.
-                self.install_observable_atom_state(binding.clone(), context, registry)?;
-                if *advisor_managed {
-                    self.advisor_managed_artifacts_mut()
-                        .insert(UnifiedArtifactId::ObservableAtom(binding));
                 }
             }
             DurablePhysicalArtifactSpec::SemanticQuotientFactor {
@@ -642,14 +595,6 @@ impl PhysicalStore {
                 i64_index_estimated_retained_bytes(state),
                 self.advisor_managed_artifacts
                     .contains(&UnifiedArtifactId::I64Index(*binding)),
-            );
-        }
-        for (binding, state) in &self.semantic_indexes {
-            add(
-                PhysicalArtifactFamily::SemanticIndex,
-                semantic_index_estimated_retained_bytes(state),
-                self.advisor_managed_artifacts
-                    .contains(&UnifiedArtifactId::SemanticIndex(binding.clone())),
             );
         }
         for state in self.observable_atom_states.values() {

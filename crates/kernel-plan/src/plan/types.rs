@@ -249,41 +249,6 @@ pub struct SemanticIndexWorkloadSample {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SemanticIndexAdvisorPolicy {
-    pub max_managed_key_cells: usize,
-    /// Budget for advisor-owned semantic indexes only.
-    pub max_managed_estimated_bytes: usize,
-    /// Global estimated retained-byte ceiling including fixed relation layouts
-    /// and physical families that this advisor is not allowed to evict.
-    pub max_total_estimated_bytes: usize,
-}
-
-impl Default for SemanticIndexAdvisorPolicy {
-    fn default() -> Self {
-        Self {
-            max_managed_key_cells: usize::MAX,
-            max_managed_estimated_bytes: usize::MAX,
-            max_total_estimated_bytes: usize::MAX,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SemanticIndexAdvisorReport {
-    pub created: Vec<SemanticIndexBinding>,
-    pub rebuilt: Vec<SemanticIndexBinding>,
-    pub retained: Vec<SemanticIndexBinding>,
-    pub evicted: Vec<SemanticIndexBinding>,
-    pub reused_existing: Vec<SemanticIndexBinding>,
-    pub rejected_unprofitable: Vec<SemanticIndexBinding>,
-    pub rejected_budget: Vec<SemanticIndexBinding>,
-    pub managed_key_cells: usize,
-    pub managed_estimated_bytes: usize,
-    pub fixed_estimated_bytes: usize,
-    pub total_estimated_bytes_after: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysicalArtifactAdvisorPolicy {
     pub max_managed_estimated_bytes: usize,
     pub max_total_estimated_bytes: usize,
@@ -301,28 +266,12 @@ pub struct I64IndexAdvisorReport {
     pub fixed_estimated_bytes: usize,
     pub total_estimated_bytes_after: usize,
 }
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SemanticStatisticsAdvisorReport {
-    pub created: Vec<SemanticIndexBinding>,
-    pub rebuilt: Vec<SemanticIndexBinding>,
-    pub retained: Vec<SemanticIndexBinding>,
-    pub evicted: Vec<SemanticIndexBinding>,
-    pub reused_existing: Vec<SemanticIndexBinding>,
-    pub rejected_unprofitable: Vec<SemanticIndexBinding>,
-    pub rejected_budget: Vec<SemanticIndexBinding>,
-    pub managed_estimated_bytes: usize,
-    pub fixed_estimated_bytes: usize,
-    pub total_estimated_bytes_after: usize,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObservableAtomConvergenceReport {
     pub created: bool,
     pub rebuilt: bool,
     pub retained_manual_observable: bool,
     pub capabilities: BTreeSet<PhysicalCapability>,
-    pub retired_legacy_indexes: Vec<SemanticIndexBinding>,
     pub retired_legacy_statistics: Vec<SemanticIndexBinding>,
     pub retired_legacy_quotient_factors: Vec<SemanticIndexBinding>,
 }
@@ -332,7 +281,6 @@ pub(super) type UnifiedAdvisorTelemetry = AdvisorTelemetry<UnifiedArtifactId>;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PhysicalArtifactTelemetryTarget {
     I64Index(I64IndexBinding),
-    SemanticIndex(SemanticIndexBinding),
     ObservableAtom(SemanticIndexBinding),
     SemanticQuotientFactor(SemanticIndexBinding),
     SemanticStatistics(SemanticIndexBinding),
@@ -342,7 +290,6 @@ impl PhysicalArtifactTelemetryTarget {
     fn into_unified(self) -> UnifiedArtifactId {
         match self {
             Self::I64Index(binding) => UnifiedArtifactId::I64Index(binding),
-            Self::SemanticIndex(binding) => UnifiedArtifactId::SemanticIndex(binding),
             Self::ObservableAtom(binding) => UnifiedArtifactId::ObservableAtom(binding),
             Self::SemanticQuotientFactor(binding) => {
                 UnifiedArtifactId::SemanticQuotientFactor(binding)
@@ -358,7 +305,6 @@ pub struct UnifiedObservableAdvisorReport {
     pub rebuilt: Vec<SemanticIndexBinding>,
     pub retained: Vec<SemanticIndexBinding>,
     pub evicted: Vec<SemanticIndexBinding>,
-    pub retired_legacy_indexes: Vec<SemanticIndexBinding>,
     pub retired_legacy_statistics: Vec<SemanticIndexBinding>,
     pub retired_legacy_quotient_factors: Vec<SemanticIndexBinding>,
     pub rejected_unprofitable: Vec<SemanticIndexBinding>,
@@ -478,7 +424,6 @@ pub enum PhysicalArtifactFamily {
     RelationLayout,
     SharedDenseIdentityMap,
     I64Index,
-    SemanticIndex,
     ObservableAtom,
     SemanticQuotientFactor,
     SemanticQuotientSupport,

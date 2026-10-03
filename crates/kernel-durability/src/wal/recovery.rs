@@ -695,7 +695,13 @@ impl ScanState {
             let transaction_key =
                 DurableTransactionKey::new(descriptor.idempotency_epoch, descriptor.transaction_id);
             let previous =
-                committed_transactions.insert(transaction_key, descriptor.intent.clone());
+                committed_transactions.insert(
+                    transaction_key,
+                    crate::domain::DurableCommittedTransaction::from_descriptor_intent(
+                        descriptor.target_revision,
+                        &descriptor.intent,
+                    ),
+                );
             debug_assert!(previous.is_none());
             committed.push(CommittedRevision {
                 descriptor,
@@ -756,7 +762,7 @@ mod tests {
                 inserted: vec![vec![value]],
                 removed: Vec::new(),
                 object_field_writes: Vec::new(),
-                authorization: crate::DurableRelationAuthorization::default(),
+                authorization: Default::default(),
             }],
             &registry,
         )

@@ -8,11 +8,6 @@ impl PhysicalStore {
     ) -> Result<(), PhysicalExecutionError> {
         for target in self.derived_artifact_targets(relation, layout) {
             let compatible = match target {
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticIndex(binding)) => self
-                    .semantic_indexes
-                    .get(binding)
-                    .expect("derived semantic index dependency points to missing artifact")
-                    .compatible_with(context, registry)?,
                 DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticQuotientFactor(
                     binding,
                 )) => self
@@ -62,11 +57,6 @@ impl PhysicalStore {
                     .get(binding)
                     .expect("derived I64 index dependency points to missing artifact")
                     .validate_physical_delta(delta)?,
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticIndex(binding)) => self
-                    .semantic_indexes
-                    .get(binding)
-                    .expect("derived semantic index dependency points to missing artifact")
-                    .validate_physical_delta(delta, context, registry)?,
                 DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticQuotientFactor(
                     binding,
                 )) => self
@@ -116,13 +106,6 @@ impl PhysicalStore {
                         .get_mut(&binding)
                         .expect("derived I64 index dependency points to missing artifact");
                     Arc::make_mut(state).apply_physical_delta(delta)?;
-                }
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticIndex(binding)) => {
-                    let state = self
-                        .semantic_indexes
-                        .get_mut(&binding)
-                        .expect("derived semantic index dependency points to missing artifact");
-                    Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
                 }
                 DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticQuotientFactor(
                     binding,

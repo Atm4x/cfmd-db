@@ -3,9 +3,9 @@ use std::io::Read;
 
 use kernel_revision::Revision;
 use kernel_schema::{
-    CapabilityDef, FieldDef, FieldRule, ModuleDigest, RelationDef, RelationSemantics,
-    RuleValueExpr, Schema, SemanticContext, SemanticEnvironment, SemanticRuleExpr, Symbol,
-    TextPattern,
+    CapabilityDef, FieldDef, FieldRule, FiniteF64, ModelRuleExpr, ModuleDigest, RelationDef,
+    RelationSemantics, RuleValueExpr, Schema, SemanticContext, SemanticEnvironment,
+    SemanticRuleExpr, Symbol, TextPattern,
 };
 use kernel_semantics::SemanticRegistry;
 use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
@@ -23,7 +23,7 @@ use super::semantic_codec::{
 };
 use super::state_codec::{decode_state, decode_type_expr, encode_state, encode_type_expr};
 
-pub(crate) const CHECKPOINT_CODEC_VERSION: u16 = 4;
+pub(crate) const CHECKPOINT_CODEC_VERSION: u16 = 5;
 
 pub(crate) fn encode_revision(revision: &Revision) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::new();
@@ -94,10 +94,6 @@ fn corrupt(reason: &'static str) -> DurabilityError {
     DurabilityError::Corruption { offset: 0, reason }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 pub(crate) fn encode_context(
     out: &mut impl crate::binary_codec::BinarySink,
     context: &SemanticContext,
@@ -181,6 +177,64 @@ pub(crate) fn encode_context(
         }
     }
 
+    push_len(out, schema.model_rules().len())?;
+    for rule in schema.model_rules() {
+        match rule {
+            ModelRuleExpr::RelationCardinality { relation, min, max } => {
+                out.push(0);
+                push_u128(out, relation.raw());
+                push_u64(out, *min);
+                match max {
+                    Some(max) => {
+                        out.push(1);
+                        push_u64(out, *max);
+                    }
+                    None => out.push(0),
+                }
+            }
+            ModelRuleExpr::RelationExists {
+                relation,
+                predicate,
+            } => {
+                out.push(1);
+                push_u128(out, relation.raw());
+                encode_semantic_rule_expr(out, predicate, 0)?;
+            }
+            ModelRuleExpr::RelationAll {
+                relation,
+                predicate,
+            } => {
+                out.push(2);
+                push_u128(out, relation.raw());
+                encode_semantic_rule_expr(out, predicate, 0)?;
+            }
+            ModelRuleExpr::RelationExactF64SumRange {
+                relation,
+                column,
+                min,
+                max,
+            } => {
+                out.push(3);
+                push_u128(out, relation.raw());
+                push_u128(out, column.raw());
+                match min {
+                    Some(value) => {
+                        out.push(1);
+                        push_u64(out, value.bits());
+                    }
+                    None => out.push(0),
+                }
+                match max {
+                    Some(value) => {
+                        out.push(1);
+                        push_u64(out, value.bits());
+                    }
+                    None => out.push(0),
+                }
+            }
+        }
+    }
+
     let relation_column_rules: Vec<_> = schema.all_relation_column_rules().collect();
     push_len(out, relation_column_rules.len())?;
     for ((relation, column), rule) in relation_column_rules {
@@ -236,6 +290,9 @@ pub(crate) fn decode_context(
         decode_entity_rules(cursor, &mut schema)?;
     }
     decode_relations(cursor, &mut schema)?;
+    if version >= 5 {
+        decode_model_rules(cursor, &mut schema)?;
+    }
     if version >= 3 {
         decode_relation_column_rules(cursor, &mut schema)?;
     }
@@ -249,6 +306,66 @@ pub(crate) fn decode_context(
         schema,
         environment,
     })
+}
+
+fn decode_model_rules(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
+    let count = cursor.len().map_err(corrupt)?;
+    for _ in 0..count {
+        let rule = match cursor.u8().map_err(corrupt)? {
+            0 => {
+                let relation = SemanticId::new(cursor.u128().map_err(corrupt)?);
+                let min = cursor.u64().map_err(corrupt)?;
+                let max = match cursor.u8().map_err(corrupt)? {
+                    0 => None,
+                    1 => Some(cursor.u64().map_err(corrupt)?),
+                    _ => return Err(corrupt("invalid model cardinality max tag")),
+                };
+                ModelRuleExpr::RelationCardinality { relation, min, max }
+            }
+            1 => ModelRuleExpr::RelationExists {
+                relation: SemanticId::new(cursor.u128().map_err(corrupt)?),
+                predicate: decode_semantic_rule_expr(cursor, 0)?,
+            },
+            2 => ModelRuleExpr::RelationAll {
+                relation: SemanticId::new(cursor.u128().map_err(corrupt)?),
+                predicate: decode_semantic_rule_expr(cursor, 0)?,
+            },
+            3 => {
+                let relation = SemanticId::new(cursor.u128().map_err(corrupt)?);
+                let column = SemanticId::new(cursor.u128().map_err(corrupt)?);
+                let min = match cursor.u8().map_err(corrupt)? {
+                    0 => None,
+                    1 => Some(
+                        FiniteF64::from_bits(cursor.u64().map_err(corrupt)?)
+                            .ok_or_else(|| corrupt("non-finite model sum min"))?,
+                    ),
+                    _ => return Err(corrupt("invalid model sum min tag")),
+                };
+                let max = match cursor.u8().map_err(corrupt)? {
+                    0 => None,
+                    1 => Some(
+                        FiniteF64::from_bits(cursor.u64().map_err(corrupt)?)
+                            .ok_or_else(|| corrupt("non-finite model sum max"))?,
+                    ),
+                    _ => return Err(corrupt("invalid model sum max tag")),
+                };
+                ModelRuleExpr::RelationExactF64SumRange {
+                    relation,
+                    column,
+                    min,
+                    max,
+                }
+            }
+            _ => return Err(corrupt("unknown model rule tag")),
+        };
+        schema
+            .add_model_rule(rule)
+            .map_err(|_| corrupt("invalid checkpoint model rule"))?;
+    }
+    Ok(())
 }
 
 fn decode_symbols(
@@ -428,7 +545,7 @@ fn encode_optional_i64(out: &mut impl BinarySink, value: Option<i64>) {
     match value {
         Some(value) => {
             out.push(1);
-            push_u64(out, value.cast_unsigned());
+            push_u64(out, value as u64);
         }
         None => out.push(0),
     }
@@ -437,7 +554,7 @@ fn encode_optional_i64(out: &mut impl BinarySink, value: Option<i64>) {
 fn decode_optional_i64(cursor: &mut impl BinarySource) -> Result<Option<i64>, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(None),
-        1 => Ok(Some((cursor.u64().map_err(corrupt)?).cast_signed())),
+        1 => Ok(Some(cursor.u64().map_err(corrupt)? as i64)),
         _ => Err(corrupt("invalid optional i64 rule tag")),
     }
 }

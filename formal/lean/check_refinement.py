@@ -197,7 +197,7 @@ if 'prepare_store_checkpoint_encoding(self, revision, chunk_size)?' not in start
 # Immutable generation artifacts must be created as new files rather than
 # opened for in-place overwrite.
 for fn_name in [
-    'fn write_checkpoint_file(',
+    'fn write_checkpoint_generation(',
     'fn write_metadata_file(',
     'fn write_prepared_cut_capsule(',
 ]:

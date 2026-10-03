@@ -23,7 +23,7 @@ use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
 };
 use crate::domain::{
-    DurableMigrationComplement, DurableRevisionEffectRecord, DurableTransactionIntent,
+    DurableMigrationComplement, DurableRevisionEffectRecord, DurableTransactionIntent, DurableCommittedTransaction,
     DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
 };
 use crate::replication::authority::ReplicationAuthorityJournal;
@@ -71,7 +71,7 @@ pub struct DurableRevisionStore {
     historical_epoch_anchors: BTreeMap<RevisionEffectId, HistoricalEpochAnchor>,
     current_idempotency_epoch: IdempotencyEpoch,
     minimum_retry_epoch: IdempotencyEpoch,
-    committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+    committed_transactions: BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
     next_revision_effect_id: u128,
     causal_coverage_root: RevisionId,
     revision_effects: BTreeMap<RevisionEffectId, DurableRevisionEffectRecord>,
@@ -127,7 +127,7 @@ use checkpoint_storage::{
     read_checkpoint_root_bounded,
 };
 #[cfg(test)]
-use format_registry::{CHECKPOINT_FORMAT_VERSION, METADATA_FILE_VERSION};
+use format_registry::{CHECKPOINT_FORMAT_TAG, METADATA_FILE_TAG};
 #[cfg(test)]
 use generation_layout::{
     checkpoint_chunk_path, checkpoint_path, manifest_path, metadata_path,

@@ -34,10 +34,6 @@ pub fn replay_durable_revisions_until(
     replay_durable_revisions_to(base_revision, scan, registry, Some(target_revision))
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn replay_durable_revisions_to(
     base_revision: &kernel_revision::Revision,
     scan: &RecoveryScan,
@@ -94,6 +90,7 @@ fn replay_durable_revisions_to(
                 semantic_revision,
                 relation_mutations,
                 model_delta,
+                ..
             } => {
                 if *semantic_revision != current.semantic_revision() {
                     return Err(RuntimeRecoveryError::SemanticRevisionMismatch);
@@ -504,9 +501,6 @@ pub(super) fn durable_physical_artifact_is_advisor_managed(
     match spec {
         DurablePhysicalArtifactSpec::RelationLayout { .. } => false,
         DurablePhysicalArtifactSpec::I64Index {
-            advisor_managed, ..
-        }
-        | DurablePhysicalArtifactSpec::SemanticIndex {
             advisor_managed, ..
         }
         | DurablePhysicalArtifactSpec::SemanticQuotientFactor {

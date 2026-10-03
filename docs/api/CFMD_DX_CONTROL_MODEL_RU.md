@@ -61,17 +61,24 @@ tx.commit()?;
 
 Она не умеет сама менять базу.
 
-Текущий переходный синтаксис:
+Обычный adaptive-синтаксис:
 
 ```rust
-let mut tx = db.transaction(TransactionId::new(42))?;
-let todos = tx.objects::<Todo>()?;
-
-tx.add_plan(todos.insert(first)?)?;
-tx.add_plan(todos.insert(second)?)?;
+let mut tx = Transaction::new();
+db.todos.add(&mut tx, first)?;
+db.todos.add(&mut tx, second)?;
 
 let preview = db.preview(&tx)?;
 let outcome = db.commit(&tx)?;
+```
+
+Если приложению нужен внешний/recoverable idempotency key, он настраивается на той же пассивной транзакции до формирования intent и не привязывает её к текущему HEAD:
+
+```rust
+let mut tx = Transaction::new()
+    .with_idempotency_key(TransactionId::new(42))?;
+db.todos.add(&mut tx, first)?;
+db.commit(&tx)?;
 ```
 
 Конечные строки читаются без знания внутреннего устройства `Transaction`:
@@ -349,3 +356,9 @@ Database.commit(Transaction)
 ```
 
 Это первая часть более крупного рефакторинга внешнего DX. Следующая часть должна убрать ручную прокладку `Plan` из обычной записи сущностей.
+
+### Hosted/binding idempotency после P458
+
+На transport boundary больше нет отдельного понятия `transaction: u128`: публичный DTO использует `IdempotencyKey`, который понижается в тот же durable `TransactionId`, что и локальный `Transaction::with_idempotency_key(...)`. Wire v2 при этом не меняется побайтно: key всё ещё кодируется фиксированным `u128`.
+
+Повтор потерянного ответа после успешного remote commit обязан работать даже при уже устаревшем `base_revision`: identical key + exact relation effect возвращает `AlreadyCommitted`, changed effect под тем же key — `TransactionConflict`. Неизвестный stale intent не исполняется заново на новом HEAD и остаётся `StaleRevision`. Это намеренно отделяет безопасный durable retry от будущей задачи transport/rebase нового stale intent.

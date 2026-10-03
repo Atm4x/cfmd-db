@@ -57,6 +57,8 @@ pub use query::{
     OrderComparison, OrderDirection, PreparedQuery, Query, QueryNode, QueryNodeId, QueryNodeKind,
     QuerySource, RelationResult,
 };
+#[doc(hidden)]
+pub use runtime::ExactRelationMutation;
 pub use runtime::{
     Database, DatabaseBuilder, Encryption, EncryptionKey, EncryptionKeyAcknowledgement,
     EncryptionKeyDestination, EncryptionKeyId, EncryptionKeyOperation, EncryptionKeyProvider,
@@ -73,8 +75,8 @@ pub use schema_model::{
     SchemaAuthorityPair,
 };
 pub use schema_model::{
-    CfmdSchema, Context, ContextSource, DatabaseContext, DatabaseDefinition, EntitySet,
-    SchemaDatabase, SchemaDatabaseBuilder, Snapshot,
+    CfmdSchema, Context, ContextSource, DatabaseDefinition, EntitySet, SchemaDatabase,
+    SchemaDatabaseBuilder, Snapshot,
 };
 pub use security::{
     Permission, PermissionSet, PrincipalId, Role, Session, SessionDatabase, SessionSnapshot,

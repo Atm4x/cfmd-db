@@ -20,23 +20,23 @@ pub use binary_codec::crc32c;
 pub use descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
     DurableRelationLayoutKind, DurableRevisionDescriptor, DurableSemanticKeyPart,
-    PHYSICAL_ARTIFACT_RECIPE_VERSION,
+    PHYSICAL_ARTIFACT_RECIPE_TAG,
 };
 pub use domain::{
-    DurableCarrierPatch, DurableEffectCoordinationClass, DurableEffectKind,
-    DurableExternalFreshnessBinding, DurableFieldPatch, DurableKeepsAlivePatch,
-    DurableMigrationComplement, DurableModelDelta, DurableObjectFieldWrite,
-    DurableRelationAuthorization, DurableRelationMutation, DurableRelationResolution,
-    DurableRelationRewriteIntent, DurableRevisionChange, DurableRevisionEffectRecord,
-    DurableTransactionIntent, DurableTransactionKey, HistoricalBoundaryAuthority,
-    HistoricalComplementError, HistoricalEpochAnchor, HistoricalLensImplementation,
-    HistoricalLensImplementationKey, HistoricalLensRegistry, HistoricalRestoreError,
-    IdempotencyEpoch, LocalHistoricalComplementChain, MigrationPhysicalAuthority,
-    SchemaMigrationPhysicalState, SemanticChangeEvent,
+    ClientIntentGuardDigest, DurableCarrierPatch, DurableClientIntent, DurableCommittedTransaction,
+    DurableEffectCoordinationClass, DurableEffectKind, DurableExternalFreshnessBinding,
+    DurableFieldPatch, DurableKeepsAlivePatch, DurableMigrationComplement, DurableModelDelta,
+    DurableObjectFieldWrite, DurableRelationAuthorization, DurableRelationMutation,
+    DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
+    DurableRevisionEffectRecord, DurableTransactionIntent, DurableTransactionKey,
+    HistoricalBoundaryAuthority, HistoricalComplementError, HistoricalEpochAnchor,
+    HistoricalLensImplementation, HistoricalLensImplementationKey, HistoricalLensRegistry,
+    HistoricalRestoreError, IdempotencyEpoch, LocalHistoricalComplementChain,
+    MigrationPhysicalAuthority, SchemaMigrationPhysicalState, SemanticChangeEvent,
 };
 pub use freshness_tcp::{TcpExternalFreshnessAuthority, TcpExternalFreshnessAuthorityServer};
 pub use wal_frame::{FORMAT_VERSION, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN};
-pub use wal_payload::MUTATION_CODEC_VERSION;
+pub use wal_payload::MUTATION_FORMAT_TAG;
 
 pub use platform_assurance::{
     DestructiveDurabilityCampaignEvidence, DestructiveDurabilityCut, DurabilityPlatformEvidence,

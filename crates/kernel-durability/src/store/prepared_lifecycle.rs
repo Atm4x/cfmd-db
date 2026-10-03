@@ -21,6 +21,10 @@ pub(super) struct PreparedTransactionLedger {
 }
 
 impl PreparedTransactionLedger {
+    pub(super) fn is_empty(&self) -> bool {
+        self.by_lsn.is_empty()
+    }
+
     pub(super) fn from_recovery_scan(scan: &RecoveryScan) -> Self {
         let mut ledger = Self::default();
         for &(prepare_lsn, ref descriptor, payload_crc32c) in scan.unresolved_prepares() {

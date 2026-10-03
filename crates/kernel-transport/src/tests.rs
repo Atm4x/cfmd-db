@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_identity::IdentityTransport;
 use kernel_model::{DatabaseState, FiniteModel};
-use kernel_query::{ExactQuery, RelExpr};
+use kernel_query::{ExactQuery, RelExpr, RelationDelta};
 use kernel_schema::SemanticContext;
 
 use kernel_schema::{
@@ -1132,16 +1132,13 @@ fn semantic_environment_transport_is_generic_across_ordering_modules() {
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn schema_migration_transport_supports_merge_split_create_and_drop_in_one_verified_step() {
     use std::collections::BTreeSet;
 
     let entity_type = SemanticId::new(20_000);
     let old_left = SemanticId::new(20_001);
     let old_right = SemanticId::new(20_002);
+    let old_dropped = SemanticId::new(20_006);
     let new_sum = SemanticId::new(20_003);
     let new_copy = SemanticId::new(20_004);
     let new_default = SemanticId::new(20_005);
@@ -1149,7 +1146,7 @@ fn schema_migration_transport_supports_merge_split_create_and_drop_in_one_verifi
     let registry = SemanticRegistry::default();
 
     let mut source_schema = Schema::new(SchemaRevisionId::new(200));
-    for field in [old_left, old_right] {
+    for field in [old_left, old_right, old_dropped] {
         source_schema
             .define_field(FieldDef {
                 id: field,
@@ -1238,6 +1235,10 @@ fn schema_migration_transport_supports_merge_split_create_and_drop_in_one_verifi
         .model
         .fields
         .insert((old_right, entity), kernel_model::Value::I64(6));
+    state
+        .model
+        .fields
+        .insert((old_dropped, entity), kernel_model::Value::I64(12));
     let source_revision = kernel_revision::Revision::build(
         kernel_types::RevisionId::new(1),
         &source,
@@ -1245,6 +1246,39 @@ fn schema_migration_transport_supports_merge_split_create_and_drop_in_one_verifi
         state,
     )
     .unwrap();
+    assert_eq!(
+        migration
+            .transport_field_dependencies_exact(&BTreeSet::from([old_left]))
+            .unwrap(),
+        BTreeSet::from([new_sum, new_copy])
+    );
+    assert_eq!(
+        migration
+            .transport_field_coordinate_dependencies_exact(&BTreeSet::from([(old_left, entity)]))
+            .unwrap(),
+        BTreeSet::from([(new_sum, entity), (new_copy, entity)])
+    );
+    assert_eq!(
+        migration.transport_field_dependencies_exact(&BTreeSet::from([old_dropped])),
+        Err(TransportError::UnrepresentableSourceFieldDependency(
+            old_dropped
+        ))
+    );
+    let unknown_source_field = SemanticId::new(20_099);
+    assert_eq!(
+        migration.transport_field_dependencies_exact(&BTreeSet::from([unknown_source_field])),
+        Err(TransportError::UnknownSourceField(unknown_source_field))
+    );
+    let (field_updates, implicit_dependencies) = migration
+        .transport_field_updates_exact(
+            source_revision.state(),
+            &[(old_left, entity, Some(kernel_model::Value::I64(5)))],
+        )
+        .unwrap();
+    assert!(field_updates.contains(&(new_sum, entity, Some(kernel_model::Value::I64(11)))));
+    assert!(field_updates.contains(&(new_copy, entity, Some(kernel_model::Value::I64(5)))));
+    assert_eq!(implicit_dependencies, BTreeSet::from([(old_right, entity)]));
+
     let migrated = migration
         .transport_revision(
             &source_revision,
@@ -1273,10 +1307,6 @@ fn schema_migration_transport_supports_merge_split_create_and_drop_in_one_verifi
 }
 
 #[test]
-#[allow(
-    clippy::similar_names,
-    reason = "Names distinguish the before and after states of the same operation."
-)]
 fn schema_migration_row_rewrite_changes_relation_column_type_without_host_callback() {
     let relation = SemanticId::new(21_000);
     let eq_i64 = SemanticId::new(21_001);
@@ -1345,6 +1375,30 @@ fn schema_migration_row_rewrite_changes_relation_column_type_without_host_callba
     )
     .unwrap();
 
+    let source_type = RelExpr::Scan(relation)
+        .typecheck(&source, &registry)
+        .unwrap();
+    let transported_delta = migration
+        .transport_relation_delta_exact(
+            relation,
+            &RelationDelta {
+                inserted: vec![vec![kernel_model::Value::I64(8)]],
+                removed: vec![vec![kernel_model::Value::I64(7)]],
+                result_type: source_type,
+            },
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(transported_delta.len(), 1);
+    assert_eq!(
+        transported_delta[0].1.inserted,
+        vec![vec![kernel_model::Value::F64Bits(8.0_f64.to_bits())]]
+    );
+    assert_eq!(
+        transported_delta[0].1.removed,
+        vec![vec![kernel_model::Value::F64Bits(7.0_f64.to_bits())]]
+    );
+
     let mut state = DatabaseState::default();
     state
         .model
@@ -1375,10 +1429,6 @@ fn schema_migration_row_rewrite_changes_relation_column_type_without_host_callba
 }
 
 #[test]
-#[allow(
-    clippy::similar_names,
-    reason = "Names distinguish the before and after states of the same operation."
-)]
 fn schema_migration_exposes_independent_row_local_physical_slice() {
     let relation = SemanticId::new(22_000);
     let eq_i64 = SemanticId::new(22_001);
@@ -1572,10 +1622,6 @@ fn schema_migration_query_slice_declares_exact_source_dependency_set() {
 }
 
 #[test]
-#[allow(
-    clippy::similar_names,
-    reason = "Names distinguish the before and after states of the same operation."
-)]
 fn mixed_migration_source_retention_frontier_is_dependency_exact_and_monotone() {
     let source_a = SemanticId::new(24_000);
     let source_b = SemanticId::new(24_001);

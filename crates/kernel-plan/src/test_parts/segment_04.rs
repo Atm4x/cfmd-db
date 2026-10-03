@@ -727,7 +727,7 @@ fn prepared_gamma_quotient_factors_reuse_delta_maintained_canonical_keys() {
         0
     );
     let factor_binding = SemanticIndexBinding::single(a, bindings[0], 0, equivalence);
-    assert!(store.semantic_index(&factor_binding).is_none());
+    assert!(store.observable_atom_state(&factor_binding).is_none());
     assert!(store.semantic_quotient_factor(&factor_binding).is_some());
 
     assert_quotient_support_cache_survives_delta(
@@ -928,7 +928,7 @@ fn structural_observable_atom_drives_persisted_join_without_primitive_gate() {
     store
         .install_observable_atom_state(binding.clone(), &context, &registry)
         .unwrap();
-    assert!(store.semantic_indexes_for_test().is_empty());
+    assert!(store.observable_atom_states_for_test().contains_key(&binding));
 
     let query = RelExpr::JoinEq {
         left: Box::new(RelExpr::Scan(left_relation)),
@@ -998,9 +998,9 @@ fn persisted_structural_semantic_index_is_consumed_and_delta_maintained() {
         .unwrap();
     let binding = SemanticIndexBinding::single(relation, layout, 0, structural);
     store
-        .install_semantic_index(binding.clone(), &context, &registry)
+        .install_observable_atom_state(binding.clone(), &context, &registry)
         .unwrap();
-    let index = store.semantic_index(&binding).unwrap();
+    let index = store.observable_atom_state(&binding).unwrap();
 
     let mut unrelated_gamma_change = context.clone();
     let unrelated_v2 = registry.install_equivalence_revision(EquivalenceModule::I64Exact, 2);
@@ -1047,7 +1047,7 @@ fn persisted_structural_semantic_index_is_consumed_and_delta_maintained() {
     store
         .apply_relation_delta(relation, layout, &delta, &context, &registry)
         .unwrap();
-    let index = store.semantic_index(&binding).unwrap();
+    let index = store.observable_atom_state(&binding).unwrap();
     assert_eq!(index.row_count(), 66);
     let (after, after_stats) = prepared.execute_native_pinned(&store, &registry).unwrap();
     assert_eq!(after.rows().len(), 2);
@@ -1108,7 +1108,7 @@ fn multiway_join_planner_reassociates_contiguous_tree_and_reuses_indexes_after_i
     }
     for (relation, binding) in [(b, bindings[1]), (c, bindings[2])] {
         store
-            .install_semantic_index(
+            .install_observable_atom_state(
                 SemanticIndexBinding::single(relation, binding, 0, equivalence),
                 &context,
                 &registry,
@@ -1202,7 +1202,7 @@ fn pass44_multiway_join_reassociation_benchmark() {
     }
     for (relation, binding) in [(b, bindings[1]), (c, bindings[2])] {
         store
-            .install_semantic_index(
+            .install_observable_atom_state(
                 SemanticIndexBinding::single(relation, binding, 0, equivalence),
                 &context,
                 &registry,
@@ -1280,7 +1280,7 @@ fn join_access_decision_unifies_persisted_and_ephemeral_i64_families() {
         .install_i64_index(i64_binding, &context, &registry)
         .unwrap();
     store
-        .install_semantic_index(semantic_binding.clone(), &context, &registry)
+        .install_observable_atom_state(semantic_binding.clone(), &context, &registry)
         .unwrap();
 
     let both = observe_right_join_access_for_test(
@@ -1316,26 +1316,8 @@ fn join_access_decision_unifies_persisted_and_ephemeral_i64_families() {
     .unwrap();
     assert_eq!(semantic_only.family, JoinAccessKind::PersistedSemantic);
 
-    store
-        .install_observable_atom_state(semantic_binding.clone(), &context, &registry)
-        .unwrap();
-    store.remove_semantic_index(&semantic_binding);
-    let samf_only = observe_right_join_access_for_test(
-        JoinAccessProbe {
-            left_rows: 100,
-            right_relation: relation,
-            right_layout: layout,
-            right_column: 0,
-            equivalence,
-            allow_ephemeral: true,
-        },
-        &store,
-        &context,
-        &registry,
-    )
-    .unwrap();
-    assert_eq!(samf_only.family, JoinAccessKind::PersistedSemantic);
-
+    // With the legacy semantic-index family removed, SAMF/ObservableAtom is the
+    // sole persisted semantic-fiber candidate. Removing it leaves only ephemeral access.
     store.remove_observable_atom_state(&semantic_binding);
     let transient = observe_right_join_access_for_test(
         JoinAccessProbe {

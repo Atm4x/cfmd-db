@@ -45,7 +45,7 @@ impl DurableRuntime {
                 inserted: rewrite.rewrite.delta().inserted.clone(),
                 removed: rewrite.rewrite.delta().removed.clone(),
                 object_field_writes: Vec::new(),
-                authorization: kernel_durability::DurableRelationAuthorization::default(),
+                authorization: Default::default(),
             });
             intents.push(DurableRelationRewriteIntent {
                 relation: rewrite.relation,
@@ -158,12 +158,13 @@ impl DurableRuntime {
     }
 
     pub fn create_with_storage_options_and_revision_publication_notifier(
-        root: RuntimeRevisionBundle,
+        mut root: RuntimeRevisionBundle,
         path: impl AsRef<std::path::Path>,
         registry: &kernel_semantics::SemanticRegistry,
         storage: &RuntimeStorageOptions,
         revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
     ) -> Result<Self, DurabilityError> {
+        root.historical = RuntimeHistoricalDerivedIndex::from_current(root.revision.id(), &root.relation_bases);
         let materialization_specs = root.durable_materialization_specs();
         let physical_artifact_specs = root.durable_physical_artifact_specs();
         let artifact_cores =
@@ -294,7 +295,7 @@ impl DurableRuntime {
         physical_recovery_policy: PhysicalRecoveryPolicy,
         revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
     ) -> Result<(Self, PhysicalRecoveryReport), RuntimeRecoveryError> {
-        let (durability, scan) = match storage.backend {
+        let (mut durability, scan) = match storage.backend {
             RuntimeDurabilityBackend::SingleFile => {
                 DurableRevisionStore::open_single_file_with_encryption(path, &storage.encryption)?
             }
@@ -319,7 +320,7 @@ impl DurableRuntime {
             .collect::<Vec<_>>();
         let physical_artifact_specs = durability.physical_artifact_specs().to_vec();
         let artifact_cores = durability.artifact_cores().to_vec();
-        let (root, recovery_report) = recover_runtime_bundle_with_policy_and_cores(
+        let (mut root, recovery_report) = recover_runtime_bundle_with_policy_and_cores(
             durability.checkpoint_revision(),
             &scan,
             &materialization_specs,
@@ -328,7 +329,70 @@ impl DurableRuntime {
             physical_recovery_policy,
             &registry,
         )?;
-        if root.revision().id() != durability.durable_head() {
+        let durable_head = durability.durable_head();
+        let causal_floor = durability.causal_coverage_root();
+        if let Some(records) = durability.revision_transition_records_back_to(causal_floor, durable_head)? {
+            let effects = records
+                .iter()
+                .map(RuntimeHistoryEffect::from_durable)
+                .collect::<Vec<_>>();
+            root.rebuild_historical_derived_index(&effects, &registry)?;
+
+            let mut epoch_effects = Vec::<RuntimeHistoryEffect>::new();
+            for record in records.iter().rev() {
+                let DurableTransactionIntent::SchemaMigration { program, .. } = &record.intent else {
+                    epoch_effects.push(RuntimeHistoryEffect::from_durable(record));
+                    continue;
+                };
+                let source = if let Some(source) =
+                    durability.historical_revision_from_realization(record.id)?
+                {
+                    source
+                } else {
+                    let material = durability
+                        .historical_epoch_material(record.id)?
+                        .ok_or(RuntimeRecoveryError::BaseRevisionMismatch)?;
+                    crate::replay_durable_revisions_until(
+                        material.checkpoint(),
+                        material.recovery_scan(),
+                        material.semantic_registry(),
+                        record.source_revision,
+                    )?
+                };
+                if source.id() != record.source_revision {
+                    return Err(RuntimeRecoveryError::BaseRevisionMismatch);
+                }
+                let relation_bases = RuntimeRevisionBundle::relation_base_witnesses(
+                    &source,
+                    &registry,
+                )?;
+                let effects_backwards = epoch_effects
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let index = RuntimeRetainedEpochIndex::rebuild_from_boundary(
+                    record.source_revision,
+                    &relation_bases,
+                    &effects_backwards,
+                    source.semantic_context(),
+                    &registry,
+                )?;
+                root.historical.retained_schema_epochs.insert(
+                    record.source_revision,
+                    RuntimeRetainedSchemaEpoch {
+                        source_revision: record.source_revision,
+                        target_revision: record.target_revision,
+                        source_context: source.semantic_context().clone(),
+                        source_fields: source.state().model.fields.clone(),
+                        program: program.clone(),
+                        index,
+                    },
+                );
+                epoch_effects.clear();
+            }
+        }
+        if root.revision().id() != durable_head {
             return Err(RuntimeRecoveryError::DurableHeadMismatch);
         }
         Ok((

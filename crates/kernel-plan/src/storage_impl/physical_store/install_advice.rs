@@ -31,8 +31,6 @@ impl PhysicalStore {
         );
         self.i64_indexes_mut_internal()
             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
-        self.semantic_indexes_mut_internal()
-            .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
         self.semantic_quotient_factors_mut()
             .retain(|index, _| index.relation != relation || index.layout.id != binding.id);
         self.semantic_quotient_supports_mut()
@@ -166,86 +164,6 @@ impl PhysicalStore {
         self.state_identity = Arc::new(());
         Ok(snapshot)
     }
-
-    // HOSTILE[P162][COMPAT][RETIRING:P160.C]: the old direct-Join statistics advisor no longer
-    // creates artifacts. Manual statistics remain valid for multiway cardinality; this surface
-    // only retires previously advisor-owned statistics until a real counterfactual consumer exists.
-    pub fn advise_semantic_statistics(
-        &mut self,
-        _workload: &[SemanticIndexWorkloadSample],
-        _policy: PhysicalArtifactAdvisorPolicy,
-        _context: &kernel_schema::SemanticContext,
-        _registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<SemanticStatisticsAdvisorReport, PhysicalExecutionError> {
-        let SemanticStatisticsAdvisorSelection {
-            selected,
-            prepared_states,
-            managed_estimated_bytes,
-            mut report,
-        } = semantic_statistics_advisor_selection(self);
-        let prepared_bindings = prepared_states
-            .iter()
-            .map(|(binding, _)| binding.clone())
-            .collect::<BTreeSet<_>>();
-        let evicted = self
-            .advisor_managed_artifacts
-            .iter()
-            .filter_map(|artifact| match artifact {
-                UnifiedArtifactId::SemanticStatistics(binding) if !selected.contains(binding) => {
-                    Some(binding.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let changed = !evicted.is_empty() || !prepared_states.is_empty();
-        let next_epoch = if changed {
-            Some(
-                self.transition_epoch
-                    .checked_add(1)
-                    .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?,
-            )
-        } else {
-            None
-        };
-        for binding in &evicted {
-            self.semantic_statistics_mut_internal().remove(binding);
-            self.advisor_managed_artifacts_mut()
-                .remove(&UnifiedArtifactId::SemanticStatistics(binding.clone()));
-            report.evicted.push(binding.clone());
-        }
-        for (binding, state) in prepared_states {
-            let existed = self.semantic_statistics.contains_key(&binding);
-            self.semantic_statistics_mut_internal()
-                .insert(binding.clone(), Arc::new(state));
-            self.advisor_managed_artifacts_mut()
-                .insert(UnifiedArtifactId::SemanticStatistics(binding.clone()));
-            if existed {
-                report.rebuilt.push(binding);
-            } else {
-                report.created.push(binding);
-            }
-        }
-        for binding in selected {
-            if prepared_bindings.contains(&binding) {
-                continue;
-            }
-            if self
-                .advisor_managed_artifacts
-                .contains(&UnifiedArtifactId::SemanticStatistics(binding.clone()))
-            {
-                report.retained.push(binding);
-            } else {
-                report.reused_existing.push(binding);
-            }
-        }
-        if let Some(next_epoch) = next_epoch {
-            self.transition_epoch = next_epoch;
-            self.state_identity = Arc::new(());
-        }
-        report.managed_estimated_bytes = managed_estimated_bytes;
-        Ok(report)
-    }
-
     pub fn semantic_statistics(
         &self,
         binding: &SemanticIndexBinding,

@@ -1,4 +1,34 @@
 impl DurableRuntime {
+    pub(crate) fn check_mixed_client_retry(
+        &self,
+        transaction_id: ClientTransactionId,
+        client_semantic_revision: kernel_types::SemanticRevision,
+        client_model_delta: &DurableModelDelta,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+        requested_target: RevisionId,
+    ) -> Result<Option<RevisionId>, DurableRuntimeCommitError> {
+        let durability = self.durability.lock().map_err(|_| {
+            let _ = self.cell.force_recovery_required();
+            DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
+        })?;
+        let Some(committed_intent) = durability.transaction_intent(transaction_id) else {
+            return Ok(None);
+        };
+        if committed_intent.matches_mixed_client_intent(
+            client_semantic_revision,
+            &[],
+            client_model_delta,
+            client_guard_digest,
+        ) {
+            return Ok(Some(committed_intent.target_revision()));
+        }
+        Err(DurableRuntimeCommitError::TransactionIdConflict {
+            transaction_id,
+            committed_target: committed_intent.target_revision(),
+            requested_target,
+        })
+    }
+
     pub fn commit_revision(
         &self,
         transaction_id: ClientTransactionId,
@@ -56,6 +86,15 @@ impl DurableRuntime {
         transaction_id: ClientTransactionId,
         request: &MixedRevisionTransitionRequest<'_>,
     ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+        self.commit_mixed_revision_guarded(transaction_id, request, None)
+    }
+
+    pub fn commit_mixed_revision_guarded(
+        &self,
+        transaction_id: ClientTransactionId,
+        request: &MixedRevisionTransitionRequest<'_>,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
         let durable_mutations = Self::canonical_durable_relation_mutations(request.mutations)?;
         let requested_intent = DurableTransactionIntent::mixed_revision(
             request.source_revision,
@@ -67,7 +106,8 @@ impl DurableRuntime {
             &self.registry,
         )
         .map_err(DurabilityError::Encode)
-        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        .map_err(DurableRuntimeCommitError::PrepareDurability)?
+        .with_client_guard_digest(client_guard_digest);
         let mut durability = self.durability.lock().map_err(|_| {
             let _ = self.cell.force_recovery_required();
             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
@@ -93,7 +133,12 @@ impl DurableRuntime {
             registry: &self.registry,
         };
         self.cell
-            .commit_mixed_revision_durable(transaction_id, &authorized_request, &mut *durability)
+            .commit_mixed_revision_durable_guarded(
+                transaction_id,
+                &authorized_request,
+                client_guard_digest,
+                &mut *durability,
+            )
             .map(|receipt| {
                 let relations = request
                     .mutations
@@ -114,18 +159,80 @@ impl DurableRuntime {
         client_mutations: &[RevisionRelationMutation<'_>],
         client_model_delta: &DurableModelDelta,
     ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+        self.commit_mixed_revision_residual_guarded(
+            transaction_id,
+            request,
+            client_mutations,
+            client_model_delta,
+            None,
+        )
+    }
+
+    pub fn commit_mixed_revision_residual_guarded(
+        &self,
+        transaction_id: ClientTransactionId,
+        request: &MixedRevisionTransitionRequest<'_>,
+        client_mutations: &[RevisionRelationMutation<'_>],
+        client_model_delta: &DurableModelDelta,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+        self.commit_mixed_revision_residual_guarded_with_dependencies(
+            transaction_id,
+            request,
+            client_mutations,
+            client_model_delta,
+            client_guard_digest,
+            None,
+        )
+    }
+
+    /// Security-critical residual publication with passive dependency proof
+    /// bound to the same immutable source root as transition preparation.
+    /// Retry identity remains the original client effect + guard digest; the
+    /// dependency list is proof material, not a second idempotency identity.
+    pub fn commit_mixed_revision_residual_guarded_with_dependencies(
+        &self,
+        transaction_id: ClientTransactionId,
+        request: &MixedRevisionTransitionRequest<'_>,
+        client_mutations: &[RevisionRelationMutation<'_>],
+        client_model_delta: &DurableModelDelta,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+        guard_observation: Option<&RuntimeGuardObservationFootprint>,
+    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+        self.commit_mixed_revision_residual_guarded_with_client_semantics_and_dependencies(
+            transaction_id,
+            request,
+            client_mutations,
+            client_model_delta,
+            request.target_revision.semantic_revision(),
+            client_guard_digest,
+            guard_observation,
+        )
+    }
+
+    pub(crate) fn commit_mixed_revision_residual_guarded_with_client_semantics_and_dependencies(
+        &self,
+        transaction_id: ClientTransactionId,
+        request: &MixedRevisionTransitionRequest<'_>,
+        client_mutations: &[RevisionRelationMutation<'_>],
+        client_model_delta: &DurableModelDelta,
+        client_semantic_revision: kernel_types::SemanticRevision,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+        guard_observation: Option<&RuntimeGuardObservationFootprint>,
+    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
         let durable_client_mutations = Self::canonical_durable_relation_mutations(client_mutations)?;
         let requested_intent = DurableTransactionIntent::mixed_revision(
             request.source_revision,
             request.target_revision,
-            request.target_revision.semantic_revision(),
+            client_semantic_revision,
             durable_client_mutations.clone(),
             client_model_delta.clone(),
             request.model_complement.clone(),
             &self.registry,
         )
         .map_err(DurabilityError::Encode)
-        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        .map_err(DurableRuntimeCommitError::PrepareDurability)?
+        .with_client_guard_digest(client_guard_digest);
         let mut durability = self.durability.lock().map_err(|_| {
             let _ = self.cell.force_recovery_required();
             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
@@ -150,7 +257,24 @@ impl DurableRuntime {
             model_complement: request.model_complement,
             registry: &self.registry,
         };
-        let prepared = self.cell.snapshot()?.prepare_mixed_revision(&authorized_request)?;
+        let snapshot = self.cell.snapshot()?;
+        if let Some(guard_observation) = guard_observation {
+            match snapshot
+                .certify_read_dependencies_stable(guard_observation)
+                .map_err(|error| match error {
+                    RuntimeHistoricalSnapshotError::Runtime(error) => DurableRuntimeCommitError::Runtime(error),
+                    RuntimeHistoricalSnapshotError::Durability(error) => DurableRuntimeCommitError::PrepareDurability(error),
+                    _ => DurableRuntimeCommitError::Runtime(PhysicalExecutionError::InvalidRevisionTransition),
+                })?
+            {
+                RuntimeTransitionRebaseOutcome::Certified(_) => {}
+                RuntimeTransitionRebaseOutcome::Conflict(conflict) => {
+                    return Err(DurableRuntimeCommitError::GuardDependencyConflict(conflict));
+                }
+            }
+        }
+        let prepared = snapshot.prepare_mixed_revision(&authorized_request)?;
+        drop(snapshot);
         self.cell
             .commit_prepared_mixed_residual_durable(
                 transaction_id,
@@ -158,6 +282,8 @@ impl DurableRuntime {
                 durable_client_mutations,
                 client_model_delta.clone(),
                 request.model_complement.clone(),
+                client_semantic_revision,
+                client_guard_digest,
                 &self.registry,
                 &mut *durability,
             )
@@ -181,21 +307,66 @@ impl DurableRuntime {
         transaction_id: ClientTransactionId,
         request: &DerivedRelationTransitionRequest<'_>,
     ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+        self.commit_derived_relation_data_guarded(transaction_id, request, None)
+    }
+
+    /// Checks durable retry authority for one exact relation-data client intent without
+    /// publishing an unknown transaction. The caller supplies the canonical client mutation
+    /// vocabulary directly, so an uncertain retry remains recognizable even after the current
+    /// semantic schema has advanced beyond the request's formation revision.
+    pub fn check_relation_data_retry(
+        &self,
+        transaction_id: ClientTransactionId,
+        mut durable_mutations: Vec<DurableRelationMutation>,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+        requested_target: RevisionId,
+    ) -> Result<Option<RevisionId>, DurableRuntimeCommitError> {
+        durable_mutations.sort_by_key(|mutation| mutation.relation);
+        if let Some(pair) = durable_mutations
+            .windows(2)
+            .find(|pair| pair[0].relation == pair[1].relation)
+        {
+            return Err(PhysicalExecutionError::DuplicateRelationMutation(pair[0].relation).into());
+        }
+        let durability = self.durability.lock().map_err(|_| {
+            let _ = self.cell.force_recovery_required();
+            DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
+        })?;
+        let Some(committed_intent) = durability.transaction_intent(transaction_id) else {
+            return Ok(None);
+        };
+        let matches = matches!(
+                &committed_intent.intent,
+                DurableClientIntent::RelationData { relation_mutations, guard_digest, .. }
+                    if relation_mutations == &durable_mutations && *guard_digest == client_guard_digest
+            );
+        if matches {
+            return Ok(Some(committed_intent.target_revision()));
+        }
+        Err(DurableRuntimeCommitError::TransactionIdConflict {
+            transaction_id,
+            committed_target: committed_intent.target_revision(),
+            requested_target,
+        })
+    }
+
+    pub fn commit_derived_relation_data_guarded(
+        &self,
+        transaction_id: ClientTransactionId,
+        request: &DerivedRelationTransitionRequest<'_>,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
         let durable_mutations = Self::canonical_durable_relation_mutations(request.mutations)?;
         let mut durability = self.durability.lock().map_err(|_| {
             let _ = self.cell.force_recovery_required();
             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
         })?;
         if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
-            let matches = match committed_intent {
-                DurableTransactionIntent::RelationDataExact { relation_mutations, .. } => {
-                    relation_mutations == &durable_mutations
-                }
-                DurableTransactionIntent::RelationDataResidualExact { client_mutations, .. } => {
-                    client_mutations == &durable_mutations
-                }
-                _ => false,
-            };
+            let matches = matches!(
+                &committed_intent.intent,
+                DurableClientIntent::RelationData { relation_mutations, guard_digest, .. }
+                    if relation_mutations == &durable_mutations && *guard_digest == client_guard_digest
+            );
             if matches {
                 return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
                     target_revision: committed_intent.target_revision(),
@@ -223,7 +394,13 @@ impl DurableRuntime {
                 .prepare_revision_derived(&target, request.mutations, &self.registry)?;
         drop(snapshot);
         self.cell
-            .commit_prepared_durable(transaction_id, prepared, &self.registry, &mut *durability)
+            .commit_prepared_durable_guarded(
+                transaction_id,
+                prepared,
+                client_guard_digest,
+                &self.registry,
+                &mut *durability,
+            )
             .map(|receipt| {
                 let relations = request
                     .mutations
@@ -243,21 +420,32 @@ impl DurableRuntime {
         request: &DerivedRelationTransitionRequest<'_>,
         client_mutations: &[RevisionRelationMutation<'_>],
     ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
+        self.commit_derived_relation_data_residual_guarded(
+            transaction_id,
+            request,
+            client_mutations,
+            None,
+        )
+    }
+
+    pub fn commit_derived_relation_data_residual_guarded(
+        &self,
+        transaction_id: ClientTransactionId,
+        request: &DerivedRelationTransitionRequest<'_>,
+        client_mutations: &[RevisionRelationMutation<'_>],
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
         let durable_client_mutations = Self::canonical_durable_relation_mutations(client_mutations)?;
         let mut durability = self.durability.lock().map_err(|_| {
             let _ = self.cell.force_recovery_required();
             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
         })?;
         if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
-            let matches = match committed_intent {
-                DurableTransactionIntent::RelationDataExact { relation_mutations, .. } => {
-                    relation_mutations == &durable_client_mutations
-                }
-                DurableTransactionIntent::RelationDataResidualExact { client_mutations, .. } => {
-                    client_mutations == &durable_client_mutations
-                }
-                _ => false,
-            };
+            let matches = matches!(
+                &committed_intent.intent,
+                DurableClientIntent::RelationData { relation_mutations, guard_digest, .. }
+                    if relation_mutations == &durable_client_mutations && *guard_digest == client_guard_digest
+            );
             if matches {
                 return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
                     target_revision: committed_intent.target_revision(),
@@ -288,6 +476,7 @@ impl DurableRuntime {
                 transaction_id,
                 prepared,
                 durable_client_mutations,
+                client_guard_digest,
                 &self.registry,
                 &mut *durability,
             )
@@ -318,13 +507,10 @@ impl DurableRuntime {
         })?;
         if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
             let matches = matches!(
-                committed_intent,
-                DurableTransactionIntent::RelationRewriteExact {
-                    relation_mutations,
-                    rewrite_intents,
-                    ..
-                } if relation_mutations == &durable_mutations
-                    && rewrite_intents == &durable_rewrite_intents
+                &committed_intent.intent,
+                DurableClientIntent::RelationRewrite { relation_mutations, rewrite_intents, .. }
+                    if relation_mutations == &durable_mutations
+                        && rewrite_intents == &durable_rewrite_intents
             );
             if matches {
                 return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
@@ -349,7 +535,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: kernel_durability::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -393,13 +579,10 @@ impl DurableRuntime {
         })?;
         if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
             let matches = matches!(
-                committed_intent,
-                DurableTransactionIntent::RelationRewriteExact {
-                    relation_mutations,
-                    rewrite_intents,
-                    ..
-                } if relation_mutations == &durable_mutations
-                    && rewrite_intents == &durable_rewrite_intents
+                &committed_intent.intent,
+                DurableClientIntent::RelationRewrite { relation_mutations, rewrite_intents, .. }
+                    if relation_mutations == &durable_mutations
+                        && rewrite_intents == &durable_rewrite_intents
             );
             if matches {
                 return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
@@ -424,7 +607,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: kernel_durability::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
             })
             .collect::<Vec<_>>();
         let target =
@@ -615,17 +798,13 @@ impl DurableRuntime {
         })?;
         if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
             let matches = matches!(
-                committed_intent,
-                DurableTransactionIntent::RelationResolutionExact {
-                    source_revision,
-                    target_revision,
+                &committed_intent.intent,
+                DurableClientIntent::RelationResolution {
                     relation_mutations,
                     rewrite_intents,
                     causal_parents: committed_parents,
                     ..
-                } if *source_revision == request.source_revision
-                    && *target_revision == request.target_revision
-                    && relation_mutations == &durable_mutations
+                } if relation_mutations == &durable_mutations
                     && rewrite_intents == &durable_rewrite_intents
                     && committed_parents == &causal_parents
             );
@@ -652,7 +831,7 @@ impl DurableRuntime {
                 relation: rewrite.relation,
                 delta: rewrite.rewrite.delta(),
             object_field_writes: &[],
-            authorization: kernel_durability::DurableRelationAuthorization::default(),
+            authorization: Default::default(),
             })
             .collect::<Vec<_>>();
         let target =

@@ -1105,7 +1105,7 @@ fn ordered_view_advances_from_certified_materialization_output_delta() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let transition = prepare_runtime_revision(&runtime, 9_995_103, &mutations, &registry).unwrap();
     let output_delta = transition
@@ -1513,7 +1513,7 @@ fn durable_commit_linearizes_before_runtime_publication_and_recovers_from_logica
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let target = target_revision_for(&runtime, 301, &mutations, &registry);
     let cell = RuntimeRevisionCell::new(runtime);
@@ -1565,7 +1565,7 @@ fn durable_recovery_replays_multiple_nonconsecutive_revision_ids_idempotently() 
         relation,
         delta: &delta_a,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let snapshot = cell.snapshot().unwrap();
     let target_a = target_revision_for(snapshot.root(), 400, &mutations_a, &registry);
@@ -1586,7 +1586,7 @@ fn durable_recovery_replays_multiple_nonconsecutive_revision_ids_idempotently() 
         relation,
         delta: &delta_b,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let snapshot = cell.snapshot().unwrap();
     let target_b = target_revision_for(snapshot.root(), 900, &mutations_b, &registry);
@@ -1638,7 +1638,7 @@ fn commit_durability_failure_after_seal_fail_stops_runtime_until_recovery() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let target = target_revision_for(&runtime, 321, &mutations, &registry);
     let cell = RuntimeRevisionCell::new(runtime);
@@ -1704,7 +1704,7 @@ fn stale_after_durable_prepare_leaves_only_uncommitted_wal_prepare() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let target = target_revision_for(&runtime, 331, &mutations, &registry);
     let cell = RuntimeRevisionCell::new(runtime);
@@ -1797,7 +1797,7 @@ fn resolved_leaf_delete_preserves_authoritative_scan_order() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let cell = RuntimeRevisionCell::new(runtime);
     let prepared = prepare_runtime_cell_revision(&cell, 601, &mutations, &registry).unwrap();
@@ -1918,7 +1918,7 @@ fn durable_runtime_owner_restarts_from_checkpoint_plus_wal_tail() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 501, &mutations, &registry);
@@ -1961,7 +1961,7 @@ fn durable_runtime_checkpoint_rotates_base_then_replays_only_new_tail() {
         relation,
         delta: &delta_a,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target_a = target_revision_for(snapshot.root(), 511, &mutations_a, &registry);
@@ -1985,7 +1985,7 @@ fn durable_runtime_checkpoint_rotates_base_then_replays_only_new_tail() {
         relation,
         delta: &delta_b,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target_b = target_revision_for(snapshot.root(), 512, &mutations_b, &registry);
@@ -2036,7 +2036,7 @@ fn durable_checkpoint_rebuilds_physical_index_recipes_on_reopen() {
     let (context, registry, relation, layout, root) = scan_runtime_bundle(515, 1215, &[1, 2, 3, 3]);
     let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
     let binding = SemanticIndexBinding::single(relation, layout, 0, sid(101));
-    runtime.install_semantic_index(binding, &registry).unwrap();
+    runtime.install_observable_atom_state(binding).unwrap();
     runtime.checkpoint().unwrap();
     runtime.compact_obsolete_generations().unwrap();
 
@@ -2049,7 +2049,7 @@ fn durable_checkpoint_rebuilds_physical_index_recipes_on_reopen() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     let snapshot = runtime.snapshot().unwrap();
     let target = target_revision_for(snapshot.root(), 516, &mutations, &registry);
@@ -2077,12 +2077,6 @@ fn durable_checkpoint_rebuilds_physical_index_recipes_on_reopen() {
             .unwrap()
             .row_count(),
         4
-    );
-    assert!(
-        snapshot
-            .physical_store()
-            .semantic_index(&recovered_binding)
-            .is_none()
     );
     assert!(
         !snapshot
@@ -2495,7 +2489,7 @@ fn wal_tail_replays_observable_atom_core_before_rehydration() {
         relation,
         delta: &delta,
     object_field_writes: &[],
-    authorization: kernel_durability::DurableRelationAuthorization::default(),
+    authorization: Default::default(),
     }];
     runtime
         .commit_derived_relation_data(

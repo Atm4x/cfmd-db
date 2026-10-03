@@ -1485,3 +1485,39 @@ P438 closed field/reference/partial-relationship semantic coordinates. P439 esta
 Immediate authorization continuation is historical undo/redo action transport plus hosted/watch refresh/revocation hostile. Do not reconstruct historical inverse as generic relation authority when exact semantic coordinates are recoverable.
 
 New mandatory Context/DX R&D item: zero-downtime remote-reader compatibility across schema semantic migrations. The reader may have no authoritative schema code; server DB must not carry reader-specific annotations or a dedicated handshake. Current schema version/epoch may be normal metadata and client compatibility may resolve once per Context/ReadContext epoch. Same-name fields may change meaning, therefore name/existence fallback is forbidden. Authoritative schema remains current-only/legacy-free. Exact reader annotation/API syntax is intentionally unresolved; do not freeze `bind/rebind` or another spelling until the DX is designed with the user.
+
+## PASS455 continuation update — ref-heavy live-ref line closed
+
+P455 measured sparse/dense `LiveRefSensitivityIndex` behavior and found no hidden relation-cardinality scan in exact delta maintenance. The hostile sweep did find one P454 correctness seam: append-only Bag publication advanced logical relation rows without advancing the compact live-ref tail-coordinate authority when the appended rows had no refs. A later ref-bearing exact delta could then receive a stale ordinal. The fast path now advances coordinate history for every exact append while reverse maps remain ref-only. Dense/sparse release diagnostics keep exact one-row delta work in single-digit microseconds through 500k rows; explicit dense consumer enumeration remains output-sensitive and is not an ordinary commit payer.
+
+Productization priority after this closure is PASS456 durable canonical transaction-requirement intent identity before external/recoverable transaction IDs become normal DX. Typed field-grant API sugar and remote-reader schema-evolution DX remain open but separate.
+
+## PASS456/PASS457 continuation update — guarded retry identity and public idempotency DX
+
+P456 separates the durable retry authorities cleanly: `TransactionId` is the idempotency namespace, `ClientIntentGuardDigest` is canonical passive-requirement identity, and the exact client effect remains the requested semantic change. Same key/effect/guard is retry-equivalent; changing either effect or guard under the same key conflicts.
+
+P457 removes the hidden database/session-bound `transaction_with_id` adapter and exposes external retry identity on the existing passive transaction only: `Transaction::new().with_idempotency_key(key)` (or strict `Transaction::from(snapshot).with_idempotency_key(key)` before intent formation). Key selection does not bind adaptive intent to a HEAD. The old P446 generated-ID rotation on `require()` is removed because it became both redundant and unsafe after P456: requirement changes are now represented exclusively by the guard digest, while the transaction key remains stable for the lifetime of the intent.
+
+Immediate continuation is PASS458: hostile the hosted/binding boundary for raw transaction-u128/retry exposure and select one transport-neutral idempotency representation without a protocol-side transaction state machine. Remote-reader schema-evolution DX and typed field-grant sugar remain separate open product lines. All deferred Context/Auth/Semantic Rules/migration frontend/final bindings/backup/perf/Windows secure-memory items remain mandatory carry.
+
+## PASS458 continuation update — hosted idempotency authority
+
+P458 removes raw hosted `transaction: u128` from the source API in favor of `IdempotencyKey` while retaining the identical fixed-u128 wire encoding. Current-base hosted commits now lower into the same runtime `Transaction` publication path as local Rust instead of publishing directly through `commit_plan`.
+
+A hostile retry case exposed a correctness gap: repeating a successfully committed hosted request necessarily carries its old `base_revision`, so the previous protocol returned `StaleRevision` before durable idempotency was consulted. P458 adds a read-only durable relation-intent retry probe over the existing committed-transaction authority. Identical key/effect returns `AlreadyCommitted`; same key with changed effect returns `TransactionConflict`; an unknown stale key remains `StaleRevision` and is never reinterpreted on current HEAD. This is not a protocol retry table and cannot publish.
+
+Immediate continuation is P459: R&D whether genuinely new stale remote relation intents can use the same kernel-change transport law as local adaptive transactions directly from exact effect + formation revision, without historical physical-Plan reconstruction, client-code replay, or generic fallback. Remote-reader schema evolution and typed field-grant DX remain separate open lines; all earlier deferred Context/Auth/Rules/migration/frontend/bindings/backup/perf/Windows items remain carried.
+
+## PASS459 continuation update — adaptive remote exact-effect transport
+
+P459 closes the semantic remote-staleness gap left intentionally fail-closed by P458. A hosted relation mutation is now treated as an exact-effect carrier, not reconstructed as a current-head Plan. The sufficient authority is `formation revision + idempotency key + exact inserted/removed rows`; runtime derives formation typing and asks the existing Γ-aware `certify_transition_rebase` law to prove commutation across intervening effects. Certified disjoint stale intents publish through durable residual relation-data authority; overlapping, opaque or unavailable-history cases fail closed. Retry identity remains checked first and therefore does not depend on historical materialization availability.
+
+The hostile performance result is also explicit: formation-world validity currently rebuilds a `RelationBaseWitness` from the touched historical relation because durable history exposes the historical Revision but not its retained Γ witness. This is exact and non-fallback, but O(touched relation). PASS460 should connect the already persistent P419/P420 witness lineage to historical intent validation so the proof is O(delta log N), then audit current Set residualization for the analogous materialization payer. Remote-reader schema evolution, typed field-grant DX and all deferred Context/Auth/Rules/migration/frontend/bindings/backup/perf/Windows items remain mandatory carry.
+
+## PASS460 continuation update — retained Γ support, no historical/full-Set scans
+
+P460 closes both explicit P459 data-size payers without introducing a second state authority. Formation validity uses a restricted `RelationSupportWitness` projected from the current P419/P420 persistent Γ root and rewound through exact durable deltas. The restricted type cannot emit Scan evidence or physical positions, so reversing value-only history cannot accidentally masquerade as reconstruction of old stable-handle order. Semantic/schema/opaque boundaries fail closed.
+
+Transition footprint certification now reuses the shared semantic context only after proving the intervening path contains no semantic/opaque boundary, eliminating `revision_at()` from the ordinary stale exact-effect certificate path. Stale Set residualization also becomes witness-native: touched Γ classes resolve to logical positions and exact current representatives are point-read; the whole current relation is never materialized. Bag behavior is unchanged.
+
+Next: PASS461 history-depth hostile/perf before deciding whether any revision->support-root memo is justified. If not, return to the remote-reader schema-evolution DX line. Typed field-grant sugar and all prior deferred Context/Rules/migration/frontend/bindings/backup/perf/Windows lines remain mandatory carry.

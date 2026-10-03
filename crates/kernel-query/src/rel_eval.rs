@@ -107,7 +107,7 @@ pub(super) fn evaluate_prepared_expr_with_occurrence_certificate(
     let certificate = RelationOccurrenceCertificate::from_dense_set_keys(
         result_type,
         semantic,
-        &canonical_keys_by_row,
+        canonical_keys_by_row,
     )?;
     Ok((value, certificate))
 }
@@ -132,7 +132,7 @@ pub(super) fn evaluate_prepared_expr_with_occurrence_certificate_seeded(
     let certificate = RelationOccurrenceCertificate::from_dense_set_keys(
         result_type,
         semantic,
-        &canonical_keys_by_row,
+        canonical_keys_by_row,
     )?;
     Ok((value, certificate))
 }
@@ -155,10 +155,6 @@ pub(super) fn evaluate_prepared_expr_seeded(
     evaluate_expr_with_canonical_keys(expr, &eval).map(|(value, _, _)| value)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn evaluate_expr_with_canonical_keys(
     expr: &RelExpr,
     eval: &RelEvalContext<'_>,
@@ -198,9 +194,9 @@ fn evaluate_expr_with_canonical_keys(
                 (Ok((left_value, _, left_keys)), Ok((right_value, _, right_keys))) => {
                     union_relation_values_from_canonical_keys(
                         left_value,
-                        &left_keys,
+                        left_keys,
                         right_value,
-                        &right_keys,
+                        right_keys,
                         &equivalences,
                     )?
                 }
@@ -232,9 +228,9 @@ fn evaluate_expr_with_canonical_keys(
                 evaluate_expr_with_canonical_keys(right, eval)?;
             join_relation_values_with_canonical_keys(
                 left_value,
-                &left_keys,
+                left_keys,
                 right_value,
-                &right_keys,
+                right_keys,
                 *left_column,
                 *right_column,
                 *equivalence,
@@ -251,9 +247,9 @@ fn evaluate_expr_with_canonical_keys(
                 (Ok((left_value, _, left_keys)), Ok((right_value, _, right_keys))) => {
                     difference_relation_values_from_canonical_keys(
                         left_value,
-                        &left_keys,
+                        left_keys,
                         right_value,
-                        &right_keys,
+                        right_keys,
                         &equivalences,
                     )?
                 }
@@ -286,7 +282,7 @@ fn evaluate_expr_with_canonical_keys(
             let right_value = right.evaluate_unchecked(eval)?;
             anti_join_relation_values_with_canonical_keys(
                 left_value,
-                &left_keys,
+                left_keys,
                 &right_value,
                 *left_column,
                 *right_column,
@@ -337,7 +333,7 @@ fn evaluate_expr_with_canonical_keys(
                 Ok((RelationValue::Set { rows, .. }, _, input_keys)) => {
                     project_relation_value_from_canonical_keys(
                         rows,
-                        &input_keys,
+                        input_keys,
                         columns,
                         equivalences,
                     )?
@@ -376,9 +372,9 @@ fn evaluate_expr_with_canonical_keys(
 
 fn union_relation_values_from_canonical_keys(
     left: RelationValue,
-    left_keys_by_row: &CanonicalRowEvidence,
+    left_keys_by_row: CanonicalRowEvidence,
     right: RelationValue,
-    right_keys_by_row: &CanonicalRowEvidence,
+    right_keys_by_row: CanonicalRowEvidence,
     column_equivalences: &[kernel_types::SemanticId],
 ) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
     let (
@@ -433,9 +429,9 @@ fn union_relation_values_from_canonical_keys(
 
 fn difference_relation_values_from_canonical_keys(
     left: RelationValue,
-    left_keys_by_row: &CanonicalRowEvidence,
+    left_keys_by_row: CanonicalRowEvidence,
     right: RelationValue,
-    right_keys_by_row: &CanonicalRowEvidence,
+    right_keys_by_row: CanonicalRowEvidence,
     column_equivalences: &[kernel_types::SemanticId],
 ) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
     let (
@@ -479,7 +475,7 @@ fn difference_relation_values_from_canonical_keys(
 
 fn project_relation_value_from_canonical_keys(
     rows: Vec<Row>,
-    input_keys_by_row: &CanonicalRowEvidence,
+    input_keys_by_row: CanonicalRowEvidence,
     columns: &[usize],
     output_equivalences: Vec<kernel_types::SemanticId>,
 ) -> Result<(RelationValue, CanonicalRowEvidence), RelQueryError> {
@@ -517,15 +513,11 @@ fn project_relation_value_from_canonical_keys(
     ))
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Keep the explicit semantic and durability inputs at this boundary."
-)]
 fn join_relation_values_with_canonical_keys(
     left: RelationValue,
-    left_keys_by_row: &CanonicalRowEvidence,
+    left_keys_by_row: CanonicalRowEvidence,
     right: RelationValue,
-    right_keys_by_row: &CanonicalRowEvidence,
+    right_keys_by_row: CanonicalRowEvidence,
     left_column: usize,
     right_column: usize,
     equivalence: kernel_types::SemanticId,
@@ -606,13 +598,9 @@ fn join_relation_values_with_canonical_keys(
     ))
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Keep the explicit semantic and durability inputs at this boundary."
-)]
 fn anti_join_relation_values_with_canonical_keys(
     left: RelationValue,
-    left_keys_by_row: &CanonicalRowEvidence,
+    left_keys_by_row: CanonicalRowEvidence,
     right: &RelationValue,
     left_column: usize,
     right_column: usize,

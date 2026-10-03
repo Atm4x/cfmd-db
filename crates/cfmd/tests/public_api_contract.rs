@@ -6,10 +6,10 @@ use std::path::Path;
 
 use cfmd::dynamic::{Query, QueryWatch, RelationId, WatchEvent};
 use cfmd::{
-    Candidate, CandidateDerivedEffects, CfmdEntity, CfmdSchema, Database, DatabaseBuilder,
-    DatabaseContext, Diagnostic, EntitySet, Error, ErrorDiagnosticExt, Id, Many, ManySelection,
-    Object, ObjectQuery, Plan, PrincipalId, QueryNodeId, QuerySource, Ref, Result, Schema,
-    Snapshot, Storage, Transaction, TransactionId,
+    Candidate, CandidateDerivedEffects, CfmdEntity, CfmdSchema, Context, Database, DatabaseBuilder,
+    Diagnostic, EntitySet, Error, ErrorDiagnosticExt, Id, Many, ManySelection, Object, ObjectQuery,
+    Plan, PrincipalId, QueryNodeId, QuerySource, Ref, Result, Schema, Snapshot, Storage,
+    Transaction, TransactionId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -48,7 +48,7 @@ fn database_builder(path: &Path) -> DatabaseBuilder {
     Database::builder(path)
 }
 
-fn typed_snapshot(context: &DatabaseContext<ContractSchema>) -> Result<Snapshot<ContractSchema>> {
+fn typed_snapshot(context: &Context<ContractSchema>) -> Result<Snapshot<ContractSchema>> {
     context.snapshot()
 }
 
@@ -93,6 +93,7 @@ fn derived_preview_api(effects: CandidateDerivedEffects) -> (usize, usize) {
 }
 
 fn transaction_api(database: &Database, plan: Plan) -> Result<()> {
+    let _explicit_retry = Transaction::new().with_idempotency_key(TransactionId::new(0xCF_457))?;
     let mut transaction = Transaction::new();
     database.objects::<ContractItem>()?.add(
         &mut transaction,
@@ -123,8 +124,7 @@ fn public_types_exist(
 #[test]
 fn public_contract_compiles_as_documented() {
     let _ = database_builder as fn(&Path) -> DatabaseBuilder;
-    let _ =
-        typed_snapshot as fn(&DatabaseContext<ContractSchema>) -> Result<Snapshot<ContractSchema>>;
+    let _ = typed_snapshot as fn(&Context<ContractSchema>) -> Result<Snapshot<ContractSchema>>;
     let _ = diagnostic as fn(&Error) -> Diagnostic;
     let query = Query::scan(RelationId::new(1));
     let _ = query_identity(&query);

@@ -33,10 +33,6 @@ pub fn validate_state_with_ids(
     validate_state_with_extents(context, registry, state, &entity_types)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 pub fn validate_state_with_extents(
     context: &SemanticContext,
     registry: &SemanticRegistry,
@@ -162,6 +158,15 @@ pub fn validate_state_with_extents(
         }
     }
 
+    for (rule_index, rule) in compiled_rules.model_rules().iter().enumerate() {
+        if !rule
+            .is_satisfied(state)
+            .map_err(|_| ValidationError::ModelRuleEvaluation)?
+        {
+            return Err(ValidationError::ModelRuleViolation { rule_index });
+        }
+    }
+
     registry.validate_model(context, &state.model)?;
     Ok(())
 }
@@ -213,6 +218,122 @@ fn validate_capability_required_fields(
 }
 
 pub fn validate_relations_with_extents(
+    context: &SemanticContext,
+    registry: &SemanticRegistry,
+    state: &DatabaseState,
+    entity_types: &DenseTypeExtents,
+    relation_ids: &BTreeSet<SemanticId>,
+) -> Result<(), ValidationError> {
+    validate_relations_with_extents_selective(
+        context,
+        registry,
+        state,
+        entity_types,
+        relation_ids,
+        &BTreeMap::new(),
+    )
+}
+
+pub fn validate_relations_with_extents_selective(
+    context: &SemanticContext,
+    registry: &SemanticRegistry,
+    state: &DatabaseState,
+    entity_types: &DenseTypeExtents,
+    relation_ids: &BTreeSet<SemanticId>,
+    footprints: &BTreeMap<SemanticId, crate::RelationMutationFootprint>,
+) -> Result<(), ValidationError> {
+    validate_relations_structural_with_extents_selective(
+        context,
+        registry,
+        state,
+        entity_types,
+        relation_ids,
+    )?;
+    let effective_footprints = relation_ids
+        .iter()
+        .copied()
+        .map(|relation| {
+            (
+                relation,
+                footprints
+                    .get(&relation)
+                    .cloned()
+                    .unwrap_or_else(crate::RelationMutationFootprint::full),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    validate_model_rules_for_relation_mutations(context, state, &effective_footprints)
+}
+
+/// Validates only newly inserted rows for an exact relation delta.
+///
+/// This function deliberately does not re-check unchanged survivors or relation
+/// uniqueness. Callers must pair it with an exact relation-support witness that
+/// proves the removals exist and Set insertions do not collide with surviving
+/// equivalence classes. A previously validated source revision then pays only
+/// for the changed rows.
+pub fn validate_relation_delta_insertions_with_extents(
+    context: &SemanticContext,
+    registry: &SemanticRegistry,
+    state: &DatabaseState,
+    entity_types: &DenseTypeExtents,
+    relation_id: SemanticId,
+    inserted: &[Vec<Value>],
+) -> Result<(), ValidationError> {
+    let relation = context
+        .schema
+        .relation(relation_id)
+        .ok_or(ValidationError::UnknownRelation(relation_id))?;
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
+    for (row_index, tuple) in inserted.iter().enumerate() {
+        if tuple.len() != relation.columns.len() {
+            return Err(ValidationError::RelationArityMismatch {
+                relation: relation_id,
+                expected: relation.columns.len(),
+                actual: tuple.len(),
+            });
+        }
+        for (column, (value, expected)) in tuple.iter().zip(&relation.columns).enumerate() {
+            validate_value(
+                value,
+                expected,
+                &state.model,
+                context,
+                registry,
+                entity_types,
+                &BTreeMap::new(),
+            )?;
+            for (rule_index, rule) in compiled_rules
+                .relation_column_rules(context, relation_id, column)
+                .iter()
+                .enumerate()
+            {
+                if !rule
+                    .matches(value)
+                    .map_err(|_| ValidationError::FieldRuleTypeMismatch { field: relation_id })?
+                {
+                    return Err(ValidationError::RelationColumnRuleViolation {
+                        relation: relation_id,
+                        row: row_index,
+                        column,
+                        rule_index,
+                    });
+                }
+            }
+        }
+    }
+    if let RelationSemantics::Set {
+        column_equivalences,
+    } = &relation.semantics
+    {
+        for (column, equivalence) in relation.columns.iter().zip(column_equivalences) {
+            validate_equivalence_type(*equivalence, column, context, registry)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_relations_structural_with_extents_selective(
     context: &SemanticContext,
     registry: &SemanticRegistry,
     state: &DatabaseState,
@@ -285,6 +406,62 @@ pub fn validate_relations_with_extents(
         }
     }
     registry.validate_model(context, &semantic_subset)?;
+    Ok(())
+}
+
+pub fn validate_model_rules_for_relation_mutations(
+    context: &SemanticContext,
+    state: &DatabaseState,
+    footprints: &BTreeMap<SemanticId, crate::RelationMutationFootprint>,
+) -> Result<(), ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
+    for (relation, footprint) in footprints {
+        for (rule_index, rule) in compiled_rules.model_rules_for_mutation(*relation, footprint) {
+            if !rule
+                .is_satisfied(state)
+                .map_err(|_| ValidationError::ModelRuleEvaluation)?
+            {
+                return Err(ValidationError::ModelRuleViolation { rule_index });
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_model_rule_witnesses_for_relation_mutations(
+    context: &SemanticContext,
+    witnesses: &crate::ModelRuleWitnessState,
+    footprints: &BTreeMap<SemanticId, crate::RelationMutationFootprint>,
+) -> Result<(), ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
+    for (relation, footprint) in footprints {
+        for (rule_index, _) in compiled_rules.model_rules_for_mutation(*relation, footprint) {
+            if !witnesses
+                .is_satisfied(context, rule_index)
+                .map_err(|_| ValidationError::ModelRuleEvaluation)?
+            {
+                return Err(ValidationError::ModelRuleViolation { rule_index });
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_model_rules_for_relation_mutation(
+    context: &SemanticContext,
+    state: &DatabaseState,
+    relation: SemanticId,
+    footprint: &crate::RelationMutationFootprint,
+) -> Result<(), ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
+    for (rule_index, rule) in compiled_rules.model_rules_for_mutation(relation, footprint) {
+        if !rule
+            .is_satisfied(state)
+            .map_err(|_| ValidationError::ModelRuleEvaluation)?
+        {
+            return Err(ValidationError::ModelRuleViolation { rule_index });
+        }
+    }
     Ok(())
 }
 

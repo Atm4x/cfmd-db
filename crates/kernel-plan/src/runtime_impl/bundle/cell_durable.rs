@@ -35,6 +35,7 @@ impl RuntimeRevisionCell {
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
         let prepared = self.prepare_revision(request)?;
+        let prepared = prepared.bind_committed_history_effect(transaction_id.raw(), request.registry)?;
         let descriptor = DurableRevisionDescriptor::full_revision(
             transaction_id,
             prepared.descriptor().source_revision(),
@@ -61,14 +62,21 @@ impl RuntimeRevisionCell {
         })
     }
 
-    pub(crate) fn commit_mixed_revision_durable<D: RevisionDurability>(
+    pub(crate) fn commit_mixed_revision_durable_guarded<D: RevisionDurability>(
         &self,
         transaction_id: ClientTransactionId,
         request: &MixedRevisionTransitionRequest<'_>,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
         let prepared = self.prepare_mixed_revision(request)?;
-        self.commit_prepared_durable(transaction_id, prepared, request.registry, durability)
+        self.commit_prepared_durable_guarded(
+            transaction_id,
+            prepared,
+            client_guard_digest,
+            request.registry,
+            durability,
+        )
     }
 
     pub(crate) fn commit_full_revision_durable<D: RevisionDurability>(
@@ -90,6 +98,10 @@ impl RuntimeRevisionCell {
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
         let prepared = self.prepare_full_revision(request)?;
+        let prepared = prepared.bind_committed_schema_migration_history_effect(
+            transaction_id.raw(),
+            migration_program,
+        )?;
         let descriptor = DurableRevisionDescriptor::schema_migration_program(
             transaction_id,
             prepared.descriptor().source_revision(),
@@ -135,10 +147,25 @@ impl RuntimeRevisionCell {
         registry: &kernel_semantics::SemanticRegistry,
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
-        let durable_descriptor = prepared
+        self.commit_prepared_durable_guarded(transaction_id, prepared, None, registry, durability)
+    }
+
+    fn commit_prepared_durable_guarded<D: RevisionDurability>(
+        &self,
+        transaction_id: ClientTransactionId,
+        prepared: PreparedRuntimeRevisionTransition,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+        registry: &kernel_semantics::SemanticRegistry,
+        durability: &mut D,
+    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+        let prepared = prepared.bind_committed_history_effect(transaction_id.raw(), registry)?;
+        let mut durable_descriptor = prepared
             .descriptor()
             .durable_descriptor(transaction_id, registry)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        durable_descriptor.intent = durable_descriptor
+            .intent
+            .with_client_guard_digest(client_guard_digest);
         let durable_prepare = durability
             .durably_prepare(&durable_descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
@@ -171,9 +198,11 @@ impl RuntimeRevisionCell {
         transaction_id: ClientTransactionId,
         prepared: PreparedRuntimeRevisionTransition,
         client_mutations: Vec<DurableRelationMutation>,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
         registry: &kernel_semantics::SemanticRegistry,
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+        let prepared = prepared.bind_committed_history_effect(transaction_id.raw(), registry)?;
         let mut durable_descriptor = prepared
             .descriptor()
             .durable_descriptor(transaction_id, registry)
@@ -201,7 +230,8 @@ impl RuntimeRevisionCell {
             registry,
         )
         .map_err(DurabilityError::Encode)
-        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        .map_err(DurableRuntimeCommitError::PrepareDurability)?
+        .with_client_guard_digest(client_guard_digest);
         let durable_prepare = durability
             .durably_prepare(&durable_descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
@@ -220,7 +250,6 @@ impl RuntimeRevisionCell {
         })
     }
 
-    #[allow(clippy::too_many_arguments, reason = "Keep the explicit semantic and durability inputs at this boundary.")]
     pub(crate) fn commit_prepared_mixed_residual_durable<D: RevisionDurability>(
         &self,
         transaction_id: ClientTransactionId,
@@ -228,19 +257,23 @@ impl RuntimeRevisionCell {
         client_relation_mutations: Vec<DurableRelationMutation>,
         client_model_delta: DurableModelDelta,
         realized_model_complement: DurableModelDelta,
+        client_semantic_revision: kernel_types::SemanticRevision,
+        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
         registry: &kernel_semantics::SemanticRegistry,
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
+        let prepared = prepared.bind_committed_history_effect(transaction_id.raw(), registry)?;
         let mut durable_descriptor = prepared
             .descriptor()
             .durable_descriptor(transaction_id, registry)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
-        let (semantic_revision, realized_relation_mutations, realized_model_delta) =
+        let (_realized_semantic_revision, realized_relation_mutations, realized_model_delta) =
             match &durable_descriptor.change {
                 DurableRevisionChange::MixedRevision {
                     semantic_revision,
                     relation_mutations,
                     model_delta,
+                    ..
                 } => (
                     *semantic_revision,
                     relation_mutations.clone(),
@@ -258,7 +291,7 @@ impl RuntimeRevisionCell {
         durable_descriptor.intent = DurableTransactionIntent::mixed_revision_residual(
             durable_descriptor.source_revision,
             prepared.descriptor().target(),
-            semantic_revision,
+            client_semantic_revision,
             client_relation_mutations,
             client_model_delta,
             realized_relation_mutations,
@@ -267,7 +300,8 @@ impl RuntimeRevisionCell {
             registry,
         )
         .map_err(DurabilityError::Encode)
-        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        .map_err(DurableRuntimeCommitError::PrepareDurability)?
+        .with_client_guard_digest(client_guard_digest);
         let durable_prepare = durability
             .durably_prepare(&durable_descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;

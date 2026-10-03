@@ -173,10 +173,6 @@ enum FieldRuleSpec {
     TextOneOf(Vec<LitStr>),
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -191,15 +187,16 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let entity_fields = classify_fields(name, fields)?;
     validate_identity_count(name, &entity_fields)?;
     validate_semantic_field_names(&entity_fields)?;
-    if options.authoritative
-        && let Some(bound) = entity_fields
+    if options.authoritative {
+        if let Some(bound) = entity_fields
             .iter()
             .find(|field| field.semantic_name.is_some())
-    {
-        return Err(syn::Error::new_spanned(
-            bound.field,
-            "#[cfmd(bind = ...)] is not permitted on an authoritative entity; authoritative entities must match the current persisted schema exactly and schema evolution must use a migration",
-        ));
+        {
+            return Err(syn::Error::new_spanned(
+                bound.field,
+                "#[cfmd(bind = ...)] is not permitted on an authoritative entity; authoritative entities must match the current persisted schema exactly and schema evolution must use a migration",
+            ));
+        }
     }
     let stored_fields = entity_fields
         .iter()
@@ -266,7 +263,10 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let accessors = stored_fields
         .iter()
         .map(|entry| accessor_tokens(name, entry));
-    let path_tokens = entity_path_tokens(name, entity_vis, &stored_fields);
+    let path_ident = format_ident!("{}Path", name);
+    let path_accessors = stored_fields
+        .iter()
+        .filter_map(|entry| path_accessor_tokens(name, entry));
     let many_accessors = many
         .iter()
         .map(|entry| many_accessor_tokens(name, entity_vis, entry));
@@ -275,7 +275,42 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
     Ok(quote! {
         #row_codec
 
-        #path_tokens
+        #[derive(Debug, Clone)]
+        #entity_vis struct #path_ident<S: ::cfmd::Object> {
+            inner: ::cfmd::RefPath<S, #name>,
+        }
+
+        impl<S: ::cfmd::Object> ::cfmd::ObjectPatchField<S, ::cfmd::Ref<#name>> for #path_ident<S> {
+            fn into_patch_field(self) -> ::cfmd::Result<::cfmd::Field<S, ::cfmd::Ref<#name>>> {
+                ::cfmd::ObjectPatchField::into_patch_field(self.inner)
+            }
+        }
+
+        impl<S: ::cfmd::Object> #path_ident<S> {
+            #[doc(hidden)]
+            #[must_use]
+            pub fn __from_inner(inner: ::cfmd::RefPath<S, #name>) -> Self {
+                Self { inner }
+            }
+
+            #[must_use]
+            pub fn eq(self, target: ::cfmd::Id<#name>)
+                -> ::cfmd::PathPredicate<S, #name, ::cfmd::EqPredicate<#name>>
+            {
+                self.inner.eq(target)
+            }
+
+            #[must_use]
+            pub fn matches<F, P>(self, predicate: F) -> ::cfmd::PathPredicate<S, #name, P>
+            where
+                F: FnOnce(&<#name as ::cfmd::Object>::Proxy) -> P,
+                P: ::cfmd::ObjectPredicate<#name>,
+            {
+                self.inner.matches(predicate)
+            }
+
+            #(#path_accessors)*
+        }
 
         #[derive(Debug, Clone)]
         #entity_vis struct #proxy {
@@ -314,56 +349,6 @@ fn expand_entity(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
         #constructor
     })
-}
-
-fn entity_path_tokens(
-    name: &Ident,
-    entity_vis: &syn::Visibility,
-    stored_fields: &[&EntityField<'_>],
-) -> TokenStream2 {
-    let path_ident = format_ident!("{}Path", name);
-    let path_accessors = stored_fields
-        .iter()
-        .filter_map(|entry| path_accessor_tokens(name, entry));
-    quote! {
-        #[derive(Debug, Clone)]
-        #entity_vis struct #path_ident<S: ::cfmd::Object> {
-            inner: ::cfmd::RefPath<S, #name>,
-        }
-
-        impl<S: ::cfmd::Object> ::cfmd::ObjectPatchField<S, ::cfmd::Ref<#name>> for #path_ident<S> {
-            fn into_patch_field(self) -> ::cfmd::Result<::cfmd::Field<S, ::cfmd::Ref<#name>>> {
-                ::cfmd::ObjectPatchField::into_patch_field(self.inner)
-            }
-        }
-
-        impl<S: ::cfmd::Object> #path_ident<S> {
-            #[doc(hidden)]
-            #[must_use]
-            pub fn __from_inner(inner: ::cfmd::RefPath<S, #name>) -> Self {
-                Self { inner }
-            }
-
-            #[must_use]
-            pub fn eq(self, target: ::cfmd::Id<#name>)
-                -> ::cfmd::PathPredicate<S, #name, ::cfmd::EqPredicate<#name>>
-            {
-                self.inner.eq(target)
-            }
-
-            #[must_use]
-            pub fn matches<F, P>(self, predicate: F) -> ::cfmd::PathPredicate<S, #name, P>
-            where
-                F: FnOnce(&<#name as ::cfmd::Object>::Proxy) -> P,
-                P: ::cfmd::ObjectPredicate<#name>,
-            {
-                self.inner.matches(predicate)
-            }
-
-            #(#path_accessors)*
-        }
-
-    }
 }
 
 fn row_codec_tokens(
@@ -982,7 +967,7 @@ fn classify_fields<'a>(
             if bind.value().is_empty() {
                 return Err(syn::Error::new_spanned(bind, "bind cannot be empty"));
             }
-            if *ident == bind.value() {
+            if bind.value() == ident.to_string() {
                 return Err(syn::Error::new_spanned(
                     bind,
                     "bind must name a different persisted field name",
@@ -1050,12 +1035,54 @@ fn parse_field_options(field: &Field) -> syn::Result<FieldOptions> {
                 return Ok(());
             }
             if meta.path.is_ident("range") {
-                let (min, max) = parse_rule_bounds(&meta, parse_i64_literal, "range")?;
+                let mut min = None;
+                let mut max = None;
+                meta.parse_nested_meta(|item| {
+                    if item.path.is_ident("min") {
+                        if min.is_some() {
+                            return Err(item.error("duplicate range min"));
+                        }
+                        min = Some(parse_i64_literal(item.value()?.parse::<Expr>()?)?);
+                        return Ok(());
+                    }
+                    if item.path.is_ident("max") {
+                        if max.is_some() {
+                            return Err(item.error("duplicate range max"));
+                        }
+                        max = Some(parse_i64_literal(item.value()?.parse::<Expr>()?)?);
+                        return Ok(());
+                    }
+                    Err(item.error("unsupported range option; expected min or max"))
+                })?;
+                if min.is_none() && max.is_none() {
+                    return Err(meta.error("range(...) requires min and/or max"));
+                }
                 rules.push(FieldRuleSpec::I64Range { min, max });
                 return Ok(());
             }
             if meta.path.is_ident("length") {
-                let (min, max) = parse_rule_bounds(&meta, parse_usize_literal, "length")?;
+                let mut min = None;
+                let mut max = None;
+                meta.parse_nested_meta(|item| {
+                    if item.path.is_ident("min") {
+                        if min.is_some() {
+                            return Err(item.error("duplicate length min"));
+                        }
+                        min = Some(parse_usize_literal(item.value()?.parse::<Expr>()?)?);
+                        return Ok(());
+                    }
+                    if item.path.is_ident("max") {
+                        if max.is_some() {
+                            return Err(item.error("duplicate length max"));
+                        }
+                        max = Some(parse_usize_literal(item.value()?.parse::<Expr>()?)?);
+                        return Ok(());
+                    }
+                    Err(item.error("unsupported length option; expected min or max"))
+                })?;
+                if min.is_none() && max.is_none() {
+                    return Err(meta.error("length(...) requires min and/or max"));
+                }
                 rules.push(FieldRuleSpec::TextLength { min, max });
                 return Ok(());
             }
@@ -1063,7 +1090,7 @@ fn parse_field_options(field: &Field) -> syn::Result<FieldOptions> {
                 let content;
                 syn::parenthesized!(content in meta.input);
                 let values = content
-                    .parse_terminated(syn::parse::ParseBuffer::parse::<LitStr>, syn::Token![,])?
+                    .parse_terminated(|input| input.parse::<LitStr>(), syn::Token![,])?
                     .into_iter()
                     .collect::<Vec<_>>();
                 if values.is_empty() {
@@ -1084,38 +1111,6 @@ fn parse_field_options(field: &Field) -> syn::Result<FieldOptions> {
         bind,
         rules,
     })
-}
-
-fn parse_rule_bounds<T>(
-    meta: &syn::meta::ParseNestedMeta<'_>,
-    parse: impl Fn(Expr) -> syn::Result<T>,
-    kind: &str,
-) -> syn::Result<(Option<T>, Option<T>)> {
-    let mut min = None;
-    let mut max = None;
-    meta.parse_nested_meta(|item| {
-        let bound = if item.path.is_ident("min") {
-            &mut min
-        } else if item.path.is_ident("max") {
-            &mut max
-        } else {
-            return Err(item.error(format!("unsupported {kind} option; expected min or max")));
-        };
-        if bound.is_some() {
-            let name = if item.path.is_ident("min") {
-                "min"
-            } else {
-                "max"
-            };
-            return Err(item.error(format!("duplicate {kind} {name}")));
-        }
-        *bound = Some(parse(item.value()?.parse::<Expr>()?)?);
-        Ok(())
-    })?;
-    if min.is_none() && max.is_none() {
-        return Err(meta.error(format!("{kind}(...) requires min and/or max")));
-    }
-    Ok((min, max))
 }
 
 fn validate_semantic_field_names(fields: &[EntityField<'_>]) -> syn::Result<()> {

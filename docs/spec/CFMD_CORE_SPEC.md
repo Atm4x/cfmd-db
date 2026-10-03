@@ -1684,7 +1684,7 @@ Current derivative summary: pure delete, pure insert/resurrection and mixed dele
 
 **[VERIFIED] General finite multiway execution.** The current finite nonrecursive relational fragment lowers prepared multiway equality constraints to query-local Γ observable coordinates, per-leaf finite measures, APNF anchor/reconstruction state and a residual compatibility pullback executor. Query coordinates are nominally distinct from semantic law identity, so independent variables using the same equivalence law do not collapse. Physical expansion preserves exact Bag multiplicity and logical order. Specialized QCN/GYO/index paths remain optional physical lowerings.
 
-**[VERIFIED] SAMF consumption and durability.** Exact support-atom fibers may directly serve semantic Filter/Join access, statistics and QCN quotient reads. The materialized state pins exact semantic-key implementation binding and fails closed on Γ drift. `ObservableAtom` is a durable physical recipe and rebuilds after reopen; legacy artifact families remain parity/specialized implementations until annotation/ordered overlays and unified advising are complete.
+**[VERIFIED] SAMF consumption and durability.** Exact support-atom fibers may directly serve semantic Filter/Join access, statistics and QCN quotient reads. The materialized state pins exact semantic-key implementation binding and fails closed on Γ drift. `ObservableAtom` is the sole persisted semantic-fiber physical family. The superseded bucket-style semantic-index family has been removed end-to-end; distinct quotient-factor/statistics/I64 artifacts remain only where they represent genuinely different capabilities rather than alternate semantic-fiber execution.
 
 **[VERIFIED] Differential/fixed-point/validity/observation chain.** `RelDifferentialProgram` is a pinned maintenance contract owned by maintained plans; Γ-BFC/GCC structurally repairs QCN support after insertion/deletion/resurrection; runtime candidates carry an exact revision-bound Γ-VMF violation state and cannot seal unless `V=0`; runtime observations are root/revision-bound Γ-OFC guards whose exact impact is evaluated through pinned Γ-DTC. These derivatives do not replace Revision authority.
 
@@ -1726,7 +1726,7 @@ The existing Γ-owned `StructuralOrderingDef`/canonical semantic order-class mac
 
 ## Historical #3 — unified physical lifecycle/materialization ontology — [VERIFIED/CLOSED]
 
-Production optional-artifact ownership now uses one internal `UnifiedArtifactId` across I64 index, semantic index, ObservableAtom/SAMF, quotient factor/support, and semantic statistics, with a shared family-neutral `PhysicalCapability` vocabulary and shared admission kernel. `PhysicalStore::converge_observable_atom_candidate` validates/installs the replacement SAMF candidate before retiring advisor-owned legacy semantic index/statistics/quotient-factor duplicates. Manual pins are preserved. Legacy Group/TopK and other specialized states remain permitted physical lowerings rather than semantic authorities.
+Production optional-artifact ownership now uses one internal `UnifiedArtifactId` across I64 index, ObservableAtom/SAMF, quotient factor/support, and semantic statistics, with a shared family-neutral `PhysicalCapability` vocabulary and shared admission kernel. There is no alternate persisted semantic-index fiber family or execution fallback. Manual pins are preserved. Group/TopK and other specialized states remain permitted physical lowerings rather than semantic authorities.
 
 ## Historical #5 — shared resource/memory pressure — [VERIFIED/PARTIAL]
 
@@ -1899,7 +1899,7 @@ The unpublished shadow WAL starts at the same next LSN as the authoritative WAL 
 
 ### Chunk-root rule
 
-Streaming checkpoints use checkpoint format v2: an ordered root identifies the cut revision, canonical logical stream length, ordered chunk ordinals/lengths/CRC32C values and descriptor checksum. Chunk payloads are written and synced independently. Reopen accepts a v2 root only when all descriptors and chunks validate and the reconstructed logical checkpoint decodes to the pinned cut revision. Legacy monolithic checkpoint v1 remains readable.
+Directory checkpoints use one current pre-release chunked representation: an ordered root identifies the cut revision, canonical logical stream length, ordered chunk ordinals/lengths/CRC32C values and descriptor checksum. Chunk payloads are written and synced independently. Bootstrap, synchronous rotation and resumable publication all emit this same representation. Reopen accepts the current format tag only when all descriptors and chunks validate and the reconstructed logical checkpoint decodes to the pinned cut revision. Obsolete pre-release monolithic checkpoint layouts fail closed and have no active decoder.
 
 ### Publication certificate
 
@@ -2941,3 +2941,30 @@ Watch bootstrap may consume semantic Scan evidence to construct maintained canon
 **[SCHEMA PUBLICATION]** Restricted schema migration requires `SchemaMigrate`; generic data `Write` is insufficient. Expensive deterministic migration preparation need not hold session authority locks, but the durable publication boundary MUST execute under current migration authority so refresh/revocation linearizes with publication.
 
 **[WATCH TERMINATION]** A blocked watch awakened by cancellation revalidates current session/query authority before returning ordinary `WatchClosed`. Session revocation maps to hosted `SessionClosed`; exact read-authority loss maps to `PermissionDenied`. Output-equivalent causal revisions remain quotiented from the public watch stream.
+
+## Pass459 normative addendum — remote adaptive exact-effect transport
+
+**[REMOTE INTENT AUTHORITY]** A binding/host MUST represent a relation write formed at an older world by the caller's formation `RevisionId`, durable idempotency key, and exact relation insert/remove effect. It MUST NOT manufacture a current-head Plan, replay client code, submit a merge certificate, or select a SQL/current-state fallback.
+
+**[SERVER CERTIFICATION LAW]** The database derives semantic typing and formation validity from its own retained authority, then applies the same Γ-coordinate transition certification used by local adaptive transactions. A stale remote effect may publish only when every intervening effect is certified coordination-free; overlap, opaque history, unavailable exact formation authority, and schema boundaries fail closed.
+
+**[RETRY-FIRST LAW]** Durable client-intent equality is checked before historical formation reconstruction. Therefore a committed uncertain retry remains recognizable even after its formation revision is no longer materially reconstructible. Retry recognition cannot publish an unknown intent.
+
+**[PERFORMANCE DEBT, NOT FALLBACK]** Reconstructing Γ support from a retained historical relation is currently an exact P459 implementation payer, not an alternative semantics. The target is persistent historical relation-witness authority with O(delta log N) formation validation and structural sharing/reclamation; no weaker current-head validation path may replace it.
+
+## Pass468 — canonical committed retry authority / unreleased format reset
+
+**[SUPERSEDES PRE-RELEASE CODEC COMPATIBILITY CLAIMS]** Earlier pass sections documenting metadata/mutation/replication backward decoders describe historical implementation states, not current product obligations. Until the first declared released compatibility boundary, CFMD carries one current internal format discriminator and fails closed on obsolete pass layouts. No pass-number codec ladder or internal format migrator may constrain architecture.
+
+**[RETRY AUTHORITY]** Durable committed retry storage contains only canonical client semantic intent plus committed target/outcome bookkeeping. Formation source/target provenance, realized residuals/complements, realized schema identity and semantic implementation deployment are not retry identity and are not stored there.
+
+**[REALIZATION AUTHORITY]** Realized publication, causal history and recovery material are owned by `DurableRevisionChange`; causal records pair canonical client intent with this realized change without merging their identities.
+
+**[SEMANTIC DEPLOYMENT AUTHORITY]** Checkpoints persist the complete installed builtin semantic registry deployment set. Historical implementation availability must not depend on full transaction descriptors surviving in the retry ledger, and persisting only modules referenced by the current `SemanticContext` is insufficient.
+
+
+## Pre-release compatibility law (P469)
+
+**[SELECTED]** Before CFMD defines its first released compatibility boundary, development snapshots do not create backward-compatibility obligations. Active kernels/codecs/APIs MUST converge on the single best current architecture rather than retain pass-era readers, residual enum taxonomy, aliases, migration shims, or fallback routes. Obsolete implementations may remain only as non-active reference material. Current physical discriminators are fail-closed format/type guards, not promises to decode earlier R&D layouts. This rule is subordinate only to explicitly declared released compatibility contracts in the future.
+
+**[P473 RETAINED SCHEMA-EPOCH ROOT LAW]** On `SchemaMigrationExact`, the runtime seals the source epoch's persistent Γ-support/action timelines together with the structurally shared field-value root needed by deterministic migration transforms. Schema-aware field-intent proof traverses schema boundaries using those immutable roots and certified migration programs; it does not replay the old epoch's ordinary causal suffix, reconstruct a full historical state on the commit path, or route queries through the old schema. Recovery rebuilds the derived epoch roots from canonical causal/historical authority, so no serialized witness cache becomes a second history authority.

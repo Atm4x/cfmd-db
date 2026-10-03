@@ -608,37 +608,37 @@ pub(crate) fn semantic_rule_to_kernel(rule: SemanticRuleExpr) -> kernel_schema::
         }
         SemanticRuleExpr::I64Range { value, min, max } => {
             kernel_schema::SemanticRuleExpr::I64Range {
-                value: rule_value_to_kernel(&value),
+                value: rule_value_to_kernel(value),
                 min,
                 max,
             }
         }
         SemanticRuleExpr::TextLength { value, min, max } => {
             kernel_schema::SemanticRuleExpr::TextLength {
-                value: rule_value_to_kernel(&value),
+                value: rule_value_to_kernel(value),
                 min,
                 max,
             }
         }
         SemanticRuleExpr::TextOneOf { value, allowed } => {
             kernel_schema::SemanticRuleExpr::TextOneOf {
-                value: rule_value_to_kernel(&value),
+                value: rule_value_to_kernel(value),
                 allowed,
             }
         }
         SemanticRuleExpr::TextMatches { value, pattern } => {
             kernel_schema::SemanticRuleExpr::TextMatches {
-                value: rule_value_to_kernel(&value),
+                value: rule_value_to_kernel(value),
                 pattern: text_pattern_to_kernel(pattern),
             }
         }
     }
 }
 
-fn rule_value_to_kernel(value: &RuleValueExpr) -> kernel_schema::RuleValueExpr {
+fn rule_value_to_kernel(value: RuleValueExpr) -> kernel_schema::RuleValueExpr {
     match value {
         RuleValueExpr::Input => kernel_schema::RuleValueExpr::Input,
-        RuleValueExpr::Field(field) => kernel_schema::RuleValueExpr::Field((*field).into()),
+        RuleValueExpr::Field(field) => kernel_schema::RuleValueExpr::Field(field.into()),
     }
 }
 

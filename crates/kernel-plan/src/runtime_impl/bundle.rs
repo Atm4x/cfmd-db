@@ -1,3 +1,4 @@
+include!("bundle/history_index.rs");
 include!("bundle/revision_build.rs");
 include!("bundle/revision_observe.rs");
 include!("bundle/revision_prepare.rs");

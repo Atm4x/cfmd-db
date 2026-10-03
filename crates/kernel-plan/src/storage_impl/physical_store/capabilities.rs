@@ -54,13 +54,7 @@ impl PhysicalStore {
             && state.compatible_with(context, registry)?
             && state.row_count() == expected_rows
         {
-            return Ok(Some(SemanticFiberCapability::ObservableAtom(state)));
-        }
-        if let Some(state) = self.semantic_indexes.get(binding)
-            && state.compatible_with(context, registry)?
-            && state.row_count() == expected_rows
-        {
-            return Ok(Some(SemanticFiberCapability::LegacyIndex(state)));
+            return Ok(Some(SemanticFiberCapability::new(state)));
         }
         Ok(None)
     }

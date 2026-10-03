@@ -374,7 +374,7 @@ pub struct CertifiedSemanticMorphism {
     source: Vec<RevisionObservableId>,
     target: Vec<RevisionObservableId>,
     certificate: SemanticMorphismCertificate,
-    mapping: BTreeMap<Vec<EqClassId>, Vec<EqClassId>>,
+    mapping: PersistentOrdMap<Vec<EqClassId>, Vec<EqClassId>>,
 }
 
 impl CertifiedSemanticMorphism {
@@ -433,7 +433,7 @@ impl CertifiedSemanticMorphism {
             source,
             target,
             certificate,
-            mapping,
+            mapping: mapping.into_iter().collect(),
         })
     }
 
@@ -474,7 +474,7 @@ impl CertifiedSemanticMorphism {
                 product,
                 component_indices,
             },
-            mapping,
+            mapping: mapping.into_iter().collect(),
         })
     }
 
@@ -491,7 +491,7 @@ impl CertifiedSemanticMorphism {
         if self.target != next.source {
             return Err(ObservableError::MorphismBoundaryMismatch);
         }
-        let mapping = self
+        let mapping: PersistentOrdMap<Vec<EqClassId>, Vec<EqClassId>> = self
             .mapping
             .iter()
             .filter_map(|(source, middle)| {
@@ -541,8 +541,46 @@ impl CertifiedSemanticMorphism {
     }
 
     #[must_use]
-    pub fn materialized_mapping(&self) -> &BTreeMap<Vec<EqClassId>, Vec<EqClassId>> {
+    pub fn materialized_mapping(&self) -> &PersistentOrdMap<Vec<EqClassId>, Vec<EqClassId>> {
         &self.mapping
+    }
+
+    pub fn extend_product_projection_class(
+        &mut self,
+        catalog: &RevisionObservableCatalog,
+        product_class: EqClassId,
+        product_components: &[EqClassId],
+    ) -> Result<(), ObservableError> {
+        if self.revision != catalog.revision || self.catalog_instance != catalog.catalog_instance {
+            return Err(ObservableError::ObservableCatalogMismatch);
+        }
+        let (product, component_indices) = match &self.certificate {
+            SemanticMorphismCertificate::ProductProjection {
+                product,
+                component_indices,
+            } => (*product, component_indices),
+            _ => return Err(ObservableError::MorphismBoundaryMismatch),
+        };
+        let source = vec![product_class];
+        catalog.validate_class_tuple(&[product], &source)?;
+        let target = component_indices
+            .iter()
+            .map(|&index| {
+                product_components
+                    .get(index)
+                    .copied()
+                    .ok_or(ObservableError::InvalidProjectionIndex(index))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        catalog.validate_class_tuple(&self.target, &target)?;
+        if let Some(existing) = self.mapping.get(&source) {
+            if existing != &target {
+                return Err(ObservableError::ConflictingMorphismImage);
+            }
+            return Ok(());
+        }
+        self.mapping.insert(source, target);
+        Ok(())
     }
 }
 

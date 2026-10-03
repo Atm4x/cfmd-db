@@ -10,6 +10,7 @@ pub(super) struct MapNode<K, V> {
     key: K,
     value: V,
     pub(super) height: u16,
+    subtree_len: usize,
     left: Option<Arc<MapNode<K, V>>>,
     right: Option<Arc<MapNode<K, V>>>,
 }
@@ -60,11 +61,35 @@ impl<K, V> Default for PersistentOrdMap<K, V> {
 impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
     #[must_use]
     pub fn from_sorted_unique(entries: Vec<(K, V)>) -> Option<Self> {
-        Self::from_sorted_unique_owned(entries)
+        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return None;
+        }
+        fn build<K: Clone, V: Clone>(entries: &[(K, V)]) -> Option<Arc<MapNode<K, V>>> {
+            if entries.is_empty() {
+                return None;
+            }
+            let mid = entries.len() / 2;
+            let left = build(&entries[..mid]);
+            let right = build(&entries[mid + 1..]);
+            Some(map_node(
+                entries[mid].0.clone(),
+                entries[mid].1.clone(),
+                left,
+                right,
+            ))
+        }
+        let len = entries.len();
+        Some(Self {
+            root: build(&entries),
+            len,
+        })
     }
 
     #[must_use]
     pub fn from_sorted_unique_owned(entries: Vec<(K, V)>) -> Option<Self> {
+        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return None;
+        }
         fn build<K, V>(
             entries: &mut std::vec::IntoIter<(K, V)>,
             len: usize,
@@ -77,9 +102,6 @@ impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
             let (key, value) = entries.next().expect("validated owned bulk map length");
             let right = build(entries, len - left_len - 1);
             Some(map_node(key, value, left, right))
-        }
-        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-            return None;
         }
         let len = entries.len();
         let mut entries = entries.into_iter();
@@ -161,6 +183,70 @@ impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
         Q: Ord + ?Sized,
     {
         self.get(key).is_some()
+    }
+
+    /// Zero-based in-order rank of `key` in O(log N).
+    ///
+    /// The rank is structural metadata maintained by the persistent AVL nodes;
+    /// callers can therefore translate a stable ordered key into a logical
+    /// position without scanning the immutable map.
+    #[must_use]
+    pub fn rank_of(&self, key: &K) -> Option<usize> {
+        let mut current = self.root.as_deref();
+        let mut rank = 0usize;
+        while let Some(node) = current {
+            match key.cmp(&node.key) {
+                Ordering::Less => current = node.left.as_deref(),
+                Ordering::Greater => {
+                    rank = rank
+                        .saturating_add(map_len(node.left.as_ref()))
+                        .saturating_add(1);
+                    current = node.right.as_deref();
+                }
+                Ordering::Equal => {
+                    return Some(rank.saturating_add(map_len(node.left.as_ref())));
+                }
+            }
+        }
+        None
+    }
+
+    /// Number of keys strictly smaller than `key` in O(log N), regardless of
+    /// whether `key` itself exists in the map.
+    #[must_use]
+    pub fn rank_before(&self, key: &K) -> usize {
+        let mut current = self.root.as_deref();
+        let mut rank = 0usize;
+        while let Some(node) = current {
+            match key.cmp(&node.key) {
+                Ordering::Less | Ordering::Equal => current = node.left.as_deref(),
+                Ordering::Greater => {
+                    rank = rank
+                        .saturating_add(map_len(node.left.as_ref()))
+                        .saturating_add(1);
+                    current = node.right.as_deref();
+                }
+            }
+        }
+        rank
+    }
+
+    /// In-order key at zero-based `rank` in O(log N).
+    #[must_use]
+    pub fn key_at_rank(&self, mut rank: usize) -> Option<&K> {
+        let mut current = self.root.as_deref();
+        while let Some(node) = current {
+            let left_len = map_len(node.left.as_ref());
+            match rank.cmp(&left_len) {
+                Ordering::Less => current = node.left.as_deref(),
+                Ordering::Equal => return Some(&node.key),
+                Ordering::Greater => {
+                    rank = rank.saturating_sub(left_len.saturating_add(1));
+                    current = node.right.as_deref();
+                }
+            }
+        }
+        None
     }
 
     #[must_use]
@@ -369,6 +455,21 @@ impl<T: Ord + Clone> PersistentOrdSet<T> {
     }
 
     #[must_use]
+    pub fn rank_of(&self, value: &T) -> Option<usize> {
+        self.entries.rank_of(value)
+    }
+
+    #[must_use]
+    pub fn rank_before(&self, value: &T) -> usize {
+        self.entries.rank_before(value)
+    }
+
+    #[must_use]
+    pub fn value_at_rank(&self, rank: usize) -> Option<&T> {
+        self.entries.key_at_rank(rank)
+    }
+
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.entries.len()
     }
@@ -520,6 +621,10 @@ fn map_height<K, V>(node: Option<&Arc<MapNode<K, V>>>) -> u16 {
     node.map_or(0, |node| node.height)
 }
 
+fn map_len<K, V>(node: Option<&Arc<MapNode<K, V>>>) -> usize {
+    node.map_or(0, |node| node.subtree_len)
+}
+
 fn map_node<K, V>(
     key: K,
     value: V,
@@ -530,6 +635,7 @@ fn map_node<K, V>(
         key,
         value,
         height: 1 + map_height(left.as_ref()).max(map_height(right.as_ref())),
+        subtree_len: 1 + map_len(left.as_ref()) + map_len(right.as_ref()),
         left,
         right,
     })

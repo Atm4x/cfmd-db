@@ -117,6 +117,579 @@ mod tests {
     }
 
     #[test]
+    fn relation_cardinality_model_rule_lowers_through_query_and_has_exact_vmf_mass() {
+        let (mut context, registry, mut state) = fixture();
+        let relation = SemanticId::new(3);
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationCardinality {
+                relation,
+                min: 2,
+                max: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(
+            validate_state(&context, &registry, &state),
+            Err(ValidationError::ModelRuleViolation { rule_index: 0 }),
+        );
+        let extents = DenseTypeExtents::compile(&state.model, &context.schema).unwrap();
+        let measure = dynamic_violation_measure(&context, &registry, &state, &extents).unwrap();
+        assert_eq!(
+            measure.mass(&DynamicViolationWitness::ModelRule { rule_index: 0 }),
+            1,
+        );
+        let oracle = kernel_query::RelExpr::Scan(relation)
+            .evaluate(&state.model, &context, &registry)
+            .unwrap();
+        assert_eq!(
+            oracle.rows().len(),
+            1,
+            "specialized cardinality must agree with query oracle"
+        );
+        assert_eq!(
+            validate_relations_with_extents(
+                &context,
+                &registry,
+                &state,
+                &extents,
+                &BTreeSet::from([relation]),
+            ),
+            Err(ValidationError::ModelRuleViolation { rule_index: 0 }),
+        );
+        assert_eq!(
+            relation_dynamic_violation_measure(&context, &registry, &state, &extents, relation)
+                .unwrap()
+                .mass(&DynamicViolationWitness::ModelRule { rule_index: 0 }),
+            1,
+        );
+
+        let second = state.model.relations.get(&relation).unwrap()[0].clone();
+        state
+            .model
+            .relations
+            .get_mut(&relation)
+            .unwrap()
+            .push(second);
+        assert_eq!(validate_state(&context, &registry, &state), Ok(()));
+        let extents = DenseTypeExtents::compile(&state.model, &context.schema).unwrap();
+        assert!(
+            dynamic_violation_measure(&context, &registry, &state, &extents)
+                .unwrap()
+                .is_zero()
+        );
+    }
+
+    #[test]
+    fn quantified_model_rules_have_exact_row_predicates_and_dependency_columns() {
+        let (mut context, registry, mut state) = fixture();
+        let relation = SemanticId::new(700);
+        let text_eq = SemanticId::new(4);
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![text_eq],
+                },
+            })
+            .unwrap();
+        state
+            .model
+            .relations
+            .insert(relation, vec![vec![Value::Text("db".into())]]);
+        let text_column = context.schema.relation_column_id(relation, 0).unwrap();
+        let predicate = kernel_schema::SemanticRuleExpr::TextLength {
+            value: kernel_schema::RuleValueExpr::Field(text_column),
+            min: 2,
+            max: None,
+        };
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExists {
+                relation,
+                predicate: predicate.clone(),
+            })
+            .unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
+                relation,
+                predicate,
+            })
+            .unwrap();
+
+        let plan = crate::CompiledRulePlan::compile(&context);
+        assert_eq!(plan.model_rules()[0].dependency().relation(), relation);
+        assert_eq!(
+            plan.model_rules()[0].dependency().columns(),
+            &BTreeSet::from([text_column])
+        );
+        assert_eq!(
+            plan.model_rules()[1].dependency().columns(),
+            &BTreeSet::from([text_column])
+        );
+        assert_eq!(validate_state(&context, &registry, &state), Ok(()));
+
+        state.model.relations.get_mut(&relation).unwrap()[0][0] = Value::Text("x".into());
+        assert_eq!(
+            validate_state(&context, &registry, &state),
+            Err(ValidationError::ModelRuleViolation { rule_index: 0 }),
+        );
+        let extents = DenseTypeExtents::compile(&state.model, &context.schema).unwrap();
+        let measure = dynamic_violation_measure(&context, &registry, &state, &extents).unwrap();
+        assert_eq!(
+            measure.mass(&DynamicViolationWitness::ModelRule { rule_index: 0 }),
+            1
+        );
+        assert_eq!(
+            measure.mass(&DynamicViolationWitness::ModelRule { rule_index: 1 }),
+            1
+        );
+        assert_eq!(
+            validate_relations_with_extents(
+                &context,
+                &registry,
+                &state,
+                &extents,
+                &BTreeSet::from([SemanticId::new(3)]),
+            ),
+            Ok(()),
+            "unrelated relation changes must not evaluate the quantified rule",
+        );
+        let relation_measure =
+            relation_dynamic_violation_measure(&context, &registry, &state, &extents, relation)
+                .unwrap();
+        assert_eq!(
+            relation_measure.mass(&DynamicViolationWitness::ModelRule { rule_index: 0 }),
+            1
+        );
+        assert_eq!(
+            relation_measure.mass(&DynamicViolationWitness::ModelRule { rule_index: 1 }),
+            1
+        );
+    }
+
+    #[test]
+    fn same_relation_field_footprint_skips_unrelated_model_rules() {
+        let (mut context, registry, mut state) = fixture();
+        let relation = SemanticId::new(704);
+        let text_eq = SemanticId::new(4);
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::Text),
+                    TypeExpr::Scalar(ScalarType::Text),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![text_eq, text_eq],
+                },
+            })
+            .unwrap();
+        state.model.relations.insert(
+            relation,
+            vec![vec![Value::Text("ok".into()), Value::Text("a".into())]],
+        );
+        let guarded = context.schema.relation_column_id(relation, 0).unwrap();
+        let unrelated = context.schema.relation_column_id(relation, 1).unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
+                relation,
+                predicate: kernel_schema::SemanticRuleExpr::TextLength {
+                    value: kernel_schema::RuleValueExpr::Field(guarded),
+                    min: 2,
+                    max: None,
+                },
+            })
+            .unwrap();
+        let plan = crate::CompiledRulePlan::compile(&context);
+        assert_eq!(
+            plan.model_rules_for_mutation(
+                relation,
+                &crate::RelationMutationFootprint::fields([unrelated]),
+            )
+            .count(),
+            0,
+        );
+        assert_eq!(
+            plan.model_rules_for_mutation(
+                relation,
+                &crate::RelationMutationFootprint::fields([guarded]),
+            )
+            .count(),
+            1,
+        );
+        state.model.relations.get_mut(&relation).unwrap()[0][0] = Value::Text("x".into());
+        let extents = DenseTypeExtents::compile(&state.model, &context.schema).unwrap();
+        assert_eq!(
+            validate_relations_with_extents_selective(
+                &context,
+                &registry,
+                &state,
+                &extents,
+                &BTreeSet::from([relation]),
+                &BTreeMap::from([(
+                    relation,
+                    crate::RelationMutationFootprint::fields([unrelated])
+                )]),
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            validate_relations_with_extents_selective(
+                &context,
+                &registry,
+                &state,
+                &extents,
+                &BTreeSet::from([relation]),
+                &BTreeMap::from([(
+                    relation,
+                    crate::RelationMutationFootprint::fields([guarded])
+                )]),
+            ),
+            Err(ValidationError::ModelRuleViolation { rule_index: 0 }),
+        );
+    }
+
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn benchmark_relevant_model_rule_scan_scaling() {
+        use std::time::Instant;
+
+        for rows in [1_000usize, 100_000, 1_000_000] {
+            let (mut context, _registry, mut state) = fixture();
+            let relation = SemanticId::new(705);
+            let text_eq = SemanticId::new(4);
+            context
+                .schema
+                .define_relation(kernel_schema::RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![text_eq],
+                    },
+                })
+                .unwrap();
+            state.model.relations.insert(
+                relation,
+                (0..rows).map(|_| vec![Value::Text("ok".into())]).collect(),
+            );
+            let column = context.schema.relation_column_id(relation, 0).unwrap();
+            context
+                .schema
+                .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
+                    relation,
+                    predicate: kernel_schema::SemanticRuleExpr::TextLength {
+                        value: kernel_schema::RuleValueExpr::Field(column),
+                        min: 2,
+                        max: Some(2),
+                    },
+                })
+                .unwrap();
+            let plan = crate::CompiledRulePlan::compile(&context);
+            let rule = &plan.model_rules()[0];
+            let started = Instant::now();
+            assert!(rule.is_satisfied(&state).unwrap());
+            let relevant = started.elapsed();
+            let started = Instant::now();
+            assert_eq!(
+                plan.model_rules_for_mutation(
+                    relation,
+                    &crate::RelationMutationFootprint::fields([SemanticId::new(999_999)]),
+                )
+                .count(),
+                0,
+            );
+            let skipped = started.elapsed();
+            eprintln!(
+                "MODEL_RULE_SCAN rows={rows} relevant_ns={} skipped_ns={}",
+                relevant.as_nanos(),
+                skipped.as_nanos()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic release benchmark"]
+    fn benchmark_maintained_model_rule_witness_delta_against_full_scan() {
+        use std::time::Instant;
+
+        let rows = 1_000_000usize;
+        let (mut context, _registry, mut state) = fixture();
+        let relation = SemanticId::new(706);
+        let text_eq = SemanticId::new(4);
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![text_eq],
+                },
+            })
+            .unwrap();
+        state.model.relations.insert(
+            relation,
+            (0..rows).map(|_| vec![Value::Text("ok".into())]).collect(),
+        );
+        let column = context.schema.relation_column_id(relation, 0).unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
+                relation,
+                predicate: kernel_schema::SemanticRuleExpr::TextLength {
+                    value: kernel_schema::RuleValueExpr::Field(column),
+                    min: 2,
+                    max: Some(2),
+                },
+            })
+            .unwrap();
+        let witnesses = crate::ModelRuleWitnessState::build(&context, &state).unwrap();
+        let removed = vec![Value::Text("ok".into())];
+        let inserted = vec![Value::Text("x".into())];
+        let footprint = crate::RelationMutationFootprint::fields([column]);
+
+        let mut target = state.clone();
+        let target_rows = target.model.relations.get_mut(&relation).unwrap();
+        target_rows.pop();
+        target_rows.push(inserted.clone());
+        let plan = crate::CompiledRulePlan::compile(&context);
+        let started = Instant::now();
+        assert_eq!(plan.model_rules()[0].violation_mass(&target).unwrap(), 1);
+        let full_scan = started.elapsed();
+
+        let started = Instant::now();
+        let next = witnesses
+            .apply_relation_delta(&context, relation, &footprint, &[removed], &[inserted])
+            .unwrap();
+        assert_eq!(next.violation_mass(&context, 0).unwrap(), 1);
+        let maintained = started.elapsed();
+        eprintln!(
+            "MODEL_RULE_WITNESS rows={rows} full_scan_ns={} maintained_delta_ns={} ratio={:.2}",
+            full_scan.as_nanos(),
+            maintained.as_nanos(),
+            full_scan.as_secs_f64() / maintained.as_secs_f64(),
+        );
+    }
+
+    #[test]
+    fn exists_all_specialization_agrees_with_relational_filter_oracle() {
+        let (mut context, registry, mut state) = fixture();
+        let relation = SemanticId::new(701);
+        let text_eq = SemanticId::new(4);
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![text_eq],
+                },
+            })
+            .unwrap();
+        state.model.relations.insert(
+            relation,
+            vec![
+                vec![Value::Text("ok".into())],
+                vec![Value::Text("bad".into())],
+            ],
+        );
+        let column = context.schema.relation_column_id(relation, 0).unwrap();
+        let predicate = kernel_schema::SemanticRuleExpr::TextOneOf {
+            value: kernel_schema::RuleValueExpr::Field(column),
+            allowed: BTreeSet::from(["ok".to_owned()]),
+        };
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExists {
+                relation,
+                predicate: predicate.clone(),
+            })
+            .unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
+                relation,
+                predicate,
+            })
+            .unwrap();
+
+        let plan = crate::CompiledRulePlan::compile(&context);
+        assert!(plan.model_rules()[0].is_satisfied(&state).unwrap());
+        assert!(!plan.model_rules()[1].is_satisfied(&state).unwrap());
+        assert_eq!(plan.model_rules()[1].violation_mass(&state).unwrap(), 1);
+
+        let oracle = kernel_query::RelExpr::FilterEqConst {
+            input: Box::new(kernel_query::RelExpr::Scan(relation)),
+            column: 0,
+            value: Value::Text("ok".into()),
+            equivalence: text_eq,
+        }
+        .evaluate(&state.model, &context, &registry)
+        .unwrap();
+        assert_eq!(oracle.rows().len(), 1);
+        assert_eq!(
+            oracle.rows().len(),
+            state
+                .model
+                .relations
+                .get(&relation)
+                .unwrap()
+                .iter()
+                .filter(|row| row[0] == Value::Text("ok".into()))
+                .count()
+        );
+    }
+
+    #[test]
+    fn exact_f64_sum_model_rule_uses_exact_aggregate_and_column_dependency() {
+        let (mut context, mut registry, mut state) = fixture();
+        let relation = SemanticId::new(702);
+        let eq_f64 = SemanticId::new(703);
+        let digest = registry.install_equivalence(kernel_semantics::EquivalenceModule::F64Bitwise);
+        context.environment.pin_module(eq_f64, digest);
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::F64)],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![eq_f64],
+                },
+            })
+            .unwrap();
+        state.model.relations.insert(
+            relation,
+            vec![
+                vec![Value::F64Bits(1.0e16_f64.to_bits())],
+                vec![Value::F64Bits(1.0_f64.to_bits())],
+                vec![Value::F64Bits((-1.0e16_f64).to_bits())],
+            ],
+        );
+        let column = context.schema.relation_column_id(relation, 0).unwrap();
+        let one = kernel_schema::FiniteF64::new(1.0).unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactF64SumRange {
+                relation,
+                column,
+                min: Some(one),
+                max: Some(one),
+            })
+            .unwrap();
+        let plan = crate::CompiledRulePlan::compile(&context);
+        let rule = &plan.model_rules()[0];
+        assert_eq!(rule.dependency().columns(), &BTreeSet::from([column]));
+        assert!(rule.is_satisfied(&state).unwrap());
+        assert_eq!(rule.violation_mass(&state).unwrap(), 0);
+        assert_eq!(validate_state(&context, &registry, &state), Ok(()));
+        state
+            .model
+            .relations
+            .get_mut(&relation)
+            .unwrap()
+            .push(vec![Value::F64Bits(0.5_f64.to_bits())]);
+        assert!(!rule.is_satisfied(&state).unwrap());
+        assert_eq!(rule.violation_mass(&state).unwrap(), 1);
+    }
+
+    #[test]
+    fn maintained_model_rule_witnesses_update_exactly_from_relation_delta() {
+        let (mut context, mut registry, mut state) = fixture();
+        let relation = SemanticId::new(710);
+        let text_eq = SemanticId::new(4);
+        let f64_eq = SemanticId::new(711);
+        let f64_digest =
+            registry.install_equivalence(kernel_semantics::EquivalenceModule::F64Bitwise);
+        context.environment.pin_module(f64_eq, f64_digest);
+        context
+            .schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::Text),
+                    TypeExpr::Scalar(ScalarType::F64),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![text_eq, f64_eq],
+                },
+            })
+            .unwrap();
+        let text_column = context.schema.relation_column_id(relation, 0).unwrap();
+        let sum_column = context.schema.relation_column_id(relation, 1).unwrap();
+        let predicate = kernel_schema::SemanticRuleExpr::TextOneOf {
+            value: kernel_schema::RuleValueExpr::Field(text_column),
+            allowed: BTreeSet::from(["ok".to_owned()]),
+        };
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExists {
+                relation,
+                predicate: predicate.clone(),
+            })
+            .unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
+                relation,
+                predicate,
+            })
+            .unwrap();
+        context
+            .schema
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactF64SumRange {
+                relation,
+                column: sum_column,
+                min: Some(kernel_schema::FiniteF64::new(3.0).unwrap()),
+                max: Some(kernel_schema::FiniteF64::new(3.0).unwrap()),
+            })
+            .unwrap();
+        state.model.relations.insert(
+            relation,
+            vec![
+                vec![Value::Text("ok".into()), Value::F64Bits(1.0_f64.to_bits())],
+                vec![Value::Text("bad".into()), Value::F64Bits(2.0_f64.to_bits())],
+            ],
+        );
+
+        let witnesses = crate::ModelRuleWitnessState::build(&context, &state).unwrap();
+        assert_eq!(witnesses.violation_mass(&context, 0).unwrap(), 0);
+        assert_eq!(witnesses.violation_mass(&context, 1).unwrap(), 1);
+        assert_eq!(witnesses.violation_mass(&context, 2).unwrap(), 0);
+
+        let removed = vec![vec![
+            Value::Text("bad".into()),
+            Value::F64Bits(2.0_f64.to_bits()),
+        ]];
+        let inserted = vec![vec![
+            Value::Text("ok".into()),
+            Value::F64Bits(2.0_f64.to_bits()),
+        ]];
+        let footprint = crate::RelationMutationFootprint::fields([text_column]);
+        let next = witnesses
+            .apply_relation_delta(&context, relation, &footprint, &removed, &inserted)
+            .unwrap();
+        assert_eq!(next.violation_mass(&context, 0).unwrap(), 0);
+        assert_eq!(next.violation_mass(&context, 1).unwrap(), 0);
+        assert_eq!(next.violation_mass(&context, 2).unwrap(), 0);
+
+        let mut target = state.clone();
+        target.model.relations.insert(
+            relation,
+            vec![
+                vec![Value::Text("ok".into()), Value::F64Bits(1.0_f64.to_bits())],
+                vec![Value::Text("ok".into()), Value::F64Bits(2.0_f64.to_bits())],
+            ],
+        );
+        let rebuilt = crate::ModelRuleWitnessState::build(&context, &target).unwrap();
+        assert_eq!(next, rebuilt);
+    }
+
+    #[test]
     fn dynamic_violation_measure_exposes_missing_live_reference_witness() {
         let (context, registry, mut state) = fixture();
         let relation = SemanticId::new(3);

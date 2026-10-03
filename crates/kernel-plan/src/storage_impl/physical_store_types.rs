@@ -5,7 +5,6 @@
 pub struct PhysicalStore {
     relations: PersistentOrdMap<(SemanticId, LayoutId), Arc<InstalledRelation>>,
     i64_indexes: PersistentOrdMap<I64IndexBinding, Arc<MaterializedI64IndexState>>,
-    semantic_indexes: PersistentOrdMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>>,
     semantic_quotient_factors:
         PersistentOrdMap<SemanticIndexBinding, Arc<MaterializedSemanticQuotientFactorState>>,
     semantic_quotient_supports: PersistentOrdMap<

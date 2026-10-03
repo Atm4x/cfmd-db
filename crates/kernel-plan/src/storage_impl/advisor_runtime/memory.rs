@@ -1,5 +1,5 @@
 #[derive(Debug, Clone)]
-struct SemanticIndexAdviceObservation {
+struct ObservableAtomAdviceObservation {
     binding: SemanticIndexBinding,
     savings_per_execution: u128,
     key_cells: usize,
@@ -7,22 +7,10 @@ struct SemanticIndexAdviceObservation {
 }
 
 #[derive(Debug, Clone)]
-struct SemanticIndexAdviceScore {
-    binding: SemanticIndexBinding,
+struct ObservableAtomAdviceScore {
     gross_savings: u128,
     key_cells: usize,
     estimated_bytes: usize,
-}
-
-#[derive(Debug, Clone)]
-struct SemanticIndexAdviceChoice {
-    binding: SemanticIndexBinding,
-    work: PhysicalWorkEstimate,
-    key_cells: usize,
-    estimated_bytes: usize,
-    compatible_existing: bool,
-    advisor_managed: bool,
-    replaced_fixed_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -64,14 +52,6 @@ struct I64IndexAdvisorSelection {
     managed_estimated_bytes: usize,
     report: I64IndexAdvisorReport,
 }
-
-struct SemanticStatisticsAdvisorSelection {
-    selected: BTreeSet<SemanticIndexBinding>,
-    prepared_states: Vec<(SemanticIndexBinding, MaterializedSemanticStatisticsState)>,
-    managed_estimated_bytes: usize,
-    report: SemanticStatisticsAdvisorReport,
-}
-
 fn canonical_eq_key_heap_bytes(key: &kernel_semantics::CanonicalEqKey) -> usize {
     use kernel_semantics::CanonicalEqKey;
     match key {
@@ -145,37 +125,11 @@ fn semantic_key_retained_bytes(key: &Vec<kernel_semantics::CanonicalEqKey>) -> u
         ))
 }
 
-fn semantic_key_heap_bytes(key: &Vec<kernel_semantics::CanonicalEqKey>) -> usize {
-    key.capacity()
-        .saturating_mul(std::mem::size_of::<kernel_semantics::CanonicalEqKey>())
-        .saturating_add(saturating_usize_sum(
-            key.iter().map(canonical_eq_key_heap_bytes),
-        ))
-}
-
 fn semantic_index_binding_heap_bytes(binding: &SemanticIndexBinding) -> usize {
     binding
         .key_parts
         .capacity()
         .saturating_mul(std::mem::size_of::<SemanticIndexKeyPart>())
-}
-
-fn semantic_index_estimated_retained_bytes(state: &MaterializedSemanticIndexState) -> usize {
-    std::mem::size_of::<SemanticIndexBinding>()
-        .saturating_add(semantic_index_binding_heap_bytes(&state.binding))
-        .saturating_add(
-            state
-                .resolved
-                .capacity()
-                .saturating_mul(std::mem::size_of::<
-                    kernel_semantics::ResolvedPrimitiveEquivalence,
-                >()),
-        )
-        .saturating_add(
-            state
-                .index
-                .estimated_retained_bytes(semantic_key_heap_bytes),
-        )
 }
 
 fn observable_atom_estimated_retained_bytes(state: &MaterializedObservableAtomState) -> usize {

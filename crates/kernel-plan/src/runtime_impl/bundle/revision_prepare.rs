@@ -127,7 +127,6 @@ impl RuntimeRevisionBundle {
         self.prepare_revision_inner(&request, RelationEndpointValidation::ExactDerived)
     }
 
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
     fn prepare_revision_inner(
         &self,
         request: &RevisionTransitionRequest<'_>,
@@ -194,7 +193,6 @@ impl RuntimeRevisionBundle {
 
         let violation_state = self.candidate_violation_state_for_relation_transition(
             request,
-            resolved.keys().copied(),
             replay_claimed_delta,
         )?;
         violation_state.require_zero()?;
@@ -209,6 +207,13 @@ impl RuntimeRevisionBundle {
             let next_base = base.advance_storage_resolved(target_revision, resolved_delta)?;
             relation_bases.insert(mutation.relation, next_base);
         }
+        let mut historical = self.historical.clone();
+        Self::index_support_successors(
+            &mut historical,
+            target_revision,
+            &relation_bases,
+            request.mutations.iter().map(|mutation| mutation.relation),
+        );
         let mut candidate_revision = request.target_revision.clone();
         candidate_revision.detach_relation_materialized_projections();
         let candidate = RuntimeRevisionBundle {
@@ -221,6 +226,7 @@ impl RuntimeRevisionBundle {
             physical: candidate_store,
             relation_layouts: self.relation_layouts.clone(),
             relation_bases,
+            historical,
             materialization_specs: self.materialization_specs.clone(),
             materializations: candidate_materializations,
             materialization_dependencies: self.materialization_dependencies.clone(),
@@ -235,11 +241,13 @@ impl RuntimeRevisionBundle {
             },
             rewrite_intents: BTreeMap::new(),
             object_field_writes: request.mutations.iter().filter(|mutation| !mutation.object_field_writes.is_empty()).map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec())).collect(),
-            relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != kernel_durability::DurableRelationAuthorization::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
+            relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != Default::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
         };
         Ok(PreparedRuntimeRevisionTransition {
             descriptor,
             source_identity: self.root_identity,
+            source_context: self.revision.semantic_context().clone(),
+            source_fields: self.revision.state().model.fields.clone(),
             candidate: Box::new(candidate),
             output_deltas,
         })
@@ -285,7 +293,7 @@ impl RuntimeRevisionBundle {
                 relation: relation_rewrite.relation,
                 delta: relation_rewrite.rewrite.delta(),
                 object_field_writes: &[],
-                authorization: kernel_durability::DurableRelationAuthorization::default(),
+                authorization: Default::default(),
             });
             rewrite_intents.insert(
                 relation_rewrite.relation,
@@ -420,6 +428,13 @@ impl RuntimeRevisionBundle {
             relation_bases.insert(mutation.relation, next_base);
         }
 
+        let mut historical = self.historical.clone();
+        Self::index_support_successors(
+            &mut historical,
+            target_revision,
+            &relation_bases,
+            request.mutations.iter().map(|mutation| mutation.relation),
+        );
         let candidate = RuntimeRevisionBundle {
             root_identity: RuntimeRootIdentity {
                 root_id: self.root_identity.root_id,
@@ -430,6 +445,7 @@ impl RuntimeRevisionBundle {
             physical: candidate_store,
             relation_layouts: self.relation_layouts.clone(),
             relation_bases,
+            historical,
             materialization_specs: self.materialization_specs.clone(),
             materializations: candidate_materializations,
             materialization_dependencies: self.materialization_dependencies.clone(),
@@ -448,9 +464,11 @@ impl RuntimeRevisionBundle {
                 },
                 rewrite_intents: BTreeMap::new(),
                 object_field_writes: request.mutations.iter().filter(|mutation| !mutation.object_field_writes.is_empty()).map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec())).collect(),
-                relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != kernel_durability::DurableRelationAuthorization::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
+                relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != Default::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
             },
             source_identity: self.root_identity,
+            source_context: self.revision.semantic_context().clone(),
+            source_fields: self.revision.state().model.fields.clone(),
             candidate: Box::new(candidate),
             output_deltas,
         })
@@ -527,6 +545,8 @@ impl RuntimeRevisionBundle {
                 relation_authorizations: BTreeMap::new(),
             },
             source_identity: self.root_identity,
+            source_context: self.revision.semantic_context().clone(),
+            source_fields: self.revision.state().model.fields.clone(),
             candidate: Box::new(candidate),
             output_deltas: BTreeMap::new(),
         })
@@ -596,6 +616,8 @@ impl RuntimeRevisionBundle {
                 relation_authorizations: BTreeMap::new(),
             },
             source_identity: self.root_identity,
+            source_context: self.revision.semantic_context().clone(),
+            source_fields: self.revision.state().model.fields.clone(),
             candidate: Box::new(candidate),
             output_deltas: BTreeMap::new(),
         })
@@ -656,6 +678,7 @@ impl RuntimeRevisionBundle {
                 physical: self.physical.clone(),
                 relation_layouts: self.relation_layouts.clone(),
                 relation_bases: self.relation_bases.clone(),
+                historical: self.historical.clone(),
                 materialization_specs,
                 materializations,
                 materialization_dependencies,

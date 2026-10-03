@@ -6,13 +6,11 @@ use super::{
     PhysicalArtifactMemoryReport, PhysicalCapability, PhysicalExecutionError,
     PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy, PhysicalRecoveryReport,
     PhysicalRowId, PhysicalWorkEstimate, Plan, RelQueryError, RelType, RelationDelta,
-    ResourceFootprint, RevisionId, SemanticAccessCostModel, SemanticId, SemanticIndexAdvisorPolicy,
-    SemanticIndexAdvisorReport, SemanticIndexBinding, SemanticIndexKeyPart,
-    SemanticIndexWorkloadSample, SemanticQuotientFactorAdvisorReport,
-    SemanticQuotientFactorWorkloadSample, SemanticStatisticsAdvisorReport,
-    StorageResolvedRelationDelta, UnifiedAdvisorPolicy, UnifiedAdvisorTelemetry, UnifiedArtifactId,
-    UnifiedObservableAdvisorReport, Value, advisor, installed_relation_estimated_retained_bytes,
-    saturating_usize_sum,
+    ResourceFootprint, RevisionId, SemanticAccessCostModel, SemanticId, SemanticIndexBinding,
+    SemanticIndexKeyPart, SemanticIndexWorkloadSample, SemanticQuotientFactorAdvisorReport,
+    SemanticQuotientFactorWorkloadSample, StorageResolvedRelationDelta, UnifiedAdvisorPolicy,
+    UnifiedAdvisorTelemetry, UnifiedArtifactId, UnifiedObservableAdvisorReport, Value, advisor,
+    installed_relation_estimated_retained_bytes, saturating_usize_sum,
 };
 use crate::filter_shape::collect_direct_filter_chain;
 use crate::join_shape::direct_join_advice_summary;
@@ -26,8 +24,7 @@ use crate::recovery::{
     matching_durable_artifact_core, recovered_semantic_index_binding,
 };
 use crate::semantic_key::{
-    ResolvedSemanticIndexKeyPart, resolve_primitive_semantic_index_binding,
-    resolve_semantic_key_binding, resolved_semantic_index_row_key,
+    resolve_primitive_semantic_index_binding, resolve_semantic_key_binding,
     semantic_key_structural_definitions_for_equivalences,
 };
 use crate::semantic_quotient_physical::{

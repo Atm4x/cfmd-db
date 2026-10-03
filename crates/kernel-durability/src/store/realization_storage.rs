@@ -60,7 +60,7 @@ pub(super) fn read_published_factorized_realization(
         });
     }
     let mut crc = !0_u32;
-    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {

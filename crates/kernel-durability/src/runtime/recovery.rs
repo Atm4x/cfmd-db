@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use kernel_types::{ClientTransactionId, RevisionId};
 
 use crate::descriptor::DurableRevisionDescriptor;
-use crate::domain::{DurableTransactionIntent, DurableTransactionKey, IdempotencyEpoch};
+use crate::domain::{DurableCommittedTransaction, DurableTransactionKey, IdempotencyEpoch};
 
 use super::protocol::DurableTransactionOutcome;
 
@@ -24,7 +24,7 @@ pub enum TailStatus {
 
 #[derive(Debug)]
 pub(crate) struct RecoveredAuthorityState {
-    pub committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+    pub committed_transactions: BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
     pub unresolved_prepares: Vec<(u64, DurableRevisionDescriptor, u32)>,
     pub replication_authority_frames: Vec<Vec<u8>>,
 }
@@ -36,7 +36,7 @@ pub struct RecoveryScan {
     last_good_offset: usize,
     next_lsn: u64,
     tail_status: TailStatus,
-    committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+    committed_transactions: BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
     unresolved_prepares: Vec<(u64, DurableRevisionDescriptor, u32)>,
     replication_authority_frames: Vec<Vec<u8>>,
 }
@@ -108,7 +108,7 @@ impl RecoveryScan {
     pub fn transaction_intent(
         &self,
         transaction_id: ClientTransactionId,
-    ) -> Option<&DurableTransactionIntent> {
+    ) -> Option<&DurableCommittedTransaction> {
         self.transaction_intent_at(IdempotencyEpoch::ZERO, transaction_id)
     }
 
@@ -130,7 +130,7 @@ impl RecoveryScan {
     #[must_use]
     pub const fn committed_transactions(
         &self,
-    ) -> &BTreeMap<DurableTransactionKey, DurableTransactionIntent> {
+    ) -> &BTreeMap<DurableTransactionKey, DurableCommittedTransaction> {
         &self.committed_transactions
     }
 
@@ -147,7 +147,7 @@ impl RecoveryScan {
         &self,
         epoch: IdempotencyEpoch,
         transaction_id: ClientTransactionId,
-    ) -> Option<&DurableTransactionIntent> {
+    ) -> Option<&DurableCommittedTransaction> {
         self.committed_transactions
             .get(&DurableTransactionKey::new(epoch, transaction_id))
     }

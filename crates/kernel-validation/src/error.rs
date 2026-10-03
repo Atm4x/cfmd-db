@@ -30,6 +30,10 @@ pub enum ValidationError {
         entity: EntityId,
         rule_index: usize,
     },
+    ModelRuleViolation {
+        rule_index: usize,
+    },
+    ModelRuleEvaluation,
     CapabilityRequiredFieldUndefined {
         capability: SemanticId,
         field: SemanticId,

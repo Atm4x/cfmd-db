@@ -31,14 +31,6 @@ impl PhysicalStore {
                     DerivedArtifactTarget::Artifact(UnifiedArtifactId::I64Index(*binding)),
                 );
             }
-            for binding in self.semantic_indexes.keys() {
-                register(
-                    (binding.relation, binding.layout.id),
-                    DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticIndex(
-                        binding.clone(),
-                    )),
-                );
-            }
             for binding in self.semantic_quotient_factors.keys() {
                 register(
                     (binding.relation, binding.layout.id),
@@ -112,13 +104,6 @@ impl PhysicalStore {
         &mut self.i64_indexes
     }
 
-    fn semantic_indexes_mut_internal(
-        &mut self,
-    ) -> &mut PersistentOrdMap<SemanticIndexBinding, Arc<MaterializedSemanticIndexState>> {
-        self.invalidate_derived_artifact_dependencies();
-        &mut self.semantic_indexes
-    }
-
     pub(super) fn semantic_quotient_factors_mut(
         &mut self,
     ) -> &mut PersistentOrdMap<SemanticIndexBinding, Arc<MaterializedSemanticQuotientFactorState>>
@@ -169,9 +154,8 @@ impl PhysicalStore {
         relation: SemanticId,
         layout: LayoutBinding,
     ) -> BTreeSet<SemanticIndexBinding> {
-        self.semantic_indexes
+        self.observable_atom_states
             .keys()
-            .chain(self.observable_atom_states.keys())
             .filter(|binding| binding.relation == relation && binding.layout == layout)
             .cloned()
             .collect()

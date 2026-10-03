@@ -597,7 +597,6 @@ fn next_effect(
         effect.kind,
         kernel_plan::RuntimeHistoryEffectKind::FullRevision
             | kernel_plan::RuntimeHistoryEffectKind::SchemaMigration
-            | kernel_plan::RuntimeHistoryEffectKind::LegacyTargetOnly
     ) {
         return Err(Error::new(
             ErrorKind::WatchUnavailable,

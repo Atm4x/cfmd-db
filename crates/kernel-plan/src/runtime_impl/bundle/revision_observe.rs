@@ -82,7 +82,7 @@ impl RuntimeRevisionBundle {
                         relation: mutation.relation,
                         delta: &mutation.delta,
                     object_field_writes: &[],
-                    authorization: kernel_durability::DurableRelationAuthorization::default(),
+                    authorization: Default::default(),
                     })
                     .collect::<Vec<_>>();
                 (

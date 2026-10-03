@@ -6,6 +6,20 @@ use crate::checkpoint;
 use crate::descriptor::DurableMaterializationSpec;
 use crate::runtime::CodecError;
 
+/// Canonical digest of passive client-side publication guards (for example
+/// `Transaction::require(...)`).  The digest is part of durable retry identity,
+/// not of the realized database effect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClientIntentGuardDigest(pub [u8; 32]);
+
+impl ClientIntentGuardDigest {
+    #[must_use]
+    pub fn canonical(bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(Sha256::digest(bytes).into())
+    }
+}
+
 use super::historical::DurableMigrationComplement;
 
 /// Durable namespace for exact client retry identity.
@@ -52,7 +66,6 @@ pub enum DurableEffectKind {
     MixedRevision,
     FullRevision,
     SchemaMigration,
-    LegacyTargetOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,10 +277,6 @@ pub struct DurableObjectFieldWrite {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "These flags record independent transaction validation facts."
-)]
 pub struct DurableRelationAuthorization {
     pub relation_write: bool,
     pub object_create: bool,
@@ -305,10 +314,6 @@ pub struct DurableRelationResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Preserve inline state ownership without adding allocations to this representation."
-)]
 pub enum DurableRevisionChange {
     RelationData {
         semantic_revision: SemanticRevision,
@@ -318,6 +323,9 @@ pub enum DurableRevisionChange {
         semantic_revision: SemanticRevision,
         relation_mutations: Vec<DurableRelationMutation>,
         model_delta: DurableModelDelta,
+        /// Exact inverse/recovery material for the realized model-side effect.
+        /// This belongs to publication/recovery authority, never client identity.
+        model_complement: Option<Box<DurableModelDelta>>,
     },
     FullRevision {
         encoded_target_revision: Vec<u8>,
@@ -335,32 +343,17 @@ pub enum DurableRevisionChange {
 /// restart. Relation-data transactions retain their immutable source/target
 /// lineage plus the exact typed delta instead of duplicating the complete target
 /// Revision. Full-revision replacements still retain canonical target bytes.
-/// Legacy stores can still be decoded, but their old target-id-only entries are
-/// never treated as exact idempotency matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableTransactionIntent {
-    /// Exact relation-data request identity.  The immutable source revision plus
-    /// the canonical relation mutations determine the target logical state, so
-    /// retaining a second full target checkpoint is redundant.
-    RelationDataExact {
+    RelationData {
         source_revision: RevisionId,
         target_revision: RevisionId,
         semantic_revision: SemanticRevision,
         relation_mutations: Vec<DurableRelationMutation>,
+        client_guard_digest: Option<ClientIntentGuardDigest>,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
-    /// One certified realization of an earlier relation-data client intent.
-    /// `client_mutations` are the stable retry identity; `realized_mutations`
-    /// are the exact residual effect published against this source revision.
-    RelationDataResidualExact {
-        source_revision: RevisionId,
-        target_revision: RevisionId,
-        semantic_revision: SemanticRevision,
-        client_mutations: Vec<DurableRelationMutation>,
-        realized_mutations: Vec<DurableRelationMutation>,
-        semantic_modules: Vec<BuiltinSemanticModuleSpec>,
-    },
-    RelationRewriteExact {
+    RelationRewrite {
         source_revision: RevisionId,
         target_revision: RevisionId,
         semantic_revision: SemanticRevision,
@@ -368,11 +361,7 @@ pub enum DurableTransactionIntent {
         rewrite_intents: Vec<DurableRelationRewriteIntent>,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
-    /// Exact resolution Rewrite whose causal parent revisions are part of the
-    /// durable transaction identity. The store derives the prerequisite effect
-    /// cut from those already-authoritative revision frontiers; callers never
-    /// supply raw effect ids.
-    RelationResolutionExact {
+    RelationResolution {
         source_revision: RevisionId,
         target_revision: RevisionId,
         semantic_revision: SemanticRevision,
@@ -381,53 +370,121 @@ pub enum DurableTransactionIntent {
         causal_parents: Vec<RevisionId>,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
-    /// Exact mixed revision identity.  The immutable source plus canonical
-    /// relation and non-relation deltas reconstruct the complete target state.
-    MixedRevisionExact {
+    MixedRevision {
         source_revision: RevisionId,
         target_revision: RevisionId,
         semantic_revision: SemanticRevision,
         relation_mutations: Vec<DurableRelationMutation>,
         model_delta: DurableModelDelta,
-        model_complement: Option<Box<DurableModelDelta>>,
+        client_guard_digest: Option<ClientIntentGuardDigest>,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
-    /// One certified realization of an earlier mixed-data client intent.
-    /// Client deltas remain the retry identity while realized deltas describe
-    /// the exact effect published against the newer source revision.
-    MixedRevisionResidualExact {
-        source_revision: RevisionId,
-        target_revision: RevisionId,
-        semantic_revision: SemanticRevision,
-        client_relation_mutations: Vec<DurableRelationMutation>,
-        client_model_delta: DurableModelDelta,
-        realized_relation_mutations: Vec<DurableRelationMutation>,
-        realized_model_delta: DurableModelDelta,
-        realized_model_complement: Box<DurableModelDelta>,
-        semantic_modules: Vec<BuiltinSemanticModuleSpec>,
-    },
-    /// Exact full-revision replacement.  Full payload bytes remain necessary
-    /// because this transition is not derivable from a smaller typed delta.
-    Exact {
+    FullRevision {
         target_revision: RevisionId,
         encoded_target_revision: Vec<u8>,
         materializations: Option<Vec<DurableMaterializationSpec>>,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
-    /// Exact schema migration whose inverse information is part of the same
-    /// PREPARE/COMMIT identity as the target revision.  The complement must
-    /// not be staged in a separate generation: recovery either observes both
-    /// the committed schema transition and this authority or neither.
-    SchemaMigrationExact {
+    SchemaMigration {
         source_revision: RevisionId,
         target_revision: RevisionId,
         program: kernel_transport::SchemaMigrationProgram,
         migration_complement: DurableMigrationComplement,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
-    LegacyTargetOnly {
-        target_revision: RevisionId,
+}
+
+/// Canonical retry identity projected from a durable transaction record.
+///
+/// Realized publication state, recovery complements, formation/target revision
+/// ids and executable deployment artifacts are intentionally absent.  They are
+/// proof/recovery authorities, not part of the client request identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableClientIntent {
+    RelationData {
+        semantic_revision: SemanticRevision,
+        relation_mutations: Vec<DurableRelationMutation>,
+        guard_digest: Option<ClientIntentGuardDigest>,
     },
+    MixedRevision {
+        semantic_revision: SemanticRevision,
+        relation_mutations: Vec<DurableRelationMutation>,
+        model_delta: DurableModelDelta,
+        guard_digest: Option<ClientIntentGuardDigest>,
+    },
+    RelationRewrite {
+        semantic_revision: SemanticRevision,
+        relation_mutations: Vec<DurableRelationMutation>,
+        rewrite_intents: Vec<DurableRelationRewriteIntent>,
+    },
+    RelationResolution {
+        semantic_revision: SemanticRevision,
+        relation_mutations: Vec<DurableRelationMutation>,
+        rewrite_intents: Vec<DurableRelationRewriteIntent>,
+        causal_parents: Vec<RevisionId>,
+    },
+    FullRevision {
+        encoded_target_revision: Vec<u8>,
+        materializations: Option<Vec<DurableMaterializationSpec>>,
+    },
+    SchemaMigration {
+        program: kernel_transport::SchemaMigrationProgram,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCommittedTransaction {
+    pub target_revision: RevisionId,
+    pub intent: DurableClientIntent,
+}
+
+impl DurableCommittedTransaction {
+    #[must_use]
+    pub fn from_descriptor_intent(
+        target_revision: RevisionId,
+        intent: &DurableTransactionIntent,
+    ) -> Self {
+        Self {
+            target_revision,
+            intent: intent.client_intent_owned(),
+        }
+    }
+
+    #[must_use]
+    pub const fn target_revision(&self) -> RevisionId {
+        self.target_revision
+    }
+
+    #[must_use]
+    pub fn same_client_intent(&self, requested: &DurableTransactionIntent) -> bool {
+        self.intent == requested.client_intent_owned()
+    }
+
+    #[must_use]
+    pub fn matches_mixed_client_intent(
+        &self,
+        semantic_revision: SemanticRevision,
+        relation_mutations: &[DurableRelationMutation],
+        model_delta: &DurableModelDelta,
+        guard_digest: Option<ClientIntentGuardDigest>,
+    ) -> bool {
+        self.intent
+            == DurableClientIntent::MixedRevision {
+                semantic_revision,
+                relation_mutations: relation_mutations.to_vec(),
+                model_delta: model_delta.clone(),
+                guard_digest,
+            }
+    }
+
+    #[must_use]
+    pub const fn client_guard_digest(&self) -> Option<ClientIntentGuardDigest> {
+        match &self.intent {
+            DurableClientIntent::RelationData { guard_digest, .. }
+            | DurableClientIntent::MixedRevision { guard_digest, .. } => *guard_digest,
+            _ => None,
+        }
+    }
 }
 
 impl DurableTransactionIntent {
@@ -442,185 +499,130 @@ impl DurableTransactionIntent {
     /// causal resolutions remain exact because their endpoint/parent identity
     /// is part of the requested operation itself.
     #[must_use]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
-    pub fn same_client_intent(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::RelationDataExact {
-                    semantic_revision: left_semantic,
-                    relation_mutations: left_mutations,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::RelationDataExact {
-                    semantic_revision: right_semantic,
-                    relation_mutations: right_mutations,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            )
-            | (
-                Self::RelationDataExact {
-                    semantic_revision: left_semantic,
-                    relation_mutations: left_mutations,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::RelationDataResidualExact {
-                    semantic_revision: right_semantic,
-                    client_mutations: right_mutations,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            )
-            | (
-                Self::RelationDataResidualExact {
-                    semantic_revision: left_semantic,
-                    client_mutations: left_mutations,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::RelationDataExact {
-                    semantic_revision: right_semantic,
-                    relation_mutations: right_mutations,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            )
-            | (
-                Self::RelationDataResidualExact {
-                    semantic_revision: left_semantic,
-                    client_mutations: left_mutations,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::RelationDataResidualExact {
-                    semantic_revision: right_semantic,
-                    client_mutations: right_mutations,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            ) => {
-                left_semantic == right_semantic
-                    && left_mutations == right_mutations
-                    && left_modules == right_modules
-            }
-            (
-                Self::RelationRewriteExact {
-                    semantic_revision: left_semantic,
-                    relation_mutations: left_mutations,
-                    rewrite_intents: left_rewrites,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::RelationRewriteExact {
-                    semantic_revision: right_semantic,
-                    relation_mutations: right_mutations,
-                    rewrite_intents: right_rewrites,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            ) => {
-                left_semantic == right_semantic
-                    && left_mutations == right_mutations
-                    && left_rewrites == right_rewrites
-                    && left_modules == right_modules
-            }
-            (
-                Self::MixedRevisionExact {
-                    semantic_revision: left_semantic,
-                    relation_mutations: left_mutations,
-                    model_delta: left_model,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::MixedRevisionExact {
-                    semantic_revision: right_semantic,
-                    relation_mutations: right_mutations,
-                    model_delta: right_model,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            ) => {
-                left_semantic == right_semantic
-                    && left_mutations == right_mutations
-                    && left_model == right_model
-                    && left_modules == right_modules
-            }
-            (
-                Self::MixedRevisionExact {
-                    semantic_revision: left_semantic,
-                    relation_mutations: left_relations,
-                    model_delta: left_model,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::MixedRevisionResidualExact {
-                    semantic_revision: right_semantic,
-                    client_relation_mutations: right_relations,
-                    client_model_delta: right_model,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            )
-            | (
-                Self::MixedRevisionResidualExact {
-                    semantic_revision: left_semantic,
-                    client_relation_mutations: left_relations,
-                    client_model_delta: left_model,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::MixedRevisionExact {
-                    semantic_revision: right_semantic,
-                    relation_mutations: right_relations,
-                    model_delta: right_model,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            )
-            | (
-                Self::MixedRevisionResidualExact {
-                    semantic_revision: left_semantic,
-                    client_relation_mutations: left_relations,
-                    client_model_delta: left_model,
-                    semantic_modules: left_modules,
-                    ..
-                },
-                Self::MixedRevisionResidualExact {
-                    semantic_revision: right_semantic,
-                    client_relation_mutations: right_relations,
-                    client_model_delta: right_model,
-                    semantic_modules: right_modules,
-                    ..
-                },
-            ) => {
-                left_semantic == right_semantic
-                    && left_relations == right_relations
-                    && left_model == right_model
-                    && left_modules == right_modules
-            }
-            _ => self == other,
+    pub fn client_intent_owned(&self) -> DurableClientIntent {
+        match self {
+            Self::RelationData {
+                semantic_revision,
+                relation_mutations,
+                client_guard_digest,
+                ..
+            } => DurableClientIntent::RelationData {
+                semantic_revision: *semantic_revision,
+                relation_mutations: relation_mutations.clone(),
+                guard_digest: *client_guard_digest,
+            },
+            Self::MixedRevision {
+                semantic_revision,
+                relation_mutations,
+                model_delta,
+                client_guard_digest,
+                ..
+            } => DurableClientIntent::MixedRevision {
+                semantic_revision: *semantic_revision,
+                relation_mutations: relation_mutations.clone(),
+                model_delta: model_delta.clone(),
+                guard_digest: *client_guard_digest,
+            },
+            Self::RelationRewrite {
+                semantic_revision,
+                relation_mutations,
+                rewrite_intents,
+                ..
+            } => DurableClientIntent::RelationRewrite {
+                semantic_revision: *semantic_revision,
+                relation_mutations: relation_mutations.clone(),
+                rewrite_intents: rewrite_intents.clone(),
+            },
+            Self::RelationResolution {
+                semantic_revision,
+                relation_mutations,
+                rewrite_intents,
+                causal_parents,
+                ..
+            } => DurableClientIntent::RelationResolution {
+                semantic_revision: *semantic_revision,
+                relation_mutations: relation_mutations.clone(),
+                rewrite_intents: rewrite_intents.clone(),
+                causal_parents: causal_parents.clone(),
+            },
+            Self::FullRevision {
+                encoded_target_revision,
+                materializations,
+                ..
+            } => DurableClientIntent::FullRevision {
+                encoded_target_revision: encoded_target_revision.clone(),
+                materializations: materializations.clone(),
+            },
+            Self::SchemaMigration { program, .. } => DurableClientIntent::SchemaMigration {
+                program: program.clone(),
+            },
         }
+    }
+
+    #[must_use]
+    pub fn same_client_intent(&self, other: &Self) -> bool {
+        self.client_intent_owned() == other.client_intent_owned()
+    }
+
+    #[must_use]
+    pub fn matches_mixed_client_intent(
+        &self,
+        semantic_revision: SemanticRevision,
+        relation_mutations: &[DurableRelationMutation],
+        model_delta: &DurableModelDelta,
+        guard_digest: Option<ClientIntentGuardDigest>,
+    ) -> bool {
+        self.client_intent_owned()
+            == DurableClientIntent::MixedRevision {
+                semantic_revision,
+                relation_mutations: relation_mutations.to_vec(),
+                model_delta: model_delta.clone(),
+                guard_digest,
+            }
+    }
+
+    #[must_use]
+    pub const fn client_guard_digest(&self) -> Option<ClientIntentGuardDigest> {
+        match self {
+            Self::RelationData {
+                client_guard_digest,
+                ..
+            }
+            | Self::MixedRevision {
+                client_guard_digest,
+                ..
+            } => *client_guard_digest,
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_client_guard_digest(mut self, digest: Option<ClientIntentGuardDigest>) -> Self {
+        match &mut self {
+            Self::RelationData {
+                client_guard_digest,
+                ..
+            }
+            | Self::MixedRevision {
+                client_guard_digest,
+                ..
+            } => {
+                *client_guard_digest = digest;
+            }
+            _ => debug_assert!(digest.is_none()),
+        }
+        self
     }
 
     #[must_use]
     pub const fn effect_kind(&self) -> DurableEffectKind {
         match self {
-            Self::RelationDataExact { .. } | Self::RelationDataResidualExact { .. } => {
-                DurableEffectKind::RelationData
-            }
-            Self::RelationRewriteExact { .. } => DurableEffectKind::RelationRewrite,
-            Self::RelationResolutionExact { .. } => DurableEffectKind::RelationResolution,
-            Self::MixedRevisionExact { .. } | Self::MixedRevisionResidualExact { .. } => {
-                DurableEffectKind::MixedRevision
-            }
-            Self::Exact { .. } => DurableEffectKind::FullRevision,
-            Self::SchemaMigrationExact { .. } => DurableEffectKind::SchemaMigration,
-            Self::LegacyTargetOnly { .. } => DurableEffectKind::LegacyTargetOnly,
+            Self::RelationData { .. } => DurableEffectKind::RelationData,
+            Self::RelationRewrite { .. } => DurableEffectKind::RelationRewrite,
+            Self::RelationResolution { .. } => DurableEffectKind::RelationResolution,
+            Self::MixedRevision { .. } => DurableEffectKind::MixedRevision,
+            Self::FullRevision { .. } => DurableEffectKind::FullRevision,
+            Self::SchemaMigration { .. } => DurableEffectKind::SchemaMigration,
         }
     }
 
@@ -641,11 +643,12 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(target.semantic_context())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::RelationDataExact {
+        Ok(Self::RelationData {
             source_revision,
             target_revision: target.id(),
             semantic_revision,
             relation_mutations,
+            client_guard_digest: None,
             semantic_modules,
         })
     }
@@ -653,7 +656,7 @@ impl DurableTransactionIntent {
     pub fn relation_data_residual(
         source_revision: RevisionId,
         target: &kernel_revision::Revision,
-        semantic_revision: SemanticRevision,
+        client_semantic_revision: SemanticRevision,
         mut client_mutations: Vec<DurableRelationMutation>,
         mut realized_mutations: Vec<DurableRelationMutation>,
         registry: &kernel_semantics::SemanticRegistry,
@@ -672,12 +675,12 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(target.semantic_context())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::RelationDataResidualExact {
+        Ok(Self::RelationData {
             source_revision,
             target_revision: target.id(),
-            semantic_revision,
-            client_mutations,
-            realized_mutations,
+            semantic_revision: client_semantic_revision,
+            relation_mutations: client_mutations,
+            client_guard_digest: None,
             semantic_modules,
         })
     }
@@ -709,7 +712,7 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(target.semantic_context())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::RelationRewriteExact {
+        Ok(Self::RelationRewrite {
             source_revision,
             target_revision: target.id(),
             semantic_revision,
@@ -762,7 +765,7 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(target.semantic_context())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::RelationResolutionExact {
+        Ok(Self::RelationResolution {
             source_revision,
             target_revision: target.id(),
             semantic_revision,
@@ -779,7 +782,7 @@ impl DurableTransactionIntent {
         semantic_revision: SemanticRevision,
         mut relation_mutations: Vec<DurableRelationMutation>,
         model_delta: DurableModelDelta,
-        model_complement: DurableModelDelta,
+        _model_complement: DurableModelDelta,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, CodecError> {
         relation_mutations.sort_by_key(|mutation| mutation.relation);
@@ -792,13 +795,13 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(target.semantic_context())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::MixedRevisionExact {
+        Ok(Self::MixedRevision {
             source_revision,
             target_revision: target.id(),
             semantic_revision,
             relation_mutations,
             model_delta,
-            model_complement: Some(Box::new(model_complement)),
+            client_guard_digest: None,
             semantic_modules,
         })
     }
@@ -807,12 +810,12 @@ impl DurableTransactionIntent {
     pub fn mixed_revision_residual(
         source_revision: RevisionId,
         target: &kernel_revision::Revision,
-        semantic_revision: SemanticRevision,
+        client_semantic_revision: SemanticRevision,
         mut client_relation_mutations: Vec<DurableRelationMutation>,
         client_model_delta: DurableModelDelta,
         mut realized_relation_mutations: Vec<DurableRelationMutation>,
-        realized_model_delta: DurableModelDelta,
-        realized_model_complement: DurableModelDelta,
+        _realized_model_delta: DurableModelDelta,
+        _realized_model_complement: DurableModelDelta,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, CodecError> {
         client_relation_mutations.sort_by_key(|mutation| mutation.relation);
@@ -829,15 +832,13 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(target.semantic_context())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::MixedRevisionResidualExact {
+        Ok(Self::MixedRevision {
             source_revision,
             target_revision: target.id(),
-            semantic_revision,
-            client_relation_mutations,
-            client_model_delta,
-            realized_relation_mutations,
-            realized_model_delta,
-            realized_model_complement: Box::new(realized_model_complement),
+            semantic_revision: client_semantic_revision,
+            relation_mutations: client_relation_mutations,
+            model_delta: client_model_delta,
+            client_guard_digest: None,
             semantic_modules,
         })
     }
@@ -849,7 +850,7 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(target.semantic_context())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::Exact {
+        Ok(Self::FullRevision {
             target_revision: target.id(),
             encoded_target_revision: checkpoint::encode_revision(target)?,
             materializations: None,
@@ -873,7 +874,7 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(target.semantic_context())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::Exact {
+        Ok(Self::FullRevision {
             target_revision: target.id(),
             encoded_target_revision: checkpoint::encode_revision(target)?,
             materializations: Some(materializations),
@@ -897,7 +898,7 @@ impl DurableTransactionIntent {
         let semantic_modules = registry
             .builtin_modules_for_context(program.target())
             .map_err(|_| CodecError::SemanticModuleUnavailable)?;
-        Ok(Self::SchemaMigrationExact {
+        Ok(Self::SchemaMigration {
             source_revision,
             target_revision,
             program,
@@ -909,31 +910,24 @@ impl DurableTransactionIntent {
     #[must_use]
     pub const fn target_revision(&self) -> RevisionId {
         match self {
-            Self::RelationDataExact {
+            Self::RelationData {
                 target_revision, ..
             }
-            | Self::RelationDataResidualExact {
+            | Self::RelationRewrite {
                 target_revision, ..
             }
-            | Self::RelationRewriteExact {
+            | Self::RelationResolution {
                 target_revision, ..
             }
-            | Self::RelationResolutionExact {
+            | Self::MixedRevision {
                 target_revision, ..
             }
-            | Self::MixedRevisionExact {
+            | Self::FullRevision {
                 target_revision, ..
             }
-            | Self::MixedRevisionResidualExact {
+            | Self::SchemaMigration {
                 target_revision, ..
-            }
-            | Self::Exact {
-                target_revision, ..
-            }
-            | Self::SchemaMigrationExact {
-                target_revision, ..
-            }
-            | Self::LegacyTargetOnly { target_revision } => *target_revision,
+            } => *target_revision,
         }
     }
 
@@ -941,42 +935,34 @@ impl DurableTransactionIntent {
     pub const fn is_exact(&self) -> bool {
         matches!(
             self,
-            Self::RelationDataExact { .. }
-                | Self::RelationDataResidualExact { .. }
-                | Self::RelationRewriteExact { .. }
-                | Self::RelationResolutionExact { .. }
-                | Self::MixedRevisionExact { .. }
-                | Self::MixedRevisionResidualExact { .. }
-                | Self::Exact { .. }
-                | Self::SchemaMigrationExact { .. }
+            Self::RelationData { .. }
+                | Self::RelationRewrite { .. }
+                | Self::RelationResolution { .. }
+                | Self::MixedRevision { .. }
+                | Self::FullRevision { .. }
+                | Self::SchemaMigration { .. }
         )
     }
 
     #[must_use]
     pub const fn source_revision(&self) -> Option<RevisionId> {
         match self {
-            Self::RelationDataExact {
+            Self::RelationData {
                 source_revision, ..
             }
-            | Self::RelationDataResidualExact {
+            | Self::RelationRewrite {
                 source_revision, ..
             }
-            | Self::RelationRewriteExact {
+            | Self::RelationResolution {
                 source_revision, ..
             }
-            | Self::RelationResolutionExact {
+            | Self::SchemaMigration {
                 source_revision, ..
             }
-            | Self::SchemaMigrationExact {
-                source_revision, ..
-            }
-            | Self::MixedRevisionExact {
-                source_revision, ..
-            }
-            | Self::MixedRevisionResidualExact {
+            | Self::MixedRevision {
                 source_revision, ..
             } => Some(*source_revision),
-            Self::Exact { .. } | Self::LegacyTargetOnly { .. } => None,
+            Self::FullRevision { .. } => None,
         }
     }
 }

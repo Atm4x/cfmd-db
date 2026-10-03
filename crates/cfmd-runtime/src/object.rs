@@ -1074,9 +1074,6 @@ pub struct ObjectManyFieldSchema {
     target_equivalence: crate::EquivalenceId,
     source_live_equivalence: crate::EquivalenceId,
     target_live_equivalence: crate::EquivalenceId,
-    // Retained only as a pre-1.0 compatibility hint while old declarations migrate. The edge
-    // relation no longer depends on a target-side Ref backlink.
-    via_field: Option<&'static str>,
     ownership: Option<crate::plan::OrphanPolicy>,
     register_owned: Option<fn(&ObjectManyFieldSchema, &mut Plan) -> Result<()>>,
     validate: fn() -> Result<()>,
@@ -1090,7 +1087,6 @@ impl std::fmt::Debug for ObjectManyFieldSchema {
             .field("target_type", &self.target_type)
             .field("target_relation", &self.target_relation)
             .field("relation", &self.relation)
-            .field("via_field", &self.via_field)
             .field("ownership", &self.ownership)
             .finish_non_exhaustive()
     }
@@ -1098,16 +1094,11 @@ impl std::fmt::Debug for ObjectManyFieldSchema {
 
 impl ObjectManyFieldSchema {
     #[must_use]
-    pub fn of<S: Object, T: Object>(name: &'static str, via_field: &'static str) -> Self {
-        Self::new::<S, T>(name, Some(via_field))
-    }
-
-    #[must_use]
     pub fn inferred<S: Object, T: Object>(name: &'static str) -> Self {
-        Self::new::<S, T>(name, None)
+        Self::new::<S, T>(name)
     }
 
-    fn new<S: Object, T: Object>(name: &'static str, via_field: Option<&'static str>) -> Self {
+    fn new<S: Object, T: Object>(name: &'static str) -> Self {
         Self {
             name,
             target_type: T::type_id(),
@@ -1127,7 +1118,6 @@ impl ObjectManyFieldSchema {
                 S::KEY,
                 name,
             )),
-            via_field,
             ownership: None,
             register_owned: None,
             validate: validate_many_field::<S, T>,
@@ -1139,7 +1129,7 @@ impl ObjectManyFieldSchema {
         name: &'static str,
         orphan_policy: crate::plan::OrphanPolicy,
     ) -> Self {
-        let mut value = Self::new::<S, T>(name, None);
+        let mut value = Self::new::<S, T>(name);
         value.ownership = Some(orphan_policy);
         value.register_owned = Some(register_owned_schema::<S, T>);
         value
@@ -1181,11 +1171,6 @@ impl ObjectManyFieldSchema {
     #[must_use]
     pub const fn relation(&self) -> RelationId {
         self.relation
-    }
-
-    #[must_use]
-    pub const fn via_field(&self) -> Option<&'static str> {
-        self.via_field
     }
 
     #[must_use]
@@ -1426,10 +1411,6 @@ pub trait Object: RowCodec + Sized + 'static {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBuilder {
     let fields = E::fields();
     let (registered, types, equivalences) = register_object_field_semantics::<E>(builder, &fields);
@@ -1465,18 +1446,18 @@ pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBu
             field.role(),
             ObjectFieldRole::Reference { .. } | ObjectFieldRole::OptionalReference { .. }
         ) {
-            let (ObjectFieldRole::Reference {
-                target_relation,
-                target_type,
-                ..
-            }
-            | ObjectFieldRole::OptionalReference {
-                target_relation,
-                target_type,
-                ..
-            }) = field.role()
-            else {
-                unreachable!("reference-role guard keeps only reference fields")
+            let (target_relation, target_type) = match field.role() {
+                ObjectFieldRole::Reference {
+                    target_relation,
+                    target_type,
+                    ..
+                }
+                | ObjectFieldRole::OptionalReference {
+                    target_relation,
+                    target_type,
+                    ..
+                } => (target_relation, target_type),
+                _ => unreachable!("reference-role guard keeps only reference fields"),
             };
             builder = builder.__require_relation(
                 target_relation,
@@ -2350,7 +2331,7 @@ impl<E: Object> ObjectSet<E> {
         })
     }
 
-    pub(crate) fn new_projected(context: ReadContext, persisted: &Relation<E>) -> Result<Self> {
+    pub(crate) fn new_projected(context: ReadContext, persisted: Relation<E>) -> Result<Self> {
         let fields = E::fields();
         let mut projection = Vec::with_capacity(fields.len());
         let mut columns = Vec::with_capacity(fields.len());
@@ -2532,10 +2513,6 @@ impl<E: Object> ObjectSet<E> {
     /// Patches one persisted scalar/reference field while preserving every persisted field omitted
     /// by this local entity contract. Reference patches also update the exact mirrored live-field
     /// authority; identity remains immutable.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     pub fn set<V, F, P>(
         &self,
         transaction: &mut crate::Transaction,
@@ -3347,7 +3324,7 @@ macro_rules! cfmd_entity {
             fields { $( $field_vis:vis $field:ident : $ty:ty ),* $(,)? }
             refs { $( $ref_vis:vis $ref_field:ident : $target:ty ),* $(,)? }
             optional_refs { $( $opt_vis:vis $opt_field:ident : $opt_target:ty ),* $(,)? }
-            many { $( $many_vis:vis $many_field:ident via $via_field:ident : $many_target:ty ),* $(,)? }
+            many { $( $many_vis:vis $many_field:ident : $many_target:ty ),* $(,)? }
         }
     ) => {
         $(#[$meta])*
@@ -3469,9 +3446,8 @@ macro_rules! cfmd_entity {
             }
             fn many_fields() -> Vec<$crate::ObjectManyFieldSchema> {
                 vec![
-                    $( $crate::ObjectManyFieldSchema::of::<$name, $many_target>(
+                    $( $crate::ObjectManyFieldSchema::inferred::<$name, $many_target>(
                         stringify!($many_field),
-                        stringify!($via_field),
                     ), )*
                 ]
             }

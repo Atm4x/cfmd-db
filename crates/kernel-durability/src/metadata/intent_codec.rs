@@ -5,6 +5,7 @@ use kernel_types::{RevisionId, SemanticId, SemanticRevision};
 
 use crate::binary_codec::{BinarySource, encode_rows, push_bytes, push_len, push_u64, push_u128};
 use crate::domain::{
+    ClientIntentGuardDigest, DurableClientIntent, DurableCommittedTransaction,
     DurableRelationMutation, DurableRelationRewriteIntent, DurableTransactionIntent,
 };
 use crate::runtime::CodecError;
@@ -14,13 +15,208 @@ use super::artifact_codec::{
     encode_migration_complements,
 };
 
-#[allow(clippy::too_many_lines)] // Canonical wire-order encoder; kept linear so field order remains auditable.
+pub(crate) fn encode_committed_transaction(
+    out: &mut impl crate::binary_codec::BinarySink,
+    committed: &DurableCommittedTransaction,
+) -> Result<(), CodecError> {
+    push_u64(out, committed.target_revision.raw());
+    match &committed.intent {
+        DurableClientIntent::RelationData {
+            semantic_revision,
+            relation_mutations,
+            guard_digest,
+        } => {
+            out.push(1);
+            push_u64(out, semantic_revision.schema.raw());
+            push_u64(out, semantic_revision.environment.raw());
+            encode_relation_mutations(out, relation_mutations)?;
+            encode_optional_guard_digest(out, *guard_digest);
+        }
+        DurableClientIntent::MixedRevision {
+            semantic_revision,
+            relation_mutations,
+            model_delta,
+            guard_digest,
+        } => {
+            out.push(2);
+            push_u64(out, semantic_revision.schema.raw());
+            push_u64(out, semantic_revision.environment.raw());
+            encode_relation_mutations(out, relation_mutations)?;
+            super::model_delta_codec::encode_model_delta(out, model_delta)?;
+            encode_optional_guard_digest(out, *guard_digest);
+        }
+        DurableClientIntent::RelationRewrite {
+            semantic_revision,
+            relation_mutations,
+            rewrite_intents,
+        } => {
+            out.push(3);
+            push_u64(out, semantic_revision.schema.raw());
+            push_u64(out, semantic_revision.environment.raw());
+            encode_relation_mutations(out, relation_mutations)?;
+            encode_relation_rewrite_intents(out, rewrite_intents)?;
+        }
+        DurableClientIntent::RelationResolution {
+            semantic_revision,
+            relation_mutations,
+            rewrite_intents,
+            causal_parents,
+        } => {
+            out.push(4);
+            push_u64(out, semantic_revision.schema.raw());
+            push_u64(out, semantic_revision.environment.raw());
+            encode_relation_mutations(out, relation_mutations)?;
+            encode_relation_rewrite_intents(out, rewrite_intents)?;
+            push_len(out, causal_parents.len())?;
+            for parent in causal_parents {
+                push_u64(out, parent.raw());
+            }
+        }
+        DurableClientIntent::FullRevision {
+            encoded_target_revision,
+            materializations,
+        } => {
+            out.push(5);
+            push_bytes(out, encoded_target_revision)?;
+            match materializations {
+                None => out.push(0),
+                Some(specs) => {
+                    out.push(1);
+                    encode_materialization_specs(out, specs)?;
+                }
+            }
+        }
+        DurableClientIntent::SchemaMigration { program } => {
+            out.push(6);
+            super::migration_program_codec::encode_schema_migration_program(out, program)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_committed_transaction(
+    cursor: &mut impl BinarySource,
+) -> Result<DurableCommittedTransaction, &'static str> {
+    let target_revision = RevisionId::new(cursor.u64()?);
+    let intent = match cursor.u8()? {
+        1 => DurableClientIntent::RelationData {
+            semantic_revision: decode_semantic_revision(cursor)?,
+            relation_mutations: decode_relation_mutations(cursor)?,
+            guard_digest: decode_optional_guard_digest(cursor)?,
+        },
+        2 => DurableClientIntent::MixedRevision {
+            semantic_revision: decode_semantic_revision(cursor)?,
+            relation_mutations: decode_relation_mutations(cursor)?,
+            model_delta: super::model_delta_codec::decode_model_delta(cursor)?,
+            guard_digest: decode_optional_guard_digest(cursor)?,
+        },
+        3 => DurableClientIntent::RelationRewrite {
+            semantic_revision: decode_semantic_revision(cursor)?,
+            relation_mutations: decode_relation_mutations(cursor)?,
+            rewrite_intents: decode_relation_rewrite_intents(cursor)?,
+        },
+        4 => {
+            let semantic_revision = decode_semantic_revision(cursor)?;
+            let relation_mutations = decode_relation_mutations(cursor)?;
+            let rewrite_intents = decode_relation_rewrite_intents(cursor)?;
+            let count = cursor.len()?;
+            let mut causal_parents = Vec::with_capacity(cursor.bounded_capacity(count));
+            let mut previous = None;
+            for _ in 0..count {
+                let parent = RevisionId::new(cursor.u64()?);
+                if previous.is_some_and(|prior| prior >= parent) {
+                    return Err("committed resolution parents are not strictly sorted");
+                }
+                previous = Some(parent);
+                causal_parents.push(parent);
+            }
+            DurableClientIntent::RelationResolution {
+                semantic_revision,
+                relation_mutations,
+                rewrite_intents,
+                causal_parents,
+            }
+        }
+        5 => {
+            let len = cursor.len()?;
+            let encoded_target_revision = cursor.take_owned(len)?;
+            let materializations = match cursor.u8()? {
+                0 => None,
+                1 => Some(decode_materialization_specs(cursor)?),
+                _ => return Err("invalid committed full-revision materialization tag"),
+            };
+            DurableClientIntent::FullRevision {
+                encoded_target_revision,
+                materializations,
+            }
+        }
+        6 => DurableClientIntent::SchemaMigration {
+            program: super::migration_program_codec::decode_schema_migration_program(cursor)?,
+        },
+        _ => return Err("invalid committed client intent tag"),
+    };
+    Ok(DurableCommittedTransaction {
+        target_revision,
+        intent,
+    })
+}
+
+fn decode_semantic_revision(
+    cursor: &mut impl BinarySource,
+) -> Result<SemanticRevision, &'static str> {
+    Ok(SemanticRevision::new(
+        kernel_types::SchemaRevisionId::new(cursor.u64()?),
+        kernel_types::SemanticEnvId::new(cursor.u64()?),
+    ))
+}
+
+fn encode_optional_guard_digest(
+    out: &mut impl crate::binary_codec::BinarySink,
+    digest: Option<ClientIntentGuardDigest>,
+) {
+    match digest {
+        Some(digest) => {
+            out.push(1);
+            out.extend_from_slice(&digest.0);
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_optional_guard_digest(
+    cursor: &mut impl BinarySource,
+) -> Result<Option<ClientIntentGuardDigest>, &'static str> {
+    match cursor.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(decode_guard_digest(cursor)?)),
+        _ => Err("invalid committed guard digest tag"),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) fn encode_transaction_intent(
     out: &mut impl crate::binary_codec::BinarySink,
     intent: &DurableTransactionIntent,
 ) -> Result<(), CodecError> {
     match intent {
-        DurableTransactionIntent::RelationRewriteExact {
+        DurableTransactionIntent::RelationData {
+            source_revision,
+            target_revision,
+            semantic_revision,
+            relation_mutations,
+            client_guard_digest,
+            semantic_modules,
+        } => {
+            out.push(1);
+            push_u64(out, source_revision.raw());
+            push_u64(out, target_revision.raw());
+            push_u64(out, semantic_revision.schema.raw());
+            push_u64(out, semantic_revision.environment.raw());
+            encode_relation_mutations(out, relation_mutations)?;
+            encode_optional_guard_digest(out, *client_guard_digest);
+            encode_semantic_module_specs(out, semantic_modules)?;
+        }
+        DurableTransactionIntent::RelationRewrite {
             source_revision,
             target_revision,
             semantic_revision,
@@ -28,7 +224,7 @@ pub(crate) fn encode_transaction_intent(
             rewrite_intents,
             semantic_modules,
         } => {
-            out.push(3);
+            out.push(2);
             push_u64(out, source_revision.raw());
             push_u64(out, target_revision.raw());
             push_u64(out, semantic_revision.schema.raw());
@@ -37,7 +233,7 @@ pub(crate) fn encode_transaction_intent(
             encode_relation_rewrite_intents(out, rewrite_intents)?;
             encode_semantic_module_specs(out, semantic_modules)?;
         }
-        DurableTransactionIntent::RelationResolutionExact {
+        DurableTransactionIntent::RelationResolution {
             source_revision,
             target_revision,
             semantic_revision,
@@ -46,7 +242,7 @@ pub(crate) fn encode_transaction_intent(
             causal_parents,
             semantic_modules,
         } => {
-            out.push(5);
+            out.push(3);
             push_u64(out, source_revision.raw());
             push_u64(out, target_revision.raw());
             push_u64(out, semantic_revision.schema.raw());
@@ -59,89 +255,32 @@ pub(crate) fn encode_transaction_intent(
             }
             encode_semantic_module_specs(out, semantic_modules)?;
         }
-        DurableTransactionIntent::RelationDataExact {
-            source_revision,
-            target_revision,
-            semantic_revision,
-            relation_mutations,
-            semantic_modules,
-        } => {
-            out.push(2);
-            push_u64(out, source_revision.raw());
-            push_u64(out, target_revision.raw());
-            push_u64(out, semantic_revision.schema.raw());
-            push_u64(out, semantic_revision.environment.raw());
-            encode_relation_mutations(out, relation_mutations)?;
-            encode_semantic_module_specs(out, semantic_modules)?;
-        }
-        DurableTransactionIntent::RelationDataResidualExact {
-            source_revision,
-            target_revision,
-            semantic_revision,
-            client_mutations,
-            realized_mutations,
-            semantic_modules,
-        } => {
-            out.push(8);
-            push_u64(out, source_revision.raw());
-            push_u64(out, target_revision.raw());
-            push_u64(out, semantic_revision.schema.raw());
-            push_u64(out, semantic_revision.environment.raw());
-            encode_relation_mutations(out, client_mutations)?;
-            encode_relation_mutations(out, realized_mutations)?;
-            encode_semantic_module_specs(out, semantic_modules)?;
-        }
-        DurableTransactionIntent::MixedRevisionExact {
+        DurableTransactionIntent::MixedRevision {
             source_revision,
             target_revision,
             semantic_revision,
             relation_mutations,
             model_delta,
-            model_complement,
+            client_guard_digest,
             semantic_modules,
         } => {
-            out.push(if model_complement.is_some() { 7 } else { 6 });
+            out.push(4);
             push_u64(out, source_revision.raw());
             push_u64(out, target_revision.raw());
             push_u64(out, semantic_revision.schema.raw());
             push_u64(out, semantic_revision.environment.raw());
             encode_relation_mutations(out, relation_mutations)?;
             super::model_delta_codec::encode_model_delta(out, model_delta)?;
-            if let Some(complement) = model_complement {
-                super::model_delta_codec::encode_model_delta(out, complement)?;
-            }
+            encode_optional_guard_digest(out, *client_guard_digest);
             encode_semantic_module_specs(out, semantic_modules)?;
         }
-        DurableTransactionIntent::MixedRevisionResidualExact {
-            source_revision,
-            target_revision,
-            semantic_revision,
-            client_relation_mutations,
-            client_model_delta,
-            realized_relation_mutations,
-            realized_model_delta,
-            realized_model_complement,
-            semantic_modules,
-        } => {
-            out.push(9);
-            push_u64(out, source_revision.raw());
-            push_u64(out, target_revision.raw());
-            push_u64(out, semantic_revision.schema.raw());
-            push_u64(out, semantic_revision.environment.raw());
-            encode_relation_mutations(out, client_relation_mutations)?;
-            super::model_delta_codec::encode_model_delta(out, client_model_delta)?;
-            encode_relation_mutations(out, realized_relation_mutations)?;
-            super::model_delta_codec::encode_model_delta(out, realized_model_delta)?;
-            super::model_delta_codec::encode_model_delta(out, realized_model_complement)?;
-            encode_semantic_module_specs(out, semantic_modules)?;
-        }
-        DurableTransactionIntent::Exact {
+        DurableTransactionIntent::FullRevision {
             target_revision,
             encoded_target_revision,
             materializations,
             semantic_modules,
         } => {
-            out.push(1);
+            out.push(5);
             push_u64(out, target_revision.raw());
             push_bytes(out, encoded_target_revision)?;
             match materializations {
@@ -153,58 +292,30 @@ pub(crate) fn encode_transaction_intent(
             }
             encode_semantic_module_specs(out, semantic_modules)?;
         }
-        DurableTransactionIntent::SchemaMigrationExact {
+        DurableTransactionIntent::SchemaMigration {
             source_revision,
             target_revision,
             program,
             migration_complement,
             semantic_modules,
         } => {
-            out.push(4);
+            out.push(6);
             push_u64(out, source_revision.raw());
             push_u64(out, target_revision.raw());
             super::migration_program_codec::encode_schema_migration_program(out, program)?;
             encode_migration_complements(out, std::slice::from_ref(migration_complement))?;
             encode_semantic_module_specs(out, semantic_modules)?;
         }
-        DurableTransactionIntent::LegacyTargetOnly { target_revision } => {
-            out.push(0);
-            push_u64(out, target_revision.raw());
-        }
     }
     Ok(())
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 pub(crate) fn decode_transaction_intent(
     cursor: &mut impl BinarySource,
 ) -> Result<DurableTransactionIntent, &'static str> {
     let tag = cursor.u8()?;
     match tag {
-        0 => Ok(DurableTransactionIntent::LegacyTargetOnly {
-            target_revision: RevisionId::new(cursor.u64()?),
-        }),
-        1 => {
-            let target_revision = RevisionId::new(cursor.u64()?);
-            let len = cursor.len()?;
-            let encoded_target_revision = cursor.take_owned(len)?;
-            let materializations = match cursor.u8()? {
-                0 => None,
-                1 => Some(decode_materialization_specs(cursor)?),
-                _ => return Err("invalid transaction intent materialization tag"),
-            };
-            let semantic_modules = decode_semantic_module_specs(cursor)?;
-            Ok(DurableTransactionIntent::Exact {
-                target_revision,
-                encoded_target_revision,
-                materializations,
-                semantic_modules,
-            })
-        }
-        2 => Ok(DurableTransactionIntent::RelationDataExact {
+        1 => Ok(DurableTransactionIntent::RelationData {
             source_revision: RevisionId::new(cursor.u64()?),
             target_revision: RevisionId::new(cursor.u64()?),
             semantic_revision: SemanticRevision::new(
@@ -212,9 +323,10 @@ pub(crate) fn decode_transaction_intent(
                 kernel_types::SemanticEnvId::new(cursor.u64()?),
             ),
             relation_mutations: decode_relation_mutations(cursor)?,
+            client_guard_digest: decode_optional_guard_digest(cursor)?,
             semantic_modules: decode_semantic_module_specs(cursor)?,
         }),
-        3 => {
+        2 => {
             let source_revision = RevisionId::new(cursor.u64()?);
             let target_revision = RevisionId::new(cursor.u64()?);
             let semantic_revision = SemanticRevision::new(
@@ -227,11 +339,11 @@ pub(crate) fn decode_transaction_intent(
                 || relation_mutations
                     .iter()
                     .zip(&rewrite_intents)
-                    .any(|(mutation, intent)| mutation.relation != intent.relation)
+                    .any(|(m, i)| m.relation != i.relation)
             {
                 return Err("relation rewrite intents do not match relation mutations");
             }
-            Ok(DurableTransactionIntent::RelationRewriteExact {
+            Ok(DurableTransactionIntent::RelationRewrite {
                 source_revision,
                 target_revision,
                 semantic_revision,
@@ -240,7 +352,36 @@ pub(crate) fn decode_transaction_intent(
                 semantic_modules: decode_semantic_module_specs(cursor)?,
             })
         }
-        4 => {
+        3 => decode_relation_resolution_intent(cursor),
+        4 => Ok(DurableTransactionIntent::MixedRevision {
+            source_revision: RevisionId::new(cursor.u64()?),
+            target_revision: RevisionId::new(cursor.u64()?),
+            semantic_revision: SemanticRevision::new(
+                kernel_types::SchemaRevisionId::new(cursor.u64()?),
+                kernel_types::SemanticEnvId::new(cursor.u64()?),
+            ),
+            relation_mutations: decode_relation_mutations(cursor)?,
+            model_delta: super::model_delta_codec::decode_model_delta(cursor)?,
+            client_guard_digest: decode_optional_guard_digest(cursor)?,
+            semantic_modules: decode_semantic_module_specs(cursor)?,
+        }),
+        5 => {
+            let target_revision = RevisionId::new(cursor.u64()?);
+            let len = cursor.len()?;
+            let encoded_target_revision = cursor.take_owned(len)?;
+            let materializations = match cursor.u8()? {
+                0 => None,
+                1 => Some(decode_materialization_specs(cursor)?),
+                _ => return Err("invalid transaction intent materialization tag"),
+            };
+            Ok(DurableTransactionIntent::FullRevision {
+                target_revision,
+                encoded_target_revision,
+                materializations,
+                semantic_modules: decode_semantic_module_specs(cursor)?,
+            })
+        }
+        6 => {
             let source_revision = RevisionId::new(cursor.u64()?);
             let target_revision = RevisionId::new(cursor.u64()?);
             let program = super::migration_program_codec::decode_schema_migration_program(cursor)?;
@@ -248,7 +389,7 @@ pub(crate) fn decode_transaction_intent(
             if complements.len() != 1 {
                 return Err("schema migration intent must carry exactly one complement");
             }
-            Ok(DurableTransactionIntent::SchemaMigrationExact {
+            Ok(DurableTransactionIntent::SchemaMigration {
                 source_revision,
                 target_revision,
                 program,
@@ -256,67 +397,16 @@ pub(crate) fn decode_transaction_intent(
                 semantic_modules: decode_semantic_module_specs(cursor)?,
             })
         }
-        5 => decode_relation_resolution_intent(cursor),
-        6 | 7 => decode_mixed_revision_intent(cursor, tag == 7),
-        8 => Ok(DurableTransactionIntent::RelationDataResidualExact {
-            source_revision: RevisionId::new(cursor.u64()?),
-            target_revision: RevisionId::new(cursor.u64()?),
-            semantic_revision: SemanticRevision::new(
-                kernel_types::SchemaRevisionId::new(cursor.u64()?),
-                kernel_types::SemanticEnvId::new(cursor.u64()?),
-            ),
-            client_mutations: decode_relation_mutations(cursor)?,
-            realized_mutations: decode_relation_mutations(cursor)?,
-            semantic_modules: decode_semantic_module_specs(cursor)?,
-        }),
-        9 => Ok(DurableTransactionIntent::MixedRevisionResidualExact {
-            source_revision: RevisionId::new(cursor.u64()?),
-            target_revision: RevisionId::new(cursor.u64()?),
-            semantic_revision: SemanticRevision::new(
-                kernel_types::SchemaRevisionId::new(cursor.u64()?),
-                kernel_types::SemanticEnvId::new(cursor.u64()?),
-            ),
-            client_relation_mutations: decode_relation_mutations(cursor)?,
-            client_model_delta: super::model_delta_codec::decode_model_delta(cursor)?,
-            realized_relation_mutations: decode_relation_mutations(cursor)?,
-            realized_model_delta: super::model_delta_codec::decode_model_delta(cursor)?,
-            realized_model_complement: Box::new(super::model_delta_codec::decode_model_delta(
-                cursor,
-            )?),
-            semantic_modules: decode_semantic_module_specs(cursor)?,
-        }),
-        _ => Err("invalid transaction intent tag"),
+        _ => Err("unsupported pre-release transaction intent tag"),
     }
 }
 
-fn decode_mixed_revision_intent(
+fn decode_guard_digest(
     cursor: &mut impl BinarySource,
-    has_complement: bool,
-) -> Result<DurableTransactionIntent, &'static str> {
-    let source_revision = RevisionId::new(cursor.u64()?);
-    let target_revision = RevisionId::new(cursor.u64()?);
-    let semantic_revision = SemanticRevision::new(
-        kernel_types::SchemaRevisionId::new(cursor.u64()?),
-        kernel_types::SemanticEnvId::new(cursor.u64()?),
-    );
-    let relation_mutations = decode_relation_mutations(cursor)?;
-    let model_delta = super::model_delta_codec::decode_model_delta(cursor)?;
-    let model_complement = if has_complement {
-        Some(Box::new(super::model_delta_codec::decode_model_delta(
-            cursor,
-        )?))
-    } else {
-        None
-    };
-    Ok(DurableTransactionIntent::MixedRevisionExact {
-        source_revision,
-        target_revision,
-        semantic_revision,
-        relation_mutations,
-        model_delta,
-        model_complement,
-        semantic_modules: decode_semantic_module_specs(cursor)?,
-    })
+) -> Result<ClientIntentGuardDigest, &'static str> {
+    let mut bytes = [0_u8; 32];
+    cursor.read_exact_into(&mut bytes)?;
+    Ok(ClientIntentGuardDigest(bytes))
 }
 
 fn decode_relation_resolution_intent(
@@ -355,7 +445,7 @@ fn decode_relation_resolution_intent(
     if causal_parents.binary_search(&source_revision).is_err() {
         return Err("relation resolution causal parents omit source revision");
     }
-    Ok(DurableTransactionIntent::RelationResolutionExact {
+    Ok(DurableTransactionIntent::RelationResolution {
         source_revision,
         target_revision,
         semantic_revision,
@@ -614,29 +704,6 @@ pub(crate) fn decode_relation_rewrite_intents(
         });
     }
     Ok(rewrite_intents)
-}
-
-pub(crate) fn decode_relation_mutations_legacy(
-    cursor: &mut impl BinarySource,
-) -> Result<Vec<DurableRelationMutation>, &'static str> {
-    let count = cursor.len()?;
-    let mut relation_mutations = Vec::with_capacity(cursor.bounded_capacity(count));
-    let mut previous = None;
-    for _ in 0..count {
-        let relation = SemanticId::new(cursor.u128()?);
-        if previous.is_some_and(|id: SemanticId| id >= relation) {
-            return Err("relation mutations are not strictly sorted and unique");
-        }
-        previous = Some(relation);
-        relation_mutations.push(DurableRelationMutation {
-            relation,
-            inserted: cursor.rows(0)?,
-            removed: cursor.rows(0)?,
-            object_field_writes: Vec::new(),
-            authorization: crate::DurableRelationAuthorization::default(),
-        });
-    }
-    Ok(relation_mutations)
 }
 
 pub(crate) fn decode_relation_mutations(

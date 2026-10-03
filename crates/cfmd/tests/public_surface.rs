@@ -610,32 +610,30 @@ fn snapshot_bound_transaction_composes_preview_and_commit_without_manual_plan_pl
         .create()
         .expect("create database");
 
-    let mut transaction = database
-        .transaction_with_id(TransactionId::new(351_001))
+    let mut transaction = Transaction::new()
+        .with_idempotency_key(TransactionId::new(351_001))
         .expect("transaction");
-    let todos = transaction.objects::<Todo>().expect("todo set");
-    transaction
-        .add_plan(
-            todos
-                .insert(Todo {
-                    id: Id::new(1),
-                    title: "first".to_owned(),
-                    done: false,
-                })
-                .expect("first insert"),
+    let todos = database.objects::<Todo>().expect("todo set");
+    todos
+        .add(
+            &mut transaction,
+            Todo {
+                id: Id::new(1),
+                title: "first".to_owned(),
+                done: false,
+            },
         )
-        .expect("compose first");
-    transaction
-        .add_plan(
-            todos
-                .insert(Todo {
-                    id: Id::new(2),
-                    title: "second".to_owned(),
-                    done: false,
-                })
-                .expect("second insert"),
+        .expect("first insert");
+    todos
+        .add(
+            &mut transaction,
+            Todo {
+                id: Id::new(2),
+                title: "second".to_owned(),
+                done: false,
+            },
         )
-        .expect("compose second");
+        .expect("second insert");
 
     let preview = database.preview(&transaction).expect("preview");
     assert_eq!(preview.effects().inserted_rows(), 2);
@@ -694,37 +692,35 @@ fn snapshot_bound_transaction_rejects_cross_snapshot_plan_and_auto_merges_indepe
         .expect("seed commit");
     drop(seed_snapshot);
 
-    let mut stale = database
-        .transaction_with_id(TransactionId::new(351_010))
+    let mut stale = Transaction::new()
+        .with_idempotency_key(TransactionId::new(351_010))
         .expect("stale transaction");
-    let stale_todos = stale.objects::<Todo>().expect("stale todos");
-    stale
-        .add_plan(
-            stale_todos
-                .insert(Todo {
-                    id: Id::new(10),
-                    title: "stale".to_owned(),
-                    done: false,
-                })
-                .expect("stale insert"),
+    let stale_todos = database.objects::<Todo>().expect("stale todos");
+    stale_todos
+        .add(
+            &mut stale,
+            Todo {
+                id: Id::new(10),
+                title: "stale".to_owned(),
+                done: false,
+            },
         )
-        .expect("compose stale");
+        .expect("stale insert");
 
-    let mut winner = database
-        .transaction_with_id(TransactionId::new(351_011))
+    let mut winner = Transaction::new()
+        .with_idempotency_key(TransactionId::new(351_011))
         .expect("winner transaction");
-    let winner_todos = winner.objects::<Todo>().expect("winner todos");
-    winner
-        .add_plan(
-            winner_todos
-                .insert(Todo {
-                    id: Id::new(11),
-                    title: "winner".to_owned(),
-                    done: false,
-                })
-                .expect("winner insert"),
+    let winner_todos = database.objects::<Todo>().expect("winner todos");
+    winner_todos
+        .add(
+            &mut winner,
+            Todo {
+                id: Id::new(11),
+                title: "winner".to_owned(),
+                done: false,
+            },
         )
-        .expect("compose winner");
+        .expect("winner insert");
     database.commit(&winner).expect("winner commit");
 
     assert!(matches!(
@@ -734,10 +730,10 @@ fn snapshot_bound_transaction_rejects_cross_snapshot_plan_and_auto_merges_indepe
         cfmd::TransactionReadiness::Rebasable {
             base_revision,
             current_revision,
-            ref intervening_effects,
+            ref intervening_effect_count,
         } if base_revision == stale.origin_revision().expect("bound stale transaction")
             && current_revision == database.current_revision().expect("current revision")
-            && intervening_effects.len() == 1
+            && *intervening_effect_count == 1
     ));
     let merged_preview = database.preview(&stale).expect("certified merged preview");
     assert_eq!(
@@ -774,38 +770,36 @@ fn independent_first_object_inserts_share_idempotent_carrier_presence() {
         .create()
         .expect("create database");
 
-    let mut first = database
-        .transaction_with_id(TransactionId::new(356_001))
+    let mut first = Transaction::new()
+        .with_idempotency_key(TransactionId::new(356_001))
         .expect("first transaction");
-    let first_todos = first.objects::<Todo>().expect("first todos");
-    first
-        .add_plan(
-            first_todos
-                .insert(Todo {
-                    id: Id::new(1),
-                    title: "first".to_owned(),
-                    done: false,
-                })
-                .expect("first insert"),
+    let first_todos = database.objects::<Todo>().expect("first todos");
+    first_todos
+        .add(
+            &mut first,
+            Todo {
+                id: Id::new(1),
+                title: "first".to_owned(),
+                done: false,
+            },
         )
-        .expect("compose first");
+        .expect("first insert");
     drop(first_todos);
 
-    let mut second = database
-        .transaction_with_id(TransactionId::new(356_002))
+    let mut second = Transaction::new()
+        .with_idempotency_key(TransactionId::new(356_002))
         .expect("second transaction");
-    let second_todos = second.objects::<Todo>().expect("second todos");
-    second
-        .add_plan(
-            second_todos
-                .insert(Todo {
-                    id: Id::new(2),
-                    title: "second".to_owned(),
-                    done: false,
-                })
-                .expect("second insert"),
+    let second_todos = database.objects::<Todo>().expect("second todos");
+    second_todos
+        .add(
+            &mut second,
+            Todo {
+                id: Id::new(2),
+                title: "second".to_owned(),
+                done: false,
+            },
         )
-        .expect("compose second");
+        .expect("second insert");
     drop(second_todos);
 
     database.commit(&first).expect("commit first");
@@ -883,8 +877,9 @@ fn transaction_rejects_plan_from_a_different_snapshot() {
         .schema(schema)
         .create()
         .expect("create database");
-    let mut transaction = database
-        .transaction_with_id(TransactionId::new(355_010))
+    let formation = database.snapshot().expect("formation snapshot");
+    let mut transaction = Transaction::from(formation)
+        .with_idempotency_key(TransactionId::new(355_010))
         .expect("transaction");
 
     let advance_snapshot = database.snapshot().expect("advance snapshot");
@@ -931,37 +926,35 @@ fn transaction_readiness_reports_semantic_coordinate_conflict() {
         .create()
         .expect("create database");
 
-    let mut first = database
-        .transaction_with_id(TransactionId::new(355_001))
+    let mut first = Transaction::new()
+        .with_idempotency_key(TransactionId::new(355_001))
         .expect("first transaction");
-    let first_todos = first.objects::<Todo>().expect("first todos");
-    first
-        .add_plan(
-            first_todos
-                .insert(Todo {
-                    id: Id::new(77),
-                    title: "first".to_owned(),
-                    done: false,
-                })
-                .expect("first insert"),
+    let first_todos = database.objects::<Todo>().expect("first todos");
+    first_todos
+        .add(
+            &mut first,
+            Todo {
+                id: Id::new(77),
+                title: "first".to_owned(),
+                done: false,
+            },
         )
-        .expect("compose first");
+        .expect("first insert");
 
-    let mut second = database
-        .transaction_with_id(TransactionId::new(355_002))
+    let mut second = Transaction::new()
+        .with_idempotency_key(TransactionId::new(355_002))
         .expect("second transaction");
-    let second_todos = second.objects::<Todo>().expect("second todos");
-    second
-        .add_plan(
-            second_todos
-                .insert(Todo {
-                    id: Id::new(77),
-                    title: "second".to_owned(),
-                    done: false,
-                })
-                .expect("second insert"),
+    let second_todos = database.objects::<Todo>().expect("second todos");
+    second_todos
+        .add(
+            &mut second,
+            Todo {
+                id: Id::new(77),
+                title: "second".to_owned(),
+                done: false,
+            },
         )
-        .expect("compose second");
+        .expect("second insert");
 
     database.commit(&first).expect("commit first");
     assert!(matches!(
@@ -1006,19 +999,19 @@ fn database_owned_transaction_control_rejects_foreign_database() {
         .create()
         .expect("second database");
 
-    let mut transaction = first
-        .transaction_with_id(TransactionId::new(354_001))
+    let mut transaction = Transaction::new()
+        .with_idempotency_key(TransactionId::new(354_001))
         .expect("transaction");
-    let todos = transaction.objects::<Todo>().expect("todos");
-    transaction
-        .add_plan(
-            todos
-                .insert(Todo {
-                    id: Id::new(1),
-                    title: "owned by first".to_owned(),
-                    done: false,
-                })
-                .expect("insert plan"),
+    first
+        .objects::<Todo>()
+        .expect("todos")
+        .add(
+            &mut transaction,
+            Todo {
+                id: Id::new(1),
+                title: "owned by first".to_owned(),
+                done: false,
+            },
         )
         .expect("compose transaction");
 
@@ -1271,10 +1264,6 @@ fn derive_many_is_first_class_object_relation() {
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn many_count_predicates_preserve_zero_degree_in_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -2071,21 +2060,21 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
     );
     assert_eq!(
         ids(children
-            .top(2, ChildFields::score)
+            .top(2, |child| child.score())
             .all()
             .expect("top boundary")),
         vec![2, 3, 4]
     );
     assert_eq!(
         ids(children
-            .bottom(2, ChildFields::score)
+            .bottom(2, |child| child.score())
             .all()
             .expect("bottom boundary")),
         vec![1, 2, 3]
     );
 
     let mut watch = children
-        .top(2, ChildFields::score)
+        .top(2, |child| child.score())
         .watch()
         .expect("boundary watch");
     assert_eq!(ids(watch.initial().to_vec()), vec![2, 3, 4]);
@@ -2114,10 +2103,6 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -2415,20 +2400,20 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
     database.commit(&seed).expect("seed commit");
 
     let children = database.objects::<Child>().expect("children");
-    let projection = children.select(ChildFields::score);
+    let projection = children.select(|child| child.score());
     let mut scores = projection.all().expect("projected scores");
     scores.sort_unstable();
     assert_eq!(scores, vec![3, 7, 7, 11]);
     assert_eq!(projection.count().expect("projection count"), 4);
 
-    let distinct = children.select(ChildFields::score).distinct();
+    let distinct = children.select(|child| child.score()).distinct();
     let mut unique_scores = distinct.all().expect("distinct scores");
     unique_scores.sort_unstable();
     assert_eq!(unique_scores, vec![3, 7, 11]);
     assert_eq!(distinct.count().expect("distinct count"), 3);
 
     let mut grouped = children
-        .group_by(ChildFields::score)
+        .group_by(|child| child.score())
         .count()
         .all()
         .expect("grouped count");
@@ -2458,7 +2443,7 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
     assert!(event.removed().is_empty());
 
     let mut distinct_watch = children
-        .select(ChildFields::score)
+        .select(|child| child.score())
         .distinct()
         .watch()
         .expect("distinct projection watch");
@@ -2526,14 +2511,14 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
     database.commit(&seed).expect("seed commit");
 
     let metrics = database.objects::<GroupedMetric>().expect("metrics");
-    let count_query = metrics.group_by(GroupedMetricFields::bucket).count();
+    let count_query = metrics.group_by(|metric| metric.bucket()).count();
     let mut counts = count_query.all().expect("group counts");
     counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(counts, vec![(1, 2), (2, 1)]);
 
     let sum_query = metrics
-        .group_by(GroupedMetricFields::bucket)
-        .sum(GroupedMetricFields::value);
+        .group_by(|metric| metric.bucket())
+        .sum(|metric| metric.value());
     let mut sums = sum_query.all().expect("group sums");
     sums.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(sums, vec![(1, 4.0), (2, 10.0)]);
@@ -2561,7 +2546,7 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
         .expect("candidate metrics");
 
     let mut future_counts = candidate_metrics
-        .group_by(GroupedMetricFields::bucket)
+        .group_by(|metric| metric.bucket())
         .count()
         .all()
         .expect("candidate group counts");
@@ -2569,8 +2554,8 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
     assert_eq!(future_counts, vec![(1, 3), (2, 1)]);
 
     let mut future_sums = candidate_metrics
-        .group_by(GroupedMetricFields::bucket)
-        .sum(GroupedMetricFields::value)
+        .group_by(|metric| metric.bucket())
+        .sum(|metric| metric.value())
         .all()
         .expect("candidate group sums");
     future_sums.sort_unstable_by_key(|(bucket, _)| *bucket);
@@ -2613,10 +2598,6 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -2652,13 +2633,13 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     database.commit(&seed).expect("seed commit");
 
     let metrics = database.objects::<GroupedMetric>().expect("metrics");
-    let count_top = metrics.group_by(GroupedMetricFields::bucket).count().top(1);
+    let count_top = metrics.group_by(|metric| metric.bucket()).count().top(1);
     let mut top_counts = count_top.all().expect("top grouped counts");
     top_counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(top_counts, vec![(1, 2), (2, 2)]);
     assert_eq!(
         metrics
-            .group_by(GroupedMetricFields::bucket)
+            .group_by(|metric| metric.bucket())
             .count()
             .bottom(1)
             .all()
@@ -2667,8 +2648,8 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     );
 
     let sum_top = metrics
-        .group_by(GroupedMetricFields::bucket)
-        .sum(GroupedMetricFields::value)
+        .group_by(|metric| metric.bucket())
+        .sum(|metric| metric.value())
         .top(1);
     let mut top_sums = sum_top.all().expect("top grouped sums");
     top_sums.sort_unstable_by_key(|(bucket, _)| *bucket);
@@ -2696,7 +2677,7 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
         .objects::<GroupedMetric>()
         .expect("candidate metrics");
     let mut candidate_counts = candidate_metrics
-        .group_by(GroupedMetricFields::bucket)
+        .group_by(|metric| metric.bucket())
         .count()
         .top(1)
         .all()
@@ -2704,8 +2685,8 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     candidate_counts.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(candidate_counts, vec![(1, 2), (2, 2), (3, 2)]);
     let mut candidate_sums = candidate_metrics
-        .group_by(GroupedMetricFields::bucket)
-        .sum(GroupedMetricFields::value)
+        .group_by(|metric| metric.bucket())
+        .sum(|metric| metric.value())
         .top(1)
         .all()
         .expect("candidate top sums");
@@ -3023,7 +3004,7 @@ fn composite_group_keys_use_kernel_group_for_exact_candidate_and_watch() {
 
     let top_sum = metrics
         .group_by(|metric| (metric.bucket(), metric.value()))
-        .sum(GroupedMetricFields::value)
+        .sum(|metric| metric.value())
         .top(1);
     let top_sum_exact = top_sum.all().expect("composite top sums");
     assert_eq!(top_sum_exact.len(), 2);
@@ -3053,7 +3034,7 @@ fn composite_group_keys_use_kernel_group_for_exact_candidate_and_watch() {
         .objects::<GroupedMetric>()
         .expect("candidate metrics")
         .group_by(|metric| (metric.bucket(), metric.value()))
-        .sum(GroupedMetricFields::value)
+        .sum(|metric| metric.value())
         .top(1)
         .all()
         .expect("candidate composite top sums");
@@ -3227,10 +3208,10 @@ fn same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_in
         .expect("add empty parent");
     database.commit(&add_parent).expect("parent commit");
 
-    let mut first = database
-        .transaction_with_id(TransactionId::new(372_001))
+    let mut first = Transaction::new()
+        .with_idempotency_key(TransactionId::new(372_001))
         .expect("first transaction");
-    let first_parent = first
+    let first_parent = database
         .objects::<Parent>()
         .expect("first parents")
         .require(Id::new(3))
@@ -3241,10 +3222,10 @@ fn same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_in
         .expect("first attach");
     drop(first_parent);
 
-    let mut second = database
-        .transaction_with_id(TransactionId::new(372_002))
+    let mut second = Transaction::new()
+        .with_idempotency_key(TransactionId::new(372_002))
         .expect("second transaction");
-    let second_parent = second
+    let second_parent = database
         .objects::<Parent>()
         .expect("second parents")
         .require(Id::new(3))
@@ -3414,7 +3395,7 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
     let users = database.objects::<RuleUser>().expect("users");
     let mut invalid = Transaction::new();
     users
-        .set(&mut invalid, id, RuleUserFields::age, 17)
+        .set(&mut invalid, id, |user| user.age(), 17)
         .expect("patch intent");
     invalid
         .require::<RuleUser>(id, adult.clone())
@@ -3426,7 +3407,7 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
 
     let mut valid = Transaction::new();
     users
-        .set(&mut valid, id, RuleUserFields::age, 20)
+        .set(&mut valid, id, |user| user.age(), 20)
         .expect("valid patch intent");
     valid
         .require::<RuleUser>(id, adult)
@@ -3446,6 +3427,361 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
     drop(valid);
     drop(invalid);
     drop(create);
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn external_transaction_id_retains_canonical_requirement_identity() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+    let entity = Id::new(456_001);
+
+    let mut seed = Transaction::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut seed,
+            RuleUser {
+                id: entity,
+                name: "Artem".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("seed intent");
+    database.commit(&seed).expect("seed commit");
+
+    let transaction_id = TransactionId::new(456_777);
+    let adult = SemanticRuleExpr::I64Range {
+        value: RuleValueExpr::Field(RuleUser::__field_id("age")),
+        min: Some(18),
+        max: None,
+    };
+    let narrower = SemanticRuleExpr::I64Range {
+        value: RuleValueExpr::Field(RuleUser::__field_id("age")),
+        min: Some(18),
+        max: Some(99),
+    };
+    let users = database.objects::<RuleUser>().expect("users");
+
+    let mut first = Transaction::new()
+        .with_idempotency_key(transaction_id)
+        .expect("external transaction");
+    assert_eq!(first.origin_revision(), None);
+    users
+        .set(&mut first, entity, |user| user.name(), "Guarded".to_owned())
+        .expect("first mutation");
+    first
+        .require::<RuleUser>(entity, adult.clone())
+        .expect("first requirement");
+    assert_eq!(first.id(), Some(transaction_id));
+
+    let mut same = Transaction::new()
+        .with_idempotency_key(transaction_id)
+        .expect("same external transaction");
+    users
+        .set(&mut same, entity, |user| user.name(), "Guarded".to_owned())
+        .expect("same mutation");
+    same.require::<RuleUser>(entity, adult)
+        .expect("same requirement");
+
+    let mut different = Transaction::new()
+        .with_idempotency_key(transaction_id)
+        .expect("conflicting external transaction");
+    users
+        .set(
+            &mut different,
+            entity,
+            |user| user.name(),
+            "Guarded".to_owned(),
+        )
+        .expect("same mutation for conflicting requirement");
+    different
+        .require::<RuleUser>(entity, narrower)
+        .expect("different requirement");
+
+    assert!(matches!(
+        database.commit(&first).expect("first commit"),
+        CommitOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        database.commit(&same).expect("same guarded retry"),
+        CommitOutcome::AlreadyCommitted { .. }
+    ));
+    assert_eq!(
+        database
+            .commit(&different)
+            .expect_err("same external id with another requirement must conflict")
+            .kind(),
+        ErrorKind::TransactionConflict,
+    );
+
+    drop(different);
+    drop(same);
+    drop(first);
+    drop(users);
+    drop(seed);
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn generated_transaction_key_does_not_rotate_when_requirements_change() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+    let entity = Id::new(457_001);
+
+    let mut seed = Transaction::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut seed,
+            RuleUser {
+                id: entity,
+                name: "Artem".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("seed intent");
+    database.commit(&seed).expect("seed commit");
+
+    let users = database.objects::<RuleUser>().expect("users");
+    let mut transaction = Transaction::new();
+    users
+        .set(
+            &mut transaction,
+            entity,
+            |user| user.name(),
+            "Stable".to_owned(),
+        )
+        .expect("mutation");
+    let key = transaction.id().expect("generated key");
+    transaction
+        .require::<RuleUser>(
+            entity,
+            SemanticRuleExpr::I64Range {
+                value: RuleValueExpr::Field(RuleUser::__field_id("age")),
+                min: Some(18),
+                max: None,
+            },
+        )
+        .expect("first guard");
+    assert_eq!(transaction.id(), Some(key));
+    database.commit(&transaction).expect("guarded commit");
+
+    transaction
+        .require::<RuleUser>(
+            entity,
+            SemanticRuleExpr::I64Range {
+                value: RuleValueExpr::Field(RuleUser::__field_id("age")),
+                min: Some(18),
+                max: Some(99),
+            },
+        )
+        .expect("second guard");
+    assert_eq!(transaction.id(), Some(key));
+    assert_eq!(
+        database
+            .commit(&transaction)
+            .expect_err("changed guarded intent under the same key must conflict")
+            .kind(),
+        ErrorKind::TransactionConflict,
+    );
+
+    drop(transaction);
+    drop(users);
+    drop(seed);
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn transaction_require_is_rechecked_on_the_rebased_candidate() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+    let id = Id::new(447_001);
+
+    let mut create = Transaction::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut create,
+            RuleUser {
+                id,
+                name: "base".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("create intent");
+    database.commit(&create).expect("create commit");
+
+    let adult = SemanticRuleExpr::I64Range {
+        value: RuleValueExpr::Field(RuleUser::__field_id("age")),
+        min: Some(18),
+        max: None,
+    };
+    let users = database.objects::<RuleUser>().expect("users");
+
+    let mut survives = Transaction::new();
+    users
+        .set(&mut survives, id, |user| user.name(), "survives".to_owned())
+        .expect("name intent");
+    survives
+        .require::<RuleUser>(id, adult.clone())
+        .expect("adult requirement");
+    let mut raise_age = Transaction::new();
+    users
+        .set(&mut raise_age, id, |user| user.age(), 21)
+        .expect("raise age");
+    database.commit(&raise_age).expect("independent age commit");
+    database
+        .commit(&survives)
+        .expect("predicate-preserving rebase");
+    let stored = database
+        .objects::<RuleUser>()
+        .expect("fresh users")
+        .require(id)
+        .expect("stored");
+    assert_eq!(stored.age, 21);
+    assert_eq!(stored.name, "survives");
+
+    let fresh = database.objects::<RuleUser>().expect("users after rebase");
+    let mut rejected = Transaction::new();
+    fresh
+        .set(&mut rejected, id, |user| user.name(), "reject".to_owned())
+        .expect("name intent");
+    rejected
+        .require::<RuleUser>(id, adult)
+        .expect("adult requirement");
+    let mut lower_age = Transaction::new();
+    fresh
+        .set(&mut lower_age, id, |user| user.age(), 17)
+        .expect("lower age");
+    database
+        .commit(&lower_age)
+        .expect("independent falsifying commit");
+    let error = database
+        .commit(&rejected)
+        .expect_err("rebased future world must fail requirement");
+    assert_eq!(error.kind(), ErrorKind::TransactionConflict);
+    let stored = database
+        .objects::<RuleUser>()
+        .expect("final users")
+        .require(id)
+        .expect("stored");
+    assert_eq!(stored.age, 17);
+    assert_eq!(stored.name, "survives");
+
+    drop(stored);
+    drop(fresh);
+    drop(users);
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn transaction_require_uses_current_read_authority_at_preview_and_commit() {
+    use cfmd::{Object, Permission, PermissionSet, PrincipalId, Session};
+
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+    let id = Id::new(447_010);
+    let mut create = Transaction::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut create,
+            RuleUser {
+                id,
+                name: "base".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("create intent");
+    database.commit(&create).expect("create commit");
+
+    let adult = SemanticRuleExpr::I64Range {
+        value: RuleValueExpr::Field(RuleUser::__field_id("age")),
+        min: Some(18),
+        max: None,
+    };
+    let session = Session::new(
+        PrincipalId::new(447_010),
+        PermissionSet::from([Permission::Write, Permission::Read]),
+    );
+    let restricted = database.session(session.clone());
+    let mut tx = Transaction::new();
+    restricted
+        .objects::<RuleUser>()
+        .expect("restricted users")
+        .set(&mut tx, id, |user| user.name(), "auth".to_owned())
+        .expect("write-only name patch");
+    tx.require::<RuleUser>(id, adult).expect("require intent");
+    restricted
+        .preview(&tx)
+        .expect("require read is initially authorized");
+
+    session
+        .refresh_permissions(PermissionSet::from([Permission::Write]))
+        .expect("revoke requirement read authority");
+    assert_eq!(
+        restricted
+            .preview(&tx)
+            .expect_err("preview must use current read authority")
+            .kind(),
+        ErrorKind::PermissionDenied,
+    );
+    assert_eq!(
+        restricted
+            .commit(&tx)
+            .expect_err("commit must use current read authority")
+            .kind(),
+        ErrorKind::PermissionDenied,
+    );
+    let stored = database
+        .objects::<RuleUser>()
+        .expect("fresh users")
+        .require(id)
+        .expect("stored");
+    assert_eq!(stored.name, "base");
+
+    drop(stored);
     drop(database);
     fs::remove_file(path).expect("remove database");
 }
@@ -3578,7 +3914,7 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         .set(
             &mut partial_tx,
             Id::new(378_001),
-            HostileReaderAccountFields::doctor_note,
+            |account| account.doctor_note(),
             "changed-by-reader".to_owned(),
         )
         .expect("semantic scalar patch");
@@ -3599,7 +3935,7 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         .set(
             &mut invalid_tx,
             Id::new(378_001),
-            HostileReaderAccountFields::doctor_note,
+            |account| account.doctor_note(),
             "x".repeat(64),
         )
         .expect("reader can form a patch without knowing the hidden authoritative rule");
@@ -3624,10 +3960,6 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
 }
 
 #[test]
-#[allow(
-    clippy::similar_names,
-    reason = "Names distinguish the before and after states of the same operation."
-)]
 fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema() {
     let path = temp_path();
     let db = RenamedAccountSchema::database(&path)
@@ -3660,7 +3992,7 @@ fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema()
         .set(
             &mut patch,
             Id::new(379_001),
-            LegacyRenameAccountFields::doctor_note,
+            |row| row.doctor_note(),
             "changed-through-old-name".to_owned(),
         )
         .expect("legacy patch resolves through the explicit client-side bind");
@@ -3678,7 +4010,7 @@ fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema()
         .set(
             &mut invalid,
             Id::new(379_001),
-            LegacyRenameAccountFields::doctor_note,
+            |row| row.doctor_note(),
             "x".repeat(64),
         )
         .expect("legacy client can form patch without copying authoritative rules");
@@ -3736,10 +4068,6 @@ fn client_bind_can_keep_old_reference_name_without_authoritative_alias() {
 }
 
 #[test]
-#[allow(
-    clippy::similar_names,
-    reason = "Names distinguish the before and after states of the same operation."
-)]
 fn partial_context_patches_required_and_optional_references_without_hidden_row_rewrite() {
     let path = temp_path();
     let db = AppSchema::database(&path)
@@ -3778,7 +4106,7 @@ fn partial_context_patches_required_and_optional_references_without_hidden_row_r
         .set(
             &mut patch,
             Id::new(438_010),
-            PartialTaskFields::owner,
+            |task| task.owner(),
             cfmd::Ref::new(bob.id),
         )
         .expect("required reference patch");
@@ -3786,7 +4114,7 @@ fn partial_context_patches_required_and_optional_references_without_hidden_row_r
         .set(
             &mut patch,
             Id::new(438_010),
-            PartialTaskFields::reviewer,
+            |task| task.reviewer(),
             Some(cfmd::Ref::new(alice.id)),
         )
         .expect("optional reference patch");
@@ -3861,10 +4189,6 @@ fn partial_context_many_mutation_preserves_hidden_owner_fields() {
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field() {
     let path = temp_path();
     let db = AppSchema::database(&path)
@@ -3903,7 +4227,7 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         .set(
             &mut title_tx,
             Id::new(438_110),
-            TaskFields::title,
+            |task| task.title(),
             "title-a".to_string(),
         )
         .expect("title patch");
@@ -3913,7 +4237,7 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         .set(
             &mut owner_tx,
             Id::new(438_110),
-            PartialTaskFields::owner,
+            |task| task.owner(),
             cfmd::Ref::new(bob.id),
         )
         .expect("owner patch");
@@ -3932,7 +4256,7 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         .set(
             &mut left,
             Id::new(438_110),
-            TaskFields::title,
+            |task| task.title(),
             "left".to_string(),
         )
         .expect("left title");
@@ -3941,7 +4265,7 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         .set(
             &mut right,
             Id::new(438_110),
-            TaskFields::title,
+            |task| task.title(),
             "right".to_string(),
         )
         .expect("right title");
@@ -4005,8 +4329,8 @@ fn relationship_authorization_preserves_semantic_actions() {
     let source = parents.require(Id::new(1)).expect("source parent");
     let destination = parents.require(Id::new(2)).expect("destination parent");
 
-    let mut move_tx = mover
-        .transaction_with_id(TransactionId::new(440_001))
+    let mut move_tx = Transaction::new()
+        .with_idempotency_key(TransactionId::new(440_001))
         .expect("move transaction");
     source
         .children
@@ -4014,8 +4338,8 @@ fn relationship_authorization_preserves_semantic_actions() {
         .expect("semantic move planning");
     mover.commit(&move_tx).expect("move-only grant commit");
 
-    let mut attach_tx = mover
-        .transaction_with_id(TransactionId::new(440_002))
+    let mut attach_tx = Transaction::new()
+        .with_idempotency_key(TransactionId::new(440_002))
         .expect("attach transaction");
     destination
         .children
@@ -4082,8 +4406,8 @@ fn owned_detach_cannot_bypass_object_delete_authority() {
         .expect("owners")
         .require(Id::new(1))
         .expect("owner");
-    let mut tx = restricted
-        .transaction_with_id(TransactionId::new(440_011))
+    let mut tx = Transaction::new()
+        .with_idempotency_key(TransactionId::new(440_011))
         .expect("detach transaction");
     owner
         .assets

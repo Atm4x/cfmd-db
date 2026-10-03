@@ -1,9 +1,7 @@
-use super::checkpoint_storage::write_checkpoint_file;
+use super::checkpoint_storage::write_checkpoint_generation;
 use super::file_io::sync_directory;
 use super::freshness::ExternalFreshnessState;
-use super::generation_layout::{
-    checkpoint_path, metadata_path, next_generation, realization_path, wal_path,
-};
+use super::generation_layout::{metadata_path, next_generation, realization_path, wal_path};
 use super::manifest::{ManifestRecord, publish_manifest_with_hook};
 use super::metadata_storage::write_metadata_file;
 use super::publication_protocol::{
@@ -184,24 +182,6 @@ impl DurableRevisionStore {
         }
     }
 
-    /// Re-encodes the fully recovered in-memory durable authority into the
-    /// current writable component formats and publishes it as a fresh immutable
-    /// generation. Historical source files are never modified in place.
-    pub fn migrate_to_current_format(
-        &mut self,
-        revision: &Revision,
-    ) -> Result<DurableGenerationReceipt, DurabilityError> {
-        let materializations = self.materialization_specs.clone();
-        let physical_artifacts = self.physical_artifact_specs.clone();
-        let artifact_cores = self.artifact_cores.clone();
-        self.rotate_checkpoint_with_materializations_physical_artifacts_and_cores(
-            revision,
-            &materializations,
-            &physical_artifacts,
-            &artifact_cores,
-        )
-    }
-
     fn rotate_checkpoint_with_fault_policy(
         &mut self,
         revision: &Revision,
@@ -245,10 +225,6 @@ impl DurableRevisionStore {
         result
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Keep the explicit semantic and durability inputs at this boundary."
-    )]
     fn rotate_checkpoint_with_hook(
         &mut self,
         revision: &Revision,
@@ -261,8 +237,7 @@ impl DurableRevisionStore {
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
         let directory = self.backend.directory_root()?.to_path_buf();
         let generation = next_generation(&directory)?;
-        let checkpoint_file = checkpoint_path(&directory, generation);
-        let checkpoint_crc32c = write_checkpoint_file(&checkpoint_file, revision)?;
+        let checkpoint_crc32c = write_checkpoint_generation(&directory, generation, revision)?;
         hook.hit(StoreFaultPoint::AfterCheckpointSync)?;
         let wal_file = wal_path(&directory, generation);
         let mut wal = FileRevisionWal::create(&wal_file)?;
@@ -296,13 +271,8 @@ impl DurableRevisionStore {
             migration_complements: self.migration_complements.clone(),
             historical_epoch_anchors: self.historical_epoch_anchors.clone(),
             committed_transactions: self.committed_transactions.clone(),
-            semantic_modules: self
-                .semantic_registry
-                .builtin_modules_for_context(revision.semantic_context())
-                .map_err(|_| DurabilityError::Protocol {
-                    offset: 0,
-                    reason: "checkpoint revision requires unavailable semantic implementation",
-                })?,
+            semantic_modules: self.semantic_registry.builtin_module_specs(),
+            next_revision_effect_id: self.next_revision_effect_id,
             causal_coverage_root: Some(self.causal_coverage_root),
             revision_effects: self.revision_effects.clone(),
             revision_effect_frontiers: self.revision_effect_frontiers.clone(),

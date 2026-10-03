@@ -84,10 +84,6 @@ struct SchemaMigrationPrepare<'a> {
     semantic_modules: &'a [kernel_semantics::BuiltinSemanticModuleSpec],
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn validate_schema_migration_prepare_intent(
     store: &DurableRevisionStore,
     registry: &mut SemanticRegistry,
@@ -256,7 +252,7 @@ fn validate_relation_rewrite_prepare_intent(
     descriptor: &DurableRevisionDescriptor,
     intent: &DurableTransactionIntent,
 ) -> Result<(), DurabilityError> {
-    let DurableTransactionIntent::RelationRewriteExact {
+    let DurableTransactionIntent::RelationRewrite {
         source_revision,
         target_revision,
         semantic_revision,
@@ -290,7 +286,7 @@ pub(super) fn validate_bound_prepare_intent(
     expected_migration_source_schema: Option<SchemaRevisionId>,
 ) -> Result<(), DurabilityError> {
     match &descriptor.intent {
-        DurableTransactionIntent::RelationResolutionExact {
+        DurableTransactionIntent::RelationResolution {
             source_revision,
             target_revision,
             semantic_revision,
@@ -317,129 +313,56 @@ pub(super) fn validate_bound_prepare_intent(
                 },
             )
         }
-        intent @ DurableTransactionIntent::RelationRewriteExact { .. } => {
+        intent @ DurableTransactionIntent::RelationRewrite { .. } => {
             validate_relation_rewrite_prepare_intent(registry, descriptor, intent)
         }
-        DurableTransactionIntent::RelationDataExact {
+        DurableTransactionIntent::RelationData {
             source_revision,
             target_revision,
-            semantic_revision,
-            relation_mutations,
             semantic_modules,
+            ..
         } => {
-            validate_relation_prepare_intent(
-                descriptor,
-                *source_revision,
-                *target_revision,
-                *semantic_revision,
-                relation_mutations,
-                None,
-            )?;
-            install_semantic_module_packages(registry, semantic_modules)?;
-            Ok(())
-        }
-        DurableTransactionIntent::RelationDataResidualExact {
-            source_revision,
-            target_revision,
-            semantic_revision,
-            client_mutations: _,
-            realized_mutations,
-            semantic_modules,
-        } => {
-            let DurableRevisionChange::RelationData {
-                semantic_revision: change_semantics,
-                relation_mutations: change_mutations,
-            } = &descriptor.change
-            else {
+            let DurableRevisionChange::RelationData { .. } = &descriptor.change else {
                 return Err(DurabilityError::Protocol {
                     offset: 0,
-                    reason: "residual relation intent is paired with a non-relation change",
+                    reason: "relation client intent is paired with a non-relation realized change",
                 });
             };
             if *source_revision != descriptor.source_revision
                 || *target_revision != descriptor.target_revision
-                || *semantic_revision != *change_semantics
-                || realized_mutations != change_mutations
             {
                 return Err(DurabilityError::Protocol {
                     offset: 0,
-                    reason: "residual relation realization does not match descriptor delta",
+                    reason: "relation intent provenance does not match descriptor",
                 });
             }
             install_semantic_module_packages(registry, semantic_modules)?;
             Ok(())
         }
-        DurableTransactionIntent::MixedRevisionExact {
+        DurableTransactionIntent::MixedRevision {
             source_revision,
             target_revision,
-            semantic_revision,
-            relation_mutations,
-            model_delta,
-            model_complement: _,
             semantic_modules,
+            ..
         } => {
-            let DurableRevisionChange::MixedRevision {
-                semantic_revision: change_semantics,
-                relation_mutations: change_mutations,
-                model_delta: change_model_delta,
-            } = &descriptor.change
-            else {
+            let DurableRevisionChange::MixedRevision { .. } = &descriptor.change else {
                 return Err(DurabilityError::Protocol {
                     offset: 0,
-                    reason: "mixed intent is paired with a non-mixed change",
+                    reason: "mixed client intent is paired with a non-mixed realized change",
                 });
             };
             if *source_revision != descriptor.source_revision
                 || *target_revision != descriptor.target_revision
-                || *semantic_revision != *change_semantics
-                || relation_mutations != change_mutations
-                || model_delta != change_model_delta
             {
                 return Err(DurabilityError::Protocol {
                     offset: 0,
-                    reason: "mixed intent does not match descriptor delta",
+                    reason: "mixed intent provenance does not match descriptor",
                 });
             }
             install_semantic_module_packages(registry, semantic_modules)?;
             Ok(())
         }
-        DurableTransactionIntent::MixedRevisionResidualExact {
-            source_revision,
-            target_revision,
-            semantic_revision,
-            client_relation_mutations: _,
-            client_model_delta: _,
-            realized_relation_mutations,
-            realized_model_delta,
-            realized_model_complement: _,
-            semantic_modules,
-        } => {
-            let DurableRevisionChange::MixedRevision {
-                semantic_revision: change_semantics,
-                relation_mutations: change_mutations,
-                model_delta: change_model_delta,
-            } = &descriptor.change
-            else {
-                return Err(DurabilityError::Protocol {
-                    offset: 0,
-                    reason: "residual mixed intent is paired with a non-mixed change",
-                });
-            };
-            if *source_revision != descriptor.source_revision
-                || *target_revision != descriptor.target_revision
-                || *semantic_revision != *change_semantics
-                || realized_relation_mutations != change_mutations
-                || realized_model_delta != change_model_delta
-            {
-                return Err(DurabilityError::Protocol {
-                    offset: 0,
-                    reason: "residual mixed realization does not match descriptor delta",
-                });
-            }
-            install_semantic_module_packages(registry, semantic_modules)?;
-            Ok(())
-        }
-        DurableTransactionIntent::Exact {
+        DurableTransactionIntent::FullRevision {
             target_revision,
             encoded_target_revision,
             semantic_modules,
@@ -453,7 +376,7 @@ pub(super) fn validate_bound_prepare_intent(
                 registry,
             )
         }
-        DurableTransactionIntent::SchemaMigrationExact {
+        DurableTransactionIntent::SchemaMigration {
             source_revision,
             target_revision,
             program,
@@ -472,9 +395,5 @@ pub(super) fn validate_bound_prepare_intent(
                 semantic_modules,
             },
         ),
-        DurableTransactionIntent::LegacyTargetOnly { .. } => Err(DurabilityError::Protocol {
-            offset: 0,
-            reason: "new durable prepare does not carry exact transaction intent",
-        }),
     }
 }

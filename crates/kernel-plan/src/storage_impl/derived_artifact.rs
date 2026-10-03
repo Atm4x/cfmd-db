@@ -20,9 +20,7 @@ impl Eq for DerivedArtifactDependencyCache {}
 impl UnifiedArtifactId {
     fn capabilities(&self) -> BTreeSet<PhysicalCapability> {
         match self {
-            Self::I64Index(_) | Self::SemanticIndex(_) => {
-                BTreeSet::from([PhysicalCapability::PointLookup])
-            }
+            Self::I64Index(_) => BTreeSet::from([PhysicalCapability::PointLookup]),
             Self::ObservableAtom(_) => BTreeSet::from([
                 PhysicalCapability::ObservableFiber,
                 PhysicalCapability::ExactCardinality,
@@ -39,8 +37,7 @@ impl UnifiedArtifactId {
             Self::I64Index(binding) => {
                 binding.relation == relation && binding.layout.id == layout.id
             }
-            Self::SemanticIndex(binding)
-            | Self::ObservableAtom(binding)
+            Self::ObservableAtom(binding)
             | Self::SemanticQuotientFactor(binding)
             | Self::SemanticStatistics(binding) => {
                 binding.relation == relation && binding.layout.id == layout.id

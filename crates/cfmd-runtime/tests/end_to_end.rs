@@ -5,7 +5,7 @@ use std::{
 
 use cfmd_runtime::{
     CommitOutcome, Database, EquivalenceId, PrimitiveEquivalence, Query, RelationId,
-    RelationResult, RelationSchema, Schema, TransactionId, Type, Value,
+    RelationResult, RelationSchema, Schema, Transaction, TransactionId, Type, Value,
 };
 
 fn temp_directory() -> std::path::PathBuf {
@@ -1312,7 +1312,7 @@ fn non_head_history_undo_rebases_over_disjoint_canonical_relation_classes() {
     assert!(matches!(
         first_entry.undo_readiness(),
         HistoryUndoReadiness::Rebased {
-            intervening_effects,
+            ref intervening_effects,
             ..
         } if intervening_effects.len() == 1
     ));
@@ -2800,10 +2800,6 @@ fn provider_rotation_rewraps_dmk_without_rewriting_database_ciphertext() {
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     use cfmd_runtime::{
         ErrorKind, Id, Object, Permission, PermissionSet, PrincipalId, Query, RowCodec, Session,
@@ -2878,11 +2874,16 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     let countries = field_writer
         .objects::<Country>()
         .expect("write-only countries handle");
-    let mut tx = field_writer
-        .transaction_with_id(TransactionId::new(9_202))
+    let mut tx = Transaction::new()
+        .with_idempotency_key(TransactionId::new(9_202))
         .expect("field transaction");
     countries
-        .set(&mut tx, Id::new(1), CountryFields::code, "DE".to_owned())
+        .set(
+            &mut tx,
+            Id::new(1),
+            |country| country.code(),
+            "DE".to_owned(),
+        )
         .expect("authorized semantic field patch");
     field_writer.commit(&tx).expect("field-only commit");
 
@@ -2912,8 +2913,8 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     let creator_countries = creator
         .objects::<Country>()
         .expect("create-only countries handle");
-    let mut create_tx = creator
-        .transaction_with_id(TransactionId::new(9_204))
+    let mut create_tx = Transaction::new()
+        .with_idempotency_key(TransactionId::new(9_204))
         .expect("create-only transaction");
     creator_countries
         .add(
@@ -2952,8 +2953,8 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     let delete_countries = deleter
         .objects::<Country>()
         .expect("delete-only countries handle");
-    let mut delete_tx = deleter
-        .transaction_with_id(TransactionId::new(9_206))
+    let mut delete_tx = Transaction::new()
+        .with_idempotency_key(TransactionId::new(9_206))
         .expect("delete-only transaction");
     delete_countries
         .remove(
@@ -3015,8 +3016,8 @@ fn history_inverse_preserves_object_action_authority_instead_of_raw_relation_wri
             Permission::DeleteObject(Country::relation_id()),
         ]),
     ));
-    let mut undo_create = delete_session
-        .transaction_with_id(TransactionId::new(9_441_002))
+    let mut undo_create = Transaction::new()
+        .with_idempotency_key(TransactionId::new(9_441_002))
         .expect("undo transaction");
     delete_session
         .undo_latest(&mut undo_create)
@@ -3033,8 +3034,8 @@ fn history_inverse_preserves_object_action_authority_instead_of_raw_relation_wri
             Permission::CreateObject(Country::relation_id()),
         ]),
     ));
-    let mut undo_delete = create_session
-        .transaction_with_id(TransactionId::new(9_441_003))
+    let mut undo_delete = Transaction::new()
+        .with_idempotency_key(TransactionId::new(9_441_003))
         .expect("redo transaction");
     create_session
         .undo_latest(&mut undo_delete)

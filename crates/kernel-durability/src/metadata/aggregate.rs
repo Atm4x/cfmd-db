@@ -13,8 +13,8 @@ use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
 };
 use crate::domain::{
-    DurableExternalFreshnessBinding, DurableMigrationComplement, DurableRevisionEffectRecord,
-    DurableTransactionIntent, DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
+    DurableCommittedTransaction, DurableExternalFreshnessBinding, DurableMigrationComplement,
+    DurableRevisionEffectRecord, DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
 };
 use crate::runtime::{CodecError, DurabilityError};
 
@@ -24,11 +24,11 @@ use super::artifact_codec::{
     encode_migration_complements, encode_physical_artifact_specs,
 };
 use super::intent_codec::{
-    decode_semantic_module_spec, decode_transaction_intent, encode_semantic_module_spec,
-    encode_transaction_intent,
+    decode_committed_transaction, decode_semantic_module_spec, decode_transaction_intent,
+    encode_committed_transaction, encode_semantic_module_spec, encode_transaction_intent,
 };
 
-const METADATA_CODEC_VERSION: u16 = 17;
+const METADATA_FORMAT_TAG: u16 = 0xC469;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DurableCheckpointRealizationBinding {
@@ -47,8 +47,9 @@ pub(crate) struct DurableStoreMetadata {
     pub artifact_cores: Vec<DurableArtifactCore>,
     pub migration_complements: Vec<DurableMigrationComplement>,
     pub historical_epoch_anchors: BTreeMap<RevisionEffectId, HistoricalEpochAnchor>,
-    pub committed_transactions: BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
+    pub committed_transactions: BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
     pub semantic_modules: Vec<BuiltinSemanticModuleSpec>,
+    pub next_revision_effect_id: u128,
     pub causal_coverage_root: Option<RevisionId>,
     pub revision_effects: BTreeMap<RevisionEffectId, DurableRevisionEffectRecord>,
     pub revision_effect_frontiers: BTreeMap<RevisionId, BTreeSet<RevisionEffectId>>,
@@ -87,7 +88,7 @@ pub(crate) fn encode_into(
     out: &mut impl BinarySink,
     metadata: &DurableStoreMetadata,
 ) -> Result<(), CodecError> {
-    out.extend_from_slice(&METADATA_CODEC_VERSION.to_le_bytes());
+    out.extend_from_slice(&METADATA_FORMAT_TAG.to_le_bytes());
     if metadata.minimum_retry_epoch > metadata.current_idempotency_epoch {
         return Err(CodecError::CollectionTooLarge);
     }
@@ -116,7 +117,7 @@ pub(crate) fn encode_into(
         }
         push_u64(out, key.epoch.raw());
         push_u128(out, key.transaction_id.raw());
-        encode_transaction_intent(out, intent)?;
+        encode_committed_transaction(out, intent)?;
     }
     let mut modules = metadata.semantic_modules.clone();
     modules.sort_by_key(|spec| spec.digest());
@@ -125,6 +126,7 @@ pub(crate) fn encode_into(
     for spec in modules {
         encode_semantic_module_spec(out, spec);
     }
+    push_u128(out, metadata.next_revision_effect_id);
     encode_revision_effect_state(
         out,
         metadata.causal_coverage_root,
@@ -138,23 +140,17 @@ pub(crate) fn encode_into(
 
 fn decode_metadata_header(
     cursor: &mut impl BinarySource,
-) -> Result<(u16, IdempotencyEpoch, IdempotencyEpoch), &'static str> {
-    let version = cursor.u16()?;
-    if !matches!(version, 1..=9 | 11..=METADATA_CODEC_VERSION) {
-        return Err("unsupported durable metadata codec version");
+) -> Result<(IdempotencyEpoch, IdempotencyEpoch), &'static str> {
+    let tag = cursor.u16()?;
+    if tag != METADATA_FORMAT_TAG {
+        return Err("unsupported pre-release durable metadata format");
     }
-    let (current, minimum) = if version >= 12 {
-        (
-            IdempotencyEpoch::new(cursor.u64()?),
-            IdempotencyEpoch::new(cursor.u64()?),
-        )
-    } else {
-        (IdempotencyEpoch::ZERO, IdempotencyEpoch::ZERO)
-    };
+    let current = IdempotencyEpoch::new(cursor.u64()?);
+    let minimum = IdempotencyEpoch::new(cursor.u64()?);
     if minimum > current {
         return Err("minimum retry epoch exceeds current idempotency epoch");
     }
-    Ok((version, current, minimum))
+    Ok((current, minimum))
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<DurableStoreMetadata, &'static str> {
@@ -170,59 +166,34 @@ pub(crate) fn decode_from_reader(
     decode_from_cursor(&mut cursor)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn decode_from_cursor(
     cursor: &mut impl BinarySource,
 ) -> Result<DurableStoreMetadata, &'static str> {
-    let (version, current_idempotency_epoch, minimum_retry_epoch) = decode_metadata_header(cursor)?;
+    let (current_idempotency_epoch, minimum_retry_epoch) = decode_metadata_header(cursor)?;
     let materializations = decode_materialization_specs(cursor)?;
-    let physical_artifacts = if version >= 5 {
-        decode_physical_artifact_specs(cursor)?
-    } else {
-        Vec::new()
-    };
-    let artifact_cores = if version >= 11 {
-        decode_artifact_cores(cursor)?
-    } else {
-        Vec::new()
-    };
-    let migration_complements = if version >= 7 {
-        decode_migration_complements(cursor)?
-    } else {
-        Vec::new()
-    };
-    let historical_epoch_anchors = if version >= 16 {
-        let count = cursor.len()?;
-        let mut anchors = BTreeMap::new();
-        for _ in 0..count {
-            let effect_id = RevisionEffectId(cursor.u128()?);
-            let anchor = HistoricalEpochAnchor {
-                effect_id,
-                source_revision: RevisionId::new(cursor.u64()?),
-                source_schema: SchemaRevisionId::new(cursor.u64()?),
-                generation: cursor.u64()?,
-            };
-            if anchors.insert(effect_id, anchor).is_some() {
-                return Err("historical epoch anchors are not unique by effect identity");
-            }
+    let physical_artifacts = decode_physical_artifact_specs(cursor)?;
+    let artifact_cores = decode_artifact_cores(cursor)?;
+    let migration_complements = decode_migration_complements(cursor)?;
+    let count = cursor.len()?;
+    let mut historical_epoch_anchors = BTreeMap::new();
+    for _ in 0..count {
+        let effect_id = RevisionEffectId(cursor.u128()?);
+        let anchor = HistoricalEpochAnchor {
+            effect_id,
+            source_revision: RevisionId::new(cursor.u64()?),
+            source_schema: SchemaRevisionId::new(cursor.u64()?),
+            generation: cursor.u64()?,
+        };
+        if historical_epoch_anchors.insert(effect_id, anchor).is_some() {
+            return Err("historical epoch anchors are not unique by effect identity");
         }
-        anchors
-    } else {
-        BTreeMap::new()
-    };
+    }
 
     let transaction_count = cursor.len()?;
     let mut committed_transactions = BTreeMap::new();
     let mut previous_transaction = None;
     for _ in 0..transaction_count {
-        let epoch = if version >= 12 {
-            IdempotencyEpoch::new(cursor.u64()?)
-        } else {
-            IdempotencyEpoch::ZERO
-        };
+        let epoch = IdempotencyEpoch::new(cursor.u64()?);
         let transaction_id = ClientTransactionId::new(cursor.u128()?);
         let key = DurableTransactionKey::new(epoch, transaction_id);
         if previous_transaction.is_some_and(|prior: DurableTransactionKey| prior >= key) {
@@ -232,47 +203,26 @@ fn decode_from_cursor(
             return Err("transaction retry epoch is outside durable retry window");
         }
         previous_transaction = Some(key);
-        let intent = if version == 1 {
-            DurableTransactionIntent::LegacyTargetOnly {
-                target_revision: RevisionId::new(cursor.u64()?),
-            }
-        } else {
-            decode_transaction_intent(cursor)?
-        };
-        committed_transactions.insert(key, intent);
+        committed_transactions.insert(key, decode_committed_transaction(cursor)?);
     }
-    let semantic_modules = if version == 1 {
-        Vec::new()
-    } else {
-        let count = cursor.len()?;
-        let mut modules = Vec::with_capacity(cursor.bounded_capacity(count));
-        let mut previous = None;
-        for _ in 0..count {
-            let spec = decode_semantic_module_spec(cursor)?;
-            let digest = spec.digest();
-            if previous.is_some_and(|prior| prior >= digest) {
-                return Err("semantic module digests are not strictly sorted and unique");
-            }
-            previous = Some(digest);
-            modules.push(spec);
+
+    let count = cursor.len()?;
+    let mut semantic_modules = Vec::with_capacity(cursor.bounded_capacity(count));
+    let mut previous = None;
+    for _ in 0..count {
+        let spec = decode_semantic_module_spec(cursor)?;
+        let digest = spec.digest();
+        if previous.is_some_and(|prior| prior >= digest) {
+            return Err("semantic module digests are not strictly sorted and unique");
         }
-        modules
-    };
-    let (causal_coverage_root, revision_effects, revision_effect_frontiers) = if version >= 9 {
-        decode_revision_effect_state(cursor, version, &committed_transactions)?
-    } else {
-        (None, BTreeMap::new(), BTreeMap::new())
-    };
-    let external_freshness = if version >= 13 {
-        decode_external_freshness(cursor)?
-    } else {
-        None
-    };
-    let checkpoint_realization = if version >= 17 {
-        decode_checkpoint_realization(cursor)?
-    } else {
-        None
-    };
+        previous = Some(digest);
+        semantic_modules.push(spec);
+    }
+    let next_revision_effect_id = cursor.u128()?;
+    let (causal_coverage_root, revision_effects, revision_effect_frontiers) =
+        decode_revision_effect_state(cursor)?;
+    let external_freshness = decode_external_freshness(cursor)?;
+    let checkpoint_realization = decode_checkpoint_realization(cursor)?;
     cursor.finish()?;
     Ok(DurableStoreMetadata {
         external_freshness,
@@ -285,6 +235,7 @@ fn decode_from_cursor(
         historical_epoch_anchors,
         committed_transactions,
         semantic_modules,
+        next_revision_effect_id,
         causal_coverage_root,
         revision_effects,
         revision_effect_frontiers,
@@ -397,6 +348,7 @@ fn encode_revision_effect_state(
         push_u64(out, effect.transaction_epoch.raw());
         push_u128(out, effect.transaction_id.raw());
         encode_transaction_intent(out, &effect.intent)?;
+        super::encode_revision_change(out, &effect.change)?;
         push_u64(out, effect.source_revision.raw());
         push_u64(out, effect.target_revision.raw());
     }
@@ -413,8 +365,6 @@ fn encode_revision_effect_state(
 
 fn decode_revision_effect_state(
     cursor: &mut impl BinarySource,
-    metadata_version: u16,
-    transactions: &BTreeMap<DurableTransactionKey, DurableTransactionIntent>,
 ) -> Result<DecodedRevisionEffectState, &'static str> {
     let causal_coverage_root = match cursor.u8()? {
         0 => None,
@@ -441,39 +391,19 @@ fn decode_revision_effect_state(
             previous_prerequisite = Some(prerequisite);
             prerequisites.insert(prerequisite);
         }
-        let transaction_epoch = if metadata_version >= 12 {
-            IdempotencyEpoch::new(cursor.u64()?)
-        } else {
-            IdempotencyEpoch::ZERO
-        };
+        let transaction_epoch = IdempotencyEpoch::new(cursor.u64()?);
         let transaction_id = ClientTransactionId::new(cursor.u128()?);
-        let intent = if metadata_version >= 12 {
-            decode_transaction_intent(cursor)?
-        } else {
-            transactions
-                .get(&DurableTransactionKey::new(
-                    transaction_epoch,
-                    transaction_id,
-                ))
-                .cloned()
-                .unwrap_or(DurableTransactionIntent::LegacyTargetOnly {
-                    target_revision: RevisionId::new(0),
-                })
-        };
+        let intent = decode_transaction_intent(cursor)?;
+        let change = super::decode_revision_change(cursor)?;
         let source_revision = RevisionId::new(cursor.u64()?);
         let target_revision = RevisionId::new(cursor.u64()?);
-        let intent = if matches!(intent, DurableTransactionIntent::LegacyTargetOnly { target_revision: revision } if revision.raw() == 0)
-        {
-            DurableTransactionIntent::LegacyTargetOnly { target_revision }
-        } else {
-            intent
-        };
         let effect = DurableRevisionEffectRecord {
             id,
             prerequisites,
             transaction_epoch,
             transaction_id,
             intent,
+            change,
             source_revision,
             target_revision,
         };

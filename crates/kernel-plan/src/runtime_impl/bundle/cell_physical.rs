@@ -32,6 +32,7 @@ impl RuntimeRevisionCell {
             physical,
             relation_layouts: live.relation_layouts.clone(),
             relation_bases: live.relation_bases.clone(),
+            historical: live.historical.clone(),
             materialization_specs: live.materialization_specs.clone(),
             materializations: live.materializations.clone(),
             materialization_dependencies: live.materialization_dependencies.clone(),
@@ -75,6 +76,7 @@ impl RuntimeRevisionCell {
             physical,
             relation_layouts: live.relation_layouts.clone(),
             relation_bases: live.relation_bases.clone(),
+            historical: live.historical.clone(),
             materialization_specs: live.materialization_specs.clone(),
             materializations: live.materializations.clone(),
             materialization_dependencies: live.materialization_dependencies.clone(),
@@ -82,45 +84,6 @@ impl RuntimeRevisionCell {
         };
         *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
         Ok(snapshot)
-    }
-
-    pub fn install_semantic_index(
-        &self,
-        index: SemanticIndexBinding,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<(), PhysicalExecutionError> {
-        let mut state = self
-            .root
-            .write()
-            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
-        let RuntimeRevisionCellState::Serving(live) = &*state else {
-            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
-        };
-        let next_version = live
-            .root_identity
-            .version
-            .0
-            .checked_add(1)
-            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
-        let mut physical = live.physical.clone();
-        physical.install_semantic_index(index, live.revision.semantic_context(), registry)?;
-        let candidate = RuntimeRevisionBundle {
-            root_identity: RuntimeRootIdentity {
-                root_id: live.root_identity.root_id,
-                version: RuntimeRootVersion(next_version),
-            },
-            revision: live.revision.clone(),
-            violation_state: live.violation_state.clone(),
-            physical,
-            relation_layouts: live.relation_layouts.clone(),
-            relation_bases: live.relation_bases.clone(),
-            materialization_specs: live.materialization_specs.clone(),
-            materializations: live.materializations.clone(),
-            materialization_dependencies: live.materialization_dependencies.clone(),
-            materializations_by_relation: live.materializations_by_relation.clone(),
-        };
-        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
-        Ok(())
     }
 
     pub fn install_observable_atom_state(
@@ -157,6 +120,7 @@ impl RuntimeRevisionCell {
             physical,
             relation_layouts: live.relation_layouts.clone(),
             relation_bases: live.relation_bases.clone(),
+            historical: live.historical.clone(),
             materialization_specs: live.materialization_specs.clone(),
             materializations: live.materializations.clone(),
             materialization_dependencies: live.materialization_dependencies.clone(),
@@ -164,55 +128,6 @@ impl RuntimeRevisionCell {
         };
         *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
         Ok(())
-    }
-
-    pub fn advise_semantic_indexes(
-        &self,
-        workload: &[SemanticIndexWorkloadSample],
-        policy: SemanticIndexAdvisorPolicy,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<SemanticIndexAdvisorReport, PhysicalExecutionError> {
-        let mut state = self
-            .root
-            .write()
-            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
-        let RuntimeRevisionCellState::Serving(live) = &*state else {
-            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
-        };
-        let mut physical = live.physical.clone();
-        let source_epoch = physical.transition_epoch();
-        let report = physical.advise_semantic_indexes(
-            workload,
-            policy,
-            live.revision.semantic_context(),
-            registry,
-        )?;
-        if physical.transition_epoch() == source_epoch {
-            return Ok(report);
-        }
-        let next_version = live
-            .root_identity
-            .version
-            .0
-            .checked_add(1)
-            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
-        let candidate = RuntimeRevisionBundle {
-            root_identity: RuntimeRootIdentity {
-                root_id: live.root_identity.root_id,
-                version: RuntimeRootVersion(next_version),
-            },
-            revision: live.revision.clone(),
-            violation_state: live.violation_state.clone(),
-            physical,
-            relation_layouts: live.relation_layouts.clone(),
-            relation_bases: live.relation_bases.clone(),
-            materialization_specs: live.materialization_specs.clone(),
-            materializations: live.materializations.clone(),
-            materialization_dependencies: live.materialization_dependencies.clone(),
-            materializations_by_relation: live.materializations_by_relation.clone(),
-        };
-        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
-        Ok(report)
     }
 
     pub(crate) fn advise_unified_observable_atoms(
@@ -263,6 +178,7 @@ impl RuntimeRevisionCell {
             physical,
             relation_layouts: live.relation_layouts.clone(),
             relation_bases: live.relation_bases.clone(),
+            historical: live.historical.clone(),
             materialization_specs: live.materialization_specs.clone(),
             materializations: live.materializations.clone(),
             materialization_dependencies: live.materialization_dependencies.clone(),
@@ -312,6 +228,7 @@ impl RuntimeRevisionCell {
             physical,
             relation_layouts: live.relation_layouts.clone(),
             relation_bases: live.relation_bases.clone(),
+            historical: live.historical.clone(),
             materialization_specs: live.materialization_specs.clone(),
             materializations: live.materializations.clone(),
             materialization_dependencies: live.materialization_dependencies.clone(),
@@ -320,56 +237,6 @@ impl RuntimeRevisionCell {
         *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
         Ok(report)
     }
-
-    pub fn advise_semantic_statistics(
-        &self,
-        workload: &[SemanticIndexWorkloadSample],
-        policy: PhysicalArtifactAdvisorPolicy,
-        registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<SemanticStatisticsAdvisorReport, PhysicalExecutionError> {
-        let mut state = self
-            .root
-            .write()
-            .map_err(|_| PhysicalExecutionError::RuntimePublicationPoisoned)?;
-        let RuntimeRevisionCellState::Serving(live) = &*state else {
-            return Err(PhysicalExecutionError::RuntimeRecoveryRequired);
-        };
-        let mut physical = live.physical.clone();
-        let source_epoch = physical.transition_epoch();
-        let report = physical.advise_semantic_statistics(
-            workload,
-            policy,
-            live.revision.semantic_context(),
-            registry,
-        )?;
-        if physical.transition_epoch() == source_epoch {
-            return Ok(report);
-        }
-        let next_version = live
-            .root_identity
-            .version
-            .0
-            .checked_add(1)
-            .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
-        let candidate = RuntimeRevisionBundle {
-            root_identity: RuntimeRootIdentity {
-                root_id: live.root_identity.root_id,
-                version: RuntimeRootVersion(next_version),
-            },
-            revision: live.revision.clone(),
-            violation_state: live.violation_state.clone(),
-            physical,
-            relation_layouts: live.relation_layouts.clone(),
-            relation_bases: live.relation_bases.clone(),
-            materialization_specs: live.materialization_specs.clone(),
-            materializations: live.materializations.clone(),
-            materialization_dependencies: live.materialization_dependencies.clone(),
-            materializations_by_relation: live.materializations_by_relation.clone(),
-        };
-        *state = RuntimeRevisionCellState::Serving(Arc::new(candidate));
-        Ok(report)
-    }
-
     fn resume_deferred_physical_recovery(
         &self,
         specs: &[DurablePhysicalArtifactSpec],
@@ -435,6 +302,7 @@ impl RuntimeRevisionCell {
             physical,
             relation_layouts: live.relation_layouts.clone(),
             relation_bases: live.relation_bases.clone(),
+            historical: live.historical.clone(),
             materialization_specs: live.materialization_specs.clone(),
             materializations: live.materializations.clone(),
             materialization_dependencies: live.materialization_dependencies.clone(),

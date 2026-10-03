@@ -3837,3 +3837,1320 @@ Transaction writes + deterministic require expression
 
 ### NEXT RECOMMENDED PASS
 **PASS447 — require rebase/auth hostile closure + model-wide invariant algebra R&D.** First close stale/rebase and granular authorization matrices for the new passive precondition law. Then, if clean, formulate exact relation/cardinality/aggregate coordinates for true model-wide invariants using existing query/aggregate semantics; do not introduce a generic validator fallback.
+
+## PASS447 — requirement rebase/auth closure + first exact model-wide invariant
+
+### CLOSED THIS PASS
+- Closed the stale/rebase hostile matrix for `Transaction::require`: an intervening disjoint change that preserves the predicate remains publishable; an intervening disjoint change that falsifies it is rejected on the exact rebased Candidate before publication.
+- Closed revoke-before-commit semantics: requirement authorization is read from the live session authority at preview/commit, not frozen into the transaction. Revoking read authority prevents the same already-formed guarded transaction from observing/publishing through the requirement path.
+- Removed one obsolete-Candidate cost from stale commit: requirements are no longer evaluated against the known-stale source Candidate before certified transport. The original durable intent is still attempted first so uncertain retries retain `AlreadyCommitted` identity behavior.
+- Added the first true model-wide semantic invariant, `ModelRuleExpr::RelationCardinality { relation, min, max }`.
+- The cardinality law has one semantic meaning and two deliberately related realizations: `RelExpr::Scan` is the correctness oracle; production `CompiledModelRule` specializes exact `COUNT(Scan(relation))` to `SharedRelationRows::len()`, which is O(1) for both materialized and persistent-delta relation carriers and does not clone/materialize rows.
+- Model-rule cardinality participates in full validation, relation-subset validation, full VMF and relation-local VMF. Relation-only publication therefore cannot bypass it.
+- Cardinality VMF mass is exact: `min-count` below the lower bound and `count-max` above the upper bound.
+- Checkpoint schema codec v5 persists model rules and retains decode support for v1-v4 checkpoint records.
+
+### SELECTED LAW
+```text
+ModelRuleExpr::RelationCardinality(R, min, max)
+                    |
+          semantic COUNT(Scan(R))
+                    |
+          +---------+----------+
+          |                    |
+ query oracle / proof       production lowering
+ RelExpr::Scan(R)           SharedRelationRows::len()
+          |                    |
+          +---------=----------+
+                    |
+             exact VMF mass
+```
+
+### HOSTILE / REJECTED
+- REJECTED: evaluate `require` only at formation/source Candidate.
+- REJECTED: freeze read permission inside a requirement; current session authority remains authoritative.
+- REJECTED: build the obsolete source Candidate on every known-stale guarded commit before rebasing.
+- REJECTED: implement model-wide rules through a second generic full-model callback/evaluator.
+- REJECTED: materialize an entire relation merely to compute cardinality when persistent relation authority already carries exact multiplicity.
+- REJECTED: validate a model rule only in full-state validation; relation-local transitions and VMF must carry the same law.
+
+### VERIFICATION
+- `cargo check --workspace --all-targets`: PASS.
+- `cfmd` public surface: **53/53**.
+- `cfmd-runtime`: **51/51** total (3 + 9 + 39).
+- `kernel-schema`: **12/12**.
+- `kernel-validation`: **21 passed / 1 ignored**.
+- `kernel-durability`: **248 passed / 2 ignored**.
+- checkpoint model-rule roundtrip: PASS.
+- query-oracle vs O(1) cardinality specialization: PASS.
+
+### OPEN — IMMEDIATE
+1. Generalize model-wide invariant algebra beyond cardinality without creating a second relational AST: quantified membership/existence and exact aggregates should lower to existing query/aggregate owners and admit specialized maintained forms where available.
+2. Derive exact dependency footprints for each model rule so Candidate/rebase/watch validation can invalidate only rules touched by changed semantic relations rather than globally recompiling/rechecking them.
+3. Before exposing externally supplied/recoverable transaction IDs in public bindings, define a durable canonical digest for transaction requirements as part of client-intent identity. Current Rust product path remains safe through opaque regenerated IDs.
+4. Final typed Rust DX for invariant/require expressions remains open; `SemanticRuleExpr` / `ModelRuleExpr` are semantic substrate, not necessarily final application syntax.
+5. Revisit granular permission-construction DX: root `cfmd` deliberately hides `RelationColumnId`; roles need a typed object-field grant form rather than forcing low-level IDs into ordinary code.
+
+### OPEN — R&D / REMOTE-READER SCHEMA-EVOLUTION DX
+- reader may contain no authoritative schema definition;
+- no reader-specific server contracts/annotations and no dedicated compatibility handshake;
+- numeric schema epoch/version comes through ordinary metadata without `ModelRead`;
+- compatibility resolves once at `Context<M>` / `Snapshot<M>` binding, never per query/row;
+- no field-name/existence fallback; same spelling may carry different semantics across epochs;
+- uncovered epochs fail closed;
+- authoritative schema remains current-only and compatibility history remains consumer-side;
+- final annotation/API syntax remains deliberately undecided; `bind/rebind` is not selected terminology.
+
+### OPEN — DEFERRED / MANDATORY CARRY
+- migration frontend Rust/Python/TMD/CLI + diagnostics;
+- final Python/.NET/Studio surfaces;
+- backup/restore/corruption UX and exact admin permissions when those surfaces become reachable;
+- public performance/binary-size budgets;
+- native Windows secure-memory expansion;
+- transient/wide persistent-tree sorted bulk-builder R&D remains performance-only.
+
+### SUPERSEDED / DO NOT EXTEND
+- public `ReadContext` / any `ReaderContext`;
+- `Snapshot::transaction()`;
+- Context shape as security;
+- host callbacks/host regex validators;
+- separate transaction precondition/model-invariant evaluator;
+- O(N) relation materialization for pure cardinality;
+- name/ordinal-based rule identity;
+- per-query reader schema-version routing.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- no `require` => no requirement Candidate-evaluation cost;
+- known-stale guarded transaction skips obsolete source-Candidate requirement evaluation;
+- cardinality invariant production evaluation is O(1) in relation cardinality and allocation-free;
+- relation-local VMF only evaluates model rules whose exact relation dependency is touched;
+- preserve P397-P400 realization native-cost class, P435 persistent sharing and non-backtracking `TextPattern` behavior.
+
+### NEXT RECOMMENDED PASS
+**PASS448 — exact quantified/aggregate model-rule algebra + dependency certificates.** Extend the single model-rule law through existing query/aggregate semantics, starting with existence/all-style predicates or exact aggregate bounds only where dependency footprints and maintained/specialized lowering are explicit. Do not add a generic full-state rule router.
+
+## PASS448 — quantified/exact-aggregate model rules + dependency certificates
+
+### CLOSED THIS PASS
+- Extended the persisted database-wide invariant algebra without introducing a second relational AST:
+  - `RelationCardinality { relation, min, max }` remains exact `COUNT(Scan(relation))`;
+  - `RelationExists { relation, predicate }` adds existential quantification over semantic rows;
+  - `RelationAll { relation, predicate }` adds universal quantification with vacuous truth on an empty relation;
+  - `RelationExactF64SumRange { relation, column, min, max }` adds an exact finite-f64 aggregate bound over one stable semantic column.
+- `Exists`/`All` predicates reuse the same persisted `SemanticRuleExpr`; stable semantic relation-column IDs are resolved once into ordinals in `CompiledRelationPredicate`, not looked up per row.
+- Added `ModelRuleDependency { relation, columns }`. Cardinality has an empty column set; quantifiers carry exactly the predicate columns; exact sum carries exactly its aggregate column.
+- `CompiledRulePlan` now builds a relation -> model-rule index. Relation-local validation/VMF no longer linearly scans every model rule merely to reject unrelated dependencies.
+- Split fail-closed validation from VMF accounting: `is_satisfied()` may early-exit (`Exists` on first witness, `All` on first counterexample), while `violation_mass()` computes the exact zero-law measure only when VMF is requested.
+- Added `ExactF64Sum::cmp_f64_exact`. Aggregate bounds compare the exact superaccumulator against a finite f64 bound by the sign of the exact difference, not by rounded `finish()` output.
+- Added canonical `FiniteF64` bounds in `kernel-schema`; non-finite bounds are unrepresentable and `-0.0/+0.0` normalize to one semantic bound.
+- Quantifier specialization is checked against the existing relational `Scan -> FilterEqConst` oracle. Exact sum reuses `kernel-aggregate::ExactF64Sum`; no host/generic aggregate evaluator exists.
+- Checkpoint schema codec v5 persists `Exists`, `All`, and exact-f64-sum model rules and continues reading earlier v5 payloads containing only cardinality/older rule tags. Pre-release external format numbering was not advanced solely for these new internal tags.
+
+### SELECTED LAW
+```text
+persisted ModelRuleExpr
+        |
+        +-- Cardinality(R)
+        |      dependency = {R, columns = {}}
+        |      production = exact persistent multiplicity
+        |
+        +-- Exists(R, P) / All(R, P)
+        |      P = the same SemanticRuleExpr
+        |      dependency = {R, exact fields(P)}
+        |      compiled once: semantic column IDs -> ordinals
+        |
+        +-- ExactF64SumRange(R, c, bounds)
+               dependency = {R, {c}}
+               aggregate = kernel_aggregate::ExactF64Sum
+               compare = exact(sum - finite_bound)
+
+CompiledRulePlan
+        -> relation -> relevant rule indices
+        -> validation: early-exit truth
+        -> VMF: exact zero-law mass
+```
+
+### HOSTILE / REJECTED
+- REJECTED: another relational/model-rule query AST.
+- REJECTED: `try generic query, then specialized fallback` routing.
+- REJECTED: schema/field-name lookup for every quantified row.
+- REJECTED: evaluate every model rule on every relation-local Candidate transition.
+- REJECTED: use rounded `ExactF64Sum::finish()` as the comparison authority for exact aggregate bounds.
+- REJECTED: accept NaN/Infinity as persisted aggregate bounds.
+- REJECTED: force VMF's full counterexample count onto ordinary fail-fast validation.
+
+### VERIFICATION
+- `cargo check --workspace --all-targets`: PASS.
+- `kernel-aggregate`: **11/11**.
+- `kernel-schema`: **12/12**.
+- `kernel-validation`: **24 passed / 1 ignored**.
+- `kernel-durability`: **248 passed / 2 ignored**.
+- `cfmd` public surface: **53/53**; public API contract PASS.
+- quantifier relation-oracle hostile: PASS.
+- exact f64 cancellation/bound hostile: PASS.
+- checkpoint model-rule roundtrip including quantifier + exact sum: PASS.
+
+### OPEN — IMMEDIATE
+1. Consume the exact column portion of `ModelRuleDependency` in semantic mutation/Candidate invalidation. Current relation-local kernel publication already indexes by relation, but it does not yet distinguish relation membership changes from a certified field-coordinate rewrite that provably leaves all rule-dependent columns unchanged.
+2. Extend model-wide algebra only where the existing query/aggregate math provides one exact law: grouped/keyed aggregates and multi-relation quantified dependencies are the next candidates. Do not add arbitrary callbacks or a generic full-state router.
+3. R&D maintained/incremental witnesses for hot `Exists`/`All`/sum rules so large-relation validation can consume exact change deltas rather than rescanning semantic rows when a maintained proof is cheaper.
+4. Before externally supplied/recoverable transaction IDs become normal binding DX, define a durable canonical digest for transaction requirements as part of client-intent identity.
+5. Design final typed Rust DX for invariant/`require` expressions only after the algebra stabilizes; `SemanticRuleExpr` / `ModelRuleExpr` remain substrate.
+6. Role DX follow-up: provide typed object-field grants without exposing low-level relation-column IDs in ordinary root API.
+
+### OPEN — R&D / REMOTE-READER SCHEMA-EVOLUTION DX
+- reader may contain no authoritative schema definition;
+- no reader-specific server contracts/annotations and no dedicated compatibility handshake;
+- numeric schema epoch/version comes through ordinary metadata without `ModelRead`;
+- compatibility resolves once at `Context<M>` / `Snapshot<M>` binding, never per query/row;
+- no field-name/existence fallback; same spelling may carry different semantics across epochs;
+- uncovered epochs fail closed;
+- authoritative schema remains current-only and compatibility history remains consumer-side;
+- final annotation/API syntax remains deliberately undecided; `bind/rebind` is not selected terminology.
+
+### OPEN — DEFERRED / MANDATORY CARRY
+- migration frontend Rust/Python/TMD/CLI + diagnostics;
+- final Python/.NET/Studio surfaces;
+- backup/restore/corruption UX and exact admin permissions when those surfaces become reachable;
+- public performance/binary-size budgets;
+- native Windows secure-memory expansion;
+- transient/wide persistent-tree sorted bulk-builder R&D remains performance-only.
+
+### SUPERSEDED / DO NOT EXTEND
+- public `ReadContext` / any `ReaderContext`;
+- `Snapshot::transaction()`;
+- Context shape as security;
+- host callbacks / generic validator / generic model-rule engine;
+- rounded floating aggregate comparison as semantic authority;
+- global model-rule scans on relation-local validation when exact dependency indexing exists;
+- name/ordinal-based semantic rule identity;
+- per-query reader schema-version routing.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- cardinality remains O(1) and allocation-free after rule-plan compilation;
+- relation-local model-rule selection is O(relevant rules), not O(all model rules);
+- quantified predicates do no schema-coordinate lookup per row after compilation;
+- ordinary fail-closed `Exists`/`All` validation may early-exit; exact VMF mass is paid only when requested;
+- exact f64 aggregation remains order-independent and uses the exact accumulator;
+- preserve P397-P400 realization native-cost class, P435 persistent sharing and non-backtracking `TextPattern` behavior.
+
+### NEXT RECOMMENDED PASS
+**PASS449 — column-selective invariant invalidation + maintained witnesses.** First connect `ModelRuleDependency.columns` to P438/P439 stable field-coordinate change authority so unrelated same-relation field updates do not reevaluate quantifier/aggregate rules. Then R&D maintained delta witnesses for hot `Exists`/`All`/sum rules, reusing query/aggregate incremental machinery rather than rescanning or adding a fallback engine.
+
+## PASS449 — column-selective model-rule invalidation + benchmark gate
+
+### CLOSED THIS PASS
+- Connected P448 `ModelRuleDependency.columns` to P438/P439 stable semantic object-field coordinates through `RelationMutationFootprint`.
+- A certified field-only relation rewrite now carries `{ membership_changed = false, exact changed semantic columns }`; generic relation/create/delete/relationship mutations remain `full` and invalidate all model rules on the relation.
+- `CompiledRulePlan::model_rules_for_mutation(...)` filters exact relation-local model rules by dependency intersection. Cardinality is skipped for field-only updates because membership is unchanged; quantified/exact-sum rules are skipped when their dependency columns are disjoint from the changed fields.
+- Selective invalidation participates in both Candidate validation and runtime VMF construction. It is not merely planner metadata.
+- Pure scalar object-field Candidate construction now uses selective relation-update validation instead of full `Revision::build`, while preserving exact relation-only provenance.
+- Hostile audit found and fixed an older append-only Bag fast-path hole exposed by P447/P448 model-wide rules: appended rows are structurally validated without rescanning old Bag support, then model rules are checked against the complete persistent target. VMF recomputes only affected model-rule witnesses instead of blindly transporting `V=0`.
+- Added hostile coverage proving same-relation unrelated fields do not select a quantified rule, while a dependent field does.
+- Added append-only cardinality hostile proving `max` cannot be bypassed through the old Bag fast path.
+
+### SELECTED LAW
+```text
+semantic mutation authority
+        |
+        +-- exact object-field rewrite
+        |      membership_changed = false
+        |      columns = {stable semantic field ids}
+        |
+        +-- generic/create/delete/relationship relation mutation
+               footprint = FULL
+
+ModelRuleDependency { relation, columns }
+        |
+        +-- cardinality: affected iff membership can change
+        +-- Exists/All/Sum: affected iff membership changes
+        |                    OR changed columns intersect dependencies
+        v
+selective Candidate validation + selective VMF rule accounting
+```
+
+The footprint is derived inside the kernel/runtime boundary from durable semantic mutation authority. It is not a caller-provided promise and never falls back from an unproven generic delta to a narrower field footprint.
+
+### PERFORMANCE R&D RESULT
+Release benchmark, one compiled `RelationAll(TextLength)` rule with all rows satisfying the predicate:
+
+```text
+rows        relevant full rule scan       column-selective skip
+1,000          9,024 ns                       631 ns
+100,000      945,936 ns                     1,412 ns
+1,000,000  9,549,789 ns                     4,607 ns
+```
+
+The relevant scan scales linearly and reaches ~9.55 ms per rule at 1M rows. A handful of hot quantified/aggregate invariants can therefore consume tens of milliseconds of commit latency. Maintained witness R&D is justified by measurement rather than speculation.
+
+### HOSTILE / REJECTED
+- REJECTED: treat a field-coordinate footprint as an externally trusted optimization hint.
+- REJECTED: infer field-only semantics from `removed.len() == inserted.len()` alone.
+- REJECTED: reevaluate cardinality after a certified same-membership field rewrite.
+- REJECTED: keep the old append-only Bag `V=0` transport after model-wide rules became authoritative.
+- REJECTED: introduce maintained witness state before measuring the O(N) payer.
+
+### VERIFICATION
+- `cargo check --workspace --all-targets`: PASS.
+- `kernel-validation`: **25 passed / 2 ignored**.
+- `kernel-revision`: **7/7**.
+- `kernel-plan`: **297 passed / 5 ignored**.
+- `cfmd-runtime`: **51/51** total (3 + 9 + 39).
+- public `cfmd`: **53/53** + API contract PASS.
+- release 1k/100k/1M model-rule benchmark: PASS, numbers above.
+- same-relation unrelated-field selective hostile: PASS.
+- append-only Bag model-rule bypass hostile: PASS.
+
+### OPEN — IMMEDIATE
+1. **PASS450 maintained model-rule witnesses**, now justified by the measured ~9.55 ms / 1M-row / rule payer. Keep them reconstructible runtime state, not a second durable semantic store. Target exact delta maintenance for `Exists`, `All`, and `ExactF64Sum`; cardinality already has O(1) persistent multiplicity.
+2. Derive witness updates from existing relation delta / query / aggregate laws. No fallback engine, no polling/recompute router, and no semantic authority separate from `ModelRuleExpr`.
+3. Extend column-selective structural validation later if profiling shows whole relation row/type validation itself dominates field-only commits; P449 specifically closes model-rule invalidation and does not falsely claim every relation-local validation cost is O(delta).
+4. Extend grouped/multi-relation model invariants only where existing query/aggregate calculus yields exact dependency closure.
+5. Define durable canonical requirement digest before externally supplied/recoverable transaction IDs become ordinary cross-binding DX.
+6. Final typed Rust invariant/`require` expression syntax and typed object-field grant DX remain open.
+
+### OPEN — R&D / REMOTE-READER SCHEMA-EVOLUTION DX
+- reader may contain no authoritative schema code;
+- server owns no reader-specific compatibility contracts/annotations;
+- no dedicated compatibility handshake;
+- numeric schema epoch/version comes through ordinary metadata without `ModelRead`;
+- compatibility resolves once at `Context<M>` / `Snapshot<M>` binding, never per query/row;
+- no field-name/existence fallback; identical spelling may have different semantics across epochs;
+- uncovered epochs fail closed;
+- authoritative schema stays current-only; compatibility history stays consumer-side;
+- final syntax remains deliberately undecided; `bind/rebind` is not selected terminology.
+
+### OPEN — DEFERRED / MANDATORY CARRY
+- migration frontend Rust/Python/TMD/CLI + diagnostics;
+- final Python/.NET/Studio surfaces;
+- backup/restore/corruption UX and exact future admin permissions;
+- public performance/binary-size budgets;
+- native Windows secure-memory expansion;
+- transient/wide persistent-tree sorted bulk-builder R&D remains performance-only.
+
+### SUPERSEDED / DO NOT EXTEND
+- public `ReadContext` / any `ReaderContext`;
+- `Snapshot::transaction()`; transactions remain `Transaction::new()` / `Transaction::from(snapshot)`;
+- Context shape as security;
+- callback/generic model-invariant engine;
+- externally trusted mutation-footprint hints;
+- unconditional append-only Bag VMF zero transport in the presence of model rules;
+- global model-rule scans when exact relation/column dependencies exist;
+- per-query reader schema-version routing.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- unrelated same-relation field rewrites perform O(relevant-rule-index lookup), not O(relation cardinality) model-rule scans;
+- cardinality remains O(1) after compilation;
+- relevant quantified rule scan baseline measured at ~9.55 ms / 1M rows / rule before maintained witnesses;
+- append-only Bag structural validation remains bounded to appended rows; model-rule cost is paid only for model rules actually affected by membership change;
+- preserve P397-P400 realization native-cost class, P435 persistent sharing, P443 non-backtracking `TextPattern`, and P447/P448 exact rule semantics.
+
+### NEXT RECOMMENDED PASS
+**PASS450 — maintained exact model-rule witness state.** Build reconstructible runtime witnesses for `Exists`, `All`, and exact-f64 sum from the existing compiled model-rule/query/aggregate laws and update them from exact relation deltas. Benchmark delta update against the P449 scan baseline before accepting the architecture. Do not persist a second semantic truth store.
+
+## PASS450 — maintained exact model-rule witness algebra + runtime VMF integration
+
+### CLOSED THIS PASS
+- Added reconstructible `ModelRuleWitnessState` over the existing compiled `ModelRuleExpr` algebra; no second semantic rule engine and no durable witness store.
+- Exact maintained witnesses are:
+  - `RelationCardinality { count }`;
+  - `RelationExists { matching }`;
+  - `RelationAll { violating }`;
+  - `RelationExactF64SumRange { ExactF64Sum }`.
+- Witness state is built exactly from an authoritative `Revision` and updated from exact relation `removed/inserted` rows plus the P449 `RelationMutationFootprint`.
+- `Exists`/`All` update only predicate contribution of changed rows; exact sum uses `ExactF64Sum::remove/add`; cardinality uses exact inserted/removed multiplicity.
+- Hostile parity proves delta-maintained witness state equals a full target-state rebuild.
+- `RuntimeViolationState` now owns this reconstructible witness state. Relation-transition VMF updates model-rule witnesses from exact relation delta instead of rescanning the target relation for model-rule mass.
+- Append-only Bag runtime VMF no longer performs the old full-target model-rule rescan; affected model-rule mass comes from the same maintained witness state.
+- Reopen/rebuild still reconstructs witnesses from authoritative `Revision + ModelRuleExpr`; no witness bytes were added to WAL/checkpoint/durable metadata.
+- Split relation dynamic VMF calculation so runtime can recompute relation-local structural witnesses while consuming maintained model-rule witnesses, avoiding duplicate model-rule scans at that boundary.
+
+### SELECTED LAW
+```text
+authoritative Revision R + persisted ModelRuleExpr
+                    |
+                    v
+          reconstruct witness W(R)
+
+exact relation delta Δ = {removed, inserted}
++ certified mutation footprint
+                    |
+                    v
+          W(R') = maintain(W(R), Δ)
+                    |
+                    +-- Exists: matching += inserted_matches - removed_matches
+                    +-- All: violating += inserted_violations - removed_violations
+                    +-- ExactSum: accumulator += inserted - removed
+                    +-- Cardinality: count += inserted_count - removed_count
+                    v
+             exact VMF rule mass
+```
+
+Witness state is optimization/proof authority only. `Revision + ModelRuleExpr` remains the sole reconstructible semantic truth.
+
+### PERFORMANCE R&D RESULT
+Release benchmark, one `RelationAll(TextLength)` rule over 1,000,000 rows and one-row replacement:
+
+```text
+full target rule scan:       8,738,476 ns  (~8.74 ms)
+maintained one-row delta:       14,742 ns  (~14.7 us)
+speedup:                        ~592.76x
+```
+
+The maintained number includes the current small compiled-rule-plan reconstruction in the prototype, so the underlying row-delta arithmetic itself is cheaper still.
+
+### HOSTILE / REJECTED
+- REJECTED: persist witness state as another durable truth source.
+- REJECTED: maintain approximate/rounded f64 sum; witness uses exact `ExactF64Sum` add/remove.
+- REJECTED: infer witness changes by rescanning target rows.
+- REJECTED: keep model-rule evaluation inside relation VMF after adding maintained witnesses; structural relation VMF and model-rule witness VMF now have separate exact payers.
+- REJECTED: claim full end-to-end commit is O(delta) yet. `kernel-revision` relation validation still evaluates affected model rules from target state before runtime VMF maintenance; PASS450 removes the duplicate runtime rescan and establishes the exact maintained algebra, but the first revision-validation payer remains OPEN.
+
+### VERIFICATION
+- witness delta-vs-full-rebuild parity hostile: PASS.
+- release 1M-row benchmark: ~8.74 ms full scan vs ~14.7 us maintained delta (~592.76x).
+- `kernel-validation`: **26 passed / 3 ignored**.
+- `kernel-plan`: **297 passed / 5 ignored**.
+- `kernel-durability`: **248 passed / 2 ignored**.
+- `cfmd-runtime`: **51/51** total (3 + 9 + 39).
+- public `cfmd`: **53/53** + API contract PASS.
+- `cargo check --workspace --all-targets`: PASS.
+
+### OPEN — IMMEDIATE
+1. **PASS451 — consume maintained model-rule witnesses at the kernel-revision Candidate validation boundary.** The first affected-rule scan still occurs while constructing/validating the logical target revision. Move/reconstruct the witness authority at the immutable Revision boundary or otherwise certify delta-maintained model-rule validity there, so hot relation/field commits actually realize O(delta) rule cost end-to-end rather than merely removing the second VMF scan.
+2. Do not weaken relation row/type/live-reference/uniqueness validation while removing the model-rule payer. Model-rule witness maintenance and structural validation are distinct laws.
+3. Benchmark the complete public commit path before and after PASS451 at 1M rows; accept the architecture only if the measured O(N) model-rule payer disappears from end-to-end publication.
+4. Only after that benchmark, profile whether field-only structural row validation itself warrants a separate delta certificate path.
+5. Extend grouped/multi-relation invariants only where existing query/aggregate calculus yields exact dependency and delta laws.
+6. Define durable canonical requirement digest before externally supplied/recoverable transaction IDs become ordinary cross-binding DX.
+7. Final typed Rust invariant/`require` expression syntax and typed object-field grant DX remain open.
+
+### OPEN — R&D / REMOTE-READER SCHEMA-EVOLUTION DX
+- reader may contain no authoritative schema code;
+- server owns no reader-specific compatibility contracts/annotations;
+- no dedicated compatibility handshake;
+- numeric schema epoch/version comes through ordinary metadata without `ModelRead`;
+- compatibility resolves once at `Context<M>` / `Snapshot<M>` binding, never per query/row;
+- no field-name/existence fallback; identical spelling may have different semantics across epochs;
+- uncovered epochs fail closed;
+- authoritative schema stays current-only; compatibility history stays consumer-side;
+- final syntax remains deliberately undecided; `bind/rebind` is not selected terminology.
+
+### OPEN — DEFERRED / MANDATORY CARRY
+- migration frontend Rust/Python/TMD/CLI + diagnostics;
+- final Python/.NET/Studio surfaces;
+- backup/restore/corruption UX and exact future admin permissions;
+- public performance/binary-size budgets;
+- native Windows secure-memory expansion;
+- transient/wide persistent-tree sorted bulk-builder R&D remains performance-only.
+
+### SUPERSEDED / DO NOT EXTEND
+- public `ReadContext` / any `ReaderContext`;
+- `Snapshot::transaction()`; transactions remain `Transaction::new()` / `Transaction::from(snapshot)`;
+- Context shape as security;
+- callback/generic model-invariant engine;
+- durable witness cache as semantic authority;
+- target-relation rescans inside runtime VMF for `Exists`/`All`/exact sum;
+- externally trusted mutation-footprint hints;
+- per-query reader schema-version routing.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P449 unrelated-field skip remains O(relevant-rule-index lookup), not O(relation cardinality).
+- P450 maintained one-row `All` delta at 1M rows is ~14.7 us vs ~8.74 ms full scan on this sandbox (~593x); do not regress maintained runtime VMF back to O(N).
+- exact-f64 witness maintenance must remain exact and order-independent.
+- witness rebuild on open is allowed to be O(data) because it is reconstructible optimization state, but steady-state relation delta maintenance must be O(delta × affected rules).
+- preserve P397-P400 realization native-cost class, P435 persistent sharing and P443 non-backtracking `TextPattern` behavior.
+
+### NEXT RECOMMENDED PASS
+**PASS451 — revision-bound maintained model-rule validity.** Reuse P450 witness algebra during logical Candidate construction so the first model-rule scan disappears, then benchmark the full public commit path. Do not fold structural row/type validation into the witness cache or create a second durable truth store.
+
+## PASS451 — revision-bound maintained model-rule validity + runtime publication hostile
+
+### CLOSED THIS PASS
+- `kernel-revision::Revision` now carries reconstructible `ModelRuleWitnessState` as non-semantic cache/proof state, alongside other revision-local derived authorities. `Revision + ModelRuleExpr` remains semantic truth.
+- Full/schema/reopen builds reconstruct the witness state from authoritative data. Relation-only candidates inherit source witnesses and update them from exact removed/inserted rows plus certified `RelationMutationFootprint`.
+- Relation candidate validation is split cleanly: structural/type/set/live-reference validation remains exact over relation state; affected model rules are certified from maintained witnesses rather than rescanning the target relation.
+- `RelationUpdateCandidate::patch_relation_rows_with_footprint` updates model-rule witnesses in O(delta x affected-rules); generic full-row replacement invalidates the cache and deliberately falls back to reconstructing it.
+- Append-only Bag revision construction updates model-rule witnesses from appended delta instead of rescanning the complete target for model rules.
+- Runtime `RuntimeViolationState` consumes the exact witness state already bound to the target `Revision`; P450's second independent witness-delta maintenance path was removed, preventing duplicate maintained authority.
+- Pure object-field target construction now goes through `RelationUpdateCandidate` with exact stable-field footprint instead of `build_relation_update_selective` over an already-mutated full target state.
+- Hostile parity proves target revision witnesses equal an independent rebuild; an invalid one-row delta is rejected at the revision witness boundary.
+- Validation API compatibility preserved: omitted explicit footprints still mean FULL for supplied relations; exact hot paths pass explicit footprints.
+
+### SELECTED LAW
+```text
+Revision R
+  = semantic state authority
+  + reconstructible W(R)
+
+certified relation delta Delta
+  -> structurally validate target relation
+  -> W(R') = maintain(W(R), Delta)
+  -> validate only affected model-rule witnesses
+  -> Revision R'
+
+runtime VMF/publication consumes W(R')
+without constructing a second witness authority.
+```
+
+### HOSTILE / PERFORMANCE FINDINGS
+- The model-rule O(N) scan targeted by PASS451 is removed from logical Candidate construction.
+- A 1,000,000-row full runtime-publication probe was killed by sandbox memory pressure (`status 9`). This is not attributed to model-rule witnesses: the existing endpoint path materializes/copies full relations for a one-row delta.
+- A retained 100,000-row release benchmark for one-row replacement with a model-wide `All` rule measured approximately:
+```text
+total publication: ~1237.3 ms
+logical target derivation: ~91.2 ms
+prepare: ~1146.0 ms
+publish/root swap: ~0.004 ms
+```
+- Therefore the next bottleneck is not model-rule evaluation. `prepare` still pays full relation structural/VMF work; endpoint derivation still materializes the relation. Both are separate from model-rule witness semantics and must not be hidden inside that cache.
+
+### VERIFICATION
+- revision witness delta-vs-full-rebuild hostile: PASS.
+- invalid maintained witness transition: rejected exactly.
+- `kernel-validation`: 26 passed / 3 ignored.
+- `kernel-revision`: 8 passed / 0 failed.
+- `kernel-plan`: 297 passed / 6 ignored.
+- public `cfmd`: 53/53.
+- workspace `cargo check --workspace --all-targets`: PASS.
+- diagnostic release runtime publication benchmark at 100k: PASS.
+
+### OPEN — IMMEDIATE
+1. **PASS452 — delta-bounded structural publication.** Remove the dominant full-relation structural/VMF scan in runtime prepare using exact relation-delta certificates/maintained structural witnesses, without claiming model-rule witnesses prove type/set/live-reference/uniqueness laws.
+2. Remove full relation materialization from `derive_relation_target_revision`; derive exact persistent endpoint/removed positions from canonical occurrence/index authority already present in query/change/storage machinery.
+3. Re-run end-to-end publication benchmark at 100k and 1M after both payers are removed. The 1M probe must no longer exceed sandbox memory because of O(N) temporary copies.
+4. Preserve P451 revision witness law and P450 ~593x model-rule delta baseline; do not regress by reintroducing target scans.
+5. Durable canonical transaction-requirement digest before externally supplied/recoverable transaction IDs become normal cross-binding DX.
+6. Final typed invariant/`require` expression syntax and typed object-field grant DX remain open.
+
+### OPEN — R&D / REMOTE-READER SCHEMA-EVOLUTION DX
+- reader may contain no authoritative schema code;
+- server owns no reader-specific compatibility contracts/annotations;
+- no dedicated compatibility handshake;
+- numeric schema epoch/version comes through ordinary metadata without `ModelRead`;
+- compatibility resolves once at `Context<M>` / `Snapshot<M>` binding, never per query/row;
+- no field-name/existence fallback; identical spelling may have different semantics across epochs;
+- uncovered epochs fail closed;
+- authoritative schema stays current-only; compatibility history stays consumer-side;
+- final syntax remains deliberately undecided; `bind/rebind` is not selected terminology.
+
+### OPEN — DEFERRED / MANDATORY CARRY
+- migration frontend Rust/Python/TMD/CLI + diagnostics;
+- final Python/.NET/Studio surfaces;
+- backup/restore/corruption UX and exact future admin permissions;
+- public performance/binary-size budgets;
+- native Windows secure-memory expansion;
+- transient/wide persistent-tree sorted bulk-builder R&D remains performance-only.
+
+### SUPERSEDED / DO NOT EXTEND
+- public `ReadContext` / any `ReaderContext`;
+- `Snapshot::transaction()`; transactions remain `Transaction::new()` / `Transaction::from(snapshot)`;
+- Context shape as security;
+- callback/generic model validator;
+- durable model-rule witness truth store;
+- a second runtime model-rule witness maintenance path after `Revision` already certifies W(R');
+- full target model-rule scans on certified relation deltas;
+- externally trusted mutation footprints;
+- per-query reader schema-version routing.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P449 unrelated-field invalidation remains relation/column selective.
+- P450 maintained 1-row model-rule delta: ~14.7 us vs ~8.74 ms full scan at 1M rows (~593x).
+- P451 model-rule validation at revision boundary is delta-maintained; any remaining O(N) cost must be attributed to structural/endpoint layers, not reintroduced rule scans.
+- publish/root-swap itself measured ~0.004 ms at 100k; do not optimize it before the ~1.146 s prepare payer and ~91 ms endpoint payer.
+
+### NEXT RECOMMENDED PASS
+**PASS452 — delta-bounded structural publication + persistent endpoint derivation.** First attack the ~1.146 s/100k prepare payer with exact structural delta certificates; then remove the ~91 ms/100k full relation materialization in endpoint derivation. Re-benchmark 1M only after memory amplification is removed.
+
+## PASS452 — persistent exact-delta endpoint + delta-bounded structural publication
+
+### CLOSED THIS PASS
+- Persistent AVL maps now maintain subtree cardinality and expose O(log N) `rank_of`, a general order-statistics primitive used to translate stable occurrence handles into logical row ordinals without scanning immutable maps.
+- `RelationBaseWitness::advance_with_source_positions` derives exact removal ordinals plus successor Γ-support in O(delta log N), preserving Set/Bag occurrence laws.
+- Runtime relation endpoint derivation no longer materializes/clones the source relation or applies a generic `RelationValue` rewrite. It patches persistent relation storage directly from exact semantic delta + relation witness.
+- Exact-delta revision construction validates only inserted rows for arity/type/column rules/live references; unchanged survivors inherit source certification. Full structural validation remains for uncertified/generic replacement paths.
+- Ref-free exact deltas preserve the source live-reference sensitivity authority without relation rescan; ref-bearing paths remain exact and recompile the affected relation.
+- Exact-derived runtime prepare consumes target `Revision` validity rather than rebuilding row-level VMF over an already-certified candidate.
+- Full-row write occurrence authority is now reconstructible runtime-root state built/restored before hot removal commits and incrementally maintained afterward; first removal no longer builds an O(N) occurrence directory inside commit.
+- `CertifiedSemanticMorphism` materialized mappings are shared through `Arc<BTreeMap<...>>`, removing a deep O(N) clone from copy-on-write physical candidate preparation.
+
+### PERFORMANCE
+- P451 baseline, 100k one-row replacement: derive ~91.2 ms, prepare ~1146.0 ms, total ~1237.3 ms.
+- P452 frozen release benchmark: derive ~0.138 ms, prepare ~122.461 ms, publish ~0.004 ms, total ~122.603 ms.
+- Endpoint derivation improved ~660x and total publication ~10x. O(N) logical endpoint materialization is removed.
+- Remaining prepare cost is now physical maintained occurrence/support transition; it is no longer attributable to model-rule or revision structural validation.
+
+### OPEN — IMMEDIATE
+1. PASS453: make physical row-occurrence/observable support candidate transition structurally persistent end-to-end so one-row mutation does not clone/rebuild support-class state; re-run 100k and 1M end-to-end publication.
+2. Extend live-reference sensitivity from ref-free fast preservation to exact stable-handle delta maintenance for ref-bearing relations, removing the remaining full affected-relation recompile without a fallback semantic path.
+3. Preserve exact relation/model-rule witness laws and public transaction/context DX.
+
+### CARRY — REMOTE READER DX
+Schema-version-aware reader binding remains open with consumer-side compatibility, no server reader contracts, no dedicated handshake, no per-query routing, and no selected `bind/rebind` syntax.
+
+### NEXT RECOMMENDED PASS
+**PASS453 — persistent physical occurrence/support transition.** Attack the remaining ~122 ms/100k prepare payer below logical revision validation; do not reopen rules or endpoint semantics.
+
+## PASS453 — persistent incremental observable projection + exact relation-witness locality
+
+### CLOSED THIS PASS
+- Fixed the P452 public-surface regression: a `RelationBaseWitness` is relation-local authority and may legally retain an older global revision id when its relation was untouched. Exact delta derivation now requires the same relation + semantic context, not false global `witness.revision == HEAD` coupling.
+- Empty/previously absent relation insertion remains valid on the persistent patch path when there are no removals.
+- `CertifiedSemanticMorphism` materialized mappings now use `PersistentOrdMap`, preserving O(1) snapshot clones and path-copy updates.
+- Observable product projection is maintained incrementally: interning one new product class extends exactly one projection image instead of rebuilding projection mapping over every historical product class.
+- `MaterializedObservableAtomState::apply_physical_delta` therefore updates occurrence/support/projection state in delta-bounded form; reconstruct/build still produces the complete certified projection from authoritative catalog state.
+
+### HOSTILE FINDINGS / SELECTED LAW
+- P452's remaining ~122 ms/100k prepare payer was not storage mutation, model rules, or VMF. The hot path rebuilt `CertifiedSemanticMorphism::product_projection` across the complete product-class catalog after every inserted row.
+- Selected law:
+```text
+certified product projection P over catalog C
++ one newly interned product class c -> components(c)
+= persistent P' = P ∪ { c -> projected components(c) }
+```
+- No fallback/full projection rebuild occurs on ordinary maintained delta. Full reconstruction remains only the rebuild/recovery oracle.
+- The P452 false revision coupling is rejected: unchanged relation support is not invalidated merely because an unrelated relation advanced the database revision.
+
+### PERFORMANCE
+- 100k one-row diagnostic stage in the same debug build:
+  - before incremental projection: physical apply ~229.6 ms;
+  - after incremental persistent projection: physical apply ~0.81 ms;
+  - improvement on the isolated dominant stage: ~283x.
+- P452 release logical endpoint baseline (~0.138 ms at 100k) is preserved conceptually; no endpoint materialization path was reintroduced.
+- The old test-only `prepare_revision_for_test` intentionally replays the claimed endpoint and therefore still contains O(N) oracle work; it is not the production `prepare_revision_derived` path used by durable exact-derived publication.
+
+### VERIFICATION
+- P452 regression hostile `same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_intent`: PASS.
+- P452 regression hostile `many_count_predicates_preserve_zero_degree_in_exact_candidate_and_watch`: PASS.
+- `kernel-semantics`: 65/65.
+- public `cfmd`: 53/53.
+
+### OPEN — IMMEDIATE
+1. Re-run retained production-derived publication diagnostics at 1M with a test hook that measures `prepare_revision_derived` rather than the replay-oracle helper; benchmark plumbing must not change production semantics.
+2. Extend exact live-reference sensitivity maintenance for ref-bearing relation deltas so those transitions do not recompile the whole affected relation.
+3. Continue reader schema-evolution DX design without selecting `bind/rebind` syntax prematurely.
+
+### CARRY — NON-NEGOTIABLE DX
+- transactions remain only `Transaction::new()` / `Transaction::from(snapshot)`;
+- public `ReadContext` / `ReaderContext` remain superseded;
+- no server-side reader contracts, dedicated compatibility handshake, or per-query schema routing;
+- no generic SQL/full-state fallback in exact-delta publication.
+
+### NEXT RECOMMENDED PASS
+**PASS454 — exact live-ref sensitivity delta maintenance + production-derived 1M benchmark.** The P453 observable-projection rebuild payer is closed; do not reopen model-rule or endpoint semantics.
+
+## PASS454 — exact live-ref delta maintenance + production-derived 1M publication
+
+### CLOSED THIS PASS
+- Ref-bearing exact relation deltas no longer trigger full affected-relation `LiveRefSensitivityIndex` recompilation.
+- Relation live-ref sensitivity now uses compact stable row coordinates: immutable base positions, persistent removed-base coordinates, monotone inserted-tail tokens, and reverse maps only for rows that actually contain live references.
+- Current row ordinals are recovered by order statistics (`rank_before` / `value_at_rank`) rather than renumbering reverse-index entries after removals.
+- Exact `RelationUpdateCandidate` transitions maintain live-ref sensitivity from the same certified remove+append delta used by persistent relation storage; generic/full replacement paths retain explicit reconstruct/recompile behavior.
+- Added a test-only production benchmark hook for the real `prepare_revision_derived` path. It does not replay/revalidate a caller-supplied full endpoint.
+
+### HOSTILE FINDINGS / SELECTED LAW
+- A first token prototype assigned one persistent AVL token to every relation row. It was rejected after the 1M probe exposed O(N) metadata/memory amplification even for relations with no live refs.
+- Selected compact law mirrors `SharedRelationRows`: source rows keep `Base(position)` identity; exact removals are a persistent set of base coordinates; inserted rows receive monotone tail tokens. Reverse metadata exists only for ref-bearing rows. Thus memory is O(ref-bearing rows + accumulated exact delta), not O(total relation cardinality).
+- The initial 1M benchmark fixture also used one million distinct scalar values and therefore measured product-catalog cardinality. The retained benchmark uses 1M rows over two source product classes and one changed class, isolating relation-cardinality publication scaling.
+
+### PERFORMANCE
+Production-derived release path, 1,000,000 logical rows, one-row replacement:
+- derive: ~0.119 ms;
+- `prepare_revision_derived`: ~0.169 ms;
+- publish/root swap: ~0.002 ms;
+- total measured transition: ~0.295 ms.
+
+This is the production exact-derived path, not `prepare_revision_for_test` replay-oracle work.
+
+### OPEN — IMMEDIATE
+1. Run a dedicated ref-heavy scaling benchmark (sparse and dense live-reference rows) to quantify O(delta log N + affected-ref-consumers) behavior and ensure no hidden ref-density payer remains.
+2. Typed field-grant DX and durable canonical transaction-requirement digest before externally supplied/recoverable transaction IDs become normal cross-binding DX.
+3. Continue remote-reader schema-evolution DX design; syntax remains intentionally undecided.
+
+### OPEN — R&D / REMOTE-READER SCHEMA EVOLUTION
+- reader may have no authoritative schema code;
+- server owns no reader-specific compatibility annotations/contracts;
+- schema epoch/version is ordinary metadata, no dedicated handshake;
+- compatibility resolves once at `Context<M>` / `Snapshot<M>` binding;
+- no name/existence fallback or per-query routing;
+- same spelling may carry different semantics across epochs; uncovered epochs fail closed;
+- final syntax deliberately undecided; `bind/rebind` is not selected terminology.
+
+### SUPERSEDED / DO NOT EXTEND
+- public `ReadContext` / any `ReaderContext`;
+- `Snapshot::transaction()`; transaction construction remains `Transaction::new()` / `Transaction::from(snapshot)`;
+- full relation live-ref recompile on certified exact delta;
+- O(total rows) token metadata for live-ref sensitivity;
+- generic SQL/full-state fallback on exact-delta publication.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P450 maintained model-rule witness: ~14.7 us one-row delta vs ~8.74 ms full 1M scan.
+- P453 incremental observable projection: ~0.81 ms debug isolated physical stage vs ~229.6 ms before.
+- P454 production-derived 1M one-row publication: derive ~0.119 ms, prepare ~0.169 ms, publish ~0.002 ms, total ~0.295 ms on the retained low-product-cardinality fixture.
+
+### NEXT RECOMMENDED PASS
+**PASS455 — ref-heavy scaling hostile + remaining productization ledger audit.** Benchmark sparse/dense live-reference exact deltas before adding more maintained state. If scaling remains delta-bounded, leave the live-ref algebra closed and return to the highest-value remaining product/DX goal rather than speculative caching.
+
+## PASS455 — ref-heavy live-ref scaling hostile + append-coordinate closure + productization audit
+
+### CLOSED THIS PASS
+- Dedicated sparse/dense `LiveRefSensitivityIndex` release diagnostics now measure exact one-row delta maintenance separately from explicit consumer-position materialization.
+- Dense exact-delta hostile coverage preserves the old snapshot and verifies current logical ordinals after multi-remove + append.
+- Found and closed a latent P454 append-only Bag seam: `Revision::build_append_only_bag_relations` inherited the old live-ref coordinate authority unchanged when appended rows contained no live refs. A later exact transition could therefore assign a newly introduced live ref the pre-append ordinal. The fast path now advances compact tail-coordinate authority for every exact append while reverse maps remain present only for ref-bearing rows.
+- The durable/runtime authoritative-target test now compares authoritative revision state/context/rule witnesses rather than requiring byte/topology equality of reconstructible live-ref coordinate history against a fresh full rebuild.
+- No additional maintained cache or second reverse-reference authority was introduced.
+
+### HOSTILE / COMPLEXITY RESULT
+Retained release diagnostic, 128 exact-delta samples after warmup and 8 consumer materializations per case:
+- sparse 100k rows / 100 ref consumers: delta ~1.753 us; consumer positions ~1.561 us;
+- sparse 500k rows / 500 ref consumers: delta ~1.916 us; consumer positions ~6.383 us;
+- dense 100k rows / 100k ref consumers: delta ~3.466 us; consumer positions ~2.210 ms;
+- dense 500k rows / 500k ref consumers: delta ~3.922 us; consumer positions ~26.753 ms.
+
+The exact mutation path stays delta/logarithmic rather than scanning relation cardinality or ref density. The expensive dense operation is explicit enumeration/materialization of the affected consumer ordinals; its output itself is O(number of consumers), and this path is not paid by ordinary exact relation publication. No speculative cache is justified.
+
+### PRODUCTIZATION AUDIT
+Highest-value remaining correctness seam is the durable canonical transaction-requirement identity. Today `Transaction::require` rotates the internally generated opaque `TransactionId`, so in-process retries cannot alias a changed requirement set. Requirements themselves are still runtime guards and are not part of the durable client-intent equality. Before caller-supplied/recovered transaction IDs become normal cross-binding DX, canonical requirement bytes/digest must be transported into durable intent identity so the same external id cannot alias different passive preconditions.
+
+Typed field-grant helpers remain a DX cleanup over already-enforced `ReadField` / `WriteField` semantics, not a missing authorization law. Remote-reader schema-evolution DX remains intentionally open and should continue as a separate design line; do not couple it to the requirement-digest correctness work.
+
+### GATES
+- `kernel-model`: 12 passed / 1 ignored.
+- `kernel-revision`: 9/9 after new append-coordinate regression.
+- `kernel-plan --lib`: 297 passed / 7 ignored.
+- public `cfmd` surface: 53/53.
+- release sparse/dense live-ref benchmark: PASS.
+
+### SUPERSEDED / DO NOT EXTEND
+- full affected-relation live-ref recompilation on certified exact deltas;
+- one persistent token for every immutable base row;
+- append-only fast paths that skip reconstructible coordinate-authority advancement;
+- speculative cache layers for dense consumer enumeration.
+
+### NEXT RECOMMENDED PASS
+**PASS456 — durable canonical transaction-requirement intent digest.** Define one canonical persisted identity representation for passive `Transaction::require` predicates and bind it into durable client-intent equality/retry conflict detection before exposing caller-supplied/recoverable transaction IDs as ordinary DX. Preserve current `Transaction::new()` / `Transaction::from(snapshot)` construction law and do not create a second precondition engine.
+
+## PASS456 — durable canonical transaction requirement intent
+
+### CLOSED THIS PASS
+- Caller-supplied `TransactionId` remains the exact durable idempotency namespace key across `Transaction::require(...)`.
+- Passive requirements have an independent canonical `ClientIntentGuardDigest`; requirement order and duplicates do not change identity.
+- Guard identity is carried through durable exact/residual relation and mixed-revision retry metadata and WAL v12 transport.
+- Same key + same exact effect + same guard retries as `AlreadyCommitted`; changing the guard under the same key fails as `TransactionConflict`.
+
+### OPEN — IMMEDIATE
+- Audit the hidden database-bound external-id constructor and generated-key lifetime semantics before making idempotency normal public DX.
+
+### CARRY — DEFERRED / MANDATORY
+- remote-reader schema-evolution DX without reader-specific server contracts or per-query routing;
+- typed field-grant DX over the already-enforced semantic authorization law;
+- final Context creation/open cleanup, migration frontend diagnostics/DSL, Python/.NET/Studio, backup/recovery UX, perf/binary budgets, Windows secure-memory expansion.
+
+## PASS457 — transaction-owned idempotency DX + stable key law
+
+### CLOSED THIS PASS
+- Added `Transaction::with_idempotency_key(TransactionId)` as the single explicit idempotency configurator on the existing transaction abstraction.
+- External idempotency configuration no longer snapshots/binds adaptive transactions. First semantic mutation remains the formation boundary exactly as for `Transaction::new()`.
+- The same configurator works on `Transaction::from(snapshot)` before intent formation; no third transaction constructor/abstraction was introduced.
+- Removed hidden `Database::transaction_with_id` / `SessionDatabase::transaction_with_id` and their premature database/session binding path.
+- Removed the P446 generated-ID rotation workaround from `require()`. P456 guard identity now owns requirement differences; transaction key identity stays stable for the lifetime of the intent.
+- Added hostile regression proving post-effect `require()` cannot rotate a generated key and turn a changed guarded intent into a fresh retry namespace.
+
+### SELECTED LAW
+`TransactionId` is only the durable idempotency namespace. `ClientIntentGuardDigest` is only passive-precondition identity. Exact client effect is only the requested database change. These three authorities are compared, not folded into or regenerated from one another.
+
+### OPEN — IMMEDIATE
+1. Audit retry/recovery exposure across hosted protocol/bindings: protocol currently carries raw transaction u128 only on its low-level relation commit path; determine one transport-neutral application idempotency representation without adding a protocol-side transaction state machine.
+2. Continue the already-open remote-reader schema-evolution DX line; do not couple reader compatibility to idempotency.
+3. Typed field-grant API sugar remains cleanup, not a missing authorization law.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- final Context creation/open DX and safe create/delete authority polish;
+- deterministic/general Semantic Rules + entity/model invariants on the common expression substrate;
+- migration frontend DSL/diagnostics across Rust/Python/TMD/CLI;
+- final Python/.NET/Studio, backup/restore/corruption UX, performance/binary budgets, Windows secure-memory expansion;
+- P435 persistent-tree transient/wide-tree bulk optimization remains performance R&D, not correctness work.
+
+### SUPERSEDED / DO NOT EXTEND
+- database/session-owned `transaction_with_id` constructors;
+- rotating generated transaction IDs when passive requirements change;
+- deriving a new transaction key from requirements/effects;
+- protocol/binding-specific retry tables or callback precondition engines.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P450 maintained model-rule witness: ~14.7 us one-row delta vs ~8.74 ms full 1M scan.
+- P453 incremental observable projection: ~0.81 ms debug isolated physical stage vs ~229.6 ms before.
+- P454 production-derived 1M one-row publication: derive ~0.119 ms, prepare ~0.169 ms, publish ~0.002 ms, total ~0.295 ms.
+- P455 exact live-ref delta remains single-digit microseconds through 500k rows; dense consumer enumeration remains output-sensitive only.
+
+### NEXT RECOMMENDED PASS
+**PASS458 — hosted/binding idempotency boundary hostile.** Keep the P457 transaction-owned law; inspect `cfmd-protocol`/host/bindings for raw/deterministic transaction identity seams and design one transport-neutral retry key representation. Do not create another transaction abstraction or protocol-side retry engine.
+
+## PASS458 — hosted idempotency ingress uses durable transaction authority
+
+### CLOSED THIS PASS
+
+- Replaced public hosted `CommitRequest.transaction: u128` with transport-neutral `IdempotencyKey`; history exposes the same key vocabulary. Wire bytes remain the same fixed `u128`, so protocol version 2 does not change.
+- Hosted relation commit no longer publishes through `SessionDatabase::commit_plan(...)`. It lowers the key + exact relation effect into the existing runtime `Transaction` and publishes through `SessionDatabase::commit(...)`.
+- Closed the uncertain-retry bug: after the first commit advances HEAD, repeating the identical hosted request with its original `base_revision` now returns `AlreadyCommitted` instead of being rejected as stale before idempotency lookup.
+- Added a read-only durable relation-intent retry probe. It consults the existing committed-transaction authority; it cannot publish an unknown transaction and therefore is not a retry table or protocol state machine.
+- Same key + different exact relation effect now returns `TransactionConflict` even when the request's formation revision is stale.
+- Unknown stale requests remain fail-closed as `StaleRevision`; the host never reinterprets their old relation mutation against the current HEAD.
+
+### OPEN — IMMEDIATE
+
+1. Remote adaptive transaction formation: decide whether a genuinely new stale hosted relation intent should be transportable through the same kernel-change certificate law as local adaptive `Transaction`, without reconstructing/re-running client logic and without a generic historical-plan fallback.
+2. Remote-reader schema-evolution DX: bind compatibility once at reader/session epoch authority; no per-query/name fallback and no server-owned reader-specific model.
+3. Typed field-grant DX sugar over the already-central authorization law.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+
+- final `Database` / `Context` creation/open cleanup and safe create/delete authority polish;
+- deterministic/general Semantic Rules and entity/model invariants;
+- migration frontend DSL/diagnostics across Rust/Python/TMD/CLI;
+- final Python facade/wheels, .NET/WPF adapter, Studio/CLI polish;
+- backup/restore/corruption-recovery UX;
+- public performance and binary-size budgets;
+- native Windows secure-memory expansion;
+- P435 transient/wide-tree persistent-tree bulk optimization remains performance R&D.
+
+### SUPERSEDED / DO NOT EXTEND
+
+- raw public hosted transaction `u128` as an untyped API concept;
+- hosted direct `commit_plan` publication as a parallel application transaction path;
+- stale-before-idempotency rejection for uncertain retries;
+- protocol/binding retry tables or state machines;
+- reinterpreting an unknown stale request against current HEAD;
+- generic SQL/full-state fallback for publication/retry identity.
+
+### PERFORMANCE BASELINES TO PRESERVE
+
+- retry probe is O(canonical client mutation size) plus one durable transaction-key lookup; it performs no database-state scan and no publication;
+- ordinary non-stale hosted commit retains one normal Plan -> Transaction lowering and no extra retry lookup;
+- all P450/P453 and physical-realization native-cost-class baselines remain carried.
+
+### NEXT RECOMMENDED PASS
+
+**PASS459 — adaptive remote-intent transport hostile/R&D.** Determine the exact minimal representation required to certify a genuinely new stale hosted relation intent against intervening history without rebuilding a historical physical Plan, rerunning client logic, or falling back to current-HEAD reinterpretation. Prefer a direct exact-effect/change-certificate law if the existing kernel-change algebra already contains enough authority.
+
+## PASS459 — transport-neutral exact relation intent + adaptive remote Γ transport
+
+### CLOSED THIS PASS
+- Hosted/binding relation commit no longer reconstructs a current-head `Plan` to represent a caller effect formed at an older revision.
+- Added hidden runtime `ExactRelationMutation`: a transport-neutral exact-effect carrier only; it is not a transaction/state-machine abstraction.
+- One runtime law now handles current and stale hosted relation effects: durable idempotency lookup -> formation-world typing/validity -> `certify_transition_rebase` -> exact residual publication.
+- A genuinely new stale hosted effect whose Γ write coordinates commute with every intervening exact effect is now published; overlapping/opaque/schema-history cases fail closed as `TransactionConflict`/`StaleRevision`.
+- Durable retry identity is checked before historical reconstruction, so uncertain retries remain O(client mutation size) + key lookup even if their formation revision has left historical materialization coverage.
+- Protocol wire format/version is unchanged; the server does not receive a Plan, certificate, merge descriptor, or client executable logic.
+
+### HOSTILE / R&D RESULT
+The existing kernel-change algebra already contained enough authority. The minimal sufficient remote representation is:
+
+`formation RevisionId + caller IdempotencyKey + exact relation insert/remove effect`.
+
+The server derives relation typing from the formation semantic revision and derives the change certificate itself. No historical physical Plan, callback replay, SQL merge, current-HEAD reinterpretation, or client-supplied certificate is needed.
+
+Formation-world validity is intentionally checked before transport. Today a retained historical logical Revision does not expose its old `RelationBaseWitness`, so P459 rebuilds Γ support for each touched historical relation before calling the O(delta log N) witness transition. This is exact, but costs O(size of touched historical relation) canonicalization. It is the next performance payer; do not hide it behind a weaker validation path.
+
+### OPEN — IMMEDIATE
+1. **PASS460 — historical Γ witness authority for stale intent formation.** Reuse/retain an exact historical `RelationBaseWitness` lineage or equivalent certified support root so formation validation becomes O(delta log N) rather than O(touched relation), without snapshot-per-transaction duplication.
+2. Remove the analogous full-current-Set materialization in residualization if the witness can supply an exact current representative/support operation without weakening history/complement identity.
+3. Remote-reader schema-evolution DX remains separate: compatibility resolves once at binding/session epoch; no per-query/name fallback.
+4. Typed field-grant DX sugar remains cleanup over existing authorization.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- final Database/Context creation/open cleanup and safe create/delete authority polish;
+- deterministic/general Semantic Rules + entity/model invariants;
+- migration frontend DSL/diagnostics across Rust/Python/TMD/CLI;
+- final Python/.NET/Studio surfaces, backup/restore/corruption UX, public perf/binary budgets, native Windows secure-memory expansion;
+- P435 transient/wide-tree persistent-tree bulk optimization remains deferred performance R&D.
+
+### SUPERSEDED / DO NOT EXTEND
+- unknown-stale hosted requests always returning `StaleRevision`;
+- reconstructing a current-head Plan from a stale wire mutation;
+- historical physical Plan reconstruction for remote adaptive commit;
+- client-supplied rebase/merge certificates or delta descriptors beyond the exact requested effect itself;
+- protocol-side retry/transaction tables;
+- generic SQL/full-state merge or current-head reinterpretation fallback.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- exact retry probe remains O(client mutation size) + one durable transaction-key lookup and runs before history reconstruction;
+- current durable exact-derived 1M one-row publication baseline remains ~0.295 ms from P454;
+- P455 exact live-ref delta remains single-digit microseconds through 500k rows;
+- P459 historical formation validation currently has an explicit O(touched historical relation) Γ-witness rebuild payer to eliminate in P460.
+
+### NEXT RECOMMENDED PASS
+**PASS460 — retained historical Γ witness transport.** Make the formation-validity proof use persistent historical witness authority directly, preserving P419/P420 structural sharing/reclamation. Then use the same witness law to remove current Set residualization scans where exact representative recovery permits it.
+
+## PASS460 — historical Γ-support transport and witness-native Set residualization
+
+### CLOSED THIS PASS
+- Historical formation validity no longer rebuilds `RelationBaseWitness` from materialized historical relation rows.
+- Added restricted `RelationSupportWitness`: O(1) projection from the current persistent Γ occurrence root; exact durable relation deltas can advance/rewind support without exposing reconstructed scan-order authority.
+- `DurableRuntime::validate_relation_delta_at` validates stale formation effects through exact reversible history and fails closed at semantic/schema/full/opaque boundaries.
+- `certify_transition_rebase` no longer calls `revision_at()` for proposed/intervening relation footprints on an exact semantic-context-preserving path.
+- Current stale Set residualization no longer materializes the full relation. `RelationBaseWitness` resolves only touched Γ classes to logical positions; exact current representatives are point-read from persistent relation storage.
+- Bag residualization remains exact multiplicity-preserving identity; no Set-specific rule leaked into Bag semantics.
+- Hostile case-insensitive Set regression proves a stale `remove("aLpHa")` formed over `"Alpha"` removes the exact current representative after a disjoint concurrent insert.
+- No witness serialization, historical snapshot-per-transaction cache, SQL fallback, current-HEAD reinterpretation, or protocol merge state introduced.
+
+### OPEN — IMMEDIATE
+1. PASS461 hostile/perf: measure historical support rewind as history depth grows; determine whether repeated stale formation validation needs a persistent path memo/root index or whether O(history * delta log N) is already below publication noise. Any index must share exact history authority rather than cache reconstructed rows.
+2. Remote-reader schema-evolution DX: compatibility resolves once per binding/session epoch; no per-query/name fallback and no reader-specific authoritative server schema.
+3. Typed field-grant DX sugar over existing DB-owned authorization.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- final Database/Context creation/open cleanup and safe create/delete authority polish;
+- deterministic/general Semantic Rules + entity/model invariants;
+- migration frontend DSL/diagnostics across Rust/Python/TMD/CLI;
+- final Python/.NET/Studio surfaces, backup/restore/corruption UX, public perf/binary budgets, native Windows secure-memory expansion;
+- P435 transient/wide-tree persistent-tree bulk optimization remains deferred performance R&D.
+
+### SUPERSEDED / DO NOT EXTEND
+- rebuilding historical relation rows/witnesses for stale intent formation;
+- using `revision_at()` only to recover a semantic context for exact relation footprint certification;
+- full current Set materialization for stale residualization;
+- serializing `RelationBaseWitness`/support caches as durable state;
+- protocol-side retry/merge state, current-head reinterpretation, SQL/full-state fallback.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- formation Γ validity: O(history-path touched effects * delta log N), zero relation-cardinality scan/canonicalization;
+- current Set residualization: O(delta log N) witness lookup + O(number of realized removals) point reads;
+- exact retry remains O(client mutation size) + one durable key lookup and runs before historical work;
+- P454/P455/P450/P453 and P399/P400 native-cost-class baselines remain mandatory.
+
+### NEXT RECOMMENDED PASS
+**PASS461 — stale-intent history-depth hostile/perf.** Benchmark exact support rewind/certificate cost across long retained history, then introduce a structurally shared revision->support-root memo only if measured depth becomes material. Do not preemptively add a cache or serialized witness. If the path stays cheap, return to remote-reader schema-evolution DX.
+
+## PASS461 — stale-intent history-depth hostile/perf + direct transition lineage
+
+### CLOSED THIS PASS
+- Added an ignored release hostile benchmark for remote stale exact effects at retained history depths 32/128/512/2048.
+- Measurement rejected the hypothesis that P460's no-index rewind is universally cheap: pre-P461 total stale commit cost grew from ~0.48 ms at depth 32 to ~22.86 ms at depth 2048 on this sandbox.
+- Found an avoidable constant/algorithmic payer inside formation validation: it reconstructed the complete causal ideal, built a revision adjacency graph, and ran BFS even though historical Γ-support transport follows the exact durable state-transition lineage.
+- Added `DurableRevisionStore::revision_transition_records_back_to(source, target)`, a projection over the existing authoritative effect/frontier ledger. It follows exact target->source revision transitions directly; no second history authority, cache, SQL fallback, or persisted index is introduced.
+- `validate_relation_delta_at` now rewinds support over that direct transition lineage and rejects non-exact/schema/opaque boundaries in place. The old causal-ideal + adjacency + BFS path is removed.
+- Post-change diagnostic totals: ~0.26 ms (32), ~0.83 ms (128), ~3.58 ms (512), ~21.19 ms (2048) median over three warm direct executable runs. The remaining depth law is real, not an artifact of BFS.
+
+### OPEN — IMMEDIATE
+1. **PASS462 — structurally shared historical support-root + causal-footprint authority.** P461 proves O(history depth) is a material payer. Retain a derived, GC-bound persistent revision->Γ-support root so formation validity is O(client delta log N), and design an exact persistent/segment aggregate for intervening write footprints so rebase certification does not rescan the whole suffix. These are derived indexes over durable history, never independent durable semantic authorities.
+2. Resume remote-reader schema-evolution DX immediately after this transaction/history payer is bounded: compatibility once per binding/session epoch; no per-query/name fallback or reader-specific server schema.
+3. Typed field-grant DX sugar over existing DB-owned authorization.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- final `Database` / `Context` creation/open cleanup and safe create/delete authority polish;
+- deterministic/general Semantic Rules and entity/model invariants;
+- migration frontend DSL/diagnostics across Rust/Python/TMD/CLI;
+- final Python facade/wheels and process lifecycle;
+- .NET/WPF adapter over the same runtime protocol;
+- Studio/CLI polish;
+- backup/restore/corruption-recovery UX;
+- public performance/binary-size budgets;
+- native Windows secure-memory expansion;
+- P435 transient/wide-tree persistent-tree bulk optimization remains deferred performance R&D.
+
+### SUPERSEDED / DO NOT EXTEND
+- reconstructing a full causal ideal + adjacency graph + BFS merely to move Γ-support along one exact revision-transition lineage;
+- assuming O(history depth * delta log N) is negligible for arbitrarily old remote intents;
+- serialized witness caches or snapshot-per-transaction historical relation copies;
+- SQL/full-state/current-HEAD reinterpretation fallback;
+- protocol-side retry/merge state machines.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P461 direct-lineage stale commit diagnostic: ~0.26 ms @32, ~0.83 ms @128, ~3.58 ms @512, ~21.19 ms @2048 median over three warm runs on this sandbox; this remains a temporary depth-sensitive baseline to beat in P462.
+- P460 stale Set residualization remains O(client delta log N) + exact representative point reads.
+- P458/P459 exact retry remains O(client mutation size) + one durable transaction-key lookup before historical work.
+- P454 production-derived 1M one-row publication remains ~0.295 ms; P455 exact live-ref delta remains single-digit microseconds through 500k rows.
+- P450/P453 maintained-rule/observable baselines and P399/P400 native-segment cost class remain mandatory.
+
+### NEXT RECOMMENDED PASS
+**PASS462 — retained persistent Γ-support roots + causal footprint aggregation.** Remove the remaining O(history depth) stale-intent payer with structurally shared derived authority tied to history retention/GC. Do not introduce a mutable witness cache, duplicate durable history, or periodic full-state checkpoint fallback.
+
+## PASS462 — persistent historical Γ-support roots + coordinate-indexed causal footprint
+
+CLOSED THIS PASS
+- Stale formation validation no longer rewinds exact history per request. Runtime keeps structurally shared revision-bound Γ-support timelines and resolves the latest support root at or before the exact formation revision.
+- Recovery rebuilds the derived support/index authority from the durable exact transition lineage; no serialized witness cache is introduced.
+- Rebase conflict proof no longer scans every intervening effect. Exact writes are indexed by semantic coordinate as persistent `(revision -> action/effect)` timelines, so a disjoint stale intent touches only its own coordinates.
+- `RuntimeTransitionRebaseCertificate` now carries compact `intervening_effect_count`; enumerating every successful suffix effect is no longer part of the proof/API cost. Effect IDs remain available for actual conflict/coordination diagnostics.
+- Full/schema/opaque revision publication resets the derived lineage floor and fails closed across the boundary.
+- No SQL/full-state/current-HEAD fallback, protocol merge state, or independently mutable cache was added.
+
+OPEN — IMMEDIATE
+1. PASS463: bind historical derived-root retention to causal/history GC/compaction boundaries and hostile-test long-running memory retention/reopen. Current roots are exact derived authority but intentionally remain live for the retained causal lineage.
+2. Return to remote-reader schema-evolution DX after retention closure: compatibility once per binding/session epoch, no per-query/name fallback, no reader-owned authoritative server schema.
+3. Typed field-grant DX sugar over existing DB-owned authorization.
+
+OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- final Database/Context creation/open cleanup and safe create/delete authority polish;
+- deterministic/general Semantic Rules and entity/model invariants;
+- migration frontend DSL/diagnostics across Rust/Python/TMD/CLI;
+- final Python facade/wheels and process lifecycle;
+- .NET/WPF adapter, Studio/CLI polish, backup/restore/corruption UX;
+- public performance/binary-size budgets; native Windows secure-memory expansion;
+- P435 persistent-tree bulk/transient optimization remains deferred R&D.
+
+SUPERSEDED / DO NOT EXTEND
+- per-request historical support rewind over every exact effect;
+- rebase proof that materializes/enumerates the complete successful intervening-effect suffix;
+- mega-footprint compression that would lose exact per-coordinate action-law evidence;
+- mutable witness caches or a second durable conflict/history authority.
+
+PERFORMANCE BASELINES TO PRESERVE
+- P461 stale-depth median baseline before structural indexing: ~0.262 ms @32, ~0.828 ms @128, ~3.578 ms @512, ~21.193 ms @2048.
+- P462 warm debug hostile benchmark after structural indexing: ~0.787 ms @32, ~0.756 ms @128, ~0.736 ms @512, ~0.792 ms @2048; depth dependence is eliminated within debug-run noise. Release benchmark should be repeated when next perf pass touches this path.
+- P460 stale Set residualization remains O(client delta log N) + touched representative point reads.
+
+## PASS463 — causal-history retention / P462 derived-root GC closure
+
+### CLOSED THIS PASS
+- Found and closed the hidden causal-GC blocker: local `RevisionEffectId` allocation high-watermark is now durable metadata authority rather than `max(retained effect)+1`; causal-prefix GC cannot reuse expired effect IDs after reopen.
+- Added explicit `release_causal_history_before_head`: it advances causal coverage atomically through checkpoint publication, rejects unresolved prepares, retained historical epoch authority and replicated prerequisites, and never falls back to current-HEAD reinterpretation.
+- P462 Γ-support/write timelines are reset in the same runtime maintenance publication; old immutable snapshots keep their old persistent nodes only while actually retained, and weak probes prove reclamation after final snapshot drop.
+- Reopen reconstructs exactly the new causal floor and preserved effect-ID high-watermark. Requests older than an explicitly expired causal floor are `Unavailable`, not semantic conflicts.
+- Metadata codec 18 carries the monotone local causal-effect identity high-watermark; older codecs derive it from retained effects as before.
+
+### OPEN — IMMEDIATE
+1. PASS464: schema-aware exact-effect transition walker across `SchemaMigrationExact`, using the P462/P463 retained coordinate/support authority and preserving original A intent identity; no full-state migrate+diff fixture in production.
+2. Formation-world `ClientIntentGuardDigest` proof/transport across schema boundaries: certified rewrite where representable, explicit fail-closed otherwise.
+3. Return to remote-reader schema-evolution DX after schema-boundary transaction transport is closed.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- typed field-grant DX sugar; final Database/Context create/open cleanup; deterministic/general Semantic Rules and invariants; migration frontend; Python/.NET/Studio/CLI; backup/restore/corruption UX; public perf/binary budgets; native Windows secure memory; P435 persistent-tree bulk R&D.
+
+### SUPERSEDED / DO NOT EXTEND
+- deriving the next causal effect identity from retained causal payloads;
+- derived history roots outliving durable causal authority;
+- causal-prefix expiry via mutable cache/tombstone routing/current-HEAD fallback.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P462 stale-depth path remains approximately flat through depth 2048 while causal history is retained.
+- Explicit causal expiry reduces the live P462 exact-effect timeline to zero at the new head and structurally reclaims old-only persistent nodes after old reader roots drop.
+
+### NEXT RECOMMENDED PASS
+**PASS464 — schema-aware exact-effect transition walker.** Turn the reviewed R&D A-intent/B-residual proof into kernel orchestration over real `SchemaMigrationExact` transitions without materialize+diff, client replay, second transaction identity, or protocol-specific merge state.
+
+## PASS464 — schema-boundary exact-effect primitives + atomic guard dependency seal
+
+### CLOSED THIS PASS
+- Productized the R&D guard-stability proof as `RuntimeRevisionSnapshot::certify_read_dependencies_stable`: passive observations have a stricter law than writes, so *any* later action on a dependency coordinate invalidates the proof; there is no idempotent-write escape hatch.
+- Bound that proof to residual publication with `commit_mixed_revision_residual_guarded_with_dependencies`. Dependency certification and transition preparation use the same immutable runtime root; the existing writer publication `seal` rejects any intervening root advance. No second lock, retry state machine or guard cache was added.
+- Replaced the loose `(Option<RevisionId>, &[RuntimeHistoryCoordinate])` guard-proof seam with canonical `RuntimeGuardObservationFootprint { source_revision, coordinates }`. Coordinates are sorted/deduplicated at construction; an empty footprint is represented by absence rather than an invalid half-configured proof object. `ClientIntentGuardDigest` remains orthogonal retry identity.
+- Added verified migration-provenance transport for passive field dependencies. A source field maps to every target field whose deterministic rewrite depends on it; dropped/unrepresentable dependencies fail closed.
+- Added owner-preserving field-coordinate dependency projection so the future walker receives exact `(field, entity)` proof coordinates directly from `kernel-transport` instead of reconstructing owner semantics in orchestration code.
+- Provenance diagnostics now distinguish an unknown source field from a known-but-erased dependency. Both fail closed for guard transport, but they are not conflated semantically.
+- Added exact row-local relation-delta transport. Inserted/removed rows are transformed directly through the verified migration row program; general query/global rewrites fail closed instead of materialize+diff or current-HEAD fallback.
+- Added bounded exact field-update transport over only affected rewrite inputs. Merge inputs not supplied by the write are returned as implicit passive source dependencies, making context sensitivity explicit instead of silently reading mutable state.
+- Hostile regressions prove: i64->f64 row-local deltas transport directly; merge/split provenance exposes target dependencies and untouched merge inputs; a guard-only concurrent mutation blocks residual publication while HEAD remains unchanged.
+
+### OPEN — IMMEDIATE
+1. **PASS465 — schema-aware transition walker orchestration.** Walk the durable primary transition lineage, segment ordinary history by `SchemaMigrationExact`, apply P464 exact-effect/dependency transport at each boundary, and use P462 coordinate timelines inside each epoch. Preserve the original formation-schema client effect + guard digest as the sole retry identity.
+2. Preserve/rebuild P462 historical support/action roots across retained schema epochs so source-epoch certification stays depth-independent after migration/reopen; do not regress to per-request causal scans.
+3. General guard expressions: transport certified observation footprints, not guessed target predicates; destructive/global migration rewrites remain fail-closed until a proof law exists.
+4. Authorization/grant transport across schema migration remains a separate authority; do not infer it from guard provenance.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- remote-reader schema-evolution activation/DX once transaction walker is closed;
+- final Database/Context create/open cleanup and safe create/delete authority polish;
+- typed field-grant DX sugar and remaining granular authorization polish;
+- deterministic/general Semantic Rules and entity/model invariants;
+- migration frontend DSL/diagnostics across Rust/Python/TMD/CLI;
+- final Python facade/wheels/process lifecycle, .NET/WPF, Studio/CLI, backup/restore/corruption UX;
+- public performance/binary-size budgets; native Windows secure-memory expansion;
+- P435 persistent-tree transient/wide-tree optimization remains deferred R&D.
+
+### SUPERSEDED / DO NOT EXTEND
+- `A_before -> migrate -> B_before` plus `A_after -> migrate -> B_after` then whole-state diff as a production effect transport algorithm;
+- guard digest as proof that the guarded observation is still true;
+- separate guard check followed by an independently fresh commit;
+- protocol-side merge/retry state, current-HEAD reinterpretation, SQL/full-state fallback;
+- guessing target guard fields by names or source-language aliases.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P462 stale-history depth remains effectively flat (~0.74–0.79 ms debug at 32..2048 in its hostile run).
+- P464 row-local effect transport is O(client relation delta × row transform width), independent of relation cardinality.
+- P464 field dependency/update transport is O(affected migration rewrite arity), not O(model/data size).
+- P460 Set residualization remains O(client delta log N) + exact representative point reads.
+
+### NEXT RECOMMENDED PASS
+**PASS465 — production schema-aware transition walker.** Compose source-epoch write+guard proofs, exact `SchemaMigrationProgram` effect/dependency transport, target-epoch proofs and one atomic publication seal. Multiple chained migrations must be iterative; unrepresentable dependency/effect transport fails closed.
+
+## PASS465 — production schema-aware field transition walker / hostile identity audit
+
+### CLOSED THIS PASS
+- Added production `SchemaAwareFieldTransitionRequest` + `DurableRuntime::commit_schema_aware_field_intent` for the exact field-coordinate class.
+- The walker follows the authoritative durable primary transition lineage, segments it at real `SchemaMigrationExact` records, reconstructs the exact retained migration-source revision through existing history authority, verifies each migration program, transports field writes and canonical guard coordinates from verified provenance, and publishes one current-schema residual through the existing guarded mixed-revision seal.
+- No `A_before -> migrate -> A_after -> diff B` production algorithm is used. Field updates are transported directly through `SchemaMigrationTransport::transport_field_updates_exact`.
+- Untouched merge inputs returned by field transport become conservative source-epoch proof dependencies; guard-only B-native changes remain independently rejected even when transported writes commute.
+- Current-epoch certification uses the P462 coordinate index. Old-epoch ordinary exact history is currently checked against authoritative durable transition records and therefore remains a depth-sensitive payer rather than a hidden fallback.
+- Targeted hostile regressions prove atomic A->B password/MFA-style field transport and rejection of a target-only passive guard mutation.
+
+### OPEN — IMMEDIATE
+1. **P466 durable client semantic identity split.** `MixedRevisionResidualExact` already separates original client effect from realized effect, but its single `semantic_revision` still names the realized/current epoch. Across another schema migration, exact retry identity can therefore drift even though original A effect + guard digest are unchanged. Introduce explicit `client_semantic_revision` versus realized semantic revision in the durable intent/codec and restore retry-before-history/GC for schema-aware transactions.
+2. Retain/rebuild per-epoch P462 coordinate/support roots at schema boundaries so old-epoch proof is depth-independent instead of scanning exact transition records per request.
+3. Extend the walker from field-only model deltas to row-local relation exact effects using the P464 direct relation-delta transport; general relational/query migration remains fail-closed.
+4. General guard/query provenance and authorization/grant transport remain separate proof authorities and must fail closed where no certified law exists.
+
+### SUPERSEDED / DO NOT EXTEND
+- recomputing a schema-aware retry identity from the current realized semantic epoch;
+- treating `ClientIntentGuardDigest` as executable guard proof;
+- migration-by-full-state-diff, current-HEAD reinterpretation, protocol-side merge state, or SQL/generic fallback;
+- hiding old-epoch O(history depth) traversal behind a cache without retained epoch authority.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Current-epoch stale proof remains P462 coordinate-indexed and effectively depth-flat.
+- P464 field transport remains O(affected rewrite arity); P465 does not introduce O(database size) effect transport.
+- Old-epoch ordinary-history certification is explicitly OPEN as O(segment depth) until retained per-epoch indexes are implemented.
+
+### NEXT RECOMMENDED PASS
+**PASS466 — durable client-vs-realized semantic identity split + exact retry closure across chained migrations/reopen/GC.** Then retain epoch coordinate indexes before widening the walker to relation effects.
+
+## PASS466 — canonical client-intent authority / realized semantic separation
+
+### CLOSED THIS PASS
+- Rejected the local "add a second semantic_revision next to the old one" patch. Retry identity is now projected through one explicit `DurableClientIntentView`, while realized publication remains `DurableRevisionChange` authority.
+- Relation/mixed residual intents now carry `client_semantic_revision`; WAL mutation codec 13 persists client semantic authority separately from realized/change semantic authority. Older residual WAL records decode their historical single semantic revision as both authorities.
+- `same_client_intent()` no longer depends on source/target revision ids, realized residual/complement payload, or semantic implementation/deployment packages. Relation and mixed exact/residual forms normalize to the same canonical client-intent shape.
+- Schema-aware field retry now checks durable client intent before snapshot/history/migration traversal. An A intent committed in B, followed by B->C migration, close/reopen, retries as `AlreadyCommitted` under the original A semantic identity; current C semantics are irrelevant to retry equality.
+- Realized residual validation remains strict against `DurableRevisionChange`; separating client semantics does not weaken recovery/publication validation.
+- No current-HEAD reinterpretation, callback replay, protocol retry state, SQL fallback, or second idempotency namespace was introduced.
+
+### OPEN — IMMEDIATE
+1. **P467 durable representation cleanup.** Residual `DurableTransactionIntent` variants still physically duplicate realized mutation/model/complement payload for legacy WAL/recovery layout even though those bytes are no longer retry authority. Move realization/recovery material completely under `DurableRevisionChange` (or a dedicated realized-change recovery payload), collapse residual-vs-direct client intent variants where possible, and make the committed retry ledger store client intent + committed target rather than a mixed client/realization record.
+2. Retain/rebuild per-epoch P462 coordinate/support roots at schema boundaries so old-epoch proof becomes depth-independent.
+3. Extend schema-aware walker to row-local relation exact effects using P464 direct transport.
+4. General relational/query guard provenance and authorization/grant transport remain fail-closed until certified laws exist.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Carry Context/DX, granular authorization, Semantic Rules/invariants, migration frontend, Python/.NET/Studio/CLI, backup/restore/corruption UX, public perf/binary budgets, native Windows secure memory, and P435 persistent-tree optimization from the master ledger.
+
+### SUPERSEDED / DO NOT EXTEND
+- treating semantic implementation package bytes as client idempotency identity;
+- deriving retry identity from the realized/current schema epoch;
+- solving schema retry by adding parallel client/realized fields everywhere without first separating the client-intent authority;
+- history/schema transport before checking an already-committed durable client intent.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Already-committed schema-aware retry is now one durable transaction-key lookup + client-intent comparison before historical work; it must remain independent of schema-chain/history depth.
+- New/unknown schema-aware intents retain P462 current-epoch depth-flat proof and P464 O(affected rewrite arity) transport; old retained epoch proof remains an explicit O(segment depth) payer until P467+ retained epoch indexes.
+
+### NEXT RECOMMENDED PASS
+**PASS467 — remove realized payload duplication from durable client intent.** Finish the structural law already enforced by P466: committed retry authority owns only canonical client intent + committed outcome; realized delta/complement/schema authority belongs only to revision-change/recovery state.
+
+## PASS467 — realized-change ownership split
+
+### CLOSED THIS PASS
+- Durable causal effect records now own canonical client intent and realized `DurableRevisionChange` independently; runtime history no longer recovers realized relation/model effects or complements from client-intent payload.
+- Current metadata codec v19 and replication protocol v3 serialize realized change separately from client intent.
+- Current residual/mixed intent encodings no longer serialize realized residual/model complement; legacy tags decode into compatibility-only realized-change hints for pre-v19 reconstruction.
+- Mixed realized recovery complement is owned by `DurableRevisionChange::MixedRevision`.
+
+### OPEN — IMMEDIATE
+- Replace committed retry map values (`DurableTransactionIntent`) with a canonical committed-client record so source/target/provenance/deployment baggage is not physically retained in retry storage.
+- After that cut, collapse/remove durable residual intent variants and compatibility-only `legacy_realized_change` from the current runtime model; retain old WAL/metadata decode only at codec boundary.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Per-schema-epoch retained P462 coordinate roots for schema-walker performance.
+- General relational/query guard provenance and authorization transport across schema migration.
+- Context/Auth/Semantic Rules/Python/.NET/productization items carried by prior ledger remain open.
+
+### SUPERSEDED / DO NOT EXTEND
+- Do not restore realized residual/complement ownership to `DurableTransactionIntent`.
+- Do not make retry equality depend on realized schema epoch, recovery complement, or deployment artifacts.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P462 stale-history depth profile must remain effectively flat for current-epoch coordinate-index paths.
+- No O(data) state-diff transport or history reconstruction may be introduced for schema-aware retry identity.
+
+### NEXT RECOMMENDED PASS
+- PASS468: canonical committed-client retry ledger; remove source/target/realization baggage from retry values and reduce residual intent variants to codec-only legacy decode forms.
+
+## PASS468 — canonical committed-client retry ledger + pre-release codec reset
+
+### CLOSED THIS PASS
+- `committed_transactions` now stores `DurableCommittedTransaction { target_revision, intent: DurableClientIntent }`; full `DurableTransactionIntent` descriptors, formation source/target provenance, realized residual/complement and deployment packages are no longer retained in retry storage.
+- `DurableClientIntent` is an explicit canonical client-side algebra for relation data, mixed/model data, rewrite, resolution, full-revision and schema-migration intents. Retry equality consumes this authority directly rather than projecting from a mixed client/realization descriptor.
+- Recovery merges WAL commits into the canonical committed-client ledger before any schema/history transport. Exact retry therefore remains independent of realized epoch/history depth.
+- Causal/history remains `client intent + DurableRevisionChange`; retry storage and historical realized-change storage no longer share an accidental container.
+- Pre-release metadata, mutation-WAL and replication codecs no longer maintain pass-to-pass version ladders. Each accepts exactly one current format discriminator and fails closed on obsolete internal snapshots. This is explicitly not a released compatibility promise.
+- Removed the pre-release store-format migration path whose only purpose was upgrading unreleased internal metadata layouts.
+- Historical semantic deployment no longer piggybacks on retry records. Checkpoints persist the complete installed builtin `SemanticRegistry` deployment set; current-context selection is no longer mistaken for complete durable deployment authority.
+
+### OPEN — IMMEDIATE
+1. Remove remaining current-runtime direct/residual distinctions inside `DurableTransactionIntent` where they are now only construction/WAL-descriptor mechanics; ideally make residual/direct a kernel-change realization property rather than a client-intent type distinction.
+2. Remove dead pre-release legacy decoder helpers/tags that are no longer reachable after the one-current-format reset; keep historical source only where it is genuinely useful as Obsolete/reference material, not active decoder branches.
+3. Retain/rebuild per-schema-epoch P462 support/action roots so P465 source-epoch proof becomes depth-independent across schema boundaries.
+4. Extend the schema-aware walker to row-local relation exact effects; general relational/query guard provenance and authorization transport remain fail-closed.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context/DX, granular authorization, Semantic Rules/invariants, migration frontend, Python/.NET/Studio/CLI, backup/restore/corruption UX, public perf/binary budgets and native Windows secure-memory work from the master ledger remain open.
+
+### SUPERSEDED / DO NOT EXTEND
+- Pass-number-style internal codec compatibility (`v18 -> v19`, replication `v2 -> v3`, etc.) before CFMD defines its first released persistence/protocol compatibility boundary.
+- Semantic deployment packages retained because the retry ledger happened to own a full transaction descriptor.
+- Full transaction descriptors as committed idempotency-map values.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Already-committed retry remains one transaction-key lookup + canonical client-intent comparison, independent of schema/history depth.
+- P462 current-epoch stale certification remains depth-flat; no O(data) schema transport/state diff.
+
+### NEXT RECOMMENDED PASS
+**PASS469 — finish current-runtime intent normalization + dead pre-release decoder removal, then return to retained per-epoch P462 indexes.** Delete direct/residual realization distinctions from client intent where possible rather than carrying them forward as historical format baggage.
+
+
+## PASS469 — pre-release legacy purge + canonical durable intent taxonomy
+
+### CLOSED THIS PASS
+- Promoted the pre-release compatibility rule from codec-specific guidance to a project-wide architectural law: before the first released compatibility boundary, pass-era formats/APIs/enum variants/shims are not compatibility obligations and may be removed outright.
+- Collapsed `DurableTransactionIntent` relation and mixed direct/residual pairs into one canonical variant per client-intent kind. Residual/rebase/schema transport is realized-change/provenance state, not durable client-intent taxonomy.
+- Removed active `LegacyTargetOnly`, `legacy_realized_change`, legacy mutation decoders, and legacy semantic-registry open adapters from `crates/`.
+- Replaced mutation PREPARE specialization with the universal wire law `identity/provenance + canonical client intent + DurableRevisionChange`; no direct/residual wire routing remains.
+- Rebuilt metadata transaction-intent encoding around one current tag set and moved metadata/mutation/replication pre-release discriminators together to the current P469 layout. Obsolete internal tags fail closed.
+- Historical/runtime/protocol effect-kind surfaces no longer expose the obsolete `LegacyTargetOnly` kind.
+
+### OPEN — IMMEDIATE
+1. Hostile-audit remaining durability format code named `LEGACY_*`. Do not mechanically delete it: the directory checkpoint writer currently still emits the old flat checkpoint representation, so first converge directory/single-file checkpoint publication on one current representation and then delete the compatibility registry/branches.
+2. Retain/rebuild per-schema-epoch P462 support/action roots so P465 source-epoch proof becomes depth-independent across schema boundaries.
+3. Extend schema-aware walker to row-local relation exact effects.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context/DX, DB-owned authorization, Semantic Rules/invariants, migration frontend, Python/.NET/Studio/CLI, backup/restore/corruption UX, public perf/binary budgets and native Windows secure memory remain carried from the master ledger.
+
+### SUPERSEDED / DO NOT EXTEND
+- Any new backward decoder/API alias/shim solely for an unreleased CFMD development snapshot.
+- Durable `Exact` versus `ResidualExact` client-intent variants.
+- WAL PREPARE tags whose only purpose is distinguishing direct from certified residual realization.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Retry remains transaction-key lookup + canonical client-intent equality before schema/history work.
+- Current-epoch stale proof remains P462 depth-flat; P469 adds no data/history scan.
+
+### NEXT RECOMMENDED PASS
+**PASS470 — one current checkpoint/storage format on the directory path, then delete remaining active `LEGACY_*` durability format branches; after that return to per-epoch P462 index retention.**
+
+## PASS470 — one current directory checkpoint/storage representation
+
+### CLOSED THIS PASS
+- Synchronous directory bootstrap and checkpoint rotation no longer emit the old flat monolithic checkpoint file. They stream the canonical revision into the same bounded chunk files and current chunk-root representation already used by resumable directory checkpointing.
+- Removed active flat-checkpoint decode, legacy checkpoint format registry entries, and legacy checkpoint handling from generation freshness authority. Directory recovery now accepts exactly one current checkpoint representation and fails closed on obsolete pre-release roots.
+- Removed legacy manifest decode and its registry entry. Directory manifests likewise accept one current pre-release representation only.
+- Renamed directory manifest/checkpoint/metadata discriminator constants from `*_FORMAT_VERSION` to `*_FORMAT_TAG` so the code states the P468/P469 law directly: these are fail-closed type/layout discriminators, not backward-compatibility ladders.
+- Updated the external-freshness hostile fork test to mutate a current checkpoint chunk rather than depending on the removed monolithic payload layout.
+- Added explicit hostile coverage proving ordinary synchronous `create` and `rotate_checkpoint` both publish chunk-root + chunk authority and reopen through that same representation.
+
+### OPEN — IMMEDIATE
+1. Hostile-audit and remove remaining active pre-release compatibility adapters outside durability (for example transitional Rust runtime aliases/hints and genuinely superseded physical-index compatibility surfaces) before carrying them into a first public release. Classify each hit first: semantic/current-structure compatibility predicates are not legacy shims and must not be deleted mechanically.
+2. Retain/rebuild per-schema-epoch P462 support/action roots across `SchemaMigrationExact` so P465 source-epoch proof becomes depth-independent rather than replaying retained old-epoch causal lineage.
+3. Extend the schema-aware walker from field/model effects to row-local relation exact effects using P464 direct migration transport.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context/DX, granular DB-owned authorization, Semantic Rules/invariants, migration frontend, Python/.NET/Studio/CLI, backup/restore/corruption UX, public perf/binary budgets, native Windows secure memory and deferred physical-tree optimization remain carried from the master ledger.
+
+### SUPERSEDED / DO NOT EXTEND
+- flat monolithic directory checkpoints;
+- manifest/checkpoint backward readers for unreleased pass-era layouts;
+- format-number ladders whose only purpose is preserving internal development snapshots.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Synchronous directory checkpoint construction remains O(checkpoint bytes), bounded by one current checkpoint chunk plus canonical encoder state; it must not regress to whole-checkpoint `Vec<u8>` materialization.
+- Resumable directory checkpointing remains O(checkpoint bytes), not O(chunks x checkpoint bytes), and keeps its canonical spool law.
+- P462 current-epoch stale proof remains depth-flat; P470 adds no history/data scan to transaction paths.
+
+### NEXT RECOMMENDED PASS
+**PASS471 — active pre-release legacy/compatibility hostile sweep.** Classify remaining active `legacy`/`compat` surfaces across runtime/kernel-plan/storage, delete actual unreleased API/format/adaptor baggage, and preserve only genuine semantic compatibility predicates or reference-only Obsolete material. Then return to retained per-schema-epoch P462 support/action authority as P472.
+
+## PASS471 — active pre-release compatibility hostile sweep
+
+### CLOSED THIS PASS
+- Removed the unreleased `DatabaseContext<M>` source-compatibility name. `Context<M>` is now the concrete Rust application-context type and the public facade exports only that canonical name.
+- Removed the obsolete target-backlink hint from `ObjectManyFieldSchema`: no `via_field` storage/getter and no `many { field via backlink: T }` macro syntax remain. Canonical many declarations lower directly from the relationship field semantic identity.
+- Removed the retirement-only `advise_semantic_statistics` surface end-to-end, including runtime wrappers, advisor selection/report plumbing and tests whose only purpose was preserving/retiring artifacts from the obsolete direct-Join statistics advisor. Manual semantic statistics remain a distinct reconstructible capability.
+- Removed a stale durability compatibility claim/test that manually constructed an old v5 mutation payload. The current pre-release format law is fail-closed and does not carry synthetic pass-era decoder tests.
+- Reclassified remaining `MaterializedSemanticIndexState` / `LegacyIndex` code from "supported compatibility" to an active architectural residue. Hostile audit shows it is a complete duplicate physical family (advisor + durable recipe + delta maintenance + execution fallback), so partial deletion was rejected.
+- Fixed a stale runtime end-to-end test pattern to match the current `HistoryUndoReadiness::Rebased` surface; no product semantics changed.
+
+### OPEN — IMMEDIATE
+1. **PASS472 — remove the superseded semantic-index physical family end-to-end.** Delete `MaterializedSemanticIndexState`, `UnifiedArtifactId::SemanticIndex`, its advisor/policy/report, durable `SemanticIndex` artifact recipe, delta maintenance and `LegacyIndex` capability fallback. Preserve only the selected ObservableAtom/SAMF path and genuinely distinct quotient/statistics capabilities.
+2. Retain/rebuild per-schema-epoch P462 support/action roots across `SchemaMigrationExact` so P465 source-epoch proof is depth-independent.
+3. Extend the schema-aware walker to row-local relation exact effects using the P464 direct migration transport.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship product polish beyond the removed compatibility syntax, granular DB-owned authorization, Semantic Rules/invariants, migration frontend, Python/.NET/Studio/CLI, backup/restore/corruption UX, public perf/binary budgets, native Windows secure memory, and deferred physical persistent-tree optimization remain carried from the master ledger.
+
+### SUPERSEDED / DO NOT EXTEND
+- `DatabaseContext<M>` as a source-compatibility alias.
+- target-backlink `via_field` metadata or `many { ... via ... }` declaration syntax.
+- advisor APIs whose only current behavior is retirement of unreleased obsolete advisor state.
+- calling the old semantic-index execution family a compatibility obligation. It is architectural residue and must be deleted, not supported.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P471 changes no selected query/transaction hot-path algorithm. ObservableAtom/SAMF remains the primary semantic fiber path.
+- Removal in P472 must preserve observable-fiber lookup/delta-maintenance cost class and must not introduce a scan/generic fallback when the superseded index family disappears.
+- P462 current-epoch stale proof remains depth-flat; no history/data scan was added.
+
+### NEXT RECOMMENDED PASS
+**PASS472 — remove `MaterializedSemanticIndexState` / `LegacyIndex` as one complete physical-family cut.** Only after the duplicate execution architecture is gone return to retained per-schema-epoch P462 indexes.
+
+
+## PASS472 — one semantic-fiber physical family
+
+### CLOSED THIS PASS
+- Removed `MaterializedSemanticIndexState` / `LegacyIndex` as an active physical execution family end-to-end.
+- Removed `UnifiedArtifactId::SemanticIndex`, the old semantic-index advisor/install surfaces, durable `SemanticIndex` recipe, relation-delta maintenance/invalidation and semantic-fiber fallback routing.
+- SAMF / `ObservableAtom` is now the sole persisted semantic-fiber execution authority. `SemanticIndexBinding` remains only the canonical semantic key/binding coordinate.
+- Recovery/advisor fixtures were rewritten against surviving distinct artifact laws: ObservableAtom durable cores rehydrate without rebuild work; I64 indexes and semantic statistics exercise rebuild/deferred work budgets.
+- Pre-release physical-artifact recipe tags from the deleted family are rejected rather than decoded.
+
+### OPEN — IMMEDIATE
+1. Retain/rebuild per-schema-epoch P462 support/action roots across `SchemaMigrationExact` so P465 source-epoch proof is depth-independent rather than O(old-epoch history depth).
+2. Extend schema-aware transport from the current field/model class to row-local relation exact effects using P464 migration transport.
+3. Continue hostile sweeps only on evidence; do not recreate a second semantic-fiber representation as a fallback.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- General relational/query guard provenance; authorization/grant transport; Context/Auth/Semantic Rules; migration frontend; Python/.NET/Studio/CLI; backup/restore/corruption UX; public perf/binary budgets; Windows secure memory remain carried.
+
+### SUPERSEDED / DO NOT EXTEND
+- `MaterializedSemanticIndexState`, `SemanticFiberCapability::LegacyIndex`, `UnifiedArtifactId::SemanticIndex` and any durable/advisor path that reconstructs the deleted family.
+- Any routing fallback between a legacy semantic bucket index and SAMF.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Persisted semantic Filter/Join access remains on SAMF/ObservableAtom and MUST NOT degrade to generic scans because the duplicate family was removed.
+- ObservableAtom durable cores rehydrate without semantic-key rebuild work; rebuild budgets apply to reconstructible families that actually rebuild.
+- P462 current-epoch stale transport remains depth-flat.
+
+### NEXT RECOMMENDED PASS
+**PASS473 — retained per-schema-epoch P462 support/action authority.** Remove the measured `O(old-epoch history depth)` payer in the schema-aware transaction walker without caches, replay fallback or duplicated history authority.
+
+## PASS473 — retained per-schema-epoch P462 support/action authority
+
+### CLOSED THIS PASS
+- Replaced the schema-aware field walker's old-epoch linear durable-record scan with immutable retained schema-epoch roots inside the existing `RuntimeHistoricalDerivedIndex`.
+- A schema cutover now seals the source epoch's P462 relation-support/action timelines instead of destroying them. The new epoch starts with the ordinary current P462 root; no second history store or mutable witness cache exists.
+- Each retained schema epoch also keeps the source `SemanticContext` and structurally shared COW field-value root required by deterministic field migration. This is proof material only, not an old-schema query authority.
+- Added `SchemaMigrationTransport::transport_field_updates_from_root_exact`; field transport reads only the retained immutable field root and affected migration dependencies. The hot schema-aware path no longer calls `revision_at()` or asks durability for the entire formation->HEAD transition chain.
+- Reopen reconstructs retained epoch support/action roots from the canonical causal ledger plus already-retained historical epoch authority. No serialized witness-cache format or compatibility branch was added.
+- Field-coordinate conflict proof now asks each persistent timeline only for the first action after the formation revision, making a conflict decision `O(log epoch-depth)` rather than collecting the suffix.
+- Hostile restart regression proves a fresh (non-retry) schema-A intent can be accepted after reopen and transported through A->B->C using the reconstructed retained roots.
+
+### OPEN — IMMEDIATE
+1. Extend the schema-aware walker from field/model effects to row-local relation exact effects using P464 `transport_relation_delta_exact` and the retained per-epoch relation-support/action authority closed here.
+2. General relational/query guard provenance remains fail-closed until an exact dependency/transport law exists; do not add old-schema query fallback.
+3. After row-local relation transport, hostile-audit authorization/grant transport across schema migration on the same semantic coordinates.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX follow-up; DB-owned granular authorization; deterministic/general Semantic Rules and invariants; migration frontend; Python/.NET/Studio/CLI surfaces; backup/restore/corruption UX; public performance/binary-size budgets; native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- `certify_old_epoch_field_segment` linear replay over durable revision records.
+- Fetching `revision_transition_records_back_to(formation, HEAD)` from the schema-aware field hot path.
+- `revision_at(old_epoch_boundary)` as migration field-transport proof material.
+- Mutable/serialized witness caches or an old-schema query router for stale-client transport.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Current-epoch P462 stale proof remains depth-flat.
+- Retained epoch field conflict lookup is one persistent-map rank lookup plus the first relevant action; diagnostic debug benchmark: 50k lookups at depth 1k = ~18.1 ms, depth 100k = ~31.1 ms (100x history depth -> ~1.72x wall time, non-release sandbox measurement).
+- Schema-aware field transport now scales with crossed schema epochs and touched/dependency coordinates, not ordinary transaction count inside old epochs.
+- Migration cutover retains COW field roots and persistent support/action roots structurally; it does not copy the full old `DatabaseState`.
+
+### NEXT RECOMMENDED PASS
+**PASS474 — row-local relation exact effects across schema epochs.** Reuse retained epoch support/action roots plus P464 direct relation-delta transport so stale A relation intents cross A->B without historical row reconstruction, inverse migration, generic query fallback or a second conflict engine.

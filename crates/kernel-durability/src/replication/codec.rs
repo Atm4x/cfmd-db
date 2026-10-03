@@ -1,5 +1,5 @@
 pub(super) const REPLICATION_MAGIC: [u8; 4] = *b"CFRP";
-pub(super) const REPLICATION_VERSION: u16 = 2;
+pub(super) const REPLICATION_FORMAT_TAG: u16 = 0xC469;
 pub(super) const FRAME_HEADER_LEN: usize = 16;
 pub(super) const KIND_INGEST: u8 = 1;
 pub(super) const KIND_RETIRE: u8 = 2;

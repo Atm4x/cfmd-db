@@ -12,9 +12,7 @@ use crate::checkpoint;
 use super::file_io::{
     read_exact_file_payload, read_exact_or_corruption, read_exact_sized_file, require_file_eof,
 };
-use super::format_registry::{
-    CHECKPOINT_FORMAT_VERSION, DurableFormatRegistry, LEGACY_CHECKPOINT_FORMAT_VERSION,
-};
+use super::format_registry::{CHECKPOINT_FORMAT_TAG, DurableFormatRegistry};
 use super::generation_layout::{checkpoint_chunk_path, checkpoint_path};
 use super::manifest::ManifestRecord;
 use crate::runtime::DurabilityError;
@@ -42,36 +40,18 @@ pub(super) fn read_checkpoint_root_bounded(path: &Path) -> Result<Vec<u8>, Durab
             reason: "checkpoint header checksum mismatch",
         });
     }
-    let tail_len = if version == LEGACY_CHECKPOINT_FORMAT_VERSION {
-        if read_u16(&header[6..8]) != 0 {
-            return Err(DurabilityError::Corruption {
-                offset: 0,
-                reason: "unsupported checkpoint file flags",
-            });
-        }
-        let payload_len = usize::try_from(read_u64(&header[8..16]))
-            .map_err(|_| DurabilityError::PayloadTooLarge)?;
-        if payload_len > MAX_CHECKPOINT_LEN {
-            return Err(DurabilityError::Corruption {
-                offset: 0,
-                reason: "checkpoint payload length exceeds hard limit",
-            });
-        }
-        payload_len
-    } else {
-        DurableFormatRegistry::require_checkpoint_current(version)?;
-        let logical_len = usize::try_from(read_u64(&header[8..16]))
-            .map_err(|_| DurabilityError::PayloadTooLarge)?;
-        if logical_len > MAX_CHECKPOINT_LEN {
-            return Err(DurabilityError::Corruption {
-                offset: 0,
-                reason: "checkpoint logical stream exceeds configured bound",
-            });
-        }
-        usize::from(read_u16(&header[6..8]))
-            .checked_mul(CHECKPOINT_CHUNK_DESCRIPTOR_LEN)
-            .ok_or(DurabilityError::PayloadTooLarge)?
-    };
+    DurableFormatRegistry::require_checkpoint_current(version)?;
+    let logical_len =
+        usize::try_from(read_u64(&header[8..16])).map_err(|_| DurabilityError::PayloadTooLarge)?;
+    if logical_len > MAX_CHECKPOINT_LEN {
+        return Err(DurabilityError::Corruption {
+            offset: 0,
+            reason: "checkpoint logical stream exceeds configured bound",
+        });
+    }
+    let tail_len = usize::from(read_u16(&header[6..8]))
+        .checked_mul(CHECKPOINT_CHUNK_DESCRIPTOR_LEN)
+        .ok_or(DurabilityError::PayloadTooLarge)?;
     let tail = read_exact_file_payload(
         &mut file,
         tail_len,
@@ -143,7 +123,7 @@ pub(super) fn write_chunked_checkpoint_root(
     }
     let mut header = [0_u8; CHECKPOINT_HEADER_LEN];
     header[0..4].copy_from_slice(&CHECKPOINT_MAGIC);
-    header[4..6].copy_from_slice(&CHECKPOINT_FORMAT_VERSION.to_le_bytes());
+    header[4..6].copy_from_slice(&CHECKPOINT_FORMAT_TAG.to_le_bytes());
     header[6..8].copy_from_slice(
         &u16::try_from(chunk_crcs.len())
             .map_err(|_| DurabilityError::PayloadTooLarge)?
@@ -223,11 +203,7 @@ pub(super) fn read_checkpoint_generation(
             reason: "checkpoint header truncated",
         });
     }
-    let version = read_u16(&root[4..6]);
-    if version == LEGACY_CHECKPOINT_FORMAT_VERSION {
-        return decode_checkpoint_file(&root, registry);
-    }
-    DurableFormatRegistry::require_checkpoint_current(version)?;
+    DurableFormatRegistry::require_checkpoint_current(read_u16(&root[4..6]))?;
     let header = &root[..CHECKPOINT_HEADER_LEN];
     if header[..4] != CHECKPOINT_MAGIC || crc32c(&header[..28]) != read_u32(&header[28..32]) {
         return Err(DurabilityError::Corruption {
@@ -300,103 +276,56 @@ pub(super) fn read_checkpoint_generation(
     Ok(revision)
 }
 
-pub(super) fn write_checkpoint_file(
-    path: &Path,
+pub(super) fn write_checkpoint_generation(
+    directory: &Path,
+    generation: u64,
     revision: &Revision,
 ) -> Result<u32, DurabilityError> {
-    let mut payload_len = 0_u64;
-    let mut payload_crc_state = !0_u32;
-    checkpoint::stream_revision(revision, &mut |bytes| {
-        let len = u64::try_from(bytes.len()).map_err(|_| DurabilityError::PayloadTooLarge)?;
-        payload_len = payload_len
-            .checked_add(len)
+    let mut logical_len = 0_usize;
+    let mut chunk = Vec::with_capacity(DEFAULT_CHECKPOINT_CHUNK_SIZE);
+    let mut chunk_crcs = Vec::new();
+
+    let mut flush_chunk = |chunk: &mut Vec<u8>| -> Result<(), DurabilityError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let ordinal = chunk_crcs.len();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(checkpoint_chunk_path(directory, generation, ordinal))?;
+        file.write_all(chunk)?;
+        file.sync_all()?;
+        chunk_crcs.push(crc32c(chunk));
+        chunk.clear();
+        Ok(())
+    };
+
+    checkpoint::stream_revision(revision, &mut |mut bytes| {
+        logical_len = logical_len
+            .checked_add(bytes.len())
             .ok_or(DurabilityError::PayloadTooLarge)?;
-        payload_crc_state = crc32c_update(payload_crc_state, bytes);
+        if logical_len > MAX_CHECKPOINT_LEN {
+            return Err(DurabilityError::PayloadTooLarge);
+        }
+        while !bytes.is_empty() {
+            let remaining = DEFAULT_CHECKPOINT_CHUNK_SIZE - chunk.len();
+            let take = remaining.min(bytes.len());
+            chunk.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if chunk.len() == DEFAULT_CHECKPOINT_CHUNK_SIZE {
+                flush_chunk(&mut chunk)?;
+            }
+        }
         Ok(())
     })?;
-    if payload_len > MAX_CHECKPOINT_LEN as u64 {
-        return Err(DurabilityError::PayloadTooLarge);
-    }
-    let payload_crc = !payload_crc_state;
-    let mut header = [0_u8; CHECKPOINT_HEADER_LEN];
-    header[0..4].copy_from_slice(&CHECKPOINT_MAGIC);
-    header[4..6].copy_from_slice(&LEGACY_CHECKPOINT_FORMAT_VERSION.to_le_bytes());
-    header[6..8].copy_from_slice(&0_u16.to_le_bytes());
-    header[8..16].copy_from_slice(&payload_len.to_le_bytes());
-    header[16..24].copy_from_slice(&revision.id().raw().to_le_bytes());
-    header[24..28].copy_from_slice(&payload_crc.to_le_bytes());
-    let header_crc = crc32c(&header[..28]);
-    header[28..32].copy_from_slice(&header_crc.to_le_bytes());
-
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
-    file.write_all(&header)?;
-    let mut file_crc = crc32c_update(!0_u32, &header);
-    checkpoint::stream_revision(revision, &mut |bytes| {
-        file.write_all(bytes)?;
-        file_crc = crc32c_update(file_crc, bytes);
-        Ok(())
-    })?;
-    file.sync_all()?;
-    Ok(!file_crc)
-}
-
-fn decode_checkpoint_file(
-    bytes: &[u8],
-    registry: &SemanticRegistry,
-) -> Result<Revision, DurabilityError> {
-    if bytes.len() < CHECKPOINT_HEADER_LEN {
-        return Err(DurabilityError::Corruption {
-            offset: 0,
-            reason: "checkpoint header truncated",
-        });
-    }
-    let header = &bytes[..CHECKPOINT_HEADER_LEN];
-    if header[..4] != CHECKPOINT_MAGIC {
-        return Err(DurabilityError::Corruption {
-            offset: 0,
-            reason: "checkpoint magic mismatch",
-        });
-    }
-    let version = read_u16(&header[4..6]);
-    DurableFormatRegistry::require_checkpoint_legacy(version)?;
-    if read_u16(&header[6..8]) != 0 {
-        return Err(DurabilityError::Corruption {
-            offset: 0,
-            reason: "unsupported checkpoint file flags",
-        });
-    }
-    if crc32c(&header[..28]) != read_u32(&header[28..32]) {
-        return Err(DurabilityError::Corruption {
-            offset: 0,
-            reason: "checkpoint header checksum mismatch",
-        });
-    }
-    let payload_len =
-        usize::try_from(read_u64(&header[8..16])).map_err(|_| DurabilityError::Corruption {
-            offset: 0,
-            reason: "checkpoint payload length overflow",
-        })?;
-    if payload_len > MAX_CHECKPOINT_LEN
-        || CHECKPOINT_HEADER_LEN.checked_add(payload_len) != Some(bytes.len())
-    {
-        return Err(DurabilityError::Corruption {
-            offset: 0,
-            reason: "checkpoint payload length mismatch",
-        });
-    }
-    let payload = &bytes[CHECKPOINT_HEADER_LEN..];
-    if crc32c(payload) != read_u32(&header[24..28]) {
-        return Err(DurabilityError::Corruption {
-            offset: 0,
-            reason: "checkpoint payload checksum mismatch",
-        });
-    }
-    let revision = checkpoint::decode_revision(payload, registry)?;
-    if revision.id().raw() != read_u64(&header[16..24]) {
-        return Err(DurabilityError::Protocol {
-            offset: 0,
-            reason: "checkpoint header revision mismatch",
-        });
-    }
-    Ok(revision)
+    flush_chunk(&mut chunk)?;
+    write_chunked_checkpoint_root(
+        directory,
+        generation,
+        revision.id(),
+        logical_len,
+        &chunk_crcs,
+        DEFAULT_CHECKPOINT_CHUNK_SIZE,
+    )
 }

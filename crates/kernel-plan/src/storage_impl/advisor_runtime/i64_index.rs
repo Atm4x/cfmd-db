@@ -184,7 +184,7 @@ fn collect_i64_join_advice_observations(
     store: &PhysicalStore,
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
-    observations: &mut Vec<SemanticIndexAdviceObservation>,
+    observations: &mut Vec<ObservableAtomAdviceObservation>,
 ) -> Result<(), PhysicalExecutionError> {
     if let Some(observation) =
         semantic_index_join_advice_observation(plan, store, context, registry)?

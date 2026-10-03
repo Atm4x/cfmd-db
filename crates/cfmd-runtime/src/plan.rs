@@ -206,10 +206,6 @@ impl Plan {
         Ok(self.remove(relation.id(), row))
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Keep the explicit semantic and durability inputs at this boundary."
-    )]
     pub(crate) fn patch_object_field(
         &mut self,
         relation: RelationId,
@@ -221,29 +217,24 @@ impl Plan {
         owner: kernel_types::EntityId,
         field: kernel_types::SemanticId,
     ) -> crate::Result<()> {
-        let patch = match self.object_field_patches.entry((relation, identity_raw)) {
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                let patch = entry.into_mut();
-                if patch.identity_column != identity_column
-                    || patch.identity_value != identity_value
-                    || patch.owner != owner
-                {
-                    return Err(crate::Error::new(
-                        crate::ErrorKind::InvalidPlan,
-                        "object field patches disagree on semantic identity",
-                    ));
-                }
-                patch
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(PendingObjectFieldPatch {
-                    identity_column,
-                    identity_value,
-                    owner,
-                    fields: BTreeMap::new(),
-                })
-            }
-        };
+        let patch = self
+            .object_field_patches
+            .entry((relation, identity_raw))
+            .or_insert_with(|| PendingObjectFieldPatch {
+                identity_column,
+                identity_value: identity_value.clone(),
+                owner,
+                fields: BTreeMap::new(),
+            });
+        if patch.identity_column != identity_column
+            || patch.identity_value != identity_value
+            || patch.owner != owner
+        {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "object field patches disagree on semantic identity",
+            ));
+        }
         patch.fields.insert(target_column, (value, field));
         Ok(())
     }
@@ -298,10 +289,6 @@ impl Plan {
     ///
     /// Composition is structural: no hidden retry, rebase, or read of a newer HEAD occurs.
     /// A plan from any other snapshot fails closed.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
-    )]
     pub fn extend(&mut self, other: Self) -> crate::Result<&mut Self> {
         if self.database_identity != other.database_identity
             || self.source != other.source

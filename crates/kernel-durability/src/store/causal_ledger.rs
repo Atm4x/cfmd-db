@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_change::{RevisionEffect, RevisionEffectId, RevisionEffectIdeal};
+use kernel_revision::Revision;
 use kernel_types::RevisionId;
 
 use crate::replication::authority::ReplicationAuthorityJournal;
@@ -79,7 +80,7 @@ fn causal_prerequisites_with_lookup(
     mut frontier: impl FnMut(RevisionId) -> Option<BTreeSet<RevisionEffectId>>,
 ) -> Result<BTreeSet<RevisionEffectId>, DurabilityError> {
     match &descriptor.intent {
-        DurableTransactionIntent::RelationResolutionExact { causal_parents, .. } => {
+        DurableTransactionIntent::RelationResolution { causal_parents, .. } => {
             if causal_parents.len() < 2
                 || causal_parents.windows(2).any(|pair| pair[0] >= pair[1])
                 || causal_parents
@@ -155,6 +156,7 @@ impl<'a> CausalCommitOverlay<'a> {
             transaction_epoch: descriptor.idempotency_epoch,
             transaction_id: descriptor.transaction_id,
             intent: descriptor.intent.clone(),
+            change: descriptor.change.clone(),
             source_revision: descriptor.source_revision,
             target_revision: descriptor.target_revision,
         };
@@ -234,7 +236,7 @@ pub(super) fn causal_prerequisites_for_replicated_effect(
     record: &DurableRevisionEffectRecord,
 ) -> Result<BTreeSet<RevisionEffectId>, DurabilityError> {
     match &record.intent {
-        DurableTransactionIntent::RelationResolutionExact { causal_parents, .. } => {
+        DurableTransactionIntent::RelationResolution { causal_parents, .. } => {
             if causal_parents.len() < 2
                 || causal_parents.windows(2).any(|pair| pair[0] >= pair[1])
                 || causal_parents
@@ -286,6 +288,7 @@ fn append_committed_revision_effect(
             transaction_epoch: descriptor.idempotency_epoch,
             transaction_id: descriptor.transaction_id,
             intent: descriptor.intent.clone(),
+            change: descriptor.change.clone(),
             source_revision: descriptor.source_revision,
             target_revision: descriptor.target_revision,
         },
@@ -346,7 +349,7 @@ pub(super) fn validate_revision_effect_state(
             });
         }
         let expected_prerequisites = match intent {
-            DurableTransactionIntent::RelationResolutionExact { causal_parents, .. } => {
+            DurableTransactionIntent::RelationResolution { causal_parents, .. } => {
                 let mut cut = BTreeSet::new();
                 for parent in causal_parents {
                     let Some(frontier) = frontiers.get(parent) else {
@@ -393,6 +396,127 @@ pub(super) fn validate_revision_effect_state(
 }
 
 impl DurableRevisionStore {
+    /// Irreversibly expires the locally retained causal prefix at the current
+    /// durable head and publishes that new coverage root in a checkpoint.
+    ///
+    /// This is the causal-history analogue of retry-history expiry: semantic
+    /// state is unchanged, but revisions older than the new root are no longer
+    /// available for causal replay/rebase. Retained migration history and
+    /// unresolved prepares are explicit blockers rather than hidden fallbacks.
+    pub fn release_causal_history_before_head(
+        &mut self,
+        revision: &Revision,
+    ) -> Result<Option<super::DurableGenerationReceipt>, DurabilityError> {
+        if revision.id() != self.durable_head {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "causal-history release revision does not match durable head",
+            });
+        }
+        if !self.prepared_transactions.is_empty() {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "causal-history release is blocked by unresolved prepared transactions",
+            });
+        }
+        if !self.historical_epoch_anchors.is_empty() {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "causal-history release is blocked by retained historical epoch authority",
+            });
+        }
+        let local_effects = self
+            .revision_effects
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if self.replication.effects_iter().any(|(_, envelope)| {
+            envelope
+                .effect
+                .prerequisites
+                .iter()
+                .any(|id| local_effects.contains(id))
+        }) {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "causal-history release is blocked by replicated causal prerequisites",
+            });
+        }
+        if self.causal_coverage_root == self.durable_head && self.revision_effects.is_empty() {
+            return Ok(None);
+        }
+
+        let previous_root = self.causal_coverage_root;
+        let previous_effects = std::mem::take(&mut self.revision_effects);
+        let previous_frontiers = std::mem::take(&mut self.revision_effect_frontiers);
+        self.causal_coverage_root = self.durable_head;
+        self.revision_effect_frontiers
+            .insert(self.durable_head, BTreeSet::new());
+
+        let result = self.rotate_checkpoint_current_specs_with_hook(
+            revision,
+            &mut super::publication_protocol::NoStoreFault,
+        );
+        if result.is_err() && !self.poisoned {
+            self.causal_coverage_root = previous_root;
+            self.revision_effects = previous_effects;
+            self.revision_effect_frontiers = previous_frontiers;
+        }
+        result.map(Some)
+    }
+
+    /// Returns the exact primary revision-transition chain from `target` back
+    /// to `source`, newest transition first.
+    ///
+    /// This is a projection of the authoritative causal ledger, not a second
+    /// history index. Every committed target revision owns exactly one local
+    /// transition effect; following that effect's `source_revision` therefore
+    /// recovers the same state-transition lineage without materializing or
+    /// topologically validating the complete causal ideal at each endpoint.
+    pub fn revision_transition_records_back_to(
+        &self,
+        source: RevisionId,
+        target: RevisionId,
+    ) -> Result<Option<Vec<DurableRevisionEffectRecord>>, DurabilityError> {
+        if source == target {
+            return Ok(Some(Vec::new()));
+        }
+        let mut cursor = target;
+        let mut seen = BTreeSet::new();
+        let mut records = Vec::new();
+        while cursor != source {
+            if !seen.insert(cursor) {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "durable revision transition lineage is cyclic",
+                });
+            }
+            let Some(frontier) = self.revision_effect_frontiers.get(&cursor) else {
+                return Ok(None);
+            };
+            if frontier.len() != 1 {
+                return Ok(None);
+            }
+            let id = *frontier.first().expect("singleton frontier");
+            let record = self
+                .revision_effects
+                .get(&id)
+                .ok_or(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "durable revision frontier references a missing effect",
+                })?;
+            if record.target_revision != cursor {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "durable revision frontier targets the wrong revision",
+                });
+            }
+            records.push(record.clone());
+            cursor = record.source_revision;
+        }
+        Ok(Some(records))
+    }
+
     #[must_use]
     pub fn revision_effect_record(
         &self,

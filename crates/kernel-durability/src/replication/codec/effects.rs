@@ -76,6 +76,7 @@ fn encode_effect(
     push_u64(out, effect.transaction_epoch.raw());
     push_u128(out, effect.transaction_id.raw());
     metadata::encode_transaction_intent(out, &effect.intent)?;
+    metadata::encode_revision_change(out, &effect.change)?;
     push_u64(out, effect.source_revision.raw());
     push_u64(out, effect.target_revision.raw());
     Ok(())
@@ -97,6 +98,7 @@ fn decode_effect(cursor: &mut Cursor<'_>) -> Result<DurableRevisionEffectRecord,
     let transaction_epoch = IdempotencyEpoch::new(cursor.u64()?);
     let transaction_id = ClientTransactionId::new(cursor.u128()?);
     let intent = metadata::decode_transaction_intent(cursor)?;
+    let change = metadata::decode_revision_change(cursor)?;
     let source_revision = RevisionId::new(cursor.u64()?);
     let target_revision = RevisionId::new(cursor.u64()?);
     let effect = DurableRevisionEffectRecord {
@@ -105,6 +107,7 @@ fn decode_effect(cursor: &mut Cursor<'_>) -> Result<DurableRevisionEffectRecord,
         transaction_epoch,
         transaction_id,
         intent,
+        change,
         source_revision,
         target_revision,
     };

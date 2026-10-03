@@ -48,31 +48,20 @@ pub(super) fn install_intent_semantic_modules(
     intent: &DurableTransactionIntent,
 ) -> Result<(), DurabilityError> {
     let semantic_modules = match intent {
-        DurableTransactionIntent::RelationDataExact {
+        DurableTransactionIntent::RelationData { semantic_modules, .. }
+        | DurableTransactionIntent::RelationRewrite {
             semantic_modules, ..
         }
-        | DurableTransactionIntent::RelationDataResidualExact {
+        | DurableTransactionIntent::RelationResolution {
             semantic_modules, ..
         }
-        | DurableTransactionIntent::RelationRewriteExact {
+        | DurableTransactionIntent::MixedRevision { semantic_modules, .. }
+        | DurableTransactionIntent::FullRevision {
             semantic_modules, ..
         }
-        | DurableTransactionIntent::RelationResolutionExact {
-            semantic_modules, ..
-        }
-        | DurableTransactionIntent::MixedRevisionExact {
-            semantic_modules, ..
-        }
-        | DurableTransactionIntent::MixedRevisionResidualExact {
-            semantic_modules, ..
-        }
-        | DurableTransactionIntent::Exact {
-            semantic_modules, ..
-        }
-        | DurableTransactionIntent::SchemaMigrationExact {
+        | DurableTransactionIntent::SchemaMigration {
             semantic_modules, ..
         } => semantic_modules,
-        DurableTransactionIntent::LegacyTargetOnly { .. } => return Ok(()),
     };
     install_semantic_module_packages(registry, semantic_modules)
 }

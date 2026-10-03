@@ -6,7 +6,7 @@ use crate::binary_codec::{
 };
 use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
-    DurableRelationLayoutKind, DurableSemanticKeyPart, PHYSICAL_ARTIFACT_RECIPE_VERSION,
+    DurableRelationLayoutKind, DurableSemanticKeyPart, PHYSICAL_ARTIFACT_RECIPE_TAG,
     canonical_physical_artifact_specs,
 };
 use crate::domain::DurableMigrationComplement;
@@ -240,7 +240,7 @@ pub(super) fn encode_physical_artifact_specs(
     out: &mut impl crate::binary_codec::BinarySink,
     specs: &[DurablePhysicalArtifactSpec],
 ) -> Result<(), CodecError> {
-    out.extend_from_slice(&PHYSICAL_ARTIFACT_RECIPE_VERSION.to_le_bytes());
+    out.extend_from_slice(&PHYSICAL_ARTIFACT_RECIPE_TAG.to_le_bytes());
     let specs = canonical_physical_artifact_specs(specs);
     push_len(out, specs.len())?;
     for spec in specs {
@@ -250,7 +250,7 @@ pub(super) fn encode_physical_artifact_specs(
                 layout_id,
                 kind,
             } => {
-                out.push(3);
+                out.push(0);
                 push_u128(out, relation.raw());
                 push_u128(out, layout_id);
                 out.push(match kind {
@@ -266,7 +266,7 @@ pub(super) fn encode_physical_artifact_specs(
                 equivalence,
                 advisor_managed,
             } => {
-                out.push(4);
+                out.push(1);
                 push_u128(out, relation.raw());
                 push_u64(
                     out,
@@ -275,23 +275,7 @@ pub(super) fn encode_physical_artifact_specs(
                 push_u128(out, equivalence.raw());
                 out.push(u8::from(advisor_managed));
             }
-            DurablePhysicalArtifactSpec::SemanticIndex {
-                relation,
-                key_parts,
-                advisor_managed,
-            } => {
-                out.push(0);
-                encode_semantic_artifact_key(out, relation, &key_parts, advisor_managed)?;
-            }
             DurablePhysicalArtifactSpec::SemanticQuotientFactor {
-                relation,
-                key_parts,
-                advisor_managed,
-            } => {
-                out.push(1);
-                encode_semantic_artifact_key(out, relation, &key_parts, advisor_managed)?;
-            }
-            DurablePhysicalArtifactSpec::SemanticStatistics {
                 relation,
                 key_parts,
                 advisor_managed,
@@ -299,12 +283,20 @@ pub(super) fn encode_physical_artifact_specs(
                 out.push(2);
                 encode_semantic_artifact_key(out, relation, &key_parts, advisor_managed)?;
             }
+            DurablePhysicalArtifactSpec::SemanticStatistics {
+                relation,
+                key_parts,
+                advisor_managed,
+            } => {
+                out.push(3);
+                encode_semantic_artifact_key(out, relation, &key_parts, advisor_managed)?;
+            }
             DurablePhysicalArtifactSpec::ObservableAtom {
                 relation,
                 key_parts,
                 advisor_managed,
             } => {
-                out.push(5);
+                out.push(4);
                 encode_semantic_artifact_key(out, relation, &key_parts, advisor_managed)?;
             }
         }
@@ -334,40 +326,15 @@ pub(super) fn encode_semantic_artifact_key(
 pub(super) fn decode_physical_artifact_specs(
     cursor: &mut impl BinarySource,
 ) -> Result<Vec<DurablePhysicalArtifactSpec>, &'static str> {
-    let recipe_version = cursor.u16()?;
-    if !(1..=PHYSICAL_ARTIFACT_RECIPE_VERSION).contains(&recipe_version) {
-        return Err("unsupported physical artifact recipe version");
+    let recipe_tag = cursor.u16()?;
+    if recipe_tag != PHYSICAL_ARTIFACT_RECIPE_TAG {
+        return Err("unsupported physical artifact recipe tag");
     }
     let count = cursor.len()?;
     let mut specs = Vec::with_capacity(cursor.bounded_capacity(count));
     for _ in 0..count {
-        let tag = cursor.u8()?;
-        let spec = match tag {
+        let spec = match cursor.u8()? {
             0 => {
-                let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
-                DurablePhysicalArtifactSpec::SemanticIndex {
-                    relation,
-                    key_parts,
-                    advisor_managed,
-                }
-            }
-            1 => {
-                let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
-                DurablePhysicalArtifactSpec::SemanticQuotientFactor {
-                    relation,
-                    key_parts,
-                    advisor_managed,
-                }
-            }
-            2 => {
-                let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
-                DurablePhysicalArtifactSpec::SemanticStatistics {
-                    relation,
-                    key_parts,
-                    advisor_managed,
-                }
-            }
-            3 if recipe_version >= 2 => {
                 let relation = SemanticId::new(cursor.u128()?);
                 let layout_id = cursor.u128()?;
                 let kind = match cursor.u8()? {
@@ -383,7 +350,7 @@ pub(super) fn decode_physical_artifact_specs(
                     kind,
                 }
             }
-            4 if recipe_version >= 2 => {
+            1 => {
                 let relation = SemanticId::new(cursor.u128()?);
                 let key_column = usize::try_from(cursor.u64()?)
                     .map_err(|_| "physical artifact column overflow")?;
@@ -400,7 +367,23 @@ pub(super) fn decode_physical_artifact_specs(
                     advisor_managed,
                 }
             }
-            5 if recipe_version >= 3 => {
+            2 => {
+                let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
+                DurablePhysicalArtifactSpec::SemanticQuotientFactor {
+                    relation,
+                    key_parts,
+                    advisor_managed,
+                }
+            }
+            3 => {
+                let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
+                DurablePhysicalArtifactSpec::SemanticStatistics {
+                    relation,
+                    key_parts,
+                    advisor_managed,
+                }
+            }
+            4 => {
                 let (relation, key_parts, advisor_managed) = decode_semantic_artifact_key(cursor)?;
                 DurablePhysicalArtifactSpec::ObservableAtom {
                     relation,

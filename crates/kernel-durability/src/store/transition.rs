@@ -58,7 +58,7 @@ fn validate_prepare_identity(
     if let Some(existing_intent) = store.committed_transactions.get(&key) {
         return Err(DurabilityError::Protocol {
             offset: 0,
-            reason: if existing_intent == &descriptor.intent {
+            reason: if existing_intent.same_client_intent(&descriptor.intent) {
                 "transaction is already committed"
             } else {
                 "transaction retry key already committed to another exact intent"
@@ -268,7 +268,7 @@ impl DurableRevisionStore {
                     reason: "local target revision already belongs to local causal authority",
                 });
             }
-            if let super::DurableTransactionIntent::SchemaMigrationExact {
+            if let super::DurableTransactionIntent::SchemaMigration {
                 migration_complement,
                 ..
             } = &descriptor.intent

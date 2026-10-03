@@ -1,4 +1,4 @@
-use crate::Row;
+use crate::{IdempotencyKey, Row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryKind {
@@ -8,7 +8,6 @@ pub enum HistoryKind {
     MixedRevision,
     FullRevision,
     SchemaMigration,
-    LegacyTargetOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +28,7 @@ pub struct HistoryRelationChangeDto {
 pub struct HistoryEntryDto {
     pub effect_id: u128,
     pub prerequisites: Vec<u128>,
-    pub transaction: u128,
+    pub idempotency_key: IdempotencyKey,
     pub source_revision: u64,
     pub target_revision: u64,
     pub kind: HistoryKind,
@@ -42,7 +41,7 @@ impl From<&cfmd_runtime::HistoryEntry> for HistoryEntryDto {
         Self {
             effect_id: entry.effect_id(),
             prerequisites: entry.prerequisites().to_vec(),
-            transaction: entry.transaction().raw(),
+            idempotency_key: IdempotencyKey::new(entry.transaction().raw()),
             source_revision: entry.source_revision().raw(),
             target_revision: entry.target_revision().raw(),
             kind: match entry.kind() {
@@ -54,7 +53,6 @@ impl From<&cfmd_runtime::HistoryEntry> for HistoryEntryDto {
                 cfmd_runtime::HistoryEffectKind::MixedRevision => HistoryKind::MixedRevision,
                 cfmd_runtime::HistoryEffectKind::FullRevision => HistoryKind::FullRevision,
                 cfmd_runtime::HistoryEffectKind::SchemaMigration => HistoryKind::SchemaMigration,
-                cfmd_runtime::HistoryEffectKind::LegacyTargetOnly => HistoryKind::LegacyTargetOnly,
             },
             reversibility: match entry.reversibility() {
                 cfmd_runtime::HistoryReversibility::ExactPlanInverse => {

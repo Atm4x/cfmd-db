@@ -13,7 +13,7 @@ impl DurableRuntime {
             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
         })?;
         if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
-            if committed_intent == &requested_intent {
+            if committed_intent.same_client_intent(&requested_intent) {
                 return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
                     target_revision: requested_intent.target_revision(),
                 });
@@ -76,7 +76,7 @@ impl DurableRuntime {
         .map_err(DurabilityError::Encode)
         .map_err(DurableRuntimeCommitError::PrepareDurability)?;
         if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
-            if committed_intent == &requested_intent {
+            if committed_intent.same_client_intent(&requested_intent) {
                 return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
                     target_revision: requested_intent.target_revision(),
                 });
@@ -134,7 +134,7 @@ impl DurableRuntime {
             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
         })?;
         if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
-            if committed_intent == &requested_intent {
+            if committed_intent.same_client_intent(&requested_intent) {
                 return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
                     target_revision: requested_intent.target_revision(),
                 });

@@ -8,9 +8,9 @@ use kernel_semantics::SemanticRegistry;
 use crate::replication::authority::ReplicationAuthorityJournal;
 
 use super::DurableRevisionStore;
-use super::checkpoint_storage::write_checkpoint_file;
+use super::checkpoint_storage::write_checkpoint_generation;
 use super::file_io::sync_directory;
-use super::generation_layout::{checkpoint_path, lock_directory, metadata_path, wal_path};
+use super::generation_layout::{lock_directory, metadata_path, wal_path};
 use super::manifest::{ManifestRecord, highest_manifest_generation, publish_manifest_with_hook};
 use super::metadata_storage::write_metadata_file;
 use super::publication_protocol::{
@@ -127,8 +127,7 @@ impl DurableRevisionStore {
             });
         }
         let generation = 1;
-        let checkpoint_path = checkpoint_path(&directory, generation);
-        let checkpoint_crc32c = write_checkpoint_file(&checkpoint_path, base_revision)?;
+        let checkpoint_crc32c = write_checkpoint_generation(&directory, generation, base_revision)?;
         hook.hit(StoreFaultPoint::AfterCheckpointSync)?;
         let wal_path = wal_path(&directory, generation);
         let mut wal = FileRevisionWal::create(&wal_path)?;
@@ -156,6 +155,7 @@ impl DurableRevisionStore {
             historical_epoch_anchors: BTreeMap::new(),
             committed_transactions: committed_transactions.clone(),
             semantic_modules,
+            next_revision_effect_id: 1,
             causal_coverage_root: Some(causal_coverage_root),
             revision_effects: revision_effects.clone(),
             revision_effect_frontiers: revision_effect_frontiers.clone(),

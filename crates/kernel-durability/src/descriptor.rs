@@ -3,7 +3,7 @@ mod revision;
 
 pub use artifacts::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
-    DurableRelationLayoutKind, DurableSemanticKeyPart, PHYSICAL_ARTIFACT_RECIPE_VERSION,
+    DurableRelationLayoutKind, DurableSemanticKeyPart, PHYSICAL_ARTIFACT_RECIPE_TAG,
 };
 pub use revision::DurableRevisionDescriptor;
 

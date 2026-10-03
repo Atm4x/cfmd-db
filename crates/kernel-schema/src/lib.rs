@@ -10,7 +10,9 @@ pub use definitions::{
     CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, StructuralEquivalenceDef,
     StructuralOrderingDef,
 };
-pub use rules::{RuleValueExpr, SemanticRuleExpr, SemanticRuleTypeError, TextPattern};
+pub use rules::{
+    FiniteF64, ModelRuleExpr, RuleValueExpr, SemanticRuleExpr, SemanticRuleTypeError, TextPattern,
+};
 pub use schema::{Schema, SchemaError};
 pub use subtype::SubtypeClosure;
 pub use types::{ScalarType, Symbol, SymbolKind, TypeError, TypeExpr, TypeVar};

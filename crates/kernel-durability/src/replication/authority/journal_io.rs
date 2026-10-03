@@ -2,7 +2,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::{ReplicationAuthorityJournal, corruption};
 use crate::binary_codec::{crc32c, read_u16, read_u32};
-use crate::replication::codec::{FRAME_HEADER_LEN, REPLICATION_MAGIC, REPLICATION_VERSION};
+use crate::replication::codec::{FRAME_HEADER_LEN, REPLICATION_FORMAT_TAG, REPLICATION_MAGIC};
 use crate::runtime::{CodecError, DurabilityError};
 use crate::wal_frame::MAX_PAYLOAD_LEN;
 
@@ -16,7 +16,7 @@ fn encode_replication_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, Durabil
         .ok_or(CodecError::LengthOverflow)?;
     let mut frame = vec![0_u8; total];
     frame[..4].copy_from_slice(&REPLICATION_MAGIC);
-    frame[4..6].copy_from_slice(&REPLICATION_VERSION.to_le_bytes());
+    frame[4..6].copy_from_slice(&REPLICATION_FORMAT_TAG.to_le_bytes());
     frame[6] = kind;
     frame[8..12].copy_from_slice(&len.to_le_bytes());
     frame[12..16].copy_from_slice(&crc32c(payload).to_le_bytes());
@@ -31,10 +31,10 @@ fn decode_replication_frame(frame: &[u8], offset: usize) -> Result<(u8, &[u8]), 
     if frame[..4] != REPLICATION_MAGIC {
         return Err(corruption(offset, "replication journal magic mismatch"));
     }
-    if !matches!(read_u16(&frame[4..6]), 1 | REPLICATION_VERSION) {
+    if read_u16(&frame[4..6]) != REPLICATION_FORMAT_TAG {
         return Err(corruption(
             offset,
-            "unsupported replication journal version",
+            "unsupported pre-release replication journal format",
         ));
     }
     if frame[7] != 0 {

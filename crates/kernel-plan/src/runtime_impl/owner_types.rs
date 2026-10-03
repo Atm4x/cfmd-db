@@ -1,3 +1,38 @@
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeIndexedHistoryAction {
+    effect_id: u128,
+    action: RewriteActionLaw,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RuntimeRetainedEpochIndex {
+    lineage_floor: Option<RevisionId>,
+    relation_supports: PersistentOrdMap<SemanticId, PersistentOrdMap<RevisionId, RelationSupportWitness>>,
+    writes: PersistentOrdMap<RuntimeHistoryCoordinate, PersistentOrdMap<RevisionId, RuntimeIndexedHistoryAction>>,
+    exact_effects: PersistentOrdMap<RevisionId, u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeRetainedSchemaEpoch {
+    source_revision: RevisionId,
+    target_revision: RevisionId,
+    source_context: kernel_schema::SemanticContext,
+    source_fields: kernel_model::CowMap<(SemanticId, kernel_types::EntityId), Value>,
+    program: kernel_transport::SchemaMigrationProgram,
+    index: RuntimeRetainedEpochIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RuntimeHistoricalDerivedIndex {
+    lineage_floor: Option<RevisionId>,
+    floor_opaque_effect: Option<u128>,
+    relation_supports: PersistentOrdMap<SemanticId, PersistentOrdMap<RevisionId, RelationSupportWitness>>,
+    writes: PersistentOrdMap<RuntimeHistoryCoordinate, PersistentOrdMap<RevisionId, RuntimeIndexedHistoryAction>>,
+    exact_effects: PersistentOrdMap<RevisionId, u128>,
+    retained_schema_epochs: PersistentOrdMap<RevisionId, RuntimeRetainedSchemaEpoch>,
+}
+
 /// Reader-visible owner for one coherent authoritative revision.
 ///
 /// The logical revision, authoritative physical relation layouts, and every
@@ -14,6 +49,7 @@ pub struct RuntimeRevisionBundle {
     physical: PhysicalStore,
     relation_layouts: PersistentOrdMap<SemanticId, LayoutBinding>,
     relation_bases: PersistentOrdMap<SemanticId, RelationBaseWitness>,
+    historical: RuntimeHistoricalDerivedIndex,
     materialization_specs: PersistentOrdMap<kernel_types::MaterializationId, RelExpr>,
     materializations: PersistentOrdMap<kernel_types::MaterializationId, MaterializedRelPlanState>,
     materialization_dependencies:
@@ -501,6 +537,8 @@ pub struct DurableRuntimeSupervisor {
 pub struct PreparedRuntimeRevisionTransition {
     descriptor: RevisionCommitDescriptor,
     source_identity: RuntimeRootIdentity,
+    source_context: kernel_schema::SemanticContext,
+    source_fields: kernel_model::CowMap<(SemanticId, kernel_types::EntityId), Value>,
     candidate: Box<RuntimeRevisionBundle>,
     output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
 }

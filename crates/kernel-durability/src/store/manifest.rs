@@ -7,15 +7,12 @@ use kernel_types::RevisionId;
 use crate::binary_codec::{crc32c, read_u16, read_u32, read_u64};
 
 use super::file_io::sync_directory;
-use super::format_registry::{
-    DurableFormatRegistry, LEGACY_MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION,
-};
+use super::format_registry::{DurableFormatRegistry, MANIFEST_FORMAT_TAG};
 use super::generation_layout::{manifest_path, parse_generation_name};
 use super::publication_protocol::{PublicationAttempt, StoreFaultHook, StoreFaultPoint};
 use crate::runtime::DurabilityError;
 
 const MANIFEST_MAGIC: [u8; 4] = *b"CFMF";
-const LEGACY_MANIFEST_LEN: usize = 36;
 const MANIFEST_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +73,7 @@ pub(super) fn publish_manifest_with_hook(
 pub(super) fn encode_manifest(manifest: ManifestRecord) -> [u8; MANIFEST_LEN] {
     let mut bytes = [0_u8; MANIFEST_LEN];
     bytes[0..4].copy_from_slice(&MANIFEST_MAGIC);
-    bytes[4..6].copy_from_slice(&MANIFEST_FORMAT_VERSION.to_le_bytes());
+    bytes[4..6].copy_from_slice(&MANIFEST_FORMAT_TAG.to_le_bytes());
     bytes[6..8].copy_from_slice(&0_u16.to_le_bytes());
     bytes[8..16].copy_from_slice(&manifest.generation.to_le_bytes());
     bytes[16..24].copy_from_slice(&manifest.base_revision.raw().to_le_bytes());
@@ -92,7 +89,7 @@ pub(super) fn encode_manifest(manifest: ManifestRecord) -> [u8; MANIFEST_LEN] {
 }
 
 pub(super) fn decode_manifest(bytes: &[u8]) -> Result<ManifestRecord, DurabilityError> {
-    if bytes.len() != MANIFEST_LEN && bytes.len() != LEGACY_MANIFEST_LEN {
+    if bytes.len() != MANIFEST_LEN {
         return Err(DurabilityError::Corruption {
             offset: 0,
             reason: "manifest length mismatch",
@@ -110,25 +107,6 @@ pub(super) fn decode_manifest(bytes: &[u8]) -> Result<ManifestRecord, Durability
         return Err(DurabilityError::Corruption {
             offset: 0,
             reason: "unsupported manifest flags",
-        });
-    }
-    if version == LEGACY_MANIFEST_FORMAT_VERSION {
-        if bytes.len() != LEGACY_MANIFEST_LEN || crc32c(&bytes[..32]) != read_u32(&bytes[32..36]) {
-            return Err(DurabilityError::Corruption {
-                offset: 0,
-                reason: "manifest checksum mismatch",
-            });
-        }
-        let base_revision = RevisionId::new(read_u64(&bytes[16..24]));
-        return Ok(ManifestRecord {
-            generation: read_u64(&bytes[8..16]),
-            base_revision,
-            published_head: base_revision,
-            wal_first_lsn: 1,
-            published_tail_lsn: 0,
-            checkpoint_crc32c: read_u32(&bytes[24..28]),
-            metadata_crc32c: read_u32(&bytes[28..32]),
-            prepared_capsule_crc32c: 0,
         });
     }
     if bytes.len() != MANIFEST_LEN || crc32c(&bytes[..60]) != read_u32(&bytes[60..64]) {

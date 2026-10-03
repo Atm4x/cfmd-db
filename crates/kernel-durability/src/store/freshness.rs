@@ -18,7 +18,7 @@ use super::checkpoint_storage::{
     CHECKPOINT_CHUNK_DESCRIPTOR_LEN, CHECKPOINT_HEADER_LEN, CHECKPOINT_MAGIC,
     read_checkpoint_root_bounded, validate_checkpoint_chunk_descriptors,
 };
-use super::format_registry::{DurableFormatRegistry, LEGACY_CHECKPOINT_FORMAT_VERSION};
+use super::format_registry::DurableFormatRegistry;
 use super::generation_layout::{
     checkpoint_chunk_path, checkpoint_path, manifest_path, metadata_path, prepared_capsule_path,
     realization_path,
@@ -377,9 +377,6 @@ fn checkpoint_chunk_ordinals(root: &[u8]) -> Result<std::ops::Range<usize>, Dura
         });
     }
     let version = read_u16(&root[4..6]);
-    if version == LEGACY_CHECKPOINT_FORMAT_VERSION {
-        return Ok(0..0);
-    }
     DurableFormatRegistry::require_checkpoint_current(version)?;
     if crc32c(&root[..28]) != read_u32(&root[28..32]) {
         return Err(DurabilityError::Corruption {

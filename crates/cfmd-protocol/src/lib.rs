@@ -19,8 +19,8 @@ pub use history::{
 };
 pub use query::{OrderDirection, ProtocolQuery, QueryRequest, QueryResponse, SnapshotTarget};
 pub use session::{
-    CommitRequest, CommitResponse, HostedRequest, HostedResponse, HostedSession, PROTOCOL_VERSION,
-    ProtocolLimits, RelationMutation,
+    CommitRequest, CommitResponse, HostedRequest, HostedResponse, HostedSession, IdempotencyKey,
+    PROTOCOL_VERSION, ProtocolLimits, RelationMutation,
 };
 pub use value::{EntityRef, ProtocolValue, Row};
 pub use watch::{

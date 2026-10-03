@@ -663,12 +663,6 @@ impl SessionDatabase {
         self.operation_context()?.objects::<E>()
     }
 
-    #[doc(hidden)]
-    pub fn transaction_with_id(&self, transaction: TransactionId) -> Result<crate::Transaction> {
-        self.authority.require_write_entry()?;
-        crate::Transaction::from_context_with_id(self.operation_context()?, transaction)
-    }
-
     pub fn plan(&self) -> Result<Plan> {
         self.authority.require_write_entry()?;
         self.database.plan_with_authority(self.authority.clone())
@@ -708,6 +702,21 @@ impl SessionDatabase {
             ));
         }
         self.database.commit(transaction)
+    }
+
+    #[doc(hidden)]
+    pub fn commit_exact_relation_intent(
+        &self,
+        formation_revision: crate::RevisionId,
+        transaction: TransactionId,
+        mutations: &[crate::ExactRelationMutation],
+    ) -> Result<crate::CommitOutcome> {
+        self.database.commit_exact_relation_intent(
+            formation_revision,
+            transaction,
+            mutations,
+            &self.authority,
+        )
     }
 
     pub fn commit_plan(

@@ -263,7 +263,6 @@ impl SharedRelationRows {
             .expect("empty-removal persistent append must be valid")
     }
 
-    #[must_use]
     pub fn patch_persistent(
         &self,
         removed_positions: &[usize],

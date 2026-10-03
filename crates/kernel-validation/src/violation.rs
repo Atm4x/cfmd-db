@@ -57,6 +57,9 @@ pub enum DynamicViolationWitness {
         entity: EntityId,
         rule_index: usize,
     },
+    ModelRule {
+        rule_index: usize,
+    },
 }
 
 fn add_missing_live_reference_violations(
@@ -187,6 +190,8 @@ pub fn dynamic_violation_measure(
             entity_types,
             relation.id,
             &compiled_rules,
+            None,
+            true,
         )?;
         for (witness, mass) in relation_measure.iter() {
             measure.add(witness.clone(), mass)?;
@@ -279,7 +284,70 @@ pub fn relation_dynamic_violation_measure(
         entity_types,
         relation_id,
         &compiled_rules,
+        None,
+        true,
     )
+}
+
+pub fn relation_dynamic_violation_measure_selective(
+    context: &SemanticContext,
+    registry: &SemanticRegistry,
+    state: &DatabaseState,
+    entity_types: &DenseTypeExtents,
+    relation_id: SemanticId,
+    footprint: &crate::RelationMutationFootprint,
+) -> Result<ViolationMeasure<DynamicViolationWitness>, ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
+    relation_dynamic_violation_measure_with_plan(
+        context,
+        registry,
+        state,
+        entity_types,
+        relation_id,
+        &compiled_rules,
+        Some(footprint),
+        true,
+    )
+}
+
+pub fn relation_dynamic_violation_measure_selective_without_model_rules(
+    context: &SemanticContext,
+    registry: &SemanticRegistry,
+    state: &DatabaseState,
+    entity_types: &DenseTypeExtents,
+    relation_id: SemanticId,
+    footprint: &crate::RelationMutationFootprint,
+) -> Result<ViolationMeasure<DynamicViolationWitness>, ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
+    relation_dynamic_violation_measure_with_plan(
+        context,
+        registry,
+        state,
+        entity_types,
+        relation_id,
+        &compiled_rules,
+        Some(footprint),
+        false,
+    )
+}
+
+pub fn model_rule_violation_measure_for_relation_mutation(
+    context: &SemanticContext,
+    state: &DatabaseState,
+    relation: SemanticId,
+    footprint: &crate::RelationMutationFootprint,
+) -> Result<ViolationMeasure<DynamicViolationWitness>, ValidationError> {
+    let compiled_rules = crate::CompiledRulePlan::compile(context);
+    let mut measure = ViolationMeasure::new();
+    for (rule_index, rule) in compiled_rules.model_rules_for_mutation(relation, footprint) {
+        let mass = rule
+            .violation_mass(state)
+            .map_err(|_| ValidationError::ModelRuleEvaluation)?;
+        if mass != 0 {
+            measure.add(DynamicViolationWitness::ModelRule { rule_index }, mass)?;
+        }
+    }
+    Ok(measure)
 }
 
 fn relation_dynamic_violation_measure_with_plan(
@@ -289,6 +357,8 @@ fn relation_dynamic_violation_measure_with_plan(
     entity_types: &DenseTypeExtents,
     relation_id: SemanticId,
     compiled_rules: &crate::CompiledRulePlan,
+    footprint: Option<&crate::RelationMutationFootprint>,
+    include_model_rules: bool,
 ) -> Result<ViolationMeasure<DynamicViolationWitness>, ValidationError> {
     let relation = context
         .schema
@@ -347,6 +417,19 @@ fn relation_dynamic_violation_measure_with_plan(
                         1,
                     )?;
                 }
+            }
+        }
+    }
+
+    if include_model_rules {
+        let full = crate::RelationMutationFootprint::full();
+        let footprint = footprint.unwrap_or(&full);
+        for (rule_index, rule) in compiled_rules.model_rules_for_mutation(relation_id, footprint) {
+            let mass = rule
+                .violation_mass(state)
+                .map_err(|_| ValidationError::ModelRuleEvaluation)?;
+            if mass != 0 {
+                measure.add(DynamicViolationWitness::ModelRule { rule_index }, mass)?;
             }
         }
     }

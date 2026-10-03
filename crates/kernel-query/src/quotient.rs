@@ -155,7 +155,7 @@ mod position_index_tests {
 
     #[test]
     fn position_index_shares_one_canonical_payload_per_gamma_class() {
-        let keys = [key(1), key(1), key(2), key(1), key(2)];
+        let keys = vec![key(1), key(1), key(2), key(1), key(2)];
         let index = canonical_row_position_index_from_keys(keys.iter());
 
         assert_eq!(index.by_key.len(), 2);
@@ -171,7 +171,7 @@ mod position_index_tests {
 
     #[test]
     fn position_index_swap_remove_preserves_shared_class_payloads() {
-        let keys = [key(1), key(2), key(1), key(3)];
+        let keys = vec![key(1), key(2), key(1), key(3)];
         let mut index = canonical_row_position_index_from_keys(keys.iter());
         index.remove_position(1);
         index.push_key(key(3));

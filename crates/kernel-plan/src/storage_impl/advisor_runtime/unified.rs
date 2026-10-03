@@ -18,7 +18,7 @@ fn unified_observable_advisor_selection(
     context: &kernel_schema::SemanticContext,
     registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<UnifiedObservableAdvisorSelection, PhysicalExecutionError> {
-    let scores = semantic_index_advice_scores(store, workload, context, registry)?;
+    let scores = observable_atom_advice_scores(store, workload, context, registry)?;
     let mut demanded = scores.keys().cloned().collect::<BTreeSet<_>>();
     demanded.extend(
         store
@@ -128,12 +128,6 @@ fn retire_advisor_legacy_for_observable(
     binding: &SemanticIndexBinding,
     report: &mut UnifiedObservableAdvisorReport,
 ) {
-    let index = UnifiedArtifactId::SemanticIndex(binding.clone());
-    if store.advisor_managed_artifacts.contains(&index) {
-        store.semantic_indexes_mut_internal().remove(binding);
-        store.advisor_managed_artifacts_mut().remove(&index);
-        report.retired_legacy_indexes.push(binding.clone());
-    }
     let statistics = UnifiedArtifactId::SemanticStatistics(binding.clone());
     if store.advisor_managed_artifacts.contains(&statistics) {
         store.semantic_statistics_mut_internal().remove(binding);
@@ -177,10 +171,7 @@ fn apply_unified_observable_selection(
     let retires_legacy = selected_bindings.iter().any(|binding| {
         store
             .advisor_managed_artifacts
-            .contains(&UnifiedArtifactId::SemanticIndex(binding.clone()))
-            || store
-                .advisor_managed_artifacts
-                .contains(&UnifiedArtifactId::SemanticStatistics(binding.clone()))
+            .contains(&UnifiedArtifactId::SemanticStatistics(binding.clone()))
             || store
                 .advisor_managed_artifacts
                 .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()))

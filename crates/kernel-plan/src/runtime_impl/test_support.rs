@@ -9,6 +9,7 @@ impl RuntimeRevisionBundle {
             physical: self.physical.clone(),
             relation_layouts: self.relation_layouts.clone(),
             relation_bases: self.relation_bases.clone(),
+            historical: self.historical.clone(),
             materialization_specs: self.materialization_specs.clone(),
             materializations: self.materializations.clone(),
             materialization_dependencies: self.materialization_dependencies.clone(),
@@ -21,6 +22,20 @@ impl RuntimeRevisionBundle {
         request: &RevisionTransitionRequest<'_>,
     ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
         self.prepare_revision(request)
+    }
+
+    pub(crate) fn prepare_revision_derived_for_test(
+        &self,
+        revision: kernel_revision::Revision,
+        exact_deltas: BTreeMap<SemanticId, RelationDelta>,
+        mutations: &[RevisionRelationMutation<'_>],
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PreparedRuntimeRevisionTransition, PhysicalExecutionError> {
+        let endpoint = DerivedRelationEndpoint {
+            revision,
+            exact_deltas,
+        };
+        self.prepare_revision_derived(&endpoint, mutations, registry)
     }
 
     pub(crate) fn prepare_rewrites_for_test<I>(
@@ -44,6 +59,25 @@ impl RuntimeRevisionBundle {
         self.prepare_rewrites_derived(&endpoint, rewrites, registry)
     }
 }
+
+impl RuntimeRevisionSnapshot {
+    pub(crate) fn historical_exact_effect_count_for_test(&self) -> usize {
+        self.root.historical.exact_effects.len()
+    }
+
+    pub(crate) fn historical_lineage_floor_for_test(&self) -> Option<RevisionId> {
+        self.root.historical.lineage_floor
+    }
+
+    pub(crate) fn historical_exact_effect_storage_probe_for_test(
+        &self,
+    ) -> kernel_persistent::PersistentOrdMapStorageProbe<RevisionId, u128> {
+        self.root
+            .historical
+            .exact_effects
+            .unique_storage_probe_against(&PersistentOrdMap::default())
+    }
+}
 impl RuntimeRevisionBundle {
     pub(crate) fn physical_store_mut_for_test(&mut self) -> &mut PhysicalStore {
         &mut self.physical
@@ -58,7 +92,8 @@ impl RuntimeRevisionBundle {
     }
 
     pub(crate) fn relation_layouts_share_root_with_for_test(&self, other: &Self) -> bool {
-        self.relation_layouts.shares_root_with(&other.relation_layouts)
+        self.relation_layouts
+            .shares_root_with(&other.relation_layouts)
     }
 
     pub(crate) fn materialization_specs_share_root_with_for_test(&self, other: &Self) -> bool {
@@ -67,7 +102,8 @@ impl RuntimeRevisionBundle {
     }
 
     pub(crate) fn materializations_share_root_with_for_test(&self, other: &Self) -> bool {
-        self.materializations.shares_root_with(&other.materializations)
+        self.materializations
+            .shares_root_with(&other.materializations)
     }
 
     pub(crate) fn materialization_dependency_contains_for_test(
@@ -152,7 +188,6 @@ impl DurableRuntime {
             .expect("test durability lock must not be poisoned");
         inspect(&durability)
     }
-
 }
 
 impl DurableRuntimeSupervisor {
@@ -179,4 +214,39 @@ impl DurableRuntimeSupervisor {
     pub(crate) fn runtime_slot_is_poisoned_for_test(&self) -> bool {
         self.runtime.is_poisoned()
     }
+}
+
+
+pub(crate) fn benchmark_retained_epoch_first_conflict_for_test(
+    depth: u64,
+    iterations: u64,
+) -> std::time::Duration {
+    let coordinate = RuntimeHistoryCoordinate::Field {
+        field: SemanticId::new(99_001),
+        owner: kernel_types::EntityId::new(99_002),
+    };
+    let mut index = RuntimeRetainedEpochIndex::default();
+    index.lineage_floor = Some(RevisionId::new(1));
+    let mut timeline = PersistentOrdMap::default();
+    for revision in 2..=depth + 1 {
+        timeline.insert(
+            RevisionId::new(revision),
+            RuntimeIndexedHistoryAction {
+                effect_id: u128::from(revision),
+                action: RewriteActionLaw::Opaque,
+            },
+        );
+    }
+    index.writes.insert(coordinate.clone(), timeline);
+
+    let started = std::time::Instant::now();
+    let mut checksum = 0_u128;
+    for _ in 0..iterations {
+        checksum ^= index
+            .first_action_after(RevisionId::new(1), &coordinate)
+            .expect("indexed conflict")
+            .effect_id;
+    }
+    std::hint::black_box(checksum);
+    started.elapsed()
 }

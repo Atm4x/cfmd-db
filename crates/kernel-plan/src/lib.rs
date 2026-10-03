@@ -7,16 +7,17 @@ use kernel_change::{
     RevisionEffectResidualChainCertificate, RevisionEffectResidualCubeLayerCertificate,
     RevisionEffectResidualMixedChainCertificate, RevisionEffectResidualNormalizedLayerCertificate,
     RevisionEffectResidualSquareChainCertificate, RevisionEffectResidualSquareLayerCertificate,
-    RewriteLawSetId, RewriteResidualCubeCertificate, RewriteSpecId,
+    RewriteActionLaw, RewriteLawSetId, RewriteResidualCubeCertificate, RewriteSpecId,
 };
 use kernel_durability::{
-    DurabilityError, DurableArtifactCore, DurableCommitReceipt, DurableEffectKind,
-    DurableGenerationReceipt, DurableMaterializationSpec, DurableMigrationComplement,
-    DurablePhysicalArtifactSpec, DurableRelationLayoutKind, DurableRelationMutation,
-    DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
-    DurableRevisionDescriptor, DurableRevisionEffectRecord, DurableRevisionStore,
-    DurableSemanticKeyPart, DurableTransactionIntent, DurableTransactionOutcome, IdempotencyEpoch,
-    RecoveryScan, RevisionDurability, SemanticChangeEvent,
+    DurabilityError, DurableArtifactCore, DurableClientIntent, DurableCommitReceipt,
+    DurableEffectKind, DurableGenerationReceipt, DurableMaterializationSpec,
+    DurableMigrationComplement, DurablePhysicalArtifactSpec, DurableRelationLayoutKind,
+    DurableRelationMutation, DurableRelationResolution, DurableRelationRewriteIntent,
+    DurableRevisionChange, DurableRevisionDescriptor, DurableRevisionEffectRecord,
+    DurableRevisionStore, DurableSemanticKeyPart, DurableTransactionIntent,
+    DurableTransactionOutcome, IdempotencyEpoch, RecoveryScan, RevisionDurability,
+    SemanticChangeEvent,
 };
 pub use kernel_durability::{
     DurableModelDelta, StorageAeadAlgorithm, StorageEncryption, StorageEncryptionKey,
@@ -30,7 +31,8 @@ use kernel_persistent::{
 use kernel_query::{
     AggregateSpec, Impact, MaterializedRelPlanState, OrderComparison, OrderDirection,
     PreparedRelationRewrite, RelExpr, RelObservationGuard, RelQueryError, RelType,
-    RelationBaseWitness, RelationDelta, RelationValue, StorageResolvedRelationDelta,
+    RelationBaseWitness, RelationDelta, RelationSupportWitness, RelationValue,
+    StorageResolvedRelationDelta,
 };
 pub use kernel_types::StableRowHandle as PhysicalRowId;
 use kernel_types::{ClientTransactionId, EqClassId, RevisionId, RevisionObservableId, SemanticId};
@@ -46,8 +48,8 @@ pub use advisor::{
 
 // HOSTILE inventory markers remain intentionally terse and grep-able while the mechanical
 // source parts are promoted into real modules. Format: HOSTILE[pass][classification][:problem].
-// ACTIVE = production authority/path; COMPAT = supported compatibility surface; RECOVERY =
-// deliberate reconstruction boundary; RESIDUE = structural cleanup debt; PAYER = open hot-path
+// ACTIVE = production authority/path; RECOVERY = deliberate reconstruction boundary;
+// RESIDUE = structural cleanup debt; PAYER = open hot-path
 // cost. These markers are temporary scaffolding for the module-boundary cleanup after Pass167.
 
 const _: () = assert!(
@@ -82,6 +84,8 @@ pub use storage_impl::*;
 mod runtime_impl;
 // HOSTILE[P171][ACTIVE][CLEAN]: revision/commit/runtime protocol ownership now lives in
 // runtime_impl/types.rs; this root re-export preserves the established crate API only.
+#[cfg(test)]
+pub(crate) use runtime_impl::benchmark_retained_epoch_first_conflict_for_test;
 pub use runtime_impl::{
     DerivedRelationRewriteTransitionRequest, DerivedRelationTransitionRequest,
     DurableMaterializationConfigOutcome, DurableRuntime, DurableRuntimeCheckpointError,
@@ -92,18 +96,19 @@ pub use runtime_impl::{
     RepairCandidateProvider, RepairSearchOutcome, RepairSearchPolicy, RepairSearchReport,
     RevisionAndMaterializationsTransitionRequest, RevisionCommitChange, RevisionCommitDescriptor,
     RevisionRelationMutation, RevisionRelationRewrite, RevisionRewriteTransitionRequest,
-    RevisionTransitionRequest, RuntimeDurabilityBackend, RuntimeHistoricalSnapshotError,
-    RuntimeHistoryCoordinate, RuntimeHistoryEffect, RuntimeHistoryEffectKind,
-    RuntimeHistoryFootprint, RuntimeHistoryRebaseCertificate, RuntimeHistoryRebaseConflict,
-    RuntimeHistoryRebaseOutcome, RuntimeHistoryRelationMutation, RuntimeHistoryReversibility,
-    RuntimeInvariantClosureCertificate, RuntimeMaterializationSpec, RuntimeObservationGuard,
-    RuntimePublicationEffect, RuntimeRecoveryError, RuntimeRepairCandidate,
-    RuntimeRepairObservationTransport, RuntimeRepairRelationMutation, RuntimeRevisionBundle,
-    RuntimeRevisionCell, RuntimeRevisionDerivationError, RuntimeRevisionPublicationNotifier,
-    RuntimeRevisionPublicationWaitHandle, RuntimeRevisionPublicationWaitOutcome,
-    RuntimeRevisionSnapshot, RuntimeRewriteIntent, RuntimeRootVersion, RuntimeStorageOptions,
-    RuntimeTransitionRebaseCertificate, RuntimeTransitionRebaseConflict,
-    RuntimeTransitionRebaseOutcome, RuntimeViolationState, SealedRuntimeRevisionTransition,
+    RevisionTransitionRequest, RuntimeDurabilityBackend, RuntimeGuardObservationFootprint,
+    RuntimeHistoricalSnapshotError, RuntimeHistoryCoordinate, RuntimeHistoryEffect,
+    RuntimeHistoryEffectKind, RuntimeHistoryFootprint, RuntimeHistoryRebaseCertificate,
+    RuntimeHistoryRebaseConflict, RuntimeHistoryRebaseOutcome, RuntimeHistoryRelationMutation,
+    RuntimeHistoryReversibility, RuntimeInvariantClosureCertificate, RuntimeMaterializationSpec,
+    RuntimeObservationGuard, RuntimePublicationEffect, RuntimeRecoveryError,
+    RuntimeRepairCandidate, RuntimeRepairObservationTransport, RuntimeRepairRelationMutation,
+    RuntimeRevisionBundle, RuntimeRevisionCell, RuntimeRevisionDerivationError,
+    RuntimeRevisionPublicationNotifier, RuntimeRevisionPublicationWaitHandle,
+    RuntimeRevisionPublicationWaitOutcome, RuntimeRevisionSnapshot, RuntimeRewriteIntent,
+    RuntimeRootVersion, RuntimeStorageOptions, RuntimeTransitionRebaseCertificate,
+    RuntimeTransitionRebaseConflict, RuntimeTransitionRebaseOutcome, RuntimeViolationState,
+    SchemaAwareFieldTransitionRequest, SealedRuntimeRevisionTransition,
 };
 
 mod recovery;

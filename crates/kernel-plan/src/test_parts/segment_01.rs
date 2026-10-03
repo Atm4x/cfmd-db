@@ -352,8 +352,8 @@ fn assert_physical_store_catalog_root_sharing(
         i64_indexes_shared
     );
     assert!(
-        left.semantic_indexes_for_test()
-            .shares_root_with(right.semantic_indexes_for_test())
+        left.observable_atom_states_for_test()
+            .shares_root_with(right.observable_atom_states_for_test())
     );
     assert!(
         left.semantic_quotient_factors_for_test()
@@ -1214,9 +1214,9 @@ fn mixed_typed_columnar_covers_all_scalar_carriers_and_matches_logical_reference
     for (key_column, equivalence) in equivalences.into_iter().enumerate() {
         let index = SemanticIndexBinding::single(relation, binding, key_column, equivalence);
         store
-            .install_semantic_index(index.clone(), &context, &registry)
+            .install_observable_atom_state(index.clone(), &context, &registry)
             .unwrap();
-        assert_eq!(store.semantic_index(&index).unwrap().row_count(), 3);
+        assert_eq!(store.observable_atom_state(&index).unwrap().row_count(), 3);
     }
 }
 
