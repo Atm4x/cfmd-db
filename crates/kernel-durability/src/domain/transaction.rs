@@ -1,10 +1,30 @@
+use std::sync::Arc;
+
 use kernel_model::{DatabaseState, Value};
+use kernel_schema::SemanticRuleExpr;
 use kernel_semantics::BuiltinSemanticModuleSpec;
 use kernel_types::{ClientTransactionId, EntityId, RevisionId, SemanticId, SemanticRevision};
 
 use crate::checkpoint;
 use crate::descriptor::DurableMaterializationSpec;
 use crate::runtime::CodecError;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DurableObservedScalar {
+    Unit,
+    Bool(bool),
+    I64(i64),
+    F64Bits(u64),
+    Text(String),
+    LiveEntityRef {
+        entity_type: SemanticId,
+        id: EntityId,
+    },
+    HistoricalEntityId {
+        entity_type: SemanticId,
+        id: EntityId,
+    },
+}
 
 /// Canonical digest of passive client-side publication guards (for example
 /// `Transaction::require(...)`).  The digest is part of durable retry identity,
@@ -18,6 +38,158 @@ impl ClientIntentGuardDigest {
         use sha2::{Digest, Sha256};
         Self(Sha256::digest(bytes).into())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DurableCausalObservationCoordinate {
+    RelationClass {
+        relation: SemanticId,
+        canonical_key: Box<[u8]>,
+    },
+    CarrierPresence {
+        carrier: SemanticId,
+    },
+    CarrierMember {
+        carrier: SemanticId,
+        entity: EntityId,
+    },
+    Field {
+        field: SemanticId,
+        owner: EntityId,
+    },
+    FieldExact {
+        field: SemanticId,
+        owner: EntityId,
+        value: DurableObservedScalar,
+    },
+    FieldPredicate {
+        field: SemanticId,
+        owner: EntityId,
+        value: DurableObservedScalar,
+        predicate: SemanticRuleExpr,
+    },
+    ObjectField {
+        relation: SemanticId,
+        owner: EntityId,
+        field: SemanticId,
+    },
+    ObjectFieldExact {
+        relation: SemanticId,
+        owner: EntityId,
+        field: SemanticId,
+        value: DurableObservedScalar,
+    },
+    /// Exact later-world unary requirement over this field. The predicate is
+    /// already normalized to `RuleValueExpr::Input`, so a retroactive write can
+    /// prove preservation without replaying the later transaction.
+    ObjectFieldPredicate {
+        relation: SemanticId,
+        owner: EntityId,
+        field: SemanticId,
+        value: DurableObservedScalar,
+        predicate: SemanticRuleExpr,
+    },
+    LifecycleEntity {
+        entity: EntityId,
+    },
+    LifecycleRoot {
+        entity: EntityId,
+    },
+    KeepsAlivePresence {
+        parent: EntityId,
+    },
+    KeepsAliveEdge {
+        parent: EntityId,
+        child: EntityId,
+    },
+}
+
+/// One later-world multi-field requirement retained as an atomic causal
+/// observation.  Unlike per-coordinate unary evidence, this certificate must
+/// be evaluated over the complete observed input vector after all retroactive
+/// writes have been applied together.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DurableCausalObservationGroup {
+    pub group_id: u32,
+    pub relation: SemanticId,
+    pub owner: EntityId,
+    pub observed_fields: Vec<(SemanticId, DurableObservedScalar)>,
+    pub predicate: SemanticRuleExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableIntentPrefix {
+    tail: Option<Arc<DurableIntentPrefixNode>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableIntentPrefixNode {
+    pub parent: Option<Arc<DurableIntentPrefixNode>>,
+    pub relation_mutations: Vec<DurableRelationMutation>,
+}
+
+impl Default for DurableIntentPrefix {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl DurableIntentPrefix {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { tail: None }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tail.is_none()
+    }
+
+    #[must_use]
+    pub fn append(&self, relation_mutations: Vec<DurableRelationMutation>) -> Self {
+        if relation_mutations.is_empty() {
+            return self.clone();
+        }
+        Self {
+            tail: Some(Arc::new(DurableIntentPrefixNode {
+                parent: self.tail.clone(),
+                relation_mutations,
+            })),
+        }
+    }
+
+    #[must_use]
+    pub fn from_tail(tail: Arc<DurableIntentPrefixNode>) -> Self {
+        Self { tail: Some(tail) }
+    }
+
+    #[must_use]
+    pub fn tail(&self) -> Option<&Arc<DurableIntentPrefixNode>> {
+        self.tail.as_ref()
+    }
+
+    #[must_use]
+    pub fn segments_oldest_first(&self) -> Vec<&[DurableRelationMutation]> {
+        let mut nodes = Vec::new();
+        let mut current = self.tail.as_deref();
+        while let Some(node) = current {
+            nodes.push(node.relation_mutations.as_slice());
+            current = node.parent.as_deref();
+        }
+        nodes.reverse();
+        nodes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableRelationalCausalObservation {
+    pub observation_id: u32,
+    /// Committed formation revision from which this observation world is reconstructed.
+    pub observed_revision: RevisionId,
+    /// Persistent exact relation-effect lineage already staged when the application performed
+    /// this read. Each node stores only the delta from the preceding Candidate world.
+    pub intent_prefix: DurableIntentPrefix,
+    pub query: kernel_query::RelExpr,
 }
 
 use super::historical::DurableMigrationComplement;
@@ -363,6 +535,9 @@ pub enum DurableTransactionIntent {
         semantic_revision: SemanticRevision,
         relation_mutations: Vec<DurableRelationMutation>,
         client_guard_digest: Option<ClientIntentGuardDigest>,
+        causal_observations: Vec<DurableCausalObservationCoordinate>,
+        causal_observation_groups: Vec<DurableCausalObservationGroup>,
+        relational_causal_observations: Vec<DurableRelationalCausalObservation>,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
     RelationRewrite {
@@ -389,6 +564,9 @@ pub enum DurableTransactionIntent {
         relation_mutations: Vec<DurableRelationMutation>,
         model_delta: DurableModelDelta,
         client_guard_digest: Option<ClientIntentGuardDigest>,
+        causal_observations: Vec<DurableCausalObservationCoordinate>,
+        causal_observation_groups: Vec<DurableCausalObservationGroup>,
+        relational_causal_observations: Vec<DurableRelationalCausalObservation>,
         semantic_modules: Vec<BuiltinSemanticModuleSpec>,
     },
     FullRevision {
@@ -631,6 +809,130 @@ impl DurableTransactionIntent {
     }
 
     #[must_use]
+    pub fn with_causal_observations(
+        mut self,
+        coordinates: impl IntoIterator<Item = DurableCausalObservationCoordinate>,
+    ) -> Self {
+        let mut coordinates = coordinates.into_iter().collect::<Vec<_>>();
+        coordinates.sort();
+        coordinates.dedup();
+        match &mut self {
+            Self::RelationData {
+                causal_observations,
+                ..
+            }
+            | Self::MixedRevision {
+                causal_observations,
+                ..
+            } => {
+                *causal_observations = coordinates;
+            }
+            _ => debug_assert!(coordinates.is_empty()),
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_causal_observation_groups(
+        mut self,
+        groups: impl IntoIterator<Item = DurableCausalObservationGroup>,
+    ) -> Self {
+        let mut groups = groups.into_iter().collect::<Vec<_>>();
+        groups.sort();
+        groups.dedup();
+        match &mut self {
+            Self::RelationData {
+                causal_observation_groups,
+                ..
+            }
+            | Self::MixedRevision {
+                causal_observation_groups,
+                ..
+            } => {
+                *causal_observation_groups = groups;
+            }
+            _ => debug_assert!(groups.is_empty()),
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn causal_observations(&self) -> &[DurableCausalObservationCoordinate] {
+        match self {
+            Self::RelationData {
+                causal_observations,
+                ..
+            }
+            | Self::MixedRevision {
+                causal_observations,
+                ..
+            } => causal_observations,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn causal_observation_groups(&self) -> &[DurableCausalObservationGroup] {
+        match self {
+            Self::RelationData {
+                causal_observation_groups,
+                ..
+            }
+            | Self::MixedRevision {
+                causal_observation_groups,
+                ..
+            } => causal_observation_groups,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn with_relational_causal_observations(
+        mut self,
+        observations: impl IntoIterator<Item = DurableRelationalCausalObservation>,
+    ) -> Self {
+        let mut observations = observations.into_iter().collect::<Vec<_>>();
+        observations.sort_by_key(|observation| observation.observation_id);
+        observations.dedup_by(|right, left| {
+            if left.observation_id == right.observation_id {
+                debug_assert_eq!(left, right);
+                true
+            } else {
+                false
+            }
+        });
+        match &mut self {
+            Self::RelationData {
+                relational_causal_observations,
+                ..
+            }
+            | Self::MixedRevision {
+                relational_causal_observations,
+                ..
+            } => {
+                *relational_causal_observations = observations;
+            }
+            _ => debug_assert!(observations.is_empty()),
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn relational_causal_observations(&self) -> &[DurableRelationalCausalObservation] {
+        match self {
+            Self::RelationData {
+                relational_causal_observations,
+                ..
+            }
+            | Self::MixedRevision {
+                relational_causal_observations,
+                ..
+            } => relational_causal_observations,
+            _ => &[],
+        }
+    }
+
+    #[must_use]
     pub const fn effect_kind(&self) -> DurableEffectKind {
         match self {
             Self::RelationData { .. } => DurableEffectKind::RelationData,
@@ -665,6 +967,9 @@ impl DurableTransactionIntent {
             semantic_revision,
             relation_mutations,
             client_guard_digest: None,
+            causal_observations: Vec::new(),
+            causal_observation_groups: Vec::new(),
+            relational_causal_observations: Vec::new(),
             semantic_modules,
         })
     }
@@ -697,6 +1002,9 @@ impl DurableTransactionIntent {
             semantic_revision: client_semantic_revision,
             relation_mutations: client_mutations,
             client_guard_digest: None,
+            causal_observations: Vec::new(),
+            causal_observation_groups: Vec::new(),
+            relational_causal_observations: Vec::new(),
             semantic_modules,
         })
     }
@@ -818,6 +1126,9 @@ impl DurableTransactionIntent {
             relation_mutations,
             model_delta,
             client_guard_digest: None,
+            causal_observations: Vec::new(),
+            causal_observation_groups: Vec::new(),
+            relational_causal_observations: Vec::new(),
             semantic_modules,
         })
     }
@@ -855,6 +1166,9 @@ impl DurableTransactionIntent {
             relation_mutations: client_relation_mutations,
             model_delta: client_model_delta,
             client_guard_digest: None,
+            causal_observations: Vec::new(),
+            causal_observation_groups: Vec::new(),
+            relational_causal_observations: Vec::new(),
             semantic_modules,
         })
     }

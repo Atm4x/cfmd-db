@@ -1,5 +1,16 @@
 ## PASS379 — stable field identity across Rust renames
 
+## 2026-10-04 — PASS507 GitHub checkpoint sync
+
+- Refreshed repository-facing docs/spec/status to the PASS507 product boundary.
+- Synchronized Rust CI prerequisites from GitHub (`ripgrep`, Ubuntu user namespaces) without importing the older PASS472 implementation snapshot.
+- Updated the Lean refinement checker to follow split Rust modules/includes and current streaming-checkpoint durability cuts.
+- Added Git-index-aware manifest generation/verification for GitHub CI while preserving archive SHA verification.
+- Normalized workspace Rust formatting with pinned Rust 1.98.1.
+- Closed the remaining strict Rust CI debt on PASS507: `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` and the complete `scripts/ci-rust.sh` gate now pass.
+- Updated the stale derive compile-fail fixture to the schema-neutral `Database::builder(...).create_authoritative::<S>()` creation law.
+- Refreshed `SurfaceKernel.lean` and its source-refinement mirror for the production `FilterOrderConst` and `Union` relational constructors; both Python refinement binders pass.
+
 - `#[cfmd(rename_from = "old_name")]` now separates the current Rust field name from the durable semantic field name used by CFMD equivalence/order/reference coordinates.
 - Partial Context projection, exact object binding, scalar patches, reference contracts and field orderings all resolve through the durable semantic name rather than the current identifier.
 - Old same-key readers using the previous field name can therefore read and patch a database created from the renamed authoritative entity; persisted Semantic Rules continue to govern the same coordinate.

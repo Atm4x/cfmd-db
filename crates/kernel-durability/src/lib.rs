@@ -23,11 +23,13 @@ pub use descriptor::{
     PHYSICAL_ARTIFACT_RECIPE_TAG,
 };
 pub use domain::{
-    ClientIntentGuardDigest, DurableCarrierPatch, DurableClientIntent, DurableCommittedTransaction,
+    ClientIntentGuardDigest, DurableCarrierPatch, DurableCausalObservationCoordinate,
+    DurableCausalObservationGroup, DurableClientIntent, DurableCommittedTransaction,
     DurableEffectCoordinationClass, DurableEffectKind, DurableExternalFreshnessBinding,
-    DurableFieldPatch, DurableKeepsAlivePatch, DurableMigrationComplement, DurableModelDelta,
-    DurableObjectFieldWrite, DurableRelationAuthorization, DurableRelationMutation,
-    DurableRelationResolution, DurableRelationRewriteIntent, DurableRevisionChange,
+    DurableFieldPatch, DurableIntentPrefix, DurableIntentPrefixNode, DurableKeepsAlivePatch,
+    DurableMigrationComplement, DurableModelDelta, DurableObjectFieldWrite, DurableObservedScalar,
+    DurableRelationAuthorization, DurableRelationMutation, DurableRelationResolution,
+    DurableRelationRewriteIntent, DurableRelationalCausalObservation, DurableRevisionChange,
     DurableRevisionEffectRecord, DurableTransactionIntent, DurableTransactionKey,
     HistoricalBoundaryAuthority, HistoricalComplementError, HistoricalEpochAnchor,
     HistoricalLensImplementation, HistoricalLensImplementationKey, HistoricalLensRegistry,
@@ -37,6 +39,24 @@ pub use domain::{
 pub use freshness_tcp::{TcpExternalFreshnessAuthority, TcpExternalFreshnessAuthorityServer};
 pub use wal_frame::{FORMAT_VERSION, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN};
 pub use wal_payload::MUTATION_FORMAT_TAG;
+
+/// Canonical structural identity bytes for a relational expression.
+/// This is reconstructible metadata, not a persisted capsule identifier.
+pub fn canonical_rel_expr_identity(
+    expr: &kernel_query::RelExpr,
+) -> Result<Vec<u8>, runtime::CodecError> {
+    let mut out = Vec::new();
+    metadata::query_codec::encode_rel_expr(&mut out, expr, 0)?;
+    Ok(out)
+}
+
+/// Canonical durable identity bytes for one exact relation-effect prefix.
+/// Used only for reconstructible in-memory interning; this is not a public semantic id.
+pub fn canonical_relation_mutations_identity(
+    mutations: &[DurableRelationMutation],
+) -> Result<Vec<u8>, runtime::CodecError> {
+    metadata::canonical_relation_mutations_identity(mutations)
+}
 
 pub use platform_assurance::{
     DestructiveDurabilityCampaignEvidence, DestructiveDurabilityCut, DurabilityPlatformEvidence,

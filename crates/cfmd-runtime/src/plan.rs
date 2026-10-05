@@ -207,12 +207,9 @@ impl Plan {
     }
 
     #[allow(
-        clippy::needless_pass_by_value,
-        reason = "Preserve the existing value-taking boundary contract."
-    )]
-    #[allow(
         clippy::too_many_arguments,
-        reason = "Keep explicit semantic and durability inputs at this boundary."
+        clippy::needless_pass_by_value,
+        reason = "Keep explicit semantic field-patch authority inputs at this boundary."
     )]
     pub(crate) fn patch_object_field(
         &mut self,
@@ -299,7 +296,7 @@ impl Plan {
     /// A plan from any other snapshot fails closed.
     #[allow(
         clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
+        reason = "Keep structural Plan composition validation together."
     )]
     pub fn extend(&mut self, other: Self) -> crate::Result<&mut Self> {
         if self.database_identity != other.database_identity

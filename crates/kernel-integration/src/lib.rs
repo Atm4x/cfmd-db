@@ -674,7 +674,7 @@ fn synthesize_lossy_project_deletion_source_rewrite_for_commit<I: Clone>(
 /// and freshness validation before publication.
 #[allow(
     clippy::result_large_err,
-    reason = "Preserve the typed commit error API."
+    reason = "Preserve concrete runtime commit error authority without heap indirection."
 )]
 pub fn commit_unique_relational_view_rewrite<I: Clone + PartialEq>(
     runtime: &DurableRuntime,
@@ -702,7 +702,7 @@ pub fn commit_unique_relational_view_rewrite<I: Clone + PartialEq>(
 /// revalidated source representatives.
 #[allow(
     clippy::result_large_err,
-    reason = "Preserve the typed commit error API."
+    reason = "Preserve concrete runtime commit error authority without heap indirection."
 )]
 pub fn commit_unique_relational_view_rewrite_with_project_constructor<I: Clone + PartialEq>(
     runtime: &DurableRuntime,
@@ -814,7 +814,7 @@ fn prepare_rel_writable_lift_strategy(
 
 #[allow(
     clippy::result_large_err,
-    reason = "Preserve the typed commit error API."
+    reason = "Preserve concrete runtime commit error authority without heap indirection."
 )]
 fn commit_unique_relational_view_rewrite_inner<I: Clone + PartialEq>(
     runtime: &DurableRuntime,

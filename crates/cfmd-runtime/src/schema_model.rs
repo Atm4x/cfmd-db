@@ -1,10 +1,14 @@
-use std::{marker::PhantomData, ops::Deref, path::PathBuf, sync::Arc};
+use std::{
+    marker::PhantomData,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
 
+use crate::security::RuntimeAuthority;
 use crate::{
-    CandidatePreview, CommitOutcome, Database, DatabaseBuilder, Encryption, GroupKey, History,
-    HistoryEntry, Object, ObjectGroupQuery, ObjectProjectionQuery, ObjectQuery, ObjectSet,
-    OrderedObjectValue, Projection, PublicationNotifier, ReadContext, Result, RevisionId, Schema,
-    Storage, Transaction, TransactionReadiness,
+    CandidatePreview, CommitOutcome, Database, GroupKey, History, HistoryEntry, IntentJournal,
+    Object, ObjectGroupQuery, ObjectProjectionQuery, ObjectQuery, ObjectSet, OrderedObjectValue,
+    Projection, ReadContext, Result, RevisionId, Schema, SemanticRuleExpr, TransactionId,
 };
 
 /// Static, explicit composition of the entity sets that belong to one database model.
@@ -19,11 +23,6 @@ pub trait CfmdSchema: Sized {
 
     #[doc(hidden)]
     fn __bind(source: Arc<ContextSource>) -> Result<Self>;
-
-    #[must_use]
-    fn database(path: impl Into<PathBuf>) -> SchemaDatabaseBuilder<Self> {
-        SchemaDatabaseBuilder::new(path)
-    }
 }
 
 /// Marker emitted only for `#[derive(CfmdEntity)]` types that explicitly opt into
@@ -63,6 +62,170 @@ where
 {
 }
 
+struct ScopedContextState {
+    journal: IntentJournal,
+    current: ReadContext,
+    intent_prefix: kernel_durability::DurableIntentPrefix,
+    published: bool,
+}
+
+#[doc(hidden)]
+pub struct ScopedContextCore {
+    database: Arc<Database>,
+    formation: ReadContext,
+    state: Mutex<ScopedContextState>,
+}
+
+impl std::fmt::Debug for ScopedContextCore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock().map_err(|_| std::fmt::Error)?;
+        formatter
+            .debug_struct("ScopedContextCore")
+            .field("formation_revision", &self.formation.revision())
+            .field("current_revision", &state.current.revision())
+            .field("has_staged_effect", &!state.journal.is_empty())
+            .field("published", &state.published)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScopedContextCore {
+    fn from_formation(database: Arc<Database>, formation: &ReadContext) -> Arc<Self> {
+        let formation = formation.with_fresh_intent_relational_causal_capture();
+        let journal = IntentJournal::from_scoped_formation(formation.clone());
+        Arc::new(Self {
+            database,
+            formation: formation.clone(),
+            state: Mutex::new(ScopedContextState {
+                journal,
+                current: formation,
+                intent_prefix: kernel_durability::DurableIntentPrefix::empty(),
+                published: false,
+            }),
+        })
+    }
+
+    fn from_snapshot(database: Arc<Database>, formation: &ReadContext) -> Arc<Self> {
+        let formation = formation.with_fresh_intent_relational_causal_capture();
+        let journal = IntentJournal::from_scoped_snapshot(formation.clone());
+        Arc::new(Self {
+            database,
+            formation: formation.clone(),
+            state: Mutex::new(ScopedContextState {
+                journal,
+                current: formation,
+                intent_prefix: kernel_durability::DurableIntentPrefix::empty(),
+                published: false,
+            }),
+        })
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ScopedContextState>> {
+        self.state.lock().map_err(|_| {
+            crate::Error::new(
+                crate::ErrorKind::Internal,
+                "scoped Context state lock poisoned",
+            )
+        })
+    }
+
+    fn current(&self) -> Result<ReadContext> {
+        Ok(self.lock_state()?.current.clone())
+    }
+
+    fn note_candidate_observations(
+        state: &mut ScopedContextState,
+        formation: RevisionId,
+    ) -> Result<()> {
+        if state.current.revision() == formation {
+            return Ok(());
+        }
+        let mut observations = state.current.relational_causal_observations()?;
+        if observations.is_empty() {
+            return Ok(());
+        }
+        for observation in &mut observations {
+            observation.observed_revision = kernel_types::RevisionId::new(formation.raw());
+            observation.intent_prefix = state.intent_prefix.clone();
+        }
+        state
+            .journal
+            .append_scoped_relational_causal_observations(observations);
+        state.current = state.current.with_fresh_intent_relational_causal_capture();
+        Ok(())
+    }
+
+    fn stage(
+        &self,
+        mutation: impl FnOnce(&mut IntentJournal, &ReadContext) -> Result<()>,
+    ) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if state.published {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "scoped Context is already committed; open a new Context scope for more work",
+            ));
+        }
+        Self::note_candidate_observations(&mut state, self.formation.revision())?;
+        let proposed = state.current.clone();
+        mutation(&mut state.journal, &proposed)?;
+        if state.journal.is_empty() {
+            state.current = self.formation.clone();
+            state.intent_prefix = kernel_durability::DurableIntentPrefix::empty();
+            return Ok(());
+        }
+        let candidate = state.journal.plan()?.candidate()?;
+        let next = candidate
+            .scoped_read_context(&self.formation)
+            .with_fresh_intent_relational_causal_capture();
+        let segment = crate::runtime::durable_relational_intent_segment(&proposed, &next)?;
+        state.intent_prefix = state.intent_prefix.append(segment);
+        state.current = next;
+        Ok(())
+    }
+
+    fn set_idempotency_key(&self, id: TransactionId) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if state.published {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "scoped Context is already committed; open a new Context scope for more work",
+            ));
+        }
+        state.journal.set_idempotency_key(id)
+    }
+
+    fn require<E: Object>(&self, entity: crate::Id<E>, expression: SemanticRuleExpr) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if state.published {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidPlan,
+                "scoped Context is already committed; open a new Context scope for more work",
+            ));
+        }
+        Self::note_candidate_observations(&mut state, self.formation.revision())?;
+        state.journal.require(entity, expression)?;
+        Ok(())
+    }
+
+    fn preview(&self) -> Result<CandidatePreview> {
+        let state = self.lock_state()?;
+        self.database.preview(&state.journal)
+    }
+
+    fn commit(&self) -> Result<CommitOutcome> {
+        let mut state = self.lock_state()?;
+        Self::note_candidate_observations(&mut state, self.formation.revision())?;
+        let outcome = self.database.commit(&state.journal)?;
+        state.published = true;
+        Ok(outcome)
+    }
+
+    fn formation_snapshot(&self) -> ReadContext {
+        self.formation.without_intent_relational_causal_capture()
+    }
+}
+
 /// A live typed collection bound to one concrete database authority.
 ///
 /// It deliberately does not retain a read snapshot. Each read/query starts from the database's
@@ -72,17 +235,17 @@ where
 #[derive(Debug, Clone)]
 #[allow(
     clippy::large_enum_variant,
-    reason = "Preserve inline state ownership without adding allocations."
+    reason = "Preserve inline exact Snapshot authority without adding an allocation to every historical read."
 )]
 pub enum ContextSource {
-    Current(Arc<Database>),
+    Scoped(Arc<ScopedContextCore>),
     Snapshot(ReadContext),
 }
 
 impl ContextSource {
     fn projected_objects<E: Object>(&self) -> Result<ObjectSet<E>> {
         match self {
-            Self::Current(database) => database.projected_objects::<E>(),
+            Self::Scoped(core) => core.current()?.projected_objects::<E>(),
             Self::Snapshot(snapshot) => snapshot.projected_objects::<E>(),
         }
     }
@@ -171,7 +334,7 @@ impl<E: Object> EntitySet<E> {
 
     pub fn set<V, F, P>(
         &self,
-        transaction: &mut Transaction,
+        transaction: &mut IntentJournal,
         id: crate::Id<E>,
         field: F,
         value: V,
@@ -184,11 +347,11 @@ impl<E: Object> EntitySet<E> {
         self.current()?.set(transaction, id, field, value)
     }
 
-    pub fn add(&self, transaction: &mut Transaction, value: E) -> Result<()> {
+    pub fn add(&self, transaction: &mut IntentJournal, value: E) -> Result<()> {
         self.current()?.add(transaction, value)
     }
 
-    pub fn remove(&self, transaction: &mut Transaction, value: E) -> Result<()> {
+    pub fn remove(&self, transaction: &mut IntentJournal, value: E) -> Result<()> {
         self.current()?.remove(transaction, value)
     }
 }
@@ -200,25 +363,32 @@ impl<E: Object> EntitySet<E> {
 /// through `Context::at`. Authorization remains owned by the database/session rather than by the
 /// snapshot token.
 pub struct Snapshot<S: CfmdSchema> {
+    database: Arc<Database>,
     context: ReadContext,
     surface: S,
 }
 
 impl<S: CfmdSchema> Snapshot<S> {
-    fn bind(context: ReadContext) -> Result<Self> {
+    fn bind(database: Arc<Database>, context: ReadContext) -> Result<Self> {
         let surface = S::__bind(Arc::new(ContextSource::Snapshot(context.clone())))?;
-        Ok(Self { context, surface })
+        Ok(Self {
+            database,
+            context,
+            surface,
+        })
     }
 
     #[must_use]
     pub fn revision(&self) -> RevisionId {
         self.context.revision()
     }
-}
 
-impl<S: CfmdSchema> From<Snapshot<S>> for Transaction {
-    fn from(snapshot: Snapshot<S>) -> Self {
-        Transaction::from(snapshot.context)
+    /// Starts one strict scoped edit whose publication basis is this exact historical world.
+    ///
+    /// Unlike a current Context, this scope is not adaptively transported to a newer HEAD. If the
+    /// database advances before publication, commit reports the snapshot-basis conflict exactly.
+    pub fn edit(self) -> Result<Context<S>> {
+        Context::bind_snapshot(self.database, &self.context)
     }
 }
 
@@ -245,7 +415,7 @@ impl<S: CfmdSchema> Deref for Snapshot<S> {
 /// Unlike database-definition authority, the context surface may describe only the semantic
 /// fields known to this consumer. Binding is by durable field semantics, not by ordinal columns.
 pub struct Context<S: CfmdSchema> {
-    database: Arc<Database>,
+    core: Arc<ScopedContextCore>,
     surface: S,
 }
 
@@ -253,46 +423,242 @@ impl<S: CfmdSchema> std::fmt::Debug for Context<S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Context")
-            .field("database", &self.database)
+            .field("core", &self.core)
             .field("schema", &std::any::type_name::<S>())
             .finish_non_exhaustive()
     }
 }
 
 impl<S: CfmdSchema> Context<S> {
-    fn bind(database: Database) -> Result<Self> {
-        let database = Arc::new(database);
-        let surface = S::__bind(Arc::new(ContextSource::Current(Arc::clone(&database))))?;
-        Ok(Self { database, surface })
+    fn bind_admission(admission: ContextAdmission) -> Result<Self> {
+        let core =
+            ScopedContextCore::from_formation(Arc::new(admission.database), &admission.formation);
+        let surface = S::__bind(Arc::new(ContextSource::Scoped(Arc::clone(&core))))?;
+        Ok(Self { core, surface })
     }
 
-    #[must_use]
-    pub fn database(&self) -> &Database {
-        &self.database
+    fn bind_snapshot(database: Arc<Database>, formation: &ReadContext) -> Result<Self> {
+        let core = ScopedContextCore::from_snapshot(database, formation);
+        let surface = S::__bind(Arc::new(ContextSource::Scoped(Arc::clone(&core))))?;
+        Ok(Self { core, surface })
     }
 
+    /// Exact committed world at Context admission. This does not silently advance with live HEAD.
     pub fn snapshot(&self) -> Result<Snapshot<S>> {
-        Snapshot::bind(self.database.snapshot()?)
+        Snapshot::bind(
+            Arc::clone(&self.core.database),
+            self.core.formation_snapshot(),
+        )
     }
 
     pub fn at(&self, revision: RevisionId) -> Result<Snapshot<S>> {
-        Snapshot::bind(self.database.at(revision)?)
+        Snapshot::bind(
+            Arc::clone(&self.core.database),
+            self.core
+                .database
+                .at_with_authority(revision, self.core.formation.runtime_authority())?,
+        )
     }
 
+    #[must_use]
+    pub fn formation_revision(&self) -> RevisionId {
+        self.core.formation.revision()
+    }
+
+    /// Semantic schema revision atomically admitted with this Context formation world.
+    #[must_use]
+    pub fn formation_schema_revision(&self) -> u64 {
+        self.core.formation.schema_revision()
+    }
+
+    /// Current speculative world of this scope: formation world plus staged exact intent.
     pub fn current_revision(&self) -> Result<RevisionId> {
-        self.database.current_revision()
+        self.core.current().map(|context| context.revision())
     }
 
     pub fn history(&self) -> Result<History> {
-        self.database.history()
+        self.core.formation.history()
     }
 
-    pub fn preview(&self, transaction: &Transaction) -> Result<CandidatePreview> {
-        self.database.preview(transaction)
+    /// Selects a caller-stable retry identity for this scope before semantic intent is formed.
+    pub fn with_idempotency_key(self, id: TransactionId) -> Result<Self> {
+        self.core.set_idempotency_key(id)?;
+        Ok(self)
     }
 
-    pub fn commit(&self, transaction: &Transaction) -> Result<CommitOutcome> {
-        self.database.commit(transaction)
+    /// Adds a deterministic semantic precondition to this Context-owned intent journal.
+    pub fn require<E: Object>(
+        &self,
+        entity: crate::Id<E>,
+        expression: SemanticRuleExpr,
+    ) -> Result<()> {
+        self.core.require(entity, expression)
+    }
+
+    /// Stages an exact undo inside this scoped unit of work.
+    pub fn undo(&self, entry: &HistoryEntry) -> Result<()> {
+        self.core
+            .stage(|journal, _proposed| self.core.database.undo(journal, entry))
+    }
+
+    /// Stages an undo of the latest reversible history entry inside this scope.
+    pub fn undo_latest(&self) -> Result<()> {
+        let history = self.core.formation.history()?;
+        let entry = history.latest().ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::NotFound,
+                "history has no transition at its head",
+            )
+        })?;
+        self.undo(entry)
+    }
+
+    /// Stages an exact create in this Context-owned intent journal.
+    pub fn add<E, F>(&self, collection: F, value: E) -> Result<()>
+    where
+        E: Object,
+        F: FnOnce(&S) -> &EntitySet<E>,
+    {
+        let _ = collection(&self.surface);
+        self.core
+            .stage(move |journal, proposed| proposed.projected_objects::<E>()?.add(journal, value))
+    }
+
+    /// Stages an exact delete in this Context-owned intent journal.
+    pub fn remove<E, F>(&self, collection: F, value: E) -> Result<()>
+    where
+        E: Object,
+        F: FnOnce(&S) -> &EntitySet<E>,
+    {
+        let _ = collection(&self.surface);
+        self.core.stage(move |journal, proposed| {
+            proposed.projected_objects::<E>()?.remove(journal, value)
+        })
+    }
+
+    /// Stages a semantic field patch without exposing the internal IntentJournal/intent journal.
+    pub fn set<E, V, C, F, P>(
+        &self,
+        collection: C,
+        id: crate::Id<E>,
+        field: F,
+        value: V,
+    ) -> Result<()>
+    where
+        E: Object,
+        V: crate::ObjectValue,
+        C: FnOnce(&S) -> &EntitySet<E>,
+        F: FnOnce(&E::Proxy) -> P,
+        P: crate::ObjectPatchField<E, V>,
+    {
+        let _ = collection(&self.surface);
+        self.core.stage(move |journal, proposed| {
+            proposed
+                .projected_objects::<E>()?
+                .set(journal, id, field, value)
+        })
+    }
+
+    /// Stages one relationship attachment against this scope's current Candidate.
+    pub fn attach<T, R>(&self, relationship: &R, target: crate::Id<T>) -> Result<()>
+    where
+        T: Object,
+        R: crate::ScopedRelationship<T>,
+    {
+        self.core.stage(|journal, proposed| {
+            journal.add_plan(relationship.__scoped_attach_plan(proposed, target)?)
+        })
+    }
+
+    /// Stages one relationship detachment against this scope's current Candidate.
+    pub fn detach<T, R>(&self, relationship: &R, target: crate::Id<T>) -> Result<()>
+    where
+        T: Object,
+        R: crate::ScopedRelationship<T>,
+    {
+        self.core.stage(|journal, proposed| {
+            journal.add_plan(relationship.__scoped_detach_plan(proposed, target)?)
+        })
+    }
+
+    /// Atomically moves one relationship target between owners inside this scoped Candidate.
+    pub fn move_to<T, R>(
+        &self,
+        relationship: &R,
+        target: crate::Id<T>,
+        destination: &R,
+    ) -> Result<()>
+    where
+        T: Object,
+        R: crate::ScopedRelationship<T>,
+    {
+        self.core.stage(|journal, proposed| {
+            journal.add_plan(relationship.__scoped_move_to_plan(proposed, target, destination)?)
+        })
+    }
+
+    /// Moves every edge from one owner to another without exposing the internal intent journal.
+    pub fn move_all_to<T, R>(&self, relationship: &R, destination: &R) -> Result<()>
+    where
+        T: Object,
+        R: crate::ScopedRelationship<T>,
+    {
+        self.core.stage(|journal, proposed| {
+            journal.add_plan(relationship.__scoped_move_all_to_plan(proposed, destination)?)
+        })
+    }
+
+    /// Detaches every edge currently present in this scope's Candidate.
+    pub fn detach_all<T, R>(&self, relationship: &R) -> Result<()>
+    where
+        T: Object,
+        R: crate::ScopedRelationship<T>,
+    {
+        self.core.stage(|journal, proposed| {
+            journal.add_plan(relationship.__scoped_detach_all_plan(proposed)?)
+        })
+    }
+
+    /// Detaches the selected target identities from this relationship.
+    pub fn detach_ids<T, R>(
+        &self,
+        relationship: &R,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+    ) -> Result<()>
+    where
+        T: Object,
+        R: crate::ScopedRelationship<T>,
+    {
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        self.core.stage(move |journal, proposed| {
+            journal.add_plan(relationship.__scoped_detach_ids_plan(proposed, ids)?)
+        })
+    }
+
+    /// Moves selected target identities to another owner inside the same relationship.
+    pub fn move_ids_to<T, R>(
+        &self,
+        relationship: &R,
+        ids: impl IntoIterator<Item = crate::Id<T>>,
+        destination: &R,
+    ) -> Result<()>
+    where
+        T: Object,
+        R: crate::ScopedRelationship<T>,
+    {
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        self.core.stage(move |journal, proposed| {
+            journal.add_plan(relationship.__scoped_move_ids_to_plan(proposed, ids, destination)?)
+        })
+    }
+
+    pub fn preview(&self) -> Result<CandidatePreview> {
+        self.core.preview()
+    }
+
+    /// Explicitly publishes the Context-owned exact intent. Drop without this call discards it.
+    pub fn commit(&self) -> Result<CommitOutcome> {
+        self.core.commit()
     }
 }
 
@@ -304,142 +670,136 @@ impl<S: CfmdSchema> Deref for Context<S> {
     }
 }
 
-impl Database {
-    /// Binds a typed consumer contract to this already-open database. The contract is allowed to
-    /// omit persisted fields; every declared local field must match one durable semantic field.
-    pub fn context<S: CfmdSchema>(&self) -> Result<Context<S>> {
-        Context::bind(self.clone())
-    }
+/// One linearizably admitted current semantic world awaiting typed consumer binding.
+///
+/// The token owns the exact runtime snapshot from the admission point. Inspecting its schema
+/// revision and subsequently binding a typed Context therefore cannot race a migration cutover:
+/// publication may advance after admission, but this token remains bound to the admitted world.
+pub struct ContextAdmission {
+    database: Database,
+    formation: ReadContext,
 }
 
-/// Database builder whose schema membership is fixed by `S` rather than assembled by calls to
-/// `SchemaBuilder::object::<T>()` in application code.
-pub struct SchemaDatabaseBuilder<S: CfmdSchema> {
-    inner: DatabaseBuilder,
-    _schema: PhantomData<fn() -> S>,
-}
-
-impl<S: CfmdSchema> std::fmt::Debug for SchemaDatabaseBuilder<S> {
+impl std::fmt::Debug for ContextAdmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("SchemaDatabaseBuilder")
-            .field("database", &self.inner)
-            .field("schema", &std::any::type_name::<S>())
+            .debug_struct("ContextAdmission")
+            .field("formation_revision", &self.formation.revision())
+            .field("schema_revision", &self.formation.schema_revision())
             .finish_non_exhaustive()
     }
 }
 
-impl<S: CfmdSchema> SchemaDatabaseBuilder<S> {
-    fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            inner: Database::builder(path),
-            _schema: PhantomData,
+impl ContextAdmission {
+    /// Exact committed revision selected at the admission linearization point.
+    #[must_use]
+    pub fn formation_revision(&self) -> RevisionId {
+        self.formation.revision()
+    }
+
+    /// Exact semantic schema revision selected by this admission.
+    #[must_use]
+    pub fn schema_revision(&self) -> u64 {
+        self.formation.schema_revision()
+    }
+
+    /// Consumes this admission and starts exactly one typed scoped Context on its admitted world.
+    pub fn context<S: CfmdSchema>(self) -> Result<Context<S>> {
+        Context::bind_admission(self)
+    }
+}
+
+impl Database {
+    pub(crate) fn begin_context_with_authority(
+        &self,
+        authority: RuntimeAuthority,
+    ) -> Result<ContextAdmission> {
+        Ok(ContextAdmission {
+            database: self.clone(),
+            formation: self.snapshot_with_authority(authority)?,
+        })
+    }
+
+    /// Atomically admits one current Context formation world.
+    ///
+    /// Schema/epoch inspection and typed binding must be performed through the returned token,
+    /// rather than by checking live database state and later calling `context::<S>()`.
+    pub fn begin_context(&self) -> Result<ContextAdmission> {
+        self.begin_context_with_authority(RuntimeAuthority::Unrestricted)
+    }
+
+    /// Binds one typed consumer contract directly to an atomically admitted current world.
+    /// For migration-ready A/B branching, call [`Database::begin_context`] first and match the
+    /// returned admission's schema revision before consuming it with `ContextAdmission::context`.
+    pub fn context<S: CfmdSchema>(&self) -> Result<Context<S>> {
+        self.begin_context()?.context::<S>()
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::{MigrationHistoryPolicy, MigrationModel, TransactionId};
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_ADMISSION_TEST: AtomicU64 = AtomicU64::new(1);
+
+    struct EmptyConsumer;
+
+    impl CfmdSchema for EmptyConsumer {
+        type DefinitionAuthority = SchemaAuthorityEmpty;
+
+        fn definition() -> Result<Schema> {
+            Schema::builder().revisions(380, 1).build()
+        }
+
+        fn __bind(_source: Arc<ContextSource>) -> Result<Self> {
+            Ok(Self)
         }
     }
 
-    #[must_use]
-    pub fn storage(mut self, storage: Storage) -> Self {
-        self.inner = self.inner.storage(storage);
-        self
-    }
+    #[test]
+    fn context_admission_keeps_schema_and_formation_root_atomic_across_migration() {
+        let path = std::env::temp_dir().join(format!(
+            "cfmd-context-admission-{}-{}",
+            std::process::id(),
+            NEXT_ADMISSION_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = Schema::builder().revisions(380, 1).build().unwrap();
+        let database = Database::create(&path, source).unwrap();
 
-    #[must_use]
-    pub fn encryption(mut self, encryption: Encryption) -> Self {
-        self.inner = self.inner.encryption(encryption);
-        self
-    }
+        let admission = database.begin_context().expect("admit A world");
+        let admitted_revision = admission.formation_revision();
+        assert_eq!(admission.schema_revision(), 380);
 
-    #[must_use]
-    pub fn publication_notifier(mut self, notifier: Arc<dyn PublicationNotifier>) -> Self {
-        self.inner = self.inner.publication_notifier(notifier);
-        self
-    }
+        let target = Schema::builder().revisions(381, 1).build().unwrap();
+        database
+            .migrate(
+                &MigrationModel::new(500_001, target),
+                TransactionId::new(500_001),
+                MigrationHistoryPolicy::Forget,
+            )
+            .expect("publish A -> B migration after admission");
+        assert_eq!(database.snapshot().unwrap().schema_revision(), 381);
 
-    pub fn open(self) -> Result<SchemaDatabase<S>> {
-        let database = self.inner.open()?;
-        database.__require_schema_definition(S::definition()?)?;
-        SchemaDatabase::bind(database)
-    }
-}
+        let old_context = admission
+            .context::<EmptyConsumer>()
+            .expect("typed branch must bind the already-admitted A world");
+        assert_eq!(old_context.formation_revision(), admitted_revision);
+        assert_eq!(old_context.formation_schema_revision(), 380);
 
-impl<S: DatabaseDefinition> SchemaDatabaseBuilder<S> {
-    pub fn create(self) -> Result<SchemaDatabase<S>> {
-        let definition = S::definition()?;
-        let database = self.inner.schema(definition).create()?;
-        SchemaDatabase::bind(database)
-    }
-}
+        let next = database
+            .begin_context()
+            .expect("admit post-migration B world");
+        assert_eq!(next.schema_revision(), 381);
+        assert_ne!(next.formation_revision(), admitted_revision);
 
-/// A concrete database together with the explicitly selected typed collection surface `S`.
-pub struct SchemaDatabase<S: CfmdSchema> {
-    database: Arc<Database>,
-    surface: S,
-}
-
-impl<S: CfmdSchema> std::fmt::Debug for SchemaDatabase<S> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SchemaDatabase")
-            .field("database", &self.database)
-            .field("schema", &std::any::type_name::<S>())
-            .finish_non_exhaustive()
-    }
-}
-
-impl<S: CfmdSchema> SchemaDatabase<S> {
-    fn bind(database: Database) -> Result<Self> {
-        let database = Arc::new(database);
-        let surface = S::__bind(Arc::new(ContextSource::Current(Arc::clone(&database))))?;
-        Ok(Self { database, surface })
-    }
-
-    /// Explicit escape hatch for hosting/tooling APIs that intentionally operate on raw Database.
-    #[must_use]
-    pub fn raw(&self) -> &Database {
-        &self.database
-    }
-
-    pub fn snapshot(&self) -> Result<Snapshot<S>> {
-        Snapshot::bind(self.database.snapshot()?)
-    }
-
-    pub fn at(&self, revision: RevisionId) -> Result<Snapshot<S>> {
-        Snapshot::bind(self.database.at(revision)?)
-    }
-
-    pub fn current_revision(&self) -> Result<RevisionId> {
-        self.database.current_revision()
-    }
-
-    pub fn history(&self) -> Result<History> {
-        self.database.history()
-    }
-
-    pub fn undo(&self, transaction: &mut Transaction, entry: &HistoryEntry) -> Result<()> {
-        self.database.undo(transaction, entry)
-    }
-
-    pub fn undo_latest(&self, transaction: &mut Transaction) -> Result<()> {
-        self.database.undo_latest(transaction)
-    }
-
-    pub fn transaction_readiness(&self, transaction: &Transaction) -> Result<TransactionReadiness> {
-        self.database.transaction_readiness(transaction)
-    }
-
-    pub fn preview(&self, transaction: &Transaction) -> Result<CandidatePreview> {
-        self.database.preview(transaction)
-    }
-
-    pub fn commit(&self, transaction: &Transaction) -> Result<CommitOutcome> {
-        self.database.commit(transaction)
-    }
-}
-
-impl<S: CfmdSchema> Deref for SchemaDatabase<S> {
-    type Target = S;
-
-    fn deref(&self) -> &Self::Target {
-        &self.surface
+        drop(old_context);
+        drop(database);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&path);
     }
 }

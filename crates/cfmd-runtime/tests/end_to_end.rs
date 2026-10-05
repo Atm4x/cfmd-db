@@ -4,8 +4,8 @@ use std::{
 };
 
 use cfmd_runtime::{
-    CommitOutcome, Database, EquivalenceId, PrimitiveEquivalence, Query, RelationId,
-    RelationResult, RelationSchema, Schema, Transaction, TransactionId, Type, Value,
+    CommitOutcome, Database, EquivalenceId, IntentJournal, PrimitiveEquivalence, Query, RelationId,
+    RelationResult, RelationSchema, Schema, TransactionId, Type, Value,
 };
 
 fn temp_directory() -> std::path::PathBuf {
@@ -2802,7 +2802,7 @@ fn provider_rotation_rewraps_dmk_without_rewriting_database_ciphertext() {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep complete end-to-end semantic authorization scenario together."
 )]
 fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     use cfmd_runtime::{
@@ -2878,7 +2878,7 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     let countries = field_writer
         .objects::<Country>()
         .expect("write-only countries handle");
-    let mut tx = Transaction::new()
+    let mut tx = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(9_202))
         .expect("field transaction");
     countries
@@ -2912,7 +2912,7 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     let creator_countries = creator
         .objects::<Country>()
         .expect("create-only countries handle");
-    let mut create_tx = Transaction::new()
+    let mut create_tx = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(9_204))
         .expect("create-only transaction");
     creator_countries
@@ -2952,7 +2952,7 @@ fn granular_authorization_uses_semantic_query_and_field_coordinates() {
     let delete_countries = deleter
         .objects::<Country>()
         .expect("delete-only countries handle");
-    let mut delete_tx = Transaction::new()
+    let mut delete_tx = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(9_206))
         .expect("delete-only transaction");
     delete_countries
@@ -3015,7 +3015,7 @@ fn history_inverse_preserves_object_action_authority_instead_of_raw_relation_wri
             Permission::DeleteObject(Country::relation_id()),
         ]),
     ));
-    let mut undo_create = Transaction::new()
+    let mut undo_create = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(9_441_002))
         .expect("undo transaction");
     delete_session
@@ -3033,7 +3033,7 @@ fn history_inverse_preserves_object_action_authority_instead_of_raw_relation_wri
             Permission::CreateObject(Country::relation_id()),
         ]),
     ));
-    let mut undo_delete = Transaction::new()
+    let mut undo_delete = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(9_441_003))
         .expect("redo transaction");
     create_session
@@ -3171,6 +3171,266 @@ fn schema_migration_requires_dedicated_authority_not_generic_write() {
             .expect("migrated head")
             .schema_revision(),
         443
+    );
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep complete end-to-end semantic authorization scenario together."
+)]
+fn schema_migration_preserves_grants_only_by_current_semantic_coordinate_identity() {
+    use cfmd_runtime::{
+        ErrorKind, MigrationColumnRule, MigrationHistoryPolicy, MigrationModel,
+        MigrationRelationRule, MigrationValueExpr, Permission, PermissionSet, PrimitiveEquivalence,
+        PrincipalId, RelationColumnId, RelationSchema, Session,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let relation = RelationId::new(504_001);
+    let old_column = RelationColumnId::new(504_002);
+    let new_column = RelationColumnId::new(504_003);
+    let equivalence = EquivalenceId::new(504_004);
+
+    let source = Schema::builder()
+        .revisions(504, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(old_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+    let session = Session::new(
+        PrincipalId::new(504_010),
+        PermissionSet::from([Permission::ReadField {
+            relation,
+            field: old_column,
+        }]),
+    );
+    let restricted = database.session(session.clone());
+
+    let identity_target = Schema::builder()
+        .revisions(505, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(old_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("identity target schema");
+    database
+        .migrate(
+            &MigrationModel::new(504_505, identity_target),
+            TransactionId::new(9_504_001),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("identity-preserving migration");
+    restricted
+        .snapshot()
+        .expect("restricted snapshot after identity migration")
+        .execute(&Query::scan(relation).project([0]))
+        .expect("stable semantic column id preserves grant");
+
+    let changed_target = Schema::builder()
+        .revisions(506, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(new_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("changed target schema");
+    let migration =
+        MigrationModel::new(505_506, changed_target).relation(MigrationRelationRule::Rows {
+            source: relation,
+            target: relation,
+            columns: vec![MigrationColumnRule {
+                source_columns: vec![0],
+                target_column: 0,
+                value: MigrationValueExpr::Column(0),
+            }],
+        });
+    database
+        .migrate(
+            &migration,
+            TransactionId::new(9_504_002),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("coordinate-changing migration");
+
+    assert_eq!(
+        restricted
+            .snapshot()
+            .expect("restricted snapshot after changed migration")
+            .execute(&Query::scan(relation).project([0]))
+            .expect_err("old coordinate grant must not silently follow a new column id")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+    session
+        .refresh_permissions(PermissionSet::from([Permission::ReadField {
+            relation,
+            field: new_column,
+        }]))
+        .expect("grant current target coordinate");
+    restricted
+        .snapshot()
+        .expect("refreshed restricted snapshot")
+        .execute(&Query::scan(relation).project([0]))
+        .expect("explicit current target grant");
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep complete end-to-end semantic authorization scenario together."
+)]
+fn stale_relation_intent_authorizes_transported_current_world_footprint() {
+    use cfmd_runtime::{
+        ErrorKind, IntentJournal, MigrationColumnRule, MigrationHistoryPolicy, MigrationModel,
+        MigrationRelationRule, MigrationValueExpr, Permission, PermissionSet, PrimitiveEquivalence,
+        PrincipalId, RelationColumnId, RelationSchema, Session,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let source_relation = RelationId::new(505_001);
+    let target_relation = RelationId::new(505_002);
+    let source_column = RelationColumnId::new(505_003);
+    let target_column = RelationColumnId::new(505_004);
+    let equivalence = EquivalenceId::new(505_005);
+
+    let source = Schema::builder()
+        .revisions(505, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            source_relation,
+            [(source_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+
+    let target_authority = database.session(Session::new(
+        PrincipalId::new(505_010),
+        PermissionSet::from([Permission::WriteRelation(target_relation)]),
+    ));
+    let source_authority = database.session(Session::new(
+        PrincipalId::new(505_011),
+        PermissionSet::from([Permission::WriteRelation(source_relation)]),
+    ));
+
+    let mut target_plan = target_authority
+        .plan()
+        .expect("target-authorized formation plan");
+    target_plan.insert(source_relation, vec![Value::I64(7)]);
+    let mut target_intent = IntentJournal::new()
+        .with_idempotency_key(TransactionId::new(9_505_001))
+        .expect("target intent id");
+    target_intent
+        .add_plan(target_plan)
+        .expect("stage target intent");
+
+    let mut source_plan = source_authority
+        .plan()
+        .expect("source-authorized formation plan");
+    source_plan.insert(source_relation, vec![Value::I64(8)]);
+    let mut source_intent = IntentJournal::new()
+        .with_idempotency_key(TransactionId::new(9_505_002))
+        .expect("source intent id");
+    source_intent
+        .add_plan(source_plan)
+        .expect("stage source intent");
+
+    let target = Schema::builder()
+        .revisions(506, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            target_relation,
+            [(target_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("target schema");
+    let migration = MigrationModel::new(505_506, target).relation(MigrationRelationRule::Rows {
+        source: source_relation,
+        target: target_relation,
+        columns: vec![MigrationColumnRule {
+            source_columns: vec![0],
+            target_column: 0,
+            value: MigrationValueExpr::Column(0),
+        }],
+    });
+    database
+        .migrate(
+            &migration,
+            TransactionId::new(9_505_003),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("migrate source relation to target relation");
+
+    assert_eq!(
+        source_authority
+            .preview(&source_intent)
+            .expect_err("source-world grant must not preview target-world publication")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        source_authority
+            .intent_readiness(&source_intent)
+            .expect_err("source-world grant must not certify target-world readiness")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+    let preview = target_authority
+        .preview(&target_intent)
+        .expect("target-world authority previews transported stale intent");
+    assert_eq!(
+        preview.source_revision(),
+        database.current_revision().unwrap()
+    );
+    assert_eq!(preview.effects().touched_relations(), 1);
+    assert_eq!(preview.effects().inserted_rows(), 1);
+    assert!(matches!(
+        target_authority
+            .intent_readiness(&target_intent)
+            .expect("target-world readiness uses prepared publication"),
+        cfmd_runtime::IntentReadiness::Rebasable { .. }
+    ));
+
+    assert_eq!(
+        source_authority
+            .commit(&source_intent)
+            .expect_err("source-world grant must not authorize target-world publication")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+    target_authority
+        .commit(&target_intent)
+        .expect("target-world relation authority publishes transported stale intent");
+
+    assert_eq!(
+        database
+            .snapshot()
+            .expect("target snapshot")
+            .execute(&Query::scan(target_relation))
+            .expect("scan target relation")
+            .rows(),
+        &[vec![Value::I64(7)]]
     );
 
     drop(database);

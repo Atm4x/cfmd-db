@@ -908,6 +908,16 @@ pub fn semantic_rule_matches(
     })
 }
 
+pub fn semantic_rule_matches_fields(
+    rule: &SemanticRuleExpr,
+    fields: &std::collections::BTreeMap<kernel_types::SemanticId, Value>,
+) -> Result<bool, RuleEvaluationError> {
+    CompiledSemanticRuleExpr::compile(rule).matches(&|coordinate| match coordinate {
+        RuleValueExpr::Input => None,
+        RuleValueExpr::Field(field) => fields.get(field),
+    })
+}
+
 pub fn relation_row_rule_matches(
     rule: &SemanticRuleExpr,
     relation: kernel_types::SemanticId,

@@ -6,9 +6,10 @@ use std::{
     },
 };
 
+use cfmd::__private::{IntentJournal, TransactionId};
 use cfmd::{
     CfmdEntity, CommitOutcome, Database, Id, ObjectWatch, ObjectWatchEvent, OwnedMany, Plan, Ref,
-    Schema, Transaction, TransactionId,
+    Schema,
     dynamic::{
         EquivalenceId, PrimitiveEquivalence, Query, RelationId, RelationSchema, Type, Value,
     },
@@ -244,7 +245,7 @@ struct ProbeDatabase {
 }
 
 impl ProbeDatabase {
-    fn commit_transaction(&self, transaction: &Transaction) -> PyResult<u64> {
+    fn commit_transaction(&self, transaction: &IntentJournal) -> PyResult<u64> {
         let outcome = self.database.commit(transaction).map_err(runtime_error)?;
         let revision = match outcome {
             CommitOutcome::Committed { revision }
@@ -500,7 +501,7 @@ impl ProbeDatabase {
         let owners = snapshot.objects::<Owner>().map_err(runtime_error)?;
         let source = owners.require(Id::new(source)).map_err(runtime_error)?;
         let target = owners.require(Id::new(target)).map_err(runtime_error)?;
-        let mut transaction = Transaction::new();
+        let mut transaction = IntentJournal::new();
         source
             .assets
             .move_to(&mut transaction, Id::new(asset), &target.assets)
@@ -536,7 +537,7 @@ impl ProbeDatabase {
             .map_err(runtime_error)?
             .require(Id::new(owner))
             .map_err(runtime_error)?;
-        let mut transaction = Transaction::new();
+        let mut transaction = IntentJournal::new();
         owner
             .assets
             .where_(|asset| asset.label().eq(label.to_owned()))
@@ -571,7 +572,7 @@ impl ProbeDatabase {
     }
 
     fn undo_latest(&self) -> PyResult<u64> {
-        let mut transaction = Transaction::new();
+        let mut transaction = IntentJournal::new();
         self.database
             .undo_latest(&mut transaction)
             .map_err(runtime_error)?;

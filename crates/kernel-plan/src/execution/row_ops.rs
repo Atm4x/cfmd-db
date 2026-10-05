@@ -116,7 +116,7 @@ pub(super) fn scan_rows(
         return Ok(rows);
     }
     match &installed.data {
-        NativeRelation::RowStore(rows) => {
+        NativeRelation::RowStore { rows, .. } => {
             stats.scanned_rows = stats.scanned_rows.saturating_add(rows.len());
             stats.values_read = stats
                 .values_read
@@ -266,7 +266,7 @@ fn execute_fused_filter_project_scan(
             registry,
             stats,
         ),
-        NativeRelation::RowStore(rows) => execute_row_store_fused(
+        NativeRelation::RowStore { rows, .. } => execute_row_store_fused(
             rows,
             predicate_column,
             predicate_value,

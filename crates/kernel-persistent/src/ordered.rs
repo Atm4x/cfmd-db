@@ -79,6 +79,7 @@ impl<K: Ord + Clone, V: Clone> PersistentOrdMap<K, V> {
             let right = build(entries, len - left_len - 1);
             Some(map_node(key, value, left, right))
         }
+
         if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
             return None;
         }

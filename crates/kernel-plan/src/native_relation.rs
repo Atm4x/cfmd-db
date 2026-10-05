@@ -57,7 +57,7 @@ pub(super) fn native_all_i64_columns(
                 _ => None,
             })
             .collect(),
-        NativeRelation::RowStore(_) | NativeRelation::Columnar { .. } => None,
+        NativeRelation::RowStore { .. } | NativeRelation::Columnar { .. } => None,
     }
 }
 
@@ -85,7 +85,7 @@ pub(super) fn native_i64_column(
             NativeColumn::I64(values) => Some(NativeI64ColumnView::Persistent(values)),
             _ => None,
         },
-        NativeRelation::RowStore(_) | NativeRelation::Columnar { .. } => None,
+        NativeRelation::RowStore { .. } | NativeRelation::Columnar { .. } => None,
     }
 }
 
@@ -94,7 +94,7 @@ pub(super) fn native_column_count(data: &NativeRelation) -> usize {
         NativeRelation::I64Columnar { columns, .. } => columns.len(),
         NativeRelation::Columnar { columns, .. } => columns.len(),
         NativeRelation::TypedColumnar { columns, .. } => columns.len(),
-        NativeRelation::RowStore(rows) => rows.first().map_or(0, Vec::len),
+        NativeRelation::RowStore { column_count, .. } => *column_count,
     }
 }
 
@@ -118,7 +118,7 @@ pub(super) fn append_native_row_values(
             row.extend(columns.iter().map(|column| column.value_at(row_index)));
             Ok(())
         }
-        NativeRelation::RowStore(_) | NativeRelation::Columnar { .. } => {
+        NativeRelation::RowStore { .. } | NativeRelation::Columnar { .. } => {
             Err(PhysicalExecutionError::UnsupportedPhysicalPlan)
         }
     }
@@ -126,7 +126,7 @@ pub(super) fn append_native_row_values(
 
 pub(super) fn native_row_count(data: &NativeRelation) -> usize {
     match data {
-        NativeRelation::RowStore(rows) => rows.len(),
+        NativeRelation::RowStore { rows, .. } => rows.len(),
         NativeRelation::Columnar { row_count, .. }
         | NativeRelation::I64Columnar { row_count, .. }
         | NativeRelation::TypedColumnar { row_count, .. } => *row_count,
@@ -138,7 +138,7 @@ pub(super) fn materialize_native_row(
     row_index: usize,
 ) -> Result<kernel_query::Row, PhysicalExecutionError> {
     match data {
-        NativeRelation::RowStore(rows) => rows
+        NativeRelation::RowStore { rows, .. } => rows
             .get(row_index)
             .cloned()
             .ok_or(PhysicalExecutionError::ColumnShapeMismatch),
@@ -164,7 +164,7 @@ pub(super) fn remove_native_row(
     row_index: usize,
 ) -> Result<(), PhysicalExecutionError> {
     match data {
-        NativeRelation::RowStore(rows) => {
+        NativeRelation::RowStore { rows, .. } => {
             if row_index >= rows.len() {
                 return Err(PhysicalExecutionError::ColumnShapeMismatch);
             }
@@ -209,7 +209,7 @@ pub(super) fn push_native_row(
         return Err(PhysicalExecutionError::PhysicalTypeMismatch);
     }
     match data {
-        NativeRelation::RowStore(rows) => rows.push(row.clone()),
+        NativeRelation::RowStore { rows, .. } => rows.push(row.clone()),
         NativeRelation::Columnar { columns, row_count } => {
             for (column, value) in columns.iter_mut().zip(row) {
                 column.push(value.clone());
@@ -243,7 +243,7 @@ pub(super) fn validate_native_row(
         return Err(PhysicalExecutionError::PhysicalTypeMismatch);
     }
     match data {
-        NativeRelation::RowStore(_) | NativeRelation::Columnar { .. } => Ok(()),
+        NativeRelation::RowStore { .. } | NativeRelation::Columnar { .. } => Ok(()),
         NativeRelation::I64Columnar { .. } => row
             .iter()
             .all(|value| matches!(value, Value::I64(_)))
@@ -389,6 +389,22 @@ pub(super) fn validate_indexable_i64_relation(
         NativeRelation::TypedColumnar { columns, .. } => {
             validate_typed_columnar_schema(context, relation, columns)
         }
-        NativeRelation::RowStore(_) | NativeRelation::Columnar { .. } => Ok(()),
+        NativeRelation::RowStore { .. } | NativeRelation::Columnar { .. } => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod row_store_shape_tests {
+    use super::*;
+
+    #[test]
+    fn row_store_retains_arity_after_becoming_empty() {
+        let mut relation =
+            NativeRelation::row_store_with_arity(vec![vec![Value::I64(7)]], 1).unwrap();
+
+        remove_native_row(&mut relation, 0).unwrap();
+        assert_eq!(native_column_count(&relation), 1);
+        push_native_row(&mut relation, &vec![Value::I64(8)]).unwrap();
+        assert_eq!(native_row_count(&relation), 1);
     }
 }

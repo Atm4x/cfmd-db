@@ -26,6 +26,7 @@ use crate::recovery::{
 };
 use crate::semantic_rows::relation_value_matches_revision_relation;
 use crate::storage_impl::{PhysicalRecoveryInputs, UnifiedObservableAdvisorInputs};
+use kernel_query::RelCausalCapsule;
 use std::sync::RwLockWriteGuard;
 include!("runtime_impl/owner_types.rs");
 include!("runtime_impl/types.rs");

@@ -10,7 +10,7 @@ impl PhysicalStore {
         }
         let family_matches = matches!(
             (binding.family, &data),
-            (LayoutFamily::RowStore, NativeRelation::RowStore(_))
+            (LayoutFamily::RowStore, NativeRelation::RowStore { .. })
                 | (
                     LayoutFamily::Columnar,
                     NativeRelation::Columnar { .. }

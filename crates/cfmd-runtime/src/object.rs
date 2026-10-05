@@ -185,6 +185,46 @@ struct ManyBinding {
     target_equivalence: crate::EquivalenceId,
 }
 
+mod scoped_relationship_sealed {
+    pub trait Sealed {}
+}
+
+/// Context-owned mutation capability for a concrete many-valued relationship.
+///
+/// Application code normally reaches this only through `Context::{attach,detach,move_*}`;
+/// the trait is public solely so those generic methods remain callable across crate boundaries.
+#[doc(hidden)]
+pub trait ScopedRelationship<T: Object>: scoped_relationship_sealed::Sealed {
+    #[doc(hidden)]
+    fn __scoped_attach_plan(&self, context: &ReadContext, target: crate::Id<T>) -> Result<Plan>;
+    #[doc(hidden)]
+    fn __scoped_detach_plan(&self, context: &ReadContext, target: crate::Id<T>) -> Result<Plan>;
+    #[doc(hidden)]
+    fn __scoped_move_to_plan(
+        &self,
+        context: &ReadContext,
+        target: crate::Id<T>,
+        destination: &Self,
+    ) -> Result<Plan>;
+    #[doc(hidden)]
+    fn __scoped_move_all_to_plan(&self, context: &ReadContext, destination: &Self) -> Result<Plan>;
+    #[doc(hidden)]
+    fn __scoped_detach_all_plan(&self, context: &ReadContext) -> Result<Plan>;
+    #[doc(hidden)]
+    fn __scoped_detach_ids_plan(
+        &self,
+        context: &ReadContext,
+        ids: Vec<crate::Id<T>>,
+    ) -> Result<Plan>;
+    #[doc(hidden)]
+    fn __scoped_move_ids_to_plan(
+        &self,
+        context: &ReadContext,
+        ids: Vec<crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<Plan>;
+}
+
 impl<T> std::fmt::Debug for Many<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -465,7 +505,7 @@ impl<T: Object> ManySelection<T> {
         self.query.one()
     }
 
-    fn transaction_binding(&self, transaction: &mut crate::Transaction) -> Result<ManyBinding> {
+    fn journal_binding(&self, transaction: &mut crate::IntentJournal) -> Result<ManyBinding> {
         let context = transaction.operation_context(&self.binding.context)?;
         let mut binding = self.binding.clone();
         binding.context = context;
@@ -483,7 +523,7 @@ impl<T: Object> ManySelection<T> {
     }
 
     /// Removes all selected relationship edges while leaving target objects alive.
-    pub fn detach_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+    pub fn detach_all(&self, transaction: &mut crate::IntentJournal) -> Result<()> {
         let plan = self.detach_all_plan_in(transaction)?;
         transaction.add_plan(plan)
     }
@@ -491,7 +531,7 @@ impl<T: Object> ManySelection<T> {
     /// Atomically moves all selected edges to another owner of the same relationship.
     pub fn move_to(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         destination: &Many<T>,
     ) -> Result<()> {
         let plan = self.move_to_plan_in(transaction, destination)?;
@@ -500,7 +540,7 @@ impl<T: Object> ManySelection<T> {
 
     /// Deletes selected target objects. CFMD reads exact stored rows but does not materialize
     /// Rust target objects; lifecycle normalization removes every now-dangling relationship edge.
-    pub fn delete_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+    pub fn delete_all(&self, transaction: &mut crate::IntentJournal) -> Result<()> {
         let plan = self.delete_all_plan_in(transaction)?;
         transaction.add_plan(plan)
     }
@@ -521,23 +561,23 @@ impl<T: Object> ManySelection<T> {
         self.delete_all_plan_with_context(&self.binding.context)
     }
 
-    fn detach_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
-        let binding = self.transaction_binding(transaction)?;
+    fn detach_all_plan_in(&self, transaction: &mut crate::IntentJournal) -> Result<Plan> {
+        let binding = self.journal_binding(transaction)?;
         plan_detach_ids::<T>(&binding, self.ids_in_context(&binding.context)?)
     }
 
     fn move_to_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         destination: &Many<T>,
     ) -> Result<Plan> {
-        let source = self.transaction_binding(transaction)?;
-        let destination = transaction_many_binding(transaction, destination)?;
+        let source = self.journal_binding(transaction)?;
+        let destination = journal_many_binding(transaction, destination)?;
         plan_move_ids::<T>(&source, &destination, self.ids_in_context(&source.context)?)
     }
 
-    fn delete_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
-        let binding = self.transaction_binding(transaction)?;
+    fn delete_all_plan_in(&self, transaction: &mut crate::IntentJournal) -> Result<Plan> {
+        let binding = self.journal_binding(transaction)?;
         self.delete_all_plan_with_context(&binding.context)
     }
 
@@ -604,19 +644,19 @@ impl<T: Object> OwnedManySelection<T> {
     pub fn one(&self) -> Result<T> {
         self.inner.one()
     }
-    pub fn detach_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+    pub fn detach_all(&self, transaction: &mut crate::IntentJournal) -> Result<()> {
         let plan = self.detach_all_plan_in(transaction)?;
         transaction.add_plan(plan)
     }
     pub fn move_to(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         destination: &OwnedMany<T>,
     ) -> Result<()> {
         let plan = self.move_to_plan_in(transaction, destination)?;
         transaction.add_plan(plan)
     }
-    pub fn delete_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+    pub fn delete_all(&self, transaction: &mut crate::IntentJournal) -> Result<()> {
         let plan = self.delete_all_plan_in(transaction)?;
         transaction.add_plan(plan)
     }
@@ -650,8 +690,8 @@ impl<T: Object> OwnedManySelection<T> {
         Ok(plan)
     }
 
-    fn detach_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
-        let binding = self.inner.transaction_binding(transaction)?;
+    fn detach_all_plan_in(&self, transaction: &mut crate::IntentJournal) -> Result<Plan> {
+        let binding = self.inner.journal_binding(transaction)?;
         let mut plan =
             plan_detach_ids::<T>(&binding, self.inner.ids_in_context(&binding.context)?)?;
         __register_owned_contract::<T>(
@@ -664,11 +704,11 @@ impl<T: Object> OwnedManySelection<T> {
 
     fn move_to_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         destination: &OwnedMany<T>,
     ) -> Result<Plan> {
-        let source = self.inner.transaction_binding(transaction)?;
-        let destination_binding = transaction_many_binding(transaction, &destination.inner)?;
+        let source = self.inner.journal_binding(transaction)?;
+        let destination_binding = journal_many_binding(transaction, &destination.inner)?;
         let mut plan = plan_move_ids::<T>(
             &source,
             &destination_binding,
@@ -682,8 +722,8 @@ impl<T: Object> OwnedManySelection<T> {
         Ok(plan)
     }
 
-    fn delete_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
-        let binding = self.inner.transaction_binding(transaction)?;
+    fn delete_all_plan_in(&self, transaction: &mut crate::IntentJournal) -> Result<Plan> {
+        let binding = self.inner.journal_binding(transaction)?;
         let mut plan = self.inner.delete_all_plan_with_context(&binding.context)?;
         __register_owned_contract::<T>(
             &many_from_binding::<T>(&binding),
@@ -848,12 +888,20 @@ impl<T: Object> OwnedMany<T> {
 
     /// Attaches an existing target as part of `transaction`. Candidate construction/commit still
     /// enforces exclusive ownership and the configured orphan policy.
-    pub fn attach(&self, transaction: &mut crate::Transaction, target: crate::Id<T>) -> Result<()> {
+    pub fn attach(
+        &self,
+        transaction: &mut crate::IntentJournal,
+        target: crate::Id<T>,
+    ) -> Result<()> {
         let plan = self.attach_plan_in(transaction, target)?;
         transaction.add_plan(plan)
     }
 
-    pub fn detach(&self, transaction: &mut crate::Transaction, target: crate::Id<T>) -> Result<()> {
+    pub fn detach(
+        &self,
+        transaction: &mut crate::IntentJournal,
+        target: crate::Id<T>,
+    ) -> Result<()> {
         let plan = self.detach_plan_in(transaction, target)?;
         transaction.add_plan(plan)
     }
@@ -862,7 +910,7 @@ impl<T: Object> OwnedMany<T> {
     /// target object row.
     pub fn move_to(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         target: crate::Id<T>,
         destination: &Self,
     ) -> Result<()> {
@@ -874,19 +922,19 @@ impl<T: Object> OwnedMany<T> {
     /// objects are not materialized into Rust.
     pub fn move_all_to(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         destination: &Self,
     ) -> Result<()> {
         let plan = self.move_all_to_plan_in(transaction, destination)?;
         transaction.add_plan(plan)
     }
-    pub fn detach_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+    pub fn detach_all(&self, transaction: &mut crate::IntentJournal) -> Result<()> {
         let plan = self.detach_all_plan_in(transaction)?;
         transaction.add_plan(plan)
     }
     pub fn detach_ids(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         ids: impl IntoIterator<Item = crate::Id<T>>,
     ) -> Result<()> {
         let plan = self.detach_ids_plan_in(transaction, ids)?;
@@ -894,7 +942,7 @@ impl<T: Object> OwnedMany<T> {
     }
     pub fn move_ids_to(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         ids: impl IntoIterator<Item = crate::Id<T>>,
         destination: &Self,
     ) -> Result<()> {
@@ -957,10 +1005,10 @@ impl<T: Object> OwnedMany<T> {
 
     fn register_owned_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         mut plan: Plan,
     ) -> Result<Plan> {
-        let binding = transaction_many_binding(transaction, &self.inner)?;
+        let binding = journal_many_binding(transaction, &self.inner)?;
         __register_owned_contract::<T>(
             &many_from_binding::<T>(&binding),
             &mut plan,
@@ -971,7 +1019,7 @@ impl<T: Object> OwnedMany<T> {
 
     fn attach_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         target: crate::Id<T>,
     ) -> Result<Plan> {
         let plan = self.inner.attach_plan_in(transaction, target)?;
@@ -980,7 +1028,7 @@ impl<T: Object> OwnedMany<T> {
 
     fn detach_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         target: crate::Id<T>,
     ) -> Result<Plan> {
         let plan = self.inner.detach_plan_in(transaction, target)?;
@@ -989,7 +1037,7 @@ impl<T: Object> OwnedMany<T> {
 
     fn move_to_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         target: crate::Id<T>,
         destination: &Self,
     ) -> Result<Plan> {
@@ -1001,7 +1049,7 @@ impl<T: Object> OwnedMany<T> {
 
     fn move_all_to_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         destination: &Self,
     ) -> Result<Plan> {
         let plan = self
@@ -1010,14 +1058,14 @@ impl<T: Object> OwnedMany<T> {
         self.register_owned_plan_in(transaction, plan)
     }
 
-    fn detach_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
+    fn detach_all_plan_in(&self, transaction: &mut crate::IntentJournal) -> Result<Plan> {
         let plan = self.inner.detach_all_plan_in(transaction)?;
         self.register_owned_plan_in(transaction, plan)
     }
 
     fn detach_ids_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         ids: impl IntoIterator<Item = crate::Id<T>>,
     ) -> Result<Plan> {
         let plan = self.inner.detach_ids_plan_in(transaction, ids)?;
@@ -1026,7 +1074,7 @@ impl<T: Object> OwnedMany<T> {
 
     fn move_ids_to_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         ids: impl IntoIterator<Item = crate::Id<T>>,
         destination: &Self,
     ) -> Result<Plan> {
@@ -1413,7 +1461,7 @@ pub trait Object: RowCodec + Sized + 'static {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep complete object schema registration case analysis together."
 )]
 pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBuilder {
     let fields = E::fields();
@@ -1699,14 +1747,29 @@ fn many_binding<T>(many: &Many<T>) -> Result<&ManyBinding> {
     })
 }
 
-fn transaction_many_binding<T>(
-    transaction: &mut crate::Transaction,
+fn journal_many_binding<T>(
+    transaction: &mut crate::IntentJournal,
     many: &Many<T>,
 ) -> Result<ManyBinding> {
     let binding = many_binding(many)?;
     let context = transaction.operation_context(&binding.context)?;
     let mut rebound = binding.clone();
     rebound.context = context;
+    Ok(rebound)
+}
+
+fn scoped_many_binding<T>(context: &ReadContext, many: &Many<T>) -> Result<ManyBinding> {
+    let binding = many_binding(many)?;
+    if binding.context.database_identity() != context.database_identity()
+        || binding.context.authority != context.authority
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidPlan,
+            "scoped Context cannot mutate a relationship from another database/session authority",
+        ));
+    }
+    let mut rebound = binding.clone();
+    rebound.context = context.without_intent_relational_causal_capture();
     Ok(rebound)
 }
 
@@ -1928,17 +1991,25 @@ impl<T: Object> Many<T> {
         Ok(plan)
     }
 
-    pub fn attach(&self, transaction: &mut crate::Transaction, target: crate::Id<T>) -> Result<()> {
+    pub fn attach(
+        &self,
+        transaction: &mut crate::IntentJournal,
+        target: crate::Id<T>,
+    ) -> Result<()> {
         let plan = self.attach_plan_in(transaction, target)?;
         transaction.add_plan(plan)
     }
-    pub fn detach(&self, transaction: &mut crate::Transaction, target: crate::Id<T>) -> Result<()> {
+    pub fn detach(
+        &self,
+        transaction: &mut crate::IntentJournal,
+        target: crate::Id<T>,
+    ) -> Result<()> {
         let plan = self.detach_plan_in(transaction, target)?;
         transaction.add_plan(plan)
     }
     pub fn move_to(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         target: crate::Id<T>,
         destination: &Self,
     ) -> Result<()> {
@@ -1947,19 +2018,19 @@ impl<T: Object> Many<T> {
     }
     pub fn move_all_to(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         destination: &Self,
     ) -> Result<()> {
         let plan = self.move_all_to_plan_in(transaction, destination)?;
         transaction.add_plan(plan)
     }
-    pub fn detach_all(&self, transaction: &mut crate::Transaction) -> Result<()> {
+    pub fn detach_all(&self, transaction: &mut crate::IntentJournal) -> Result<()> {
         let plan = self.detach_all_plan_in(transaction)?;
         transaction.add_plan(plan)
     }
     pub fn detach_ids(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         ids: impl IntoIterator<Item = crate::Id<T>>,
     ) -> Result<()> {
         let plan = self.detach_ids_plan_in(transaction, ids)?;
@@ -1967,7 +2038,7 @@ impl<T: Object> Many<T> {
     }
     pub fn move_ids_to(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         ids: impl IntoIterator<Item = crate::Id<T>>,
         destination: &Self,
     ) -> Result<()> {
@@ -2014,10 +2085,10 @@ impl<T: Object> Many<T> {
 
     fn attach_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         target: crate::Id<T>,
     ) -> Result<Plan> {
-        let binding = transaction_many_binding(transaction, self)?;
+        let binding = journal_many_binding(transaction, self)?;
         let mut plan = binding.context.plan()?;
         plan.insert_semantic(
             binding.relation,
@@ -2029,39 +2100,39 @@ impl<T: Object> Many<T> {
 
     fn detach_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         target: crate::Id<T>,
     ) -> Result<Plan> {
-        let binding = transaction_many_binding(transaction, self)?;
+        let binding = journal_many_binding(transaction, self)?;
         plan_detach_ids::<T>(&binding, [target])
     }
 
     fn move_to_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         target: crate::Id<T>,
         destination: &Self,
     ) -> Result<Plan> {
-        let source = transaction_many_binding(transaction, self)?;
-        let destination = transaction_many_binding(transaction, destination)?;
+        let source = journal_many_binding(transaction, self)?;
+        let destination = journal_many_binding(transaction, destination)?;
         plan_move_ids::<T>(&source, &destination, [target])
     }
 
     fn move_all_to_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         destination: &Self,
     ) -> Result<Plan> {
-        let source = transaction_many_binding(transaction, self)?;
-        let destination = transaction_many_binding(transaction, destination)?;
+        let source = journal_many_binding(transaction, self)?;
+        let destination = journal_many_binding(transaction, destination)?;
         let ids = bound_target_ids::<T>(&source)?
             .into_iter()
             .map(crate::Id::<T>::new);
         plan_move_ids::<T>(&source, &destination, ids)
     }
 
-    fn detach_all_plan_in(&self, transaction: &mut crate::Transaction) -> Result<Plan> {
-        let binding = transaction_many_binding(transaction, self)?;
+    fn detach_all_plan_in(&self, transaction: &mut crate::IntentJournal) -> Result<Plan> {
+        let binding = journal_many_binding(transaction, self)?;
         let ids = bound_target_ids::<T>(&binding)?
             .into_iter()
             .map(crate::Id::<T>::new);
@@ -2070,22 +2141,191 @@ impl<T: Object> Many<T> {
 
     fn detach_ids_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         ids: impl IntoIterator<Item = crate::Id<T>>,
     ) -> Result<Plan> {
-        let binding = transaction_many_binding(transaction, self)?;
+        let binding = journal_many_binding(transaction, self)?;
         plan_detach_ids::<T>(&binding, ids)
     }
 
     fn move_ids_to_plan_in(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         ids: impl IntoIterator<Item = crate::Id<T>>,
         destination: &Self,
     ) -> Result<Plan> {
-        let source = transaction_many_binding(transaction, self)?;
-        let destination = transaction_many_binding(transaction, destination)?;
+        let source = journal_many_binding(transaction, self)?;
+        let destination = journal_many_binding(transaction, destination)?;
         plan_move_ids::<T>(&source, &destination, ids)
+    }
+}
+
+impl<T: Object> scoped_relationship_sealed::Sealed for Many<T> {}
+
+impl<T: Object> ScopedRelationship<T> for Many<T> {
+    fn __scoped_attach_plan(&self, context: &ReadContext, target: crate::Id<T>) -> Result<Plan> {
+        let binding = scoped_many_binding(context, self)?;
+        let mut plan = binding.context.plan()?;
+        plan.insert_semantic(
+            binding.relation,
+            edge_row(&binding, target),
+            crate::plan::MutationAction::RelationshipAttach,
+        );
+        Ok(plan)
+    }
+
+    fn __scoped_detach_plan(&self, context: &ReadContext, target: crate::Id<T>) -> Result<Plan> {
+        let binding = scoped_many_binding(context, self)?;
+        plan_detach_ids::<T>(&binding, [target])
+    }
+
+    fn __scoped_move_to_plan(
+        &self,
+        context: &ReadContext,
+        target: crate::Id<T>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let source = scoped_many_binding(context, self)?;
+        let destination = scoped_many_binding(context, destination)?;
+        plan_move_ids::<T>(&source, &destination, [target])
+    }
+
+    fn __scoped_move_all_to_plan(&self, context: &ReadContext, destination: &Self) -> Result<Plan> {
+        let source = scoped_many_binding(context, self)?;
+        let destination = scoped_many_binding(context, destination)?;
+        let ids = bound_target_ids::<T>(&source)?
+            .into_iter()
+            .map(crate::Id::<T>::new);
+        plan_move_ids::<T>(&source, &destination, ids)
+    }
+
+    fn __scoped_detach_all_plan(&self, context: &ReadContext) -> Result<Plan> {
+        let binding = scoped_many_binding(context, self)?;
+        let ids = bound_target_ids::<T>(&binding)?
+            .into_iter()
+            .map(crate::Id::<T>::new);
+        plan_detach_ids::<T>(&binding, ids)
+    }
+
+    fn __scoped_detach_ids_plan(
+        &self,
+        context: &ReadContext,
+        ids: Vec<crate::Id<T>>,
+    ) -> Result<Plan> {
+        let binding = scoped_many_binding(context, self)?;
+        plan_detach_ids::<T>(&binding, ids)
+    }
+
+    fn __scoped_move_ids_to_plan(
+        &self,
+        context: &ReadContext,
+        ids: Vec<crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let source = scoped_many_binding(context, self)?;
+        let destination = scoped_many_binding(context, destination)?;
+        plan_move_ids::<T>(&source, &destination, ids)
+    }
+}
+
+impl<T: Object> scoped_relationship_sealed::Sealed for OwnedMany<T> {}
+
+impl<T: Object> ScopedRelationship<T> for OwnedMany<T> {
+    fn __scoped_attach_plan(&self, context: &ReadContext, target: crate::Id<T>) -> Result<Plan> {
+        let mut plan = self.inner.__scoped_attach_plan(context, target)?;
+        let binding = scoped_many_binding(context, &self.inner)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn __scoped_detach_plan(&self, context: &ReadContext, target: crate::Id<T>) -> Result<Plan> {
+        let mut plan = self.inner.__scoped_detach_plan(context, target)?;
+        let binding = scoped_many_binding(context, &self.inner)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn __scoped_move_to_plan(
+        &self,
+        context: &ReadContext,
+        target: crate::Id<T>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let mut plan = self
+            .inner
+            .__scoped_move_to_plan(context, target, &destination.inner)?;
+        let destination_binding = scoped_many_binding(context, &destination.inner)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&destination_binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn __scoped_move_all_to_plan(&self, context: &ReadContext, destination: &Self) -> Result<Plan> {
+        let mut plan = self
+            .inner
+            .__scoped_move_all_to_plan(context, &destination.inner)?;
+        let destination_binding = scoped_many_binding(context, &destination.inner)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&destination_binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn __scoped_detach_all_plan(&self, context: &ReadContext) -> Result<Plan> {
+        let mut plan = self.inner.__scoped_detach_all_plan(context)?;
+        let binding = scoped_many_binding(context, &self.inner)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn __scoped_detach_ids_plan(
+        &self,
+        context: &ReadContext,
+        ids: Vec<crate::Id<T>>,
+    ) -> Result<Plan> {
+        let mut plan = self.inner.__scoped_detach_ids_plan(context, ids)?;
+        let binding = scoped_many_binding(context, &self.inner)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
+    }
+
+    fn __scoped_move_ids_to_plan(
+        &self,
+        context: &ReadContext,
+        ids: Vec<crate::Id<T>>,
+        destination: &Self,
+    ) -> Result<Plan> {
+        let mut plan = self
+            .inner
+            .__scoped_move_ids_to_plan(context, ids, &destination.inner)?;
+        let destination_binding = scoped_many_binding(context, &destination.inner)?;
+        __register_owned_contract::<T>(
+            &many_from_binding::<T>(&destination_binding),
+            &mut plan,
+            self.orphan_policy,
+        )?;
+        Ok(plan)
     }
 }
 
@@ -2337,7 +2577,7 @@ impl<E: Object> ObjectSet<E> {
 
     #[allow(
         clippy::needless_pass_by_value,
-        reason = "Preserve the existing value-taking boundary contract."
+        reason = "Preserve the value-taking projected relation boundary."
     )]
     pub(crate) fn new_projected(context: ReadContext, persisted: Relation<E>) -> Result<Self> {
         let fields = E::fields();
@@ -2523,11 +2763,11 @@ impl<E: Object> ObjectSet<E> {
     /// authority; identity remains immutable.
     #[allow(
         clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
+        reason = "Keep certified object field patch validation and lowering together."
     )]
     pub fn set<V, F, P>(
         &self,
-        transaction: &mut crate::Transaction,
+        transaction: &mut crate::IntentJournal,
         id: crate::Id<E>,
         field: F,
         value: V,
@@ -2689,7 +2929,7 @@ impl<E: Object> ObjectSet<E> {
     ///
     /// The collection names the database resource, `transaction` names the atomic change set, and
     /// `value` is the payload. Plan construction remains internal to the ordinary CRUD path.
-    pub fn add(&self, transaction: &mut crate::Transaction, value: E) -> Result<()> {
+    pub fn add(&self, transaction: &mut crate::IntentJournal, value: E) -> Result<()> {
         if !self.exact_shape {
             return Err(Error::new(
                 ErrorKind::InvalidPlan,
@@ -2702,7 +2942,7 @@ impl<E: Object> ObjectSet<E> {
     }
 
     /// Removes one exact entity value as part of `transaction`.
-    pub fn remove(&self, transaction: &mut crate::Transaction, value: E) -> Result<()> {
+    pub fn remove(&self, transaction: &mut crate::IntentJournal, value: E) -> Result<()> {
         if !self.exact_shape {
             return Err(Error::new(
                 ErrorKind::InvalidPlan,
@@ -2911,7 +3151,7 @@ impl<E: Object> ObjectQuery<E> {
     }
 
     /// Deletes every object selected by this exact query as part of `transaction`.
-    pub fn delete(&self, transaction: &mut crate::Transaction) -> Result<()> {
+    pub fn delete(&self, transaction: &mut crate::IntentJournal) -> Result<()> {
         let context = transaction.operation_context(&self.context)?;
         if !self.exact_shape {
             return Err(Error::new(
@@ -2929,7 +3169,7 @@ impl<E: Object> ObjectQuery<E> {
     }
 
     /// Rewrites every object selected by this exact query as part of `transaction`.
-    pub fn update<F>(&self, transaction: &mut crate::Transaction, rewrite: F) -> Result<()>
+    pub fn update<F>(&self, transaction: &mut crate::IntentJournal, rewrite: F) -> Result<()>
     where
         F: FnMut(E) -> E,
         E: Clone,

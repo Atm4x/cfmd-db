@@ -415,6 +415,8 @@ impl Encoder {
 
     fn commit_request(&mut self, request: &CommitRequest, depth: u16) -> Result<()> {
         self.u64(request.base_revision)?;
+        self.u64(request.formation_semantic_revision.schema)?;
+        self.u64(request.formation_semantic_revision.environment)?;
         self.u128(request.idempotency_key.raw())?;
         self.collection_len(request.mutations.len())?;
         for mutation in &request.mutations {
@@ -928,6 +930,7 @@ impl<'a> Decoder<'a> {
 
     fn commit_request(&mut self, depth: u16) -> Result<CommitRequest> {
         let base_revision = self.u64()?;
+        let formation_semantic_revision = crate::SemanticRevision::new(self.u64()?, self.u64()?);
         let idempotency_key = crate::IdempotencyKey::new(self.u128()?);
         let len = self.collection_len()?;
         let mut mutations = Vec::with_capacity(len);
@@ -940,6 +943,7 @@ impl<'a> Decoder<'a> {
         }
         Ok(CommitRequest {
             base_revision,
+            formation_semantic_revision,
             idempotency_key,
             mutations,
         })

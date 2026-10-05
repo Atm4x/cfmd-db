@@ -35,7 +35,6 @@ impl RuntimeRevisionCell {
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
         let prepared = self.prepare_revision(request)?;
-        let prepared = prepared.bind_committed_history_effect(transaction_id.raw(), request.registry)?;
         let descriptor = DurableRevisionDescriptor::full_revision(
             transaction_id,
             prepared.descriptor().source_revision(),
@@ -47,6 +46,10 @@ impl RuntimeRevisionCell {
         let durable_prepare = durability
             .durably_prepare(&descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let prepared = prepared.bind_committed_history_effect(
+            durable_prepare.revision_effect_id().0,
+            request.registry,
+        )?;
         let sealed = prepared.seal(self)?;
         let durable = match durability.durably_commit(durable_prepare) {
             Ok(durable) => durable,
@@ -60,23 +63,6 @@ impl RuntimeRevisionCell {
             durable,
             publication: RuntimePublicationEffect::Incremental(output_deltas),
         })
-    }
-
-    pub(crate) fn commit_mixed_revision_durable_guarded<D: RevisionDurability>(
-        &self,
-        transaction_id: ClientTransactionId,
-        request: &MixedRevisionTransitionRequest<'_>,
-        client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
-        durability: &mut D,
-    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
-        let prepared = self.prepare_mixed_revision(request)?;
-        self.commit_prepared_durable_guarded(
-            transaction_id,
-            prepared,
-            client_guard_digest,
-            request.registry,
-            durability,
-        )
     }
 
     pub(crate) fn commit_full_revision_durable<D: RevisionDurability>(
@@ -98,10 +84,6 @@ impl RuntimeRevisionCell {
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
         let prepared = self.prepare_full_revision(request)?;
-        let prepared = prepared.bind_committed_schema_migration_history_effect(
-            transaction_id.raw(),
-            migration_program,
-        );
         let descriptor = DurableRevisionDescriptor::schema_migration_program(
             transaction_id,
             prepared.descriptor().source_revision(),
@@ -115,6 +97,10 @@ impl RuntimeRevisionCell {
         let durable_prepare = durability
             .durably_prepare(&descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let prepared = prepared.bind_committed_schema_migration_history_effect(
+            durable_prepare.revision_effect_id().0,
+            migration_program,
+        );
         let sealed = prepared.seal(self)?;
         let durable = match durability.durably_commit(durable_prepare) {
             Ok(durable) => durable,
@@ -158,17 +144,47 @@ impl RuntimeRevisionCell {
         registry: &kernel_semantics::SemanticRegistry,
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
-        let prepared = prepared.bind_committed_history_effect(transaction_id.raw(), registry)?;
         let mut durable_descriptor = prepared
             .descriptor()
             .durable_descriptor(transaction_id, registry)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
         durable_descriptor.intent = durable_descriptor
             .intent
-            .with_client_guard_digest(client_guard_digest);
+            .with_client_guard_digest(client_guard_digest)
+            .with_causal_observations(prepared.descriptor().causal_observations().iter().map(
+                |coordinate| {
+                    durable_causal_observation(
+                        coordinate,
+                        prepared
+                            .descriptor()
+                            .causal_observation_exact_value(coordinate),
+                        prepared
+                            .descriptor()
+                            .causal_observation_preservation_rule(coordinate),
+                    )
+                },
+            ))
+            .with_causal_observation_groups(
+                prepared
+                    .descriptor()
+                    .causal_observation_groups()
+                    .iter()
+                    .filter_map(durable_causal_observation_group),
+            )
+            .with_relational_causal_observations(
+                prepared
+                    .descriptor()
+                    .relational_causal_observations()
+                    .iter()
+                    .map(durable_relational_causal_observation),
+            );
         let durable_prepare = durability
             .durably_prepare(&durable_descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let prepared = prepared.bind_committed_history_effect(
+            durable_prepare.revision_effect_id().0,
+            registry,
+        )?;
         let sealed = prepared.seal(self)?;
         let durable = match durability.durably_commit(durable_prepare) {
             Ok(durable) => durable,
@@ -193,25 +209,28 @@ impl RuntimeRevisionCell {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep explicit semantic and durability inputs at this boundary."
+    )]
     fn commit_prepared_relation_residual_durable<D: RevisionDurability>(
         &self,
         transaction_id: ClientTransactionId,
         prepared: PreparedRuntimeRevisionTransition,
         client_mutations: Vec<DurableRelationMutation>,
+        client_semantic_revision: kernel_types::SemanticRevision,
         client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
         registry: &kernel_semantics::SemanticRegistry,
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
-        let prepared = prepared.bind_committed_history_effect(transaction_id.raw(), registry)?;
         let mut durable_descriptor = prepared
             .descriptor()
             .durable_descriptor(transaction_id, registry)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
-        let (semantic_revision, realized_mutations) = match &durable_descriptor.change {
+        let realized_mutations = match &durable_descriptor.change {
             DurableRevisionChange::RelationData {
-                semantic_revision,
-                relation_mutations,
-            } => (*semantic_revision, relation_mutations.clone()),
+                relation_mutations, ..
+            } => relation_mutations.clone(),
             _ => {
                 return Err(DurableRuntimeCommitError::PrepareDurability(
                     DurabilityError::Protocol {
@@ -224,17 +243,48 @@ impl RuntimeRevisionCell {
         durable_descriptor.intent = DurableTransactionIntent::relation_data_residual(
             durable_descriptor.source_revision,
             prepared.descriptor().target(),
-            semantic_revision,
+            client_semantic_revision,
             client_mutations,
             realized_mutations,
             registry,
         )
         .map_err(DurabilityError::Encode)
         .map_err(DurableRuntimeCommitError::PrepareDurability)?
-        .with_client_guard_digest(client_guard_digest);
+        .with_client_guard_digest(client_guard_digest)
+        .with_causal_observations(prepared.descriptor().causal_observations().iter().map(
+            |coordinate| {
+                durable_causal_observation(
+                    coordinate,
+                    prepared
+                        .descriptor()
+                        .causal_observation_exact_value(coordinate),
+                    prepared
+                        .descriptor()
+                        .causal_observation_preservation_rule(coordinate),
+                )
+            },
+        ))
+        .with_causal_observation_groups(
+            prepared
+                .descriptor()
+                .causal_observation_groups()
+                .iter()
+                .filter_map(durable_causal_observation_group),
+        )
+        .with_relational_causal_observations(
+            prepared
+                .descriptor()
+                .relational_causal_observations()
+                .iter()
+                .map(durable_relational_causal_observation),
+        );
         let durable_prepare = durability
             .durably_prepare(&durable_descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let prepared = prepared.bind_committed_history_effect(
+            durable_prepare.revision_effect_id().0,
+            registry,
+        )?;
         let sealed = prepared.seal(self)?;
         let durable = match durability.durably_commit(durable_prepare) {
             Ok(durable) => durable,
@@ -250,7 +300,10 @@ impl RuntimeRevisionCell {
         })
     }
 
-    #[allow(clippy::too_many_arguments, reason = "Keep explicit semantic and durability inputs at this boundary.")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep explicit semantic and durability inputs at this boundary."
+    )]
     pub(crate) fn commit_prepared_mixed_residual_durable<D: RevisionDurability>(
         &self,
         transaction_id: ClientTransactionId,
@@ -263,7 +316,6 @@ impl RuntimeRevisionCell {
         registry: &kernel_semantics::SemanticRegistry,
         durability: &mut D,
     ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
-        let prepared = prepared.bind_committed_history_effect(transaction_id.raw(), registry)?;
         let mut durable_descriptor = prepared
             .descriptor()
             .durable_descriptor(transaction_id, registry)
@@ -302,10 +354,41 @@ impl RuntimeRevisionCell {
         )
         .map_err(DurabilityError::Encode)
         .map_err(DurableRuntimeCommitError::PrepareDurability)?
-        .with_client_guard_digest(client_guard_digest);
+        .with_client_guard_digest(client_guard_digest)
+        .with_causal_observations(prepared.descriptor().causal_observations().iter().map(
+            |coordinate| {
+                durable_causal_observation(
+                    coordinate,
+                    prepared
+                        .descriptor()
+                        .causal_observation_exact_value(coordinate),
+                    prepared
+                        .descriptor()
+                        .causal_observation_preservation_rule(coordinate),
+                )
+            },
+        ))
+        .with_causal_observation_groups(
+            prepared
+                .descriptor()
+                .causal_observation_groups()
+                .iter()
+                .filter_map(durable_causal_observation_group),
+        )
+        .with_relational_causal_observations(
+            prepared
+                .descriptor()
+                .relational_causal_observations()
+                .iter()
+                .map(durable_relational_causal_observation),
+        );
         let durable_prepare = durability
             .durably_prepare(&durable_descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let prepared = prepared.bind_committed_history_effect(
+            durable_prepare.revision_effect_id().0,
+            registry,
+        )?;
         let sealed = prepared.seal(self)?;
         let durable = match durability.durably_commit(durable_prepare) {
             Ok(durable) => durable,
@@ -346,6 +429,10 @@ impl RuntimeRevisionCell {
         let durable_prepare = durability
             .durably_prepare(&durable_descriptor)
             .map_err(DurableRuntimeCommitError::PrepareDurability)?;
+        let prepared = prepared.bind_committed_history_effect(
+            durable_prepare.revision_effect_id().0,
+            registry,
+        )?;
         let sealed = prepared.seal(self)?;
         let durable = match durability.durably_commit(durable_prepare) {
             Ok(durable) => durable,

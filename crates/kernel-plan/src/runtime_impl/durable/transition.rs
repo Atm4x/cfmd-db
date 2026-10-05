@@ -1,5 +1,59 @@
 impl PreparedRuntimeRevisionTransition {
     #[must_use]
+    pub fn with_causal_observations(
+        mut self,
+        observation: Option<&RuntimeGuardObservationFootprint>,
+    ) -> Self {
+        self.descriptor.causal_observations = observation
+            .map(|observation| observation.coordinates().to_vec())
+            .unwrap_or_default();
+        self.descriptor.causal_observation_values = observation
+            .map(|observation| {
+                observation
+                    .coordinates()
+                    .iter()
+                    .filter_map(|coordinate| {
+                        observation
+                            .exact_value(coordinate)
+                            .cloned()
+                            .map(|value| (coordinate.clone(), value))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.descriptor.causal_observation_predicates = observation
+            .map(|observation| {
+                observation
+                    .coordinates()
+                    .iter()
+                    .filter_map(|coordinate| {
+                        observation
+                            .preservation_rule(coordinate)
+                            .cloned()
+                            .map(|rule| (coordinate.clone(), rule))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.descriptor.causal_observation_groups = observation
+            .map(|observation| observation.joint_groups().to_vec())
+            .unwrap_or_default();
+        self
+    }
+
+    #[must_use]
+    pub fn with_relational_causal_observations(
+        mut self,
+        observations: impl IntoIterator<Item = RuntimeRelationalCausalObservation>,
+    ) -> Self {
+        let mut observations = observations.into_iter().collect::<Vec<_>>();
+        observations.sort_by_key(|observation| observation.observation_id);
+        observations.dedup_by_key(|observation| observation.observation_id);
+        self.descriptor.relational_causal_observations = observations;
+        self
+    }
+
+    #[must_use]
     pub const fn descriptor(&self) -> &RevisionCommitDescriptor {
         &self.descriptor
     }
@@ -203,4 +257,3 @@ impl SealedRuntimeRevisionTransition<'_> {
         *self.live = RuntimeRevisionCellState::RecoveryRequired;
     }
 }
-

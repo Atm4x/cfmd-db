@@ -311,15 +311,19 @@ Until CFMD declares its first released compatibility boundary, unreleased intern
 
 Single-file generation publication MUST stream section bytes directly to their final offsets and MUST NOT construct whole encrypted sections or generations in memory. Encrypted payloads are sealed one 64 KiB AEAD chunk at a time. Because ciphertext section digests are known only after payload emission, the current pre-release generation layout stores the section descriptor table as a footer after all section data. The generation header records the footer offset/length and total generation length. The generation digest is accumulated in physical byte order during the same write; no whole-generation reread is required. Root authority remains unchanged: the streamed generation is non-authoritative until fully written, synced and referenced by a durably published root.
 
-### Product transaction composition and transport
+### Product scoped-Context composition and transport
 
-Rust product code groups atomic mutations with `Transaction::new()`. The transaction starts unbound; its first database mutation establishes only the formation provenance/authority of the exact internal effect. Compatible later HEAD movement is certified and transported automatically by the kernel change algebra. `Transaction::from(snapshot)` is the explicit strict-snapshot form: the supplied world is part of caller intent and any HEAD movement makes publication stale. Publication authority remains the database (`db.preview(&tx)` / `db.commit(&tx)`), while ordinary collection CRUD mutates the passive transaction via `&mut tx` without exposing `Plan` or `TransactionId`.
+Rust product code groups atomic mutation in one bounded `Context<M>`. Context admission pins one exact formation world, owns the speculative Candidate, causal observations and one internal `IntentJournal`, and never re-reads a newer HEAD implicitly. Compatible later HEAD movement is certified/transported by the kernel change algebra at publication; dropping the Context without `commit()` publishes nothing.
 
-Explicit cross-process/process-restart retry identity is configured on the same passive transaction with `Transaction::new().with_idempotency_key(TransactionId)` (or on `Transaction::from(snapshot)` before intent formation). Selecting the key MUST NOT bind an adaptive transaction to a database/revision; first mutation remains the formation boundary. The key must be selected before effects or requirements are added. Once selected or generated it is stable for the lifetime of that transaction intent: `require(...)` MUST NOT rotate it. Passive requirements are distinguished solely by the durable canonical `ClientIntentGuardDigest`, so the same key + same exact effect + same guard is an idempotent retry, while the same key with a changed effect or changed guard is a conflict.
+`Snapshot<M>::edit()` is the strict-snapshot form. The snapshot world is part of caller intent and any incompatible HEAD movement fails stale instead of silently becoming adaptive. There is no second normal public Transaction owner.
 
-The same product law applies to relationship mutation. `Many<T>`, `OwnedMany<T>` and relationship selections MUST accumulate ordinary attach/detach/move/delete operations directly into `&mut Transaction`. If a transaction was already bound by an earlier operation, relationship evaluation MUST use that same formation world rather than silently compose effects evaluated at another revision. A filtered relationship selection is therefore re-evaluated against the transaction formation context before its identity-only mutation is lowered. Advanced tooling MAY request the exact low-level effect through explicitly named `*_plan` methods; ordinary application mutation MUST NOT require `Plan` plumbing.
+Explicit cross-process/process-restart retry identity is selected on the Context with `Context::with_idempotency_key(TransactionId)` before semantic intent is formed. The key remains stable for that intent; deterministic `require(...)` conditions and exact effects are distinguished by the durable canonical guard/effect authority. The same key + same exact effect + same guard is an idempotent retry; changed effect or guard under that key is a conflict. `TransactionId` therefore remains protocol identity even though the mutable runtime carrier is named `IntentJournal`.
 
-A newer global revision is not by itself a conflict. Runtime certification classifies the already-formed exact effect against intervening causal effects using Γ-canonical coordinates and action laws. `TransactionReadiness` exposes `Ready`, `Rebasable`, or `Conflict` for diagnostics, while ordinary commit performs the same certification automatically. User mutation code MUST NOT be re-executed on a newer snapshot as an implicit retry. Unknown, opaque or coordination-required overlap fails closed.
+Reference/Many/OwnedMany mutation, field patches, create/delete and history undo all stage through the same Context-owned journal and Candidate. Internal lowering reads are passive; only application-visible reads form causal observations. No operation-specific transaction engine, callback retry, full-state recomputation or old-schema current-world fallback is permitted.
+
+A newer global revision is not by itself a conflict. Runtime certification classifies the already-formed exact effect against intervening causal effects using Γ-canonical coordinates and action laws. Internal `IntentReadiness` may classify Ready/Rebasable/Conflict for diagnostics; ordinary Context commit performs the same proof automatically. Unknown, opaque or coordination-required overlap fails closed.
+
+Authoritative typed creation consumes one complete `DatabaseDefinition` at `DatabaseBuilder::create_authoritative::<S>()` and returns ordinary schema-neutral `Database`. Consumer `Context<M>` binding is separate; no `Database<S>`/`SchemaDatabase<S>` authority is part of the model.
 
 ### Pass357 stable semantic retry identity
 
@@ -373,3 +377,83 @@ The persisted semantic-fiber execution authority MUST be SAMF/`ObservableAtom`. 
 
 ## Retained schema-epoch intent authority (P473)
 A live schema migration seals the source epoch's persistent Γ-support/action root and structurally shared field-value root. A stale field intent is transported across schema epochs by consulting only these retained roots and the certified migration programs; ordinary old-epoch causal records are not replayed and an old schema is never revived as current query authority. Retained roots are derived from the same causal/history authority and are rebuilt on reopen rather than serialized as a second witness-cache format.
+
+## PASS479 — Formation-world seal across schema migration
+
+Schema-aware transactions use a one-way boundary law. A transaction formed in schema epoch `A`
+finishes all A-specific read/guard semantics at the first crossed migration source revision. Once the
+formation-world seal is certified, migration transports only the already-formed exact effect forward.
+Later B/C epochs perform native exact effect rebase/conflict/residualization; they do not execute,
+transport, or reinterpret the old A guard.
+
+```text
+formation A
+    -> exact A rebase / Candidate<A> guard certification
+    -> FormationWorldSeal @ migration source
+    -> ΔA --M--> ΔB
+    -> native B effect rebase
+    -> ...
+    -> revision-bound publication
+```
+
+A condition that must remain true at current publication HEAD is a distinct current-world publication
+precondition/authority, not a formation-world transaction guard. No transaction path may require
+`q_A -> q_B`, `M^-1`, B-to-A event interpretation, or old-schema query routing.
+
+
+## PASS480 — B-native causal observation authority for retroactive sealed-effect reorder
+
+### CLOSED THIS PASS
+- Hostile audit confirmed PASS479's formation seal alone was insufficient: a sealed old effect physically published after a later B transaction could otherwise invalidate an observation that B transaction causally relied on.
+- Added durable causal-observation coordinates to committed relation/mixed intents, explicitly separate from `ClientIntentGuardDigest` retry identity.
+- Added reconstructible persistent current/retained-epoch observation timelines over the same durable causal authority; no second history store.
+- Schema-aware post-boundary braid now checks transported sealed writes against observations of logically later B/C transactions. Overlap is reported as coordination-required, not falsely claimed to be an exact semantic conflict.
+- Hostile reopen regression proves: B reads password=OLD then writes generation; late sealed A password:=NEW cannot be retroactively inserted before B.
+- Preserved PASS479 law: later B writes with no causal observation of the old effect remain reorderable when normal effect laws certify them.
+
+### OPEN — IMMEDIATE
+1. Lower product `Transaction::require` canonical requirement footprints automatically into durable causal-observation authority; current kernel path accepts explicit observation footprints.
+2. Derive exact observation-preservation/commutation certificates so coordinate overlap need not always require coordination when the earlier write provably preserves the later predicate.
+3. Introduce distinct current-world publication preconditions for semantics that must hold at publication HEAD; do not reuse formation guards.
+4. Extend B-native causal observation authority to general relational/OFC requirements without reintroducing B->A or old-guard transport.
+
+### SUPERSEDED / DO NOT EXTEND
+- Treating write/write post-boundary rebase alone as sufficient proof for retroactively inserting a formation-sealed effect before later current-world transactions.
+- Reinterpreting this B-native anti-dependency proof as transport/revalidation of the old A guard.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Causal observation lookup is coordinate-indexed persistent-tree authority; no linear history scan.
+- Observation timelines are reconstructible from durable committed intent and retained epoch roots; no independently serialized witness cache/history.
+- Ordinary same-schema stale transactions do not pay the retroactive-seal anti-dependency rule unless logical order has already been fixed before a crossed schema boundary.
+
+### NEXT RECOMMENDED PASS
+**PASS481 — product `Transaction::require` causal-observation lowering + exact observation-preservation/commutation law.** Read `PROJECT_RULES.md` first and carry that requirement into every successor PASS.
+
+## PASS482 — Predicate-specific current-world causal preservation
+
+A formation-world seal still terminates all old-schema guard semantics at the first schema boundary. Later committed B/C `Transaction::require` observations are separate current-world causal authority. When the complete later `SemanticRuleExpr` depends on exactly one field, CFMD may persist the same deterministic rule normalized to `RuleValueExpr::Input`. A retroactively published sealed effect may cross that later transaction iff its proposed scalar satisfies the persisted unary predicate (or preserves the exact observed scalar). This is direct preservation proof, not query replay and not `B -> A` interpretation.
+
+Multi-field requirements are atomic observations. They may not be accepted by checking each changed field independently; until a joint preservation certificate exists they remain on exact-input/coordination-required semantics.
+
+## PASS483 — Joint multi-field causal observation preservation
+
+A committed current-world `Transaction::require` whose deterministic `SemanticRuleExpr` depends on multiple fields is one atomic causal observation, not a set of independently commutable field observations. The durable authority stores the predicate once together with its exact observed field vector and stable group identity. Reconstructible history indexes may route each member coordinate to that group, but may not duplicate or reinterpret the predicate as independent per-field truth.
+
+For a retroactively published formation-sealed effect, all proposed writes touching one observation group are first overlaid on the group's exact observed vector. The full persisted predicate is then evaluated once against that combined candidate. The effect may braid through the later transaction only when the complete predicate remains true. This remains entirely current-world B/C authority; no formation-world guard is transported or re-executed after its seal.
+
+
+## PASS484 — Interned causal-group routing and relational/OFC hidden-state boundary
+
+PASS484 removes an accidental O(width²) reconstructible-memory shape from PASS483: grouped causal payloads are interned once by `(effect_id, group_id)`, while each `Field`/`ObjectField` timeline stores only a compact group id. Retained schema epochs structurally share the same persistent group pool.
+
+A hostile Γ-DTC regression also proves that a relational causal observation cannot be represented exactly by only its query, observed OFC key and source-relation envelope. Two join states may expose the same empty output fiber while one retains a hidden matching left fiber; the same later right insert changes only that observation. General relational/OFC causal authority therefore requires exact hidden maintained state. CFMD must share/intern that state rather than copy an O(data) maintained query snapshot per transaction, and must not fall back to relation-wide conflicts or query replay.
+
+
+## Current PASS507 publication/authority boundary
+
+1. Ordinary typed mutation ownership is `Context<M>` only. `IntentJournal` is internal runtime plumbing; `TransactionId` remains durable idempotency identity.
+2. `Database::builder(path).create_authoritative::<S>() -> Database` consumes the authoritative definition at creation without creating a typed live database wrapper.
+3. Authorization is DB-owned and current-world. Consumer shape/local `bind` names are not security identities. Grants are never migrated.
+4. A stale effect crossing a schema boundary is prepared once as `PreparedSchemaAwarePublication`, which binds the transported current effect, exact required current authorization footprint, formation semantic identity and authorized HEAD. New publication cannot reuse that proof after HEAD changes.
+5. Hosted/dynamic requests state formation identity explicitly as `SemanticRevision { schema, environment }`; `base_revision` cannot be used to infer schema identity.
+6. Pure field-only model deltas participate in the same prepared publication law. Mixed model/relation and carrier/lifecycle transport remain fail-closed until exact delta laws are proved; whole-state reconstruct/diff and old-schema routing are not fallbacks.

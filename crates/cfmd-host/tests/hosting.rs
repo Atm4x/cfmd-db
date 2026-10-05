@@ -13,7 +13,7 @@ use cfmd_host::{
 };
 use cfmd_protocol::{
     CommitRequest, HostedRequest, IdempotencyKey, OpenWatchRequest, ProtocolErrorCode,
-    ProtocolQuery, ProtocolValue, RelationMutation,
+    ProtocolQuery, ProtocolValue, RelationMutation, SemanticRevision,
     wire::{
         ProtocolHello, WireLimits, WireResponse, decode_hello_ack_frame, decode_response_frame,
         encode_hello_frame, encode_request_frame,
@@ -142,6 +142,7 @@ fn authentication_and_authorization_are_host_owned() {
 
     let commit = HostedRequest::Commit(CommitRequest {
         base_revision: 1,
+        formation_semantic_revision: SemanticRevision::new(1, 1),
         idempotency_key: IdempotencyKey::new(900),
         mutations: vec![RelationMutation {
             relation: relation.raw(),

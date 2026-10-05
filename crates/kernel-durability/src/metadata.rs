@@ -3,7 +3,7 @@ mod artifact_codec;
 mod intent_codec;
 mod migration_program_codec;
 mod model_delta_codec;
-mod query_codec;
+pub(crate) mod query_codec;
 mod revision_change_codec;
 
 #[cfg(test)]
@@ -27,3 +27,5 @@ pub(crate) use revision_change_codec::{decode_revision_change, encode_revision_c
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use intent_codec::canonical_relation_mutations_identity;

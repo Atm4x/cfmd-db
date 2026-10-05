@@ -256,7 +256,7 @@ impl RuntimeRevisionBundle {
                 continue;
             };
             let kind = match installed.data {
-                NativeRelation::RowStore(_) => DurableRelationLayoutKind::RowStore,
+                NativeRelation::RowStore { .. } => DurableRelationLayoutKind::RowStore,
                 NativeRelation::Columnar { .. } => DurableRelationLayoutKind::ValueColumnar,
                 NativeRelation::I64Columnar { .. } => DurableRelationLayoutKind::I64Columnar,
                 NativeRelation::TypedColumnar { .. } => DurableRelationLayoutKind::TypedColumnar,

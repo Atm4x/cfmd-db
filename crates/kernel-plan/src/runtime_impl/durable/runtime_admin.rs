@@ -177,7 +177,10 @@ impl DurableRuntime {
         Ok(None)
     }
 
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn revision_at(
         &self,
         revision: RevisionId,
@@ -453,6 +456,10 @@ impl DurableRuntime {
     /// intervening exact effect must be disjoint, while opaque/full/schema boundaries fail
     /// closed. This is the product-facing bridge to Γ-aware stale-intent transport; it does not
     /// synthesize a merge endpoint for overlapping writes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn certify_transition_rebase(
         &self,
         source_revision: RevisionId,
@@ -551,6 +558,34 @@ impl DurableRuntime {
                 },
             ));
         }
+
+        let mut relation_deltas = BTreeMap::<SemanticId, RelationDelta>::new();
+        for mutation in mutations {
+            match relation_deltas.entry(mutation.relation) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(mutation.delta.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get().result_type != mutation.delta.result_type {
+                        return Err(RuntimeHistoricalSnapshotError::Unavailable {
+                            revision: source_revision,
+                        });
+                    }
+                    entry.get_mut().inserted.extend(mutation.delta.inserted.clone());
+                    entry.get_mut().removed.extend(mutation.delta.removed.clone());
+                }
+            }
+        }
+        if !relation_deltas.is_empty()
+            && let RuntimeTransitionRebaseOutcome::Conflict(conflict) = snapshot
+                .certify_retroactive_relation_deltas_against_relational_causal_observations(
+                    source_revision,
+                    &relation_deltas,
+                    &self.registry,
+                )?
+            {
+                return Ok(RuntimeTransitionRebaseOutcome::Conflict(conflict));
+            }
 
         Ok(RuntimeTransitionRebaseOutcome::Certified(
             RuntimeTransitionRebaseCertificate {
@@ -807,6 +842,166 @@ impl DurableRuntime {
 }
 
 impl RuntimeRevisionSnapshot {
+    pub fn certify_retroactive_writes_against_causal_observations(
+        &self,
+        source_revision: RevisionId,
+        coordinates: impl IntoIterator<Item = RuntimeHistoryCoordinate>,
+    ) -> Result<RuntimeTransitionRebaseOutcome, RuntimeHistoricalSnapshotError> {
+        self.certify_retroactive_exact_writes_against_causal_observations(
+            source_revision,
+            coordinates.into_iter().map(|coordinate| (coordinate, None)),
+        )
+    }
+
+    pub fn certify_retroactive_relation_deltas_against_relational_causal_observations(
+        &self,
+        source_revision: RevisionId,
+        deltas: &BTreeMap<SemanticId, RelationDelta>,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RuntimeTransitionRebaseOutcome, RuntimeHistoricalSnapshotError> {
+        let head = self.revision();
+        let historical = &self.root().historical;
+        if source_revision > head.id() || !historical.contains_revision(source_revision) {
+            return Err(RuntimeHistoricalSnapshotError::Unavailable {
+                revision: source_revision,
+            });
+        }
+        let mut observations = BTreeMap::new();
+        for relation in deltas.keys() {
+            for (observation_ref, capsule) in
+                historical.relational_observations_after(source_revision, *relation)
+            {
+                observations.entry(observation_ref).or_insert(capsule);
+            }
+        }
+        let observation_entries = observations.into_iter().collect::<Vec<_>>();
+        let capsules = observation_entries
+            .iter()
+            .map(|(_, capsule)| *capsule)
+            .collect::<Vec<_>>();
+        let impacts = RelCausalCapsule::impact_many_relation_deltas(
+            &capsules,
+            deltas,
+            head.semantic_context(),
+            registry,
+        )
+        .map_err(PhysicalExecutionError::from)?;
+        let mut coordination_effects = BTreeSet::new();
+        for ((observation_ref, _), impact) in observation_entries.into_iter().zip(impacts) {
+            if impact == Impact::Changed {
+                coordination_effects.insert(observation_ref.effect_id);
+            }
+        }
+        if !coordination_effects.is_empty() {
+            return Ok(RuntimeTransitionRebaseOutcome::Conflict(
+                RuntimeTransitionRebaseConflict {
+                    source_revision,
+                    current_revision: head.id(),
+                    conflicting_effects: Vec::new(),
+                    coordination_effects: coordination_effects.into_iter().collect(),
+                    coordinates: Vec::new(),
+                    opaque_effects: Vec::new(),
+                },
+            ));
+        }
+        Ok(RuntimeTransitionRebaseOutcome::Certified(
+            RuntimeTransitionRebaseCertificate {
+                source_revision,
+                current_revision: head.id(),
+                intervening_effect_count: historical.exact_effect_count_after(source_revision),
+            },
+        ))
+    }
+
+    /// Exact B/C-native anti-dependency proof for retroactive sealed writes.
+    ///
+    /// An overlapping later observation is allowed only when the durable
+    /// observation carries an exact value and the retroactively inserted write
+    /// leaves that observed input byte-for-byte/semantically equal. This is a
+    /// universal preservation certificate: it never inspects an old-schema
+    /// guard and never guesses predicate semantics.
+    pub fn certify_retroactive_exact_writes_against_causal_observations(
+        &self,
+        source_revision: RevisionId,
+        writes: impl IntoIterator<Item = (RuntimeHistoryCoordinate, Option<Value>)>,
+    ) -> Result<RuntimeTransitionRebaseOutcome, RuntimeHistoricalSnapshotError> {
+        let head = self.revision();
+        let historical = &self.root().historical;
+        if source_revision > head.id() || !historical.contains_revision(source_revision) {
+            return Err(RuntimeHistoricalSnapshotError::Unavailable {
+                revision: source_revision,
+            });
+        }
+        let writes = writes.into_iter().collect::<Vec<_>>();
+        let proposed_fields = proposed_field_values(&writes);
+        let mut effects = BTreeSet::new();
+        let mut blocked = BTreeSet::new();
+        let mut joint_groups = BTreeMap::<(u128, u32), RuntimeJointCausalObservationGroup>::new();
+        for (coordinate, proposed_value) in &writes {
+            for observation in historical.observations_after(source_revision, coordinate) {
+                let exact_preserved = proposed_value
+                    .as_ref()
+                    .zip(observation.exact_value.as_ref())
+                    .is_some_and(|(proposed, observed)| proposed == observed);
+                let predicate_preserved = proposed_value
+                    .as_ref()
+                    .zip(observation.preservation_rule.as_ref())
+                    .is_some_and(|(proposed, rule)| {
+                        kernel_validation::semantic_rule_matches(rule, proposed).unwrap_or(false)
+                    });
+                let has_scalar_certificate =
+                    observation.exact_value.is_some() || observation.preservation_rule.is_some();
+                if (has_scalar_certificate && !exact_preserved && !predicate_preserved)
+                    || (!has_scalar_certificate && observation.joint_group_ids.is_empty())
+                {
+                    effects.insert(observation.effect_id);
+                    blocked.insert(coordinate.clone());
+                }
+                for &group_id in &observation.joint_group_ids {
+                    if let Some(group) =
+                        historical.joint_observation_group(observation.effect_id, group_id)
+                    {
+                        joint_groups
+                            .entry((observation.effect_id, group_id))
+                            .or_insert_with(|| group.clone());
+                    }
+                }
+            }
+        }
+        for ((effect_id, _), group) in joint_groups {
+            if !joint_causal_observation_preserved(&group, &proposed_fields) {
+                effects.insert(effect_id);
+                for field in group.observed_fields.keys() {
+                    if proposed_fields.contains_key(&(group.owner, *field)) {
+                        blocked.insert(RuntimeHistoryCoordinate::Field {
+                            field: *field,
+                            owner: group.owner,
+                        });
+                    }
+                }
+            }
+        }
+        if !effects.is_empty() {
+            return Ok(RuntimeTransitionRebaseOutcome::Conflict(
+                RuntimeTransitionRebaseConflict {
+                    source_revision,
+                    current_revision: head.id(),
+                    conflicting_effects: Vec::new(),
+                    coordination_effects: effects.into_iter().collect(),
+                    coordinates: blocked.into_iter().collect(),
+                    opaque_effects: Vec::new(),
+                },
+            ));
+        }
+        Ok(RuntimeTransitionRebaseOutcome::Certified(
+            RuntimeTransitionRebaseCertificate {
+                source_revision,
+                current_revision: head.id(),
+                intervening_effect_count: historical.exact_effect_count_after(source_revision),
+            },
+        ))
+    }
+
     /// Certifies that every passive guard/read dependency remained untouched
     /// between `source_revision` and this exact immutable snapshot. Unlike
     /// write/write rebase, any later action on a dependency invalidates the
@@ -833,11 +1028,18 @@ impl RuntimeRevisionSnapshot {
             ));
         }
         if source_revision > head.id() {
-            return Err(RuntimeHistoricalSnapshotError::Unavailable { revision: source_revision });
+            return Err(RuntimeHistoricalSnapshotError::Unavailable {
+                revision: source_revision,
+            });
         }
-        if historical.lineage_floor.is_some_and(|floor| source_revision < floor) {
+        if historical
+            .lineage_floor
+            .is_some_and(|floor| source_revision < floor)
+        {
             if historical.floor_opaque_effect.is_none() {
-                return Err(RuntimeHistoricalSnapshotError::Unavailable { revision: source_revision });
+                return Err(RuntimeHistoricalSnapshotError::Unavailable {
+                    revision: source_revision,
+                });
             }
             return Ok(RuntimeTransitionRebaseOutcome::Conflict(
                 RuntimeTransitionRebaseConflict {
@@ -851,7 +1053,9 @@ impl RuntimeRevisionSnapshot {
             ));
         }
         if !historical.contains_revision(source_revision) {
-            return Err(RuntimeHistoricalSnapshotError::Unavailable { revision: source_revision });
+            return Err(RuntimeHistoricalSnapshotError::Unavailable {
+                revision: source_revision,
+            });
         }
 
         let mut conflicting_effects = BTreeSet::new();
@@ -882,6 +1086,42 @@ impl RuntimeRevisionSnapshot {
             },
         ))
     }
+}
+
+fn proposed_field_values(
+    writes: &[(RuntimeHistoryCoordinate, Option<Value>)],
+) -> BTreeMap<(kernel_types::EntityId, SemanticId), Option<Value>> {
+    let mut out = BTreeMap::new();
+    for (coordinate, value) in writes {
+        match coordinate {
+            RuntimeHistoryCoordinate::Field { field, owner }
+            | RuntimeHistoryCoordinate::ObjectField { field, owner, .. } => {
+                out.insert((*owner, *field), value.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn joint_causal_observation_preserved(
+    group: &RuntimeJointCausalObservationGroup,
+    proposed_fields: &BTreeMap<(kernel_types::EntityId, SemanticId), Option<Value>>,
+) -> bool {
+    let mut candidate = group.observed_fields.clone();
+    for field in group.observed_fields.keys() {
+        if let Some(proposed) = proposed_fields.get(&(group.owner, *field)) {
+            match proposed {
+                Some(value) => {
+                    candidate.insert(*field, value.clone());
+                }
+                None => {
+                    candidate.remove(field);
+                }
+            }
+        }
+    }
+    kernel_validation::semantic_rule_matches_fields(&group.predicate, &candidate).unwrap_or(false)
 }
 
 fn apply_runtime_history_effect(

@@ -521,6 +521,9 @@ fn failed_replicated_ingest_does_not_publish_semantic_modules() {
                 semantic_revision: base.semantic_revision(),
                 relation_mutations: Vec::new(),
                 client_guard_digest: None,
+                causal_observations: Vec::new(),
+                causal_observation_groups: Vec::new(),
+                relational_causal_observations: Vec::new(),
                 semantic_modules: vec![BuiltinSemanticModuleSpec::Equivalence {
                     module: EquivalenceModule::TextExact,
                     implementation_revision: 1,
@@ -4183,6 +4186,9 @@ macro_rules! replicated_relation_effect {
                     semantic_revision: $semantic,
                     relation_mutations: Vec::new(),
                     client_guard_digest: None,
+                    causal_observations: Vec::new(),
+                    causal_observation_groups: Vec::new(),
+                    relational_causal_observations: Vec::new(),
                     semantic_modules: Vec::new(),
                 },
                 change: DurableRevisionChange::RelationData {

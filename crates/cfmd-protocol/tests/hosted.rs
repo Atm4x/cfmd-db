@@ -9,7 +9,7 @@ use std::{
 use cfmd_protocol::{
     CommitRequest, CommitResponse, HostedRequest, HostedResponse, HostedSession, IdempotencyKey,
     OpenWatchRequest, ProtocolErrorCode, ProtocolLimits, ProtocolQuery, ProtocolValue,
-    QueryRequest, RelationMutation, SnapshotTarget, WatchStatusDto,
+    QueryRequest, RelationMutation, SemanticRevision, SnapshotTarget, WatchStatusDto,
 };
 use cfmd_runtime::{
     Database, EquivalenceId, Permission, PermissionSet, PrimitiveEquivalence, PrincipalId,
@@ -66,6 +66,7 @@ fn stale_set_removal_uses_historical_gamma_support_and_current_exact_representat
     let commit = |base_revision, key, inserted: &[&str], removed: &[&str]| {
         hosted.execute(HostedRequest::Commit(CommitRequest {
             base_revision,
+            formation_semantic_revision: SemanticRevision::new(1, 1),
             idempotency_key: IdempotencyKey::new(key),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
@@ -136,6 +137,7 @@ fn benchmark_stale_exact_effect_history_depth() {
             let response = hosted
                 .execute(HostedRequest::Commit(CommitRequest {
                     base_revision: head,
+                    formation_semantic_revision: SemanticRevision::new(1, 1),
                     idempotency_key: IdempotencyKey::new(u128::from(head) + 10_000),
                     mutations: vec![RelationMutation {
                         relation: relation.raw(),
@@ -154,6 +156,7 @@ fn benchmark_stale_exact_effect_history_depth() {
         let response = hosted
             .execute(HostedRequest::Commit(CommitRequest {
                 base_revision: 1,
+                formation_semantic_revision: SemanticRevision::new(1, 1),
                 idempotency_key: IdempotencyKey::new(u128::from(depth) + 1_000_000),
                 mutations: vec![RelationMutation {
                     relation: relation.raw(),
@@ -188,6 +191,7 @@ fn commit_i64(
     hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision,
+            formation_semantic_revision: SemanticRevision::new(1, 1),
             idempotency_key: IdempotencyKey::new(idempotency_key),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
@@ -201,7 +205,7 @@ fn commit_i64(
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep complete hosted authorization protocol scenario together."
 )]
 fn protocol_dispatches_through_restricted_product_authority() {
     let (directory, database, relation, equivalence) = fixture();
@@ -219,6 +223,7 @@ fn protocol_dispatches_through_restricted_product_authority() {
     let committed = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
+            formation_semantic_revision: SemanticRevision::new(1, 1),
             idempotency_key: IdempotencyKey::new(500),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
@@ -235,6 +240,7 @@ fn protocol_dispatches_through_restricted_product_authority() {
     let retry = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
+            formation_semantic_revision: SemanticRevision::new(1, 1),
             idempotency_key: IdempotencyKey::new(500),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
@@ -251,6 +257,7 @@ fn protocol_dispatches_through_restricted_product_authority() {
     let changed_retry = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
+            formation_semantic_revision: SemanticRevision::new(1, 1),
             idempotency_key: IdempotencyKey::new(500),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
@@ -314,6 +321,7 @@ fn protocol_dispatches_through_restricted_product_authority() {
     let transported = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
+            formation_semantic_revision: SemanticRevision::new(1, 1),
             idempotency_key: IdempotencyKey::new(501),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
@@ -330,6 +338,7 @@ fn protocol_dispatches_through_restricted_product_authority() {
     let overlapping = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
+            formation_semantic_revision: SemanticRevision::new(1, 1),
             idempotency_key: IdempotencyKey::new(502),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
@@ -356,6 +365,7 @@ fn protocol_cannot_expand_session_grants() {
     let denied = hosted
         .execute(HostedRequest::Commit(CommitRequest {
             base_revision: 1,
+            formation_semantic_revision: SemanticRevision::new(1, 1),
             idempotency_key: IdempotencyKey::new(600),
             mutations: vec![RelationMutation {
                 relation: relation.raw(),
@@ -594,6 +604,121 @@ fn protocol_session_close_cancels_blocked_watch_and_rejects_future_requests() {
     assert_eq!(rejected.code(), ProtocolErrorCode::SessionClosed);
 
     drop(hosted);
+    drop(database);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep complete hosted schema-aware authority scenario together."
+)]
+fn hosted_schema_aware_commit_uses_explicit_formation_identity_and_current_authority() {
+    use cfmd_runtime::{
+        MigrationColumnRule, MigrationHistoryPolicy, MigrationModel, MigrationRelationRule,
+        MigrationValueExpr, PermissionSet, PrimitiveEquivalence, RelationColumnId, RelationSchema,
+        TransactionId,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("fixture directory");
+    let source_relation = RelationId::new(507_001);
+    let target_relation = RelationId::new(507_002);
+    let source_column = RelationColumnId::new(507_003);
+    let target_column = RelationColumnId::new(507_004);
+    let equivalence = EquivalenceId::new(507_005);
+
+    let source = Schema::builder()
+        .revisions(507, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            source_relation,
+            [(source_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("database");
+    let source_hosted = HostedSession::new(database.session(Session::new(
+        PrincipalId::new(507_010),
+        PermissionSet::from([Permission::WriteRelation(source_relation)]),
+    )));
+    let target_hosted = HostedSession::new(database.session(Session::new(
+        PrincipalId::new(507_011),
+        PermissionSet::from([Permission::WriteRelation(target_relation)]),
+    )));
+
+    let target = Schema::builder()
+        .revisions(508, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            target_relation,
+            [(target_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("target schema");
+    let migration = MigrationModel::new(507_508, target).relation(MigrationRelationRule::Rows {
+        source: source_relation,
+        target: target_relation,
+        columns: vec![MigrationColumnRule {
+            source_columns: vec![0],
+            target_column: 0,
+            value: MigrationValueExpr::Column(0),
+        }],
+    });
+    database
+        .migrate(
+            &migration,
+            TransactionId::new(9_507_001),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("migration");
+
+    let stale = CommitRequest {
+        base_revision: 1,
+        formation_semantic_revision: SemanticRevision::new(507, 1),
+        idempotency_key: IdempotencyKey::new(9_507_002),
+        mutations: vec![RelationMutation {
+            relation: source_relation.raw(),
+            inserted: vec![vec![ProtocolValue::I64(7)]],
+            removed: vec![],
+        }],
+    };
+    assert_eq!(
+        source_hosted
+            .execute(HostedRequest::Commit(stale.clone()))
+            .expect_err("source-world grant must not authorize target-world publication")
+            .code(),
+        ProtocolErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        target_hosted
+            .execute(HostedRequest::Commit(stale))
+            .expect("target-world grant publishes transported intent"),
+        HostedResponse::Commit(CommitResponse::Committed { revision: 3 })
+    );
+
+    let bad_identity = CommitRequest {
+        base_revision: 1,
+        formation_semantic_revision: SemanticRevision::new(999, 1),
+        idempotency_key: IdempotencyKey::new(9_507_003),
+        mutations: vec![RelationMutation {
+            relation: source_relation.raw(),
+            inserted: vec![vec![ProtocolValue::I64(8)]],
+            removed: vec![],
+        }],
+    };
+    assert_eq!(
+        target_hosted
+            .execute(HostedRequest::Commit(bad_identity))
+            .expect_err("explicit semantic identity mismatch must fail closed")
+            .code(),
+        ProtocolErrorCode::InvalidRequest
+    );
+
+    drop(source_hosted);
+    drop(target_hosted);
     drop(database);
     fs::remove_dir_all(directory).expect("cleanup");
 }

@@ -370,7 +370,7 @@ impl SemanticQuotientStoreView for PhysicalStore {
             .position(row_id)
             .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
         match &installed.data {
-            NativeRelation::RowStore(rows) => rows
+            NativeRelation::RowStore { rows, .. } => rows
                 .get(position)
                 .and_then(|row| row.get(column))
                 .cloned()

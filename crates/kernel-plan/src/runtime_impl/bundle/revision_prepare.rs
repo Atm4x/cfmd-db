@@ -51,10 +51,8 @@ impl RuntimeRevisionBundle {
         resolved: &BTreeMap<SemanticId, StorageResolvedRelationDelta>,
         target_revision: RevisionId,
         registry: &kernel_semantics::SemanticRegistry,
-    ) -> Result<
-        (CandidateMaterializationMap, MaterializationOutputDeltaMap),
-        PhysicalExecutionError,
-    > {
+    ) -> Result<(CandidateMaterializationMap, MaterializationOutputDeltaMap), PhysicalExecutionError>
+    {
         let mut candidate_materializations = self.materializations.clone();
         let mut output_deltas = BTreeMap::new();
         let affected_materializations = self.affected_materializations(resolved.keys().copied());
@@ -127,7 +125,10 @@ impl RuntimeRevisionBundle {
         self.prepare_revision_inner(&request, RelationEndpointValidation::ExactDerived)
     }
 
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn prepare_revision_inner(
         &self,
         request: &RevisionTransitionRequest<'_>,
@@ -192,10 +193,8 @@ impl RuntimeRevisionBundle {
                 request.registry,
             )?;
 
-        let violation_state = self.candidate_violation_state_for_relation_transition(
-            request,
-            replay_claimed_delta,
-        )?;
+        let violation_state =
+            self.candidate_violation_state_for_relation_transition(request, replay_claimed_delta)?;
         violation_state.require_zero()?;
         let mut relation_bases = self.relation_bases.clone();
         for mutation in request.mutations {
@@ -241,14 +240,30 @@ impl RuntimeRevisionBundle {
                 relation_deltas,
             },
             rewrite_intents: BTreeMap::new(),
-            object_field_writes: request.mutations.iter().filter(|mutation| !mutation.object_field_writes.is_empty()).map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec())).collect(),
-            relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != kernel_durability::DurableRelationAuthorization::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
+            object_field_writes: request
+                .mutations
+                .iter()
+                .filter(|mutation| !mutation.object_field_writes.is_empty())
+                .map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec()))
+                .collect(),
+            relation_authorizations: request
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.authorization != kernel_durability::DurableRelationAuthorization::default())
+                .map(|mutation| (mutation.relation, mutation.authorization))
+                .collect(),
+            causal_observations: Vec::new(),
+            causal_observation_values: BTreeMap::new(),
+            causal_observation_predicates: BTreeMap::new(),
+            causal_observation_groups: Vec::new(),
+            relational_causal_observations: Vec::new(),
         };
         Ok(PreparedRuntimeRevisionTransition {
             descriptor,
             source_identity: self.root_identity,
             source_context: self.revision.semantic_context().clone(),
             source_fields: self.revision.state().model.fields.clone(),
+            source_historical: self.historical.clone(),
             candidate: Box::new(candidate),
             output_deltas,
         })
@@ -378,17 +393,13 @@ impl RuntimeRevisionBundle {
             true,
         )?;
 
-        let exact_model_delta = DurableModelDelta::between(
-            self.revision.state(),
-            request.target_revision.state(),
-        );
+        let exact_model_delta =
+            DurableModelDelta::between(self.revision.state(), request.target_revision.state());
         if &exact_model_delta != request.model_delta {
             return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
         }
-        let exact_model_complement = DurableModelDelta::between(
-            request.target_revision.state(),
-            self.revision.state(),
-        );
+        let exact_model_complement =
+            DurableModelDelta::between(request.target_revision.state(), self.revision.state());
         if &exact_model_complement != request.model_complement {
             return Err(PhysicalExecutionError::LogicalRevisionMutationMismatch);
         }
@@ -399,8 +410,8 @@ impl RuntimeRevisionBundle {
             .0
             .checked_add(1)
             .ok_or(PhysicalExecutionError::RuntimeRootVersionExhausted)?;
-        let (mut candidate_store, resolved) = self
-            .candidate_physical_store_for_mutations(request.mutations, request.registry)?;
+        let (mut candidate_store, resolved) =
+            self.candidate_physical_store_for_mutations(request.mutations, request.registry)?;
         candidate_store.rebind_unpublished_candidate_revision(source_revision, target_revision)?;
 
         let (candidate_materializations, output_deltas) = self
@@ -414,7 +425,8 @@ impl RuntimeRevisionBundle {
         // violation measure is not authoritative. Rebuild the logical measure
         // from the already validated target Revision, while preserving the
         // incremental physical/materialization publication path.
-        let violation_state = RuntimeViolationState::build(request.target_revision, request.registry)?;
+        let violation_state =
+            RuntimeViolationState::build(request.target_revision, request.registry)?;
         violation_state.require_zero()?;
 
         let mut relation_bases = self.relation_bases.clone();
@@ -464,12 +476,28 @@ impl RuntimeRevisionBundle {
                     model_complement: Box::new(request.model_complement.clone()),
                 },
                 rewrite_intents: BTreeMap::new(),
-                object_field_writes: request.mutations.iter().filter(|mutation| !mutation.object_field_writes.is_empty()).map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec())).collect(),
-                relation_authorizations: request.mutations.iter().filter(|mutation| mutation.authorization != kernel_durability::DurableRelationAuthorization::default()).map(|mutation| (mutation.relation, mutation.authorization)).collect(),
+                object_field_writes: request
+                    .mutations
+                    .iter()
+                    .filter(|mutation| !mutation.object_field_writes.is_empty())
+                    .map(|mutation| (mutation.relation, mutation.object_field_writes.to_vec()))
+                    .collect(),
+                relation_authorizations: request
+                    .mutations
+                    .iter()
+                    .filter(|mutation| mutation.authorization != kernel_durability::DurableRelationAuthorization::default())
+                    .map(|mutation| (mutation.relation, mutation.authorization))
+                    .collect(),
+                causal_observations: Vec::new(),
+                causal_observation_values: BTreeMap::new(),
+                causal_observation_predicates: BTreeMap::new(),
+                causal_observation_groups: Vec::new(),
+                relational_causal_observations: Vec::new(),
             },
             source_identity: self.root_identity,
             source_context: self.revision.semantic_context().clone(),
             source_fields: self.revision.state().model.fields.clone(),
+            source_historical: self.historical.clone(),
             candidate: Box::new(candidate),
             output_deltas,
         })
@@ -512,7 +540,7 @@ impl RuntimeRevisionBundle {
             physical.install(
                 relation.id,
                 LayoutBinding::RECOVERY_ROW_STORE,
-                NativeRelation::row_store(rows),
+                NativeRelation::row_store_with_arity(rows, relation.columns.len())?,
             )?;
             relation_layouts.insert(relation.id, LayoutBinding::RECOVERY_ROW_STORE);
         }
@@ -544,10 +572,16 @@ impl RuntimeRevisionBundle {
                 rewrite_intents: BTreeMap::new(),
                 object_field_writes: BTreeMap::new(),
                 relation_authorizations: BTreeMap::new(),
+                causal_observations: Vec::new(),
+                causal_observation_values: BTreeMap::new(),
+                causal_observation_predicates: BTreeMap::new(),
+                causal_observation_groups: Vec::new(),
+                relational_causal_observations: Vec::new(),
             },
             source_identity: self.root_identity,
             source_context: self.revision.semantic_context().clone(),
             source_fields: self.revision.state().model.fields.clone(),
+            source_historical: self.historical.clone(),
             candidate: Box::new(candidate),
             output_deltas: BTreeMap::new(),
         })
@@ -590,7 +624,7 @@ impl RuntimeRevisionBundle {
             physical.install(
                 relation.id,
                 LayoutBinding::RECOVERY_ROW_STORE,
-                NativeRelation::row_store(rows),
+                NativeRelation::row_store_with_arity(rows, relation.columns.len())?,
             )?;
             relation_layouts.insert(relation.id, LayoutBinding::RECOVERY_ROW_STORE);
         }
@@ -615,10 +649,16 @@ impl RuntimeRevisionBundle {
                 rewrite_intents: BTreeMap::new(),
                 object_field_writes: BTreeMap::new(),
                 relation_authorizations: BTreeMap::new(),
+                causal_observations: Vec::new(),
+                causal_observation_values: BTreeMap::new(),
+                causal_observation_predicates: BTreeMap::new(),
+                causal_observation_groups: Vec::new(),
+                relational_causal_observations: Vec::new(),
             },
             source_identity: self.root_identity,
             source_context: self.revision.semantic_context().clone(),
             source_fields: self.revision.state().model.fields.clone(),
+            source_historical: self.historical.clone(),
             candidate: Box::new(candidate),
             output_deltas: BTreeMap::new(),
         })
@@ -698,10 +738,8 @@ impl RuntimeRevisionBundle {
         let source = self.revision.state();
         let target = target_revision.state();
 
-        let mutated_relations: BTreeSet<_> = mutations
-            .iter()
-            .map(|mutation| mutation.relation)
-            .collect();
+        let mutated_relations: BTreeSet<_> =
+            mutations.iter().map(|mutation| mutation.relation).collect();
 
         if !target_revision.certifies_relation_only_from(&self.revision, &mutated_relations) {
             if !allow_non_relation_changes
@@ -737,11 +775,10 @@ impl RuntimeRevisionBundle {
                     registry,
                 )?,
             };
-            let next = mutation.delta.apply_to_value(
-                old,
-                self.revision.semantic_context(),
-                registry,
-            )?;
+            let next =
+                mutation
+                    .delta
+                    .apply_to_value(old, self.revision.semantic_context(), registry)?;
             affected.insert(mutation.relation, next);
         }
 
@@ -759,5 +796,4 @@ impl RuntimeRevisionBundle {
 
         Ok(())
     }
-
 }

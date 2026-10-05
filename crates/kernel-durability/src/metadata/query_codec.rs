@@ -10,7 +10,7 @@ const MAX_QUERY_DEPTH: usize = 128;
     clippy::too_many_lines,
     reason = "Keep the complete operator or protocol case analysis together."
 )]
-pub(super) fn encode_rel_expr(
+pub(crate) fn encode_rel_expr(
     out: &mut impl crate::binary_codec::BinarySink,
     expr: &RelExpr,
     depth: usize,

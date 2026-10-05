@@ -1,8 +1,3 @@
-type FieldTransportChanges = (
-    Vec<(kernel_types::SemanticId, EntityId, Option<Value>)>,
-    BTreeSet<(kernel_types::SemanticId, EntityId)>,
-);
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_model::{DatabaseState, FiniteModel, Value};
@@ -12,6 +7,11 @@ use kernel_semantics::SemanticRegistry;
 use kernel_types::EntityId;
 
 use crate::TransportError;
+
+type FieldTransportChanges = (
+    Vec<(kernel_types::SemanticId, EntityId, Option<Value>)>,
+    BTreeSet<(kernel_types::SemanticId, EntityId)>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldRewrite {
@@ -399,8 +399,22 @@ pub enum MigrationRelationRewrite {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedMigrationColumnRewrite {
+    target_column: kernel_types::SemanticId,
     source_columns: Vec<(kernel_types::SemanticId, usize)>,
     transform: ExactQuery,
+}
+
+/// Exact current-schema write coordinates induced by a source relation-column
+/// footprint through one verified row-local migration step.
+///
+/// This transports *required authority*, not grants. Callers must authorize
+/// every returned target coordinate in the current world. General relational
+/// rewrites remain fail-closed because a local source write can have
+/// non-local output effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationRelationWriteFootprint {
+    pub target_relation: kernel_types::SemanticId,
+    pub target_columns: BTreeSet<kernel_types::SemanticId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,6 +778,7 @@ impl SchemaMigrationTransport {
                             ));
                         }
                         prepared_columns.push(PreparedMigrationColumnRewrite {
+                            target_column: target_column_id,
                             source_columns,
                             transform: column.transform.clone(),
                         });
@@ -990,6 +1005,131 @@ impl SchemaMigrationTransport {
             ));
         }
         Ok(out)
+    }
+
+    /// Transports an exact source relation-column write footprint to the
+    /// current target schema without transporting or widening any grants.
+    ///
+    /// A target column is required iff its verified row-local transform reads
+    /// at least one touched source column. Passthrough is identity. Query/global
+    /// rewrites fail closed because their write footprint is not row-local.
+    pub fn transport_relation_write_footprint_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+        source_columns: &BTreeSet<kernel_types::SemanticId>,
+    ) -> Result<Vec<MigrationRelationWriteFootprint>, TransportError> {
+        let source_column_ids = self
+            .source
+            .schema
+            .relation_column_ids(source_relation)
+            .ok_or(TransportError::UnknownSourceRelation(source_relation))?;
+        if let Some(unknown) = source_columns
+            .iter()
+            .find(|column| !source_column_ids.contains(column))
+        {
+            return Err(TransportError::UnknownSourceMigrationColumn(
+                source_relation,
+                *unknown,
+            ));
+        }
+        if self.relation_passthrough.contains(&source_relation) {
+            return Ok(vec![MigrationRelationWriteFootprint {
+                target_relation: source_relation,
+                target_columns: source_columns.clone(),
+            }]);
+        }
+
+        for rewrite in &self.relation_rewrites {
+            if let PreparedMigrationRelationRewrite::Query {
+                rewrite,
+                source_relations,
+            } = rewrite
+                && source_relations.contains(&source_relation)
+            {
+                return Err(TransportError::MigrationSliceNotRowLocal(
+                    rewrite.target_relation,
+                ));
+            }
+        }
+
+        let mut out = Vec::new();
+        for rewrite in &self.relation_rewrites {
+            let PreparedMigrationRelationRewrite::Rows {
+                source_relation: rewrite_source,
+                target_relation,
+                columns,
+            } = rewrite
+            else {
+                continue;
+            };
+            if *rewrite_source != source_relation {
+                continue;
+            }
+            let target_columns = columns
+                .iter()
+                .filter(|column| {
+                    column
+                        .source_columns
+                        .iter()
+                        .any(|(source_column, _)| source_columns.contains(source_column))
+                })
+                .map(|column| column.target_column)
+                .collect::<BTreeSet<_>>();
+            if !target_columns.is_empty() {
+                out.push(MigrationRelationWriteFootprint {
+                    target_relation: *target_relation,
+                    target_columns,
+                });
+            }
+        }
+        if out.is_empty() {
+            return Err(TransportError::UnrepresentableSourceRelationEffect(
+                source_relation,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Exact target relations that a row-local source relation effect may
+    /// mutate. This is the relation-level counterpart of
+    /// `transport_relation_write_footprint_exact`.
+    pub fn transport_relation_write_targets_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+    ) -> Result<BTreeSet<kernel_types::SemanticId>, TransportError> {
+        if self.source.schema.relation(source_relation).is_none() {
+            return Err(TransportError::UnknownSourceRelation(source_relation));
+        }
+        if self.relation_passthrough.contains(&source_relation) {
+            return Ok(BTreeSet::from([source_relation]));
+        }
+        let mut targets = BTreeSet::new();
+        for rewrite in &self.relation_rewrites {
+            match rewrite {
+                PreparedMigrationRelationRewrite::Query {
+                    rewrite,
+                    source_relations,
+                } if source_relations.contains(&source_relation) => {
+                    return Err(TransportError::MigrationSliceNotRowLocal(
+                        rewrite.target_relation,
+                    ));
+                }
+                PreparedMigrationRelationRewrite::Rows {
+                    source_relation: rewrite_source,
+                    target_relation,
+                    ..
+                } if *rewrite_source == source_relation => {
+                    targets.insert(*target_relation);
+                }
+                _ => {}
+            }
+        }
+        if targets.is_empty() {
+            return Err(TransportError::UnrepresentableSourceRelationEffect(
+                source_relation,
+            ));
+        }
+        Ok(targets)
     }
 
     /// Transports exact field assignments with bounded work over only affected

@@ -5759,8 +5759,11 @@ mod relational_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
-    fn maintained_scan_shares_factorized_relation_occurrence_witness_without_recanonicalization() {
+    #[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn maintained_scan_shares_factorized_relation_occurrence_witness_without_recanonicalization() {
         let (context, registry, _, relation, _) = setup();
         let rows = vec![
             vec![Value::Text("Alpha".into()), Value::I64(1)],
@@ -6306,6 +6309,287 @@ mod relational_tests {
                 .unwrap()
         );
     }
+
+
+    #[test]
+    fn p484_observed_ofc_key_and_relation_envelope_do_not_replace_hidden_dtc_state() {
+        let (context, registry, text_eq, left, right) = setup();
+        let query = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(right)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        };
+        let matching_left = vec![Value::Text("alpha".into()), Value::I64(1)];
+        let inserted_right = vec![Value::Text("ALPHA".into()), Value::I64(2)];
+
+        let mut hidden_match = FiniteModel::default();
+        hidden_match.relations.insert(left, vec![matching_left]);
+        hidden_match.relations.insert(right, Vec::new());
+        let mut no_hidden_match = FiniteModel::default();
+        no_hidden_match.relations.insert(left, Vec::new());
+        no_hidden_match.relations.insert(right, Vec::new());
+
+        let guard_with_hidden_match =
+            RelObservationGuard::observe(&query, &hidden_match, &context, &registry).unwrap();
+        let guard_without_hidden_match =
+            RelObservationGuard::observe(&query, &no_hidden_match, &context, &registry).unwrap();
+        assert_eq!(
+            guard_with_hidden_match.observed_key(),
+            guard_without_hidden_match.observed_key()
+        );
+        assert_eq!(
+            guard_with_hidden_match.source_relations(),
+            guard_without_hidden_match.source_relations()
+        );
+
+        let mut changed_hidden_match = hidden_match.clone();
+        changed_hidden_match
+            .relations
+            .get_mut(&right)
+            .unwrap()
+            .push(inserted_right.clone());
+        let mut changed_no_hidden_match = no_hidden_match.clone();
+        changed_no_hidden_match
+            .relations
+            .get_mut(&right)
+            .unwrap()
+            .push(inserted_right);
+
+        assert_eq!(
+            guard_with_hidden_match
+                .impact_between(&hidden_match, &changed_hidden_match, &context, &registry)
+                .unwrap(),
+            Impact::Changed
+        );
+        assert_eq!(
+            guard_without_hidden_match
+                .impact_between(&no_hidden_match, &changed_no_hidden_match, &context, &registry)
+                .unwrap(),
+            Impact::Unaffected
+        );
+    }
+
+    #[test]
+    fn p485_causal_capsule_reconstructs_hidden_join_state_without_query_replay() {
+        let (context, registry, text_eq, left, right) = setup();
+        let query = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(right)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        };
+        let matching_left = vec![Value::Text("alpha".into()), Value::I64(1)];
+        let inserted_right = vec![Value::Text("ALPHA".into()), Value::I64(2)];
+
+        let mut head = FiniteModel::default();
+        head.relations.insert(left, vec![matching_left]);
+        head.relations.insert(right, vec![inserted_right.clone()]);
+        let mut maintained =
+            MaterializedRelPlanState::build(&query, &head, &context, &registry).unwrap();
+        maintained.bind_revision(kernel_types::RevisionId::new(2)).unwrap();
+        let head_capsule = RelCausalCapsule::capture(&maintained).unwrap();
+
+        let right_type = RelExpr::Scan(right).typecheck(&context, &registry).unwrap();
+        let forward = BTreeMap::from([(
+            right,
+            RelationDelta {
+                inserted: vec![inserted_right.clone()],
+                removed: Vec::new(),
+                result_type: right_type.clone(),
+            },
+        )]);
+        let observed_capsule = head_capsule
+            .rewind_forward_deltas(
+                kernel_types::RevisionId::new(1),
+                &forward,
+                &context,
+                &registry,
+            )
+            .unwrap();
+        let proposed = BTreeMap::from([(
+            right,
+            RelationDelta {
+                inserted: vec![inserted_right],
+                removed: Vec::new(),
+                result_type: right_type,
+            },
+        )]);
+        assert_eq!(
+            observed_capsule
+                .impact_relation_deltas(&proposed, &context, &registry)
+                .unwrap(),
+            Impact::Changed
+        );
+
+        let mut no_hidden_head = FiniteModel::default();
+        no_hidden_head.relations.insert(left, Vec::new());
+        no_hidden_head
+            .relations
+            .insert(right, vec![proposed[&right].inserted[0].clone()]);
+        let mut no_hidden_maintained =
+            MaterializedRelPlanState::build(&query, &no_hidden_head, &context, &registry).unwrap();
+        no_hidden_maintained
+            .bind_revision(kernel_types::RevisionId::new(2))
+            .unwrap();
+        let no_hidden_observed = RelCausalCapsule::capture(&no_hidden_maintained)
+            .unwrap()
+            .rewind_forward_deltas(
+                kernel_types::RevisionId::new(1),
+                &forward,
+                &context,
+                &registry,
+            )
+            .unwrap();
+        assert_eq!(
+            no_hidden_observed
+                .impact_relation_deltas(&proposed, &context, &registry)
+                .unwrap(),
+            Impact::Unaffected
+        );
+    }
+
+    #[test]
+    fn p485_causal_capsule_keeps_one_payload_for_unrelated_revision_churn() {
+        let (context, registry, _, left, _) = setup();
+        let query = RelExpr::Scan(left);
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, Vec::new());
+        let mut maintained =
+            MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        maintained.bind_revision(kernel_types::RevisionId::new(7)).unwrap();
+        let capsule = RelCausalCapsule::capture(&maintained).unwrap();
+
+        let unrelated = BTreeMap::new();
+        let next = capsule
+            .advance(
+                kernel_types::RevisionId::new(8),
+                &unrelated,
+                &context,
+                &registry,
+            )
+            .unwrap();
+        assert!(capsule.shares_payload_with(&next));
+        assert_eq!(next.revision(), kernel_types::RevisionId::new(7));
+    }
+
+    #[test]
+    fn p489_identical_relational_semantics_form_one_shareable_maintained_state_class() {
+        let (context, registry, text_eq, left, _) = setup();
+        let query = RelExpr::FilterEqConst {
+            input: Box::new(RelExpr::Scan(left)),
+            column: 0,
+            value: Value::Text("alpha".into()),
+            equivalence: text_eq,
+        };
+        let row = vec![Value::Text("ALPHA".into()), Value::I64(1)];
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, vec![row.clone()]);
+
+        let mut first = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        let mut second = MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        first.bind_revision(RevisionId::new(2)).unwrap();
+        second.bind_revision(RevisionId::new(2)).unwrap();
+        let first = RelCausalCapsule::capture(&first).unwrap();
+        let second = RelCausalCapsule::capture(&second).unwrap();
+        assert_eq!(first, second);
+
+        let scan_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
+        let forward = BTreeMap::from([(
+            left,
+            RelationDelta {
+                inserted: vec![row],
+                removed: Vec::new(),
+                result_type: scan_type,
+            },
+        )]);
+        let first = first
+            .rewind_forward_deltas(RevisionId::new(1), &forward, &context, &registry)
+            .unwrap();
+        let second = second
+            .rewind_forward_deltas(RevisionId::new(1), &forward, &context, &registry)
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn p489_source_relation_and_revision_do_not_define_a_shareable_causal_state_class() {
+        let (context, registry, text_eq, left, _) = setup();
+        let alpha = RelExpr::FilterEqConst {
+            input: Box::new(RelExpr::Scan(left)),
+            column: 0,
+            value: Value::Text("alpha".into()),
+            equivalence: text_eq,
+        };
+        let beta = RelExpr::FilterEqConst {
+            input: Box::new(RelExpr::Scan(left)),
+            column: 0,
+            value: Value::Text("beta".into()),
+            equivalence: text_eq,
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, Vec::new());
+
+        let mut alpha_state =
+            MaterializedRelPlanState::build(&alpha, &model, &context, &registry).unwrap();
+        let mut beta_state =
+            MaterializedRelPlanState::build(&beta, &model, &context, &registry).unwrap();
+        alpha_state.bind_revision(RevisionId::new(1)).unwrap();
+        beta_state.bind_revision(RevisionId::new(1)).unwrap();
+        let alpha_capsule = RelCausalCapsule::capture(&alpha_state).unwrap();
+        let beta_capsule = RelCausalCapsule::capture(&beta_state).unwrap();
+
+        assert_eq!(alpha_capsule.revision(), beta_capsule.revision());
+        assert_eq!(alpha_capsule.source_relations(), beta_capsule.source_relations());
+        assert_ne!(alpha_capsule.query(), beta_capsule.query());
+
+        let scan_type = RelExpr::Scan(left).typecheck(&context, &registry).unwrap();
+        let proposed = BTreeMap::from([(
+            left,
+            RelationDelta {
+                inserted: vec![vec![Value::Text("ALPHA".into()), Value::I64(7)]],
+                removed: Vec::new(),
+                result_type: scan_type,
+            },
+        )]);
+        assert_eq!(
+            alpha_capsule
+                .impact_relation_deltas(&proposed, &context, &registry)
+                .unwrap(),
+            Impact::Changed
+        );
+        assert_eq!(
+            beta_capsule
+                .impact_relation_deltas(&proposed, &context, &registry)
+                .unwrap(),
+            Impact::Unaffected
+        );
+    }
+
+    #[test]
+    fn p485_causal_capsule_exposes_compact_source_occurrence_routing() {
+        let (context, registry, text_eq, left, _) = setup();
+        let query = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(left)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: text_eq,
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(left, Vec::new());
+        let mut maintained =
+            MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        maintained.bind_revision(kernel_types::RevisionId::new(9)).unwrap();
+        let capsule = RelCausalCapsule::capture(&maintained).unwrap();
+        assert_eq!(
+            capsule.source_occurrence_counts(),
+            BTreeMap::from([(left, 2)])
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -6495,8 +6779,11 @@ mod positive_recursive_query_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
-    fn quotient_operators_emit_exact_occurrence_certificate_without_second_gamma_pass() {
+    #[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn quotient_operators_emit_exact_occurrence_certificate_without_second_gamma_pass() {
         let text_eq = SemanticId::new(91_020);
         let i64_eq = SemanticId::new(91_021);
         let set_relation = SemanticId::new(91_022);
@@ -6814,8 +7101,11 @@ mod positive_recursive_query_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
-    fn anti_join_composes_left_occurrence_certificate_without_full_row_recanonicalization() {
+    #[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn anti_join_composes_left_occurrence_certificate_without_full_row_recanonicalization() {
         let text_eq = SemanticId::new(91_060);
         let i64_eq = SemanticId::new(91_061);
         let source_bag = SemanticId::new(91_062);
@@ -7461,8 +7751,11 @@ mod positive_recursive_query_tests {
 
     #[test]
     #[ignore = "manual release-mode compositional AntiJoin occurrence certificate benchmark"]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
-    fn anti_join_compositional_occurrence_certificate_scale_benchmark() {
+    #[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn anti_join_compositional_occurrence_certificate_scale_benchmark() {
         use std::hint::black_box;
         use std::time::Instant;
 
@@ -7577,8 +7870,11 @@ mod positive_recursive_query_tests {
 
     #[test]
     #[ignore = "manual release-mode quotient occurrence certificate benchmark"]
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
-    fn quotient_operator_occurrence_certificate_scale_benchmark() {
+    #[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn quotient_operator_occurrence_certificate_scale_benchmark() {
         use std::hint::black_box;
         use std::time::Instant;
 
@@ -7993,7 +8289,10 @@ use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
 use super::*;
 
 #[test]
-#[allow(clippy::cast_precision_loss, reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio.")]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+)]
 fn pinned_set_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_nodes() {
     let eq = SemanticId::new(91_070_420);
     let source = SemanticId::new(91_070_421);
@@ -8078,7 +8377,10 @@ fn pinned_set_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_no
 }
 
 #[test]
-#[allow(clippy::cast_precision_loss, reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio.")]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+)]
 fn pinned_bag_fifo_witness_lineage_retains_path_copy_nodes_and_reclaims_old_unique_nodes() {
     let eq = SemanticId::new(91_070_422);
     let source = SemanticId::new(91_070_423);

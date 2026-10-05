@@ -218,7 +218,7 @@ fn schema_migration_prepare_carries_program_not_target_snapshot() {
             source_schema: SchemaRevisionId::new(380),
             target_schema: SchemaRevisionId::new(381),
             lens_spec: LensSpecId(SemanticId::new(380_381)),
-            semantic_pins: SemanticManifestId(SemanticId::new(0x00CF_4D38_0381)),
+            semantic_pins: SemanticManifestId(SemanticId::new(0xCF_4D38_0381)),
             encoding_version: 1,
             complement: Value::Unit,
         },

@@ -67,6 +67,11 @@ impl RevisionDurability for SimulatedRevisionWal {
         Ok(DurablePrepareToken::from_wal(
             descriptor.transaction_id,
             descriptor.target_revision,
+            descriptor
+                .revision_effect_id
+                .unwrap_or(kernel_change::RevisionEffectId(
+                    descriptor.transaction_id.raw(),
+                )),
             frame.lsn,
             frame.payload_crc32c,
         ))

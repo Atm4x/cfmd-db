@@ -2059,8 +2059,8 @@ impl RelationDelta {
         let mut inserted = Vec::new();
         for row in &self.inserted {
             let key = canonical_row_key(row, equivalences, context, registry)?;
-            if let std::collections::btree_map::Entry::Vacant(e) = current_by_key.entry(key) {
-                e.insert(row.clone());
+            if let std::collections::btree_map::Entry::Vacant(entry) = current_by_key.entry(key) {
+                entry.insert(row.clone());
                 inserted.push(row.clone());
             }
         }

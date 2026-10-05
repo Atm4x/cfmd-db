@@ -1,6 +1,9 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeRelation {
-    RowStore(PersistentPhysicalVec<kernel_query::Row>),
+    RowStore {
+        rows: PersistentPhysicalVec<kernel_query::Row>,
+        column_count: usize,
+    },
     Columnar {
         columns: Vec<PersistentPhysicalVec<Value>>,
         row_count: usize,
@@ -80,7 +83,25 @@ impl NativeRelation {
 
     #[must_use]
     pub fn row_store(rows: Vec<kernel_query::Row>) -> Self {
-        Self::RowStore(PersistentPhysicalVec::from_vec(rows))
+        let column_count = rows.first().map_or(0, Vec::len);
+        debug_assert!(rows.iter().all(|row| row.len() == column_count));
+        Self::RowStore {
+            rows: PersistentPhysicalVec::from_vec(rows),
+            column_count,
+        }
+    }
+
+    pub fn row_store_with_arity(
+        rows: Vec<kernel_query::Row>,
+        column_count: usize,
+    ) -> Result<Self, PhysicalExecutionError> {
+        if rows.iter().any(|row| row.len() != column_count) {
+            return Err(PhysicalExecutionError::ColumnShapeMismatch);
+        }
+        Ok(Self::RowStore {
+            rows: PersistentPhysicalVec::from_vec(rows),
+            column_count,
+        })
     }
 }
 
@@ -128,7 +149,7 @@ fn value_heap_bytes(value: &Value) -> usize {
 
 fn native_relation_estimated_heap_bytes(relation: &NativeRelation) -> usize {
     match relation {
-        NativeRelation::RowStore(rows) => {
+        NativeRelation::RowStore { rows, .. } => {
             rows.estimated_heap_bytes()
                 .saturating_add(saturating_usize_sum(rows.iter().map(|row| {
                     row.capacity()

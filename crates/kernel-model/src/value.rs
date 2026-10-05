@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kernel_types::{EntityId, SemanticId};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     Unit,
     Bool(bool),

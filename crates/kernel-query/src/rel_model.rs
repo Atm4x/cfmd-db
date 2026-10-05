@@ -102,7 +102,7 @@ pub(super) fn relation_value_from_rows(rows: Vec<Row>, relation_type: &RelType) 
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AggregateSpec {
     Count {
         result_equivalence: kernel_types::SemanticId,
@@ -113,7 +113,7 @@ pub enum AggregateSpec {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OrderComparison {
     Less,
     LessOrEqual,
@@ -121,13 +121,13 @@ pub enum OrderComparison {
     GreaterOrEqual,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OrderDirection {
     Ascending,
     Descending,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RelExpr {
     Scan(kernel_types::SemanticId),
     FilterEqConst {

@@ -20,7 +20,7 @@ pub use history::{
 pub use query::{OrderDirection, ProtocolQuery, QueryRequest, QueryResponse, SnapshotTarget};
 pub use session::{
     CommitRequest, CommitResponse, HostedRequest, HostedResponse, HostedSession, IdempotencyKey,
-    PROTOCOL_VERSION, ProtocolLimits, RelationMutation,
+    PROTOCOL_VERSION, ProtocolLimits, RelationMutation, SemanticRevision,
 };
 pub use value::{EntityRef, ProtocolValue, Row};
 pub use watch::{

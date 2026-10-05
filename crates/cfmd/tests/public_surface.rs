@@ -4,10 +4,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use cfmd::__private::{IntentJournal, TransactionId};
 use cfmd::{
     CfmdEntity, CfmdSchema, CommitOutcome, Database, DiagnosticCode, EntitySet, ErrorDiagnosticExt,
-    ErrorKind, Id, Object, ObjectPredicate, RuleValueExpr, Schema, SemanticRuleExpr, Transaction,
-    TransactionId,
+    ErrorKind, Id, Object, ObjectPredicate, RuleValueExpr, Schema, SemanticRuleExpr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -202,8 +202,9 @@ struct ParentReader {
 }
 
 #[derive(CfmdSchema)]
-struct ParentReaderSchema {
+struct ParentReaderWriteSchema {
     parents: EntitySet<ParentReader>,
+    children: EntitySet<Child>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -230,6 +231,11 @@ struct Asset {
     #[cfmd(id)]
     pub id: Id<Asset>,
     pub label: String,
+}
+
+#[derive(CfmdSchema)]
+struct OwnerSchema {
+    owners: EntitySet<Owner>,
 }
 
 #[derive(Debug, Clone, PartialEq, CfmdEntity)]
@@ -282,6 +288,22 @@ fn temp_path() -> std::path::PathBuf {
     ))
 }
 
+fn create_typed<S>(path: &std::path::Path) -> cfmd::Result<cfmd::Context<S>>
+where
+    S: cfmd::DatabaseDefinition,
+{
+    Database::builder(path)
+        .create_authoritative::<S>()?
+        .context::<S>()
+}
+
+fn open_typed<S>(path: &std::path::Path) -> cfmd::Result<cfmd::Context<S>>
+where
+    S: CfmdSchema,
+{
+    Database::open(path)?.context::<S>()
+}
+
 #[test]
 fn adaptive_transaction_crud_keeps_database_and_payload_visible() {
     let path = temp_path();
@@ -291,7 +313,7 @@ fn adaptive_transaction_crud_keeps_database_and_payload_visible() {
         .create()
         .expect("create database");
 
-    let mut transaction = Transaction::new();
+    let mut transaction = IntentJournal::new();
     database
         .objects::<Todo>()
         .expect("todos")
@@ -333,7 +355,7 @@ fn history_undo_accumulates_into_the_same_visible_transaction_language() {
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     database
         .objects::<Todo>()
         .expect("todos")
@@ -350,7 +372,7 @@ fn history_undo_accumulates_into_the_same_visible_transaction_language() {
 
     let history = database.history().expect("history");
     let entry = history.latest().expect("latest history");
-    let mut undo = Transaction::new();
+    let mut undo = IntentJournal::new();
     database.undo(&mut undo, entry).expect("append undo");
     let preview = database.preview(&undo).expect("undo preview");
     assert!(preview.effects().changes_lifecycle());
@@ -364,7 +386,7 @@ fn history_undo_accumulates_into_the_same_visible_transaction_language() {
             .is_none()
     );
 
-    let mut redo = Transaction::new();
+    let mut redo = IntentJournal::new();
     database
         .undo_latest(&mut redo)
         .expect("append undo-of-undo");
@@ -391,7 +413,7 @@ fn history_undo_composes_atomically_with_ordinary_crud() {
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     database
         .objects::<Todo>()
         .expect("todos")
@@ -408,7 +430,7 @@ fn history_undo_composes_atomically_with_ordinary_crud() {
 
     let history = database.history().expect("history");
     let entry = history.latest().expect("latest history");
-    let mut transaction = Transaction::new();
+    let mut transaction = IntentJournal::new();
     database.undo(&mut transaction, entry).expect("append undo");
     database
         .objects::<Todo>()
@@ -447,7 +469,7 @@ fn history_undo_composes_atomically_with_ordinary_crud() {
 }
 
 #[test]
-fn typed_context_snapshot_keeps_one_exact_revision_while_context_tracks_head() {
+fn scoped_context_keeps_one_admitted_formation_world_while_database_head_advances() {
     let path = temp_path();
     let schema = Schema::builder().object::<Todo>().build().expect("schema");
     let database = Database::builder(&path)
@@ -455,28 +477,35 @@ fn typed_context_snapshot_keeps_one_exact_revision_while_context_tracks_head() {
         .create()
         .expect("create database");
     let context = database.context::<TodoSchema>().expect("context");
-    let snapshot = context.snapshot().expect("snapshot");
+    let formation = context.formation_revision();
+    let snapshot = context.snapshot().expect("formation snapshot");
 
-    let mut transaction = Transaction::new();
-    context
-        .todos
+    let mut external = IntentJournal::new();
+    database
+        .objects::<Todo>()
+        .expect("live todos")
         .add(
-            &mut transaction,
+            &mut external,
             Todo {
                 id: Id::new(358_099),
-                title: "after-snapshot".to_owned(),
+                title: "after-admission".to_owned(),
                 done: false,
             },
         )
-        .expect("add");
-    context.commit(&transaction).expect("commit");
+        .expect("external add");
+    database.commit(&external).expect("external commit");
 
+    assert_eq!(context.formation_revision(), formation);
+    assert_eq!(
+        context.current_revision().expect("context revision"),
+        formation
+    );
     assert!(
         context
             .todos
             .get(Id::new(358_099))
-            .expect("current read")
-            .is_some()
+            .expect("bounded context read")
+            .is_none()
     );
     assert!(
         snapshot
@@ -485,10 +514,125 @@ fn typed_context_snapshot_keeps_one_exact_revision_while_context_tracks_head() {
             .expect("snapshot read")
             .is_none()
     );
+    assert!(
+        database
+            .context::<TodoSchema>()
+            .expect("new context")
+            .todos
+            .get(Id::new(358_099))
+            .expect("new scope read")
+            .is_some()
+    );
 
     drop(snapshot);
     drop(context);
     drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn scoped_context_owns_basic_exact_intent_without_public_transaction() {
+    let path = temp_path();
+    let schema = Schema::builder().object::<Todo>().build().expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+    let context = database.context::<TodoSchema>().expect("context");
+    let formation = context.formation_revision();
+
+    context
+        .add(
+            |schema| &schema.todos,
+            Todo {
+                id: Id::new(358_100),
+                title: "scoped".to_owned(),
+                done: false,
+            },
+        )
+        .expect("stage scoped add");
+    let preview = context.preview().expect("scoped preview");
+    assert_eq!(preview.source_revision(), formation);
+    assert_ne!(
+        context.current_revision().expect("candidate revision"),
+        formation
+    );
+    context.commit().expect("scoped commit");
+
+    assert!(
+        database
+            .objects::<Todo>()
+            .expect("live todos")
+            .get(Id::new(358_100))
+            .expect("committed read")
+            .is_some()
+    );
+
+    drop(context);
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn scoped_context_read_write_read_write_commit_reopens_with_prefix_observation() {
+    let path = temp_path();
+    let schema = Schema::builder().object::<Todo>().build().expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+    let context = database.context::<TodoSchema>().expect("context");
+
+    context
+        .add(
+            |schema| &schema.todos,
+            Todo {
+                id: Id::new(358_101),
+                title: "candidate".to_owned(),
+                done: false,
+            },
+        )
+        .expect("stage scoped add");
+    assert_eq!(
+        context
+            .todos
+            .require(Id::new(358_101))
+            .expect("read own staged row")
+            .title,
+        "candidate"
+    );
+    context
+        .add(
+            |schema| &schema.todos,
+            Todo {
+                id: Id::new(358_102),
+                title: "after-read".to_owned(),
+                done: true,
+            },
+        )
+        .expect("stage second write after candidate observation");
+    context.commit().expect("prefix-qualified scoped commit");
+
+    drop(context);
+    drop(database);
+    let reopened = Database::open(&path).expect("reopen prefix-qualified scoped database");
+    let stored = reopened
+        .objects::<Todo>()
+        .expect("reopened todos")
+        .require(Id::new(358_101))
+        .expect("reopened staged row");
+    assert_eq!(stored.title, "candidate");
+    assert!(!stored.done);
+    assert!(
+        reopened
+            .objects::<Todo>()
+            .expect("reopened todos")
+            .get(Id::new(358_102))
+            .expect("reopened second row")
+            .is_some()
+    );
+
+    drop(reopened);
     fs::remove_file(path).expect("remove database");
 }
 
@@ -503,12 +647,10 @@ fn snapshot_transaction_refuses_silent_time_transport() {
 
     let context = database.context::<TodoSchema>().expect("context");
     let snapshot = context.snapshot().expect("snapshot");
-    let mut strict = Transaction::from(snapshot);
-    database
-        .objects::<Todo>()
-        .expect("todos")
+    let strict = snapshot.edit().expect("strict snapshot edit");
+    strict
         .add(
-            &mut strict,
+            |schema| &schema.todos,
             Todo {
                 id: Id::new(358_010),
                 title: "strict".to_owned(),
@@ -530,13 +672,9 @@ fn snapshot_transaction_refuses_silent_time_transport() {
         .commit_plan(&advance, TransactionId::new(358_011))
         .expect("advance commit");
 
-    assert!(matches!(
-        database.transaction_readiness(&strict).expect("readiness"),
-        cfmd::TransactionReadiness::SnapshotChanged { .. }
-    ));
     assert_eq!(
-        database
-            .commit(&strict)
+        strict
+            .commit()
             .expect_err("strict snapshot transaction must not move")
             .kind(),
         ErrorKind::StaleRevision
@@ -610,7 +748,7 @@ fn snapshot_bound_transaction_composes_preview_and_commit_without_manual_plan_pl
         .create()
         .expect("create database");
 
-    let mut transaction = Transaction::new()
+    let mut transaction = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(351_001))
         .expect("transaction");
     let todos = database.objects::<Todo>().expect("todo set");
@@ -692,7 +830,7 @@ fn snapshot_bound_transaction_rejects_cross_snapshot_plan_and_auto_merges_indepe
         .expect("seed commit");
     drop(seed_snapshot);
 
-    let mut stale = Transaction::new()
+    let mut stale = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(351_010))
         .expect("stale transaction");
     let stale_todos = database.objects::<Todo>().expect("stale todos");
@@ -707,7 +845,7 @@ fn snapshot_bound_transaction_rejects_cross_snapshot_plan_and_auto_merges_indepe
         )
         .expect("stale insert");
 
-    let mut winner = Transaction::new()
+    let mut winner = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(351_011))
         .expect("winner transaction");
     let winner_todos = database.objects::<Todo>().expect("winner todos");
@@ -725,9 +863,9 @@ fn snapshot_bound_transaction_rejects_cross_snapshot_plan_and_auto_merges_indepe
 
     assert!(matches!(
         database
-            .transaction_readiness(&stale)
+            .intent_readiness(&stale)
             .expect("stale transaction readiness"),
-        cfmd::TransactionReadiness::Rebasable {
+        cfmd::__private::IntentReadiness::Rebasable {
             base_revision,
             current_revision,
             ref intervening_effect_count,
@@ -770,7 +908,7 @@ fn independent_first_object_inserts_share_idempotent_carrier_presence() {
         .create()
         .expect("create database");
 
-    let mut first = Transaction::new()
+    let mut first = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(356_001))
         .expect("first transaction");
     let first_todos = database.objects::<Todo>().expect("first todos");
@@ -786,7 +924,7 @@ fn independent_first_object_inserts_share_idempotent_carrier_presence() {
         .expect("first insert");
     drop(first_todos);
 
-    let mut second = Transaction::new()
+    let mut second = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(356_002))
         .expect("second transaction");
     let second_todos = database.objects::<Todo>().expect("second todos");
@@ -805,9 +943,9 @@ fn independent_first_object_inserts_share_idempotent_carrier_presence() {
     database.commit(&first).expect("commit first");
     assert!(matches!(
         database
-            .transaction_readiness(&second)
+            .intent_readiness(&second)
             .expect("second readiness"),
-        cfmd::TransactionReadiness::Rebasable { .. }
+        cfmd::__private::IntentReadiness::Rebasable { .. }
     ));
     database
         .preview(&second)
@@ -838,7 +976,7 @@ fn independent_first_object_inserts_share_idempotent_carrier_presence() {
     );
     drop(snapshot);
 
-    let mut undo = Transaction::new();
+    let mut undo = IntentJournal::new();
     database.undo_latest(&mut undo).expect("undo merged insert");
     database.commit(&undo).expect("commit merged undo");
     let snapshot = database.snapshot().expect("undo snapshot");
@@ -878,7 +1016,7 @@ fn transaction_rejects_plan_from_a_different_snapshot() {
         .create()
         .expect("create database");
     let formation = database.snapshot().expect("formation snapshot");
-    let mut transaction = Transaction::from(formation)
+    let mut transaction = IntentJournal::from(formation)
         .with_idempotency_key(TransactionId::new(355_010))
         .expect("transaction");
 
@@ -918,7 +1056,7 @@ fn transaction_rejects_plan_from_a_different_snapshot() {
 }
 
 #[test]
-fn transaction_readiness_reports_semantic_coordinate_conflict() {
+fn intent_readiness_reports_semantic_coordinate_conflict() {
     let path = temp_path();
     let schema = Schema::builder().object::<Todo>().build().expect("schema");
     let database = Database::builder(&path)
@@ -926,7 +1064,7 @@ fn transaction_readiness_reports_semantic_coordinate_conflict() {
         .create()
         .expect("create database");
 
-    let mut first = Transaction::new()
+    let mut first = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(355_001))
         .expect("first transaction");
     let first_todos = database.objects::<Todo>().expect("first todos");
@@ -941,7 +1079,7 @@ fn transaction_readiness_reports_semantic_coordinate_conflict() {
         )
         .expect("first insert");
 
-    let mut second = Transaction::new()
+    let mut second = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(355_002))
         .expect("second transaction");
     let second_todos = database.objects::<Todo>().expect("second todos");
@@ -959,9 +1097,9 @@ fn transaction_readiness_reports_semantic_coordinate_conflict() {
     database.commit(&first).expect("commit first");
     assert!(matches!(
         database
-            .transaction_readiness(&second)
+            .intent_readiness(&second)
             .expect("second readiness"),
-        cfmd::TransactionReadiness::Conflict {
+        cfmd::__private::IntentReadiness::Conflict {
             conflicting_coordinates,
             ..
         } if conflicting_coordinates > 0
@@ -999,7 +1137,7 @@ fn database_owned_transaction_control_rejects_foreign_database() {
         .create()
         .expect("second database");
 
-    let mut transaction = Transaction::new()
+    let mut transaction = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(354_001))
         .expect("transaction");
     first
@@ -1266,7 +1404,7 @@ fn derive_many_is_first_class_object_relation() {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep complete public semantic regression scenario together."
 )]
 fn many_count_predicates_preserve_zero_degree_in_exact_candidate_and_watch() {
     let path = temp_path();
@@ -1281,7 +1419,7 @@ fn many_count_predicates_preserve_zero_degree_in_exact_candidate_and_watch() {
         .expect("database");
     seed_object_many(&database);
 
-    let mut add_zero = Transaction::new();
+    let mut add_zero = IntentJournal::new();
     database
         .objects::<Parent>()
         .expect("parents")
@@ -1388,7 +1526,7 @@ fn many_count_predicates_preserve_zero_degree_in_exact_candidate_and_watch() {
             .is_empty()
     );
 
-    let mut attach = Transaction::new();
+    let mut attach = IntentJournal::new();
     zero_parent
         .children
         .attach(&mut attach, Id::new(10))
@@ -1644,37 +1782,35 @@ fn owned_many_enforces_exclusive_owner_and_supports_atomic_move() {
         .commit_plan(&plan, TransactionId::new(343_001))
         .expect("seed");
 
-    let snapshot = database.snapshot().expect("snapshot");
-    let owner1 = snapshot
-        .objects::<Owner>()
-        .expect("owners")
-        .require(Id::new(1))
-        .expect("one");
-    let owner2 = snapshot
-        .objects::<Owner>()
-        .expect("owners")
-        .require(Id::new(2))
-        .expect("two");
+    let conflict = database.context::<OwnerSchema>().expect("conflict context");
+    let conflict_owner2 = conflict.owners.require(Id::new(2)).expect("two");
+    let error = conflict
+        .attach(&conflict_owner2.assets, Id::new(10))
+        .expect_err("scoped OwnedMany must reject a second owner while forming Candidate");
+    assert_eq!(error.kind(), ErrorKind::Cardinality);
+    drop(conflict_owner2);
+    drop(conflict);
 
-    let mut conflict_tx = cfmd::Transaction::new();
-    owner2
-        .assets
-        .attach(&mut conflict_tx, Id::new(10))
-        .expect("proposal");
-    assert!(
-        database.preview(&conflict_tx).is_err(),
-        "OwnedMany must reject a second owner"
+    let move_context = database.context::<OwnerSchema>().expect("move context");
+    let owner1 = move_context.owners.require(Id::new(1)).expect("one");
+    let owner2 = move_context.owners.require(Id::new(2)).expect("two");
+    move_context
+        .move_to(&owner1.assets, Id::new(10), &owner2.assets)
+        .expect("scoped owned move proposal");
+    assert_eq!(
+        move_context
+            .owners
+            .require(Id::new(2))
+            .expect("candidate destination")
+            .assets
+            .count()
+            .expect("candidate destination count"),
+        1
     );
-
-    let mut move_tx = cfmd::Transaction::new();
-    owner1
-        .assets
-        .move_to(&mut move_tx, Id::new(10), &owner2.assets)
-        .expect("move proposal");
+    move_context.commit().expect("scoped owned move");
     drop(owner1);
     drop(owner2);
-    drop(snapshot);
-    database.commit(&move_tx).expect("move");
+    drop(move_context);
 
     let snapshot = database.snapshot().expect("snapshot");
     let owner1 = snapshot
@@ -1776,11 +1912,11 @@ fn many_selection_moves_only_matching_edges_without_materializing_targets() {
         selected.ids().expect("identity projection"),
         vec![Id::new(11)]
     );
-    let mut transaction = cfmd::Transaction::new();
+    let mut transaction = IntentJournal::new();
     selected
         .move_to(&mut transaction, &destination.children)
         .expect("filtered edge move");
-    let mut invalid = cfmd::Transaction::new();
+    let mut invalid = IntentJournal::new();
     assert!(
         source
             .children
@@ -1876,7 +2012,7 @@ fn owned_selection_preview_exposes_orphan_deletion_before_commit() {
         .assets
         .where_(|asset| asset.label().eq("drop".to_owned()))
         .expect("selection");
-    let mut transaction = cfmd::Transaction::new();
+    let mut transaction = IntentJournal::new();
     selection
         .detach_all(&mut transaction)
         .expect("detach proposal");
@@ -2025,7 +2161,7 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     for (id, score) in [(1, 3), (2, 7), (3, 7), (4, 11)] {
         database
             .objects::<Child>()
@@ -2084,7 +2220,7 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
     assert_eq!(ids(watch.initial().to_vec()), vec![2, 3, 4]);
     drop(children);
 
-    let mut update = Transaction::new();
+    let mut update = IntentJournal::new();
     database
         .objects::<Child>()
         .expect("children")
@@ -2109,7 +2245,7 @@ fn object_query_composition_and_ordered_boundaries_stay_gamma_native() {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep complete public semantic regression scenario together."
 )]
 fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() {
     let path = temp_path();
@@ -2122,7 +2258,7 @@ fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() 
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     for (id, left, right) in [(1, 3, 3), (2, 3, 4), (3, 7, 7)] {
         database
             .objects::<ColumnPair>()
@@ -2179,7 +2315,7 @@ fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() 
     let mut watch = query.watch().expect("field equality watch");
     assert_eq!(ids(watch.initial().to_vec()), vec![1, 3]);
 
-    let mut matching = Transaction::new();
+    let mut matching = IntentJournal::new();
     database
         .objects::<ColumnPair>()
         .expect("pairs")
@@ -2200,7 +2336,7 @@ fn field_equality_uses_kernel_filter_eq_columns_for_exact_candidate_and_watch() 
     assert_eq!(ids(event.inserted().to_vec()), vec![4]);
     assert!(event.removed().is_empty());
 
-    let mut nonmatching = Transaction::new();
+    let mut nonmatching = IntentJournal::new();
     database
         .objects::<ColumnPair>()
         .expect("pairs")
@@ -2234,7 +2370,7 @@ fn predicate_or_uses_native_gamma_union_for_exact_candidate_and_watch() {
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     for (id, left, right) in [(1, 3, 3), (2, 3, 4), (3, 7, 7), (4, 8, 9)] {
         database
             .objects::<ColumnPair>()
@@ -2286,7 +2422,7 @@ fn predicate_or_uses_native_gamma_union_for_exact_candidate_and_watch() {
     let mut watch = query.watch().expect("disjunction watch");
     assert_eq!(ids(watch.initial().to_vec()), vec![1, 2, 3]);
 
-    let mut matching = Transaction::new();
+    let mut matching = IntentJournal::new();
     database
         .objects::<ColumnPair>()
         .expect("pairs")
@@ -2304,7 +2440,7 @@ fn predicate_or_uses_native_gamma_union_for_exact_candidate_and_watch() {
     assert_eq!(ids(event.inserted().to_vec()), vec![5]);
     assert!(event.removed().is_empty());
 
-    let mut nonmatching = Transaction::new();
+    let mut nonmatching = IntentJournal::new();
     database
         .objects::<ColumnPair>()
         .expect("pairs")
@@ -2338,7 +2474,7 @@ fn projection_and_group_keys_do_not_stop_at_three_columns() {
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     for (id, a, b, c) in [(1, 10, 20, 30), (2, 10, 20, 30)] {
         database
             .objects::<WideRow>()
@@ -2391,7 +2527,7 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     for (id, score) in [(1, 3), (2, 7), (3, 7), (4, 11)] {
         database
             .objects::<Child>()
@@ -2433,7 +2569,7 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
     initial.sort_unstable();
     assert_eq!(initial, vec![3, 7, 7, 11]);
 
-    let mut duplicate = Transaction::new();
+    let mut duplicate = IntentJournal::new();
     database
         .objects::<Child>()
         .expect("children")
@@ -2459,7 +2595,7 @@ fn projection_preserves_multiplicity_and_distinct_is_explicit_kernel_semantics()
     distinct_initial.sort_unstable();
     assert_eq!(distinct_initial, vec![3, 7, 11]);
 
-    let mut another_duplicate = Transaction::new();
+    let mut another_duplicate = IntentJournal::new();
     database
         .objects::<Child>()
         .expect("children")
@@ -2501,7 +2637,7 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     for (id, bucket, value) in [(1, 1, 1.25), (2, 1, 2.75), (3, 2, 10.0)] {
         database
             .objects::<GroupedMetric>()
@@ -2569,7 +2705,7 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
     future_sums.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(future_sums, vec![(1, 4.5), (2, 10.0)]);
 
-    let mut live_insert = Transaction::new();
+    let mut live_insert = IntentJournal::new();
     database
         .objects::<GroupedMetric>()
         .expect("live metrics")
@@ -2608,7 +2744,7 @@ fn grouped_count_and_exact_sum_use_kernel_group_for_live_and_candidate_worlds() 
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep complete public semantic regression scenario together."
 )]
 fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     let path = temp_path();
@@ -2621,7 +2757,7 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     for (id, bucket, value) in [
         (1, 1, 1.0),
         (2, 1, 3.0),
@@ -2705,7 +2841,7 @@ fn grouped_aggregate_boundaries_preserve_ties_for_exact_candidate_and_watch() {
     candidate_sums.sort_unstable_by_key(|(bucket, _)| *bucket);
     assert_eq!(candidate_sums, vec![(1, 4.0), (2, 4.0), (3, 4.0)]);
 
-    let mut live_insert = Transaction::new();
+    let mut live_insert = IntentJournal::new();
     database
         .objects::<GroupedMetric>()
         .expect("live metrics")
@@ -2837,7 +2973,7 @@ fn ordered_f64_predicates_follow_total_order_hostile_edges() {
         .create()
         .expect("database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     let values = [
         (1, f64::NEG_INFINITY),
         (2, -0.0),
@@ -2912,7 +3048,7 @@ fn ordered_f64_watch_matches_exact_total_order_and_suppresses_empty_revisions() 
         .create()
         .expect("database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     database
         .objects::<OrderedF64>()
         .expect("ordered values")
@@ -2933,7 +3069,7 @@ fn ordered_f64_watch_matches_exact_total_order_and_suppresses_empty_revisions() 
     let mut watch = query.watch().expect("watch");
     assert_eq!(watch.initial()[0].id.raw(), 10);
 
-    let mut nonmatching = Transaction::new();
+    let mut nonmatching = IntentJournal::new();
     database
         .objects::<OrderedF64>()
         .expect("ordered values")
@@ -2948,7 +3084,7 @@ fn ordered_f64_watch_matches_exact_total_order_and_suppresses_empty_revisions() 
     database.commit(&nonmatching).expect("nonmatching commit");
     assert!(watch.try_recv().expect("nonmatching watch read").is_none());
 
-    let mut matching = Transaction::new();
+    let mut matching = IntentJournal::new();
     database
         .objects::<OrderedF64>()
         .expect("ordered values")
@@ -2987,7 +3123,7 @@ fn composite_group_keys_use_kernel_group_for_exact_candidate_and_watch() {
         .create()
         .expect("create database");
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     for (id, bucket, value) in [(1, 1, 10.0), (2, 1, 10.0), (3, 1, 20.0), (4, 2, 10.0)] {
         database
             .objects::<GroupedMetric>()
@@ -3053,7 +3189,7 @@ fn composite_group_keys_use_kernel_group_for_exact_candidate_and_watch() {
     assert_eq!(future_top_sum.len(), 3);
     assert!(future_top_sum.contains(&((2, 10.0), 20.0)));
 
-    let mut tx = Transaction::new();
+    let mut tx = IntentJournal::new();
     database
         .objects::<GroupedMetric>()
         .expect("live metrics")
@@ -3128,7 +3264,7 @@ fn deep_typed_reference_path_lowers_without_nested_matches_or_hidden_io() {
     let passport_id = Id::new(10);
     let person_id = Id::new(100);
     let snapshot = db.snapshot().expect("seed snapshot");
-    let mut tx = Transaction::new();
+    let mut tx = IntentJournal::new();
     snapshot
         .objects::<PathRegion>()
         .expect("regions")
@@ -3209,7 +3345,7 @@ fn same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_in
         .expect("database");
     seed_object_many(&database);
 
-    let mut add_parent = Transaction::new();
+    let mut add_parent = IntentJournal::new();
     database
         .objects::<Parent>()
         .expect("parents")
@@ -3220,7 +3356,7 @@ fn same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_in
         .expect("add empty parent");
     database.commit(&add_parent).expect("parent commit");
 
-    let mut first = Transaction::new()
+    let mut first = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(372_001))
         .expect("first transaction");
     let first_parent = database
@@ -3234,7 +3370,7 @@ fn same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_in
         .expect("first attach");
     drop(first_parent);
 
-    let mut second = Transaction::new()
+    let mut second = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(372_002))
         .expect("second transaction");
     let second_parent = database
@@ -3250,8 +3386,8 @@ fn same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_in
 
     database.commit(&first).expect("first commit");
     assert!(matches!(
-        database.transaction_readiness(&second).expect("readiness"),
-        cfmd::TransactionReadiness::Rebasable { .. }
+        database.intent_readiness(&second).expect("readiness"),
+        cfmd::__private::IntentReadiness::Rebasable { .. }
     ));
     let residual_revision = match database
         .commit(&second)
@@ -3308,7 +3444,7 @@ fn database_owned_object_field_rules_reject_invalid_candidates_and_survive_reope
         .create()
         .expect("create database");
 
-    let mut valid = Transaction::new();
+    let mut valid = IntentJournal::new();
     database
         .objects::<RuleUser>()
         .expect("users")
@@ -3324,7 +3460,7 @@ fn database_owned_object_field_rules_reject_invalid_candidates_and_survive_reope
         .expect("valid intent");
     database.commit(&valid).expect("valid commit");
 
-    let mut invalid = Transaction::new();
+    let mut invalid = IntentJournal::new();
     database
         .objects::<RuleUser>()
         .expect("users")
@@ -3347,7 +3483,7 @@ fn database_owned_object_field_rules_reject_invalid_candidates_and_survive_reope
     drop(invalid);
     drop(database);
     let reopened = Database::builder(&path).open().expect("reopen database");
-    let mut invalid_after_reopen = Transaction::new();
+    let mut invalid_after_reopen = IntentJournal::new();
     reopened
         .objects::<RuleUser>()
         .expect("users")
@@ -3383,7 +3519,7 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
         .expect("create database");
     let id = Id::new(446_001);
 
-    let mut create = Transaction::new();
+    let mut create = IntentJournal::new();
     database
         .objects::<RuleUser>()
         .expect("users")
@@ -3405,7 +3541,7 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
         max: None,
     };
     let users = database.objects::<RuleUser>().expect("users");
-    let mut invalid = Transaction::new();
+    let mut invalid = IntentJournal::new();
     users
         .set(&mut invalid, id, RuleUserFields::age, 17)
         .expect("patch intent");
@@ -3417,7 +3553,7 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
         .expect_err("future-world requirement must reject");
     assert_eq!(error.kind(), ErrorKind::TransactionConflict);
 
-    let mut valid = Transaction::new();
+    let mut valid = IntentJournal::new();
     users
         .set(&mut valid, id, RuleUserFields::age, 20)
         .expect("valid patch intent");
@@ -3446,7 +3582,7 @@ fn transaction_require_is_evaluated_on_the_exact_future_candidate() {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete transaction identity scenario together."
+    reason = "Keep complete public semantic regression scenario together."
 )]
 fn external_transaction_id_retains_canonical_requirement_identity() {
     let path = temp_path();
@@ -3460,7 +3596,7 @@ fn external_transaction_id_retains_canonical_requirement_identity() {
         .expect("create database");
     let entity = Id::new(456_001);
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     database
         .objects::<RuleUser>()
         .expect("users")
@@ -3489,7 +3625,7 @@ fn external_transaction_id_retains_canonical_requirement_identity() {
     };
     let users = database.objects::<RuleUser>().expect("users");
 
-    let mut first = Transaction::new()
+    let mut first = IntentJournal::new()
         .with_idempotency_key(transaction_id)
         .expect("external transaction");
     assert_eq!(first.origin_revision(), None);
@@ -3506,7 +3642,7 @@ fn external_transaction_id_retains_canonical_requirement_identity() {
         .expect("first requirement");
     assert_eq!(first.id(), Some(transaction_id));
 
-    let mut same = Transaction::new()
+    let mut same = IntentJournal::new()
         .with_idempotency_key(transaction_id)
         .expect("same external transaction");
     users
@@ -3520,7 +3656,7 @@ fn external_transaction_id_retains_canonical_requirement_identity() {
     same.require::<RuleUser>(entity, adult)
         .expect("same requirement");
 
-    let mut different = Transaction::new()
+    let mut different = IntentJournal::new()
         .with_idempotency_key(transaction_id)
         .expect("conflicting external transaction");
     users
@@ -3573,7 +3709,7 @@ fn generated_transaction_key_does_not_rotate_when_requirements_change() {
         .expect("create database");
     let entity = Id::new(457_001);
 
-    let mut seed = Transaction::new();
+    let mut seed = IntentJournal::new();
     database
         .objects::<RuleUser>()
         .expect("users")
@@ -3590,7 +3726,7 @@ fn generated_transaction_key_does_not_rotate_when_requirements_change() {
     database.commit(&seed).expect("seed commit");
 
     let users = database.objects::<RuleUser>().expect("users");
-    let mut transaction = Transaction::new();
+    let mut transaction = IntentJournal::new();
     users
         .set(
             &mut transaction,
@@ -3640,6 +3776,65 @@ fn generated_transaction_key_does_not_rotate_when_requirements_change() {
 }
 
 #[test]
+fn transaction_user_read_is_causal_but_mutation_lowering_is_not() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+    let id = Id::new(486_701);
+
+    let mut create = IntentJournal::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut create,
+            RuleUser {
+                id,
+                name: "base".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("create intent");
+    database.commit(&create).expect("create commit");
+
+    let users = database.objects::<RuleUser>().expect("users");
+
+    let mut retroactive = IntentJournal::new();
+    users
+        .set(&mut retroactive, id, RuleUserFields::age, 17)
+        .expect("age intent");
+
+    let mut observer = IntentJournal::new();
+    users
+        .set(&mut observer, id, RuleUserFields::name, "seen".to_owned())
+        .expect("name intent");
+    let adults = observer
+        .objects::<RuleUser>()
+        .expect("transaction users")
+        .where_(|user| user.age().greater_than_or_equal(18))
+        .count()
+        .expect("transaction-bound count");
+    assert_eq!(adults, 1);
+    database.commit(&observer).expect("observer commit");
+
+    let error = database
+        .commit(&retroactive)
+        .expect_err("retroactive effect must preserve later application-visible observation");
+    assert_eq!(error.kind(), ErrorKind::TransactionConflict);
+
+    drop(users);
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
 fn transaction_require_is_rechecked_on_the_rebased_candidate() {
     let path = temp_path();
     let schema = Schema::builder()
@@ -3652,7 +3847,7 @@ fn transaction_require_is_rechecked_on_the_rebased_candidate() {
         .expect("create database");
     let id = Id::new(447_001);
 
-    let mut create = Transaction::new();
+    let mut create = IntentJournal::new();
     database
         .objects::<RuleUser>()
         .expect("users")
@@ -3675,7 +3870,7 @@ fn transaction_require_is_rechecked_on_the_rebased_candidate() {
     };
     let users = database.objects::<RuleUser>().expect("users");
 
-    let mut survives = Transaction::new();
+    let mut survives = IntentJournal::new();
     users
         .set(
             &mut survives,
@@ -3687,7 +3882,7 @@ fn transaction_require_is_rechecked_on_the_rebased_candidate() {
     survives
         .require::<RuleUser>(id, adult.clone())
         .expect("adult requirement");
-    let mut raise_age = Transaction::new();
+    let mut raise_age = IntentJournal::new();
     users
         .set(&mut raise_age, id, RuleUserFields::age, 21)
         .expect("raise age");
@@ -3704,14 +3899,14 @@ fn transaction_require_is_rechecked_on_the_rebased_candidate() {
     assert_eq!(stored.name, "survives");
 
     let fresh = database.objects::<RuleUser>().expect("users after rebase");
-    let mut rejected = Transaction::new();
+    let mut rejected = IntentJournal::new();
     fresh
         .set(&mut rejected, id, RuleUserFields::name, "reject".to_owned())
         .expect("name intent");
     rejected
         .require::<RuleUser>(id, adult)
         .expect("adult requirement");
-    let mut lower_age = Transaction::new();
+    let mut lower_age = IntentJournal::new();
     fresh
         .set(&mut lower_age, id, RuleUserFields::age, 17)
         .expect("lower age");
@@ -3751,7 +3946,7 @@ fn transaction_require_uses_current_read_authority_at_preview_and_commit() {
         .create()
         .expect("create database");
     let id = Id::new(447_010);
-    let mut create = Transaction::new();
+    let mut create = IntentJournal::new();
     database
         .objects::<RuleUser>()
         .expect("users")
@@ -3777,7 +3972,7 @@ fn transaction_require_uses_current_read_authority_at_preview_and_commit() {
         PermissionSet::from([Permission::Write, Permission::Read]),
     );
     let restricted = database.session(session.clone());
-    let mut tx = Transaction::new();
+    let mut tx = IntentJournal::new();
     restricted
         .objects::<RuleUser>()
         .expect("restricted users")
@@ -3820,7 +4015,7 @@ fn transaction_require_uses_current_read_authority_at_preview_and_commit() {
 #[test]
 fn typed_schema_root_binds_live_entity_sets_without_global_registration() {
     let path = temp_path();
-    let db = AppSchema::database(&path).create().expect("typed create");
+    let db = create_typed::<AppSchema>(&path).expect("typed create");
 
     assert_eq!(db.users.count().expect("empty users"), 0);
     assert_eq!(db.tasks.count().expect("empty tasks"), 0);
@@ -3836,35 +4031,34 @@ fn typed_schema_root_binds_live_entity_sets_without_global_registration() {
         reviewer: None,
     };
 
-    let mut tx = Transaction::new();
-    db.users.add(&mut tx, user.clone()).expect("add user");
-    db.tasks.add(&mut tx, task.clone()).expect("add task");
-    db.commit(&tx).expect("commit typed schema transaction");
+    db.add(|schema| &schema.users, user.clone())
+        .expect("add user");
+    db.add(|schema| &schema.tasks, task.clone())
+        .expect("add task");
+    db.commit().expect("commit typed schema context");
 
     assert_eq!(db.users.require(user.id).expect("read user"), user);
     assert_eq!(db.tasks.require(task.id).expect("read task"), task);
-    drop(tx);
     drop(db);
 
-    let reopened = AppSchema::database(&path).open().expect("typed reopen");
+    let reopened = open_typed::<AppSchema>(&path).expect("typed reopen");
     assert_eq!(reopened.users.count().expect("reopened users"), 1);
     assert_eq!(reopened.tasks.count().expect("reopened tasks"), 1);
     drop(reopened);
 
-    let mismatch = UserOnlySchema::database(&path)
-        .open()
-        .expect_err("typed open must reject a different persisted schema");
-    assert_eq!(mismatch.kind(), ErrorKind::InvalidSchema);
+    let subset = open_typed::<UserOnlySchema>(&path).expect(
+        "consumer Context may bind an explicit subset of the authoritative database schema",
+    );
+    assert_eq!(subset.users.count().expect("subset users"), 1);
+    drop(subset);
 
     let broken_path = temp_path();
-    let broken = BrokenTaskSchema::database(&broken_path)
-        .create()
+    let broken = create_typed::<BrokenTaskSchema>(&broken_path)
         .expect_err("missing referenced entity must fail closed");
     assert_eq!(broken.kind(), ErrorKind::InvalidSchema);
 
     let isolated_path = temp_path();
-    let isolated = UserOnlySchema::database(&isolated_path)
-        .create()
+    let isolated = create_typed::<UserOnlySchema>(&isolated_path)
         .expect("same process may host a different explicit schema");
     assert_eq!(isolated.users.count().expect("isolated users"), 0);
 
@@ -3877,9 +4071,7 @@ fn typed_schema_root_binds_live_entity_sets_without_global_registration() {
 #[test]
 fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
     let path = temp_path();
-    let db = HostileAccountSchema::database(&path)
-        .create()
-        .expect("authoritative account schema");
+    let db = create_typed::<HostileAccountSchema>(&path).expect("authoritative account schema");
 
     let account = HostileAccount {
         id: Id::new(378_001),
@@ -3887,22 +4079,20 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         passport_secret: "SECRET".to_owned(),
         doctor_note: "editable".to_owned(),
     };
-    let mut tx = Transaction::new();
-    db.accounts
-        .add(&mut tx, account.clone())
+    db.add(|schema| &schema.accounts, account.clone())
         .expect("authoritative insert");
-    db.commit(&tx).expect("authoritative commit");
+    db.commit().expect("authoritative commit");
+    drop(db);
+    let database = Database::open(&path).expect("reopen authoritative account database");
 
     // Raw object binding remains exact-shape by design. Partial contracts enter only through a
     // typed Context so low-level/tooling code cannot accidentally change semantics.
-    let error = db
-        .raw()
+    let error = database
         .objects::<HostileReaderAccount>()
         .expect_err("raw object binding remains exact");
     assert_eq!(error.kind(), ErrorKind::TypeMismatch);
 
-    let ctx = db
-        .raw()
+    let ctx = database
         .context::<HostileReaderSchema>()
         .expect("partial context binds by semantic field identity");
     let visible = ctx.accounts.all().expect("projected read");
@@ -3916,7 +4106,7 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
     );
 
     // A truncated Rust value is never interpreted as a replacement persisted row.
-    let mut partial_tx = Transaction::new();
+    let mut partial_tx = IntentJournal::new();
     let error = ctx
         .accounts
         .add(
@@ -3941,18 +4131,19 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
         .expect_err("partial full-row rewrite must fail closed");
     assert_eq!(error.kind(), ErrorKind::InvalidPlan);
 
-    ctx.accounts
-        .set(
-            &mut partial_tx,
-            Id::new(378_001),
-            HostileReaderAccountFields::doctor_note,
-            "changed-by-reader".to_owned(),
-        )
-        .expect("semantic scalar patch");
-    ctx.commit(&partial_tx)
-        .expect("commit partial scalar patch");
+    ctx.set(
+        |schema| &schema.accounts,
+        Id::new(378_001),
+        HostileReaderAccountFields::doctor_note,
+        "changed-by-reader".to_owned(),
+    )
+    .expect("semantic scalar patch");
+    ctx.commit().expect("commit partial scalar patch");
 
-    let stored = db
+    let authoritative = database
+        .context::<HostileAccountSchema>()
+        .expect("fresh authoritative context");
+    let stored = authoritative
         .accounts
         .require(account.id)
         .expect("authoritative reread");
@@ -3961,77 +4152,86 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
 
     // The reader descriptor deliberately does not repeat the authoritative field rule. The full
     // persisted candidate still owns validation and rejects a patch that violates it.
-    let mut invalid_tx = Transaction::new();
-    ctx.accounts
+    let invalid_ctx = database
+        .context::<HostileReaderSchema>()
+        .expect("fresh reader context");
+    invalid_ctx
         .set(
-            &mut invalid_tx,
+            |schema| &schema.accounts,
             Id::new(378_001),
             HostileReaderAccountFields::doctor_note,
             "x".repeat(64),
         )
-        .expect("reader can form a patch without knowing the hidden authoritative rule");
-    let error = ctx
-        .commit(&invalid_tx)
-        .expect_err("persisted semantic rules must reject the invalid full candidate");
-    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
-    let stored = db
+        .expect_err("persisted semantic rules reject invalid Candidate formation");
+    let stored = authoritative
         .accounts
         .require(account.id)
         .expect("reread after rejected patch");
     assert_eq!(stored.passport_secret, "SECRET");
     assert_eq!(stored.doctor_note, "changed-by-reader");
 
-    drop(invalid_tx);
+    drop(invalid_ctx);
     drop(partial_tx);
-    drop(tx);
     drop(ctx);
-    drop(db);
+    drop(authoritative);
+    drop(database);
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&path);
 }
 
 #[test]
-#[allow(
-    clippy::similar_names,
-    reason = "Names distinguish related before and after states."
-)]
 fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema() {
+    use cfmd::{Permission, PermissionSet, PrincipalId, Session};
+
     let path = temp_path();
-    let db = RenamedAccountSchema::database(&path)
-        .create()
-        .expect("authoritative renamed schema");
+    let db = create_typed::<RenamedAccountSchema>(&path).expect("authoritative renamed schema");
 
     let account = RenamedAccount {
         id: Id::new(379_001),
         name: "rename-safe".to_owned(),
         medical_note: "old-visible".to_owned(),
     };
-    let mut create = Transaction::new();
-    db.accounts
-        .add(&mut create, account.clone())
+    db.add(|schema| &schema.accounts, account.clone())
         .expect("authoritative insert");
-    db.commit(&create).expect("authoritative commit");
-    drop(create);
+    db.commit().expect("authoritative commit");
     drop(db);
 
     // The authoritative schema has only `medical_note`; compatibility belongs to the client.
     let reopened = Database::open(&path).expect("raw reopen without Rust schema authority");
+    let schema = reopened
+        .snapshot()
+        .expect("schema snapshot")
+        .schema()
+        .expect("schema metadata");
+    let relation = RenamedAccount::relation_id();
+    let medical_note = schema
+        .relation(relation)
+        .expect("renamed account relation")
+        .column_ids()[2];
     let old = reopened
+        .session(Session::new(
+            PrincipalId::new(503_100),
+            PermissionSet::from([
+                Permission::Read,
+                Permission::WriteField {
+                    relation,
+                    field: medical_note,
+                },
+            ]),
+        ))
         .context::<LegacyRenameSchema>()
-        .expect("legacy local field explicitly binds to the current persisted coordinate");
+        .expect("legacy local field explicitly binds to the authorized persisted coordinate");
     let legacy = old.accounts.require(Id::new(379_001)).expect("legacy read");
     assert_eq!(legacy.doctor_note, "old-visible");
 
-    let mut patch = Transaction::new();
-    old.accounts
-        .set(
-            &mut patch,
-            Id::new(379_001),
-            LegacyRenameAccountFields::doctor_note,
-            "changed-through-old-name".to_owned(),
-        )
-        .expect("legacy patch resolves through the explicit client-side bind");
-    old.commit(&patch).expect("legacy patch commit");
+    old.set(
+        |schema| &schema.accounts,
+        Id::new(379_001),
+        LegacyRenameAccountFields::doctor_note,
+        "changed-through-old-name".to_owned(),
+    )
+    .expect("legacy patch resolves through the explicit client-side bind");
+    old.commit().expect("legacy patch commit");
 
     let current = reopened
         .objects::<RenamedAccount>()
@@ -4040,17 +4240,16 @@ fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema()
         .expect("authoritative reread");
     assert_eq!(current.medical_note, "changed-through-old-name");
 
-    let mut invalid = Transaction::new();
-    old.accounts
+    let invalid = reopened
+        .context::<LegacyRenameSchema>()
+        .expect("fresh legacy context");
+    let error = invalid
         .set(
-            &mut invalid,
+            |schema| &schema.accounts,
             Id::new(379_001),
             LegacyRenameAccountFields::doctor_note,
             "x".repeat(64),
         )
-        .expect("legacy client can form patch without copying authoritative rules");
-    let error = old
-        .commit(&invalid)
         .expect_err("persisted authoritative rule still governs the bound field");
     assert_eq!(error.kind(), ErrorKind::InvariantViolation);
 
@@ -4063,8 +4262,7 @@ fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema()
 #[test]
 fn client_bind_can_keep_old_reference_name_without_authoritative_alias() {
     let path = temp_path();
-    let db = RenamedReferenceSchema::database(&path)
-        .create()
+    let db = create_typed::<RenamedReferenceSchema>(&path)
         .expect("current authoritative reference schema");
     let doctor = RenameDoctor {
         id: Id::new(379_101),
@@ -4074,13 +4272,11 @@ fn client_bind_can_keep_old_reference_name_without_authoritative_alias() {
         id: Id::new(379_102),
         primary_doctor: cfmd::Ref::new(doctor.id),
     };
-    let mut tx = Transaction::new();
-    db.doctors
-        .add(&mut tx, doctor.clone())
+    db.add(|schema| &schema.doctors, doctor.clone())
         .expect("doctor insert");
-    db.patients.add(&mut tx, patient).expect("patient insert");
-    db.commit(&tx).expect("reference commit");
-    drop(tx);
+    db.add(|schema| &schema.patients, patient)
+        .expect("patient insert");
+    db.commit().expect("reference commit");
     drop(db);
 
     let reopened = Database::open(&path).expect("reopen");
@@ -4103,15 +4299,9 @@ fn client_bind_can_keep_old_reference_name_without_authoritative_alias() {
 }
 
 #[test]
-#[allow(
-    clippy::similar_names,
-    reason = "Names distinguish related before and after states."
-)]
 fn partial_context_patches_required_and_optional_references_without_hidden_row_rewrite() {
     let path = temp_path();
-    let db = AppSchema::database(&path)
-        .create()
-        .expect("authoritative app schema");
+    let db = create_typed::<AppSchema>(&path).expect("authoritative app schema");
     let alice = User {
         id: Id::new(438_001),
         name: "Alice".into(),
@@ -4120,46 +4310,51 @@ fn partial_context_patches_required_and_optional_references_without_hidden_row_r
         id: Id::new(438_002),
         name: "Bob".into(),
     };
-    let mut seed = Transaction::new();
-    db.users.add(&mut seed, alice.clone()).expect("alice");
-    db.users.add(&mut seed, bob.clone()).expect("bob");
-    db.tasks
-        .add(
-            &mut seed,
-            Task {
-                id: Id::new(438_010),
-                title: "hidden-title".into(),
-                owner: cfmd::Ref::new(alice.id),
-                reviewer: None,
-            },
-        )
-        .expect("task");
-    db.commit(&seed).expect("seed commit");
+    db.add(|schema| &schema.users, alice.clone())
+        .expect("alice");
+    db.add(|schema| &schema.users, bob.clone()).expect("bob");
+    db.add(
+        |schema| &schema.tasks,
+        Task {
+            id: Id::new(438_010),
+            title: "hidden-title".into(),
+            owner: cfmd::Ref::new(alice.id),
+            reviewer: None,
+        },
+    )
+    .expect("task");
+    db.commit().expect("seed commit");
+    drop(db);
+    let database = Database::open(&path).expect("reopen app database");
 
-    let ctx = db
-        .raw()
+    let ctx = database
         .context::<PartialTaskSchema>()
         .expect("partial task context");
-    let mut patch = Transaction::new();
-    ctx.tasks
-        .set(
-            &mut patch,
-            Id::new(438_010),
-            PartialTaskFields::owner,
-            cfmd::Ref::new(bob.id),
-        )
-        .expect("required reference patch");
-    ctx.tasks
-        .set(
-            &mut patch,
-            Id::new(438_010),
-            PartialTaskFields::reviewer,
-            Some(cfmd::Ref::new(alice.id)),
-        )
-        .expect("optional reference patch");
-    ctx.commit(&patch).expect("reference patch commit");
+    ctx.set(
+        |schema| &schema.tasks,
+        Id::new(438_010),
+        PartialTaskFields::owner,
+        cfmd::Ref::new(bob.id),
+    )
+    .expect("required scoped reference patch");
+    let candidate = ctx
+        .tasks
+        .require(Id::new(438_010))
+        .expect("candidate reference reread");
+    assert_eq!(candidate.owner.id(), bob.id);
+    ctx.set(
+        |schema| &schema.tasks,
+        Id::new(438_010),
+        PartialTaskFields::reviewer,
+        Some(cfmd::Ref::new(alice.id)),
+    )
+    .expect("optional scoped reference patch after candidate observation");
+    ctx.commit().expect("scoped reference patch commit");
 
-    let stored = db
+    let authoritative = database
+        .context::<AppSchema>()
+        .expect("fresh authoritative context");
+    let stored = authoritative
         .tasks
         .require(Id::new(438_010))
         .expect("authoritative reread");
@@ -4168,7 +4363,7 @@ fn partial_context_patches_required_and_optional_references_without_hidden_row_r
     assert_eq!(stored.reviewer.as_ref().map(cfmd::Ref::id), Some(alice.id));
 
     drop(ctx);
-    drop(db);
+    drop(database);
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&path);
 }
@@ -4188,21 +4383,39 @@ fn partial_context_many_mutation_preserves_hidden_owner_fields() {
     seed_object_many(&database);
 
     let ctx = database
-        .context::<ParentReaderSchema>()
+        .context::<ParentReaderWriteSchema>()
         .expect("partial parent context");
     let parent = ctx.parents.require(Id::new(1)).expect("partial owner");
     assert_eq!(parent.children.count().expect("initial count"), 2);
-    let mut tx = Transaction::new();
-    parent
-        .children
-        .attach(&mut tx, Id::new(12))
-        .expect("attach existing child");
-    parent
-        .children
-        .detach(&mut tx, Id::new(10))
-        .expect("detach child");
-    ctx.commit(&tx).expect("relationship mutation commit");
+    ctx.add(
+        |schema| &schema.children,
+        Child {
+            id: Id::new(13),
+            score: 130,
+        },
+    )
+    .expect("stage child before relationship mutation");
+    ctx.attach(&parent.children, Id::new(13))
+        .expect("scoped attach staged child");
+    assert_eq!(
+        ctx.parents
+            .require(Id::new(1))
+            .expect("candidate owner")
+            .children
+            .count()
+            .expect("candidate relationship count"),
+        3
+    );
+    // `parent.children` was materialized before the first stage. Scoped mutation must rebind its
+    // semantic owner identity to the current Candidate rather than read the stale snapshot.
+    ctx.detach(&parent.children, Id::new(10))
+        .expect("scoped detach from current Candidate");
+    ctx.commit().expect("scoped relationship mutation commit");
 
+    drop(parent);
+    drop(ctx);
+    drop(database);
+    let database = Database::open(&path).expect("reopen relationship mutation database");
     let snapshot = database.snapshot().expect("snapshot");
     let authoritative = snapshot
         .objects::<Parent>()
@@ -4218,25 +4431,18 @@ fn partial_context_many_mutation_preserves_hidden_owner_fields() {
         .map(|child| child.id.raw())
         .collect::<Vec<_>>();
     ids.sort_unstable();
-    assert_eq!(ids, vec![11, 12]);
+    assert_eq!(ids, vec![11, 13]);
 
     drop(snapshot);
-    drop(ctx);
     drop(database);
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&path);
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
-)]
 fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field() {
     let path = temp_path();
-    let db = AppSchema::database(&path)
-        .create()
-        .expect("authoritative app schema");
+    let seed = create_typed::<AppSchema>(&path).expect("authoritative app schema");
     let alice = User {
         id: Id::new(438_101),
         name: "Alice".into(),
@@ -4245,95 +4451,82 @@ fn context_field_coordinates_rebase_independent_fields_and_conflict_same_field()
         id: Id::new(438_102),
         name: "Bob".into(),
     };
-    let mut seed = Transaction::new();
-    db.users.add(&mut seed, alice.clone()).expect("alice");
-    db.users.add(&mut seed, bob.clone()).expect("bob");
-    db.tasks
-        .add(
-            &mut seed,
-            Task {
-                id: Id::new(438_110),
-                title: "base".into(),
-                owner: cfmd::Ref::new(alice.id),
-                reviewer: None,
-            },
-        )
-        .expect("task");
-    db.commit(&seed).expect("seed commit");
+    seed.add(|schema| &schema.users, alice.clone())
+        .expect("alice");
+    seed.add(|schema| &schema.users, bob.clone()).expect("bob");
+    seed.add(
+        |schema| &schema.tasks,
+        Task {
+            id: Id::new(438_110),
+            title: "base".into(),
+            owner: cfmd::Ref::new(alice.id),
+            reviewer: None,
+        },
+    )
+    .expect("task");
+    seed.commit().expect("seed commit");
+    drop(seed);
 
-    let partial = db
-        .raw()
+    let database = Database::open(&path).expect("reopen field-coordinate database");
+    let title = database.context::<AppSchema>().expect("title context");
+    let owner = database
         .context::<PartialTaskSchema>()
-        .expect("partial task context");
-    let mut title_tx = Transaction::new();
-    db.tasks
+        .expect("owner partial context");
+    title
         .set(
-            &mut title_tx,
+            |schema| &schema.tasks,
             Id::new(438_110),
             TaskFields::title,
             "title-a".to_string(),
         )
         .expect("title patch");
-    let mut owner_tx = Transaction::new();
-    partial
-        .tasks
+    owner
         .set(
-            &mut owner_tx,
+            |schema| &schema.tasks,
             Id::new(438_110),
             PartialTaskFields::owner,
             cfmd::Ref::new(bob.id),
         )
         .expect("owner patch");
 
-    db.commit(&title_tx)
-        .expect("first independent field commit");
-    partial
-        .commit(&owner_tx)
-        .expect("stale independent field rebase");
-    let stored = db.tasks.require(Id::new(438_110)).expect("reread");
+    title.commit().expect("first independent field commit");
+    owner.commit().expect("stale independent field rebase");
+
+    let check = database.context::<AppSchema>().expect("fresh check");
+    let stored = check.tasks.require(Id::new(438_110)).expect("reread");
     assert_eq!(stored.title, "title-a");
     assert_eq!(stored.owner.id(), bob.id);
 
-    let mut left = Transaction::new();
-    db.tasks
+    let left = database.context::<AppSchema>().expect("left context");
+    let right = database.context::<AppSchema>().expect("right context");
+    left.set(
+        |schema| &schema.tasks,
+        Id::new(438_110),
+        TaskFields::title,
+        "left".to_string(),
+    )
+    .expect("left title");
+    right
         .set(
-            &mut left,
-            Id::new(438_110),
-            TaskFields::title,
-            "left".to_string(),
-        )
-        .expect("left title");
-    let mut right = Transaction::new();
-    db.tasks
-        .set(
-            &mut right,
+            |schema| &schema.tasks,
             Id::new(438_110),
             TaskFields::title,
             "right".to_string(),
         )
         .expect("right title");
-    db.commit(&left).expect("left commit");
-    let conflict = db
-        .commit(&right)
+    left.commit().expect("left commit");
+    let conflict = right
+        .commit()
         .expect_err("same semantic field must conflict");
     assert_eq!(conflict.kind(), ErrorKind::TransactionConflict);
 
-    let retry = partial
-        .commit(&owner_tx)
-        .expect("committed field intent retry");
-    assert!(matches!(
-        retry,
-        cfmd::CommitOutcome::AlreadyCommitted { .. }
-    ));
-
     drop(stored);
-    drop(seed);
-    drop(title_tx);
-    drop(owner_tx);
+    drop(check);
     drop(left);
     drop(right);
-    drop(partial);
-    drop(db);
+    drop(owner);
+    drop(title);
+    drop(database);
     let reopened = Database::open(&path).expect("reopen");
     let ctx = reopened
         .context::<AppSchema>()
@@ -4364,41 +4557,47 @@ fn relationship_authorization_preserves_semantic_actions() {
     seed_object_many(&database);
 
     let relationship = Parent::many_fields()[0].relation();
-    let mover = database.session(Session::new(
+    let session = Session::new(
         PrincipalId::new(440_001),
         PermissionSet::from([Permission::Read, Permission::MoveRelationship(relationship)]),
-    ));
-    let parents = mover.objects::<Parent>().expect("parents");
-    let source = parents.require(Id::new(1)).expect("source parent");
-    let destination = parents.require(Id::new(2)).expect("destination parent");
-
-    let mut move_tx = Transaction::new()
-        .with_idempotency_key(TransactionId::new(440_001))
-        .expect("move transaction");
-    source
-        .children
-        .move_to(&mut move_tx, Id::new(10), &destination.children)
+    );
+    let mover = database
+        .session(session.clone())
+        .context::<ParentReaderWriteSchema>()
+        .expect("move-authorized scoped Context");
+    let source = mover.parents.require(Id::new(1)).expect("source parent");
+    let destination = mover
+        .parents
+        .require(Id::new(2))
+        .expect("destination parent");
+    mover
+        .move_to(&source.children, Id::new(10), &destination.children)
         .expect("semantic move planning");
-    mover.commit(&move_tx).expect("move-only grant commit");
+    mover.commit().expect("move-only grant commit");
 
-    let mut attach_tx = Transaction::new()
-        .with_idempotency_key(TransactionId::new(440_002))
-        .expect("attach transaction");
-    destination
-        .children
-        .attach(&mut attach_tx, Id::new(11))
+    let attach = database
+        .session(session)
+        .context::<ParentReaderWriteSchema>()
+        .expect("fresh restricted Context");
+    let destination = attach
+        .parents
+        .require(Id::new(2))
+        .expect("destination parent");
+    attach
+        .attach(&destination.children, Id::new(11))
         .expect("attach planning remains structurally valid");
     assert_eq!(
-        mover
-            .commit(&attach_tx)
+        attach
+            .commit()
             .expect_err("move grant must not authorize relationship attach")
             .kind(),
         ErrorKind::PermissionDenied
     );
 
-    drop(parents);
     drop(source);
     drop(destination);
+    drop(mover);
+    drop(attach);
     drop(database);
     fs::remove_file(path).expect("remove relationship authorization db");
 }
@@ -4449,7 +4648,7 @@ fn owned_detach_cannot_bypass_object_delete_authority() {
         .expect("owners")
         .require(Id::new(1))
         .expect("owner");
-    let mut tx = Transaction::new()
+    let mut tx = IntentJournal::new()
         .with_idempotency_key(TransactionId::new(440_011))
         .expect("detach transaction");
     owner
@@ -4478,4 +4677,340 @@ fn owned_detach_cannot_bypass_object_delete_authority() {
     drop(owner);
     drop(database);
     fs::remove_file(path).expect("remove owned authorization db");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep complete public semantic regression scenario together."
+)]
+fn transaction_reference_and_deep_path_reads_are_exact_causal_observations() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<PathRegion>()
+        .object::<PathPassport>()
+        .object::<PathPerson>()
+        .build()
+        .expect("path schema");
+    let database = Database::create(&path, schema).expect("create path database");
+
+    let region_id = Id::new(495_001);
+    let passport_id = Id::new(495_010);
+    let person_id = Id::new(495_100);
+    let mut seed = IntentJournal::new();
+    database
+        .objects::<PathRegion>()
+        .expect("regions")
+        .add(
+            &mut seed,
+            PathRegion {
+                id: region_id,
+                code: "RU".to_owned(),
+            },
+        )
+        .expect("region");
+    database
+        .objects::<PathPassport>()
+        .expect("passports")
+        .add(
+            &mut seed,
+            PathPassport {
+                id: passport_id,
+                number: "42".to_owned(),
+                region: cfmd::Ref::new(region_id),
+            },
+        )
+        .expect("passport");
+    database
+        .objects::<PathPerson>()
+        .expect("people")
+        .add(
+            &mut seed,
+            PathPerson {
+                id: person_id,
+                name: "Artem".to_owned(),
+                passport: cfmd::Ref::new(passport_id),
+            },
+        )
+        .expect("person");
+    database.commit(&seed).expect("seed commit");
+
+    let mut retroactive_ref = IntentJournal::new();
+    database
+        .objects::<PathRegion>()
+        .expect("regions")
+        .set(
+            &mut retroactive_ref,
+            region_id,
+            PathRegionFields::code,
+            "NL".to_owned(),
+        )
+        .expect("retroactive region change");
+
+    let mut ref_observer = IntentJournal::new();
+    database
+        .objects::<PathPerson>()
+        .expect("people")
+        .set(
+            &mut ref_observer,
+            person_id,
+            PathPersonFields::name,
+            "RefSeen".to_owned(),
+        )
+        .expect("observer binding write");
+    let person = ref_observer
+        .objects::<PathPerson>()
+        .expect("transaction people")
+        .require(person_id)
+        .expect("transaction person");
+    let passport = person.passport.load().expect("explicit passport traversal");
+    let region = passport.region.load().expect("explicit region traversal");
+    assert_eq!(region.code, "RU");
+    database
+        .commit(&ref_observer)
+        .expect("reference observer commit");
+    let ref_conflict = database
+        .commit(&retroactive_ref)
+        .expect_err("reference traversal observation must block changed target value");
+    assert_eq!(ref_conflict.kind(), ErrorKind::TransactionConflict);
+
+    let mut retroactive_path = IntentJournal::new();
+    database
+        .objects::<PathRegion>()
+        .expect("regions")
+        .set(
+            &mut retroactive_path,
+            region_id,
+            PathRegionFields::code,
+            "DE".to_owned(),
+        )
+        .expect("second retroactive region change");
+
+    let mut path_observer = IntentJournal::new();
+    database
+        .objects::<PathPerson>()
+        .expect("people")
+        .set(
+            &mut path_observer,
+            person_id,
+            PathPersonFields::name,
+            "PathSeen".to_owned(),
+        )
+        .expect("path observer binding write");
+    let matching = path_observer
+        .objects::<PathPerson>()
+        .expect("transaction people")
+        .where_(|person| person.passport().region().code().eq("RU".to_owned()))
+        .count()
+        .expect("deep path count");
+    assert_eq!(matching, 1);
+    database
+        .commit(&path_observer)
+        .expect("path observer commit");
+    let path_conflict = database
+        .commit(&retroactive_path)
+        .expect_err("deep traversal observation must block changed joined value");
+    assert_eq!(path_conflict.kind(), ErrorKind::TransactionConflict);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn transaction_many_count_is_exact_causal_observation() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<Parent>()
+        .object::<Child>()
+        .build()
+        .expect("relationship schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create relationship database");
+    seed_object_many(&database);
+
+    let parent = database
+        .objects::<Parent>()
+        .expect("parents")
+        .require(Id::new(1))
+        .expect("parent");
+    let mut retroactive = IntentJournal::new();
+    parent
+        .children
+        .detach(&mut retroactive, Id::new(11))
+        .expect("retroactive detach");
+    drop(parent);
+
+    let mut observer = IntentJournal::new();
+    database
+        .objects::<Parent>()
+        .expect("parents")
+        .set(
+            &mut observer,
+            Id::new(1),
+            ParentFields::name,
+            "observed".to_owned(),
+        )
+        .expect("observer binding write");
+    let observed_parent = observer
+        .objects::<Parent>()
+        .expect("transaction parents")
+        .require(Id::new(1))
+        .expect("transaction parent");
+    assert_eq!(observed_parent.children.count().expect("children count"), 2);
+    database
+        .commit(&observer)
+        .expect("relationship observer commit");
+
+    let error = database
+        .commit(&retroactive)
+        .expect_err("relationship count observation must block retroactive detach");
+    assert_eq!(error.kind(), ErrorKind::TransactionConflict);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep complete public semantic regression scenario together."
+)]
+fn scoped_context_carries_session_authority_without_raw_database_escape() {
+    use cfmd::{Permission, PermissionSet, PrincipalId, Session};
+
+    let path = temp_path();
+    let database = Database::builder(&path)
+        .create_authoritative::<AppSchema>()
+        .expect("authoritative app database");
+
+    let seed = database.context::<AppSchema>().expect("seed context");
+    let alice = User {
+        id: Id::new(503_001),
+        name: "Alice".into(),
+    };
+    seed.add(|schema| &schema.users, alice.clone())
+        .expect("seed user");
+    seed.add(
+        |schema| &schema.tasks,
+        Task {
+            id: Id::new(503_010),
+            title: "before".into(),
+            owner: cfmd::Ref::new(alice.id),
+            reviewer: None,
+        },
+    )
+    .expect("seed task");
+    seed.commit().expect("seed commit");
+
+    let model = database
+        .snapshot()
+        .expect("model snapshot")
+        .schema()
+        .expect("model schema");
+    let task_relation = Task::relation_id();
+    let title_field = model
+        .relation(task_relation)
+        .expect("task relation")
+        .column_ids()[1];
+
+    let session = Session::new(
+        PrincipalId::new(503_001),
+        PermissionSet::from([Permission::WriteField {
+            relation: task_relation,
+            field: title_field,
+        }]),
+    );
+    let scoped = database
+        .session(session)
+        .context::<AppSchema>()
+        .expect("write-only session Context admission");
+
+    assert_eq!(
+        scoped
+            .tasks
+            .require(Id::new(503_010))
+            .expect_err("write authority must not imply read authority")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        scoped
+            .at(scoped.formation_revision())
+            .expect_err("Context::at must require dedicated historical authority")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+
+    scoped
+        .set(
+            |schema| &schema.tasks,
+            Id::new(503_010),
+            TaskFields::title,
+            "after".to_owned(),
+        )
+        .expect("field-authorized Context patch");
+    scoped.commit().expect("field-authorized Context commit");
+
+    let revocable = Session::new(
+        PrincipalId::new(503_002),
+        PermissionSet::from([Permission::WriteField {
+            relation: task_relation,
+            field: title_field,
+        }]),
+    );
+    let guarded = database
+        .session(revocable.clone())
+        .context::<AppSchema>()
+        .expect("revocable session Context");
+    guarded
+        .set(
+            |schema| &schema.tasks,
+            Id::new(503_010),
+            TaskFields::title,
+            "must-not-publish".to_owned(),
+        )
+        .expect("stage before revocation");
+    revocable.revoke().expect("revoke publication authority");
+    assert_eq!(
+        guarded
+            .commit()
+            .expect_err("revocation must be checked at publication")
+            .kind(),
+        ErrorKind::SessionRevoked
+    );
+
+    let no_history = database
+        .session(Session::new(
+            PrincipalId::new(503_003),
+            PermissionSet::from([Permission::WriteField {
+                relation: task_relation,
+                field: title_field,
+            }]),
+        ))
+        .context::<AppSchema>()
+        .expect("write-only history test Context");
+    assert_eq!(
+        no_history
+            .undo_latest()
+            .expect_err("write permission must not bypass HistoryRead")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+
+    let check = database.context::<AppSchema>().expect("unrestricted check");
+    assert_eq!(
+        check
+            .tasks
+            .require(Id::new(503_010))
+            .expect("task after authorized patch")
+            .title,
+        "after"
+    );
+
+    drop(check);
+    drop(database);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&path);
 }

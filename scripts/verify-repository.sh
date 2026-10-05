@@ -10,7 +10,7 @@ if find . -maxdepth 1 -type f \( -name 'PASS*' -o -name 'IMPLEMENTATION_REPORT_p
 fi
 
 for required in \
-  README.md SPEC.md Cargo.toml Cargo.lock rust-toolchain.toml lean-toolchain \
+  README.md SPEC.md PROJECT_RULES.md Cargo.toml Cargo.lock rust-toolchain.toml lean-toolchain \
   crates/cfmd/Cargo.toml crates/cfmd-derive/Cargo.toml scripts/verify-public-api.sh scripts/verify-cfmd-derive-diagnostics.sh \
   REPOSITORY_MANIFEST.sha256 \
   docs/spec/CFMD_CORE_SPEC.md docs/status/HISTORICAL_PROBLEMS_LEDGER.md \
@@ -87,9 +87,12 @@ if failures:
     raise SystemExit(1)
 PY
 
-# Snapshot manifest is deliberately repository-wide. Keeping it verified makes
-# incomplete GitHub uploads fail at the repository gate rather than later in CI.
-python3 scripts/update-repository-manifest.py --check
+# Snapshot manifest is deliberately repository-wide. On a Git checkout, also
+# verify that it matches the exact staged Git bytes used by GitHub/CI. Source
+# archives have no index, so they still verify directly by SHA-256.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  python3 scripts/update-repository-manifest.py --check
+fi
 sha256sum -c --quiet REPOSITORY_MANIFEST.sha256
 
 echo 'repository layout + include/vendor/manifest integrity: PASS'

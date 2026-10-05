@@ -20,8 +20,8 @@ pub use cfmd_runtime::{
     AndPredicate, BetweenPredicate, Candidate, CandidateDerivedEffects, CandidateDiagnostics,
     CandidateEffects, CandidateGroupedAggregateQuery, CandidateObjectQuery, CandidateObjectSet,
     CandidatePreview, CandidateProjectionQuery, CandidateReadiness, CfmdSchema, CommitOutcome,
-    Context, Database, DatabaseBuilder, DatabaseDefinition, Encryption, EncryptionKey,
-    EncryptionKeyAcknowledgement, EncryptionKeyDestination, EncryptionKeyId,
+    Context, ContextAdmission, Database, DatabaseBuilder, DatabaseDefinition, Encryption,
+    EncryptionKey, EncryptionKeyAcknowledgement, EncryptionKeyDestination, EncryptionKeyId,
     EncryptionKeyOperation, EncryptionKeyProvider, EncryptionProviderKeyMetadata, EntitySet,
     EqOperand, EqPredicate, Error, ErrorKind, Field, FieldRule, GroupKey, GroupedAggregateQuery,
     GroupedAggregateWatch, GroupedAggregateWatchEvent, History, HistoryEffectKind, HistoryEntry,
@@ -34,11 +34,10 @@ pub use cfmd_runtime::{
     OrderedObjectValue, OrphanPolicy, OwnedMany, OwnedManySelection, PathField, PathPredicate,
     Permission, PermissionSet, Plan, PrincipalId, Projection, ProjectionWatch,
     ProjectionWatchEvent, PublicationNotifier, QueryNodeId, QuerySource, Ref, RefField, RefPath,
-    RefPredicate, RelationChange, Result, RevisionId, Role, RuleValueExpr, Schema, SchemaDatabase,
-    SchemaDatabaseBuilder, SemanticRuleExpr, Session, SessionDatabase, SessionSnapshot, Snapshot,
-    Storage, TextPattern, Transaction, TransactionId, TransactionReadiness, ValueCodec,
-    WatchCancellation, WatchDrain, WatchNext, WatchReadiness, WatchReadinessSourceId, WatchStatus,
-    WatchSubscriptionId, WatchWake,
+    RefPredicate, RelationChange, Result, RevisionId, Role, RuleValueExpr, Schema,
+    ScopedRelationship, SemanticRuleExpr, Session, SessionDatabase, SessionSnapshot, Snapshot,
+    Storage, TextPattern, ValueCodec, WatchCancellation, WatchDrain, WatchNext, WatchReadiness,
+    WatchReadinessSourceId, WatchStatus, WatchSubscriptionId, WatchWake,
 };
 
 #[doc(hidden)]
@@ -48,9 +47,9 @@ pub mod __private {
         __append_remove_many_edges as append_remove_many_edges,
         __identity_equivalence_id as identity_equivalence_id,
         __many_relation_id as many_relation_id, __register_owned_many as register_owned_many,
-        __row_shape_error as row_shape_error, AuthoritativeObject, ContextSource, ReadContext,
-        Relation, Row, RowCodec, SchemaAuthorityEmpty, SchemaAuthorityLeaf, SchemaAuthorityPair,
-        Type, ValueCodec,
+        __row_shape_error as row_shape_error, AuthoritativeObject, ContextSource, IntentJournal,
+        IntentReadiness, ReadContext, Relation, Row, RowCodec, SchemaAuthorityEmpty,
+        SchemaAuthorityLeaf, SchemaAuthorityPair, TransactionId, Type, ValueCodec,
     };
 }
 
@@ -74,6 +73,6 @@ pub mod prelude {
     pub use crate::{
         CfmdEntity, CfmdSchema, Database, EntitySet, ErrorDiagnosticExt, Id, Many, Object,
         ObjectPredicate, OrphanPolicy, OwnedMany, PrincipalId, Ref, Result, RevisionId, Schema,
-        Storage, Transaction, TransactionId, TransactionReadiness, cfmd_entity, cfmd_object,
+        Storage, cfmd_entity, cfmd_object,
     };
 }

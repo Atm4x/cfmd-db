@@ -322,6 +322,10 @@ impl Candidate {
             .map_err(|error| crate::query::query_error_at(query, &error))
     }
 
+    pub(crate) fn scoped_read_context(&self, formation: &crate::ReadContext) -> crate::ReadContext {
+        formation.speculative_from_revision((*self.target).clone())
+    }
+
     pub fn objects<E: Object>(&self) -> Result<CandidateObjectSet<E>> {
         self.plan.authority.require_read_entry()?;
         let schema = crate::SchemaView::from_kernel(&self.target.semantic_context().schema);

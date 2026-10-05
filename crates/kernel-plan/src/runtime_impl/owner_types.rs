@@ -1,15 +1,52 @@
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeIndexedHistoryAction {
     effect_id: u128,
     action: RewriteActionLaw,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeIndexedCausalObservation {
+    effect_id: u128,
+    exact_value: Option<Value>,
+    preservation_rule: Option<kernel_schema::SemanticRuleExpr>,
+    joint_group_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RuntimeRelationalObservationRef {
+    effect_id: u128,
+    observation_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeIndexedRelationalCausalObservation {
+    capsule_ref: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct RuntimeRetainedEpochIndex {
     lineage_floor: Option<RevisionId>,
-    relation_supports: PersistentOrdMap<SemanticId, PersistentOrdMap<RevisionId, RelationSupportWitness>>,
-    writes: PersistentOrdMap<RuntimeHistoryCoordinate, PersistentOrdMap<RevisionId, RuntimeIndexedHistoryAction>>,
+    relation_supports:
+        PersistentOrdMap<SemanticId, PersistentOrdMap<RevisionId, RelationSupportWitness>>,
+    writes: PersistentOrdMap<
+        RuntimeHistoryCoordinate,
+        PersistentOrdMap<RevisionId, RuntimeIndexedHistoryAction>,
+    >,
+    observations: PersistentOrdMap<
+        RuntimeHistoryCoordinate,
+        PersistentOrdMap<RevisionId, RuntimeIndexedCausalObservation>,
+    >,
+    joint_observation_groups: PersistentOrdMap<(u128, u32), RuntimeJointCausalObservationGroup>,
+    relational_observations: PersistentOrdMap<
+        RuntimeRelationalObservationRef,
+        RuntimeIndexedRelationalCausalObservation,
+    >,
+    relational_capsule_keys: PersistentOrdMap<(RevisionId, Vec<u8>), u32>,
+    relational_capsules: PersistentOrdMap<u32, RelCausalCapsule>,
+    relational_routes: PersistentOrdMap<
+        SemanticId,
+        PersistentOrdMap<RevisionId, PersistentOrdSet<RuntimeRelationalObservationRef>>,
+    >,
     exact_effects: PersistentOrdMap<RevisionId, u128>,
 }
 
@@ -27,8 +64,27 @@ struct RuntimeRetainedSchemaEpoch {
 struct RuntimeHistoricalDerivedIndex {
     lineage_floor: Option<RevisionId>,
     floor_opaque_effect: Option<u128>,
-    relation_supports: PersistentOrdMap<SemanticId, PersistentOrdMap<RevisionId, RelationSupportWitness>>,
-    writes: PersistentOrdMap<RuntimeHistoryCoordinate, PersistentOrdMap<RevisionId, RuntimeIndexedHistoryAction>>,
+    relation_supports:
+        PersistentOrdMap<SemanticId, PersistentOrdMap<RevisionId, RelationSupportWitness>>,
+    writes: PersistentOrdMap<
+        RuntimeHistoryCoordinate,
+        PersistentOrdMap<RevisionId, RuntimeIndexedHistoryAction>,
+    >,
+    observations: PersistentOrdMap<
+        RuntimeHistoryCoordinate,
+        PersistentOrdMap<RevisionId, RuntimeIndexedCausalObservation>,
+    >,
+    joint_observation_groups: PersistentOrdMap<(u128, u32), RuntimeJointCausalObservationGroup>,
+    relational_observations: PersistentOrdMap<
+        RuntimeRelationalObservationRef,
+        RuntimeIndexedRelationalCausalObservation,
+    >,
+    relational_capsule_keys: PersistentOrdMap<(RevisionId, Vec<u8>), u32>,
+    relational_capsules: PersistentOrdMap<u32, RelCausalCapsule>,
+    relational_routes: PersistentOrdMap<
+        SemanticId,
+        PersistentOrdMap<RevisionId, PersistentOrdSet<RuntimeRelationalObservationRef>>,
+    >,
     exact_effects: PersistentOrdMap<RevisionId, u128>,
     retained_schema_epochs: PersistentOrdMap<RevisionId, RuntimeRetainedSchemaEpoch>,
 }
@@ -131,12 +187,7 @@ pub trait RuntimeRevisionPublicationNotifier: std::fmt::Debug + Send + Sync {
     /// must not rely on a future wake. Implementations must make registration
     /// race-free with `notify_waiters`.
     #[must_use]
-    fn register_waker_after(
-        &self,
-        waiter_id: u64,
-        observed: u64,
-        waker: &std::task::Waker,
-    ) -> u64;
+    fn register_waker_after(&self, waiter_id: u64, observed: u64, waker: &std::task::Waker) -> u64;
 
     /// Dependency-aware counterpart of [`Self::register_waker_after`].
     ///
@@ -226,9 +277,7 @@ impl RuntimeRevisionPublicationWaitHandle {
 
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.inner
-            .notifier
-            .generation_for(&self.inner.dependencies)
+        self.inner.notifier.generation_for(&self.inner.dependencies)
     }
 
     #[must_use]
@@ -315,9 +364,11 @@ impl InProcessRevisionPublicationState {
         if dependencies.is_empty() {
             return self.generation;
         }
-        dependencies.iter().fold(self.opaque_generation, |generation, relation| {
-            generation.max(self.relation_generation.get(relation).copied().unwrap_or(0))
-        })
+        dependencies
+            .iter()
+            .fold(self.opaque_generation, |generation, relation| {
+                generation.max(self.relation_generation.get(relation).copied().unwrap_or(0))
+            })
     }
 
     fn remove_waiter(&mut self, waiter_id: u64) -> Option<std::task::Waker> {
@@ -326,13 +377,13 @@ impl InProcessRevisionPublicationState {
             self.wildcard_waiters.remove(&waiter_id);
         } else {
             for relation in &registered.dependencies {
-                let remove_relation = self
-                    .waiters_by_relation
-                    .get_mut(relation)
-                    .is_some_and(|waiters| {
-                        waiters.remove(&waiter_id);
-                        waiters.is_empty()
-                    });
+                let remove_relation =
+                    self.waiters_by_relation
+                        .get_mut(relation)
+                        .is_some_and(|waiters| {
+                            waiters.remove(&waiter_id);
+                            waiters.is_empty()
+                        });
                 if remove_relation {
                     self.waiters_by_relation.remove(relation);
                 }
@@ -424,12 +475,7 @@ impl RuntimeRevisionPublicationNotifier for InProcessRevisionPublicationNotifier
         state.relevant_generation(dependencies)
     }
 
-    fn register_waker_after(
-        &self,
-        waiter_id: u64,
-        observed: u64,
-        waker: &std::task::Waker,
-    ) -> u64 {
+    fn register_waker_after(&self, waiter_id: u64, observed: u64, waker: &std::task::Waker) -> u64 {
         let mut state = self
             .state
             .lock()
@@ -539,6 +585,7 @@ pub struct PreparedRuntimeRevisionTransition {
     source_identity: RuntimeRootIdentity,
     source_context: kernel_schema::SemanticContext,
     source_fields: kernel_model::CowMap<(SemanticId, kernel_types::EntityId), Value>,
+    source_historical: RuntimeHistoricalDerivedIndex,
     candidate: Box<RuntimeRevisionBundle>,
     output_deltas: BTreeMap<kernel_types::MaterializationId, RelationDelta>,
 }

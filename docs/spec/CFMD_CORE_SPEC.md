@@ -2968,3 +2968,37 @@ Watch bootstrap may consume semantic Scan evidence to construct maintained canon
 **[SELECTED]** Before CFMD defines its first released compatibility boundary, development snapshots do not create backward-compatibility obligations. Active kernels/codecs/APIs MUST converge on the single best current architecture rather than retain pass-era readers, residual enum taxonomy, aliases, migration shims, or fallback routes. Obsolete implementations may remain only as non-active reference material. Current physical discriminators are fail-closed format/type guards, not promises to decode earlier R&D layouts. This rule is subordinate only to explicitly declared released compatibility contracts in the future.
 
 **[P473 RETAINED SCHEMA-EPOCH ROOT LAW]** On `SchemaMigrationExact`, the runtime seals the source epoch's persistent Γ-support/action timelines together with the structurally shared field-value root needed by deterministic migration transforms. Schema-aware field-intent proof traverses schema boundaries using those immutable roots and certified migration programs; it does not replay the old epoch's ordinary causal suffix, reconstruct a full historical state on the commit path, or route queries through the old schema. Recovery rebuilds the derived epoch roots from canonical causal/historical authority, so no serialized witness cache becomes a second history authority.
+
+## P479 formation-world transaction seal
+
+For an in-flight transaction whose formation semantic context is `A`, schema-specific observation
+semantics end at the first migration boundary. The source segment is certified against retained A
+Γ/action authority; formation guards are resolved in A. A successful boundary produces a
+`SchemaEpochFormationSeal`. From that point onward only the exact effect is transported through
+verified schema migrations and rebased in each later current epoch.
+
+The old guard is not forward-projected into B and B-native events are not interpreted as evidence
+about A. Current-head conditions such as revocation/freshness belong to a separate publication
+precondition authority.
+
+### Predicate-specific causal-observation preservation (PASS482)
+
+Later-world causal requirements are not transported formation guards. For a committed `Transaction::require` whose full deterministic `SemanticRuleExpr` depends on exactly one object field, the runtime normalizes that expression to `RuleValueExpr::Input` and durably retains it with the observed scalar. A retroactive formation-sealed write may braid before that committed transaction when the proposed scalar satisfies the retained unary expression. Exact-input equality remains the universal base certificate. Multi-field predicates require a joint certificate and must not be decomposed into independent per-coordinate approvals.
+
+
+## PASS484 — Interned causal-group routing and relational/OFC hidden-state boundary
+
+PASS484 removes an accidental O(width²) reconstructible-memory shape from PASS483: grouped causal payloads are interned once by `(effect_id, group_id)`, while each `Field`/`ObjectField` timeline stores only a compact group id. Retained schema epochs structurally share the same persistent group pool.
+
+A hostile Γ-DTC regression also proves that a relational causal observation cannot be represented exactly by only its query, observed OFC key and source-relation envelope. Two join states may expose the same empty output fiber while one retains a hidden matching left fiber; the same later right insert changes only that observation. General relational/OFC causal authority therefore requires exact hidden maintained state. CFMD must share/intern that state rather than copy an O(data) maintained query snapshot per transaction, and must not fall back to relation-wide conflicts or query replay.
+
+
+## PASS507 — explicit hosted formation identity and prepared field publication
+
+**[FORMATION IDENTITY]** A hosted/dynamic stale intent crossing a semantic migration MUST carry an explicit semantic formation identity. `base_revision` is causal/history identity, not schema identity. Historical authority may verify a supplied semantic identity but MUST NOT silently infer or route an old schema from the revision.
+
+**[ONE PREPARED PUBLICATION LAW]** `PreparedSchemaAwarePublication` is the common preparation artifact for exact relation publication and the proved pure field-only model-delta class. Preparation binds the transported current effect, exact current publication-authority footprint, authorized HEAD and client formation identity. Publication MUST consume the prepared artifact and MUST NOT perform a second migration walk.
+
+**[FAIL-CLOSED BREADTH]** Mixed relation+field effects, carrier/lifecycle effects, formation predicates and global/non-local rewrites may join prepared publication only through explicit transport/preservation laws. Whole-state reconstruction/diff, old-schema query routing, migrated ACLs and generic relation-write fallback are forbidden substitutes.
+
+**[NEXT R&D BOUNDARY]** Hosted formation verification currently has an exact historical materialization payer. The next architecture target is a bounded formation-context witness integrated into the same preparation traversal, followed by one mixed prepared effect law and proved carrier/lifecycle delta transport.

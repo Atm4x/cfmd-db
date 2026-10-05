@@ -6,10 +6,10 @@ use std::path::Path;
 
 use cfmd::dynamic::{Query, QueryWatch, RelationId, WatchEvent};
 use cfmd::{
-    Candidate, CandidateDerivedEffects, CfmdEntity, CfmdSchema, Context, Database, DatabaseBuilder,
-    Diagnostic, EntitySet, Error, ErrorDiagnosticExt, Id, Many, ManySelection, Object, ObjectQuery,
-    Plan, PrincipalId, QueryNodeId, QuerySource, Ref, Result, Schema, Snapshot, Storage,
-    Transaction, TransactionId,
+    Candidate, CandidateDerivedEffects, CfmdEntity, CfmdSchema, Context, ContextAdmission,
+    Database, DatabaseBuilder, Diagnostic, EntitySet, Error, ErrorDiagnosticExt, Id, Many, Object,
+    ObjectQuery, Plan, PrincipalId, QueryNodeId, QuerySource, Ref, Result, Schema, Snapshot,
+    Storage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -52,6 +52,10 @@ fn typed_snapshot(context: &Context<ContractSchema>) -> Result<Snapshot<Contract
     context.snapshot()
 }
 
+fn context_admission(database: &Database) -> Result<ContextAdmission> {
+    database.begin_context()
+}
+
 fn diagnostic(error: &Error) -> Diagnostic {
     error.diagnostic()
 }
@@ -75,16 +79,6 @@ fn relationship_api(
     Ok((reference.query()?, many.query()?))
 }
 
-fn relationship_selection_api(
-    selection: &ManySelection<ContractChild>,
-    transaction: &mut Transaction,
-) -> Result<(Vec<Id<ContractChild>>, usize)> {
-    let ids = selection.ids()?;
-    let count = selection.count()?;
-    selection.detach_all(transaction)?;
-    Ok((ids, count))
-}
-
 fn derived_preview_api(effects: CandidateDerivedEffects) -> (usize, usize) {
     (
         effects.normalized_rows_removed(),
@@ -92,30 +86,24 @@ fn derived_preview_api(effects: CandidateDerivedEffects) -> (usize, usize) {
     )
 }
 
-fn transaction_api(database: &Database, plan: Plan) -> Result<()> {
-    let _explicit_retry = Transaction::new().with_idempotency_key(TransactionId::new(0xCF_457))?;
-    let mut transaction = Transaction::new();
-    database.objects::<ContractItem>()?.add(
-        &mut transaction,
+fn scoped_context_api(database: &Database) -> Result<()> {
+    let context = database.context::<ContractSchema>()?;
+    context.add(
+        |schema| &schema.items,
         ContractItem {
             id: Id::new(1),
             name: "contract".to_owned(),
         },
     )?;
-    let _ = transaction.id();
-    let _ = transaction.origin_revision();
-    transaction.add_plan(plan)?;
-    let _ = database.preview(&transaction)?;
-    let _ = database.commit(&transaction)?;
+    let _ = context.preview()?;
+    let _ = context.commit()?;
     Ok(())
 }
-
 fn public_types_exist(
     _storage: Storage,
     _schema: Schema,
     _plan: Option<Plan>,
     _candidate: Option<Candidate>,
-    _transaction: TransactionId,
     _principal: PrincipalId,
     _reference: Ref<ContractItem>,
 ) {
@@ -125,6 +113,7 @@ fn public_types_exist(
 fn public_contract_compiles_as_documented() {
     let _ = database_builder as fn(&Path) -> DatabaseBuilder;
     let _ = typed_snapshot as fn(&Context<ContractSchema>) -> Result<Snapshot<ContractSchema>>;
+    let _ = context_admission as fn(&Database) -> Result<ContextAdmission>;
     let _ = diagnostic as fn(&Error) -> Diagnostic;
     let query = Query::scan(RelationId::new(1));
     let _ = query_identity(&query);
@@ -139,13 +128,7 @@ fn public_contract_compiles_as_documented() {
         as fn(Id<ContractParent>, String, Many<ContractChild>) -> ContractParent;
     assert_eq!(ContractParent::fields().len(), 2);
     assert_eq!(ContractParent::many_fields().len(), 1);
-    let _ = relationship_selection_api
-        as fn(
-            &ManySelection<ContractChild>,
-            &mut Transaction,
-        ) -> Result<(Vec<Id<ContractChild>>, usize)>;
     let _ = derived_preview_api as fn(CandidateDerivedEffects) -> (usize, usize);
-    let _ = transaction_api as fn(&Database, Plan) -> Result<()>;
-    let _ = ContractSchema::database(Path::new("."));
+    let _ = scoped_context_api as fn(&Database) -> Result<()>;
     let _ = public_types_exist;
 }

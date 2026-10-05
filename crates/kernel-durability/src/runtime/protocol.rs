@@ -1,3 +1,4 @@
+use kernel_change::RevisionEffectId;
 use kernel_types::{ClientTransactionId, RevisionId};
 
 use crate::descriptor::DurableRevisionDescriptor;
@@ -15,6 +16,7 @@ pub enum DurableTransactionOutcome {
 pub struct DurablePrepareToken {
     transaction_id: ClientTransactionId,
     target_revision: RevisionId,
+    revision_effect_id: RevisionEffectId,
     prepare_lsn: u64,
     prepare_payload_crc32c: u32,
 }
@@ -23,12 +25,14 @@ impl DurablePrepareToken {
     pub(crate) const fn from_wal(
         transaction_id: ClientTransactionId,
         target_revision: RevisionId,
+        revision_effect_id: RevisionEffectId,
         prepare_lsn: u64,
         prepare_payload_crc32c: u32,
     ) -> Self {
         Self {
             transaction_id,
             target_revision,
+            revision_effect_id,
             prepare_lsn,
             prepare_payload_crc32c,
         }
@@ -42,6 +46,11 @@ impl DurablePrepareToken {
     #[must_use]
     pub const fn target_revision(self) -> RevisionId {
         self.target_revision
+    }
+
+    #[must_use]
+    pub const fn revision_effect_id(self) -> RevisionEffectId {
+        self.revision_effect_id
     }
 
     #[must_use]

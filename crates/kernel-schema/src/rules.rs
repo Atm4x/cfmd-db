@@ -64,13 +64,13 @@ pub enum ModelRuleExpr {
 
 use crate::{FieldRule, ScalarType, TypeExpr};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuleValueExpr {
     Input,
     Field(SemanticId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TextPattern {
     Never,
     Empty,
@@ -100,7 +100,7 @@ impl TextPattern {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SemanticRuleExpr {
     True,
     False,

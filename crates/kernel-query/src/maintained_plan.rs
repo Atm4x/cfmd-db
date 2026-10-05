@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -7,7 +7,7 @@ use kernel_model::Value;
 use kernel_persistent::{PersistentOrdMap, PersistentVec};
 
 use crate::{
-    MaintainedDelta,
+    Impact, MaintainedDelta,
     blocker::{
         BlockerBuildSpec, BlockerDeltaPatch, MaintainedBlockerKind, MaterializedBlockerDeltaState,
     },
@@ -21,7 +21,7 @@ use crate::{
     },
     differential_api::relation_deltas_semantically_equivalent,
     differential_program::{RelDifferentialProgram, RelDifferentialStateRequirement},
-    execgraph::{NodeId, NodeInbox, UnifiedTransitionScratch},
+    execgraph::{ExecutionInputSlot, NodeId, NodeInbox, UnifiedTransitionScratch},
     group::{GroupCommitPatch, MaterializedGroupDeltaState},
     join::{JoinDeltaPatch, MaterializedJoinDeltaState},
     maintained_delta_kernels::{
@@ -45,6 +45,364 @@ use crate::{
     },
     topk::{MaterializedTopKDeltaState, TopKDeltaPatch},
 };
+
+/// Immutable exact Γ-DTC state captured for a relational causal observation.
+///
+/// Live single-query capture may own one `MaterializedRelPlanState`; reopen may
+/// instead reference one root of a shared multi-root `RelObservationForest`.
+/// Both are derived runtime authority over the same Γ-DTC semantics. Neither
+/// representation introduces a durable capsule/node identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelCausalCapsule {
+    payload: RelCausalCapsulePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelCausalCapsulePayload {
+    Plan(Arc<MaterializedRelPlanState>),
+    Forest {
+        forest: Arc<RelObservationForest>,
+        root: usize,
+    },
+}
+
+impl RelCausalCapsule {
+    pub fn capture(state: &MaterializedRelPlanState) -> Result<Self, RelQueryError> {
+        if state.revision().is_none() {
+            return Err(RelQueryError::RevisionBindingMismatch);
+        }
+        Ok(Self {
+            payload: RelCausalCapsulePayload::Plan(Arc::new(state.clone())),
+        })
+    }
+
+    pub fn capture_forest_root(
+        forest: Arc<RelObservationForest>,
+        root: usize,
+    ) -> Result<Self, RelQueryError> {
+        if forest.root_revision(root).is_none() || forest.root_node(root).is_none() {
+            return Err(RelQueryError::RevisionBindingMismatch);
+        }
+        Ok(Self {
+            payload: RelCausalCapsulePayload::Forest { forest, root },
+        })
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> kernel_types::RevisionId {
+        match &self.payload {
+            RelCausalCapsulePayload::Plan(state) => state
+                .revision()
+                .expect("causal capsule is always revision-bound"),
+            RelCausalCapsulePayload::Forest { forest, root } => forest
+                .root_revision(*root)
+                .expect("causal forest capsule root is always revision-bound"),
+        }
+    }
+
+    #[must_use]
+    pub fn query(&self) -> &RelExpr {
+        match &self.payload {
+            RelCausalCapsulePayload::Plan(state) => state.query(),
+            RelCausalCapsulePayload::Forest { forest, root } => forest
+                .root_expression(*root)
+                .expect("causal forest capsule root must exist"),
+        }
+    }
+
+    #[must_use]
+    pub fn source_relations(&self) -> BTreeSet<kernel_types::SemanticId> {
+        self.query().scan_relations()
+    }
+
+    #[must_use]
+    pub fn source_occurrence_counts(&self) -> BTreeMap<kernel_types::SemanticId, usize> {
+        fn collect(expression: &RelExpr, out: &mut BTreeMap<kernel_types::SemanticId, usize>) {
+            match expression {
+                RelExpr::Scan(relation) => *out.entry(*relation).or_default() += 1,
+                RelExpr::FilterEqConst { input, .. }
+                | RelExpr::FilterOrderConst { input, .. }
+                | RelExpr::FilterEqColumns { input, .. }
+                | RelExpr::Project { input, .. }
+                | RelExpr::Distinct { input, .. }
+                | RelExpr::Group { input, .. }
+                | RelExpr::TopKWithTies { input, .. }
+                | RelExpr::PromoteToBag(input) => collect(input, out),
+                RelExpr::JoinEq { left, right, .. }
+                | RelExpr::Difference { left, right }
+                | RelExpr::Union { left, right }
+                | RelExpr::AntiJoin { left, right, .. } => {
+                    collect(left, out);
+                    collect(right, out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        collect(self.query(), &mut out);
+        out
+    }
+
+    pub fn impact_relation_deltas(
+        &self,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Impact, RelQueryError> {
+        match &self.payload {
+            RelCausalCapsulePayload::Plan(state) => {
+                state.impact_relation_deltas(deltas, context, registry)
+            }
+            RelCausalCapsulePayload::Forest { forest, root } => {
+                forest.impact_root_relation_deltas(*root, deltas, context, registry)
+            }
+        }
+    }
+
+    /// Evaluates a set of causal capsules while planning each shared forest
+    /// snapshot at most once. Return order matches `capsules` exactly.
+    pub fn impact_many_relation_deltas(
+        capsules: &[&Self],
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Vec<Impact>, RelQueryError> {
+        Self::impact_many_relation_deltas_with_stats(capsules, deltas, context, registry)
+            .map(|(impacts, _)| impacts)
+    }
+
+    #[doc(hidden)]
+    pub fn impact_many_relation_deltas_with_stats(
+        capsules: &[&Self],
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(Vec<Impact>, usize), RelQueryError> {
+        let mut impacts = vec![Impact::Unaffected; capsules.len()];
+        let mut forest_groups =
+            HashMap::<usize, (&Arc<RelObservationForest>, Vec<(usize, usize)>)>::new();
+        let mut plan_count = 0usize;
+
+        for (position, capsule) in capsules.iter().enumerate() {
+            match &capsule.payload {
+                RelCausalCapsulePayload::Plan(state) => {
+                    impacts[position] = state.impact_relation_deltas(deltas, context, registry)?;
+                    plan_count = plan_count
+                        .checked_add(1)
+                        .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                }
+                RelCausalCapsulePayload::Forest { forest, root } => {
+                    let identity = Arc::as_ptr(forest) as usize;
+                    forest_groups
+                        .entry(identity)
+                        .or_insert_with(|| (forest, Vec::new()))
+                        .1
+                        .push((position, *root));
+                }
+            }
+        }
+
+        for (_, (forest, routes)) in forest_groups {
+            let forest_impacts = forest.impact_relation_deltas(deltas, context, registry)?;
+            plan_count = plan_count
+                .checked_add(1)
+                .ok_or(RelQueryError::TransitionEpochExhausted)?;
+            for (position, root) in routes {
+                impacts[position] = *forest_impacts
+                    .get(root)
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            }
+        }
+        Ok((impacts, plan_count))
+    }
+
+    /// Produces the next persistent capsule state for the same compiled query.
+    /// Unrelated deltas retain the exact same payload; relevant deltas path-copy
+    /// only the touched maintained nodes/cells.
+    pub fn advance(
+        &self,
+        target_revision: kernel_types::RevisionId,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        let sources = self.source_relations();
+        let relevant = deltas
+            .iter()
+            .filter(|(relation, _)| sources.contains(relation))
+            .map(|(relation, delta)| (*relation, delta.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if relevant.is_empty() {
+            return Ok(self.clone());
+        }
+        match &self.payload {
+            RelCausalCapsulePayload::Plan(state) => {
+                let (next, _) = state.candidate_from_relation_deltas_for_revision(
+                    target_revision,
+                    &relevant,
+                    context,
+                    registry,
+                )?;
+                Ok(Self {
+                    payload: RelCausalCapsulePayload::Plan(Arc::new(next)),
+                })
+            }
+            RelCausalCapsulePayload::Forest { forest, root } => {
+                let (next, _) = forest.candidate_from_relation_deltas_for_revision(
+                    target_revision,
+                    &relevant,
+                    context,
+                    registry,
+                )?;
+                Ok(Self {
+                    payload: RelCausalCapsulePayload::Forest {
+                        forest: Arc::new(next),
+                        root: *root,
+                    },
+                })
+            }
+        }
+    }
+
+    /// Reconstructs the preceding persistent capsule state from one durable
+    /// forward semantic effect. Reopen therefore walks exact durable semantic
+    /// effects rather than serializing a second maintained-state history.
+    pub fn rewind_forward_deltas(
+        &self,
+        source_revision: kernel_types::RevisionId,
+        forward: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        let inverse = forward
+            .iter()
+            .map(|(relation, delta)| {
+                (
+                    *relation,
+                    RelationDelta {
+                        inserted: delta.removed.clone(),
+                        removed: delta.inserted.clone(),
+                        result_type: delta.result_type.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.advance(source_revision, &inverse, context, registry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_payload_with(&self, other: &Self) -> bool {
+        match (&self.payload, &other.payload) {
+            (RelCausalCapsulePayload::Plan(left), RelCausalCapsulePayload::Plan(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (
+                RelCausalCapsulePayload::Forest { forest: left, .. },
+                RelCausalCapsulePayload::Forest { forest: right, .. },
+            ) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+pub type RelObservationForestNodeId = usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelObservationForestInputs {
+    Source,
+    Unary(RelObservationForestNodeId),
+    Binary {
+        left: RelObservationForestNodeId,
+        right: RelObservationForestNodeId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelObservationForestCell {
+    expression: RelExpr,
+    inputs: RelObservationForestInputs,
+    state: Arc<FlatMaintainedRelPlanNode>,
+}
+
+/// Derived multi-root Γ-DTC execution state with canonical semantic state cells.
+///
+/// Identical `RelExpr` subtrees are interned once per semantic context/revision
+/// world. Observation roots remain separate entries that may point to the same
+/// canonical cell. The forest is runtime-only derived authority: node ids and
+/// structural hash results are never durable identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelObservationForestEdge {
+    node: RelObservationForestNodeId,
+    slot: ExecutionInputSlot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelObservationEqDispatchFamily {
+    column: usize,
+    equivalence: kernel_types::SemanticId,
+    compiled: kernel_semantics::CompiledEquivalence,
+    routes: BTreeMap<kernel_semantics::CanonicalEqKey, Box<[RelObservationForestNodeId]>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelObservationOrderCut {
+    key: kernel_semantics::CanonicalOrderKey,
+    routes: Box<[RelObservationForestNodeId]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelObservationOrderDispatchFamily {
+    column: usize,
+    compiled: kernel_semantics::CompiledOrdering,
+    less: Box<[RelObservationOrderCut]>,
+    less_or_equal: Box<[RelObservationOrderCut]>,
+    greater: Box<[RelObservationOrderCut]>,
+    greater_or_equal: Box<[RelObservationOrderCut]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RelObservationForestFanoutPlan {
+    ordinary: Box<[RelObservationForestEdge]>,
+    equality: Box<[RelObservationEqDispatchFamily]>,
+    ordered: Box<[RelObservationOrderDispatchFamily]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelObservationForest {
+    semantic_context: kernel_schema::SemanticContext,
+    cells: PersistentVec<Arc<RelObservationForestCell>>,
+    roots: Box<[RelObservationForestNodeId]>,
+    fanout: Box<[Box<[RelObservationForestEdge]>]>,
+    fanout_plans: Box<[RelObservationForestFanoutPlan]>,
+    root_routes: Box<[Box<[usize]>]>,
+    sources: BTreeMap<kernel_types::SemanticId, RelObservationForestNodeId>,
+    roots_by_relation: BTreeMap<kernel_types::SemanticId, Box<[usize]>>,
+    world_revision: Option<kernel_types::RevisionId>,
+    root_revisions: Box<[Option<kernel_types::RevisionId>]>,
+    transition_epoch: u64,
+}
+
+#[derive(Debug)]
+struct PlannedRelObservationForestTransition {
+    patches: Vec<(RelObservationForestNodeId, GraphNodePatch)>,
+    effects: Vec<MaintainedDelta>,
+    visited_nodes: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    equality_rows_classified: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    ordered_rows_classified: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    fused_filter_effects: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelObservationForestBuildStats {
+    pub root_occurrences: usize,
+    pub unique_cells: usize,
+    pub reused_subtrees: usize,
+    pub source_materializations: usize,
+    pub source_rows_materialized: usize,
+    pub local_cell_initializations: usize,
+}
 
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +627,1398 @@ struct GraphPatchSet {
 struct PlannedGraphNodeTransition {
     patch: Option<GraphNodePatch>,
     effect: MaintainedDelta,
+}
+
+impl RelObservationForest {
+    pub fn build(
+        roots: &[RelExpr],
+        old: &kernel_model::FiniteModel,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        Self::build_with_stats(roots, old, context, registry).map(|(forest, _)| forest)
+    }
+
+    pub fn build_with_stats(
+        roots: &[RelExpr],
+        old: &kernel_model::FiniteModel,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(Self, RelObservationForestBuildStats), RelQueryError> {
+        if roots.is_empty() {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        for root in roots {
+            root.typecheck(context, registry)?;
+        }
+
+        let mut intern = HashMap::<RelExpr, RelObservationForestNodeId>::new();
+        let mut cells = Vec::<Arc<RelObservationForestCell>>::new();
+        let mut outputs = Vec::<RelationValue>::new();
+        let mut stats = RelObservationForestBuildStats {
+            root_occurrences: roots.len(),
+            ..RelObservationForestBuildStats::default()
+        };
+        let mut root_ids = Vec::with_capacity(roots.len());
+        for root in roots {
+            root_ids.push(Self::intern_subtree(
+                root,
+                old,
+                context,
+                registry,
+                &mut intern,
+                &mut cells,
+                &mut outputs,
+                &mut stats,
+            )?);
+        }
+        stats.unique_cells = cells.len();
+
+        let mut fanout = vec![Vec::<RelObservationForestEdge>::new(); cells.len()];
+        let mut sources = BTreeMap::new();
+        for (node, cell) in cells.iter().enumerate() {
+            match cell.inputs {
+                RelObservationForestInputs::Source => {
+                    let RelExpr::Scan(relation) = cell.expression else {
+                        return Err(RelQueryError::InconsistentIncrementalDelta);
+                    };
+                    if sources.insert(relation, node).is_some() {
+                        return Err(RelQueryError::InconsistentIncrementalDelta);
+                    }
+                }
+                RelObservationForestInputs::Unary(input) => {
+                    fanout[input].push(RelObservationForestEdge {
+                        node,
+                        slot: ExecutionInputSlot::Unary,
+                    });
+                }
+                RelObservationForestInputs::Binary { left, right } => {
+                    fanout[left].push(RelObservationForestEdge {
+                        node,
+                        slot: ExecutionInputSlot::Left,
+                    });
+                    fanout[right].push(RelObservationForestEdge {
+                        node,
+                        slot: ExecutionInputSlot::Right,
+                    });
+                }
+            }
+        }
+        let mut root_routes = vec![Vec::<usize>::new(); cells.len()];
+        let mut roots_by_relation = BTreeMap::<kernel_types::SemanticId, Vec<usize>>::new();
+        for (route, (&node, expression)) in root_ids.iter().zip(roots.iter()).enumerate() {
+            root_routes[node].push(route);
+            for relation in expression.scan_relations() {
+                roots_by_relation.entry(relation).or_default().push(route);
+            }
+        }
+
+        let fanout_plans = fanout
+            .iter()
+            .map(|edges| Self::compile_fanout_plan(edges, &cells, context, registry))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let forest = Self {
+            semantic_context: context.clone(),
+            cells: cells.into(),
+            roots: root_ids.into_boxed_slice(),
+            fanout: fanout
+                .into_iter()
+                .map(Vec::into_boxed_slice)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            fanout_plans: fanout_plans.into_boxed_slice(),
+            root_routes: root_routes
+                .into_iter()
+                .map(Vec::into_boxed_slice)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            sources,
+            roots_by_relation: roots_by_relation
+                .into_iter()
+                .map(|(relation, routes)| (relation, routes.into_boxed_slice()))
+                .collect(),
+            world_revision: None,
+            root_revisions: vec![None; roots.len()].into_boxed_slice(),
+            transition_epoch: 0,
+        };
+        Ok((forest, stats))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
+    fn compile_fanout_plan(
+        edges: &[RelObservationForestEdge],
+        cells: &[Arc<RelObservationForestCell>],
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelObservationForestFanoutPlan, RelQueryError> {
+        let mut equality_groups = BTreeMap::<
+            (usize, kernel_types::SemanticId),
+            Vec<(RelObservationForestEdge, Value)>,
+        >::new();
+        let mut ordered_groups = BTreeMap::<
+            (usize, kernel_types::SemanticId),
+            Vec<(RelObservationForestEdge, Value, crate::OrderComparison)>,
+        >::new();
+        let mut ordinary = Vec::new();
+
+        for edge in edges.iter().copied() {
+            if edge.slot != ExecutionInputSlot::Unary {
+                ordinary.push(edge);
+                continue;
+            }
+            let cell = cells
+                .get(edge.node)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            match &cell.expression {
+                RelExpr::FilterEqConst {
+                    column,
+                    value,
+                    equivalence,
+                    ..
+                } => equality_groups
+                    .entry((*column, *equivalence))
+                    .or_default()
+                    .push((edge, value.clone())),
+                RelExpr::FilterOrderConst {
+                    column,
+                    value,
+                    ordering,
+                    comparison,
+                    ..
+                } => ordered_groups
+                    .entry((*column, *ordering))
+                    .or_default()
+                    .push((edge, value.clone(), *comparison)),
+                _ => ordinary.push(edge),
+            }
+        }
+
+        let mut equality = Vec::new();
+        for ((column, equivalence), members) in equality_groups {
+            if members.len() < 2 {
+                ordinary.extend(members.into_iter().map(|(edge, _)| edge));
+                continue;
+            }
+            let compiled = registry.compile_equivalence(context, equivalence)?;
+            let mut routes =
+                BTreeMap::<kernel_semantics::CanonicalEqKey, Vec<RelObservationForestNodeId>>::new(
+                );
+            for (edge, value) in members {
+                routes
+                    .entry(compiled.canonical_key(&value)?)
+                    .or_default()
+                    .push(edge.node);
+            }
+            equality.push(RelObservationEqDispatchFamily {
+                column,
+                equivalence,
+                compiled,
+                routes: routes
+                    .into_iter()
+                    .map(|(key, routes)| (key, routes.into_boxed_slice()))
+                    .collect(),
+            });
+        }
+
+        let mut ordered = Vec::new();
+        for ((column, ordering), members) in ordered_groups {
+            if members.len() < 2 {
+                ordinary.extend(members.into_iter().map(|(edge, _, _)| edge));
+                continue;
+            }
+            let compiled = registry.compile_ordering(context, ordering)?;
+            let mut less = BTreeMap::<kernel_semantics::CanonicalOrderKey, Vec<_>>::new();
+            let mut less_or_equal = BTreeMap::<kernel_semantics::CanonicalOrderKey, Vec<_>>::new();
+            let mut greater = BTreeMap::<kernel_semantics::CanonicalOrderKey, Vec<_>>::new();
+            let mut greater_or_equal =
+                BTreeMap::<kernel_semantics::CanonicalOrderKey, Vec<_>>::new();
+            for (edge, value, comparison) in members {
+                let target = match comparison {
+                    crate::OrderComparison::Less => &mut less,
+                    crate::OrderComparison::LessOrEqual => &mut less_or_equal,
+                    crate::OrderComparison::Greater => &mut greater,
+                    crate::OrderComparison::GreaterOrEqual => &mut greater_or_equal,
+                };
+                target
+                    .entry(compiled.canonical_key(&value)?)
+                    .or_default()
+                    .push(edge.node);
+            }
+            let into_cuts = |cuts: BTreeMap<kernel_semantics::CanonicalOrderKey, Vec<_>>| {
+                cuts.into_iter()
+                    .map(|(key, routes)| RelObservationOrderCut {
+                        key,
+                        routes: routes.into_boxed_slice(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            };
+            ordered.push(RelObservationOrderDispatchFamily {
+                column,
+                compiled,
+                less: into_cuts(less),
+                less_or_equal: into_cuts(less_or_equal),
+                greater: into_cuts(greater),
+                greater_or_equal: into_cuts(greater_or_equal),
+            });
+        }
+
+        Ok(RelObservationForestFanoutPlan {
+            ordinary: ordinary.into_boxed_slice(),
+            equality: equality.into_boxed_slice(),
+            ordered: ordered.into_boxed_slice(),
+        })
+    }
+
+    #[allow(
+        clippy::similar_names,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
+    fn intern_subtree(
+        expression: &RelExpr,
+        old: &kernel_model::FiniteModel,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+        intern: &mut HashMap<RelExpr, RelObservationForestNodeId>,
+        cells: &mut Vec<Arc<RelObservationForestCell>>,
+        outputs: &mut Vec<RelationValue>,
+        stats: &mut RelObservationForestBuildStats,
+    ) -> Result<RelObservationForestNodeId, RelQueryError> {
+        if let Some(&node) = intern.get(expression) {
+            stats.reused_subtrees = stats
+                .reused_subtrees
+                .checked_add(1)
+                .ok_or(RelQueryError::TransitionEpochExhausted)?;
+            return Ok(node);
+        }
+
+        let inputs = match expression {
+            RelExpr::Scan(_) => RelObservationForestInputs::Source,
+            RelExpr::FilterEqConst { input, .. }
+            | RelExpr::FilterOrderConst { input, .. }
+            | RelExpr::FilterEqColumns { input, .. }
+            | RelExpr::Project { input, .. }
+            | RelExpr::Distinct { input, .. }
+            | RelExpr::Group { input, .. }
+            | RelExpr::TopKWithTies { input, .. }
+            | RelExpr::PromoteToBag(input) => RelObservationForestInputs::Unary(
+                Self::intern_subtree(input, old, context, registry, intern, cells, outputs, stats)?,
+            ),
+            RelExpr::JoinEq { left, right, .. }
+            | RelExpr::Difference { left, right }
+            | RelExpr::Union { left, right }
+            | RelExpr::AntiJoin { left, right, .. } => RelObservationForestInputs::Binary {
+                left: Self::intern_subtree(
+                    left, old, context, registry, intern, cells, outputs, stats,
+                )?,
+                right: Self::intern_subtree(
+                    right, old, context, registry, intern, cells, outputs, stats,
+                )?,
+            },
+        };
+
+        let result_type = expression.typecheck(context, registry)?;
+        let child_output = |node: RelObservationForestNodeId| {
+            outputs
+                .get(node)
+                .cloned()
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)
+        };
+        let child_type = |node: RelObservationForestNodeId| {
+            cells
+                .get(node)
+                .map(|cell| cell.state.result_type.clone())
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)
+        };
+
+        let (kind, output) = match expression {
+            RelExpr::Scan(relation) => {
+                let rows = old
+                    .relations
+                    .materialize_owned(relation)
+                    .unwrap_or_default();
+                stats.source_materializations = stats
+                    .source_materializations
+                    .checked_add(1)
+                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                stats.source_rows_materialized = stats
+                    .source_rows_materialized
+                    .checked_add(rows.len())
+                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                let value = relation_value_from_rows(rows, &result_type);
+                let canonical_lookup = canonical_row_position_index(
+                    value.rows(),
+                    relation_column_equivalences(&result_type),
+                    context,
+                    registry,
+                )?;
+                (
+                    FlatMaintainedRelPlanNodeKind::Scan {
+                        relation: *relation,
+                        value: value.rows().to_vec().into(),
+                        handles: None,
+                        base_witness: None,
+                        canonical_lookup,
+                    },
+                    value,
+                )
+            }
+            RelExpr::FilterEqConst {
+                column,
+                value,
+                equivalence,
+                ..
+            } => {
+                let RelObservationForestInputs::Unary(input) = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let filtered = rel_delta_filter(
+                    RelationDelta {
+                        inserted: child_output(input)?.into_rows(),
+                        removed: Vec::new(),
+                        result_type: child_type(input)?,
+                    },
+                    *column,
+                    value,
+                    *equivalence,
+                    context,
+                    registry,
+                )?;
+                (
+                    FlatMaintainedRelPlanNodeKind::Filter {
+                        input,
+                        column: *column,
+                        value: value.clone(),
+                        equivalence: *equivalence,
+                    },
+                    relation_value_from_rows(filtered.inserted, &result_type),
+                )
+            }
+            RelExpr::FilterOrderConst {
+                column,
+                value,
+                ordering,
+                comparison,
+                ..
+            } => {
+                let RelObservationForestInputs::Unary(input) = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let filtered = rel_delta_filter_order_const(
+                    RelationDelta {
+                        inserted: child_output(input)?.into_rows(),
+                        removed: Vec::new(),
+                        result_type: child_type(input)?,
+                    },
+                    *column,
+                    value,
+                    *ordering,
+                    *comparison,
+                    context,
+                    registry,
+                )?;
+                (
+                    FlatMaintainedRelPlanNodeKind::FilterOrder {
+                        input,
+                        column: *column,
+                        value: value.clone(),
+                        ordering: *ordering,
+                        comparison: *comparison,
+                    },
+                    relation_value_from_rows(filtered.inserted, &result_type),
+                )
+            }
+            RelExpr::FilterEqColumns {
+                left_column,
+                right_column,
+                equivalence,
+                ..
+            } => {
+                let RelObservationForestInputs::Unary(input) = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let filtered = rel_delta_filter_columns(
+                    RelationDelta {
+                        inserted: child_output(input)?.into_rows(),
+                        removed: Vec::new(),
+                        result_type: child_type(input)?,
+                    },
+                    *left_column,
+                    *right_column,
+                    *equivalence,
+                    context,
+                    registry,
+                )?;
+                (
+                    FlatMaintainedRelPlanNodeKind::FilterColumns {
+                        input,
+                        left_column: *left_column,
+                        right_column: *right_column,
+                        equivalence: *equivalence,
+                    },
+                    relation_value_from_rows(filtered.inserted, &result_type),
+                )
+            }
+            RelExpr::Project { columns, .. } => {
+                let RelObservationForestInputs::Unary(input) = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let rows = project_rows(child_output(input)?.into_rows(), columns)?;
+                if matches!(
+                    child_type(input)?.semantics,
+                    kernel_schema::RelationSemantics::Set { .. }
+                ) {
+                    let supports = MaterializedSetSupportState::build(
+                        &rows,
+                        result_type.clone(),
+                        context,
+                        registry,
+                    )?;
+                    let output = supports.output_value();
+                    (
+                        FlatMaintainedRelPlanNodeKind::ProjectSet {
+                            input,
+                            columns: columns.clone(),
+                            supports,
+                        },
+                        output,
+                    )
+                } else {
+                    (
+                        FlatMaintainedRelPlanNodeKind::ProjectBag {
+                            input,
+                            columns: columns.clone(),
+                        },
+                        relation_value_from_rows(rows, &result_type),
+                    )
+                }
+            }
+            RelExpr::Union { .. } => {
+                let RelObservationForestInputs::Binary { left, right } = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let mut rows = child_output(left)?.into_rows();
+                rows.extend(child_output(right)?.into_rows());
+                if matches!(
+                    result_type.semantics,
+                    kernel_schema::RelationSemantics::Set { .. }
+                ) {
+                    let supports = MaterializedSetSupportState::build(
+                        &rows,
+                        result_type.clone(),
+                        context,
+                        registry,
+                    )?;
+                    let output = supports.output_value();
+                    (
+                        FlatMaintainedRelPlanNodeKind::UnionSet {
+                            left,
+                            right,
+                            supports,
+                        },
+                        output,
+                    )
+                } else {
+                    (
+                        FlatMaintainedRelPlanNodeKind::UnionBag { left, right },
+                        relation_value_from_rows(rows, &result_type),
+                    )
+                }
+            }
+            RelExpr::Difference { .. } => {
+                let RelObservationForestInputs::Binary { left, right } = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let left_output = child_output(left)?;
+                let right_output = child_output(right)?;
+                let state = MaterializedBlockerDeltaState::build(
+                    &left_output,
+                    &right_output,
+                    BlockerBuildSpec {
+                        kind: &MaintainedBlockerKind::Difference,
+                        left_type: child_type(left)?,
+                        right_type: child_type(right)?,
+                        result_type: result_type.clone(),
+                        context,
+                        registry,
+                    },
+                )?;
+                let output = state.output_value()?;
+                (
+                    FlatMaintainedRelPlanNodeKind::Blocker { left, right, state },
+                    output,
+                )
+            }
+            RelExpr::AntiJoin {
+                left_column,
+                right_column,
+                equivalence,
+                ..
+            } => {
+                let RelObservationForestInputs::Binary { left, right } = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let left_output = child_output(left)?;
+                let right_output = child_output(right)?;
+                let kind = MaintainedBlockerKind::AntiJoin {
+                    left_column: *left_column,
+                    right_column: *right_column,
+                    equivalence: *equivalence,
+                };
+                let state = MaterializedBlockerDeltaState::build(
+                    &left_output,
+                    &right_output,
+                    BlockerBuildSpec {
+                        kind: &kind,
+                        left_type: child_type(left)?,
+                        right_type: child_type(right)?,
+                        result_type: result_type.clone(),
+                        context,
+                        registry,
+                    },
+                )?;
+                let output = state.output_value()?;
+                (
+                    FlatMaintainedRelPlanNodeKind::Blocker { left, right, state },
+                    output,
+                )
+            }
+            RelExpr::Distinct { .. } => {
+                let RelObservationForestInputs::Unary(input) = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let input_output = child_output(input)?;
+                let supports = MaterializedSetSupportState::build(
+                    input_output.rows(),
+                    result_type.clone(),
+                    context,
+                    registry,
+                )?;
+                let output = supports.output_value();
+                (
+                    FlatMaintainedRelPlanNodeKind::Distinct { input, supports },
+                    output,
+                )
+            }
+            RelExpr::PromoteToBag(_) => {
+                let RelObservationForestInputs::Unary(input) = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let output = RelationValue::Bag(child_output(input)?.into_rows());
+                (
+                    FlatMaintainedRelPlanNodeKind::PromoteToBag { input },
+                    output,
+                )
+            }
+            RelExpr::JoinEq { .. } => {
+                let RelObservationForestInputs::Binary { left, right } = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let left_output = child_output(left)?;
+                let right_output = child_output(right)?;
+                let state = MaterializedJoinDeltaState::build_from_input_values(
+                    expression,
+                    &left_output,
+                    &right_output,
+                    context,
+                    registry,
+                )?
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                let output = state.output_value(context, registry)?;
+                (
+                    FlatMaintainedRelPlanNodeKind::Join { left, right, state },
+                    output,
+                )
+            }
+            RelExpr::Group { .. } => {
+                let RelObservationForestInputs::Unary(input) = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let state = MaterializedGroupDeltaState::build_from_input_value(
+                    expression,
+                    child_output(input)?,
+                    context,
+                    registry,
+                )?
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                let output = state.output_value()?;
+                (
+                    FlatMaintainedRelPlanNodeKind::Group { input, state },
+                    output,
+                )
+            }
+            RelExpr::TopKWithTies { .. } => {
+                let RelObservationForestInputs::Unary(input) = inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let state = MaterializedTopKDeltaState::build_from_input_value(
+                    expression,
+                    child_output(input)?,
+                    context,
+                    registry,
+                )?
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                let output = state.output_value()?;
+                (FlatMaintainedRelPlanNodeKind::TopK { input, state }, output)
+            }
+        };
+
+        stats.local_cell_initializations = stats
+            .local_cell_initializations
+            .checked_add(1)
+            .ok_or(RelQueryError::TransitionEpochExhausted)?;
+        let node = cells.len();
+        cells.push(Arc::new(RelObservationForestCell {
+            expression: expression.clone(),
+            inputs,
+            state: Arc::new(FlatMaintainedRelPlanNode { result_type, kind }),
+        }));
+        outputs.push(output);
+        if intern.insert(expression.clone(), node).is_some() {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        Ok(node)
+    }
+
+    pub fn bind_revision(
+        &mut self,
+        revision: kernel_types::RevisionId,
+    ) -> Result<(), RelQueryError> {
+        match self.world_revision {
+            Some(current) if current == revision => return Ok(()),
+            Some(_) => return Err(RelQueryError::RevisionBindingMismatch),
+            None => {}
+        }
+        let next_epoch = self
+            .transition_epoch
+            .checked_add(1)
+            .ok_or(RelQueryError::TransitionEpochExhausted)?;
+        self.world_revision = Some(revision);
+        self.root_revisions.fill(Some(revision));
+        self.transition_epoch = next_epoch;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Option<kernel_types::RevisionId> {
+        self.world_revision
+    }
+
+    #[must_use]
+    pub fn root_revision(&self, root: usize) -> Option<kernel_types::RevisionId> {
+        self.root_revisions.get(root).copied().flatten()
+    }
+
+    #[must_use]
+    pub fn root_count(&self) -> usize {
+        self.roots.len()
+    }
+
+    #[must_use]
+    pub fn unique_node_count(&self) -> usize {
+        self.cells.len()
+    }
+
+    #[must_use]
+    pub fn fanout_edge_count(&self) -> usize {
+        self.fanout.iter().map(|edges| edges.len()).sum()
+    }
+
+    #[must_use]
+    pub fn root_node(&self, root: usize) -> Option<RelObservationForestNodeId> {
+        self.roots.get(root).copied()
+    }
+
+    #[must_use]
+    pub fn root_expression(&self, root: usize) -> Option<&RelExpr> {
+        let node = *self.roots.get(root)?;
+        self.cells.get(node).map(|cell| &cell.expression)
+    }
+
+    pub fn root_output_value(
+        &self,
+        root: usize,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelationValue, RelQueryError> {
+        if context != &self.semantic_context {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let node = *self
+            .roots
+            .get(root)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        self.output_value_from_cell(node, context, registry)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
+    fn output_value_from_cell(
+        &self,
+        node_id: RelObservationForestNodeId,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<RelationValue, RelQueryError> {
+        let cell = self
+            .cells
+            .get(node_id)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let node = cell.state.as_ref();
+        match &node.kind {
+            FlatMaintainedRelPlanNodeKind::Scan { value, handles, .. } => {
+                let rows = if let Some(handles) = handles {
+                    handles.ordered_rows(value)?
+                } else {
+                    value.iter().cloned().collect()
+                };
+                Ok(relation_value_from_rows(rows, &node.result_type))
+            }
+            FlatMaintainedRelPlanNodeKind::Filter {
+                column,
+                value,
+                equivalence,
+                ..
+            } => {
+                let RelObservationForestInputs::Unary(input) = cell.inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let input_value = self.output_value_from_cell(input, context, registry)?;
+                let input_type = self.cells[input].state.result_type.clone();
+                let filtered = rel_delta_filter(
+                    RelationDelta {
+                        inserted: input_value.into_rows(),
+                        removed: Vec::new(),
+                        result_type: input_type,
+                    },
+                    *column,
+                    value,
+                    *equivalence,
+                    context,
+                    registry,
+                )?;
+                Ok(relation_value_from_rows(
+                    filtered.inserted,
+                    &node.result_type,
+                ))
+            }
+            FlatMaintainedRelPlanNodeKind::FilterOrder {
+                column,
+                value,
+                ordering,
+                comparison,
+                ..
+            } => {
+                let RelObservationForestInputs::Unary(input) = cell.inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let input_value = self.output_value_from_cell(input, context, registry)?;
+                let input_type = self.cells[input].state.result_type.clone();
+                let filtered = rel_delta_filter_order_const(
+                    RelationDelta {
+                        inserted: input_value.into_rows(),
+                        removed: Vec::new(),
+                        result_type: input_type,
+                    },
+                    *column,
+                    value,
+                    *ordering,
+                    *comparison,
+                    context,
+                    registry,
+                )?;
+                Ok(relation_value_from_rows(
+                    filtered.inserted,
+                    &node.result_type,
+                ))
+            }
+            FlatMaintainedRelPlanNodeKind::FilterColumns {
+                left_column,
+                right_column,
+                equivalence,
+                ..
+            } => {
+                let RelObservationForestInputs::Unary(input) = cell.inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let input_value = self.output_value_from_cell(input, context, registry)?;
+                let input_type = self.cells[input].state.result_type.clone();
+                let filtered = rel_delta_filter_columns(
+                    RelationDelta {
+                        inserted: input_value.into_rows(),
+                        removed: Vec::new(),
+                        result_type: input_type,
+                    },
+                    *left_column,
+                    *right_column,
+                    *equivalence,
+                    context,
+                    registry,
+                )?;
+                Ok(relation_value_from_rows(
+                    filtered.inserted,
+                    &node.result_type,
+                ))
+            }
+            FlatMaintainedRelPlanNodeKind::ProjectBag { columns, .. } => {
+                let RelObservationForestInputs::Unary(input) = cell.inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let rows = project_rows(
+                    self.output_value_from_cell(input, context, registry)?
+                        .into_rows(),
+                    columns,
+                )?;
+                Ok(relation_value_from_rows(rows, &node.result_type))
+            }
+            FlatMaintainedRelPlanNodeKind::ProjectSet { supports, .. }
+            | FlatMaintainedRelPlanNodeKind::Distinct { supports, .. } => {
+                Ok(supports.output_value())
+            }
+            FlatMaintainedRelPlanNodeKind::PromoteToBag { .. } => {
+                let RelObservationForestInputs::Unary(input) = cell.inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                Ok(RelationValue::Bag(
+                    self.output_value_from_cell(input, context, registry)?
+                        .into_rows(),
+                ))
+            }
+            FlatMaintainedRelPlanNodeKind::UnionBag { .. } => {
+                let RelObservationForestInputs::Binary { left, right } = cell.inputs else {
+                    return Err(RelQueryError::InconsistentIncrementalDelta);
+                };
+                let mut rows = self
+                    .output_value_from_cell(left, context, registry)?
+                    .into_rows();
+                rows.extend(
+                    self.output_value_from_cell(right, context, registry)?
+                        .into_rows(),
+                );
+                Ok(RelationValue::Bag(rows))
+            }
+            FlatMaintainedRelPlanNodeKind::UnionSet { supports, .. } => Ok(supports.output_value()),
+            FlatMaintainedRelPlanNodeKind::Blocker { state, .. } => state.output_value(),
+            FlatMaintainedRelPlanNodeKind::Join { state, .. } => {
+                state.output_value(context, registry)
+            }
+            FlatMaintainedRelPlanNodeKind::Group { state, .. } => state.output_value(),
+            FlatMaintainedRelPlanNodeKind::TopK { state, .. } => state.output_value(),
+        }
+    }
+
+    pub fn candidate_from_relation_deltas_for_revision(
+        &self,
+        target_revision: kernel_types::RevisionId,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(Self, Vec<RelationDelta>), RelQueryError> {
+        self.candidate_from_relation_deltas_for_revision_with_stats(
+            target_revision,
+            deltas,
+            context,
+            registry,
+        )
+        .map(|(candidate, effects, _)| (candidate, effects))
+    }
+
+    #[doc(hidden)]
+    pub fn candidate_from_relation_deltas_for_revision_with_stats(
+        &self,
+        target_revision: kernel_types::RevisionId,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(Self, Vec<RelationDelta>, usize), RelQueryError> {
+        let source_revision = self
+            .world_revision
+            .ok_or(RelQueryError::RevisionBindingMismatch)?;
+        if source_revision == target_revision {
+            return Err(RelQueryError::InvalidRevisionTransition);
+        }
+        if context != &self.semantic_context {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let next_epoch = self
+            .transition_epoch
+            .checked_add(1)
+            .ok_or(RelQueryError::TransitionEpochExhausted)?;
+        let planned = self.plan_relation_deltas(deltas, context, registry)?;
+        let visited_nodes = planned.visited_nodes;
+        let mut outputs = Vec::with_capacity(self.roots.len());
+        for (route, &root) in self.roots.iter().enumerate() {
+            let result_type = self
+                .cells
+                .get(root)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?
+                .state
+                .result_type
+                .clone();
+            outputs.push(materialize_exact_delta_view(
+                &planned.effects[route],
+                result_type,
+            )?);
+        }
+        let mut candidate = self.clone();
+        candidate.commit_planned_transition(planned);
+        candidate.world_revision = Some(target_revision);
+        for relation in deltas.keys() {
+            if let Some(routes) = candidate.roots_by_relation.get(relation) {
+                for &route in &**routes {
+                    candidate.root_revisions[route] = Some(target_revision);
+                }
+            }
+        }
+        candidate.transition_epoch = next_epoch;
+        Ok((candidate, outputs, visited_nodes))
+    }
+
+    pub fn rewind_forward_deltas_for_revision_with_stats(
+        &self,
+        source_revision: kernel_types::RevisionId,
+        forward: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(Self, Vec<RelationDelta>, usize), RelQueryError> {
+        let inverse = forward
+            .iter()
+            .map(|(relation, delta)| {
+                (
+                    *relation,
+                    RelationDelta {
+                        inserted: delta.removed.clone(),
+                        removed: delta.inserted.clone(),
+                        result_type: delta.result_type.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.candidate_from_relation_deltas_for_revision_with_stats(
+            source_revision,
+            &inverse,
+            context,
+            registry,
+        )
+    }
+
+    pub fn impact_root_relation_deltas(
+        &self,
+        root: usize,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Impact, RelQueryError> {
+        if context != &self.semantic_context {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let node = *self
+            .roots
+            .get(root)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        let planned = self.plan_relation_deltas(deltas, context, registry)?;
+        let result_type = self
+            .cells
+            .get(node)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?
+            .state
+            .result_type
+            .clone();
+        let output = materialize_exact_delta_view(&planned.effects[root], result_type)?;
+        Ok(if output.is_empty() {
+            Impact::Unaffected
+        } else {
+            Impact::Changed
+        })
+    }
+
+    pub fn impact_relation_deltas(
+        &self,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Vec<Impact>, RelQueryError> {
+        if context != &self.semantic_context {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let planned = self.plan_relation_deltas(deltas, context, registry)?;
+        planned
+            .effects
+            .iter()
+            .enumerate()
+            .map(|(route, effect)| {
+                let root = self.roots[route];
+                let result_type = self.cells[root].state.result_type.clone();
+                let output = materialize_exact_delta_view(effect, result_type)?;
+                Ok(if output.is_empty() {
+                    Impact::Unaffected
+                } else {
+                    Impact::Changed
+                })
+            })
+            .collect()
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
+    fn plan_relation_deltas(
+        &self,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<PlannedRelObservationForestTransition, RelQueryError> {
+        let mut scratch = UnifiedTransitionScratch::default();
+        scratch.ensure_nodes(self.cells.len());
+        let mut patches = Vec::new();
+        let mut root_effects = vec![MaintainedDelta::default(); self.roots.len()];
+        let mut visited_nodes = 0usize;
+        let mut equality_rows_classified = 0usize;
+        let mut ordered_rows_classified = 0usize;
+        let mut fused_filter_effects = 0usize;
+
+        for (relation, delta) in deltas {
+            let node_id = *self
+                .sources
+                .get(relation)
+                .ok_or(RelQueryError::UnknownRelation(*relation))?;
+            visited_nodes = visited_nodes
+                .checked_add(1)
+                .ok_or(RelQueryError::TransitionEpochExhausted)?;
+            let cell = self
+                .cells
+                .get(node_id)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let node = cell.state.as_ref();
+            let FlatMaintainedRelPlanNodeKind::Scan {
+                relation: node_relation,
+                value,
+                canonical_lookup,
+                ..
+            } = &node.kind
+            else {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            };
+            if node_relation != relation {
+                return Err(RelQueryError::InconsistentIncrementalDelta);
+            }
+            if delta.result_type != node.result_type {
+                return Err(RelQueryError::TypeMismatch);
+            }
+            MaterializedSetSupportState::validate_rows(
+                &delta.removed,
+                &node.result_type,
+                context,
+                registry,
+            )?;
+            MaterializedSetSupportState::validate_rows(
+                &delta.inserted,
+                &node.result_type,
+                context,
+                registry,
+            )?;
+            let plan = plan_relation_mutation(
+                value,
+                delta,
+                &node.result_type,
+                canonical_lookup,
+                context,
+                registry,
+            )?;
+            patches.push((
+                node_id,
+                GraphNodePatch::Scan(MaintainedScanCommitPatch::Semantic(plan)),
+            ));
+            let effect = maintained_delta_from_relation_delta(delta.clone());
+            self.record_root_effect(node_id, &effect, &mut root_effects);
+            self.deliver_fanout(
+                node_id,
+                &effect,
+                &mut scratch,
+                &mut root_effects,
+                context,
+                registry,
+                &mut visited_nodes,
+                &mut equality_rows_classified,
+                &mut ordered_rows_classified,
+                &mut fused_filter_effects,
+            )?;
+        }
+
+        while let Some((node_id, inbox)) = scratch.pop_next() {
+            visited_nodes = visited_nodes
+                .checked_add(1)
+                .ok_or(RelQueryError::TransitionEpochExhausted)?;
+            let cell = self
+                .cells
+                .get(node_id)
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            let planned = MaterializedRelPlanState::plan_execgraph_node(
+                cell.state.as_ref(),
+                inbox,
+                context,
+                registry,
+            )?;
+            if let Some(patch) = planned.patch {
+                patches.push((node_id, patch));
+            }
+            self.record_root_effect(node_id, &planned.effect, &mut root_effects);
+            self.deliver_fanout(
+                node_id,
+                &planned.effect,
+                &mut scratch,
+                &mut root_effects,
+                context,
+                registry,
+                &mut visited_nodes,
+                &mut equality_rows_classified,
+                &mut ordered_rows_classified,
+                &mut fused_filter_effects,
+            )?;
+        }
+        scratch.finish_success();
+        patches.sort_unstable_by_key(|(node, _)| *node);
+        if patches.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        Ok(PlannedRelObservationForestTransition {
+            patches,
+            effects: root_effects,
+            visited_nodes,
+            equality_rows_classified,
+            ordered_rows_classified,
+            fused_filter_effects,
+        })
+    }
+
+    fn record_root_effect(
+        &self,
+        node: RelObservationForestNodeId,
+        effect: &MaintainedDelta,
+        roots: &mut [MaintainedDelta],
+    ) {
+        for &route in &*self.root_routes[node] {
+            roots[route] = effect.clone();
+        }
+    }
+
+    #[allow(
+        clippy::only_used_in_recursion,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "Keep recursive fanout semantics and explicit semantic context together."
+    )]
+    fn deliver_fanout(
+        &self,
+        node: RelObservationForestNodeId,
+        effect: &MaintainedDelta,
+        scratch: &mut UnifiedTransitionScratch<MaintainedDelta>,
+        root_effects: &mut [MaintainedDelta],
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+        visited_nodes: &mut usize,
+        equality_rows_classified: &mut usize,
+        ordered_rows_classified: &mut usize,
+        fused_filter_effects: &mut usize,
+    ) -> Result<(), RelQueryError> {
+        if effect.support_len() == 0 {
+            return Ok(());
+        }
+        let plan = self
+            .fanout_plans
+            .get(node)
+            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+        for edge in &*plan.ordinary {
+            scratch.deliver(edge.node, edge.slot, effect.clone())?;
+        }
+
+        for family in &*plan.equality {
+            let mut routed = BTreeMap::<RelObservationForestNodeId, MaintainedDelta>::new();
+            let mut error = None;
+            effect.visit_exact(|weight, row| {
+                if error.is_some() {
+                    return;
+                }
+                let Some(value) = row.get(family.column) else {
+                    error = Some(RelQueryError::ColumnOutOfBounds);
+                    return;
+                };
+                let key = match family.compiled.canonical_key(value) {
+                    Ok(key) => key,
+                    Err(next) => {
+                        error = Some(next.into());
+                        return;
+                    }
+                };
+                *equality_rows_classified = equality_rows_classified.saturating_add(1);
+                if let Some(routes) = family.routes.get(&key) {
+                    for &route in &**routes {
+                        routed
+                            .entry(route)
+                            .or_default()
+                            .push_exact(weight.clone(), row.clone());
+                    }
+                }
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+            for (route, filtered) in routed {
+                *visited_nodes = visited_nodes
+                    .checked_add(1)
+                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                *fused_filter_effects = fused_filter_effects
+                    .checked_add(1)
+                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                self.record_root_effect(route, &filtered, root_effects);
+                self.deliver_fanout(
+                    route,
+                    &filtered,
+                    scratch,
+                    root_effects,
+                    context,
+                    registry,
+                    visited_nodes,
+                    equality_rows_classified,
+                    ordered_rows_classified,
+                    fused_filter_effects,
+                )?;
+            }
+        }
+
+        for family in &*plan.ordered {
+            let mut routed = BTreeMap::<RelObservationForestNodeId, MaintainedDelta>::new();
+            let mut error = None;
+            effect.visit_exact(|weight, row| {
+                if error.is_some() {
+                    return;
+                }
+                let Some(value) = row.get(family.column) else {
+                    error = Some(RelQueryError::ColumnOutOfBounds);
+                    return;
+                };
+                let key = match family.compiled.canonical_key(value) {
+                    Ok(key) => key,
+                    Err(next) => {
+                        error = Some(next.into());
+                        return;
+                    }
+                };
+                *ordered_rows_classified = ordered_rows_classified.saturating_add(1);
+                let families = [
+                    (crate::OrderComparison::Less, family.less.as_ref()),
+                    (
+                        crate::OrderComparison::LessOrEqual,
+                        family.less_or_equal.as_ref(),
+                    ),
+                    (crate::OrderComparison::Greater, family.greater.as_ref()),
+                    (
+                        crate::OrderComparison::GreaterOrEqual,
+                        family.greater_or_equal.as_ref(),
+                    ),
+                ];
+                for (comparison, cuts) in families {
+                    let boundary = match comparison {
+                        crate::OrderComparison::Less => cuts.partition_point(|cut| cut.key <= key),
+                        crate::OrderComparison::LessOrEqual => {
+                            cuts.partition_point(|cut| cut.key < key)
+                        }
+                        crate::OrderComparison::Greater => {
+                            cuts.partition_point(|cut| cut.key < key)
+                        }
+                        crate::OrderComparison::GreaterOrEqual => {
+                            cuts.partition_point(|cut| cut.key <= key)
+                        }
+                    };
+                    let matching: &[RelObservationOrderCut] = match comparison {
+                        crate::OrderComparison::Less | crate::OrderComparison::LessOrEqual => {
+                            &cuts[boundary..]
+                        }
+                        crate::OrderComparison::Greater
+                        | crate::OrderComparison::GreaterOrEqual => &cuts[..boundary],
+                    };
+                    for cut in matching {
+                        for &route in &*cut.routes {
+                            routed
+                                .entry(route)
+                                .or_default()
+                                .push_exact(weight.clone(), row.clone());
+                        }
+                    }
+                }
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+            for (route, filtered) in routed {
+                *visited_nodes = visited_nodes
+                    .checked_add(1)
+                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                *fused_filter_effects = fused_filter_effects
+                    .checked_add(1)
+                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                self.record_root_effect(route, &filtered, root_effects);
+                self.deliver_fanout(
+                    route,
+                    &filtered,
+                    scratch,
+                    root_effects,
+                    context,
+                    registry,
+                    visited_nodes,
+                    equality_rows_classified,
+                    ordered_rows_classified,
+                    fused_filter_effects,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_planned_transition(&mut self, planned: PlannedRelObservationForestTransition) {
+        for (node, patch) in planned.patches {
+            let cell = Arc::make_mut(
+                self.cells
+                    .get_mut(node)
+                    .expect("forest patch node must exist"),
+            );
+            let state = Arc::make_mut(&mut cell.state);
+            MaterializedRelPlanState::commit_flat_node_patch(state, patch);
+        }
+    }
+
+    #[cfg(test)]
+    fn test_transition_work(
+        &self,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(usize, usize), RelQueryError> {
+        let planned = self.plan_relation_deltas(deltas, context, registry)?;
+        Ok((planned.visited_nodes, self.cells.len()))
+    }
+
+    #[cfg(test)]
+    fn test_parameter_family_work(
+        &self,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(usize, usize, usize), RelQueryError> {
+        let planned = self.plan_relation_deltas(deltas, context, registry)?;
+        Ok((
+            planned.equality_rows_classified,
+            planned.ordered_rows_classified,
+            planned.fused_filter_effects,
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -1383,6 +3133,72 @@ impl MaterializedRelPlanState {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Exact non-mutating Γ-DTC impact of semantic source deltas against this
+    /// maintained state. This is the causal-proof boundary: it consumes the
+    /// hidden maintained state directly and never replays the query/model.
+    pub fn impact_relation_deltas(
+        &self,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Impact, RelQueryError> {
+        if context != &self.semantic_context {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        if deltas.is_empty() {
+            return Ok(Impact::Unaffected);
+        }
+        let mut frames = self.validate_leaf_deltas(deltas, context, registry)?;
+        let mut scratch = UnifiedTransitionScratch::default();
+        let planned = self.plan_relation_deltas_execgraph_with_scratch(
+            &mut frames,
+            context,
+            registry,
+            &mut scratch,
+        )?;
+        let output = materialize_exact_delta_view(&planned.root_effect, self.result_type.clone())?;
+        Ok(if output.is_empty() {
+            Impact::Unaffected
+        } else {
+            Impact::Changed
+        })
+    }
+
+    /// Advances or rewinds a revision-bound maintained state using exact
+    /// semantic relation deltas. This path deliberately has no physical-handle
+    /// dependency: causal reconstruction is derived authority and is rebuilt
+    /// from durable semantic effects, not from a second physical history store.
+    pub fn candidate_from_relation_deltas_for_revision(
+        &self,
+        target_revision: kernel_types::RevisionId,
+        deltas: &BTreeMap<kernel_types::SemanticId, RelationDelta>,
+        context: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(Self, RelationDelta), RelQueryError> {
+        let source_revision = self
+            .revision
+            .ok_or(RelQueryError::RevisionBindingMismatch)?;
+        if source_revision == target_revision {
+            return Err(RelQueryError::InvalidRevisionTransition);
+        }
+        if context != &self.semantic_context {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let mut candidate = self.clone();
+        let mut frames = candidate.validate_leaf_deltas(deltas, context, registry)?;
+        let next_epoch = candidate
+            .transition_epoch
+            .checked_add(1)
+            .ok_or(RelQueryError::TransitionEpochExhausted)?;
+        let planned = candidate.plan_relation_deltas_execgraph(&mut frames, context, registry)?;
+        let output =
+            materialize_exact_delta_view(&planned.root_effect, candidate.result_type.clone())?;
+        candidate.commit_graph_patch_set(planned);
+        candidate.revision = Some(target_revision);
+        candidate.transition_epoch = next_epoch;
+        Ok((candidate, output))
     }
 
     pub fn output_value(
@@ -2783,55 +4599,56 @@ impl MaterializedRelPlanState {
                     .get_mut(node_id)
                     .expect("execgraph patch NodeId must exist in flat arena"),
             );
-            match (&mut node.kind, patch) {
-                (
-                    FlatMaintainedRelPlanNodeKind::Scan {
+            Self::commit_flat_node_patch(node, patch);
+        }
+    }
+
+    fn commit_flat_node_patch(node: &mut FlatMaintainedRelPlanNode, patch: GraphNodePatch) {
+        match (&mut node.kind, patch) {
+            (
+                FlatMaintainedRelPlanNodeKind::Scan {
+                    value,
+                    handles,
+                    base_witness,
+                    canonical_lookup,
+                    ..
+                },
+                GraphNodePatch::Scan(patch),
+            ) => match patch {
+                MaintainedScanCommitPatch::Semantic(plan) => {
+                    commit_relation_mutation(value, canonical_lookup, plan);
+                    *base_witness = None;
+                }
+                MaintainedScanCommitPatch::StorageResolved(plan) => {
+                    Self::commit_storage_resolved_scan_patch(
                         value,
                         handles,
                         base_witness,
                         canonical_lookup,
-                        ..
-                    },
-                    GraphNodePatch::Scan(patch),
-                ) => match patch {
-                    MaintainedScanCommitPatch::Semantic(plan) => {
-                        commit_relation_mutation(value, canonical_lookup, plan);
-                        *base_witness = None;
-                    }
-                    MaintainedScanCommitPatch::StorageResolved(plan) => {
-                        Self::commit_storage_resolved_scan_patch(
-                            value,
-                            handles,
-                            base_witness,
-                            canonical_lookup,
-                            plan,
-                        );
-                    }
-                },
-                (
-                    FlatMaintainedRelPlanNodeKind::ProjectSet { supports, .. }
-                    | FlatMaintainedRelPlanNodeKind::Distinct { supports, .. }
-                    | FlatMaintainedRelPlanNodeKind::UnionSet { supports, .. },
-                    GraphNodePatch::SetSupport(patch),
-                ) => supports.commit_support_patch(patch),
-                (
-                    FlatMaintainedRelPlanNodeKind::Blocker { state, .. },
-                    GraphNodePatch::Blocker(patch),
-                ) => state.commit_patch(patch),
-                (
-                    FlatMaintainedRelPlanNodeKind::Join { state, .. },
-                    GraphNodePatch::Join(patch),
-                ) => state.commit_join_patch(patch),
-                (
-                    FlatMaintainedRelPlanNodeKind::Group { state, .. },
-                    GraphNodePatch::Group(patch),
-                ) => state.commit_sealed_patch(patch),
-                (
-                    FlatMaintainedRelPlanNodeKind::TopK { state, .. },
-                    GraphNodePatch::TopK(patch),
-                ) => state.commit_topk_patch(patch),
-                _ => unreachable!("execgraph patch/flat-arena node mismatch"),
+                        plan,
+                    );
+                }
+            },
+            (
+                FlatMaintainedRelPlanNodeKind::ProjectSet { supports, .. }
+                | FlatMaintainedRelPlanNodeKind::Distinct { supports, .. }
+                | FlatMaintainedRelPlanNodeKind::UnionSet { supports, .. },
+                GraphNodePatch::SetSupport(patch),
+            ) => supports.commit_support_patch(patch),
+            (
+                FlatMaintainedRelPlanNodeKind::Blocker { state, .. },
+                GraphNodePatch::Blocker(patch),
+            ) => state.commit_patch(patch),
+            (FlatMaintainedRelPlanNodeKind::Join { state, .. }, GraphNodePatch::Join(patch)) => {
+                state.commit_join_patch(patch);
             }
+            (FlatMaintainedRelPlanNodeKind::Group { state, .. }, GraphNodePatch::Group(patch)) => {
+                state.commit_sealed_patch(patch);
+            }
+            (FlatMaintainedRelPlanNodeKind::TopK { state, .. }, GraphNodePatch::TopK(patch)) => {
+                state.commit_topk_patch(patch);
+            }
+            _ => unreachable!("execgraph patch/flat-arena node mismatch"),
         }
     }
 
@@ -3388,8 +5205,8 @@ mod tests {
         RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext, SemanticEnvironment,
         TypeExpr,
     };
-    use kernel_semantics::{EquivalenceModule, SemanticRegistry};
-    use kernel_types::{SchemaRevisionId, SemanticEnvId, SemanticId};
+    use kernel_semantics::{EquivalenceModule, OrderingModule, SemanticRegistry};
+    use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
 
     fn setup() -> (
         SemanticContext,
@@ -3428,6 +5245,754 @@ mod tests {
             environment,
         };
         (context, registry, text_eq, left, right)
+    }
+
+    fn forest_setup() -> (
+        SemanticContext,
+        SemanticRegistry,
+        SemanticId,
+        SemanticId,
+        SemanticId,
+        SemanticId,
+        FiniteModel,
+    ) {
+        let eq = SemanticId::new(500);
+        let order = SemanticId::new(501);
+        let left = SemanticId::new(502);
+        let right = SemanticId::new(503);
+        let mut registry = SemanticRegistry::default();
+        let eq_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let order_digest = registry.install_ordering(OrderingModule::I64Ascending);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(500));
+        environment.pin_module(eq, eq_digest);
+        environment.pin_module(order, order_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(500));
+        for relation in [left, right] {
+            schema
+                .define_relation(RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![eq],
+                    },
+                })
+                .unwrap();
+        }
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            left,
+            vec![
+                vec![Value::I64(1)],
+                vec![Value::I64(2)],
+                vec![Value::I64(3)],
+            ],
+        );
+        model
+            .relations
+            .insert(right, vec![vec![Value::I64(2)], vec![Value::I64(4)]]);
+        (context, registry, eq, order, left, right, model)
+    }
+
+    #[test]
+    fn p492_bottom_up_forest_initializes_each_unique_cell_once() {
+        let (context, registry, eq, _, left, _, model) = forest_setup();
+        let roots = (0..64)
+            .map(|value| RelExpr::FilterEqConst {
+                input: Box::new(RelExpr::Scan(left)),
+                column: 0,
+                value: Value::I64(value),
+                equivalence: eq,
+            })
+            .collect::<Vec<_>>();
+
+        let (forest, stats) =
+            RelObservationForest::build_with_stats(&roots, &model, &context, &registry).unwrap();
+
+        assert_eq!(stats.root_occurrences, 64);
+        assert_eq!(stats.unique_cells, 65);
+        assert_eq!(stats.local_cell_initializations, 65);
+        assert_eq!(stats.source_materializations, 1);
+        assert_eq!(stats.source_rows_materialized, 3);
+        assert_eq!(stats.reused_subtrees, 63);
+        assert_eq!(forest.unique_node_count(), 65);
+        assert_eq!(forest.root_count(), 64);
+
+        for (route, query) in roots.iter().enumerate() {
+            let independent =
+                MaterializedRelPlanState::build(query, &model, &context, &registry).unwrap();
+            let ty = query.typecheck(&context, &registry).unwrap();
+            assert!(
+                relation_values_semantically_equivalent(
+                    &forest
+                        .root_output_value(route, &context, &registry)
+                        .unwrap(),
+                    &independent.output_value(&context, &registry).unwrap(),
+                    &ty,
+                    &context,
+                    &registry,
+                )
+                .unwrap(),
+                "bottom-up forest output diverged at root {route}"
+            );
+        }
+    }
+
+    #[test]
+    fn p492_bottom_up_self_join_materializes_shared_source_once() {
+        let (context, registry, eq, _, left, _, model) = forest_setup();
+        let query = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(left)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: eq,
+        };
+        let (forest, stats) = RelObservationForest::build_with_stats(
+            std::slice::from_ref(&query),
+            &model,
+            &context,
+            &registry,
+        )
+        .unwrap();
+        let independent =
+            MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        let ty = query.typecheck(&context, &registry).unwrap();
+
+        assert_eq!(stats.unique_cells, 2);
+        assert_eq!(stats.local_cell_initializations, 2);
+        assert_eq!(stats.source_materializations, 1);
+        assert_eq!(stats.source_rows_materialized, 3);
+        assert_eq!(stats.reused_subtrees, 1);
+        assert!(
+            relation_values_semantically_equivalent(
+                &forest.root_output_value(0, &context, &registry).unwrap(),
+                &independent.output_value(&context, &registry).unwrap(),
+                &ty,
+                &context,
+                &registry,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn p493_equality_family_dispatches_by_canonical_gamma_class_once_per_row() {
+        let (context, registry, text_eq, left, _) = setup();
+        let roots = ["alpha", "ALPHA", "beta", "gamma"]
+            .into_iter()
+            .map(|value| RelExpr::FilterEqConst {
+                input: Box::new(RelExpr::Scan(left)),
+                column: 0,
+                value: Value::Text(value.into()),
+                equivalence: text_eq,
+            })
+            .collect::<Vec<_>>();
+        let mut model = FiniteModel::default();
+        model
+            .relations
+            .insert(left, vec![vec![Value::Text("seed".into()), Value::I64(0)]]);
+        let mut forest = RelObservationForest::build(&roots, &model, &context, &registry).unwrap();
+        forest.bind_revision(RevisionId::new(0)).unwrap();
+        let delta = RelationDelta {
+            inserted: vec![vec![Value::Text("AlPhA".into()), Value::I64(7)]],
+            removed: Vec::new(),
+            result_type: RelExpr::Scan(left).typecheck(&context, &registry).unwrap(),
+        };
+        let deltas = BTreeMap::from([(left, delta)]);
+        let (eq_rows, ordered_rows, fused_effects) = forest
+            .test_parameter_family_work(&deltas, &context, &registry)
+            .unwrap();
+        assert_eq!(
+            eq_rows, 1,
+            "one changed row must be canonicalized once for the family"
+        );
+        assert_eq!(ordered_rows, 0);
+        assert_eq!(fused_effects, 2, "both spelling variants share one Γ class");
+
+        let (_, forest_effects) = forest
+            .candidate_from_relation_deltas_for_revision(
+                RevisionId::new(1),
+                &deltas,
+                &context,
+                &registry,
+            )
+            .unwrap();
+        for (route, query) in roots.iter().enumerate() {
+            let mut independent =
+                MaterializedRelPlanState::build(query, &model, &context, &registry).unwrap();
+            independent.bind_revision(RevisionId::new(0)).unwrap();
+            let (_, effect) = independent
+                .candidate_from_relation_deltas_for_revision(
+                    RevisionId::new(1),
+                    &deltas,
+                    &context,
+                    &registry,
+                )
+                .unwrap();
+            assert!(
+                relation_deltas_semantically_equivalent(
+                    &forest_effects[route],
+                    &effect,
+                    &context,
+                    &registry,
+                )
+                .unwrap(),
+                "equality-family root {route} diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn p493_ordered_cut_families_use_one_order_key_and_binary_boundary_per_family() {
+        let (context, registry, _, order, left, _, model) = forest_setup();
+        let comparisons = [
+            crate::OrderComparison::Less,
+            crate::OrderComparison::LessOrEqual,
+            crate::OrderComparison::Greater,
+            crate::OrderComparison::GreaterOrEqual,
+        ];
+        let roots = comparisons
+            .into_iter()
+            .flat_map(|comparison| {
+                [2_i64, 4, 6]
+                    .into_iter()
+                    .map(move |threshold| RelExpr::FilterOrderConst {
+                        input: Box::new(RelExpr::Scan(left)),
+                        column: 0,
+                        value: Value::I64(threshold),
+                        ordering: order,
+                        comparison,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut forest = RelObservationForest::build(&roots, &model, &context, &registry).unwrap();
+        forest.bind_revision(RevisionId::new(0)).unwrap();
+        let delta = RelationDelta {
+            inserted: vec![vec![Value::I64(4)]],
+            removed: Vec::new(),
+            result_type: RelExpr::Scan(left).typecheck(&context, &registry).unwrap(),
+        };
+        let deltas = BTreeMap::from([(left, delta)]);
+        let (eq_rows, ordered_rows, fused_effects) = forest
+            .test_parameter_family_work(&deltas, &context, &registry)
+            .unwrap();
+        assert_eq!(eq_rows, 0);
+        assert_eq!(
+            ordered_rows, 1,
+            "the row must be canonicalized once for the whole ordering family, not once per comparator/cut"
+        );
+        assert_eq!(fused_effects, 6);
+
+        let (_, forest_effects) = forest
+            .candidate_from_relation_deltas_for_revision(
+                RevisionId::new(1),
+                &deltas,
+                &context,
+                &registry,
+            )
+            .unwrap();
+        for (route, query) in roots.iter().enumerate() {
+            let mut independent =
+                MaterializedRelPlanState::build(query, &model, &context, &registry).unwrap();
+            independent.bind_revision(RevisionId::new(0)).unwrap();
+            let (_, effect) = independent
+                .candidate_from_relation_deltas_for_revision(
+                    RevisionId::new(1),
+                    &deltas,
+                    &context,
+                    &registry,
+                )
+                .unwrap();
+            assert!(
+                relation_deltas_semantically_equivalent(
+                    &forest_effects[route],
+                    &effect,
+                    &context,
+                    &registry,
+                )
+                .unwrap(),
+                "ordered-cut root {route} diverged"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
+    fn p494_one_axis_order_conjunction_has_exact_interval_normal_form() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Bound {
+            key: kernel_semantics::CanonicalOrderKey,
+            inclusive: bool,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Default)]
+        struct Interval {
+            lower: Option<Bound>,
+            upper: Option<Bound>,
+        }
+
+        impl Interval {
+            fn intersect_lower(&mut self, next: Bound) {
+                match &mut self.lower {
+                    None => self.lower = Some(next),
+                    Some(current) if next.key > current.key => *current = next,
+                    Some(current) if next.key == current.key => {
+                        current.inclusive &= next.inclusive;
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            fn intersect_upper(&mut self, next: Bound) {
+                match &mut self.upper {
+                    None => self.upper = Some(next),
+                    Some(current) if next.key < current.key => *current = next,
+                    Some(current) if next.key == current.key => {
+                        current.inclusive &= next.inclusive;
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            fn contains(&self, key: &kernel_semantics::CanonicalOrderKey) -> bool {
+                let lower_ok = self
+                    .lower
+                    .as_ref()
+                    .is_none_or(|lower| key > &lower.key || (lower.inclusive && key == &lower.key));
+                let upper_ok = self
+                    .upper
+                    .as_ref()
+                    .is_none_or(|upper| key < &upper.key || (upper.inclusive && key == &upper.key));
+                lower_ok && upper_ok
+            }
+        }
+
+        let (context, registry, _, ordering, left, _, _) = forest_setup();
+        let compiled = registry.compile_ordering(&context, ordering).unwrap();
+        let mut interval = Interval::default();
+        for (comparison, threshold) in [
+            (crate::OrderComparison::GreaterOrEqual, 2_i64),
+            (crate::OrderComparison::Greater, 1_i64),
+            (crate::OrderComparison::LessOrEqual, 5_i64),
+            (crate::OrderComparison::Less, 6_i64),
+        ] {
+            let bound = Bound {
+                key: compiled.canonical_key(&Value::I64(threshold)).unwrap(),
+                inclusive: matches!(
+                    comparison,
+                    crate::OrderComparison::GreaterOrEqual | crate::OrderComparison::LessOrEqual
+                ),
+            };
+            match comparison {
+                crate::OrderComparison::Greater | crate::OrderComparison::GreaterOrEqual => {
+                    interval.intersect_lower(bound);
+                }
+                crate::OrderComparison::Less | crate::OrderComparison::LessOrEqual => {
+                    interval.intersect_upper(bound);
+                }
+            }
+        }
+
+        let query = RelExpr::FilterOrderConst {
+            input: Box::new(RelExpr::FilterOrderConst {
+                input: Box::new(RelExpr::FilterOrderConst {
+                    input: Box::new(RelExpr::FilterOrderConst {
+                        input: Box::new(RelExpr::Scan(left)),
+                        column: 0,
+                        value: Value::I64(2),
+                        ordering,
+                        comparison: crate::OrderComparison::GreaterOrEqual,
+                    }),
+                    column: 0,
+                    value: Value::I64(1),
+                    ordering,
+                    comparison: crate::OrderComparison::Greater,
+                }),
+                column: 0,
+                value: Value::I64(5),
+                ordering,
+                comparison: crate::OrderComparison::LessOrEqual,
+            }),
+            column: 0,
+            value: Value::I64(6),
+            ordering,
+            comparison: crate::OrderComparison::Less,
+        };
+
+        let mut model = FiniteModel::default();
+        model.relations.insert(
+            left,
+            (-1_i64..=8).map(|value| vec![Value::I64(value)]).collect(),
+        );
+        let actual = query.evaluate(&model, &context, &registry).unwrap();
+        let expected = model.relations[&left]
+            .iter()
+            .filter(|row| interval.contains(&compiled.canonical_key(&row[0]).unwrap()))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(actual.into_rows(), expected);
+        assert_eq!(
+            interval.lower.as_ref().unwrap().key,
+            compiled.canonical_key(&Value::I64(2)).unwrap()
+        );
+        assert!(interval.lower.as_ref().unwrap().inclusive);
+        assert_eq!(
+            interval.upper.as_ref().unwrap().key,
+            compiled.canonical_key(&Value::I64(5)).unwrap()
+        );
+        assert!(interval.upper.as_ref().unwrap().inclusive);
+    }
+
+    #[test]
+    fn p494_multiaxis_conjunction_has_no_single_scalar_family_key() {
+        let eq = SemanticId::new(610);
+        let ordering = SemanticId::new(611);
+        let relation = SemanticId::new(612);
+        let mut registry = SemanticRegistry::default();
+        let eq_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+        let order_digest = registry.install_ordering(OrderingModule::I64Ascending);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(610));
+        environment.pin_module(eq, eq_digest);
+        environment.pin_module(ordering, order_digest);
+        let mut schema = Schema::new(SchemaRevisionId::new(610));
+        schema
+            .define_relation(RelationDef {
+                id: relation,
+                columns: vec![
+                    TypeExpr::Scalar(ScalarType::I64),
+                    TypeExpr::Scalar(ScalarType::I64),
+                ],
+                semantics: RelationSemantics::Bag {
+                    column_equivalences: vec![eq, eq],
+                },
+            })
+            .unwrap();
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+
+        let quadrant = |x_positive: bool, y_positive: bool| {
+            let x = RelExpr::FilterOrderConst {
+                input: Box::new(RelExpr::Scan(relation)),
+                column: 0,
+                value: Value::I64(0),
+                ordering,
+                comparison: if x_positive {
+                    crate::OrderComparison::GreaterOrEqual
+                } else {
+                    crate::OrderComparison::Less
+                },
+            };
+            RelExpr::FilterOrderConst {
+                input: Box::new(x),
+                column: 1,
+                value: Value::I64(0),
+                ordering,
+                comparison: if y_positive {
+                    crate::OrderComparison::GreaterOrEqual
+                } else {
+                    crate::OrderComparison::Less
+                },
+            }
+        };
+        let roots = [
+            quadrant(true, true),
+            quadrant(true, false),
+            quadrant(false, true),
+            quadrant(false, false),
+        ];
+
+        let membership = |row: Row| {
+            roots
+                .iter()
+                .map(|query| {
+                    let mut model = FiniteModel::default();
+                    model.relations.insert(relation, vec![row.clone()]);
+                    !query
+                        .evaluate(&model, &context, &registry)
+                        .unwrap()
+                        .rows()
+                        .is_empty()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let pp = vec![Value::I64(1), Value::I64(1)];
+        let pn = vec![Value::I64(1), Value::I64(-1)];
+        let np = vec![Value::I64(-1), Value::I64(1)];
+        let compiled = registry.compile_ordering(&context, ordering).unwrap();
+
+        assert_eq!(
+            compiled.canonical_key(&pp[0]).unwrap(),
+            compiled.canonical_key(&pn[0]).unwrap(),
+            "fixture must keep the x scalar family key identical"
+        );
+        assert_ne!(
+            membership(pp.clone()),
+            membership(pn),
+            "the same x key has different conjunction routing because y matters"
+        );
+        assert_eq!(
+            compiled.canonical_key(&pp[1]).unwrap(),
+            compiled.canonical_key(&np[1]).unwrap(),
+            "fixture must keep the y scalar family key identical"
+        );
+        assert_ne!(
+            membership(pp),
+            membership(np),
+            "the same y key has different conjunction routing because x matters"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
+    fn p490_multi_root_forest_shares_state_cells_and_matches_independent_gamma_dtc() {
+        let (context, registry, eq, order, left, right, model) = forest_setup();
+        let shared = RelExpr::FilterOrderConst {
+            input: Box::new(RelExpr::Scan(left)),
+            column: 0,
+            value: Value::I64(2),
+            ordering: order,
+            comparison: crate::OrderComparison::GreaterOrEqual,
+        };
+        let roots = vec![
+            RelExpr::Project {
+                input: Box::new(shared.clone()),
+                columns: vec![0],
+            },
+            RelExpr::Distinct {
+                input: Box::new(shared.clone()),
+                column_equivalences: vec![eq],
+            },
+            RelExpr::Difference {
+                left: Box::new(shared.clone()),
+                right: Box::new(RelExpr::Scan(right)),
+            },
+            RelExpr::JoinEq {
+                left: Box::new(shared.clone()),
+                right: Box::new(RelExpr::Scan(right)),
+                left_column: 0,
+                right_column: 0,
+                equivalence: eq,
+            },
+            RelExpr::AntiJoin {
+                left: Box::new(shared.clone()),
+                right: Box::new(RelExpr::Scan(right)),
+                left_column: 0,
+                right_column: 0,
+                equivalence: eq,
+            },
+            RelExpr::Group {
+                input: Box::new(shared.clone()),
+                group_columns: vec![0],
+                group_equivalences: vec![eq],
+                aggregate: AggregateSpec::Count {
+                    result_equivalence: eq,
+                },
+            },
+            RelExpr::TopKWithTies {
+                input: Box::new(shared.clone()),
+                column: 0,
+                ordering: order,
+                direction: crate::OrderDirection::Ascending,
+                k: 2,
+            },
+            RelExpr::Union {
+                left: Box::new(shared.clone()),
+                right: Box::new(RelExpr::Scan(right)),
+            },
+        ];
+
+        let mut forest = RelObservationForest::build(&roots, &model, &context, &registry).unwrap();
+        forest.bind_revision(RevisionId::new(0)).unwrap();
+        let mut independent = roots
+            .iter()
+            .map(|query| {
+                let mut state =
+                    MaterializedRelPlanState::build(query, &model, &context, &registry).unwrap();
+                state.bind_revision(RevisionId::new(0)).unwrap();
+                state
+            })
+            .collect::<Vec<_>>();
+
+        let independent_occurrences = independent
+            .iter()
+            .map(MaterializedRelPlanState::test_arena_len)
+            .sum::<usize>();
+        assert!(
+            forest.unique_node_count() < independent_occurrences,
+            "forest did not structurally share canonical subtrees"
+        );
+        assert_eq!(forest.root_count(), roots.len());
+        assert_eq!(forest.root_node(0), forest.root_node(0));
+        for (route, state) in independent.iter().enumerate() {
+            let ty = roots[route].typecheck(&context, &registry).unwrap();
+            assert!(
+                relation_values_semantically_equivalent(
+                    &forest
+                        .root_output_value(route, &context, &registry)
+                        .unwrap(),
+                    &state.output_value(&context, &registry).unwrap(),
+                    &ty,
+                    &context,
+                    &registry,
+                )
+                .unwrap(),
+                "initial forest output diverged at root {route}"
+            );
+        }
+
+        let left_delta = RelationDelta {
+            inserted: vec![vec![Value::I64(4)]],
+            removed: vec![vec![Value::I64(1)]],
+            result_type: RelExpr::Scan(left).typecheck(&context, &registry).unwrap(),
+        };
+        let right_delta = RelationDelta {
+            inserted: vec![vec![Value::I64(3)]],
+            removed: Vec::new(),
+            result_type: RelExpr::Scan(right).typecheck(&context, &registry).unwrap(),
+        };
+        let all_deltas = BTreeMap::from([(left, left_delta), (right, right_delta)]);
+        let (forest_next, forest_effects) = forest
+            .candidate_from_relation_deltas_for_revision(
+                RevisionId::new(1),
+                &all_deltas,
+                &context,
+                &registry,
+            )
+            .unwrap();
+
+        for (route, state) in independent.iter_mut().enumerate() {
+            let sources = state.scan_relations();
+            let local = all_deltas
+                .iter()
+                .filter(|(relation, _)| sources.contains(relation))
+                .map(|(relation, delta)| (*relation, delta.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let (next, effect) = state
+                .candidate_from_relation_deltas_for_revision(
+                    RevisionId::new(1),
+                    &local,
+                    &context,
+                    &registry,
+                )
+                .unwrap();
+            assert!(
+                relation_deltas_semantically_equivalent(
+                    &forest_effects[route],
+                    &effect,
+                    &context,
+                    &registry,
+                )
+                .unwrap(),
+                "forest root delta diverged at root {route}: forest={:?} independent={effect:?}",
+                forest_effects[route]
+            );
+            let ty = roots[route].typecheck(&context, &registry).unwrap();
+            assert!(
+                relation_values_semantically_equivalent(
+                    &forest_next
+                        .root_output_value(route, &context, &registry)
+                        .unwrap(),
+                    &next.output_value(&context, &registry).unwrap(),
+                    &ty,
+                    &context,
+                    &registry,
+                )
+                .unwrap(),
+                "forest successor output diverged at root {route}"
+            );
+            *state = next;
+        }
+    }
+
+    #[test]
+    fn p490_self_join_shares_one_scan_cell_but_preserves_two_occurrence_edges() {
+        let (context, registry, eq, _, left, _, model) = forest_setup();
+        let query = RelExpr::JoinEq {
+            left: Box::new(RelExpr::Scan(left)),
+            right: Box::new(RelExpr::Scan(left)),
+            left_column: 0,
+            right_column: 0,
+            equivalence: eq,
+        };
+        let mut forest =
+            RelObservationForest::build(std::slice::from_ref(&query), &model, &context, &registry)
+                .unwrap();
+        forest.bind_revision(RevisionId::new(0)).unwrap();
+        assert_eq!(
+            forest.unique_node_count(),
+            2,
+            "scan + join must be the only cells"
+        );
+
+        let delta = RelationDelta {
+            inserted: vec![vec![Value::I64(4)]],
+            removed: Vec::new(),
+            result_type: RelExpr::Scan(left).typecheck(&context, &registry).unwrap(),
+        };
+        let deltas = BTreeMap::from([(left, delta)]);
+        let (visited, nodes) = forest
+            .test_transition_work(&deltas, &context, &registry)
+            .unwrap();
+        assert_eq!(nodes, 2);
+        assert_eq!(
+            visited, 2,
+            "shared scan and join must each transition exactly once"
+        );
+
+        let (forest_next, effects) = forest
+            .candidate_from_relation_deltas_for_revision(
+                RevisionId::new(1),
+                &deltas,
+                &context,
+                &registry,
+            )
+            .unwrap();
+        let mut independent =
+            MaterializedRelPlanState::build(&query, &model, &context, &registry).unwrap();
+        independent.bind_revision(RevisionId::new(0)).unwrap();
+        let (independent_next, independent_effect) = independent
+            .candidate_from_relation_deltas_for_revision(
+                RevisionId::new(1),
+                &deltas,
+                &context,
+                &registry,
+            )
+            .unwrap();
+        assert!(
+            relation_deltas_semantically_equivalent(
+                &effects[0],
+                &independent_effect,
+                &context,
+                &registry,
+            )
+            .unwrap()
+        );
+        let ty = query.typecheck(&context, &registry).unwrap();
+        assert!(
+            relation_values_semantically_equivalent(
+                &forest_next
+                    .root_output_value(0, &context, &registry)
+                    .unwrap(),
+                &independent_next.output_value(&context, &registry).unwrap(),
+                &ty,
+                &context,
+                &registry,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -3469,6 +6034,57 @@ mod tests {
                 vec![Value::Text("Beta".into()), Value::I64(2)],
                 vec![Value::Text("Gamma".into()), Value::I64(3)],
             ]
+        );
+    }
+
+    #[test]
+    fn p491_shared_forest_capsules_plan_causal_impact_once_per_snapshot() {
+        let (context, registry, eq, _, left, _, model) = forest_setup();
+        let shared = RelExpr::Scan(left);
+        let roots = vec![
+            RelExpr::FilterEqConst {
+                input: Box::new(shared.clone()),
+                column: 0,
+                value: Value::I64(2),
+                equivalence: eq,
+            },
+            RelExpr::FilterEqConst {
+                input: Box::new(shared),
+                column: 0,
+                value: Value::I64(3),
+                equivalence: eq,
+            },
+        ];
+        let mut forest = RelObservationForest::build(&roots, &model, &context, &registry).unwrap();
+        forest.bind_revision(RevisionId::new(0)).unwrap();
+        let forest = Arc::new(forest);
+        let first = RelCausalCapsule::capture_forest_root(Arc::clone(&forest), 0).unwrap();
+        let second = RelCausalCapsule::capture_forest_root(Arc::clone(&forest), 1).unwrap();
+        let delta = RelationDelta {
+            inserted: vec![vec![Value::I64(2)]],
+            removed: Vec::new(),
+            result_type: RelExpr::Scan(left).typecheck(&context, &registry).unwrap(),
+        };
+        let deltas = BTreeMap::from([(left, delta)]);
+        let individual = vec![
+            first
+                .impact_relation_deltas(&deltas, &context, &registry)
+                .unwrap(),
+            second
+                .impact_relation_deltas(&deltas, &context, &registry)
+                .unwrap(),
+        ];
+        let (batched, plans) = RelCausalCapsule::impact_many_relation_deltas_with_stats(
+            &[&first, &second],
+            &deltas,
+            &context,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(batched, individual);
+        assert_eq!(
+            plans, 1,
+            "shared forest must be planned once for both roots"
         );
     }
 

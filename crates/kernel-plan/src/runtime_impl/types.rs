@@ -82,6 +82,12 @@ pub struct RuntimeHistoryEffect {
     pub model_delta: Option<DurableModelDelta>,
     pub model_complement: Option<DurableModelDelta>,
     pub semantic_change: Option<SemanticChangeEvent>,
+    pub causal_observations: Vec<RuntimeHistoryCoordinate>,
+    pub causal_observation_values: BTreeMap<RuntimeHistoryCoordinate, Value>,
+    pub causal_observation_predicates:
+        BTreeMap<RuntimeHistoryCoordinate, kernel_schema::SemanticRuleExpr>,
+    pub causal_observation_groups: Vec<RuntimeJointCausalObservationGroup>,
+    pub relational_causal_observations: Vec<kernel_durability::DurableRelationalCausalObservation>,
 }
 
 /// Exact write coordinate used to prove that a historical inverse can be
@@ -126,6 +132,318 @@ pub enum RuntimeHistoryCoordinate {
     },
 }
 
+fn durable_causal_observation_coordinate(
+    coordinate: &RuntimeHistoryCoordinate,
+) -> kernel_durability::DurableCausalObservationCoordinate {
+    match coordinate {
+        RuntimeHistoryCoordinate::RelationClass {
+            relation,
+            canonical_key,
+        } => kernel_durability::DurableCausalObservationCoordinate::RelationClass {
+            relation: *relation,
+            canonical_key: canonical_key.clone(),
+        },
+        RuntimeHistoryCoordinate::CarrierPresence { carrier } => {
+            kernel_durability::DurableCausalObservationCoordinate::CarrierPresence {
+                carrier: *carrier,
+            }
+        }
+        RuntimeHistoryCoordinate::CarrierMember { carrier, entity } => {
+            kernel_durability::DurableCausalObservationCoordinate::CarrierMember {
+                carrier: *carrier,
+                entity: *entity,
+            }
+        }
+        RuntimeHistoryCoordinate::Field { field, owner } => {
+            kernel_durability::DurableCausalObservationCoordinate::Field {
+                field: *field,
+                owner: *owner,
+            }
+        }
+        RuntimeHistoryCoordinate::ObjectField {
+            relation,
+            owner,
+            field,
+        } => kernel_durability::DurableCausalObservationCoordinate::ObjectField {
+            relation: *relation,
+            owner: *owner,
+            field: *field,
+        },
+        RuntimeHistoryCoordinate::LifecycleEntity { entity } => {
+            kernel_durability::DurableCausalObservationCoordinate::LifecycleEntity {
+                entity: *entity,
+            }
+        }
+        RuntimeHistoryCoordinate::LifecycleRoot { entity } => {
+            kernel_durability::DurableCausalObservationCoordinate::LifecycleRoot { entity: *entity }
+        }
+        RuntimeHistoryCoordinate::KeepsAlivePresence { parent } => {
+            kernel_durability::DurableCausalObservationCoordinate::KeepsAlivePresence {
+                parent: *parent,
+            }
+        }
+        RuntimeHistoryCoordinate::KeepsAliveEdge { parent, child } => {
+            kernel_durability::DurableCausalObservationCoordinate::KeepsAliveEdge {
+                parent: *parent,
+                child: *child,
+            }
+        }
+    }
+}
+
+fn durable_causal_observation(
+    coordinate: &RuntimeHistoryCoordinate,
+    exact_value: Option<&Value>,
+    preservation_rule: Option<&kernel_schema::SemanticRuleExpr>,
+) -> kernel_durability::DurableCausalObservationCoordinate {
+    let exact_value = exact_value.and_then(durable_observed_scalar);
+    match (coordinate, exact_value, preservation_rule) {
+        (RuntimeHistoryCoordinate::Field { field, owner }, Some(value), Some(predicate)) => {
+            kernel_durability::DurableCausalObservationCoordinate::FieldPredicate {
+                field: *field,
+                owner: *owner,
+                value,
+                predicate: predicate.clone(),
+            }
+        }
+        (RuntimeHistoryCoordinate::Field { field, owner }, Some(value), None) => {
+            kernel_durability::DurableCausalObservationCoordinate::FieldExact {
+                field: *field,
+                owner: *owner,
+                value,
+            }
+        }
+        (
+            RuntimeHistoryCoordinate::ObjectField {
+                relation,
+                owner,
+                field,
+            },
+            Some(value),
+            Some(predicate),
+        ) => kernel_durability::DurableCausalObservationCoordinate::ObjectFieldPredicate {
+            relation: *relation,
+            owner: *owner,
+            field: *field,
+            value,
+            predicate: predicate.clone(),
+        },
+        (
+            RuntimeHistoryCoordinate::ObjectField {
+                relation,
+                owner,
+                field,
+            },
+            Some(value),
+            None,
+        ) => kernel_durability::DurableCausalObservationCoordinate::ObjectFieldExact {
+            relation: *relation,
+            owner: *owner,
+            field: *field,
+            value,
+        },
+        _ => durable_causal_observation_coordinate(coordinate),
+    }
+}
+
+fn durable_causal_observation_group(
+    group: &RuntimeJointCausalObservationGroup,
+) -> Option<kernel_durability::DurableCausalObservationGroup> {
+    let mut observed_fields = Vec::with_capacity(group.observed_fields.len());
+    for (field, value) in &group.observed_fields {
+        observed_fields.push((*field, durable_observed_scalar(value)?));
+    }
+    Some(kernel_durability::DurableCausalObservationGroup {
+        group_id: group.group_id,
+        relation: group.relation,
+        owner: group.owner,
+        observed_fields,
+        predicate: group.predicate.clone(),
+    })
+}
+
+fn runtime_causal_observation_group(
+    group: &kernel_durability::DurableCausalObservationGroup,
+) -> RuntimeJointCausalObservationGroup {
+    RuntimeJointCausalObservationGroup {
+        group_id: group.group_id,
+        relation: group.relation,
+        owner: group.owner,
+        observed_fields: group
+            .observed_fields
+            .iter()
+            .map(|(field, value)| (*field, runtime_observed_scalar(value)))
+            .collect(),
+        predicate: group.predicate.clone(),
+    }
+}
+
+fn durable_observed_scalar(value: &Value) -> Option<kernel_durability::DurableObservedScalar> {
+    Some(match value {
+        Value::Unit => kernel_durability::DurableObservedScalar::Unit,
+        Value::Bool(value) => kernel_durability::DurableObservedScalar::Bool(*value),
+        Value::I64(value) => kernel_durability::DurableObservedScalar::I64(*value),
+        Value::F64Bits(value) => kernel_durability::DurableObservedScalar::F64Bits(*value),
+        Value::Text(value) => kernel_durability::DurableObservedScalar::Text(value.clone()),
+        Value::LiveEntityRef { entity_type, id } => {
+            kernel_durability::DurableObservedScalar::LiveEntityRef {
+                entity_type: *entity_type,
+                id: *id,
+            }
+        }
+        Value::HistoricalEntityId { entity_type, id } => {
+            kernel_durability::DurableObservedScalar::HistoricalEntityId {
+                entity_type: *entity_type,
+                id: *id,
+            }
+        }
+        Value::Product(_)
+        | Value::Option(_)
+        | Value::Variant { .. }
+        | Value::Seq(_)
+        | Value::Set { .. }
+        | Value::Bag { .. }
+        | Value::Map { .. } => return None,
+    })
+}
+
+fn runtime_observed_scalar(value: &kernel_durability::DurableObservedScalar) -> Value {
+    match value {
+        kernel_durability::DurableObservedScalar::Unit => Value::Unit,
+        kernel_durability::DurableObservedScalar::Bool(value) => Value::Bool(*value),
+        kernel_durability::DurableObservedScalar::I64(value) => Value::I64(*value),
+        kernel_durability::DurableObservedScalar::F64Bits(value) => Value::F64Bits(*value),
+        kernel_durability::DurableObservedScalar::Text(value) => Value::Text(value.clone()),
+        kernel_durability::DurableObservedScalar::LiveEntityRef { entity_type, id } => {
+            Value::LiveEntityRef {
+                entity_type: *entity_type,
+                id: *id,
+            }
+        }
+        kernel_durability::DurableObservedScalar::HistoricalEntityId { entity_type, id } => {
+            Value::HistoricalEntityId {
+                entity_type: *entity_type,
+                id: *id,
+            }
+        }
+    }
+}
+
+fn durable_relational_causal_observation(
+    observation: &RuntimeRelationalCausalObservation,
+) -> kernel_durability::DurableRelationalCausalObservation {
+    kernel_durability::DurableRelationalCausalObservation {
+        observation_id: observation.observation_id,
+        observed_revision: observation.observed_revision,
+        intent_prefix: observation.intent_prefix.clone(),
+        query: observation.capsule.query().clone(),
+    }
+}
+
+fn runtime_causal_observation_coordinate(
+    coordinate: &kernel_durability::DurableCausalObservationCoordinate,
+) -> RuntimeHistoryCoordinate {
+    match coordinate {
+        kernel_durability::DurableCausalObservationCoordinate::RelationClass {
+            relation,
+            canonical_key,
+        } => RuntimeHistoryCoordinate::RelationClass {
+            relation: *relation,
+            canonical_key: canonical_key.clone(),
+        },
+        kernel_durability::DurableCausalObservationCoordinate::CarrierPresence { carrier } => {
+            RuntimeHistoryCoordinate::CarrierPresence { carrier: *carrier }
+        }
+        kernel_durability::DurableCausalObservationCoordinate::CarrierMember {
+            carrier,
+            entity,
+        } => RuntimeHistoryCoordinate::CarrierMember {
+            carrier: *carrier,
+            entity: *entity,
+        },
+        kernel_durability::DurableCausalObservationCoordinate::Field { field, owner }
+        | kernel_durability::DurableCausalObservationCoordinate::FieldExact {
+            field, owner, ..
+        }
+        | kernel_durability::DurableCausalObservationCoordinate::FieldPredicate {
+            field,
+            owner,
+            ..
+        } => RuntimeHistoryCoordinate::Field {
+            field: *field,
+            owner: *owner,
+        },
+        kernel_durability::DurableCausalObservationCoordinate::ObjectField {
+            relation,
+            owner,
+            field,
+        }
+        | kernel_durability::DurableCausalObservationCoordinate::ObjectFieldExact {
+            relation,
+            owner,
+            field,
+            ..
+        }
+        | kernel_durability::DurableCausalObservationCoordinate::ObjectFieldPredicate {
+            relation,
+            owner,
+            field,
+            ..
+        } => RuntimeHistoryCoordinate::ObjectField {
+            relation: *relation,
+            owner: *owner,
+            field: *field,
+        },
+        kernel_durability::DurableCausalObservationCoordinate::LifecycleEntity { entity } => {
+            RuntimeHistoryCoordinate::LifecycleEntity { entity: *entity }
+        }
+        kernel_durability::DurableCausalObservationCoordinate::LifecycleRoot { entity } => {
+            RuntimeHistoryCoordinate::LifecycleRoot { entity: *entity }
+        }
+        kernel_durability::DurableCausalObservationCoordinate::KeepsAlivePresence { parent } => {
+            RuntimeHistoryCoordinate::KeepsAlivePresence { parent: *parent }
+        }
+        kernel_durability::DurableCausalObservationCoordinate::KeepsAliveEdge { parent, child } => {
+            RuntimeHistoryCoordinate::KeepsAliveEdge {
+                parent: *parent,
+                child: *child,
+            }
+        }
+    }
+}
+
+fn runtime_causal_observation_exact_value(
+    coordinate: &kernel_durability::DurableCausalObservationCoordinate,
+) -> Option<Value> {
+    match coordinate {
+        kernel_durability::DurableCausalObservationCoordinate::FieldExact { value, .. }
+        | kernel_durability::DurableCausalObservationCoordinate::FieldPredicate { value, .. }
+        | kernel_durability::DurableCausalObservationCoordinate::ObjectFieldExact {
+            value, ..
+        }
+        | kernel_durability::DurableCausalObservationCoordinate::ObjectFieldPredicate {
+            value,
+            ..
+        } => Some(runtime_observed_scalar(value)),
+        _ => None,
+    }
+}
+
+fn runtime_causal_observation_predicate(
+    coordinate: &kernel_durability::DurableCausalObservationCoordinate,
+) -> Option<kernel_schema::SemanticRuleExpr> {
+    match coordinate {
+        kernel_durability::DurableCausalObservationCoordinate::FieldPredicate {
+            predicate, ..
+        }
+        | kernel_durability::DurableCausalObservationCoordinate::ObjectFieldPredicate {
+            predicate,
+            ..
+        } => Some(predicate.clone()),
+        _ => None,
+    }
+}
+
 /// Canonical passive observation footprint owned by one formation revision.
 ///
 /// This is deliberately distinct from `ClientIntentGuardDigest`: the digest is
@@ -135,6 +453,60 @@ pub enum RuntimeHistoryCoordinate {
 pub struct RuntimeGuardObservationFootprint {
     source_revision: RevisionId,
     coordinates: Box<[RuntimeHistoryCoordinate]>,
+    exact_values: BTreeMap<RuntimeHistoryCoordinate, Value>,
+    preservation_rules: BTreeMap<RuntimeHistoryCoordinate, kernel_schema::SemanticRuleExpr>,
+    joint_groups: Box<[RuntimeJointCausalObservationGroup]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeJointCausalObservationGroup {
+    pub group_id: u32,
+    pub relation: SemanticId,
+    pub owner: kernel_types::EntityId,
+    pub observed_fields: BTreeMap<SemanticId, Value>,
+    pub predicate: kernel_schema::SemanticRuleExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRelationalCausalObservation {
+    pub observation_id: u32,
+    pub observed_revision: RevisionId,
+    pub intent_prefix: kernel_durability::DurableIntentPrefix,
+    pub capsule: RelCausalCapsule,
+}
+
+/// Proof token that one schema-bound transaction has finished all formation-world
+/// semantics at an exact schema boundary.
+///
+/// After this seal is produced, later schema epochs may transport/rebase only the
+/// already-formed exact effect. Formation-world queries/guards are not executable
+/// authorities in those later epochs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "Revision suffix makes each formation-world boundary coordinate explicit."
+)]
+pub struct SchemaEpochFormationSeal {
+    formation_revision: RevisionId,
+    boundary_revision: RevisionId,
+    semantic_revision: kernel_types::SemanticRevision,
+}
+
+impl SchemaEpochFormationSeal {
+    #[must_use]
+    pub const fn formation_revision(&self) -> RevisionId {
+        self.formation_revision
+    }
+
+    #[must_use]
+    pub const fn boundary_revision(&self) -> RevisionId {
+        self.boundary_revision
+    }
+
+    #[must_use]
+    pub const fn semantic_revision(&self) -> kernel_types::SemanticRevision {
+        self.semantic_revision
+    }
 }
 
 impl RuntimeGuardObservationFootprint {
@@ -149,8 +521,138 @@ impl RuntimeGuardObservationFootprint {
         }
         Some(Self {
             source_revision,
-            coordinates: coordinates.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            coordinates: coordinates
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            exact_values: BTreeMap::new(),
+            preservation_rules: BTreeMap::new(),
+            joint_groups: Box::new([]),
         })
+    }
+
+    #[must_use]
+    pub fn with_exact_values(
+        source_revision: RevisionId,
+        observations: impl IntoIterator<Item = (RuntimeHistoryCoordinate, Option<Value>)>,
+    ) -> Option<Self> {
+        let mut coordinates = BTreeSet::new();
+        let mut exact_values = BTreeMap::new();
+        for (coordinate, value) in observations {
+            coordinates.insert(coordinate.clone());
+            if let Some(value) = value {
+                exact_values.insert(coordinate, value);
+            }
+        }
+        if coordinates.is_empty() {
+            return None;
+        }
+        Some(Self {
+            source_revision,
+            coordinates: coordinates
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            exact_values,
+            preservation_rules: BTreeMap::new(),
+            joint_groups: Box::new([]),
+        })
+    }
+
+    #[must_use]
+    pub fn with_exact_values_and_rules(
+        source_revision: RevisionId,
+        observations: impl IntoIterator<
+            Item = (
+                RuntimeHistoryCoordinate,
+                Option<Value>,
+                Option<kernel_schema::SemanticRuleExpr>,
+            ),
+        >,
+    ) -> Option<Self> {
+        let mut coordinates = BTreeSet::new();
+        let mut exact_values = BTreeMap::new();
+        let mut preservation_rules =
+            BTreeMap::<RuntimeHistoryCoordinate, kernel_schema::SemanticRuleExpr>::new();
+        for (coordinate, value, rule) in observations {
+            coordinates.insert(coordinate.clone());
+            if let Some(value) = value {
+                exact_values.insert(coordinate.clone(), value);
+            }
+            if let Some(rule) = rule {
+                preservation_rules
+                    .entry(coordinate)
+                    .and_modify(|existing| {
+                        *existing = kernel_schema::SemanticRuleExpr::And(vec![
+                            existing.clone(),
+                            rule.clone(),
+                        ]);
+                    })
+                    .or_insert(rule);
+            }
+        }
+        if coordinates.is_empty() {
+            return None;
+        }
+        Some(Self {
+            source_revision,
+            coordinates: coordinates
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            exact_values,
+            preservation_rules,
+            joint_groups: Box::new([]),
+        })
+    }
+
+    #[must_use]
+    pub fn with_exact_values_rules_and_groups(
+        source_revision: RevisionId,
+        observations: impl IntoIterator<
+            Item = (
+                RuntimeHistoryCoordinate,
+                Option<Value>,
+                Option<kernel_schema::SemanticRuleExpr>,
+            ),
+        >,
+        groups: impl IntoIterator<Item = RuntimeJointCausalObservationGroup>,
+    ) -> Option<Self> {
+        let mut footprint = Self::with_exact_values_and_rules(source_revision, observations)
+            .unwrap_or(Self {
+                source_revision,
+                coordinates: Box::new([]),
+                exact_values: BTreeMap::new(),
+                preservation_rules: BTreeMap::new(),
+                joint_groups: Box::new([]),
+            });
+        let mut groups = groups.into_iter().collect::<Vec<_>>();
+        groups.sort_by_key(|group| group.group_id);
+        groups.dedup_by_key(|group| group.group_id);
+        let mut coordinates = footprint
+            .coordinates
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for group in &groups {
+            for field in group.observed_fields.keys() {
+                coordinates.insert(RuntimeHistoryCoordinate::Field {
+                    field: *field,
+                    owner: group.owner,
+                });
+                coordinates.insert(RuntimeHistoryCoordinate::ObjectField {
+                    relation: group.relation,
+                    owner: group.owner,
+                    field: *field,
+                });
+            }
+        }
+        footprint.coordinates = coordinates
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        footprint.joint_groups = groups.into_boxed_slice();
+        (!footprint.coordinates.is_empty()).then_some(footprint)
     }
 
     #[must_use]
@@ -161,6 +663,24 @@ impl RuntimeGuardObservationFootprint {
     #[must_use]
     pub fn coordinates(&self) -> &[RuntimeHistoryCoordinate] {
         &self.coordinates
+    }
+
+    #[must_use]
+    pub fn exact_value(&self, coordinate: &RuntimeHistoryCoordinate) -> Option<&Value> {
+        self.exact_values.get(coordinate)
+    }
+
+    #[must_use]
+    pub fn preservation_rule(
+        &self,
+        coordinate: &RuntimeHistoryCoordinate,
+    ) -> Option<&kernel_schema::SemanticRuleExpr> {
+        self.preservation_rules.get(coordinate)
+    }
+
+    #[must_use]
+    pub fn joint_groups(&self) -> &[RuntimeJointCausalObservationGroup] {
+        &self.joint_groups
     }
 }
 
@@ -226,46 +746,69 @@ fn durable_model_delta_is_empty(delta: &DurableModelDelta) -> bool {
 }
 
 impl RuntimeHistoryEffect {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     fn from_durable(record: &DurableRevisionEffectRecord) -> Self {
         let semantic_change = record.semantic_change_event();
         let kind = match &record.intent {
             DurableTransactionIntent::RelationData { .. } => RuntimeHistoryEffectKind::RelationData,
-            DurableTransactionIntent::RelationRewrite { .. } => RuntimeHistoryEffectKind::RelationRewrite,
-            DurableTransactionIntent::RelationResolution { .. } => RuntimeHistoryEffectKind::RelationResolution,
-            DurableTransactionIntent::MixedRevision { .. } => RuntimeHistoryEffectKind::MixedRevision,
+            DurableTransactionIntent::RelationRewrite { .. } => {
+                RuntimeHistoryEffectKind::RelationRewrite
+            }
+            DurableTransactionIntent::RelationResolution { .. } => {
+                RuntimeHistoryEffectKind::RelationResolution
+            }
+            DurableTransactionIntent::MixedRevision { .. } => {
+                RuntimeHistoryEffectKind::MixedRevision
+            }
             DurableTransactionIntent::FullRevision { .. } => RuntimeHistoryEffectKind::FullRevision,
-            DurableTransactionIntent::SchemaMigration { .. } => RuntimeHistoryEffectKind::SchemaMigration,
+            DurableTransactionIntent::SchemaMigration { .. } => {
+                RuntimeHistoryEffectKind::SchemaMigration
+            }
         };
         let (relation_mutations, model_delta, model_complement) = match &record.change {
-            kernel_durability::DurableRevisionChange::RelationData { relation_mutations, .. } =>
-                (relation_mutations.as_slice(), None, None),
+            kernel_durability::DurableRevisionChange::RelationData {
+                relation_mutations, ..
+            } => (relation_mutations.as_slice(), None, None),
             kernel_durability::DurableRevisionChange::MixedRevision {
-                relation_mutations, model_delta, model_complement, ..
+                relation_mutations,
+                model_delta,
+                model_complement,
+                ..
             } => (
                 relation_mutations.as_slice(),
                 Some(model_delta.clone()),
                 model_complement.as_deref().cloned(),
             ),
             kernel_durability::DurableRevisionChange::FullRevision { .. }
-            | kernel_durability::DurableRevisionChange::FullRevisionAndMaterializations { .. }
-            | kernel_durability::DurableRevisionChange::SchemaMigration { .. } =>
-                (&[] as &[DurableRelationMutation], None, None),
+            | kernel_durability::DurableRevisionChange::FullRevisionAndMaterializations {
+                ..
+            }
+            | kernel_durability::DurableRevisionChange::SchemaMigration { .. } => {
+                (&[] as &[DurableRelationMutation], None, None)
+            }
         };
         let reversibility = match kind {
             RuntimeHistoryEffectKind::RelationData
             | RuntimeHistoryEffectKind::RelationRewrite
-            | RuntimeHistoryEffectKind::RelationResolution => RuntimeHistoryReversibility::ExactPlanInverse,
+            | RuntimeHistoryEffectKind::RelationResolution => {
+                RuntimeHistoryReversibility::ExactPlanInverse
+            }
             RuntimeHistoryEffectKind::MixedRevision => {
-                let delta = model_delta.as_ref().expect("mixed durable change has model delta");
+                let delta = model_delta
+                    .as_ref()
+                    .expect("mixed durable change has model delta");
                 if durable_model_delta_is_empty(delta) || model_complement.is_some() {
                     RuntimeHistoryReversibility::ExactPlanInverse
                 } else {
                     RuntimeHistoryReversibility::ComplementRequired
                 }
             }
-            RuntimeHistoryEffectKind::FullRevision
-            | RuntimeHistoryEffectKind::SchemaMigration
-            => RuntimeHistoryReversibility::NonPlanTransition,
+            RuntimeHistoryEffectKind::FullRevision | RuntimeHistoryEffectKind::SchemaMigration => {
+                RuntimeHistoryReversibility::NonPlanTransition
+            }
         };
         debug_assert_eq!(
             record.kind(),
@@ -300,6 +843,41 @@ impl RuntimeHistoryEffect {
             model_delta,
             model_complement,
             semantic_change,
+            causal_observations: record
+                .intent
+                .causal_observations()
+                .iter()
+                .map(runtime_causal_observation_coordinate)
+                .collect(),
+            causal_observation_values: record
+                .intent
+                .causal_observations()
+                .iter()
+                .filter_map(|observation| {
+                    runtime_causal_observation_exact_value(observation)
+                        .map(|value| (runtime_causal_observation_coordinate(observation), value))
+                })
+                .collect(),
+            causal_observation_predicates: record
+                .intent
+                .causal_observations()
+                .iter()
+                .filter_map(|observation| {
+                    runtime_causal_observation_predicate(observation).map(|predicate| {
+                        (
+                            runtime_causal_observation_coordinate(observation),
+                            predicate,
+                        )
+                    })
+                })
+                .collect(),
+            causal_observation_groups: record
+                .intent
+                .causal_observation_groups()
+                .iter()
+                .map(runtime_causal_observation_group)
+                .collect(),
+            relational_causal_observations: record.intent.relational_causal_observations().to_vec(),
         }
     }
 }
@@ -436,6 +1014,12 @@ pub struct RevisionCommitDescriptor {
     rewrite_intents: BTreeMap<SemanticId, RuntimeRewriteIntent>,
     object_field_writes: BTreeMap<SemanticId, Vec<kernel_durability::DurableObjectFieldWrite>>,
     relation_authorizations: BTreeMap<SemanticId, kernel_durability::DurableRelationAuthorization>,
+    causal_observations: Vec<RuntimeHistoryCoordinate>,
+    causal_observation_values: BTreeMap<RuntimeHistoryCoordinate, Value>,
+    causal_observation_predicates:
+        BTreeMap<RuntimeHistoryCoordinate, kernel_schema::SemanticRuleExpr>,
+    causal_observation_groups: Vec<RuntimeJointCausalObservationGroup>,
+    relational_causal_observations: Vec<RuntimeRelationalCausalObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,6 +1070,37 @@ impl RevisionCommitDescriptor {
     }
 
     #[must_use]
+    pub fn causal_observations(&self) -> &[RuntimeHistoryCoordinate] {
+        &self.causal_observations
+    }
+
+    #[must_use]
+    pub fn causal_observation_exact_value(
+        &self,
+        coordinate: &RuntimeHistoryCoordinate,
+    ) -> Option<&Value> {
+        self.causal_observation_values.get(coordinate)
+    }
+
+    #[must_use]
+    pub fn causal_observation_preservation_rule(
+        &self,
+        coordinate: &RuntimeHistoryCoordinate,
+    ) -> Option<&kernel_schema::SemanticRuleExpr> {
+        self.causal_observation_predicates.get(coordinate)
+    }
+
+    #[must_use]
+    pub fn causal_observation_groups(&self) -> &[RuntimeJointCausalObservationGroup] {
+        &self.causal_observation_groups
+    }
+
+    #[must_use]
+    pub fn relational_causal_observations(&self) -> &[RuntimeRelationalCausalObservation] {
+        &self.relational_causal_observations
+    }
+
+    #[must_use]
     pub const fn semantic_revision(&self) -> Option<kernel_types::SemanticRevision> {
         match &self.change {
             RevisionCommitChange::RelationData {
@@ -513,6 +1128,10 @@ impl RevisionCommitDescriptor {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn durable_descriptor(
         &self,
         transaction_id: ClientTransactionId,
@@ -529,8 +1148,16 @@ impl RevisionCommitDescriptor {
                         relation,
                         inserted: delta.inserted.clone(),
                         removed: delta.removed.clone(),
-                        object_field_writes: self.object_field_writes.get(&relation).cloned().unwrap_or_default(),
-                        authorization: self.relation_authorizations.get(&relation).copied().unwrap_or_default(),
+                        object_field_writes: self
+                            .object_field_writes
+                            .get(&relation)
+                            .cloned()
+                            .unwrap_or_default(),
+                        authorization: self
+                            .relation_authorizations
+                            .get(&relation)
+                            .copied()
+                            .unwrap_or_default(),
                     })
                     .collect();
                 if self.rewrite_intents.is_empty() {
@@ -575,8 +1202,16 @@ impl RevisionCommitDescriptor {
                         relation,
                         inserted: delta.inserted.clone(),
                         removed: delta.removed.clone(),
-                        object_field_writes: self.object_field_writes.get(&relation).cloned().unwrap_or_default(),
-                        authorization: self.relation_authorizations.get(&relation).copied().unwrap_or_default(),
+                        object_field_writes: self
+                            .object_field_writes
+                            .get(&relation)
+                            .cloned()
+                            .unwrap_or_default(),
+                        authorization: self
+                            .relation_authorizations
+                            .get(&relation)
+                            .copied()
+                            .unwrap_or_default(),
                     })
                     .collect();
                 DurableRevisionDescriptor::mixed_revision(
@@ -640,7 +1275,11 @@ impl RevisionCommitDescriptor {
                 inserted: delta.inserted.clone(),
                 removed: delta.removed.clone(),
                 object_field_writes: Vec::new(),
-                authorization: self.relation_authorizations.get(&relation).copied().unwrap_or_default(),
+                authorization: self
+                    .relation_authorizations
+                    .get(&relation)
+                    .copied()
+                    .unwrap_or_default(),
             })
             .collect();
         let rewrite_intents = self
@@ -672,14 +1311,66 @@ impl RevisionCommitDescriptor {
 /// certified transport through one or more durable schema migrations.
 ///
 /// `formation_semantic_revision` is part of client identity, while the guard
-/// footprint is executable proof material and is deliberately separate from
-/// `client_guard_digest`.
+/// footprint is formation-world proof material and is deliberately separate
+/// from `client_guard_digest`. When this request crosses its first schema
+/// boundary, that guard authority ends at the formation seal; it is not
+/// transported into later schema epochs.
 pub struct SchemaAwareFieldTransitionRequest<'a> {
     pub formation_revision: RevisionId,
     pub formation_semantic_revision: kernel_types::SemanticRevision,
     pub client_model_delta: &'a DurableModelDelta,
     pub guard_observation: Option<&'a RuntimeGuardObservationFootprint>,
     pub client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+}
+
+/// One kernel-certified current-world publication prepared from an exact relation intent
+/// formed in an older semantic epoch. Effect transport and required-authority transport are
+/// derived in the same retained-epoch walk and are bound to `authorized_head_revision`.
+#[derive(Debug, Clone)]
+pub struct PreparedSchemaAwarePublication {
+    pub formation_revision: RevisionId,
+    pub formation_semantic_revision: kernel_types::SemanticRevision,
+    pub authorized_head_revision: RevisionId,
+    pub intervening_effect_count: usize,
+    pub relation_writes: BTreeSet<SemanticId>,
+    pub field_writes: BTreeSet<(SemanticId, SemanticId)>,
+    pub relation_authorizations:
+        BTreeMap<SemanticId, kernel_durability::DurableRelationAuthorization>,
+    pub client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    pub(crate) source_model_delta: DurableModelDelta,
+    pub(crate) current_model_delta: DurableModelDelta,
+    pub(crate) publication_guard: Option<RuntimeGuardObservationFootprint>,
+    pub(crate) source_mutations: Vec<(
+        SemanticId,
+        RelationDelta,
+        kernel_durability::DurableRelationAuthorization,
+    )>,
+    pub(crate) current_mutations: Vec<(
+        SemanticId,
+        RelationDelta,
+        kernel_durability::DurableRelationAuthorization,
+    )>,
+}
+
+impl PreparedSchemaAwarePublication {
+    #[must_use]
+    pub fn current_model_delta(&self) -> &DurableModelDelta {
+        &self.current_model_delta
+    }
+
+    pub fn current_relation_deltas(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            SemanticId,
+            &RelationDelta,
+            kernel_durability::DurableRelationAuthorization,
+        ),
+    > + '_ {
+        self.current_mutations
+            .iter()
+            .map(|(relation, delta, authorization)| (*relation, delta, *authorization))
+    }
 }
 
 #[derive(Debug)]
@@ -696,9 +1387,10 @@ pub enum DurableRuntimeCommitError {
     },
     GuardDependencyConflict(RuntimeTransitionRebaseConflict),
     SchemaAwareTransitionConflict(RuntimeTransitionRebaseConflict),
-    SchemaAwareTransitionUnavailable { revision: RevisionId },
+    SchemaAwareTransitionUnavailable {
+        revision: RevisionId,
+    },
 }
-
 
 impl From<PhysicalExecutionError> for DurableRuntimeCommitError {
     fn from(value: PhysicalExecutionError) -> Self {
@@ -1273,7 +1965,8 @@ impl RuntimeViolationState {
         }
 
         let model_rule_witnesses = target.model_rule_witnesses().clone();
-        let compiled_rules = kernel_validation::CompiledRulePlan::compile(target.semantic_context());
+        let compiled_rules =
+            kernel_validation::CompiledRulePlan::compile(target.semantic_context());
         let mut measure = kernel_violation::ViolationMeasure::new();
         for mutation in mutations {
             let footprint = mutation.validation_footprint();
@@ -1292,18 +1985,27 @@ impl RuntimeViolationState {
                     )
                 })?;
             }
-            for (rule_index, _) in compiled_rules.model_rules_for_mutation(mutation.relation, &footprint) {
+            for (rule_index, _) in
+                compiled_rules.model_rules_for_mutation(mutation.relation, &footprint)
+            {
                 let mass = model_rule_witnesses
                     .violation_mass(target.semantic_context(), rule_index)
-                    .map_err(|_| PhysicalExecutionError::Validation(
-                        kernel_validation::ValidationError::ModelRuleEvaluation,
-                    ))?;
+                    .map_err(|_| {
+                        PhysicalExecutionError::Validation(
+                            kernel_validation::ValidationError::ModelRuleEvaluation,
+                        )
+                    })?;
                 if mass != 0 {
                     measure
-                        .add(kernel_validation::DynamicViolationWitness::ModelRule { rule_index }, mass)
-                        .map_err(|error| PhysicalExecutionError::Validation(
-                            kernel_validation::ValidationError::ViolationMeasure(error),
-                        ))?;
+                        .add(
+                            kernel_validation::DynamicViolationWitness::ModelRule { rule_index },
+                            mass,
+                        )
+                        .map_err(|error| {
+                            PhysicalExecutionError::Validation(
+                                kernel_validation::ValidationError::ViolationMeasure(error),
+                            )
+                        })?;
                 }
             }
         }
@@ -1314,7 +2016,6 @@ impl RuntimeViolationState {
             model_rule_witnesses,
         })
     }
-
 
     #[must_use]
     pub fn is_zero(&self) -> bool {

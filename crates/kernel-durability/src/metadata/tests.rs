@@ -37,6 +37,14 @@ fn current_test_transactions() -> BTreeMap<DurableTransactionKey, DurableCommitt
                     authorization: crate::DurableRelationAuthorization::default(),
                 }],
                 client_guard_digest: None,
+                causal_observations: Vec::new(),
+                causal_observation_groups: Vec::new(),
+                relational_causal_observations: vec![crate::DurableRelationalCausalObservation {
+                    observation_id: 7,
+                    observed_revision: RevisionId::new(12),
+                    intent_prefix: DurableIntentPrefix::empty(),
+                    query: kernel_query::RelExpr::Scan(SemanticId::new(9)),
+                }],
                 semantic_modules: Vec::new(),
             },
         ),
@@ -397,4 +405,66 @@ fn metadata_decoder_accepts_bounded_reader_source_without_slice_materialization(
     let decoded = decode_from_reader(&mut reader, bytes.len() as u64).unwrap();
     assert_eq!(decoded, metadata);
     assert_eq!(reader.position(), bytes.len() as u64);
+}
+
+#[test]
+fn p498_relational_intent_prefix_codec_is_persistent_linear_chain() {
+    use std::sync::Arc;
+
+    let relation = SemanticId::new(49_800);
+    let mut prefix = DurableIntentPrefix::empty();
+    let mut observations = Vec::new();
+    for index in 0..128_u32 {
+        prefix = prefix.append(vec![DurableRelationMutation {
+            relation,
+            inserted: vec![vec![Value::I64(i64::from(index))]],
+            removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
+        }]);
+        observations.push(DurableRelationalCausalObservation {
+            observation_id: index,
+            observed_revision: RevisionId::new(49_800),
+            intent_prefix: prefix.clone(),
+            query: RelExpr::Scan(relation),
+        });
+    }
+
+    let intent = DurableTransactionIntent::RelationData {
+        source_revision: RevisionId::new(49_800),
+        target_revision: RevisionId::new(49_801),
+        semantic_revision: kernel_types::SemanticRevision::new(
+            kernel_types::SchemaRevisionId::new(498),
+            kernel_types::SemanticEnvId::new(1),
+        ),
+        relation_mutations: Vec::new(),
+        client_guard_digest: None,
+        causal_observations: Vec::new(),
+        causal_observation_groups: Vec::new(),
+        relational_causal_observations: observations,
+        semantic_modules: Vec::new(),
+    };
+
+    let mut encoded = Vec::new();
+    encode_transaction_intent(&mut encoded, &intent).unwrap();
+    assert!(
+        encoded.len() < 32_000,
+        "persistent segment chain must stay linear rather than serializing cumulative prefixes: {} bytes",
+        encoded.len()
+    );
+
+    let mut cursor = Cursor::new(&encoded);
+    let decoded = decode_transaction_intent(&mut cursor).unwrap();
+    let decoded = decoded.relational_causal_observations();
+    assert_eq!(decoded.len(), 128);
+    assert_eq!(
+        decoded[127].intent_prefix.segments_oldest_first().len(),
+        128
+    );
+    for pair in decoded.windows(2) {
+        let previous = pair[0].intent_prefix.tail().unwrap();
+        let current = pair[1].intent_prefix.tail().unwrap();
+        let parent = current.parent.as_ref().unwrap();
+        assert!(Arc::ptr_eq(previous, parent));
+    }
 }

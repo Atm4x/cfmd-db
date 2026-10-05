@@ -8,6 +8,10 @@ The historical problem ledger is closed for the declared scope; the current audi
 
 ## Active phase — Rust productization
 
+### PASS507 GitHub checkpoint maintenance status
+
+The repository checkpoint is synchronized to the PASS507 product boundary. Pinned Rust 1.98.1 formatting, strict workspace Clippy (`-D warnings`), and the full Rust CI script are green. The formal source-refinement binders are also synchronized with production `FilterOrderConst`/`Union` and pass. Local execution of Lean 4.34.0 itself was unavailable in the maintenance sandbox, so the repository does not claim a local Lean compiler run; GitHub CI remains pinned to `leanprover/lean4:v4.34.0`. PASS508 remains the next product/R&D target.
+
 The architecture is Rust-first and now has two deliberate product layers:
 
 ```text
@@ -495,3 +499,105 @@ P472 removes the superseded `MaterializedSemanticIndexState`/`LegacyIndex` famil
 
 ### PASS473 status
 Schema-aware field intent transport now retains one immutable P462 support/action root per live schema epoch. Migration boundaries preserve structurally shared source field roots and semantic context, so stale field intents cross old epochs without durable-history replay or `revision_at()` on the commit hot path. Reopen rebuilds the retained roots from canonical causal/historical authority. Next: row-local relation exact-effect transport through the same epoch-root law.
+
+### PASS474 checkpoint status
+Retained-epoch row-local relation certification and P464 transport are integrated without old-epoch revision/history replay. Hostile type-changing A->B reopen coverage exposed the remaining architectural payer below the migration calculus: durable runtime publication still applies a current-B relation residual directly to lagging A-shaped `PhysicalStore` authority. The proof/transport path is correct; final P474 closure requires wiring the existing `kernel-realization` B-native exact-delta overlay beneath runtime publication rather than materializing the relation or routing through schema A.
+
+### PASS474 final status
+PASS474 is complete. Retained-epoch relation proof and P464 row-local transport publish correctly after reopen, including the active type-changing A `Set<I64>` -> B `Set<F64>` stale-intent regression. The checkpoint's proposed realization-overlay payer was disproved by direct instrumentation: recovery already held a B/F64 RowStore and the transported residual was B/F64. The actual defect was representation-local: RowStore inferred arity from its first row, so removing its last row transiently changed arity to zero before inserting the replacement. RowStore now stores `column_count` independently of cardinality, recovery/preparation preserve schema arity for empty relations, and a focused shape regression protects the law. No materialization fallback, schema-A routing or second write engine was added. Next active line: exact general relational/query guard provenance across schema migration.
+
+### PASS479 — formation-world seal correction
+
+Schema-aware transaction semantics are now explicitly one-way: formation guards end at the first
+migration boundary and only exact effects continue. The previous P475–P478 cross-schema guard/event
+transport direction is rejected as transaction architecture. Migration cutover now also seals the
+actual source historical persistent root, fixing loss of retained pre-boundary action authority.
+
+
+## PASS480 — B-native causal observation authority for retroactive sealed-effect reorder
+
+### CLOSED THIS PASS
+- Hostile audit confirmed PASS479's formation seal alone was insufficient: a sealed old effect physically published after a later B transaction could otherwise invalidate an observation that B transaction causally relied on.
+- Added durable causal-observation coordinates to committed relation/mixed intents, explicitly separate from `ClientIntentGuardDigest` retry identity.
+- Added reconstructible persistent current/retained-epoch observation timelines over the same durable causal authority; no second history store.
+- Schema-aware post-boundary braid now checks transported sealed writes against observations of logically later B/C transactions. Overlap is reported as coordination-required, not falsely claimed to be an exact semantic conflict.
+- Hostile reopen regression proves: B reads password=OLD then writes generation; late sealed A password:=NEW cannot be retroactively inserted before B.
+- Preserved PASS479 law: later B writes with no causal observation of the old effect remain reorderable when normal effect laws certify them.
+
+### OPEN — IMMEDIATE
+1. Lower product `Transaction::require` canonical requirement footprints automatically into durable causal-observation authority; current kernel path accepts explicit observation footprints.
+2. Derive exact observation-preservation/commutation certificates so coordinate overlap need not always require coordination when the earlier write provably preserves the later predicate.
+3. Introduce distinct current-world publication preconditions for semantics that must hold at publication HEAD; do not reuse formation guards.
+4. Extend B-native causal observation authority to general relational/OFC requirements without reintroducing B->A or old-guard transport.
+
+### SUPERSEDED / DO NOT EXTEND
+- Treating write/write post-boundary rebase alone as sufficient proof for retroactively inserting a formation-sealed effect before later current-world transactions.
+- Reinterpreting this B-native anti-dependency proof as transport/revalidation of the old A guard.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Causal observation lookup is coordinate-indexed persistent-tree authority; no linear history scan.
+- Observation timelines are reconstructible from durable committed intent and retained epoch roots; no independently serialized witness cache/history.
+- Ordinary same-schema stale transactions do not pay the retroactive-seal anti-dependency rule unless logical order has already been fixed before a crossed schema boundary.
+
+### NEXT RECOMMENDED PASS
+**PASS481 — product `Transaction::require` causal-observation lowering + exact observation-preservation/commutation law.** Read `PROJECT_RULES.md` first and carry that requirement into every successor PASS.
+
+
+## PASS484 — Interned causal-group routing / general OFC hostile boundary
+
+### CLOSED THIS PASS
+- P483 reconstructible group routing no longer clones the full grouped predicate/vector under every member coordinate. One payload is interned by `(effect_id, group_id)`; coordinate timelines store only `u32` group ids.
+- Retained schema epochs structurally share the interned group pool instead of multiplying payloads at cutover.
+- Structural hostile scaling is exact: widths 8/64/512 retain 1 payload, N payload fields and 2N routing refs (`Field` + `ObjectField`), replacing the previous O(N²) payload duplication.
+- Executable join hostile proves `query + observed OFC + source-relations` is insufficient for general relational causal preservation; hidden Γ-DTC state is a mandatory part of any exact certificate.
+
+### OPEN — IMMEDIATE
+1. Build a shared/interned persistent relational causal capsule lineage over exact `MaterializedRelPlanState`/Γ-DTC state, with one capsule payload shared by observations rather than one O(data) snapshot per transaction.
+2. Make that capsule lineage reconstructible across reopen from existing durable causal authority without per-braid query replay or an independently serialized second history store.
+3. Add relation/source-occurrence routing and hostile scaling for many relational observations sharing hot source relations.
+4. Current-world publication preconditions remain a separate authority from formation guards.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX and field-granular certified changes.
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Migration frontend and final Python/.NET/Studio/CLI surfaces; backup/recovery UX; public perf/binary budgets; Windows secure memory.
+
+### SUPERSEDED / DO NOT EXTEND
+- Copying one full `RuntimeJointCausalObservationGroup` into every member-coordinate timeline.
+- Treating relational source-relation envelopes or observed OFC keys as exact causal conflict authority.
+- Per-transaction full maintained-query snapshots, global query replay, relation-wide coarse conflicts, or any P475-P478 old-guard transport architecture.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Group payload count is O(groups), not O(groups × width); member routing refs are O(total memberships).
+- One touched group is evaluated once per braid.
+- Future relational capsules must be persistent/shared; no O(source-data) duplication per committed observation.
+- No global history scan or full query recomputation on the retroactive hot path.
+
+### NEXT RECOMMENDED PASS — PASS485
+Shared persistent relational/OFC causal capsule lineage and reopen reconstruction. Read root `PROJECT_RULES.md`, PASS484 report, active ledger tails, and relevant R&D before implementation; carry this instruction forward again.
+
+
+## Pass502 current product authority
+
+- Normal mutable Rust ownership is `Context<M>` only; the former runtime `Transaction` carrier is now `IntentJournal` and remains hidden implementation/probe plumbing.
+- `TransactionId` remains the durable protocol/idempotency identity; no semantic retry law was renamed or duplicated.
+- Authoritative typed creation is `Database::builder(path).create_authoritative::<S>()`, returning schema-neutral `Database`; consumer Context binding remains separate.
+- `Snapshot<M>::edit()` remains the strict snapshot-bound edit surface.
+- No fallback/router/SQL-shaped path was introduced; existing Candidate, Γ-DTC observation, kernel-change transport and durability authorities remain unchanged.
+
+## PASS503 authority update
+Scoped typed authorization is now integrated with the selected Context model. `SessionDatabase::context::<S>()` admits one bounded working world carrying the live session authority; Context no longer exposes a raw unrestricted Database handle. Read/query footprints, field/action writes, history/historical reads, relationship operations and publication freshness reuse the existing semantic plan authority rather than frontend checks. Next security work is authorization transport across schema migration/current-world publication freshness.
+
+
+## PASS507 current product checkpoint
+
+- `Context<M>` is the sole normal mutable Rust unit-of-work owner; runtime intent plumbing is hidden as `IntentJournal`.
+- Authoritative typed creation returns schema-neutral `Database`; consumer Context binding remains separate.
+- Scoped DB-owned authorization is enforced on persisted semantic coordinates and live session publication authority.
+- Across migration, grants are never transported. One `PreparedSchemaAwarePublication` transports the exact effect together with its required current-world authorization footprint and binds both to one HEAD.
+- `commit`, `preview` and `intent_readiness` consume the same prepared relation meaning. Pure field-only `DurableModelDelta` publication now uses the same prepare/commit split.
+- Hosted/dynamic commits carry explicit `SemanticRevision { schema, environment }`; historical material verifies the declared formation identity rather than inferring it from `base_revision`.
+- OPEN next: remove hosted `revision_at(base_revision)` as a preparation payer by introducing a bounded formation-context witness; unify mixed relation+field prepared publication; derive carrier/lifecycle delta transport from proved identity/lifecycle laws. Unsupported cases remain fail-closed.
+
+Repository/CI checkpoint work after PASS507 synchronizes the current tree with the later GitHub CI repairs: pinned Rust 1.98.1 strict fmt/Clippy workflow prerequisites (`ripgrep`, Ubuntu user namespaces), Git-index-aware repository manifest support, and the updated Lean source-refinement checker that follows split `mod`/`include!` durability sources and current streaming checkpoint cuts.

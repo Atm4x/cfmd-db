@@ -164,7 +164,8 @@ impl DurableRuntime {
         storage: &RuntimeStorageOptions,
         revision_publication: Arc<dyn RuntimeRevisionPublicationNotifier>,
     ) -> Result<Self, DurabilityError> {
-        root.historical = RuntimeHistoricalDerivedIndex::from_current(root.revision.id(), &root.relation_bases);
+        root.historical =
+            RuntimeHistoricalDerivedIndex::from_current(root.revision.id(), &root.relation_bases);
         let materialization_specs = root.durable_materialization_specs();
         let physical_artifact_specs = root.durable_physical_artifact_specs();
         let artifact_cores =
@@ -289,7 +290,10 @@ impl DurableRuntime {
         )
     }
 
-    #[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the complete operator or protocol case analysis together."
+    )]
     pub fn open_with_storage_options_recovery_policy_and_revision_publication_notifier(
         path: impl AsRef<std::path::Path>,
         storage: &RuntimeStorageOptions,
@@ -302,10 +306,12 @@ impl DurableRuntime {
             }
             RuntimeDurabilityBackend::Directory => {
                 if storage.encryption.algorithm().is_some() {
-                    return Err(RuntimeRecoveryError::Durability(DurabilityError::Protocol {
-                        offset: 0,
-                        reason: "directory storage encryption is not implemented",
-                    }));
+                    return Err(RuntimeRecoveryError::Durability(
+                        DurabilityError::Protocol {
+                            offset: 0,
+                            reason: "directory storage encryption is not implemented",
+                        },
+                    ));
                 }
                 DurableRevisionStore::open(path)?
             }
@@ -332,7 +338,9 @@ impl DurableRuntime {
         )?;
         let durable_head = durability.durable_head();
         let causal_floor = durability.causal_coverage_root();
-        if let Some(records) = durability.revision_transition_records_back_to(causal_floor, durable_head)? {
+        if let Some(records) =
+            durability.revision_transition_records_back_to(causal_floor, durable_head)?
+        {
             let effects = records
                 .iter()
                 .map(RuntimeHistoryEffect::from_durable)
@@ -341,7 +349,8 @@ impl DurableRuntime {
 
             let mut epoch_effects = Vec::<RuntimeHistoryEffect>::new();
             for record in records.iter().rev() {
-                let DurableTransactionIntent::SchemaMigration { program, .. } = &record.intent else {
+                let DurableTransactionIntent::SchemaMigration { program, .. } = &record.intent
+                else {
                     epoch_effects.push(RuntimeHistoryEffect::from_durable(record));
                     continue;
                 };
@@ -363,17 +372,12 @@ impl DurableRuntime {
                 if source.id() != record.source_revision {
                     return Err(RuntimeRecoveryError::BaseRevisionMismatch);
                 }
-                let relation_bases = RuntimeRevisionBundle::relation_base_witnesses(
-                    &source,
-                    &registry,
-                )?;
-                let effects_backwards = epoch_effects
-                    .iter()
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let relation_bases =
+                    RuntimeRevisionBundle::relation_base_witnesses(&source, &registry)?;
+                let effects_backwards = epoch_effects.iter().rev().cloned().collect::<Vec<_>>();
                 let index = RuntimeRetainedEpochIndex::rebuild_from_boundary(
                     record.source_revision,
+                    &source.state().model,
                     &relation_bases,
                     &effects_backwards,
                     source.semantic_context(),

@@ -90,3 +90,89 @@ Evidence reopened `kernel-model` / `kernel-revision` under the P454 live-ref opt
 - SELECTED: one retained immutable P462 epoch root (support/action timelines + structurally shared field-value root) under the existing historical owner.
 - REJECTED: mutable witness cache, serialized compatibility cache, old-schema query fallback/router, duplicated merge/conflict engine.
 - OPEN: row-local relation exact effects and then general query/auth provenance.
+
+## PASS474 — row-local relation transport / runtime-realization publication seam
+- CLOSED: old-epoch relation certification no longer scans the complete retained causal suffix or reconstructs an old `Revision`; retained P462 support/action roots are the proof authority.
+- CLOSED: exact row-local relation delta transport uses P464 migration transport and fails closed for general relational slices.
+- CLOSED: relation residual retry identity now includes the client's formation semantic revision.
+- HOSTILE FINDING / OPEN: after semantic A->B cutover with physical convergence lag, `prepare_revision_derived` still assumes the physical relation accepts the current-B delta directly. A type-changing stale write therefore reaches `PhysicalTypeMismatch` only at publication. Full materialization is rejected as an O(data) fallback. Integrate the existing factorized B-native relation overlay into runtime physical publication.
+
+## PASS474 FINAL — RowStore shape authority correction
+- CLOSED: retained-epoch row-local relation exact effects now survive type-changing schema migration and reopen end-to-end.
+- CORRECTED FINDING: the checkpoint attribution to lagging A-shaped runtime physical authority was false. Instrumentation showed current B/F64 physical rows and a correct B/F64 transported delta before the failure.
+- ROOT CAUSE: `NativeRelation::RowStore` derived arity from the first row. `remove(last)` therefore made arity zero and the immediately following exact replacement insert failed `PhysicalTypeMismatch`.
+- SELECTED LAW: physical relation shape is representation authority independent of cardinality. RowStore stores `column_count`; empty cardinality does not erase arity.
+- REJECTED: migration-specific overlay/router/materialize-before-write workaround for this defect. Existing realization-overlay algebra remains reserved for actual derived physical authority, not used to mask a local representation invariant failure.
+- VERIFIED: active A(I64)->B(F64) reopen hostile regression passes; focused empty-RowStore shape regression passes; kernel-plan full gate passes.
+- NEXT: general relational/query guard provenance across migration, exact/fail-closed before authorization transport.
+
+## P479 hostile finding — schema boundary and retained source authority
+
+- REJECTED: keeping a formation-world guard executable across B/C epochs via query/provenance/derivative transport.
+- SELECTED: exact formation-world serialization seal followed by forward effect-only transport.
+- FIXED: migration candidate construction started with an empty historical index; schema sealing now starts from the persistent source historical root before target-epoch reset.
+- RULE: B-native changes after the formation seal cannot retroactively invalidate an A transaction guard. Conditions requiring current-head validity belong to a distinct publication authority.
+
+
+## PASS480 — B-native causal observation authority for retroactive sealed-effect reorder
+
+### CLOSED THIS PASS
+- Hostile audit confirmed PASS479's formation seal alone was insufficient: a sealed old effect physically published after a later B transaction could otherwise invalidate an observation that B transaction causally relied on.
+- Added durable causal-observation coordinates to committed relation/mixed intents, explicitly separate from `ClientIntentGuardDigest` retry identity.
+- Added reconstructible persistent current/retained-epoch observation timelines over the same durable causal authority; no second history store.
+- Schema-aware post-boundary braid now checks transported sealed writes against observations of logically later B/C transactions. Overlap is reported as coordination-required, not falsely claimed to be an exact semantic conflict.
+- Hostile reopen regression proves: B reads password=OLD then writes generation; late sealed A password:=NEW cannot be retroactively inserted before B.
+- Preserved PASS479 law: later B writes with no causal observation of the old effect remain reorderable when normal effect laws certify them.
+
+### OPEN — IMMEDIATE
+1. Lower product `Transaction::require` canonical requirement footprints automatically into durable causal-observation authority; current kernel path accepts explicit observation footprints.
+2. Derive exact observation-preservation/commutation certificates so coordinate overlap need not always require coordination when the earlier write provably preserves the later predicate.
+3. Introduce distinct current-world publication preconditions for semantics that must hold at publication HEAD; do not reuse formation guards.
+4. Extend B-native causal observation authority to general relational/OFC requirements without reintroducing B->A or old-guard transport.
+
+### SUPERSEDED / DO NOT EXTEND
+- Treating write/write post-boundary rebase alone as sufficient proof for retroactively inserting a formation-sealed effect before later current-world transactions.
+- Reinterpreting this B-native anti-dependency proof as transport/revalidation of the old A guard.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Causal observation lookup is coordinate-indexed persistent-tree authority; no linear history scan.
+- Observation timelines are reconstructible from durable committed intent and retained epoch roots; no independently serialized witness cache/history.
+- Ordinary same-schema stale transactions do not pay the retroactive-seal anti-dependency rule unless logical order has already been fixed before a crossed schema boundary.
+
+### NEXT RECOMMENDED PASS
+**PASS481 — product `Transaction::require` causal-observation lowering + exact observation-preservation/commutation law.** Read `PROJECT_RULES.md` first and carry that requirement into every successor PASS.
+
+
+## PASS484 — Interned causal-group routing / general OFC hostile boundary
+
+### CLOSED THIS PASS
+- P483 reconstructible group routing no longer clones the full grouped predicate/vector under every member coordinate. One payload is interned by `(effect_id, group_id)`; coordinate timelines store only `u32` group ids.
+- Retained schema epochs structurally share the interned group pool instead of multiplying payloads at cutover.
+- Structural hostile scaling is exact: widths 8/64/512 retain 1 payload, N payload fields and 2N routing refs (`Field` + `ObjectField`), replacing the previous O(N²) payload duplication.
+- Executable join hostile proves `query + observed OFC + source-relations` is insufficient for general relational causal preservation; hidden Γ-DTC state is a mandatory part of any exact certificate.
+
+### OPEN — IMMEDIATE
+1. Build a shared/interned persistent relational causal capsule lineage over exact `MaterializedRelPlanState`/Γ-DTC state, with one capsule payload shared by observations rather than one O(data) snapshot per transaction.
+2. Make that capsule lineage reconstructible across reopen from existing durable causal authority without per-braid query replay or an independently serialized second history store.
+3. Add relation/source-occurrence routing and hostile scaling for many relational observations sharing hot source relations.
+4. Current-world publication preconditions remain a separate authority from formation guards.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX and field-granular certified changes.
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Migration frontend and final Python/.NET/Studio/CLI surfaces; backup/recovery UX; public perf/binary budgets; Windows secure memory.
+
+### SUPERSEDED / DO NOT EXTEND
+- Copying one full `RuntimeJointCausalObservationGroup` into every member-coordinate timeline.
+- Treating relational source-relation envelopes or observed OFC keys as exact causal conflict authority.
+- Per-transaction full maintained-query snapshots, global query replay, relation-wide coarse conflicts, or any P475-P478 old-guard transport architecture.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Group payload count is O(groups), not O(groups × width); member routing refs are O(total memberships).
+- One touched group is evaluated once per braid.
+- Future relational capsules must be persistent/shared; no O(source-data) duplication per committed observation.
+- No global history scan or full query recomputation on the retroactive hot path.
+
+### NEXT RECOMMENDED PASS — PASS485
+Shared persistent relational/OFC causal capsule lineage and reopen reconstruction. Read root `PROJECT_RULES.md`, PASS484 report, active ledger tails, and relevant R&D before implementation; carry this instruction forward again.

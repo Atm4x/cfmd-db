@@ -179,7 +179,7 @@ fn native_semantic_column_work_units(
     column: usize,
 ) -> Result<usize, PhysicalExecutionError> {
     match data {
-        NativeRelation::RowStore(rows) => rows.iter().try_fold(0_usize, |work, row| {
+        NativeRelation::RowStore { rows, .. } => rows.iter().try_fold(0_usize, |work, row| {
             let value = row
                 .get(column)
                 .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;

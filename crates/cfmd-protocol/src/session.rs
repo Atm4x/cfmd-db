@@ -33,6 +33,22 @@ impl IdempotencyKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticRevision {
+    pub schema: u64,
+    pub environment: u64,
+}
+
+impl SemanticRevision {
+    #[must_use]
+    pub const fn new(schema: u64, environment: u64) -> Self {
+        Self {
+            schema,
+            environment,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolLimits {
     pub max_query_nodes: usize,
     pub max_query_depth: usize,
@@ -67,6 +83,7 @@ pub struct RelationMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRequest {
     pub base_revision: u64,
+    pub formation_semantic_revision: SemanticRevision,
     pub idempotency_key: IdempotencyKey,
     pub mutations: Vec<RelationMutation>,
 }
@@ -451,6 +468,8 @@ impl HostedSession {
             .collect::<Vec<_>>();
         let outcome = self.database.commit_exact_relation_intent(
             RevisionId::new(request.base_revision),
+            request.formation_semantic_revision.schema,
+            request.formation_semantic_revision.environment,
             transaction_id,
             &mutations,
         )?;

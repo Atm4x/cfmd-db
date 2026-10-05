@@ -1521,3 +1521,159 @@ P460 closes both explicit P459 data-size payers without introducing a second sta
 Transition footprint certification now reuses the shared semantic context only after proving the intervening path contains no semantic/opaque boundary, eliminating `revision_at()` from the ordinary stale exact-effect certificate path. Stale Set residualization also becomes witness-native: touched Γ classes resolve to logical positions and exact current representatives are point-read; the whole current relation is never materialized. Bag behavior is unchanged.
 
 Next: PASS461 history-depth hostile/perf before deciding whether any revision->support-root memo is justified. If not, return to the remote-reader schema-evolution DX line. Typed field-grant sugar and all prior deferred Context/Rules/migration/frontend/bindings/backup/perf/Windows lines remain mandatory carry.
+
+## P479 correction — schema-epoch transaction boundary
+
+The post-P463 guard-transport direction is superseded for transaction semantics. A transaction's
+formation-world reads/requirements terminate at an exact `FormationWorldSeal` immediately before the
+first crossed schema migration. Migration transports the exact effect only. B/C native history is
+handled by ordinary current-epoch change/rebase laws; B does not need to mean anything in A.
+
+Current-world conditions that must remain true at physical publication time are a separate publication
+precondition/authority problem. Every successor PASS must read `PROJECT_RULES.md` first and propagate
+that requirement again.
+
+## PASS485 UPDATE — persistent relational causal capsule primitive
+PASS485 establishes the exact no-fallback Γ-DTC state carrier required by PASS484. `RelCausalCapsule` shares one revision-bound `MaterializedRelPlanState` payload, checks proposed relation deltas directly against hidden maintained state, and reconstructs predecessor capsule states from exact durable forward relation effects without physical handles or query replay. Unrelated revision churn preserves the same payload Arc; relevant transitions use existing persistent/COW maintained-plan nodes. Immediate continuation is durable relational observation->capsule identity plus compact runtime relation/source-occurrence routing and reopen interning; no serialized maintained-state history may be introduced.
+
+## PASS486 UPDATE — relational causal identity / compact routing / reopen interning
+PASS486 removes the need for any durable capsule namespace. Durable authority is observation-local identity plus observed state frontier and `RelExpr`; runtime capsule refs are derived only. Current/retained indexes intern shared `RelCausalCapsule` states, relation routes retain compact observation refs, reopen reconstructs one persistent lineage per unique query by rewinding existing exact durable relation effects, and snapshot certification evaluates proposed relation deltas directly through Γ-DTC state. Immediate continuation is product observation capture and canonical history-normalization braid integration with before/after-reopen equivalence tests. All deferred Context/Auth/Rules/frontend/bindings/backup/perf/Windows lines remain mandatory carry.
+
+## PASS487 UPDATE — product relational capture / canonical braid / restart-stable effect identity
+PASS487 moves relational causal authority into explicit transaction-bound application reads without a second query replay: one maintained Γ-DTC execution yields both the application result and the shared causal capsule. A hostile public-surface regression refined the boundary: mutation lowering is not an observation, so `set`/relationship/query mutation construction uses a passive clone of the same formation snapshot while `tx.objects()` reads retain capture authority. This preserves field-granular rebase and `require` semantics without whitelists. Captured observations persist through direct/residual commits and canonical current/retained braid certification invokes exact relational anti-dependency proof. A hostile restart regression also exposed that live history used client transaction ids while reopen used durable revision-effect ids; PREPARE now returns the assigned `RevisionEffectId` and runtime history binds only with that durable identity, making verdict/witness identity restart invariant. Immediate continuation is retained-epoch end-to-end restart proof plus distinct-query/hot-relation scaling. All deferred Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS488 continuation update — retained relational braid restart + output-sensitive reopen
+P488 proves the schema-boundary case end-to-end: retained source-epoch Γ-DTC join observations are reconstructed after reopen and issue the same causal conflict identity as live execution. Relational capsule recovery is now a single backward history sweep with `relation -> unique lineage` influence routing. It does not pay Q times for irrelevant history and constructs effect delta maps only when at least one exact compiled lineage depends on a touched relation. The preserved complexity law is O(H + Q + I + O), with I the true semantic effect-lineage influence count; no fallback is permitted to pretend fully-hot I=H*Q work does not exist. Next R&D should determine whether shared maintained sub-DAG interning can reduce the fully-hot distinct-query case exactly; if not, carry the lower bound and continue broader relational/object capture coverage before returning to Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows lines.
+
+## PASS489 continuation update — relational multi-root state-cell architecture
+
+P489 proves that the remaining fully-hot relational payer is reducible exactly when observation roots share canonical semantic substructure. Identical `RelExpr` subtrees at the same semantic world/revision have the same Γ-DTC maintained state and transition, so one maintained state cell may fan out to many operator occurrences/observation roots. Relation-envelope sharing is explicitly rejected by a hostile regression because distinct filters over the same relation have different future causal behavior. Query-kernel structural `Eq/Hash` is the derived runtime key; no durable DAG identity or maintained-state snapshot is introduced.
+
+Worst-case arbitrary distinct stateful semantics remain `H*Q`; the correct target is output-sensitive unique-node work, not a claim that all hot query sets become sublinear. PASS490 should implement a multi-root `RelObservationForest` with canonical state cells and separate occurrences, prove exact equivalence to independent Γ-DTC roots, and only then replace per-lineage reopen rewind. Parameter-family fusion is deferred until the structural forest is exact. Deferred Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS490 continuation update — canonical multi-root relational forest
+
+P490 closes the representation prerequisite from P489. `RelObservationForest` interns identical semantic subtrees into one maintained Γ-DTC state-cell arena while preserving operator/root occurrences as fanout edges. Exact multi-root transitions reuse the existing maintained node kernels and are executable-equivalent to independent roots across the current relational operator vocabulary. A self-join explicitly shares one Scan cell but preserves two input occurrences. Forest reconstruction has one sweep anchor and per-root causal dependency frontiers; no forest/node identity is durable. PASS491 should switch P488 reopen from per-lineage capsules to one forest transition lineage and measure unique-node/node-transition savings before any parameter-family fusion. Deferred Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS491 continuation update — forest-backed reopen + shared-root causal batch
+
+P491 closes the runtime integration half of the P489/P490 forest line. Reopen creates one `RelObservationForest` for all unique relational observation roots, rewinds it once per relevant historical effect, and emits root capsules sharing the same forest snapshot. Current and retained causal braid checking batches shared forest capsules, so one proposed effect no longer replans the same forest once per observation root. Durable observation identity and on-disk authority are unchanged.
+
+The next immediate hostile payer is forest construction itself: canonical cells are retained once, but parent-cell initialization still transiently builds whole independent subtrees and can duplicate O(source-data) boundary work. PASS492 should make forest construction bottom-up/local-cell exact before parameter-family fusion. All deferred Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS492 continuation update — bottom-up canonical forest construction
+
+P492 closes the remaining initial-build payer from P491. `RelObservationForest` no longer constructs a complete independent maintained subtree for every new parent cell. Canonical children are initialized first and each parent local Γ-DTC state is built once directly from the already-built child output/type using existing node-local semantic builders. Hostile coverage proves 64 `Filter(Scan)` roots produce 65 local cell initializations and one source materialization, while self-join keeps two occurrence edges but materializes its shared Scan once. Transition/reopen/braid semantics remain unchanged.
+
+Next: PASS493 may investigate exact parameter-family fusion (equality-value dispatch and ordered cuts) as a lowering of the same canonical forest. It must not weaken root identity/frontiers, add relation-envelope heuristics, or introduce a second query/history engine. Deferred Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS493 continuation update — exact equality/order parameter-family fusion
+
+P493 adds an exact lowering inside `RelObservationForest` for sibling parameterized stateless filters. Equality constants sharing one parent/column/Γ-equivalence are indexed by compiled canonical equivalence key; ordered constants sharing one parent/column/ordering share one canonical order key and sorted cut projections across `<`, `<=`, `>`, `>=`. Roots, observation identities/frontiers and downstream occurrence edges remain distinct; no family id is durable. Work is output-sensitive and preserves the true cost of emitted root memberships. The prior PASS488 miss-heavy reopen workload now needs only its four Scan transitions instead of transitioning 64 filter cells per hot effect. Next hostile question is whether richer conjunction/range families admit one general exact normalized decision/interval structure; if not, stop specializing and return to broader product observation/Context lines. Deferred Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows work remains mandatory carry.
+
+## PASS494 continuation update — generalized predicate-family boundary
+
+P494 closes the current parameter-family specialization line. Constant order conjunctions over one canonical semantic coordinate `(parent, column, ordering)` have an exact interval normal form obtained by intersecting canonical lower/upper cuts. Executable coverage verifies the normal form against ordinary nested `RelExpr` evaluation. The hostile multi-column case is fundamentally different: conjunctions become product regions, and rows sharing the same canonical key on either individual axis can require different root routing because another independent coordinate matters. Therefore no existing one-dimensional scalar family key can be a universal exact conjunction router.
+
+Do not grow recovery/forest code with conjunction-specific pattern routers or host tuple/hash shortcuts. A future multidimensional acceleration, if justified, must be a first-class Γ-aware index algebra. Immediate continuation returns to broader product observation coverage: audit object/reference/relationship/deep-traversal application reads and ensure they lower into the existing exact relational causal capture while internal mutation/lowering reads remain passive. Deferred Context/Auth/Semantic Rules/frontend/bindings/history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS495 handoff — product observation breadth / selected scoped Context authority
+
+PASS495 hostile-audited application-visible object/reference/relationship/deep-traversal reads against the P487-P494 relational causal authority. `Ref`, `Many`/`OwnedMany`, deep typed paths, projections and aggregates all lower through the ordinary `RelExpr` / `ReadContext::execute` path and therefore reuse the same Γ-DTC causal observation machinery; internal mutation/effect lowering remains passive. New public-surface regressions prove chained reference reads, deep reference-path predicates and relationship cardinality observations reject retroactive effects that would change the committed observation.
+
+The selected scoped Context DX contract has now been copied into mainline as `docs/api/CFMD_SELECTED_SCOPED_CONTEXT_DX_RU.md`. It supersedes treating current `ContextSource::Current` as final semantics. Target model: long-lived schema-neutral `Database`; bounded `Context<M>` owns one formation world, incremental Candidate, observation journal and internal exact intent journal; ordinary public `Transaction` becomes implementation plumbing rather than a second unit-of-work owner. No auto-commit on drop, no old-schema current-world routing, no second observation model.
+
+Immediate continuation: PASS496 should replace fresh-snapshot-per-call `ContextSource::Current` with the selected scoped Context core while preserving P487-P495 causal capture, durable intent identity, rebase/FormationWorldSeal and touched-data performance laws. Then complete reference/relationship partial-Context writes, DB-owned authorization and Semantic Rules.
+
+## PASS496 continuation update — scoped Context formation core
+
+P496 replaces public `Context<M>`'s fresh-snapshot-per-call semantics with one admitted formation world and one Context-owned speculative unit of work. Basic create/delete/field-patch staging, preview and commit now use an internal adaptive exact-intent journal; ordinary Context reads run on the formation world before writes and on the exact Candidate after staged effects. Successful commit seals the scope; drop does not publish. Existing transaction/Plan/query/change machinery remains the single semantic owner.
+
+Hostile R&D found the exact remaining RYW durability gap: a relational observation after a staged effect lives in a virtual Candidate world and cannot be represented by the current durable `(committed revision, RelExpr)` certificate. P496 therefore fails commit closed after such an observation rather than inventing a fake revision or dropping causal authority. PASS497 must add ordered intent-prefix/segment authority so recovery can reconstruct candidate observation worlds exactly. Relationship mutation DX, authorization, Semantic Rules, bindings, history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS497 continuation update — scoped Candidate prefix authority
+
+P497 removes the P496 fail-closed boundary for reads after staged writes. Relational observations in a speculative Context are durably qualified by the committed formation revision plus the exact cumulative staged relation-effect prefix. Reopen rebuilds the ordinary shared observation forest at the formation revision and advances it through that prefix using the same Γ-DTC transition machinery; maintained query state is not serialized and application callbacks are never replayed. Equal prefixes are interned by the durability codec.
+
+Immediate continuation is PASS498: replace cumulative prefix snapshots with a persistent/interned ordered IntentJournal segment chain so many alternating writes/reads cannot create O(S²) durable prefix payload; then prove retained-schema/migration restart equivalence for prefix-qualified Candidate observations. Context relationship/reference mutations, authorization, Semantic Rules, bindings, history/backup/perf/Windows remain mandatory carry.
+
+## PASS498 continuation update — persistent scoped intent-prefix lineage
+
+P498 removes the cumulative-prefix O(S^2) payer introduced by P497. Candidate observation authority now uses a persistent parent-linked `DurableIntentPrefix`: each Context stage appends one exact relation delta from the previous Candidate to the next, and observations retain only the current tail. The durable codec stores unique `(parent_ref, segment)` nodes once and observations store compact tail refs; reopen reconstructs shared `Arc` lineage and advances the existing `RelObservationForest` through segments in order. No fake Candidate revision, callback replay, maintained-query serialization or second query engine is introduced.
+
+The retained-schema proof is now prefix-qualified: an A-native self-join observation formed after a staged A relation write survives A->B migration and reopen, and the same retroactive A effect yields the same coordination conflict before and after restart. Formation semantics still terminate at `FormationWorldSeal`; prefix reconstruction belongs entirely to the retained native formation epoch.
+
+Immediate continuation: PASS499 moves reference-field and relationship mutations (`Ref`, `Many`, `OwnedMany`) under the scoped Context-owned internal intent journal/persistent prefix lineage so ordinary DX no longer requires external `&mut Transaction`. Atomic migration-ready Context admission follows. Authorization, Semantic Rules, bindings, history/backup/perf and Windows secure-memory lines remain mandatory carry.
+
+## PASS499 continuation update — scoped relationship/reference mutation ownership
+
+P499 moves ordinary reference and relationship writes under the scoped Context unit-of-work owner. Required/optional Ref fields use `Context::set`; `Many` and `OwnedMany` expose sealed semantic handles consumed by Context attach/detach/move APIs. Handles are rebound to the current Candidate by semantic owner/relation identity before lowering, so stale materialized handles cannot regress read-your-writes. Internal edge discovery remains passive, and every resulting exact Plan is staged through the same internal journal/persistent intent-prefix lineage. OwnedMany exclusivity/orphan laws remain exact and can fail during Candidate formation.
+
+Immediate continuation: PASS500 should implement atomic migration-ready Context admission, eliminating the check-then-bind race between schema/contract selection and formation binding. Authorization, Semantic Rules, bindings, history/backup/perf and Windows secure-memory remain mandatory carry.
+
+## PASS500 continuation update — atomic scoped Context admission
+
+P500 closes the migration-ready Context check-then-bind race with one generic `ContextAdmission`. `Database::begin_context()` clones one coherent immutable runtime root and exposes the schema revision from that same admitted world; consuming the token with `context::<M>()` binds the scoped Context to that exact formation root. A migration may publish between admission and typed branch execution without switching the admitted scope, while the next admission sees the new schema. The implementation reuses existing atomic runtime-root publication and introduces no migration router, long-held cutover lock, old-schema current-world path or client compatibility graph. `Database::context::<M>()` now delegates through the same admission primitive.
+
+Immediate continuation should hostile-audit the remaining ordinary public `Transaction` and transitional live `SchemaDatabase<S>` ownership surfaces. The selected target remains one public scoped unit-of-work owner (`Context<M>`), with separate transaction/snapshot vocabulary retained only where semantics are genuinely distinct. Authorization, Semantic Rules, bindings, history/backup/perf and Windows secure-memory lines remain mandatory carry.
+
+## PASS501 continuation update — one public scoped unit-of-work owner
+
+P501 removes the transitional live typed-database model. `SchemaDatabase<S>`, its builder, `CfmdSchema::database(...)`, and `ContextSource::Current` are gone. Typed application worlds are now structurally either bounded `Context<M>` scopes or immutable `Snapshot<M>` values. The `cfmd` facade no longer exports ordinary Transaction/TransactionId/TransactionReadiness ownership. Existing low-level transaction regressions import the hidden runtime journal explicitly rather than defining product DX.
+
+Strict historical editing is preserved without a second public transaction vocabulary: `Snapshot<M>::edit()` starts a scoped Context whose internal journal is snapshot-bound and refuses silent transport if HEAD advances. Consumer subset Contexts are intentionally not full authoritative-schema identities; binding a valid subset is legal.
+
+Immediate continuation: PASS502 should rename/internalize remaining runtime Transaction-shaped binding plumbing and finalize authoritative Database creation ergonomics without resurrecting `SchemaDatabase<S>`. Then return to DB-owned granular authorization, Semantic Rules, bindings, history/backup/perf and Windows secure-memory.
+
+## PASS502 continuation update — internal IntentJournal boundary + authoritative creation
+
+P502 closes the post-P501 mutable-owner naming leak. Active runtime/application plumbing no longer uses `Transaction` / `TransactionReadiness` as the carrier vocabulary; the hidden shared carrier is `IntentJournal` / `IntentReadiness`, while `TransactionId` remains the durable retry/protocol identity. `Context<M>` is still the only normal mutable unit-of-work owner and `Snapshot<M>::edit()` remains the strict snapshot-bound form. No Candidate/rebase/Γ-DTC/durability semantics were forked or replaced.
+
+Authoritative typed creation now has a schema-neutral builder endpoint: `Database::builder(path).create_authoritative::<S>()` (plus direct convenience) consumes `S: DatabaseDefinition` only to define the initial persisted semantic model, then returns ordinary `Database`. Raw `Schema` creation remains for dynamic/generated bindings. `Database<S>` / `SchemaDatabase<S>` remain forbidden.
+
+Immediate continuation is DB-owned granular authorization over stable Context semantic coordinates, with hosted/session Context admission audited in the same line so restricted clients do not revive hidden journal ownership. Semantic Rules, bindings, history/backup/perf and Windows secure-memory remain mandatory carry items.
+
+## PASS503 CONTINUATION UPDATE — scoped semantic authorization
+
+PASS503 closes the old deferred "DB-owned granular authorization" line for the current-schema scoped Context surface. Restricted typed work now enters through `SessionDatabase::context::<S>()`, with one live `RuntimeAuthority` carried inside the exact formation world and all derived Candidate/Snapshot worlds. `Context::database()` was removed because it was an unrestricted authority escape. Historical selection requires `HistoricalRead`; `undo_latest` requires restricted history authority; preview/readiness validate exact plan permissions; publication observes live session revocation.
+
+Authorization remains bound to persisted semantic relation/column/action coordinates. A consumer-local `bind` rename does not create a new permission identity. Relationship actions continue to use semantic attach/detach/move authorities and induced lifecycle effects still require their own object authority.
+
+The remaining authorization line is schema migration/current-world freshness, not ordinary CRUD: prove grant transport for identity-preserving coordinates, define fail-closed semantics for split/merge/non-representable migration mappings, and keep publication-time grant/lease freshness separate from formation-world transaction guards.
+
+## PASS504 continuation update — migration authorization law / publication generation seal
+
+PASS504 rejects ACL/grant migration as the wrong abstraction. Grants remain current-world facts over stable semantic IDs. Migration transports only the exact authority footprint required by a transported effect, using the same verified migration dependency graph as data transport. `SchemaMigrationTransport` now has bounded row-local relation/column authority-footprint transport: split/fan-out requires every dependent target column; general relational/query slices fail closed. Real migration E2E proves a preserved `RelationColumnId` retains grant identity while a new target ID inherits nothing.
+
+Current-world freshness is now structurally stronger: runtime publication collects one exact `PublicationAuthorityFootprint` and holds the session-state read seal through durable publication. Permission refresh/revocation takes the write side of the same authority state, so it cannot race between authorization and publish. Preview/readiness remain ordinary checks and do not hold publication authority.
+
+Immediate continuation is PASS505: fuse transported B/C publication footprints into the retained-epoch schema-aware stale-intent walkers and then into typed Context + hosted/dynamic paths. Semantic create/delete/relationship action transport must be certified by identity/action law; do not degrade actions to generic relation writes or revive old-schema permission routing. Semantic Rules, bindings, history/backup/perf and Windows secure-memory remain mandatory carry items.
+
+## PASS505 continuation update — schema-aware current-world publication authority
+
+P505 fuses current-world authorization into normal stale relation-intent publication across retained schema epochs. A crossed semantic-schema boundary no longer attempts source-world publication authorization first. `kernel-plan` derives `SchemaAwareRelationAuthorityFootprint` through the same verified migration dependency graph as the effect and returns the exact current HEAD used by that proof; publication must present that `authorized_head_revision`, so B authority cannot be reused if HEAD advances to C. Grants are still never transported.
+
+Relation writes and relation-column writes follow exact target fan-out. Semantic create/delete/relationship action authority survives only exact relation passthrough identity; a row-local rewrite is fail-closed even when relation IDs happen to match. The schema-aware relation walker now preserves transported durable action/history authorization metadata in the realized residual. Runtime E2E proves an A-formed intent after A->B is denied with only A authority and succeeds with only B authority. Idempotent `AlreadyCommitted` remains valid independently of later HEAD movement because the head certificate constrains new publication only.
+
+Immediate continuation is PASS506: remove the remaining duplicate migration traversal by introducing one kernel-owned prepared schema-aware publication object containing current effect + exact current authority footprint + authorized HEAD + client semantic identity. Reuse it for commit/readiness/preview, extend it to field/model/lifecycle effects, and upgrade the hosted/dynamic wire path so formation semantic identity is explicit/certified rather than guessed from `base_revision`. Semantic Rules, bindings, history/backup/perf and Windows secure-memory remain mandatory carry items.
+
+## PASS506 continuation update — one prepared schema-aware publication
+
+P506 removes PASS505's deliberate duplicate retained-migration traversal. `PreparedSchemaAwarePublication` is now the kernel-owned relation-effect artifact that derives transported current effect and exact current authority footprint in the same verified epoch walk, binds them to one authorized HEAD and formation semantic identity, and carries the certified intervening-effect count. New publication consumes that artifact without re-walking migration; durable idempotent retry remains checked independently because it is not a new publish.
+
+The product runtime now uses the same prepared meaning for schema-aware relation `commit`, `preview` and `intent_readiness`. Current-world permission is therefore consistent across diagnostics and publication; source-world grants cannot preview/readiness-certify a B/C publication. Unsupported formation `require`, relational-observation, field/model/lifecycle and hosted dynamic cases remain explicit fail-closed/open work rather than fallback paths.
+
+Immediate continuation is PASS507: extend prepared publication to exact field/model/lifecycle classes and give hosted/dynamic wire commits explicit/certified formation semantic identity before routing them through the same artifact. Do not infer formation semantics from `base_revision`, add compatibility ACL/schema routing, or widen unsupported actions to generic relation authority. Semantic Rules, bindings, history/backup/perf and Windows secure-memory remain mandatory carry items.
+
+## PASS507 continuation update — explicit hosted formation identity + prepared field publication
+
+P507 gives hosted/dynamic relation commits an explicit transport-neutral `SemanticRevision { schema, environment }`. `base_revision` is no longer used as an implicit schema identity. The exact formation revision verifies the client-declared identity, while the stale relation effect itself enters the same kernel `PreparedSchemaAwarePublication` and current-world publication-authority path as scoped local commits. Hosted E2E proves an A-only grant is denied after A->B, a B-only grant publishes the same A-formed intent, and a false formation identity fails closed.
+
+The prepared artifact is also widened to the exact field-only model-delta class: it can carry source/current `DurableModelDelta`, exact authorized HEAD and the sealed publication guard. The P465 field walker now exposes preparation separately from publication and publishes the prepared artifact without a second migration traversal. Carrier/lifecycle and mixed object-field effects remain fail-closed; the existing lifecycle identity calculus is not yet a proven `DurableModelDelta` transport law.
+
+Hostile perf debt remains visible: hosted source typing currently verifies the explicit identity by reconstructing the exact formation revision through `revision_at`. This is semantically valid proof material, not schema inference, but it is not the target cost model. PASS508 should move formation-context verification/source typecheck into the kernel preparation walk itself, then unify mixed relation+field prepared publication and derive exact carrier/lifecycle delta transport where the identity calculus proves it. Semantic Rules, bindings, history/backup/perf and Windows secure-memory remain mandatory carry items.
+
+
+## GitHub checkpoint sync after PASS507
+
+Repository checkpoint synchronized the current PASS507 mainline with later GitHub-only CI repairs without importing the older PASS472 product tree: Rust workflow prerequisites (`ripgrep`, Ubuntu user-namespace enablement), Git-aware repository manifest validation, and the current Lean durability/refinement source-closure checker are retained. Workspace formatting was normalized with pinned Rust 1.98.1. Strict Clippy cleanup was in progress when the external hard wall-clock boundary was reached; no new product semantics were introduced by the checkpoint. PASS508 remains the next architecture target exactly as recorded above.

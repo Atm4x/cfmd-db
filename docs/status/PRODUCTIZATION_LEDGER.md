@@ -5154,3 +5154,1109 @@ PERFORMANCE BASELINES TO PRESERVE
 
 ### NEXT RECOMMENDED PASS
 **PASS474 — row-local relation exact effects across schema epochs.** Reuse retained epoch support/action roots plus P464 direct relation-delta transport so stale A relation intents cross A->B without historical row reconstruction, inverse migration, generic query fallback or a second conflict engine.
+
+## PASS474 — retained-epoch row-local relation transport (HOSTILE CHECKPOINT)
+
+### CLOSED THIS PASS
+- Added a schema-aware relation-intent path that reuses retained P462 epoch roots instead of replaying the durable old-epoch transition suffix.
+- Old-epoch exact relation proof validates the proposed delta against retained relation support and scans only action timelines for the touched semantic coordinates; it does not reconstruct an old `Revision` or invoke a second conflict engine.
+- P464 `transport_relation_delta_exact` now carries stale row-local relation effects epoch-by-epoch. General relational/query migration remains fail-closed.
+- Durable retry identity for relation residual publication now preserves the client's formation semantic revision; byte-identical relation deltas formed under different schema revisions cannot alias one intent identity.
+- Independently transported source deltas converging on one target relation are rejected unless a future explicit Γ-merge certificate exists; generic concatenation is not accepted.
+
+### OPEN — IMMEDIATE
+1. **Finish P474 by integrating B-native relation publication with runtime Physical Realization authority.** The hostile A(i64) -> B(f64) reopen regression proves relation proof/transport/current support/residualization all succeed, but `prepare_revision_derived` still attempts to mutate an A-shaped physical relation with the B-native residual and returns `PhysicalTypeMismatch` while physical convergence legitimately lags semantic cutover.
+2. Reuse the existing `kernel-realization` exact relation-delta overlay law beneath the current semantic B boundary; do not materialize the whole relation before write and do not route through schema A.
+3. Re-enable the hostile type-changing reopen regression and benchmark overlay publication/compaction once runtime integration is exact.
+4. Then continue general relational/query guard provenance and authorization/grant transport across schema migration.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX and remaining field-granular product polish; DB-owned granular authorization; deterministic/general Semantic Rules and invariants; migration frontend; Python/.NET/Studio/CLI; backup/restore/corruption UX; public performance/binary-size budgets; native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Full relation materialization before accepting a current-B write.
+- Old-schema query/revision fallback or inverse migration for relation publication.
+- Generic recomputation of a migration query on every stale write.
+- Concatenating multiple transported deltas that converge on one target relation without an exact Γ merge law.
+- Any relation-specific second conflict/rebase engine outside `kernel-change` / retained P462 authority.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Generic old-epoch history depth is no longer a factor in row-local relation certification; remaining proof work is bounded by touched semantic-coordinate action timelines.
+- P464 row-local transport remains proportional to the client delta and transform width, not source relation cardinality.
+- P462 current-epoch stale proof remains depth-flat.
+- No O(data) materialize-before-write workaround is acceptable for the runtime publication gap.
+
+### NEXT RECOMMENDED PASS
+**PASS474 finalization — current-B native relation overlays over lagging physical realization.** Integrate the existing factorized realization overlay primitive into durable runtime publication so a B-semantic residual can publish over A-shaped physical leaves without schema-A routing or whole-relation materialization; then re-enable the hostile reopen test and close P474.
+
+## PASS474 FINALIZATION — row-local relation exact effects across schema epochs
+
+### CLOSED THIS PASS
+- Closed the retained-epoch row-local relation line end-to-end: source-epoch proof uses retained P462 support/action authority; P464 transports exact row-local relation deltas; current residual publishes through the ordinary current-schema runtime path.
+- Re-enabled `p474_schema_aware_relation_walker_transports_row_local_delta_after_reopen`; the A `Set<I64>` -> B `Set<F64>` reopen/stale-intent regression now passes and remains an ordinary active test.
+- Corrected the hostile checkpoint diagnosis. Direct instrumentation proved recovery already owns a current-B/F64 `RowStore`; the failing transported residual was also B/F64. No lagging-A publication or missing realization-overlay integration caused this failure.
+- Closed the actual physical-representation defect: `NativeRelation::RowStore` now owns immutable `column_count` independently of cardinality. Removing the last row no longer collapses relation arity to zero, so exact remove-last/insert-replacement publication preserves layout shape.
+- Recovery and revision preparation construct row stores with schema arity explicitly, including empty relations. Selected row-store views preserve the stored arity.
+- Added a focused regression proving RowStore retains arity after becoming empty and accepts a subsequent same-shape insertion.
+
+### OPEN — IMMEDIATE
+1. General relational/query guard provenance across schema migration remains fail-closed until exact dependency/transport certificates exist.
+2. Hostile-audit authorization/grant transport across schema migration on the same semantic coordinates; do not make Context shape an authorization authority.
+3. Continue schema-aware relation transport beyond row-local slices only when a universal exact law exists; convergent source effects still require an explicit Γ-merge certificate rather than concatenation/fallback.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX follow-up and final Context/open/create cleanup.
+- DB-owned granular authorization.
+- Deterministic/general Semantic Rules, regex/pattern semantics, entity/model invariants and transaction `require` unification.
+- Migration frontend/diagnostics.
+- Python/.NET/Studio/CLI product surfaces.
+- Backup/restore/corruption UX.
+- Public performance and binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- The P474-checkpoint hypothesis that this regression required a B-native realization overlay over an A-shaped recovered relation. Direct hostile evidence disproved that diagnosis; realization overlays remain valid architecture for genuinely derived/lagging physical realizations, but are not a fix for this RowStore shape bug.
+- Inferring RowStore relation arity from `rows.first()` after construction.
+- Any materialize-before-write workaround for row-local migration publication.
+- Old-schema query/replay fallback or a second relation conflict engine.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P473 retained-epoch stale proof remains independent of unrelated old-epoch history depth.
+- P474 relation proof cost depends on touched semantic-coordinate contention plus schema migrations crossed, not total retained history.
+- RowStore shape retention adds O(1) metadata and no row/data scan.
+- Row-local type-changing stale intents remain publishable after reopen without whole-relation materialization.
+
+### NEXT RECOMMENDED PASS
+**PASS475 — exact general relational/query guard provenance across schema migration.** Recover the semantic dependency law needed to transport guarded/query-derived intent across schema epochs without old-schema query execution, generic recomputation fallback or dual current worlds; keep unsupported global transforms fail-closed until certified.
+
+## PASS479 — Formation-world seal; P475–P478 transaction direction rejected
+
+### CLOSED THIS PASS
+- Added normative `PROJECT_RULES.md` to the P474 baseline and made repository verification require it.
+- Replaced cross-schema guard-liveness semantics with the formation-world seal law: A guards end at the first migration source boundary; only exact effects cross A->B.
+- Added `SchemaEpochFormationSeal` as the explicit proof token for that boundary.
+- `commit_schema_aware_field_intent` no longer transports guard coordinates through B/C or revalidates an A guard at current B HEAD after crossing a schema boundary.
+- Migration transform boundary inputs are read from the exact retained migration-source field root and are no longer misclassified as passive guard dependencies.
+- Fixed a retained-epoch authority defect found by the new hostile test: full-revision migration preparation previously attempted to seal the target bundle's freshly empty historical index. `PreparedRuntimeRevisionTransition` now carries the persistent source historical root, and schema migration seals that source root before resetting current authority to the target epoch.
+- Hostile regressions prove both sides of the serialization law: a source-A guard dependency changed before the migration boundary prevents the seal; a B-native change to the corresponding target field after migration does not retroactively invalidate the already sealed A guard.
+
+### OPEN — IMMEDIATE
+1. Integrate formation-world sealing with the product `Transaction::require` path so arbitrary persisted semantic requirements are evaluated on the exact rebased `Candidate<A>` before the first schema boundary, rather than relying only on passive-coordinate stability proof material in the lower-level walker.
+2. Introduce a distinct current-world publication precondition/authority primitive for semantics that truly must remain valid at publication HEAD (authorization revocation/freshness, leases, etc.); do not reuse formation guards.
+3. Extend the same explicit formation-seal orchestration to generalized relation/model/lifecycle schema-aware requests while preserving existing exact-effect transport and `kernel-change` conflict authority.
+4. Then hostile-audit authorization/grant transport across schema migration under the new separation between formation semantics and current publication authority.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX follow-up and final Context/open/create cleanup.
+- DB-owned granular authorization.
+- Deterministic/general Semantic Rules, regex/pattern semantics, entity/model invariants and transaction `require` unification.
+- Migration frontend/diagnostics.
+- Python/.NET/Studio/CLI product surfaces.
+- Backup/restore/corruption UX.
+- Public performance and binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- PASS475–PASS478 as a schema-epoch **transaction** architecture: query factorization `q_A = q_B o M`, forward guard provenance kept live in B, derivative-state transport across migration, B-event -> A-derivative classification, and observation-specific inverse-like quotient work are rejected as transaction authority.
+- Transporting formation guard coordinates `GA -> GB` merely so an old A guard remains live after the first schema boundary.
+- Treating deterministic forward migration as permission to infer old A observation meaning from arbitrary B-native events.
+- Treating migration transform source dependencies read at the exact boundary root as passive transaction guards.
+- Sealing a newly rebuilt target bundle's empty historical index instead of the source epoch persistent index.
+
+Independent query/transport theorems or derivative primitives discovered in rejected R&D may be reused only if justified by another subsystem; they are not transaction transport authority.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Formation seal uses retained persistent source-epoch Γ/action roots; no history replay or full historical revision reconstruction is introduced.
+- Source historical authority is structurally shared through persistent roots across migration preparation; no O(history) copy is introduced.
+- Forward effect transport remains proportional to touched coordinates / transform width for factorizable field and row-local classes.
+- Later epochs pay only native exact-effect rebase/conflict cost plus number of schema boundaries crossed; old guard state is not maintained through them.
+
+### NEXT RECOMMENDED PASS
+**PASS480 — product Candidate<A> formation seal for `Transaction::require` + current-world publication-precondition split.** Read `PROJECT_RULES.md` before implementation and carry this instruction into every successor PASS.
+
+
+## PASS480 — B-native causal observation authority for retroactive sealed-effect reorder
+
+### CLOSED THIS PASS
+- Hostile audit confirmed PASS479's formation seal alone was insufficient: a sealed old effect physically published after a later B transaction could otherwise invalidate an observation that B transaction causally relied on.
+- Added durable causal-observation coordinates to committed relation/mixed intents, explicitly separate from `ClientIntentGuardDigest` retry identity.
+- Added reconstructible persistent current/retained-epoch observation timelines over the same durable causal authority; no second history store.
+- Schema-aware post-boundary braid now checks transported sealed writes against observations of logically later B/C transactions. Overlap is reported as coordination-required, not falsely claimed to be an exact semantic conflict.
+- Hostile reopen regression proves: B reads password=OLD then writes generation; late sealed A password:=NEW cannot be retroactively inserted before B.
+- Preserved PASS479 law: later B writes with no causal observation of the old effect remain reorderable when normal effect laws certify them.
+
+### OPEN — IMMEDIATE
+1. Lower product `Transaction::require` canonical requirement footprints automatically into durable causal-observation authority; current kernel path accepts explicit observation footprints.
+2. Derive exact observation-preservation/commutation certificates so coordinate overlap need not always require coordination when the earlier write provably preserves the later predicate.
+3. Introduce distinct current-world publication preconditions for semantics that must hold at publication HEAD; do not reuse formation guards.
+4. Extend B-native causal observation authority to general relational/OFC requirements without reintroducing B->A or old-guard transport.
+
+### SUPERSEDED / DO NOT EXTEND
+- Treating write/write post-boundary rebase alone as sufficient proof for retroactively inserting a formation-sealed effect before later current-world transactions.
+- Reinterpreting this B-native anti-dependency proof as transport/revalidation of the old A guard.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Causal observation lookup is coordinate-indexed persistent-tree authority; no linear history scan.
+- Observation timelines are reconstructible from durable committed intent and retained epoch roots; no independently serialized witness cache/history.
+- Ordinary same-schema stale transactions do not pay the retroactive-seal anti-dependency rule unless logical order has already been fixed before a crossed schema boundary.
+
+### NEXT RECOMMENDED PASS
+**PASS481 — product `Transaction::require` causal-observation lowering + exact observation-preservation/commutation law.** Read `PROJECT_RULES.md` first and carry that requirement into every successor PASS.
+
+## PASS481 — Product require causal observation lowering / exact input preservation
+
+### CLOSED THIS PASS
+- Product `Transaction::require` now lowers its validated `Candidate` observation into durable causal-observation authority automatically; ordinary callers no longer need to supply manual causal coordinates.
+- The canonical requirement footprint includes entity lifecycle/existence, identity, and referenced object-field coordinates.
+- Scalar object-field observations may retain their exact observed input value durably and reconstruct it after reopen.
+- Retroactive formation-sealed writes now have an exact universal preservation certificate: a coordinate overlap does not require coordination when the proposed value is exactly equal to the value the later committed transaction observed.
+- `ClientIntentGuardDigest` remains retry identity; causal observation authority remains separate.
+
+### OPEN — IMMEDIATE
+1. Predicate-specific observation preservation beyond exact input equality (for example, `20 -> 21` preserving `age >= 18`) using certified semantic-rule algebra, never query replay or old-schema guard transport.
+2. General relational/OFC requirement observation lowering and preservation certificates.
+3. Current-world publication preconditions remain a separate authority from formation guards.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX and field-granular change coordinates.
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Migration frontend and final Python/.NET/Studio/CLI product surfaces.
+
+### SUPERSEDED / DO NOT EXTEND
+- Manual causal-coordinate plumbing for ordinary product `Transaction::require`.
+- Treating every causal-coordinate overlap as mandatory coordination when exact observed-input equality proves preservation.
+- Any revival of `q_A -> q_B`, inverse migration, B-event -> A-guard interpretation, or post-boundary A-guard revalidation.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Causal proof remains coordinate-indexed over persistent observation timelines; no total-history scan or full query recomputation.
+- Exact-value evidence is stored only for supported scalar observations; unsupported structural values fail conservatively to coordinate-only authority.
+- Current implementation may enumerate later observations on the same coordinate; future compression may improve that local payer without weakening exactness.
+
+### NEXT RECOMMENDED PASS — PASS482
+Certified predicate-specific observation-preservation algebra for `SemanticRuleExpr`, starting from product `Transaction::require`, so retroactive formation-sealed effects can commute through later B/C transactions whenever the later requirement remains provably true without replaying the transaction or reviving formation-world semantics.
+
+PROJECT RULES / CONTINUATION CONTRACT: every subsequent PASS must first read root `PROJECT_RULES.md`, the immediately preceding PASS report, the active ledger tails, and relevant R&D. Every PASS report must carry this instruction forward.
+
+## PASS482 — Predicate-specific unary causal-observation preservation
+
+### CLOSED THIS PASS
+- Product `Transaction::require` now derives a certified unary preservation rule when the complete `SemanticRuleExpr` depends on exactly one field; all field references are normalized to `RuleValueExpr::Input` without replaying the transaction.
+- Durable causal-observation authority now retains that normalized predicate alongside the exact observed scalar and reconstructs it after reopen for both model-field and object-field coordinates.
+- Retroactive formation-sealed writes may cross later B/C transactions when the proposed scalar satisfies the later persisted unary requirement, even when the exact input changes (for example `20 -> 21` under `age >= 18`).
+- The symmetric hostile case remains fail-closed: a proposed value outside the persisted predicate produces coordination-required and is not published.
+- Fixed the PASS481 coordinate seam by lowering product object requirements to both `ObjectField` and canonical model `Field` observation coordinates, so schema-aware `DurableModelDelta` writes and object-field writes meet the same causal authority.
+- Current-epoch and retained-epoch schema walkers now use exact proposed field values plus persisted preservation predicates rather than dropping back to coordinate-only causal checks.
+
+### OPEN — IMMEDIATE
+1. Joint preservation certificates for multi-field `SemanticRuleExpr` without unsound independent-coordinate reasoning.
+2. General relational/OFC requirement observation lowering and preservation certificates.
+3. Current-world publication preconditions for semantics that must hold at publication HEAD remain a separate authority.
+4. Hostile-audit compression/indexing of many later causal observations on one hot coordinate without weakening exactness.
+
+### SUPERSEDED / DO NOT EXTEND
+- Treating predicate-specific preservation as replay/revalidation of an old formation-world guard.
+- Independent per-field acceptance of multi-field Boolean requirements such as `x || y`; without a joint theorem this is unsound under simultaneous retroactive writes.
+- Coordinate-only anti-dependency when exact scalar or certified unary predicate evidence is available.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Causal lookup remains persistent coordinate-indexed authority; no global history scan or query recomputation.
+- Predicate evaluation is local to the proposed scalar and persisted deterministic `SemanticRuleExpr`.
+- Unsupported/multi-field requirement classes remain conservative rather than introducing generic fallback.
+
+### NEXT RECOMMENDED PASS — PASS483
+Joint multi-field observation-preservation certificate algebra for `SemanticRuleExpr`, preserving atomic evaluation of all retroactively changed inputs in one later B/C requirement. Read `PROJECT_RULES.md` before implementation and carry this instruction forward.
+
+## PASS483 — Joint multi-field causal-observation preservation
+
+### CLOSED THIS PASS
+- Multi-field product `Transaction::require` now lowers to one grouped causal certificate containing the complete deterministic `SemanticRuleExpr` plus its exact observed field vector; independent per-field acceptance is no longer the representation for this class.
+- Durable intent stores each group once. Reconstructible persistent history indexes route every member `Field`/`ObjectField` coordinate to the same `(effect_id, group_id)` certificate instead of duplicating the predicate/vector in WAL.
+- Retroactive sealed effects are evaluated atomically: all proposed member-field writes are overlaid on the observed vector, then the complete predicate is evaluated once. `x==0 || y==0` correctly accepts `(1,0)` and rejects simultaneous `(1,1)` after reopen.
+- PASS482 unary exact/predicate preservation remains intact and is composed alongside grouped authority.
+
+### OPEN — IMMEDIATE
+1. Extend grouped preservation beyond scalar object/model fields to general relational/OFC causal observations while retaining one current-world semantic authority and no query replay.
+2. Hostile-audit compression/indexing when many later grouped observations share hot coordinates; avoid O(number-of-groups × width) duplicate work without weakening exactness.
+3. Introduce distinct current-world publication preconditions for semantics that must hold at publication HEAD.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX and field-granular certified changes.
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Migration frontend and final Python/.NET/Studio/CLI product surfaces.
+
+### SUPERSEDED / DO NOT EXTEND
+- Independent per-field preservation decisions for one multi-field Boolean requirement.
+- Persisting one copy of the complete grouped predicate/vector per member coordinate.
+- Any revival of `q_A -> q_B`, inverse migration, B-event -> A-guard interpretation, or post-boundary A-guard revalidation.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Group payload is durable once per committed requirement; coordinate indexes hold reconstructible routing references only.
+- One touched group is evaluated once per retroactive braid regardless of how many of its fields are modified.
+- Causal lookup remains coordinate-indexed persistent authority; no global history scan or transaction replay.
+
+### NEXT RECOMMENDED PASS — PASS484
+General relational/OFC grouped causal-observation authority and hot-coordinate/group-index hostile performance audit. Read root `PROJECT_RULES.md`, the immediately preceding PASS report, active ledger tails, and relevant R&D before implementation; carry this instruction forward again.
+
+
+## PASS484 — Interned causal-group routing / general OFC hostile boundary
+
+### CLOSED THIS PASS
+- P483 reconstructible group routing no longer clones the full grouped predicate/vector under every member coordinate. One payload is interned by `(effect_id, group_id)`; coordinate timelines store only `u32` group ids.
+- Retained schema epochs structurally share the interned group pool instead of multiplying payloads at cutover.
+- Structural hostile scaling is exact: widths 8/64/512 retain 1 payload, N payload fields and 2N routing refs (`Field` + `ObjectField`), replacing the previous O(N²) payload duplication.
+- Executable join hostile proves `query + observed OFC + source-relations` is insufficient for general relational causal preservation; hidden Γ-DTC state is a mandatory part of any exact certificate.
+
+### OPEN — IMMEDIATE
+1. Build a shared/interned persistent relational causal capsule lineage over exact `MaterializedRelPlanState`/Γ-DTC state, with one capsule payload shared by observations rather than one O(data) snapshot per transaction.
+2. Make that capsule lineage reconstructible across reopen from existing durable causal authority without per-braid query replay or an independently serialized second history store.
+3. Add relation/source-occurrence routing and hostile scaling for many relational observations sharing hot source relations.
+4. Current-world publication preconditions remain a separate authority from formation guards.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX and field-granular certified changes.
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Migration frontend and final Python/.NET/Studio/CLI surfaces; backup/recovery UX; public perf/binary budgets; Windows secure memory.
+
+### SUPERSEDED / DO NOT EXTEND
+- Copying one full `RuntimeJointCausalObservationGroup` into every member-coordinate timeline.
+- Treating relational source-relation envelopes or observed OFC keys as exact causal conflict authority.
+- Per-transaction full maintained-query snapshots, global query replay, relation-wide coarse conflicts, or any P475-P478 old-guard transport architecture.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Group payload count is O(groups), not O(groups × width); member routing refs are O(total memberships).
+- One touched group is evaluated once per braid.
+- Future relational capsules must be persistent/shared; no O(source-data) duplication per committed observation.
+- No global history scan or full query recomputation on the retroactive hot path.
+
+### NEXT RECOMMENDED PASS — PASS485
+Shared persistent relational/OFC causal capsule lineage and reopen reconstruction. Read root `PROJECT_RULES.md`, PASS484 report, active ledger tails, and relevant R&D before implementation; carry this instruction forward again.
+
+## PASS485 — persistent relational Γ-DTC causal capsule primitive
+
+### CLOSED THIS PASS
+- Added `RelCausalCapsule`: immutable shared exact relational causal state over revision-bound `MaterializedRelPlanState`; clones share one `Arc` payload rather than copying maintained state per observation.
+- Added non-mutating `MaterializedRelPlanState::impact_relation_deltas`, which evaluates proposed semantic source deltas directly through maintained Γ-DTC hidden state; no query/model replay.
+- Added semantic-only revision transition `candidate_from_relation_deltas_for_revision`; causal reconstruction no longer depends on physical storage handles.
+- Added `RelCausalCapsule::rewind_forward_deltas`: exact predecessor reconstruction from the existing durable forward relation effect by swapping inserted/removed sets.
+- Added compact compiled source-occurrence routing metadata; hostile self-join coverage proves one source relation can feed multiple exact occurrences without route ambiguity.
+- Executable hidden-join reopen regression reconstructs the pre-insert capsule from the later state and correctly reports the same insertion as observation-changing.
+
+### OPEN — IMMEDIATE
+1. Bind durable relational causal-observation identity to shared capsule identity/query reconstruction authority; do not serialize capsule state.
+2. Add runtime relation/source-occurrence -> compact capsule-ref indexes and hostile scaling for many observations sharing hot relations.
+3. Reopen: instantiate each unique needed capsule lineage once from durable query/effect authority, rewind only relevant exact effects, and share states across observation refs.
+4. Define schema-boundary handling for relational capsules in the native target epoch; formation-world A guards remain sealed and must not be revived.
+5. Current-world publication preconditions remain a separate authority from formation guards.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX and field-granular certified changes.
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Migration frontend; final Python/.NET/Studio/CLI; backup/recovery UX; public perf/binary budgets; native Windows secure memory.
+
+### SUPERSEDED / DO NOT EXTEND
+- Per-observation serialized/full `MaterializedRelPlanState` snapshots.
+- Query/model replay as relational causal braid proof.
+- Physical storage handles as durable relational causal authority.
+- Static relation envelope or OFC key as exact relational causal authority.
+- Any post-boundary old-schema guard/query transport.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Same capsule state: one shared payload plus compact observation refs.
+- Unrelated revision churn retains the same capsule `Arc`.
+- Relevant transitions path-copy maintained nodes; source data is not copied per observation.
+- Braid-time proof is Γ-DTC delta propagation, not full query recomputation or global history scan.
+
+### NEXT RECOMMENDED PASS — PASS486
+Durable relational observation -> capsule identity plus runtime compact hot-relation/source-occurrence routing and reopen interning. Read root `PROJECT_RULES.md`, PASS485 report, active ledger tails and relevant R&D before implementation; carry this requirement forward again.
+
+## PASS486 — durable relational causal identity / compact routing / reopen interning
+
+Goal: close the PASS485 runtime/durable identity gap without introducing a durable capsule namespace, a second query-history store, per-braid query replay or per-source-occurrence payload copies.
+
+Selected implementation: durable observation authority is `(effect id, observation id, observed state frontier, RelExpr)`; runtime assigns only derived compact capsule refs. Reopen groups by canonical structural RelExpr identity, materializes one boundary state per unique query, rewinds one persistent Γ-DTC lineage through exact durable relation effects, and interns capsule states by `(state-frontier revision, canonical query identity)`. Relation routes contain compact observation refs only.
+
+Implemented state: transaction intent codec persists relational causal observations; current and retained-epoch derived indexes own interned capsule pools and compact relation timelines; live commit indexing accepts already-captured exact capsules; reopen reconstruction is current/retained-epoch native; snapshot exposes exact no-replay Γ-DTC impact certification for retroactive relation deltas; 1024 observations sharing one hot relation/query retain one capsule payload entry.
+
+### CLOSED THIS PASS
+- Durable relational causal-observation identity without durable `capsule_id`.
+- Canonical reconstructible RelExpr identity bytes for runtime interning.
+- Compact source-relation routing to observation refs; no per-occurrence capsule copy.
+- Shared runtime capsule pool for current and retained schema epochs.
+- One backward lineage reconstruction sweep per unique query on reopen.
+- Exact Γ-DTC relational anti-dependency certification over routed capsules.
+- Hot-relation hostile structural scaling: 1024 observation refs -> 1 capsule payload.
+- Current pre-release transaction codec updated in place; no compatibility/version ladder introduced.
+
+### OPEN — IMMEDIATE
+1. Wire relational observation capture into the actual product query/transaction observation path so application reads emit `RuntimeRelationalCausalObservation` automatically rather than only exposing the kernel primitive.
+2. Integrate relational capsule certification into the canonical late-effect/history-normalization braid orchestration and test a sealed effect crossing a later join/group observation end-to-end.
+3. Add durable reopen end-to-end regression proving the same conflict/preservation verdict before and after restart across current and retained epochs.
+4. Hostile perf for many distinct queries on one hot relation and long exact history; verify one build/rewind per unique query and output-sensitive routing only.
+5. Current-world publication preconditions remain separate from formation/capsule observations.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX completion and field-granular certified change coordinates.
+- DB-owned granular authorization over semantic coordinates.
+- General deterministic Semantic Rules / regex / entity-model invariants.
+- Migration frontend / user-facing authoring layer.
+- History/retention PhysicalAtom/root reachability evolution.
+- Final Python/.NET/Studio/CLI surfaces, backup/recovery UX, public perf/binary budgets, native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Durable runtime capsule ids.
+- Serialized maintained-plan snapshots per observation.
+- Relation-envelope/OFC-key authority without hidden Γ-DTC state.
+- Per-braid query replay/full-state recomputation.
+- Per-source-occurrence payload routing.
+- Old-schema guard/query transport beyond FormationWorldSeal.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- One maintained capsule payload per interned `(query identity, state frontier)`, independent of number of observations/routes.
+- One compact observation ref per relevant relation route, not per compiled source occurrence.
+- One reopen maintained-state build + one backwards exact-effect sweep per unique query lineage.
+- Braid-time validation touches only routed observations and Γ-DTC delta propagation; no global WAL scan or query rebuild.
+
+### NEXT RECOMMENDED PASS — PASS487
+Product observation capture + canonical history-normalization braid integration + restart equivalence regression. Read root `PROJECT_RULES.md`, PASS486 report, active ledger tails and the zero-downtime history-normalization R&D before implementation; carry the same rule forward.
+
+## PASS487 — product relational observation capture / canonical braid / restart identity
+
+Goal: move PASS486 relational capsules from a kernel-only primitive into ordinary transaction/query execution and the canonical history-normalization braid without query replay, while proving restart-stable causal identity.
+
+Selected implementation: application-visible transaction-bound relational queries use one `MaterializedRelPlanState` both for the returned query value and for `RelCausalCapsule` capture. The transaction retains that observation-enabled formation context, while mutation lowering receives a passive clone of the identical snapshot with capture disabled; therefore effect construction is not misclassified as an application observation. Captured observations are transaction-scoped and deduplicated by `(revision, canonical RelExpr identity)`. Commit persists them through the existing durable intent. Canonical stale-transition certification and retained-epoch relation-segment certification route proposed deltas through the existing compact relational capsule indexes. Durable PREPARE now exposes the assigned causal-ledger `RevisionEffectId`, and live history binding occurs after PREPARE with that exact id.
+
+Implemented state: explicit transaction read execution emits relational causal observations automatically, while internal mutation/query-lowering reads remain non-observational; direct/residual relation and mixed commits preserve captured observations; current-world and retained-epoch braid paths invoke exact Γ-DTC anti-dependency proof; restart regression proves identical preserve/conflict verdict and coordination effect identity before/after reopen. Public hostile coverage proves independent field rebase and rebased `require` semantics remain valid while a later application-visible transaction read blocks a retroactive effect that would change it.
+
+### CLOSED THIS PASS
+- Application-read vs mutation-lowering observation boundary: CLOSED by passive lowering clone of the same formation snapshot.
+- Product transaction-bound relational query capture from the same maintained execution that returns the result; no second query replay.
+- Per-transaction duplicate relational read interning by revision + canonical query identity.
+- Durable propagation of product-captured relational observations through direct and residual commit paths.
+- Canonical `certify_transition_rebase` relational anti-dependency integration.
+- Retained-epoch relation-segment walker integration with native relational capsules.
+- Restart-equivalent relational causal verdict regression for current epoch.
+- Hostile restart bug: live `effect_id` used client transaction identity while reopen used durable effect identity. Fixed by carrying assigned `RevisionEffectId` in `DurablePrepareToken` and binding live history only after PREPARE.
+
+### OPEN — IMMEDIATE
+1. Add explicit retained-schema-epoch end-to-end restart regression: sealed pre-boundary effect crossing a later native join/group observation must produce the same verdict before/after reopen.
+2. Hostile perf/scaling for many distinct query lineages sharing one hot relation and long exact history; verify output-sensitive routing and one maintained build/rewind per unique lineage.
+3. Exercise the product capture path through broader public object/traversal query shapes and close any maintained-program coverage gaps fail-closed rather than by replay fallback.
+4. Keep current-world publication preconditions separate from formation/capsule observations.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX completion and field-granular certified change coordinates.
+- DB-owned granular authorization over semantic coordinates.
+- General deterministic Semantic Rules / regex / entity-model invariants.
+- Migration frontend / user-facing authoring layer.
+- History/retention PhysicalAtom/root reachability evolution.
+- Final Python/.NET/Studio/CLI surfaces, backup/recovery UX, public perf/binary budgets, native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Query execution followed by a second query replay solely to capture a causal certificate.
+- Standalone relational conflict checker as an alternate correctness path outside canonical rebase/braid certification.
+- Client transaction id as runtime historical `effect_id`.
+- Durable capsule ids, serialized maintained-plan snapshots, relation-envelope/OFC-key authority, per-braid full-state/query replay, or post-seal old-schema guard transport.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- One maintained relational execution serves both product result and causal capture.
+- Mutation lowering performs no causal-certificate work; only explicit application reads pay capture cost.
+- Repeated identical transaction reads do not duplicate maintained capsule state.
+- Braid validation touches only relation-routed observations and propagates proposed deltas through Γ-DTC state.
+- Reopen identity and verdict are invariant; no recovery-only semantic namespace.
+- Existing PASS486 interning/routing baselines remain mandatory.
+
+### NEXT RECOMMENDED PASS — PASS488
+Retained-epoch relational braid restart E2E + distinct-lineage/hot-relation hostile scaling. Read root `PROJECT_RULES.md`, PASS487 report, active ledger tails and zero-downtime history-normalization R&D before implementation; carry the same rule forward.
+
+## PASS488 UPDATE — retained-epoch relational restart proof / influence-indexed capsule rebuild
+P488 closes the explicit retained-schema-epoch restart gap: a pre-boundary A relation intent is braided against a later A-native self-join observation retained before A→B migration; the same coordination conflict and durable `RevisionEffectId` witness survive reopen. Recovery no longer runs every unique query lineage across every exact suffix effect. It builds each unique lineage once, derives the exact compiled source-relation influence index, scans exact history once, builds relation deltas only for effects relevant to at least one lineage, and rewinds only affected lineages. Structural regression: 128 exact effects / 64 distinct queries with 4 hot-relation effects performs 128 history visits, 4 delta-map builds and 256 lineage rewinds instead of 8192 query-history passes. General cost is O(H + Q + I + O); fully hot distinct lineages retain the unavoidable I=H*Q semantic work. Immediate continuation: hostile whether distinct hot-query lineages can share compiled/maintained sub-DAG state without changing observation identity or introducing a second query engine; otherwise return to broader object/traversal capture coverage and then the deferred Context/Auth/Semantic Rules product lines. All deferred productization items remain mandatory carry.
+
+## PASS489 continuation update — shared maintained relational DAG R&D
+
+P489 resolves the fully-hot shared-query hypothesis. Exact cross-root sharing is sound for canonical-identical semantic `RelExpr` subtrees at one semantic context/revision/source world; it is unsound when keyed only by source-relation envelope or current output. Executable regressions prove both the positive deterministic state class and the hostile same-relation/different-future-behavior case. `Value` and `RelExpr` structural `Hash` now provide a query-kernel-owned in-memory key for the future compiler; durable query bytes remain durability authority only and are not reused as runtime node ids.
+
+The selected representation splits maintained state cells from operator occurrences/root observation identities and compiles all live relational observations into one derived multi-root forest. Target reopen cost becomes `O(H + N + J + O)` for unique semantic nodes `N` and true effect-node influences `J`, while independent stateful roots preserve the worst-case `J ~= H*Q`. Parameter-family fusion (equality dispatch, ordered cuts, etc.) is a later exact lowering, never a recovery-specific router/fallback.
+
+Immediate continuation is PASS490: implement canonical multi-root `RelObservationForest` compilation and the state-cell/occurrence split in `kernel-query`, prove forest transitions equal independent `MaterializedRelPlanState` roots, then replace PASS488 per-lineage reconstruction only after equivalence is executable. All deferred Context/Auth/Semantic Rules/migration frontend/final bindings/history/backup/perf/Windows secure-memory lines remain mandatory carry.
+
+## PASS490 continuation update — canonical multi-root relational forest
+
+PASS490 implements `RelObservationForest`: canonical-identical `RelExpr` subtrees become one maintained Γ-DTC state cell with separate parent/root fanout occurrences. The sparse scheduler transitions each influenced unique cell once and fans out its exact delta; self-join keeps two occurrence edges while sharing one Scan state. Root-by-root executable equivalence now covers Project, Distinct/Set support, blocker, Join, AntiJoin, Group, TopK and Union against independent `MaterializedRelPlanState` execution. Multi-root causal identity uses a shared sweep anchor plus per-root dependency frontiers so unrelated churn does not rewrite capsule identity. Immediate continuation: PASS491 replaces PASS488 per-lineage reopen reconstruction with one forest rewind and proves live/reopen parity plus shared-prefix scaling. All deferred Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS491 continuation update — forest-backed reopen + shared-root causal batch
+
+PASS491 switches PASS488 relational capsule recovery from one persistent lineage per unique query to one canonical `RelObservationForest` reconstruction per epoch world. Exact history is still swept once, but every relevant effect now rewinds the shared forest once; observation capsules are root views sharing one forest Arc at each emitted frontier. Causal anti-dependency checking batches capsules by forest snapshot and executes one Γ-DTC plan per shared forest rather than one plan per root. Retained-schema restart equivalence remains exact and durable coordination identity is unchanged.
+
+Hostile audit exposed the next physical payer: `RelObservationForest::intern_subtree` currently initializes a newly interned parent cell by transiently building a complete single-root `MaterializedRelPlanState` and retaining only its root local state. Thus transition/reopen history work is shared, but boundary construction can still repeat source-data work across Q roots. PASS492 should replace this with bottom-up local-cell initialization from already-interned child outputs/state using the existing Γ-DTC local kernels, then benchmark build work separately from transition work. No recovery cache, second query engine, or durable forest identity is permitted. Deferred Context/Auth/Rules/frontend/bindings/history/backup/perf/Windows lines remain mandatory carry.
+
+## PASS492 — bottom-up canonical forest construction
+
+Goal: remove the remaining PASS491 boundary payer where canonical forest cells were retained once but each new parent transiently built a complete independent maintained subtree.
+
+Selected implementation: `RelObservationForest::intern_subtree` now initializes canonical cells directly in post-order from already-interned child outputs/types and the existing Γ-DTC local state builders. A transient output table exists only for construction; no independent subtree graph is created. Constructor statistics separately account root occurrences, unique cells, reused subtrees, source materializations/source rows and local cell initializations.
+
+### CLOSED THIS PASS
+- Transient full `MaterializedRelPlanState` build per new forest parent: CLOSED.
+- Repeated source materialization caused by shared-prefix roots: CLOSED.
+- Self-join source initialization duplication during forest build: CLOSED while occurrence multiplicity remains preserved.
+- Constructor work accounting independent from transition/reopen counters: CLOSED.
+- Root-by-root equivalence after bottom-up construction: CLOSED by existing broad P490 operator coverage plus new P492 hostile regressions.
+
+### OPEN — IMMEDIATE
+1. PASS493 R&D/implementation: parameter-family fusion over the exact forest — equality-value dispatch and ordered-cut families first.
+2. Prove the family lowering is extensionally equivalent to independent canonical parent cells and preserves root-specific observation identity/frontiers.
+3. Measure whether fully-hot families reduce parent-local work from one full child scan/transition per parameter to output-sensitive dispatch/cut updates without hiding genuinely distinct semantic work.
+4. Preserve PASS491/PASS492 reopen, batching and bottom-up constructor laws.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX completion and remaining field-granular change work.
+- DB-owned granular authorization.
+- deterministic Semantic Rules/invariants.
+- migration frontend and final Context/open DX.
+- Python/.NET/Studio/CLI product surfaces.
+- backup/recovery UX.
+- public performance/binary-size budgets.
+- native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- forest construction by transient independent subtree builds;
+- recovery/build caches that duplicate maintained semantic authority;
+- serialized maintained forest snapshots or durable forest/node ids;
+- root-expanded source materialization hidden behind canonical final-state interning.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- one exact-history sweep for relational causal reconstruction;
+- one forest rewind per relevant historical effect;
+- one causal impact plan per shared forest snapshot;
+- one source materialization per unique canonical Scan cell during forest build;
+- one local initialization per unique canonical cell, independent of number of roots referencing that cell;
+- no query replay/full-state recomputation/per-transaction O(data) causal store.
+
+### NEXT RECOMMENDED PASS — PASS493
+Parameter-family fusion R&D/implementation over `RelObservationForest`: begin with exact equality-value dispatch and ordered-cut families. Read `PROJECT_RULES.md`, PASS492 report and both active ledger tails before implementation and carry the read-before-work contract forward.
+
+## PASS493 — exact parameter-family fusion
+
+Goal: reduce the remaining fully-hot stateless filter-family payer without weakening canonical root identity, Γ semantics, or the P490–P492 forest laws.
+
+### CLOSED THIS PASS
+- Equality-constant sibling filters over one canonical parent now compile into one exact Γ-equivalence dispatch family. A changed row is canonicalized once and routed only to constants in the same semantic class.
+- Ordered-constant sibling filters over one canonical parent now compile into one exact order-cut family across all four comparison directions. A changed row receives one canonical order key, then binary cut selection plus exact fanout to matching roots.
+- Case-insensitive hostile equality confirms semantically equal but byte-different constants share the correct Γ class.
+- Root-by-root effects remain extensionally equal to independent `MaterializedRelPlanState` execution.
+- PASS488 reopen miss-heavy workload improves from 260 maintained-node transitions to 4 Scan transitions; the 64 stateless equality roots are discharged by four family classifications because none of the historical rows enter their classes.
+
+### OPEN — IMMEDIATE
+1. Hostile-audit parameter-family construction/update memory for very large Q and repeated semantically equivalent constants/cuts; keep only output-relevant routing state.
+2. Determine whether the same exact family principle extends to richer predicate conjunctions/ranges as a normalized interval/decision structure without creating a predicate engine beside `RelExpr`.
+3. If no larger universal law is justified, return to broader object/traversal relational observation coverage rather than accumulating special cases.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX completion and remaining field-granular change work.
+- DB-owned granular authorization.
+- deterministic Semantic Rules/invariants.
+- migration frontend and final Context/open DX.
+- Python/.NET/Studio/CLI product surfaces.
+- backup/recovery UX.
+- public performance/binary-size budgets.
+- native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Q independent semantic equality comparisons per changed row for sibling equality-constant filters.
+- Q independent ordering comparisons per changed row for sibling ordered-cut filters.
+- comparator-direction-specific order-key recomputation; `<`, `<=`, `>`, `>=` share one canonical order family.
+- any relation-envelope or host-value dispatch that bypasses pinned Γ canonicalization.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- PASS490–P492 unique-cell, shared-reopen and bottom-up-construction laws remain mandatory.
+- Equality family: one canonical Γ key per changed row per `(parent,column,equivalence)` family plus actual emitted root memberships.
+- Ordered family: one canonical order key per changed row per `(parent,column,ordering)` family, logarithmic cut lookup plus actual emitted root memberships.
+- Stateless family roots with zero effect do not need individual maintained-node transitions.
+- No durable family ids, no second query engine, no query replay/full-state recomputation fallback.
+
+### NEXT RECOMMENDED PASS — PASS494
+Hostile/R&D the generalized predicate-family boundary: test whether conjunction/range predicates admit one canonical interval/decision lowering built from the existing `RelExpr` forest. Implement only if it is a genuine universal exact law; otherwise close the family line and return to broader object/traversal product capture. Read `PROJECT_RULES.md`, PASS493 report and both active ledger tails first and carry the rule forward.
+
+## PASS494 — generalized predicate-family boundary / specialization stop
+
+Goal: determine whether PASS493 scalar equality/order fusion extends to one universal exact conjunction/range family without introducing another predicate engine.
+
+### CLOSED THIS PASS
+- One-dimensional constant order conjunctions are characterized exactly as intersection of canonical Γ-order cuts; their normal form is one interval (possibly empty).
+- Executable coverage proves a nested four-bound conjunction agrees exactly with the corresponding canonical interval.
+- Multi-column conjunctions are characterized as product regions, not one-dimensional cuts.
+- Executable four-quadrant hostile coverage proves no existing single scalar `(column, ordering)` family key is sufficient for general multi-column conjunction routing.
+- The current parameter-family specialization line is CLOSED rather than extended with ad-hoc conjunction routers.
+
+### OPEN — IMMEDIATE
+1. Return to broader product observation coverage: hostile-audit object/reference/relationship/deep-traversal read surfaces and verify that all application-visible reads lowering to relational semantics acquire the exact Γ-DTC causal authority while internal lowering remains passive.
+2. Close any remaining capture gaps through the existing `RelExpr` / `RelObservationForest` path; do not add an ORM/navigation observation engine.
+3. After breadth is closed, return to Context reference/relationship DX and the long-deferred DB-owned authorization / Semantic Rules product lines.
+4. Treat multidimensional predicate indexing as a separate future Γ-aware index-algebra R&D item only if measured product workloads justify it.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Context reference/relationship DX completion and remaining field-granular change work.
+- DB-owned granular authorization.
+- deterministic Semantic Rules/invariants.
+- migration frontend and final Context/open DX.
+- Python/.NET/Studio/CLI product surfaces.
+- backup/recovery UX.
+- public performance/binary-size budgets.
+- native Windows secure-memory expansion.
+- optional multidimensional Γ-aware predicate index algebra, only with a first-class theorem/benchmark case.
+
+### SUPERSEDED / DO NOT EXTEND
+- conjunction-specific pattern routers in recovery or forest fanout;
+- pretending a multi-column product region is one scalar interval;
+- host tuple/hash classification that bypasses pinned semantic modules;
+- a second predicate evaluator/cache beside `RelExpr` and Γ-DTC;
+- further parameter-family specialization without a universal semantic law.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- PASS490–P493 forest sharing, bottom-up construction, shared reopen and scalar-family dispatch laws remain mandatory.
+- One-dimensional equality/order families remain output-sensitive.
+- General multi-coordinate predicates may pay their genuine semantic work until/unless a first-class multidimensional Γ-index is designed; no hidden full-state/query replay fallback.
+
+### NEXT RECOMMENDED PASS — PASS495
+Broader product observation coverage audit/integration: start from object/reference/relationship/deep-traversal application reads, trace their lowering into `RelExpr`, and ensure exact causal capture reaches the existing shared `RelObservationForest` without making internal mutation/lowering reads observational. Read `PROJECT_RULES.md`, PASS494 report, both ledger tails and the relevant Context/DX docs before implementation; carry the read-before-work contract forward.
+
+## PASS495 — product observation breadth / scoped Context audit
+
+Goal: trace application-visible object/reference/relationship/deep-traversal reads into the existing `RelExpr` / `RelObservationForest` causal authority, preserve passive internal lowering, and reconcile the result with the selected scoped `Context<M>` DX contract.
+
+### CLOSED THIS PASS
+- Hostile audit confirms ordinary object queries, projections, aggregates and typed raw prepared execution converge on `ReadContext::execute` and therefore one relational causal capture owner when transaction/scoped observation capture is enabled.
+- `Ref::query/load` preserves the exact bound `ReadContext`; chained reference traversal therefore remains in the same capture journal rather than creating hidden ORM I/O authority.
+- `Many` / `OwnedMany` query/load/count/ids lower through ordinary `RelExpr` over edge/target relations. Explicit relationship reads are causal observations; merely accessing the materialized relationship field remains I/O-free.
+- Deep typed reference predicates lower into the same relational algebra and acquire exact Γ-DTC causal authority without a navigation-specific observation engine.
+- Internal mutation/relationship lowering continues to use passive `Transaction::operation_context` / `execute_for_mutation`, preserving the PASS487 distinction between effect construction and application-visible observation.
+- Executable hostile regressions now prove chained Ref target reads, deep reference-path predicates and Many cardinality reads reject retroactive effects that would change the later committed observation.
+- Selected `CFMD_SELECTED_SCOPED_CONTEXT_DX_RU.md` contract is incorporated into `PROJECT_RULES.md`: scoped `Context<M>` is the future public working-world owner; current public Transaction machinery becomes its internal exact intent journal rather than a competing semantic model.
+
+### OPEN — IMMEDIATE
+1. Replace transitional live `ContextSource::Current` semantics with the selected bounded scoped Context formation world / Candidate owner. Current Context takes a fresh committed snapshot per collection access and therefore is not the selected unit-of-work model.
+2. Preserve read-your-writes through incremental Candidate maintenance while routing all application-visible Context reads through the same exact relational observation journal proven in P487-P495.
+3. Internalize normal public `Transaction` ownership behind Context without losing durable idempotency identity, exact effect journal, formation provenance, requirements or schema-epoch FormationWorldSeal semantics.
+4. Add atomic Context admission across migration cutover before exposing migration-ready A/B typed branch DX.
+5. After scoped Context core is mainline, return to reference/relationship partial-Context mutation completion and field-granular authority cleanup.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- DB-owned granular authorization.
+- deterministic Semantic Rules/invariants.
+- migration frontend / atomic typed Context admission syntax.
+- Python/.NET/Studio/CLI final surfaces.
+- backup/recovery UX.
+- public performance/binary-size budgets.
+- native Windows secure-memory expansion.
+- optional multidimensional Γ-aware predicate index algebra only with measured justification.
+
+### SUPERSEDED / DO NOT EXTEND
+- treating current `ContextSource::Current` fresh-snapshot-per-call behavior as final Context semantics;
+- public Transaction and Context as two permanent competing unit-of-work owners;
+- navigation-specific observation/read-set machinery for Ref/Many/deep traversal;
+- hidden relationship I/O on field access;
+- mutation-lowering reads becoming causal anti-dependencies.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- P490-P493 forest sharing/fusion/reopen laws remain mandatory for all object/traversal reads.
+- Explicit Ref/Many traversal pays only its actual RelExpr/Γ-DTC work; no N+1 I/O is hidden by field access.
+- Scoped Context creation/read/write must not clone O(data) state; Candidate and observation maintenance stay incremental/touched-data proportional where the algebra permits.
+- No duplicate query replay merely to create a causal certificate.
+
+### NEXT RECOMMENDED PASS — PASS496
+Implement the selected scoped `Context<M>` runtime owner: one admitted formation world + incremental Candidate + shared observation journal + internal intent journal, while keeping the existing Transaction kernel machinery as an implementation detail. Start by replacing `ContextSource::Current` fresh-snapshot-per-call semantics without changing kernel commit/rebase laws. Read `PROJECT_RULES.md`, PASS495 report, both active ledger tails, and `CFMD_SELECTED_SCOPED_CONTEXT_DX_RU.md` before implementation and carry the read-before-work contract forward.
+
+## PASS496 — scoped Context formation core / candidate authority boundary
+
+### CLOSED THIS PASS
+- `Database::context::<M>()` no longer binds `ContextSource::Current` and silently takes a fresh committed snapshot on each EntitySet operation. It atomically admits one formation `ReadContext` and keeps that formation world fixed for the scope.
+- Added one `ScopedContextCore` owning: database capability, formation world, internal adaptive `Transaction`/exact intent journal, current speculative read world, and observation state.
+- Added Context-owned basic exact staging (`Context::add`, `Context::remove`, `Context::set`) so ordinary basic CRUD no longer requires a public `&mut Transaction` parameter at the Context call site.
+- `Context::preview()` and `Context::commit()` now operate on the Context-owned intent journal. Drop remains discard-only; successful commit seals the scope against further mutation.
+- Candidate read world reuses ordinary `ReadContext` / `RelExpr` / Γ-DTC execution. No second query engine or Candidate ORM path was introduced.
+- Application reads before the first staged write share the same relational causal capture authority owned by the internal adaptive journal.
+- Read-your-writes is executable: reads after staged writes evaluate against the exact Candidate rather than formation or live HEAD.
+- Hostile regression proves an admitted Context does not start tracking newer HEAD after an external commit; a newly admitted Context sees the newer world.
+
+### HOSTILE / R&D FINDING
+- Current durable relational observation identity is `(observation id, committed observed revision, RelExpr)`. A post-write Context observation occurs in a virtual Candidate world `prefix(F)(formation)` and therefore cannot honestly be encoded as a committed revision.
+- Persisting that Candidate capsule without its exact intent prefix would make reopen reconstruction unsound. Dropping the observation would make future retroactive braid checking unsound.
+- Selected exact continuation: ordered intent segments / prefix-qualified observations. Recovery must be able to reconstruct the virtual Candidate observation world from formation authority + exact staged prefix, without host callback replay and without serializing O(data) query state.
+- PASS496 therefore executes RYW locally but fails Context commit closed if a post-write relational observation occurred. This is an explicit proof gap, not a fallback.
+
+### OPEN — IMMEDIATE
+1. PASS497: exact segmented `IntentJournal` / prefix-qualified relational observation authority for post-write reads; recover/reopen the observation world from formation + exact prefix and remove the PASS496 fail-closed gate.
+2. Finish Context-owned relationship/reference mutation surfaces so `Many`/`OwnedMany` and relationship operations no longer require an external public Transaction.
+3. Atomic migration-ready Context admission across schema contract choices, preserving one chosen type for the scope.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- Complete reference/relationship partial-Context writes.
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Migration frontend and final bindings (Python/.NET/Studio/CLI).
+- History/retention UX, backup/recovery UX, public perf/binary budgets, native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Fresh-snapshot-per-call `ContextSource::Current` as the semantics of public `Context<M>`.
+- A permanent second public unit-of-work owner beside scoped Context.
+- Encoding speculative Candidate observations as fake committed revisions.
+- Dropping post-write observations or replaying host code on rebase/recovery.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Context admission is O(1)/persistent-root style, not O(data) cloning.
+- Candidate maintenance remains proportional to touched/affected data through existing Plan/Candidate kernels.
+- Reads continue through the same `RelExpr` / Γ-DTC machinery.
+- No per-operation global mutex beyond the Context-local unit-of-work state; no new global routing layer.
+
+### NEXT RECOMMENDED PASS — PASS497
+**Segmented IntentJournal / prefix-qualified Candidate observation authority.** Make read-after-write observations fully durable/reconstructible so scoped Context can commit arbitrary normal host-language read → write → read → write flows without exposing Transaction and without weakening causal braid exactness.
+
+## PASS497 — prefix-qualified scoped Candidate observations
+
+### CLOSED THIS PASS
+- PASS496 fail-closed commit after post-write scoped Context observation.
+- Exact durable candidate observation authority: formation revision + exact staged relation prefix + RelExpr.
+- Reopen reconstruction through existing shared relational observation forest / Γ-DTC transitions; no maintained-state serialization.
+- Durability codec interning for equal relation-effect prefixes within one observation set.
+- Public hostile path `write -> candidate read -> second write -> commit -> reopen`.
+
+### OPEN — IMMEDIATE
+1. Replace cumulative prefix snapshots with a persistent/interned ordered IntentJournal segment chain; prevent O(S²) prefix payload across many alternating writes/reads.
+2. Extend the same scoped Context owner to relationship mutations / reference writes and prove prefix reconstruction for those paths.
+3. Retained-schema-epoch hostile E2E for prefix-qualified Candidate observations crossing migration.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Final Python/.NET/Studio/CLI surfaces.
+- Backup/recovery UX.
+- Public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- PASS496 post-write-observation fail-closed gate.
+- Fake/synthetic durable Candidate revisions as causal authority.
+- Serialized maintained-query snapshots for Candidate observations.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Candidate observation reconstruction uses exact prefix deltas, not full-state Candidate snapshots.
+- Equal prefix payloads are encoded once per durable observation set.
+- Query hidden state is rebuilt through the shared RelObservationForest / Γ-DTC path.
+
+### NEXT RECOMMENDED PASS — PASS498
+Persistent/interned ordered IntentJournal segment chain + retained-epoch prefix observation E2E. Eliminate cumulative-prefix O(S²) payload while preserving exact read/write/read/write semantics and reopen equivalence.
+
+## PASS498 — persistent scoped IntentJournal prefix chain / retained-epoch prefix authority
+
+### CLOSED THIS PASS
+- Replaced cumulative per-observation relation-prefix snapshots with persistent parent-linked `DurableIntentPrefix` nodes.
+- Scoped Context now appends one exact `Candidate_i -> Candidate_{i+1}` relation segment per staged step; observations clone only the current tail.
+- Durable codec writes each unique `(parent_ref, segment)` node once and observations store compact tail refs; decode rebuilds shared `Arc` lineage.
+- Recovery applies prefix segments in order through the existing shared `RelObservationForest`, preserving one query engine and exact Γ-DTC state evolution.
+- Executable 128-level hostile codec regression proves linear segment storage and decoded parent sharing.
+- Retained-schema restart regression now uses a genuinely prefix-qualified A-native self-join observation formed after a staged relation write; the same retroactive A-effect conflicts before and after A->B migration/reopen.
+
+### OPEN — IMMEDIATE
+1. Extend scoped Context ownership to reference-field and relationship mutations (`Ref`, `Many`, `OwnedMany`) without external public `Transaction`, reusing the same persistent prefix lineage.
+2. Atomic migration-ready Context admission across consumer contract choices while keeping one chosen type/formation world for the scope.
+3. Hostile-audit prefix segment derivation for large multi-relation stages and compact touched-relation scaling; no full-model diff fallback on ordinary Context writes.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- DB-owned granular authorization.
+- General deterministic Semantic Rules/invariants.
+- Final Python/.NET/Studio/CLI surfaces.
+- Backup/recovery UX, public performance/binary-size budgets, native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Cumulative `Vec<DurableRelationMutation>` copied into every Candidate observation.
+- Prefix codec interning only whole cumulative snapshots.
+- Reconstructing Candidate observation state by flattening/replaying cumulative prefix payloads.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Prefix storage is O(S + O), not O(S^2), for S staged segments and O observations.
+- Observation prefix clone is O(1) persistent-tail sharing.
+- Reopen applies each prefix segment through the shared forest; no maintained-query snapshot serialization or callback replay.
+
+### NEXT RECOMMENDED PASS — PASS499
+Scoped Context relationship/reference mutation ownership over the same persistent IntentJournal chain. Remove remaining ordinary `&mut Transaction` DX from `Ref`/`Many`/`OwnedMany` mutations and prove read/write/read prefixes remain reconstructible without a second mutation engine.
+
+## PASS499 — scoped reference/relationship mutation ownership
+
+CLOSED THIS PASS
+- Ordinary required/optional reference field mutation through scoped `Context::set`, including read-after-reference-write prefix observations.
+- Context-owned `Many<T>` mutation: attach/detach/move/move-all/detach-all/selected-id operations without external `&mut Transaction`.
+- Context-owned `OwnedMany<T>` mutation over the same path while preserving exclusivity/orphan policy validation.
+- Relationship handle rebinding to the current Candidate so handles materialized at an earlier intent prefix cannot read stale edge state during a later mutation.
+- Hostile E2E: ordinary write -> relationship mutation -> Candidate relationship observation -> later relationship write -> commit -> reopen.
+
+OPEN — IMMEDIATE
+- Atomic migration-ready Context admission / typed A-or-B scope selection without check-then-bind race.
+- Continue collapsing ordinary public Transaction DX into Context-owned IntentJournal while retaining explicit advanced/strict snapshot machinery where semantically distinct.
+
+OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- DB-owned granular authorization over final Context coordinates.
+- General deterministic Semantic Rules/invariants.
+- Final Python/.NET/Studio/CLI surfaces.
+- Backup/recovery UX and public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+SUPERSEDED / DO NOT EXTEND
+- Requiring application code to pass `&mut Transaction` for ordinary reference/Many/OwnedMany mutations.
+- Binding a scoped relationship mutation to the snapshot embedded in a previously materialized relationship handle.
+- Any second relationship-specific intent/recovery engine.
+
+PERFORMANCE BASELINES TO PRESERVE
+- Relationship mutation lowering reads only exact affected edge state and remains passive with respect to application observations.
+- Candidate/prefix maintenance remains proportional to staged exact effects; no full-state clone/replay is introduced.
+- Prefix-qualified observations continue to reconstruct through the single persistent IntentJournal segment lineage.
+
+NEXT RECOMMENDED PASS
+- PASS500: atomic migration-ready scoped Context admission. Resolve schema/contract epoch and formation revision in one linearizable runtime admission primitive; typed frontend branching must consume that admitted token rather than `current_schema()` followed by `context::<M>()`.
+
+## PASS500 — atomic migration-ready scoped Context admission
+
+### CLOSED THIS PASS
+- Added one generic runtime `ContextAdmission` token returned by `Database::begin_context()`.
+- Admission samples one coherent immutable runtime root exactly once; schema revision and formation revision/root therefore have one linearization point.
+- `ContextAdmission::context::<M>(self)` consumes the token and binds the typed scoped Context to that exact admitted world even if migration publishes between admission and typed branch execution.
+- `Database::context::<M>()` now delegates through the same atomic admission primitive instead of maintaining a second bind path.
+- Executable hostile regression proves admission in schema A, A->B migration, then delayed typed bind still produces an A formation Context while the next admission observes B.
+- No long-held migration lock, router graph or alternate old-schema current-world execution path was introduced.
+
+### OPEN — IMMEDIATE
+1. Continue collapsing ordinary public `Transaction` DX into Context-owned `IntentJournal`; distinguish only genuinely strict/advanced snapshot operations that deserve a separate explicit surface.
+2. Hostile-audit transitional `SchemaDatabase<S>` / `ContextSource::Current` surfaces so they cannot remain a second live typed working-world model beside scoped `Context<M>`.
+3. Decide the thin migration-rollout frontend syntax (`context!` or equivalent) only after compile probes; it must consume `ContextAdmission`, not inspect live schema separately.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- DB-owned granular authorization over final Context coordinates.
+- General deterministic Semantic Rules/invariants.
+- Final Python/.NET/Studio/CLI surfaces.
+- Backup/recovery UX and public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- `current_schema/current_schema_revision -> later context::<M>()` check-then-bind patterns as migration-ready admission.
+- Long-held migration locks spanning application branch execution.
+- Permanent migration routers, `Context<A,B>`, `ReaderContext`, schema-router graphs or client compatibility graphs.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Context admission is one immutable runtime-root snapshot/Arc clone; no O(data) work and no long-held writer lock.
+- Migration remains free to publish immediately after admission.
+- Admitted Context remains bound to one exact formation root; later publication does not mutate the scope.
+- All PASS487-P499 Candidate/observation/prefix and relationship laws remain unchanged.
+
+### NEXT RECOMMENDED PASS — PASS501
+**Public unit-of-work ownership cleanup.** Hostile-audit and collapse the remaining ordinary public `Transaction`/live `SchemaDatabase<S>` paths into scoped `Context<M>` where they duplicate unit-of-work ownership. Preserve explicit snapshot-bound/advanced transaction semantics only where mathematically distinct; do not keep compatibility surface merely because it already exists.
+
+## PASS501 — scoped unit-of-work ownership cleanup
+
+### CLOSED THIS PASS
+- Transitional `SchemaDatabase<S>` / `SchemaDatabaseBuilder<S>` and `CfmdSchema::database(...)` live typed-database path removed.
+- `ContextSource::Current` removed; typed surfaces are now structurally only scoped working worlds or immutable snapshots.
+- Normal `cfmd` facade no longer re-exports `Transaction`, `TransactionId`, or `TransactionReadiness`; the runtime transaction object is hidden implementation/advanced proof plumbing.
+- `Snapshot<M>::edit()` now creates a strict snapshot-bound scoped Context rather than requiring `Transaction::from(snapshot)` in normal SDK code.
+- Context-owned explicit retry identity, deterministic `require`, and history undo staging are available without exposing the internal journal.
+- Public todo/example and API contract now use `Database + Context<M>` ownership.
+
+### OPEN — IMMEDIATE
+1. Remove remaining ordinary Transaction-shaped methods from the `cfmd-runtime` binding surface by replacing them with an explicit internal `IntentJournal`/runtime-core vocabulary; keep low-level protocol hooks only where bindings genuinely need them.
+2. Finish Context creation ergonomics for authoritative database creation without resurrecting a typed `SchemaDatabase<S>` wrapper.
+3. Continue DB-owned granular authorization now that Context/reference/relationship coordinates are stable.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- General deterministic Semantic Rules/invariants.
+- Final Python/.NET/Studio/CLI surfaces over ContextCore.
+- History/backup/recovery UX and public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- `SchemaDatabase<S>` as a live typed database authority.
+- `CfmdSchema::database(path)` typed builder entry point.
+- `ContextSource::Current` fresh-HEAD-per-call semantics.
+- Normal SDK `Transaction::new()` / `Transaction::from(snapshot)` ownership model.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Context creation pins one immutable admitted root; no O(data) clone.
+- Snapshot edit reuses the existing scoped Candidate/Γ-DTC machinery; no second query/change engine.
+- No long-held migration lock or old-schema current-world routing.
+
+### NEXT RECOMMENDED PASS
+**PASS502 — internal IntentJournal/runtime binding cleanup + authoritative Database creation DX.** Rename/collapse remaining runtime-facing Transaction vocabulary where it is only implementation plumbing, while preserving protocol retry identity and strict snapshot semantics through Context/Snapshot APIs. Design a clean `Database` creation entry that consumes authoritative schema definition without creating a generic `Database<S>` or `SchemaDatabase<S>`.
+
+## PASS502 — internal IntentJournal boundary + authoritative Database creation DX
+
+### CLOSED THIS PASS
+- Removed the remaining runtime type/module vocabulary `Transaction` / `TransactionReadiness` from active `cfmd-runtime`, `cfmd`, and the Python probe path; the shared exact-effect carrier is now explicitly `IntentJournal` with `IntentReadiness` diagnostics.
+- Preserved `TransactionId` unchanged as the genuine durable retry/protocol identity; no retry/idempotency format or kernel semantic law changed.
+- Scoped `Context<M>` and strict `Snapshot<M>::edit()` continue to reuse the same journal/Candidate/Γ-DTC machinery; no second mutation/query/rebase engine was introduced.
+- Python probe/deep regressions now reach the low-level journal only through the explicit hidden `cfmd::__private` boundary rather than normal root DX.
+- Added authoritative typed creation without a generic typed database wrapper: `Database::builder(path).create_authoritative::<S>()` and `Database::create_authoritative::<S>(path)` consume `S: DatabaseDefinition` only while constructing the persisted semantic model and return ordinary schema-neutral `Database`.
+- Kept raw `Schema` builder creation as the dynamic/generated-binding primitive; no typed live-database authority was reintroduced.
+- Updated active README/SPEC/current-status text to selected scoped Context ownership so normal docs no longer teach the superseded public Transaction model.
+- Hostile sweep of the touched owner found no fallback/router/SQL-shaped algorithm to replace. PASS502 is an ownership/boundary cleanup; the exact Candidate, kernel-change, Γ-DTC observation and durability paths remain the single semantic mechanisms.
+
+### OPEN — IMMEDIATE
+1. Granular DB-owned authorization over the now-stable Context field/reference/relationship/create/delete/history/watch coordinates. Context shape is not authorization; grants bind to semantic coordinates and must survive local `bind`/migration naming changes.
+2. Hostile-audit the hosted/session Context admission surface while integrating authorization so restricted clients also use one bounded Context owner rather than requiring the hidden IntentJournal as application DX.
+3. Preserve dynamic/generated binding access without promoting `IntentJournal` into a second public frontend unit-of-work abstraction.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- General deterministic Semantic Rules/invariants, including pattern/regex and entity/model invariants on the common deterministic expression substrate.
+- Final Python/.NET/Studio/CLI surfaces over ContextCore.
+- History/backup/recovery UX and public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Runtime/application type name `Transaction` as the mutable journal owner.
+- `TransactionReadiness` as product-facing mutable-owner vocabulary; internal diagnostics are `IntentReadiness`.
+- Normal typed creation via `S::definition()` manually threaded into `.schema(...)` at application call sites.
+- Any return to `Database<S>`, `SchemaDatabase<S>`, `CfmdSchema::database(...)`, or `ContextSource::Current`.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Context admission remains one immutable runtime-root snapshot/Arc clone; no O(data) creation/admission work.
+- Authoritative typed creation only compiles the schema definition already required by raw creation; it adds no second schema or runtime wrapper.
+- Candidate/intent-prefix/Γ-DTC maintenance remains incremental/touched-data proportional and shares the same engine before/after this vocabulary cleanup.
+- No long-held migration lock, old-schema current-world routing, fallback query replay, or second mutation engine.
+
+### NEXT RECOMMENDED PASS — PASS503
+**Granular DB-owned authorization on scoped Context coordinates.** Start from the existing kernel-auth/session semantic permission authority and map Context field/reference/relationship/create/delete/history/watch operations to stable semantic coordinates without using consumer struct shape as security. Hostile-audit hosted/session Context admission at the same time so authorization does not resurrect a public IntentJournal/Transaction owner.
+
+# PASS503 — SCOPED SEMANTIC AUTHORIZATION AUTHORITY
+
+### CLOSED THIS PASS
+- Restricted typed clients can now admit `SessionDatabase::begin_context()` / `context::<S>()`; the bounded `Context<S>` remains the sole normal mutable owner.
+- Session authority is carried by the exact formation `ReadContext` into Candidate reads, snapshots, strict snapshot edits and publication; no second mutation/query engine was added.
+- Public `Context::database()` unrestricted escape hatch: REMOVED.
+- `Context::at(...)` now preserves authority and `Database::at_with_authority` itself requires `HistoricalRead`.
+- `Context::undo_latest()` no longer reaches unrestricted `Database::history()`; it requires the formation world's `HistoryRead` authority.
+- `Database::preview` and `intent_readiness` now validate the exact bound plan authorization, preventing generic-write/preview bypasses.
+- Publication-time session revocation is regression-covered through scoped Context commit.
+- Local consumer `bind` authorization is regression-covered against the persisted semantic field coordinate, not the Rust field spelling.
+- Scoped relationship move vs attach authorization is regression-covered through `Context::move_to/attach`.
+- Existing dynamic/raw relation clients remain fail-closed through the same plan authorization law.
+
+### OPEN — IMMEDIATE
+1. Hostile-audit authorization/grant transport across schema migration: define how stable permissions follow preserved semantic identity and how non-identity/split/merge coordinates fail closed or require explicit policy transport.
+2. Make current-world publication authority explicit where semantics require HEAD-time freshness beyond session revocation (leases/external grants/etc.); keep it separate from formation guards.
+3. Audit hosted dynamic protocol and typed Context against the same migration-time grant law; no old-schema current-world routing or copied compatibility permission tables.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- General deterministic Semantic Rules/invariants, including regex/pattern semantics and entity/model invariants.
+- Migration frontend/diagnostics.
+- Final Python/.NET/Studio/CLI surfaces over ContextCore/runtime protocol.
+- History/backup/restore/corruption-recovery UX.
+- Public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Context field omission / consumer shape as authorization.
+- Restricted Context exposing raw unrestricted `Database` authority.
+- Per-frontend permission engines or ORM/controller-level authorization as database truth.
+- Generic `Write` as a fallback for missing exact field/action grants.
+- Old-schema query/permission routing after migration.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Context admission remains O(1) immutable-root/authority clone class; no O(data) copy.
+- Permission checks are footprint/coordinate/action proportional; no row scan and no query replay for authorization.
+- Session refresh/revocation remains shared authority state; no per-Context grant copying.
+- No second query/change/rebase engine and no public IntentJournal owner.
+
+### NEXT RECOMMENDED PASS — PASS504
+**Authorization transport across migration + explicit current-world publication authority.** Prove the law for permissions over preserved semantic coordinates and fail closed for split/merge/non-representable mappings. Keep session/grant freshness a current-world publication concern, not a transported formation guard.
+
+## PASS504 — migration authorization footprint + current-world publication seal
+
+### CLOSED THIS PASS
+- Selected the authorization-migration law: **transport required effect authority, never grants**. Stable semantic IDs preserve grant identity by definition; no migration ACL copy/alias table exists.
+- `kernel-transport::SchemaMigrationTransport` now exposes exact row-local write-authority dependency transport through `transport_relation_write_footprint_exact` and relation-level target transport through `transport_relation_write_targets_exact`.
+- Split/fan-out is exact: one touched source column requires every target column whose verified transform reads it. Changed target IDs therefore require explicit current-world grants.
+- General/query/global relational migration slices fail closed for local write-authority footprint transport instead of falling back to coarse `WriteRelation` or replaying an old-schema query.
+- Runtime read authorization is regression-proven across real schema migration: preserved `RelationColumnId` keeps the same grant identity; changing the semantic column ID does not inherit the old grant and requires explicit grant refresh.
+- Publication permission checks are now represented once as `PublicationAuthorityFootprint` and evaluated under one session-state read seal. `refresh_permissions` / `revoke` require the opposing write seal, so grant generation cannot change between exact authorization and durable publication.
+- Direct and adaptive/residual runtime publication paths use the same sealed publication-authority primitive; preview/readiness remain non-publishing exact authorization checks.
+- Hosted grant refresh/revocation inherits the same `Session` authority state; no host-side permission engine or copied grant state was introduced.
+- Added normative authorization-migration law to root `PROJECT_RULES.md` so successor passes cannot regress into ACL transport/routing.
+
+### OPEN — IMMEDIATE
+1. Fuse the new transported current-schema authority footprint into **schema-aware stale A-intent publication**. Existing kernel schema-aware field/relation walkers already transport effects across retained epochs, but product `Context` publication does not yet consume the current-B footprint under the session publication seal as one end-to-end path.
+2. For relation/object semantic actions, add only certified identity-preserving action transport; relation-ID-changing create/delete/relationship action mappings remain fail-closed rather than degrading to generic relation writes.
+3. Audit the dynamic hosted intent path when the schema-aware publication fusion lands, so typed Context and wire clients use the same current-world authority footprint and session-generation seal.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- General deterministic Semantic Rules/invariants, including regex/pattern semantics and entity/model invariants.
+- Migration frontend/diagnostics.
+- Final Python/.NET/Studio/CLI surfaces over ContextCore/runtime protocol.
+- History/backup/restore/corruption-recovery UX.
+- Public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Transporting/re-writing grants or roles through schema migration.
+- Name/ordinal-based ACL compatibility aliases.
+- Checking only formation-world A permissions for an effect physically published into B.
+- Releasing the session generation before durable publication and calling that publication-time revocation safety.
+- Coarse `WriteRelation` fallback when exact split/merge field authority is unavailable.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Authority-footprint transport is O(touched source coordinates + verified migration dependency fan-out), not O(rows) and not O(database size).
+- Publication sealing is one shared `RwLock` read acquisition per publish; concurrent publishes under the same generation remain concurrent, while refresh/revoke serialize at the generation boundary.
+- No grant copying per Context/Candidate, no old-schema query replay, no compatibility permission routing.
+- Existing Context admission remains O(1) immutable-root/authority clone class.
+
+### NEXT RECOMMENDED PASS — PASS505
+**Schema-aware current-world publication authority fusion.** Feed the exact B/C authority footprint produced by verified migration transport into the existing schema-aware stale-intent publication walkers, then hold the live session-generation seal through their final durable freshness publication. Preserve action semantics only where identity is certified; otherwise fail closed. Cover typed Context and hosted/dynamic entry points through one runtime law.
+
+## PASS505 — schema-aware current-world publication authority fusion
+
+### CLOSED THIS PASS
+- Normal adaptive `IntentJournal` / scoped-Context relation publication now detects a crossed semantic-schema boundary before attempting source-world publication authorization.
+- Added kernel-owned `SchemaAwareRelationAuthorityFootprint`: required relation/field/action authority is transported through retained migration epochs with the same verified `SchemaMigrationTransport` provenance used by data transport. Grants remain outside the kernel and are never migrated.
+- Authority-footprint transport returns the exact current `head_revision`; schema-aware publication must present that revision back as `authorized_head_revision`. A later schema publication therefore cannot reuse a B-world permission proof for C.
+- Relation-write authority follows exact row-local/passthrough target relation fan-out. Relation-column authority follows exact verified target-column dependency fan-out.
+- Semantic mutation action authority (`CreateObject`, `DeleteObject`, `AttachRelationship`, `DetachRelationship`, `MoveRelationship`) is preserved only through exact relation passthrough identity. Row-local rewrite is not treated as action identity even when the numeric relation ID is unchanged.
+- `commit_schema_aware_relation_intent` now carries transported `DurableRelationAuthorization` into the realized current-world residual instead of erasing action/history authority metadata.
+- Idempotent retries remain prior to the authorized-head freshness rejection: an already committed intent still returns `AlreadyCommitted`; the head certificate constrains only a new publication.
+- Runtime E2E proves an A-formed relation intent after A->B migration is rejected with only the A relation grant and succeeds with only the B relation grant. No source-world ACL check is used as a publication fallback.
+- The old direct stale commit probe is skipped after a semantic schema boundary, preventing source-footprint authorization from pre-empting the schema-aware current-world path.
+- P474 retained-epoch regression now also proves action authority fails closed across a row-local rewrite rather than silently degrading to generic relation write.
+
+### OPEN — IMMEDIATE
+1. Collapse the current two-pass schema-aware flow (authority-footprint traversal, then effect traversal) into one kernel-owned `PreparedSchemaAwarePublication` artifact. It should carry current effect, exact current authority footprint, authorized HEAD and client semantic identity from one verified retained-epoch walk, eliminating duplicated migration traversal and proof-divergence risk.
+2. Extend the prepared publication class beyond relation-only deltas to field/model/lifecycle effects so scalar/reference patches and identity-preserving object create/delete can cross migration under the same current-world authority law. Non-identity lifecycle/action mappings remain fail-closed until certified.
+3. Make `intent_readiness` and `preview` consume the same prepared schema-aware artifact. They currently remain same-schema-oriented even though relation-only `commit` can now cross the schema boundary correctly.
+4. Upgrade hosted/dynamic exact-relation protocol formation identity. The wire request currently carries only `base_revision`; do not infer an old semantic revision through a historical fallback. Carry/derive a certified formation semantic identity and route it through the same prepared publication law before claiming hosted migration closure.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- General deterministic Semantic Rules/invariants, including regex/pattern semantics and entity/model invariants.
+- Migration frontend/diagnostics.
+- Final Python/.NET/Studio/CLI surfaces over ContextCore/runtime protocol.
+- History/backup/restore/corruption-recovery UX.
+- Public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Source-schema permission checks before effect transport when the current semantic schema differs.
+- Treating equal relation numeric IDs as sufficient proof that create/delete/relationship action meaning survived a row-local migration rewrite.
+- Recomputing or copying grants at migration time.
+- Allowing a transported authority footprint to float across later HEAD/schema changes without an exact authorized-head certificate.
+- Any coarse `WriteRelation` fallback for non-local/global or unproved action transport.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Current PASS505 relation authority transport is O(retained schema epochs × touched semantic coordinates/dependency fan-out), never O(rows) or O(database size).
+- No ACL/grant copy, old-schema query replay or per-row authorization metadata.
+- Publication still uses one shared session-generation seal; the new authorized-head value adds no lock or long-held migration barrier.
+- PASS506 should reduce the duplicated schema-epoch traversal to one prepared walk rather than adding another router/cache.
+- Context admission remains O(1) immutable-root/authority clone class.
+
+### NEXT RECOMMENDED PASS — PASS506
+**Prepared schema-aware publication authority.** Replace the temporary separate footprint/effect walks with one kernel-certified prepared publication carrying the transported current effect, current authority footprint and authorized HEAD. Reuse that artifact for commit/readiness/preview, then extend it to field/model/lifecycle effects and give hosted/dynamic requests an exact formation semantic identity instead of guessing from `base_revision`.
+
+## PASS506 — prepared schema-aware publication authority
+
+### CLOSED THIS PASS
+- Replaced the separate retained-epoch authority-footprint walk + relation-effect walk with one kernel `PreparedSchemaAwarePublication` preparation path.
+- One prepared artifact now binds: formation revision + formation semantic revision, exact current HEAD, current transported relation effect, current relation/field/action authority footprint, client guard digest and certified intervening-effect count.
+- `commit` consumes the prepared artifact directly; durable publication does not re-walk schema migrations.
+- `preview` and `intent_readiness` now consume the same prepared current-world meaning for supported relation-only cross-schema intents instead of authorizing the source-world plan.
+- Source-world-only grants cannot preview, certify readiness for, or publish a transported current-world relation effect; current-world grants can do all three.
+- Prepared artifacts fail freshness if HEAD changes before a new publication; `AlreadyCommitted` retry semantics remain independent from that freshness check.
+- Formation-world `require` transport is explicitly fail-closed in schema-aware preview rather than silently re-evaluated in a different semantic world.
+
+### OPEN — IMMEDIATE
+1. Extend `PreparedSchemaAwarePublication` beyond relation-only effects to scalar/reference field patches, model/lifecycle effects and identity-certified create/delete/relationship actions without widening to generic relation authority.
+2. Upgrade hosted/dynamic `CommitRequest` to carry exact formation semantic identity and route wire publication through the same prepared artifact. Do not infer semantic identity from `base_revision` or arbitrary historical lookup.
+3. Unify schema-aware conflict diagnostics so `intent_readiness` can expose structured `Conflict` rather than an error for unsupported/certification-conflict cases while preserving the same prepared kernel proof.
+4. Transport formation-world semantic `require` only if an exact expression/observation law is proven; otherwise keep it fail-closed.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- General deterministic Semantic Rules/invariants, including regex/pattern semantics and entity/model invariants.
+- Migration frontend/diagnostics.
+- Final Python/.NET/Studio/CLI surfaces over ContextCore/runtime protocol.
+- History/backup/restore/corruption-recovery UX.
+- Public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Separate schema migration walks for effect transport and publication-authority transport.
+- Source-world authorization in `preview`/`intent_readiness` after semantic migration.
+- Reconstructing a current Plan first and then asking a second engine what authority it needs.
+- Hosted formation semantic identity guessed from revision number/history.
+- Generic fallback for unsupported field/model/lifecycle/require transport.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Supported cross-schema relation preparation is one retained-epoch traversal: O(schema epochs * touched exact effects/dependency fan-out), not two traversals and not O(rows/database size) metadata.
+- `commit` after preparation performs no schema migration walk; it only checks exact HEAD, residualizes against current support and enters the existing durable publication path.
+- `preview`/`intent_readiness` share the same prepared effect/authority meaning; no diagnostic-only migration executor exists.
+- No ACL copy/replay, old-schema current-world query execution, long-held migration lock or coarse authorization fallback.
+
+### NEXT RECOMMENDED PASS — PASS507
+**Prepared publication breadth + hosted formation identity.** Extend the prepared artifact to field/model/lifecycle classes where exact laws already exist, then add explicit formation semantic revision to hosted/dynamic commits and route them through the same prepared publication authority. Keep non-representable action/require/global-rewrite classes fail-closed.
+
+# PASS507 — prepared field publication + hosted formation identity
+
+### CLOSED THIS PASS
+- Hosted/dynamic `CommitRequest` now carries explicit transport-neutral `SemanticRevision { schema, environment }`; `base_revision` alone is no longer treated as semantic identity.
+- Hosted stale relation commits crossing A->B verify the client-declared formation semantic identity against the exact formation world and then consume the same `PreparedSchemaAwarePublication` / current-world authority law as local scoped publication.
+- Hosted source-world grants do not authorize target-world publication. E2E proves source-only `WriteRelation(A)` is denied while target-only `WriteRelation(B)` publishes the same A-formed intent after A->B.
+- False hosted formation semantic identity fails closed; no schema inference from `base_revision` and no compatibility ACL routing were added.
+- `PreparedSchemaAwarePublication` now also carries source/current `DurableModelDelta` and a sealed publication guard for the exact field-only class.
+- The P465 schema-aware field walker is split into `prepare_schema_aware_field_publication` + `commit_prepared_schema_aware_publication`; direct prepared publication is regression-proven.
+- Existing `commit_schema_aware_field_intent` remains only as an internal compatibility wrapper over the prepared path and preserves durable idempotent retry semantics.
+
+### OPEN — IMMEDIATE
+1. Remove the hosted `revision_at(base_revision)` formation-context reconstruction payer. Add a kernel-owned formation-context witness/raw-relation preparation entry so explicit semantic identity verification + source typecheck + effect/authority transport happen in one retained-epoch walk.
+2. Fuse mixed object-field publication: product object/reference patches currently carry both mirrored relation deltas and model field deltas, while PASS507 preparation closes only pure field-only model delta and pure relation paths separately.
+3. Derive exact carrier/lifecycle `DurableModelDelta` transport from the existing kernel identity/lifecycle transport laws. Do not reconstruct whole states or assume lifecycle identity across non-bijective migrations.
+4. Preserve structured readiness conflict diagnostics for prepared schema-aware conflicts rather than collapsing all unsupported classes into generic stale errors.
+5. Derive exact formation-world `require` and relational-causal-observation transport laws if possible; otherwise remain fail-closed.
+
+### OPEN — DEFERRED / RETURN AFTER CURRENT LINE
+- General deterministic Semantic Rules/invariants, including regex/pattern semantics and entity/model invariants.
+- Migration frontend/diagnostics.
+- Final Python/.NET/Studio/CLI surfaces over ContextCore/runtime protocol.
+- History/backup/restore/corruption-recovery UX.
+- Public performance/binary-size budgets.
+- Native Windows secure-memory expansion.
+
+### SUPERSEDED / DO NOT EXTEND
+- Hosted semantic identity inferred from historical revision number alone.
+- Separate hosted migration/authorization engine.
+- Source-world hosted grant checks before schema-aware authority-footprint transport.
+- Monolithic field schema-walker prepare+publish as the only field transport API.
+- Generic whole-state reconstruction as a model/lifecycle migration fallback.
+- ACL/grant migration or old-schema current-world routing.
+
+### PERFORMANCE BASELINES TO PRESERVE
+- Supported relation preparation remains one retained-epoch effect+authority traversal and publication performs no second migration traversal.
+- Prepared field publication performs one retained-epoch field transport/certification walk and no second migration walk at publication.
+- Work remains proportional to crossed retained epochs + touched semantic effect/dependency support, never total row count.
+- Hosted formation verification must be reduced from current exact historical reconstruction to a bounded formation-context witness/preparation step; do not normalize the temporary payer as final architecture.
+- No long-held migration lock, ACL copy, query replay, or compatibility router.
+
+### NEXT RECOMMENDED PASS — PASS508
+**Unified mixed prepared publication + formation-context witness.** First remove hosted `revision_at` by making explicit formation semantic identity a kernel-verified input of the same preparation walk. Then derive one prepared mixed effect law for relation delta + field model delta, and R&D exact carrier/lifecycle delta transport from existing identity/lifecycle mathematics. Keep non-bijective lifecycle/model classes, formation `require`, and unsupported global rewrites fail-closed.
+
+
+## GitHub checkpoint sync after PASS507
+
+Repository checkpoint synchronized the current PASS507 mainline with later GitHub-only CI repairs without importing the older PASS472 product tree: Rust workflow prerequisites (`ripgrep`, Ubuntu user-namespace enablement), Git-aware repository manifest validation, and the current Lean durability/refinement source-closure checker are retained. Workspace formatting was normalized with pinned Rust 1.98.1. Strict Clippy cleanup was in progress when the external hard wall-clock boundary was reached; no new product semantics were introduced by the checkpoint. PASS508 remains the next architecture target exactly as recorded above.
+## GitHub checkpoint CI closure after PASS507
+
+### CLOSED IN MAINTENANCE CHECKPOINT
+- Pinned Rust 1.98.1 workspace formatting is clean.
+- Strict workspace Clippy (`--workspace --all-targets --locked --offline -- -D warnings`) is clean on the PASS507 product tree.
+- Full `scripts/ci-rust.sh` is green, including repository/public API/derive-diagnostic gates and all workspace targets/tests.
+- The derive compile-fail fixture now targets the selected schema-neutral authoritative creation law rather than removed `CfmdSchema::database(...)` DX.
+- `SurfaceKernel.lean` and `check_surface_refinement.py` now cover production `FilterOrderConst` and `Union`; durability and surface source-refinement binders both pass.
+
+### ENVIRONMENT NOTE
+- Local Lean 4.34.0 compiler execution was not available in this maintenance sandbox: the compiler is not installed, prior split toolchain attachments are not available in this conversation/library, and the sandbox has no outbound network. The GitHub Lean workflow remains pinned to `leanprover/lean4:v4.34.0`; source-refinement checks are green. This is an execution-environment limitation, not a claimed Lean compiler PASS.
+
+### NEXT RECOMMENDED PASS
+PASS508 remains unchanged: **Unified mixed prepared publication + formation-context witness.**
+

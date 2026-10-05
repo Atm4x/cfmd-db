@@ -2898,7 +2898,10 @@ fn advisor_i64_recovery_bundle(
 
 
 #[test]
-#[allow(clippy::cast_precision_loss, reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio.")]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
+)]
 fn pinned_runtime_snapshots_share_relation_witness_nodes_and_reclaim_dropped_oldest_root() {
     let values = (0_i64..4_096).collect::<Vec<_>>();
     let (context, registry, relation, _binding, runtime) =
@@ -2965,7 +2968,10 @@ fn pinned_runtime_snapshots_share_relation_witness_nodes_and_reclaim_dropped_old
 }
 
 #[test]
-#[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn pinned_runtime_whole_root_census_uses_persistent_logical_delta_roots() {
     let values = (0_i64..4_096).collect::<Vec<_>>();
     let (context, registry, relation, _binding, runtime) =

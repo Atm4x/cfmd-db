@@ -8,6 +8,7 @@ mod entity;
 mod error;
 mod history;
 mod ids;
+mod intent_journal;
 mod migration;
 mod notification;
 mod object;
@@ -17,7 +18,6 @@ mod runtime;
 mod schema;
 mod schema_model;
 mod security;
-mod transaction;
 mod typed;
 mod value;
 mod watch;
@@ -41,6 +41,8 @@ pub use ids::{
     EquivalenceId, FieldId, OrderingId, RelationColumnId, RelationId, RevisionId, TransactionId,
     TypeId, VariantTagId,
 };
+#[doc(hidden)]
+pub use intent_journal::{IntentJournal, IntentReadiness};
 pub use migration::{
     MigrationColumnRule, MigrationFieldRule, MigrationHistoryPolicy, MigrationModel,
     MigrationRelationRule, MigrationValueExpr,
@@ -50,7 +52,7 @@ pub use object::{
     __row_shape_error, GroupedAggregateQuery, Many, ManySelection, Object, ObjectEquivalence,
     ObjectFieldRole, ObjectFieldSchema, ObjectGroupQuery, ObjectManyFieldSchema, ObjectPatchField,
     ObjectProjectionQuery, ObjectProxy, ObjectQuery, ObjectRelationshipCardinality, ObjectSet,
-    ObjectValue, OrderedObjectValue, OwnedMany, OwnedManySelection,
+    ObjectValue, OrderedObjectValue, OwnedMany, OwnedManySelection, ScopedRelationship,
 };
 pub use plan::{CommitOutcome, OrphanPolicy, Plan};
 pub use query::{
@@ -75,13 +77,11 @@ pub use schema_model::{
     SchemaAuthorityPair,
 };
 pub use schema_model::{
-    CfmdSchema, Context, ContextSource, DatabaseDefinition, EntitySet, SchemaDatabase,
-    SchemaDatabaseBuilder, Snapshot,
+    CfmdSchema, Context, ContextAdmission, ContextSource, DatabaseDefinition, EntitySet, Snapshot,
 };
 pub use security::{
     Permission, PermissionSet, PrincipalId, Role, Session, SessionDatabase, SessionSnapshot,
 };
-pub use transaction::{Transaction, TransactionReadiness};
 pub use value::{EntityRef, Row, Value};
 pub use watch::{
     GroupedAggregateWatch, GroupedAggregateWatchEvent, ObjectWatch, ObjectWatchEvent,

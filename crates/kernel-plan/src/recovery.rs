@@ -241,12 +241,13 @@ pub(super) fn recover_runtime_bundle_with_policy_and_cores(
                     .ok()
                     .map(|native| (layout, native))
             });
-        let (layout, native) = recovered.unwrap_or_else(|| {
-            (
+        let (layout, native) = match recovered {
+            Some(recovered) => recovered,
+            None => (
                 LayoutBinding::RECOVERY_ROW_STORE,
-                NativeRelation::row_store(rows),
-            )
-        });
+                NativeRelation::row_store_with_arity(rows, relation.columns.len())?,
+            ),
+        };
         physical.install(relation.id, layout, native)?;
         relation_layouts.insert(relation.id, layout);
     }
@@ -603,7 +604,9 @@ fn recovered_native_relation(
     kind: DurableRelationLayoutKind,
 ) -> Result<NativeRelation, PhysicalExecutionError> {
     match kind {
-        DurableRelationLayoutKind::RowStore => Ok(NativeRelation::row_store(rows.to_vec())),
+        DurableRelationLayoutKind::RowStore => {
+            NativeRelation::row_store_with_arity(rows.to_vec(), relation.columns.len())
+        }
         DurableRelationLayoutKind::ValueColumnar => {
             NativeRelation::columnar(transpose_value_rows(rows, relation.columns.len())?)
         }

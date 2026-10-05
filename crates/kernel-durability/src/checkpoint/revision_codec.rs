@@ -622,7 +622,7 @@ fn decode_rule_value_expr(
     }
 }
 
-fn encode_semantic_rule_expr(
+pub(crate) fn encode_semantic_rule_expr(
     out: &mut impl BinarySink,
     rule: &SemanticRuleExpr,
     depth: usize,
@@ -689,7 +689,7 @@ fn encode_semantic_rule_expr(
     Ok(())
 }
 
-fn decode_semantic_rule_expr(
+pub(crate) fn decode_semantic_rule_expr(
     cursor: &mut impl BinarySource,
     depth: usize,
 ) -> Result<SemanticRuleExpr, DurabilityError> {

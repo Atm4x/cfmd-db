@@ -166,9 +166,9 @@ fn main() {}
 RS
 
 run_fail 'DatabaseDefinition' <<'RS'
-use cfmd::{CfmdEntity, CfmdSchema, EntitySet, Id};
+use cfmd::{CfmdEntity, CfmdSchema, Database, EntitySet, Id};
 
-#[derive(CfmdEntity)]
+#[derive(Debug, Clone, CfmdEntity)]
 #[cfmd(key = "ui.reader-user")]
 struct ReaderUser {
     #[cfmd(id)]
@@ -182,7 +182,7 @@ struct ReaderSchema {
 }
 
 fn main() {
-    let _ = ReaderSchema::database("reader.cfmd").create();
+    let _ = Database::builder("reader.cfmd").create_authoritative::<ReaderSchema>();
 }
 RS
 

@@ -10,6 +10,11 @@ The historical kernel backlog (#1–#22) is closed for the declared support scop
 
 The active project phase is now **productization through a public Rust application facade over the universal runtime boundary**. The ordinary adaptive transaction path now also carries `kernel-change` rebase certificates through durable residual publication for both relation-only and mixed/object commits, with stable client intent separated from the realized history/recovery effect. Pass281 introduced `cfmd-runtime`; Pass337 adds the user-facing `cfmd` crate; the product line now includes object-first typed Rust DX, Plan/Candidate preview, durable history with exact mixed undo/redo, historical worlds through `db.at(revision)`, certified non-head undo/rebase, exact query-result watch, provider-neutral wake delivery, deterministic watch lifecycle/catch-up, and P299 hosted session/permission authority, P300 transport-neutral hosted protocol ingress, P301 exact hosted watch subscriptions, and P302 canonical transport-neutral wire framing/negotiation, P303 hosted server composition, P304 dynamic hosted security lifecycle, and P313 unified database construction/opening with parity-complete single-file storage as the default new-store path. Rust applications depend on `cfmd`; Python/.NET/Studio bind to the stable runtime protocol. None call `kernel-*` crates directly.
 
+
+### PASS507 checkpoint
+
+The current product mainline is PASS507. Normal mutable Rust application ownership is `Context<M>`; authoritative creation is schema-neutral `Database::builder(path).create_authoritative::<S>()`. Cross-schema stale publication uses one kernel-owned `PreparedSchemaAwarePublication` carrying the transported current effect, exact current authorization footprint and HEAD binding. Hosted/dynamic commit requests carry an explicit `SemanticRevision { schema, environment }`; `base_revision` is not treated as schema identity. Pure field-only model deltas share the prepared publication path. Mixed relation+field publication, carrier/lifecycle delta transport and the bounded hosted formation-context witness remain the next R&D line (PASS508); unsupported classes fail closed rather than using old-schema routing or reconstruction fallback.
+
 ## Product direction
 
 The implementation order is Rust-first. Rust applications depend on the public `cfmd` crate; `cfmd-runtime` remains the universal runtime/binding anti-corruption layer below it. The normal Rust path is object-first:
@@ -17,9 +22,10 @@ The implementation order is Rust-first. Rust applications depend on the public `
 ```rust
 use cfmd::prelude::*;
 
-let schema = Schema::builder().object::<Todo>().build()?;
-let db = Database::builder("app.cfmd").schema(schema).create()?;
-let todos = db.snapshot()?.objects::<Todo>()?;
+let db = Database::builder("app.cfmd")
+    .create_authoritative::<AppSchema>()?;
+let ctx = db.context::<AppSchema>()?;
+let todos = ctx.todos.all()?;
 ```
 
 Object-first Rust DX uses stable textual domain keys and symbolic field/reference accessors. The relation/value/query IR remains available explicitly through `cfmd::dynamic` for generated bindings, tooling and genuinely dynamic applications; it is not the default application vocabulary.
@@ -375,35 +381,33 @@ Single-file physical compaction is also first-class. The backend relocates the c
 
 `DatabaseBuilder` is now the canonical product entry point. `Storage::Auto` resolves an existing file as single-file, an existing directory as directory-backed, and a new path as single-file; `Storage::Directory`/`SingleFile` remain explicit overrides. `Database::create/open` are thin sugar over this same builder path rather than separate construction semantics. Publication notification is a builder concern because it belongs to the opened runtime, while authentication/authorization remain hosted-service concerns. `cfmd-host` therefore exposes `DatabaseHostingExt`, allowing `db.host(authenticator, authorizer)` without adding a dependency from `cfmd-runtime` back to hosting.
 
-## Database-owned Rust transaction control (Pass354–359)
+## Scoped Context unit-of-work control (Pass495–502)
 
-A transaction is a passive atomic intent container. The database remains the visible authority for preview and publication:
-
-```rust
-let mut tx = Transaction::new();
-
-db.objects::<Todo>()?.add(&mut tx, first)?;
-db.objects::<Todo>()?.add(&mut tx, second)?;
-
-let preview = db.preview(&tx)?;
-let outcome = db.commit(&tx)?;
-```
-
-The terminal lines therefore state both pieces a reviewer needs: **which database** is being inspected or changed and **which transaction** is being inspected or published. `Transaction` cannot publish itself and `Candidate` cannot publish itself. Low-level tooling that intentionally constructs `Plan` values uses the explicit `db.commit_plan(&plan, transaction_id)` escape hatch.
-
-A normal `Transaction::new()` is a passive atomic intent container, not a child database and not a pinned global snapshot. The first mutation forms an exact internal effect against one read world; later compatible HEAD movement is handled automatically by the kernel change algebra and durable semantic-intent identity. `Transaction::from(db.snapshot()?)` is the explicit strict-snapshot form and never silently moves to a newer world. `Plan` and explicit `TransactionId` plumbing remain advanced tooling/protocol escape hatches, not ordinary CRUD.
-
-Relationship mutation follows the same rule. A materialized relationship names the concrete resource, `&mut tx` names the atomic intent being accumulated, and the target/selection names the payload:
+Normal Rust mutation has one mutable owner: a bounded `Context<M>`. Admission pins one formation world, staged effects advance only the Context Candidate, application-visible reads become exact causal observations, and publication is explicit. Dropping an uncommitted Context discards the unit of work.
 
 ```rust
-owner.assets.attach(&mut tx, asset_id)?;
-owner.assets.move_to(&mut tx, asset_id, &other.assets)?;
-owner.assets
-    .where_(|asset| asset.archived().eq(true))?
-    .detach_all(&mut tx)?;
+let db = Database::builder("app.cfmd")
+    .create_authoritative::<AppSchema>()?;
+let ctx = db.context::<AppSchema>()?;
+
+ctx.add(|schema| &schema.todos, first)?;
+ctx.add(|schema| &schema.todos, second)?;
+
+let preview = ctx.preview()?;
+let outcome = ctx.commit()?;
 ```
 
-`Many<T>`, `OwnedMany<T>` and their filtered selections do not expose `Plan` in ordinary application mutation. Tooling that intentionally needs the exact low-level effect uses explicit `attach_plan`, `move_to_plan`, `detach_all_plan`, and related `*_plan` methods. Owned relation exclusivity, orphan deletion and `preview.derived()` remain Candidate/kernel laws rather than facade-side behavior.
+Reference and relationship writes use the same owner; no second public transaction container is required:
+
+```rust
+ctx.attach(&owner.assets, asset_id)?;
+ctx.move_to(&owner.assets, asset_id, &other.assets)?;
+ctx.undo(history_entry)?;
+```
+
+`Snapshot<M>::edit()` creates the semantically distinct strict snapshot-bound Context: if HEAD advances, publication fails stale rather than transporting silently. Internally the runtime uses one `IntentJournal` implementation for exact effects, retry identity, requirements and Candidate publication; it is hidden implementation/binding plumbing rather than normal application DX. `TransactionId` remains a genuine durable retry/protocol identity.
+
+Authoritative typed creation consumes `S: DatabaseDefinition` only at creation time through `DatabaseBuilder::create_authoritative::<S>()`; the returned object is still schema-neutral `Database`. Dynamic/generated bindings may continue to supply raw `Schema` through the runtime builder without creating a `Database<S>` wrapper.
 
 ### Semantic transaction transport and durable retry identity (Pass355–357)
 
@@ -417,15 +421,6 @@ Pass356 strengthens the P355 runtime bridge: exact causal footprints now retain 
 
 ### Unified mutation/history DX + ordered hostile closure (Pass359–360)
 
-Ordinary entity, relationship and history mutation now use one accumulation shape: the concrete database/resource stays visible, `&mut Transaction` names the atomic intent container, and no `Plan` is required at the application call site. `Many<T>`, `OwnedMany<T>`, filtered relationship selections and history undo all lower to the same existing Plan/Candidate/kernel machinery internally. Undo-of-undo is redo; there is no separate redo engine.
-
-```rust
-let mut tx = Transaction::new();
-db.users.add(&mut tx, user)?;
-owner.assets.attach(&mut tx, asset_id)?;
-db.undo(&mut tx, history_entry)?;
-let preview = db.preview(&tx)?;
-db.commit(&tx)?;
-```
+Pass359–360 established the shared Plan/Candidate/kernel semantics later internalized by scoped `Context<M>`. The old public `&mut Transaction` accumulation shape is superseded by the Context-owned `IntentJournal`; undo-of-undo remains redo and no separate redo engine exists.
 
 The Γ-native `F64Total` object predicate path is hostile-checked at the public exact-query and maintained-watch surfaces for `NaN`, signed zero, and infinities. The ordering remains the pinned total-order semantic module; no Rust partial-order fallback, post-materialization filter, or watch recomputation path is introduced.

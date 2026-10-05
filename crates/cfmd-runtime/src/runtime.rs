@@ -2,15 +2,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 use crate::{
-    CandidatePreview, CommitOutcome, Error, ErrorKind, Plan, PreparedQuery, Query, RelationId,
-    RelationResult, Result, RevisionId, Row, Schema, SchemaView, SemanticRuleExpr, Transaction,
-    TransactionId, TransactionReadiness,
+    CandidatePreview, CommitOutcome, Error, ErrorKind, IntentJournal, IntentReadiness, Plan,
+    PreparedQuery, Query, RelationId, RelationResult, Result, RevisionId, Row, Schema, SchemaView,
+    SemanticRuleExpr, TransactionId,
     query::{query_error, query_error_at},
     schema::{
         PrimitiveEquivalence, PrimitiveOrdering, RelationSemantics, StructuralEquivalence,
@@ -363,6 +363,24 @@ impl DatabaseBuilder {
         }
     }
 
+    /// Creates a database from one complete authoritative typed schema definition.
+    ///
+    /// The schema type is consumed only as creation authority; the returned runtime authority is
+    /// the ordinary schema-neutral [`Database`]. Consumer contexts bind separately afterwards.
+    pub fn create_authoritative<S>(mut self) -> Result<Database>
+    where
+        S: crate::DatabaseDefinition,
+    {
+        if self.schema.is_some() {
+            return Err(Error::new(
+                ErrorKind::InvalidSchema,
+                "authoritative typed creation cannot be combined with an explicit dynamic schema",
+            ));
+        }
+        self.schema = Some(S::definition()?);
+        self.create()
+    }
+
     pub fn create(self) -> Result<Database> {
         let storage = self.resolved_storage_for_create();
         let encryption = self
@@ -501,7 +519,7 @@ fn relation_semantics(value: &RelationSemantics) -> kernel_schema::RelationSeman
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep complete schema compiler case analysis together."
 )]
 pub(crate) fn compile_schema(
     definition: Schema,
@@ -1253,7 +1271,7 @@ fn build_explicit_model_target(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep exact plan target construction case analysis together."
 )]
 pub(crate) fn build_plan_target(plan: &Plan) -> Result<kernel_revision::Revision> {
     let target_revision = plan_target_revision_id(plan)?;
@@ -1393,16 +1411,90 @@ fn collect_requirement_fields(
     }
 }
 
+fn bind_single_requirement_field_to_input(
+    expression: &SemanticRuleExpr,
+    field: crate::FieldId,
+) -> Option<SemanticRuleExpr> {
+    Some(match expression {
+        SemanticRuleExpr::True => SemanticRuleExpr::True,
+        SemanticRuleExpr::False => SemanticRuleExpr::False,
+        SemanticRuleExpr::And(parts) => SemanticRuleExpr::And(
+            parts
+                .iter()
+                .map(|part| bind_single_requirement_field_to_input(part, field))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        SemanticRuleExpr::Or(parts) => SemanticRuleExpr::Or(
+            parts
+                .iter()
+                .map(|part| bind_single_requirement_field_to_input(part, field))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        SemanticRuleExpr::Not(part) => SemanticRuleExpr::Not(Box::new(
+            bind_single_requirement_field_to_input(part, field)?,
+        )),
+        SemanticRuleExpr::I64Range { value, min, max } => SemanticRuleExpr::I64Range {
+            value: match value {
+                crate::RuleValueExpr::Input => crate::RuleValueExpr::Input,
+                crate::RuleValueExpr::Field(candidate) if *candidate == field => {
+                    crate::RuleValueExpr::Input
+                }
+                crate::RuleValueExpr::Field(_) => return None,
+            },
+            min: *min,
+            max: *max,
+        },
+        SemanticRuleExpr::TextLength { value, min, max } => SemanticRuleExpr::TextLength {
+            value: match value {
+                crate::RuleValueExpr::Input => crate::RuleValueExpr::Input,
+                crate::RuleValueExpr::Field(candidate) if *candidate == field => {
+                    crate::RuleValueExpr::Input
+                }
+                crate::RuleValueExpr::Field(_) => return None,
+            },
+            min: *min,
+            max: *max,
+        },
+        SemanticRuleExpr::TextOneOf { value, allowed } => SemanticRuleExpr::TextOneOf {
+            value: match value {
+                crate::RuleValueExpr::Input => crate::RuleValueExpr::Input,
+                crate::RuleValueExpr::Field(candidate) if *candidate == field => {
+                    crate::RuleValueExpr::Input
+                }
+                crate::RuleValueExpr::Field(_) => return None,
+            },
+            allowed: allowed.clone(),
+        },
+        SemanticRuleExpr::TextMatches { value, pattern } => SemanticRuleExpr::TextMatches {
+            value: match value {
+                crate::RuleValueExpr::Input => crate::RuleValueExpr::Input,
+                crate::RuleValueExpr::Field(candidate) if *candidate == field => {
+                    crate::RuleValueExpr::Input
+                }
+                crate::RuleValueExpr::Field(_) => return None,
+            },
+            pattern: pattern.clone(),
+        },
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep semantic requirement validation case analysis together."
+)]
 fn validate_transaction_requirements(
     plan: &Plan,
-    requirements: &[crate::transaction::TransactionRequirement],
-) -> Result<()> {
+    requirements: &[crate::intent_journal::IntentRequirement],
+) -> Result<Option<kernel_plan::RuntimeGuardObservationFootprint>> {
     if requirements.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let target = build_plan_target(plan)?;
     let context = target.semantic_context();
-    for requirement in requirements {
+    let source_revision = plan.source.revision().id();
+    let mut observations = Vec::new();
+    let mut joint_groups = Vec::new();
+    for (requirement_index, requirement) in requirements.iter().enumerate() {
         let relation = kernel_types::SemanticId::new(requirement.relation.raw());
         let expression = semantic_rule_to_kernel(requirement.expression.clone());
         context
@@ -1422,7 +1514,7 @@ fn validate_transaction_requirements(
         if fields.is_empty() {
             plan.authority.require_read_relation(requirement.relation)?;
         } else {
-            for field in fields {
+            for field in &fields {
                 plan.authority.require_read_field(
                     requirement.relation,
                     crate::RelationColumnId::new(field.raw()),
@@ -1462,6 +1554,89 @@ fn validate_transaction_requirements(
                 "transaction requirement identity matched more than one future row",
             ));
         }
+        let owner = kernel_types::EntityId::new(requirement.entity);
+        observations.push((
+            kernel_plan::RuntimeHistoryCoordinate::LifecycleEntity { entity: owner },
+            None,
+            None,
+        ));
+        let identity_field = context
+            .schema
+            .relation_column_id(relation, requirement.identity_column)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidSchema,
+                    "transaction requirement identity column has no semantic id",
+                )
+            })?;
+        observations.push((
+            kernel_plan::RuntimeHistoryCoordinate::ObjectField {
+                relation,
+                owner,
+                field: identity_field,
+            },
+            row.get(requirement.identity_column).cloned(),
+            None,
+        ));
+        observations.push((
+            kernel_plan::RuntimeHistoryCoordinate::Field {
+                field: identity_field,
+                owner,
+            },
+            row.get(requirement.identity_column).cloned(),
+            None,
+        ));
+        let single_field_rule = if fields.len() == 1 {
+            let field = *fields.iter().next().expect("single field");
+            bind_single_requirement_field_to_input(&requirement.expression, field)
+                .map(semantic_rule_to_kernel)
+        } else {
+            None
+        };
+        let mut joint_values = BTreeMap::new();
+        for field in &fields {
+            let field = kernel_types::SemanticId::new(field.raw());
+            let ordinal = context
+                .schema
+                .relation_column_ordinal(relation, field)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidSchema,
+                        "transaction requirement field has no relation-column ordinal",
+                    )
+                })?;
+            let observed = row.get(ordinal).cloned();
+            if fields.len() == 1 {
+                observations.push((
+                    kernel_plan::RuntimeHistoryCoordinate::ObjectField {
+                        relation,
+                        owner,
+                        field,
+                    },
+                    observed.clone(),
+                    single_field_rule.clone(),
+                ));
+                observations.push((
+                    kernel_plan::RuntimeHistoryCoordinate::Field { field, owner },
+                    observed,
+                    single_field_rule.clone(),
+                ));
+            } else if let Some(observed) = observed {
+                joint_values.insert(field, observed);
+            }
+        }
+        if fields.len() > 1 {
+            let group_id = u32::try_from(requirement_index).map_err(|_| {
+                Error::new(ErrorKind::InvalidPlan, "too many transaction requirements")
+            })?;
+            joint_groups.push(kernel_plan::RuntimeJointCausalObservationGroup {
+                group_id,
+                relation,
+                owner,
+                observed_fields: joint_values,
+                predicate: expression.clone(),
+            });
+        }
         let matches =
             kernel_validation::relation_row_rule_matches(&expression, relation, row, context)
                 .map_err(|error| {
@@ -1480,7 +1655,13 @@ fn validate_transaction_requirements(
             ));
         }
     }
-    Ok(())
+    Ok(
+        kernel_plan::RuntimeGuardObservationFootprint::with_exact_values_rules_and_groups(
+            source_revision,
+            observations,
+            joint_groups,
+        ),
+    )
 }
 
 fn plan_object_field_writes(
@@ -1620,6 +1801,30 @@ fn plan_rebasable_effect(plan: &Plan) -> Result<RebasablePlanEffect> {
     })
 }
 
+pub(crate) fn durable_relational_intent_segment(
+    source: &ReadContext,
+    target: &ReadContext,
+) -> Result<Vec<kernel_durability::DurableRelationMutation>> {
+    let mut mutations = revision_relation_deltas(
+        source.kernel_revision(),
+        target.kernel_revision(),
+        source.runtime.semantic_registry(),
+    )?
+    .into_iter()
+    .map(
+        |(relation, delta)| kernel_durability::DurableRelationMutation {
+            relation,
+            inserted: delta.inserted,
+            removed: delta.removed,
+            object_field_writes: Vec::new(),
+            authorization: kernel_durability::DurableRelationAuthorization::default(),
+        },
+    )
+    .collect::<Vec<_>>();
+    mutations.sort_by_key(|mutation| mutation.relation);
+    Ok(mutations)
+}
+
 fn certify_plan_rebase(
     runtime: &kernel_plan::DurableRuntime,
     plan: &Plan,
@@ -1703,7 +1908,7 @@ fn exact_rebased_plan(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep certified relation residual publication protocol together."
 )]
 fn commit_certified_relation_residual(
     runtime: &Arc<kernel_plan::DurableRuntime>,
@@ -1711,6 +1916,8 @@ fn commit_certified_relation_residual(
     effect: &RebasablePlanEffect,
     transaction: TransactionId,
     client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    guard_observation: Option<&kernel_plan::RuntimeGuardObservationFootprint>,
+    relational_observations: &[kernel_plan::RuntimeRelationalCausalObservation],
 ) -> Result<Option<CommitOutcome>> {
     if effect.model_delta != kernel_plan::DurableModelDelta::default()
         || !plan.object_contracts.is_empty()
@@ -1798,11 +2005,13 @@ fn commit_certified_relation_residual(
         mutations: &realized_refs,
     };
     let transaction_id = kernel_types::ClientTransactionId::new(transaction.raw());
-    let outcome = runtime.commit_derived_relation_data_residual_guarded(
+    let outcome = runtime.commit_derived_relation_data_residual_guarded_with_dependencies_and_relational_observations(
         transaction_id,
         &request,
         &client_refs,
         client_guard_digest,
+        guard_observation,
+        relational_observations,
     );
     match outcome {
         Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
@@ -1836,7 +2045,7 @@ fn commit_certified_relation_residual(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep certified field residual publication protocol together."
 )]
 fn commit_certified_field_reapply_residual(
     runtime: &Arc<kernel_plan::DurableRuntime>,
@@ -1844,6 +2053,8 @@ fn commit_certified_field_reapply_residual(
     effect: &RebasablePlanEffect,
     transaction: TransactionId,
     client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    guard_observation: Option<&kernel_plan::RuntimeGuardObservationFootprint>,
+    relational_observations: &[kernel_plan::RuntimeRelationalCausalObservation],
 ) -> Result<Option<CommitOutcome>> {
     if effect.field_writes.is_empty() {
         return Ok(None);
@@ -1916,13 +2127,16 @@ fn commit_certified_field_reapply_residual(
         registry: runtime.semantic_registry(),
     };
     let transaction_id = kernel_types::ClientTransactionId::new(transaction.raw());
-    let outcome = runtime.commit_mixed_revision_residual_guarded(
-        transaction_id,
-        &request,
-        &client_refs,
-        &effect.model_delta,
-        client_guard_digest,
-    );
+    let outcome = runtime
+        .commit_mixed_revision_residual_guarded_with_dependencies_and_relational_observations(
+            transaction_id,
+            &request,
+            &client_refs,
+            &effect.model_delta,
+            client_guard_digest,
+            guard_observation,
+            relational_observations,
+        );
     match outcome {
         Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
             Ok(Some(CommitOutcome::Committed {
@@ -1955,13 +2169,15 @@ fn commit_certified_field_reapply_residual(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep certified mixed residual publication protocol together."
 )]
 fn commit_certified_mixed_residual(
     runtime: &Arc<kernel_plan::DurableRuntime>,
     effect: &RebasablePlanEffect,
     transaction: TransactionId,
     client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    guard_observation: Option<&kernel_plan::RuntimeGuardObservationFootprint>,
+    relational_observations: &[kernel_plan::RuntimeRelationalCausalObservation],
 ) -> Result<Option<CommitOutcome>> {
     if effect.model_delta == kernel_plan::DurableModelDelta::default()
         || !effect.field_writes.is_empty()
@@ -2074,13 +2290,16 @@ fn commit_certified_mixed_residual(
         registry,
     };
     let transaction_id = kernel_types::ClientTransactionId::new(transaction.raw());
-    let outcome = runtime.commit_mixed_revision_residual_guarded(
-        transaction_id,
-        &request,
-        &client_refs,
-        &effect.model_delta,
-        client_guard_digest,
-    );
+    let outcome = runtime
+        .commit_mixed_revision_residual_guarded_with_dependencies_and_relational_observations(
+            transaction_id,
+            &request,
+            &client_refs,
+            &effect.model_delta,
+            client_guard_digest,
+            guard_observation,
+            relational_observations,
+        );
     match outcome {
         Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
             Ok(Some(CommitOutcome::Committed {
@@ -2135,6 +2354,15 @@ impl Database {
         Self::builder(path).schema(definition).create()
     }
 
+    /// Creates an authoritative database from a complete typed schema while returning a
+    /// schema-neutral runtime authority.
+    pub fn create_authoritative<S>(path: impl Into<PathBuf>) -> Result<Self>
+    where
+        S: crate::DatabaseDefinition,
+    {
+        Self::builder(path).create_authoritative::<S>()
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         Self::builder(path).open()
     }
@@ -2156,7 +2384,7 @@ impl Database {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
+        reason = "Keep migration authority verification and publication protocol together."
     )]
     pub(crate) fn migrate_with_authority(
         &self,
@@ -2463,6 +2691,7 @@ impl Database {
             revision: Some(revision),
             factorized: None,
             live_snapshot: Some(snapshot),
+            relational_causal_capture: None,
             authority: RuntimeAuthority::Unrestricted,
         })
     }
@@ -2490,6 +2719,7 @@ impl Database {
                 revision: None,
                 factorized: Some(factorized),
                 live_snapshot: None,
+                relational_causal_capture: None,
                 authority: RuntimeAuthority::Unrestricted,
             });
         }
@@ -2515,6 +2745,7 @@ impl Database {
             revision: Some(revision),
             factorized: None,
             live_snapshot: None,
+            relational_causal_capture: None,
             authority: RuntimeAuthority::Unrestricted,
         })
     }
@@ -2530,7 +2761,7 @@ impl Database {
     /// Adds the exact compensating inverse of one durable history entry to an ordinary
     /// transaction. The database remains the visible authority; the history entry only describes
     /// which committed effect is being inverted.
-    pub fn undo(&self, transaction: &mut Transaction, entry: &crate::HistoryEntry) -> Result<()> {
+    pub fn undo(&self, transaction: &mut IntentJournal, entry: &crate::HistoryEntry) -> Result<()> {
         let plan = entry.undo_plan()?;
         if plan.database_identity != self.identity {
             return Err(Error::new(
@@ -2542,7 +2773,7 @@ impl Database {
     }
 
     /// Adds the current history head's exact inverse to `transaction`.
-    pub fn undo_latest(&self, transaction: &mut Transaction) -> Result<()> {
+    pub fn undo_latest(&self, transaction: &mut IntentJournal) -> Result<()> {
         let history = self.history()?;
         let entry = history.latest().ok_or_else(|| {
             Error::new(ErrorKind::NotFound, "history has no transition at its head")
@@ -2556,43 +2787,74 @@ impl Database {
         self.snapshot()?.objects::<E>()
     }
 
-    pub(crate) fn projected_objects<E: crate::Object>(&self) -> Result<crate::ObjectSet<E>> {
-        self.snapshot()?.projected_objects::<E>()
-    }
-
     /// Reports whether this transaction can be applied to the current head without changing its
     /// exact semantic effect. A newer global revision is not itself a conflict: the kernel proves
     /// transport across intervening exact effects by Γ-canonical write coordinates. Overlap or
     /// opaque history fails closed.
-    pub fn transaction_readiness(&self, transaction: &Transaction) -> Result<TransactionReadiness> {
-        self.require_transaction_owner(transaction)?;
+    pub fn intent_readiness(&self, transaction: &IntentJournal) -> Result<IntentReadiness> {
+        self.require_intent_owner(transaction)?;
         let Some(base_revision) = transaction.origin_revision() else {
-            return Ok(TransactionReadiness::Unbound);
+            return Ok(IntentReadiness::Unbound);
         };
-        let current_revision = self.current_revision()?;
+        let plan = transaction.plan()?;
+        let current_snapshot = self.runtime.snapshot().map_err(|error| {
+            Error::new(
+                ErrorKind::Internal,
+                format!("readiness head snapshot failed: {error:?}"),
+            )
+        })?;
+        let current_revision: RevisionId = current_snapshot.revision().id().into();
+        let crossed_schema_boundary = current_revision != base_revision
+            && current_snapshot.revision().semantic_context().revision()
+                != plan.source.revision().semantic_context().revision();
+        drop(current_snapshot);
         if current_revision == base_revision {
-            return Ok(TransactionReadiness::Ready {
+            authorize_bound_plan(plan)?;
+            return Ok(IntentReadiness::Ready {
                 revision: current_revision,
             });
         }
         if transaction.is_snapshot_bound() {
-            return Ok(TransactionReadiness::SnapshotChanged {
+            authorize_bound_plan(plan)?;
+            return Ok(IntentReadiness::SnapshotChanged {
                 snapshot_revision: base_revision,
                 current_revision,
             });
         }
-        let plan = transaction.plan()?;
         let effect = plan_rebasable_effect(plan)?;
+        if crossed_schema_boundary {
+            let relational_observations = transaction.relational_causal_observations()?;
+            if let Some(prepared) = prepare_schema_aware_relation_plan(
+                &self.runtime,
+                plan,
+                &effect,
+                transaction.client_guard_digest(),
+                &relational_observations,
+            )? {
+                let footprint = publication_authority_footprint_from_schema_aware(&prepared);
+                plan.authority.require_publication_footprint(&footprint)?;
+                return Ok(IntentReadiness::Rebasable {
+                    base_revision,
+                    current_revision: prepared.authorized_head_revision.into(),
+                    intervening_effect_count: prepared.intervening_effect_count,
+                });
+            }
+            return Err(Error::new(
+                ErrorKind::StaleRevision,
+                "schema-aware readiness is unavailable for this effect class",
+            ));
+        }
+        authorize_bound_plan(plan)?;
         match certify_plan_rebase(&self.runtime, plan, &effect)? {
             kernel_plan::RuntimeTransitionRebaseOutcome::Certified(certificate) => {
-                Ok(TransactionReadiness::Rebasable {
+                Ok(IntentReadiness::Rebasable {
                     base_revision,
                     current_revision: certificate.current_revision.into(),
                     intervening_effect_count: certificate.intervening_effect_count,
                 })
             }
             kernel_plan::RuntimeTransitionRebaseOutcome::Conflict(conflict) => {
-                Ok(TransactionReadiness::Conflict {
+                Ok(IntentReadiness::Conflict {
                     base_revision,
                     current_revision: conflict.current_revision.into(),
                     conflicting_effects: conflict.conflicting_effects,
@@ -2608,16 +2870,28 @@ impl Database {
     /// without publishing it. If the transaction's source revision is older, preview uses the same
     /// Γ-coordinate certificate as history rebase and transports only a proven-disjoint exact
     /// effect. Conflicting or opaque intervening effects fail closed.
-    pub fn preview(&self, transaction: &Transaction) -> Result<CandidatePreview> {
-        self.require_transaction_owner(transaction)?;
+    pub fn preview(&self, transaction: &IntentJournal) -> Result<CandidatePreview> {
+        self.require_intent_owner(transaction)?;
         let plan = transaction.plan()?;
         let base_revision = plan.base_revision();
-        let current_revision = self.current_revision()?;
+        let current_snapshot = self.runtime.snapshot().map_err(|error| {
+            Error::new(
+                ErrorKind::Internal,
+                format!("preview head snapshot failed: {error:?}"),
+            )
+        })?;
+        let current_revision: RevisionId = current_snapshot.revision().id().into();
+        let crossed_schema_boundary = current_revision != base_revision
+            && current_snapshot.revision().semantic_context().revision()
+                != plan.source.revision().semantic_context().revision();
+        drop(current_snapshot);
         if current_revision == base_revision {
+            authorize_bound_plan(plan)?;
             validate_transaction_requirements(plan, transaction.requirements())?;
             return Ok(plan.candidate()?.preview());
         }
         if transaction.is_snapshot_bound() {
+            authorize_bound_plan(plan)?;
             return Err(Error::new(
                 ErrorKind::StaleRevision,
                 format!(
@@ -2628,6 +2902,37 @@ impl Database {
             ));
         }
         let effect = plan_rebasable_effect(plan)?;
+        if crossed_schema_boundary {
+            if !transaction.requirements().is_empty() {
+                return Err(Error::new(
+                    ErrorKind::StaleRevision,
+                    "schema-aware preview cannot transport formation-world require predicates",
+                ));
+            }
+            let relational_observations = transaction.relational_causal_observations()?;
+            if let Some(prepared) = prepare_schema_aware_relation_plan(
+                &self.runtime,
+                plan,
+                &effect,
+                transaction.client_guard_digest(),
+                &relational_observations,
+            )? {
+                let footprint = publication_authority_footprint_from_schema_aware(&prepared);
+                plan.authority.require_publication_footprint(&footprint)?;
+                return Ok(current_plan_from_prepared_schema_aware(
+                    &self.runtime,
+                    plan,
+                    &prepared,
+                )?
+                .candidate()?
+                .preview());
+            }
+            return Err(Error::new(
+                ErrorKind::StaleRevision,
+                "schema-aware preview is unavailable for this effect class",
+            ));
+        }
+        authorize_bound_plan(plan)?;
         match certify_plan_rebase(&self.runtime, plan, &effect)? {
             kernel_plan::RuntimeTransitionRebaseOutcome::Certified(_) => {
                 let rebased = exact_rebased_plan(&self.runtime, plan, effect)?;
@@ -2681,6 +2986,7 @@ impl Database {
             revision: Some(revision),
             factorized: None,
             live_snapshot: Some(snapshot),
+            relational_causal_capture: None,
             authority,
         })
     }
@@ -2690,6 +2996,7 @@ impl Database {
         revision: RevisionId,
         authority: RuntimeAuthority,
     ) -> Result<ReadContext> {
+        authority.require(Permission::HistoricalRead)?;
         if let Some(factorized) = self
             .runtime
             .factorized_read_snapshot_at(kernel_types::RevisionId::new(revision.raw()))
@@ -2706,6 +3013,7 @@ impl Database {
                 revision: None,
                 factorized: Some(factorized),
                 live_snapshot: None,
+                relational_causal_capture: None,
                 authority,
             });
         }
@@ -2731,6 +3039,7 @@ impl Database {
             revision: Some(revision),
             factorized: None,
             live_snapshot: None,
+            relational_causal_capture: None,
             authority,
         })
     }
@@ -2748,22 +3057,51 @@ impl Database {
     /// retried idempotently after an uncertain caller-side failure.  If the live head advanced,
     /// publication first asks the kernel to certify transport of the already-formed exact effect;
     /// user code is never re-executed against the newer world.
-    pub fn commit(&self, transaction: &Transaction) -> Result<CommitOutcome> {
-        self.require_transaction_owner(transaction)?;
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep Context commit publication decision tree together."
+    )]
+    pub fn commit(&self, transaction: &IntentJournal) -> Result<CommitOutcome> {
+        self.require_intent_owner(transaction)?;
         let plan = transaction.plan()?;
         let transaction_id = transaction.transaction_id()?;
         let client_guard_digest = transaction.client_guard_digest();
+        let relational_observations = transaction.relational_causal_observations()?;
         // A stale adaptive transaction cannot publish its original Candidate. Avoid building that
         // obsolete future world solely to evaluate requirements: requirements are checked on the
-        // exact rebased Candidate below. We still try the original durable intent first so an
-        // uncertain retry can return `AlreadyCommitted` with its original client identity.
-        if self.current_revision()? == plan.base_revision() {
-            validate_transaction_requirements(plan, transaction.requirements())?;
-        }
-        match commit_bound_plan(&self.runtime, plan, transaction_id, client_guard_digest) {
-            Ok(outcome) => return Ok(outcome),
-            Err(error) if error.kind() == ErrorKind::StaleRevision => {}
-            Err(error) => return Err(error),
+        // exact rebased Candidate below. Same-schema stale intents still probe the original durable
+        // identity first. Once a schema boundary was crossed, however, source-world authorization
+        // must not run before authority-footprint transport; the schema-aware walker performs its
+        // own durable retry probe under the current-world publication authority.
+        let current_snapshot = self.runtime.snapshot().map_err(|error| {
+            Error::new(
+                ErrorKind::Internal,
+                format!("commit head snapshot failed: {error:?}"),
+            )
+        })?;
+        let current_revision: RevisionId = current_snapshot.revision().id().into();
+        let crossed_schema_boundary = current_revision != plan.base_revision()
+            && current_snapshot.revision().semantic_context().revision()
+                != plan.source.revision().semantic_context().revision();
+        drop(current_snapshot);
+        let direct_observation = if current_revision == plan.base_revision() {
+            validate_transaction_requirements(plan, transaction.requirements())?
+        } else {
+            None
+        };
+        if !crossed_schema_boundary {
+            match commit_bound_plan_with_relational_observations(
+                &self.runtime,
+                plan,
+                transaction_id,
+                client_guard_digest,
+                direct_observation.as_ref(),
+                &relational_observations,
+            ) {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if error.kind() == ErrorKind::StaleRevision => {}
+                Err(error) => return Err(error),
+            }
         }
         if transaction.is_snapshot_bound() {
             return Err(Error::new(
@@ -2773,52 +3111,72 @@ impl Database {
         }
 
         let effect = plan_rebasable_effect(plan)?;
+        if let Some(outcome) = commit_schema_aware_relation_plan(
+            &self.runtime,
+            plan,
+            &effect,
+            transaction_id,
+            client_guard_digest,
+            &relational_observations,
+        )? {
+            return Ok(outcome);
+        }
         match certify_plan_rebase(&self.runtime, plan, &effect)? {
             kernel_plan::RuntimeTransitionRebaseOutcome::Certified(_) => {
-                if !transaction.requirements().is_empty() {
+                let rebased_requirement_observation = if transaction.requirements().is_empty() {
+                    None
+                } else {
                     let rebased_for_requirements =
                         exact_rebased_plan(&self.runtime, plan, plan_rebasable_effect(plan)?)?;
                     validate_transaction_requirements(
                         &rebased_for_requirements,
                         transaction.requirements(),
-                    )?;
-                }
-                // Recheck the original semantic intent immediately before publication. Residual
-                // rows are an internal realization of this already-authorized action.
-                authorize_bound_plan(plan)?;
-                if let Some(outcome) = commit_certified_field_reapply_residual(
-                    &self.runtime,
-                    plan,
-                    &effect,
-                    transaction_id,
-                    client_guard_digest,
-                )? {
-                    return Ok(outcome);
-                }
-                if let Some(outcome) = commit_certified_relation_residual(
-                    &self.runtime,
-                    plan,
-                    &effect,
-                    transaction_id,
-                    client_guard_digest,
-                )? {
-                    return Ok(outcome);
-                }
-                if let Some(outcome) = commit_certified_mixed_residual(
-                    &self.runtime,
-                    &effect,
-                    transaction_id,
-                    client_guard_digest,
-                )? {
-                    return Ok(outcome);
-                }
-                let rebased = exact_rebased_plan(&self.runtime, plan, effect)?;
-                commit_bound_plan_authorized(
-                    &self.runtime,
-                    &rebased,
-                    transaction_id,
-                    client_guard_digest,
-                )
+                    )?
+                };
+                let footprint = publication_authority_footprint(plan);
+                plan.authority.with_publication_authority(&footprint, || {
+                    if let Some(outcome) = commit_certified_field_reapply_residual(
+                        &self.runtime,
+                        plan,
+                        &effect,
+                        transaction_id,
+                        client_guard_digest,
+                        rebased_requirement_observation.as_ref(),
+                        &relational_observations,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    if let Some(outcome) = commit_certified_relation_residual(
+                        &self.runtime,
+                        plan,
+                        &effect,
+                        transaction_id,
+                        client_guard_digest,
+                        rebased_requirement_observation.as_ref(),
+                        &relational_observations,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    if let Some(outcome) = commit_certified_mixed_residual(
+                        &self.runtime,
+                        &effect,
+                        transaction_id,
+                        client_guard_digest,
+                        rebased_requirement_observation.as_ref(),
+                        &relational_observations,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    let rebased = exact_rebased_plan(&self.runtime, plan, effect)?;
+                    commit_bound_plan_authorized(
+                        &self.runtime,
+                        &rebased,
+                        transaction_id,
+                        client_guard_digest,
+                        rebased_requirement_observation.as_ref(),
+                        &relational_observations,
+                    )
+                })
             }
             kernel_plan::RuntimeTransitionRebaseOutcome::Conflict(conflict) => Err(Error::new(
                 ErrorKind::TransactionConflict,
@@ -2843,11 +3201,13 @@ impl Database {
     #[doc(hidden)]
     #[allow(
         clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
+        reason = "Keep exact relation intent publication protocol together."
     )]
     pub(crate) fn commit_exact_relation_intent(
         &self,
         formation_revision: RevisionId,
+        formation_schema_revision: u64,
+        formation_environment_revision: u64,
         transaction: TransactionId,
         mutations: &[ExactRelationMutation],
         authority: &RuntimeAuthority,
@@ -2860,9 +3220,12 @@ impl Database {
             ));
         }
 
+        let formation_semantic_revision = kernel_types::SemanticRevision::new(
+            kernel_types::SchemaRevisionId::new(formation_schema_revision),
+            kernel_types::SemanticEnvId::new(formation_environment_revision),
+        );
         let mut normalized = BTreeMap::<RelationId, (Vec<Row>, Vec<Row>)>::new();
         for mutation in mutations {
-            authority.require_write_relation(mutation.relation)?;
             let entry = normalized.entry(mutation.relation).or_default();
             entry.0.extend(mutation.inserted.iter().cloned());
             entry.1.extend(mutation.removed.iter().cloned());
@@ -2876,6 +3239,142 @@ impl Database {
             })
             .collect::<Vec<_>>();
 
+        let current_snapshot = self.runtime.snapshot().map_err(|error| {
+            Error::new(
+                ErrorKind::Internal,
+                format!("remote intent semantic snapshot failed: {error:?}"),
+            )
+        })?;
+        let current_revision: RevisionId = current_snapshot.revision().id().into();
+        let current_semantic_revision = current_snapshot.revision().semantic_context().revision();
+        drop(current_snapshot);
+
+        if current_semantic_revision != formation_semantic_revision {
+            let formation = self
+                .runtime
+                .revision_at(kernel_types::RevisionId::new(formation_revision.raw()))
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::StaleRevision,
+                        format!(
+                            "explicit formation world {} cannot be verified: {error:?}",
+                            formation_revision.raw(),
+                        ),
+                    )
+                })?;
+            if formation.semantic_context().revision() != formation_semantic_revision {
+                return Err(Error::new(
+                    ErrorKind::InvalidPlan,
+                    "hosted formation semantic identity does not match the exact formation revision",
+                ));
+            }
+            let registry = self.runtime.semantic_registry();
+            let mut deltas = Vec::with_capacity(normalized.len());
+            for mutation in &normalized {
+                let relation: kernel_types::SemanticId = mutation.relation.into();
+                let result_type = kernel_query::RelExpr::Scan(relation)
+                    .typecheck(formation.semantic_context(), registry)
+                    .map_err(|error| query_error(&error))?;
+                let delta = kernel_query::RelationDelta {
+                    inserted: mutation
+                        .inserted
+                        .iter()
+                        .cloned()
+                        .map(|row| row.into_iter().map(Into::into).collect())
+                        .collect(),
+                    removed: mutation
+                        .removed
+                        .iter()
+                        .cloned()
+                        .map(|row| row.into_iter().map(Into::into).collect())
+                        .collect(),
+                    result_type,
+                };
+                deltas.push((relation, delta));
+            }
+            let client_refs = deltas
+                .iter()
+                .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+                    relation: *relation,
+                    delta,
+                    object_field_writes: &[],
+                    authorization: kernel_durability::DurableRelationAuthorization::default(),
+                })
+                .collect::<Vec<_>>();
+            let relation_writes = deltas
+                .iter()
+                .map(|(relation, _)| *relation)
+                .collect::<BTreeSet<_>>();
+            let prepared = self
+                .runtime
+                .prepare_schema_aware_publication(
+                    kernel_types::RevisionId::new(formation_revision.raw()),
+                    formation_semantic_revision,
+                    &client_refs,
+                    &relation_writes,
+                    &BTreeSet::new(),
+                    None,
+                )
+                .map_err(|error| match error {
+                    kernel_plan::DurableRuntimeCommitError::TransactionIdConflict { .. }
+                    | kernel_plan::DurableRuntimeCommitError::SchemaAwareTransitionConflict(_) => {
+                        Error::new(
+                            ErrorKind::TransactionConflict,
+                            format!("hosted schema-aware preparation rejected: {error:?}"),
+                        )
+                    }
+                    kernel_plan::DurableRuntimeCommitError::SchemaAwareTransitionUnavailable {
+                        ..
+                    } => Error::new(
+                        ErrorKind::StaleRevision,
+                        "hosted schema-aware formation world is no longer available",
+                    ),
+                    other => Error::new(
+                        ErrorKind::InvalidPlan,
+                        format!("hosted schema-aware preparation rejected: {other:?}"),
+                    ),
+                })?;
+            let footprint = publication_authority_footprint_from_schema_aware(&prepared);
+            return authority.with_publication_authority(&footprint, || {
+                match self.runtime.commit_prepared_schema_aware_publication(
+                    kernel_types::ClientTransactionId::new(transaction.raw()),
+                    &prepared,
+                ) {
+                    Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
+                        Ok(CommitOutcome::Committed {
+                            revision: receipt.durable.target_revision().into(),
+                        })
+                    }
+                    Ok(kernel_plan::DurableRuntimeCommitOutcome::AlreadyCommitted {
+                        target_revision,
+                    }) => Ok(CommitOutcome::AlreadyCommitted {
+                        revision: target_revision.into(),
+                    }),
+                    Err(kernel_plan::DurableRuntimeCommitError::TransactionIdConflict {
+                        ..
+                    }) => Err(Error::new(
+                        ErrorKind::TransactionConflict,
+                        "transaction id conflicts with a different committed intent",
+                    )),
+                    Err(
+                        kernel_plan::DurableRuntimeCommitError::SchemaAwareTransitionUnavailable {
+                            ..
+                        },
+                    ) => Err(Error::new(
+                        ErrorKind::StaleRevision,
+                        "authorized hosted schema-aware publication head is no longer current",
+                    )),
+                    Err(error) => Err(Error::new(
+                        ErrorKind::InvariantViolation,
+                        format!("hosted schema-aware publication rejected: {error:?}"),
+                    )),
+                }
+            });
+        }
+
+        for mutation in &normalized {
+            authority.require_write_relation(mutation.relation)?;
+        }
         let durable_mutations = normalized
             .iter()
             .map(|mutation| kernel_durability::DurableRelationMutation {
@@ -2896,7 +3395,6 @@ impl Database {
                 authorization: kernel_durability::DurableRelationAuthorization::default(),
             })
             .collect::<Vec<_>>();
-        let current_revision = self.current_revision()?;
         let requested_target = current_revision
             .raw()
             .checked_add(1)
@@ -2943,6 +3441,12 @@ impl Database {
             ));
         }
         let semantic_context = current_snapshot.revision().semantic_context();
+        if semantic_context.revision() != formation_semantic_revision {
+            return Err(Error::new(
+                ErrorKind::StaleRevision,
+                "formation semantic identity no longer matches current semantic world",
+            ));
+        }
         let mut deltas = Vec::with_capacity(normalized.len());
         for mutation in &normalized {
             let relation: kernel_types::SemanticId = mutation.relation.into();
@@ -3135,10 +3639,10 @@ impl Database {
                 "plan belongs to a different open database instance",
             ));
         }
-        commit_bound_plan(&self.runtime, plan, transaction, None)
+        commit_bound_plan(&self.runtime, plan, transaction, None, None)
     }
 
-    fn require_transaction_owner(&self, transaction: &Transaction) -> Result<()> {
+    fn require_intent_owner(&self, transaction: &IntentJournal) -> Result<()> {
         let Some(identity) = transaction.database_identity() else {
             return Err(Error::new(
                 ErrorKind::InvalidPlan,
@@ -3155,12 +3659,16 @@ impl Database {
     }
 }
 
-fn authorize_bound_plan(plan: &Plan) -> Result<()> {
-    plan.authority.require_write_entry()?;
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep exact publication authority footprint derivation together."
+)]
+fn publication_authority_footprint(plan: &Plan) -> crate::security::PublicationAuthorityFootprint {
+    let mut footprint = crate::security::PublicationAuthorityFootprint::default();
     for (relation, coverage) in &plan.history_authorization {
         let authorization = coverage.authorization;
         if authorization.relation_write {
-            plan.authority.require_write_relation(*relation)?;
+            footprint.relation_writes.insert(*relation);
         }
         for (required, action) in [
             (
@@ -3185,12 +3693,16 @@ fn authorize_bound_plan(plan: &Plan) -> Result<()> {
             ),
         ] {
             if required {
-                plan.authority.require_mutation_action(*relation, action)?;
+                footprint.actions.insert((*relation, action));
             }
         }
-        for field in &coverage.fields {
-            plan.authority.require_write_field(*relation, *field)?;
-        }
+        footprint.field_writes.extend(
+            coverage
+                .fields
+                .iter()
+                .copied()
+                .map(|field| (*relation, field)),
+        );
     }
     for (relation, mutation) in &plan.mutations {
         for index in 0..mutation.inserted.len() {
@@ -3206,8 +3718,12 @@ fn authorize_bound_plan(plan: &Plan) -> Result<()> {
                 crate::plan::MutationDirection::Insert,
                 index,
             )) {
-                Some(action) => plan.authority.require_mutation_action(*relation, *action)?,
-                None => plan.authority.require_write_relation(*relation)?,
+                Some(action) => {
+                    footprint.actions.insert((*relation, *action));
+                }
+                None => {
+                    footprint.relation_writes.insert(*relation);
+                }
             }
         }
         for index in 0..mutation.removed.len() {
@@ -3223,19 +3739,23 @@ fn authorize_bound_plan(plan: &Plan) -> Result<()> {
                 crate::plan::MutationDirection::Remove,
                 index,
             )) {
-                Some(action) => plan.authority.require_mutation_action(*relation, *action)?,
-                None => plan.authority.require_write_relation(*relation)?,
+                Some(action) => {
+                    footprint.actions.insert((*relation, *action));
+                }
+                None => {
+                    footprint.relation_writes.insert(*relation);
+                }
             }
         }
     }
     for ((relation, _), patch) in &plan.object_field_patches {
-        for (_, field) in patch.fields.values() {
-            plan.authority
-                .require_write_field(*relation, crate::RelationColumnId::new(field.raw()))?;
-        }
+        footprint.field_writes.extend(
+            patch
+                .fields
+                .values()
+                .map(|(_, field)| (*relation, crate::RelationColumnId::new(field.raw()))),
+        );
     }
-    // Detaching an exclusively-owned edge under DeleteIfUnowned can delete the target object.
-    // That induced lifecycle effect must never be a route around explicit object-delete authority.
     for contract in plan.owned_relations.values() {
         if contract.orphan_policy != crate::plan::OrphanPolicy::DeleteIfUnowned {
             continue;
@@ -3248,13 +3768,251 @@ fn authorize_bound_plan(plan: &Plan) -> Result<()> {
                     && *action == crate::plan::MutationAction::RelationshipDetach
             });
         if can_orphan {
-            plan.authority.require_mutation_action(
+            footprint.actions.insert((
                 contract.target_relation,
                 crate::plan::MutationAction::ObjectDelete,
-            )?;
+            ));
         }
     }
-    Ok(())
+    footprint
+}
+
+fn publication_authority_footprint_from_schema_aware(
+    transported: &kernel_plan::PreparedSchemaAwarePublication,
+) -> crate::security::PublicationAuthorityFootprint {
+    let mut footprint = crate::security::PublicationAuthorityFootprint::default();
+    footprint.relation_writes.extend(
+        transported
+            .relation_writes
+            .iter()
+            .copied()
+            .map(|relation| RelationId::new(relation.raw())),
+    );
+    footprint
+        .field_writes
+        .extend(transported.field_writes.iter().map(|(relation, field)| {
+            (
+                RelationId::new(relation.raw()),
+                crate::RelationColumnId::new(field.raw()),
+            )
+        }));
+    for (relation, authorization) in &transported.relation_authorizations {
+        let relation = RelationId::new(relation.raw());
+        for (required, action) in [
+            (
+                authorization.object_create,
+                crate::plan::MutationAction::ObjectCreate,
+            ),
+            (
+                authorization.object_delete,
+                crate::plan::MutationAction::ObjectDelete,
+            ),
+            (
+                authorization.relationship_attach,
+                crate::plan::MutationAction::RelationshipAttach,
+            ),
+            (
+                authorization.relationship_detach,
+                crate::plan::MutationAction::RelationshipDetach,
+            ),
+            (
+                authorization.relationship_move,
+                crate::plan::MutationAction::RelationshipMove,
+            ),
+        ] {
+            if required {
+                footprint.actions.insert((relation, action));
+            }
+        }
+    }
+    footprint
+}
+
+fn prepare_schema_aware_relation_plan(
+    runtime: &Arc<kernel_plan::DurableRuntime>,
+    plan: &Plan,
+    effect: &RebasablePlanEffect,
+    client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    relational_observations: &[kernel_plan::RuntimeRelationalCausalObservation],
+) -> Result<Option<kernel_plan::PreparedSchemaAwarePublication>> {
+    if effect.model_delta != kernel_plan::DurableModelDelta::default()
+        || !effect.field_writes.is_empty()
+        || !relational_observations.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let source_semantic_revision = plan.source.revision().semantic_context().revision();
+    let current_snapshot = runtime.snapshot().map_err(|error| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("schema-aware preparation snapshot failed: {error:?}"),
+        )
+    })?;
+    if current_snapshot.revision().semantic_context().revision() == source_semantic_revision {
+        return Ok(None);
+    }
+    drop(current_snapshot);
+
+    let source_footprint = publication_authority_footprint(plan);
+    let relation_writes = source_footprint
+        .relation_writes
+        .iter()
+        .map(|relation| kernel_types::SemanticId::new(relation.raw()))
+        .collect::<BTreeSet<_>>();
+    let field_writes = source_footprint
+        .field_writes
+        .iter()
+        .map(|(relation, field)| {
+            (
+                kernel_types::SemanticId::new(relation.raw()),
+                kernel_types::SemanticId::new(field.raw()),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mutations = effect
+        .deltas
+        .iter()
+        .map(|(relation, delta)| kernel_plan::RevisionRelationMutation {
+            relation: *relation,
+            delta,
+            object_field_writes: &[],
+            authorization: effect
+                .authorizations
+                .get(relation)
+                .copied()
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    runtime
+        .prepare_schema_aware_publication(
+            plan.source.revision().id(),
+            source_semantic_revision,
+            &mutations,
+            &relation_writes,
+            &field_writes,
+            client_guard_digest,
+        )
+        .map(Some)
+        .map_err(|error| match error {
+            kernel_plan::DurableRuntimeCommitError::SchemaAwareTransitionConflict(conflict) => Error::new(
+                ErrorKind::TransactionConflict,
+                format!(
+                    "schema-aware intent conflicts at revision {} across {} semantic coordinates",
+                    conflict.current_revision.raw(),
+                    conflict.coordinates.len(),
+                ),
+            ),
+            other => Error::new(
+                ErrorKind::StaleRevision,
+                format!("schema-aware publication preparation unavailable: {other:?}"),
+            ),
+        })
+}
+
+fn current_plan_from_prepared_schema_aware(
+    runtime: &Arc<kernel_plan::DurableRuntime>,
+    source_plan: &Plan,
+    prepared: &kernel_plan::PreparedSchemaAwarePublication,
+) -> Result<Plan> {
+    let snapshot = runtime.snapshot().map_err(|error| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("prepared schema-aware snapshot failed: {error:?}"),
+        )
+    })?;
+    if snapshot.revision().id() != prepared.authorized_head_revision {
+        return Err(Error::new(
+            ErrorKind::StaleRevision,
+            "prepared schema-aware publication head is no longer current",
+        ));
+    }
+    let mut current = Plan::new(
+        runtime,
+        snapshot,
+        source_plan.database_identity,
+        source_plan.authority.clone(),
+    );
+    for (relation, delta, _) in prepared.current_relation_deltas() {
+        let relation = RelationId::new(relation.raw());
+        for row in &delta.removed {
+            current.remove(relation, row.iter().cloned().map(Into::into).collect());
+        }
+        for row in &delta.inserted {
+            current.insert(relation, row.iter().cloned().map(Into::into).collect());
+        }
+    }
+    Ok(current)
+}
+
+fn commit_schema_aware_relation_plan(
+    runtime: &Arc<kernel_plan::DurableRuntime>,
+    plan: &Plan,
+    effect: &RebasablePlanEffect,
+    transaction: TransactionId,
+    client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    relational_observations: &[kernel_plan::RuntimeRelationalCausalObservation],
+) -> Result<Option<CommitOutcome>> {
+    let Some(prepared) = prepare_schema_aware_relation_plan(
+        runtime,
+        plan,
+        effect,
+        client_guard_digest,
+        relational_observations,
+    )?
+    else {
+        return Ok(None);
+    };
+    let current_footprint = publication_authority_footprint_from_schema_aware(&prepared);
+    plan.authority.with_publication_authority(&current_footprint, || {
+        match runtime.commit_prepared_schema_aware_publication(
+            kernel_types::ClientTransactionId::new(transaction.raw()),
+            &prepared,
+        ) {
+            Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
+                Ok(CommitOutcome::Committed {
+                    revision: receipt.durable.target_revision().into(),
+                })
+            }
+            Ok(kernel_plan::DurableRuntimeCommitOutcome::AlreadyCommitted { target_revision }) => {
+                Ok(CommitOutcome::AlreadyCommitted {
+                    revision: target_revision.into(),
+                })
+            }
+            Err(kernel_plan::DurableRuntimeCommitError::TransactionIdConflict { .. }) => Err(
+                Error::new(
+                    ErrorKind::TransactionConflict,
+                    "transaction id conflicts with a different committed intent",
+                ),
+            ),
+            Err(kernel_plan::DurableRuntimeCommitError::SchemaAwareTransitionConflict(conflict)) => {
+                Err(Error::new(
+                    ErrorKind::TransactionConflict,
+                    format!(
+                        "schema-aware intent conflicts at revision {} across {} semantic coordinates",
+                        conflict.current_revision.raw(),
+                        conflict.coordinates.len(),
+                    ),
+                ))
+            }
+            Err(kernel_plan::DurableRuntimeCommitError::SchemaAwareTransitionUnavailable { .. }) => {
+                Err(Error::new(
+                    ErrorKind::StaleRevision,
+                    "authorized schema-aware publication head is no longer current",
+                ))
+            }
+            Err(error) => Err(Error::new(
+                ErrorKind::InvariantViolation,
+                format!("schema-aware publication rejected: {error:?}"),
+            )),
+        }
+    })
+    .map(Some)
+}
+
+fn authorize_bound_plan(plan: &Plan) -> Result<()> {
+    plan.authority
+        .require_publication_footprint(&publication_authority_footprint(plan))
 }
 
 pub(crate) fn commit_bound_plan(
@@ -3262,20 +4020,50 @@ pub(crate) fn commit_bound_plan(
     plan: &Plan,
     transaction: TransactionId,
     client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    guard_observation: Option<&kernel_plan::RuntimeGuardObservationFootprint>,
 ) -> Result<CommitOutcome> {
-    authorize_bound_plan(plan)?;
-    commit_bound_plan_authorized(runtime, plan, transaction, client_guard_digest)
+    commit_bound_plan_with_relational_observations(
+        runtime,
+        plan,
+        transaction,
+        client_guard_digest,
+        guard_observation,
+        &[],
+    )
+}
+
+fn commit_bound_plan_with_relational_observations(
+    runtime: &kernel_plan::DurableRuntime,
+    plan: &Plan,
+    transaction: TransactionId,
+    client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    guard_observation: Option<&kernel_plan::RuntimeGuardObservationFootprint>,
+    relational_observations: &[kernel_plan::RuntimeRelationalCausalObservation],
+) -> Result<CommitOutcome> {
+    let footprint = publication_authority_footprint(plan);
+    plan.authority.with_publication_authority(&footprint, || {
+        commit_bound_plan_authorized(
+            runtime,
+            plan,
+            transaction,
+            client_guard_digest,
+            guard_observation,
+            relational_observations,
+        )
+    })
 }
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Keep the complete operator or protocol case analysis together."
+    reason = "Keep bound-plan authorization and publication protocol together."
 )]
 fn commit_bound_plan_authorized(
     runtime: &kernel_plan::DurableRuntime,
     plan: &Plan,
     transaction: TransactionId,
     client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
+    guard_observation: Option<&kernel_plan::RuntimeGuardObservationFootprint>,
+    relational_observations: &[kernel_plan::RuntimeRelationalCausalObservation],
 ) -> Result<CommitOutcome> {
     if plan.is_empty() {
         return Err(Error::new(
@@ -3311,7 +4099,13 @@ fn commit_bound_plan_authorized(
             model_complement: &model_complement,
             registry: runtime.semantic_registry(),
         };
-        runtime.commit_mixed_revision_guarded(transaction_id, &request, client_guard_digest)
+        runtime.commit_mixed_revision_guarded_with_dependencies_and_relational_observations(
+            transaction_id,
+            &request,
+            client_guard_digest,
+            guard_observation,
+            relational_observations,
+        )
     } else if plan.object_contracts.is_empty() {
         let deltas = plan_relation_deltas(plan, runtime.semantic_registry())?;
         let mutation_refs = deltas
@@ -3328,7 +4122,13 @@ fn commit_bound_plan_authorized(
             target_revision,
             mutations: &mutation_refs,
         };
-        runtime.commit_derived_relation_data_guarded(transaction_id, &request, client_guard_digest)
+        runtime.commit_derived_relation_data_guarded_with_dependencies_and_relational_observations(
+            transaction_id,
+            &request,
+            client_guard_digest,
+            guard_observation,
+            relational_observations,
+        )
     } else {
         let target = build_object_target(plan, target_revision, runtime.semantic_registry())?;
         let deltas =
@@ -3354,7 +4154,13 @@ fn commit_bound_plan_authorized(
             model_complement: &model_complement,
             registry: runtime.semantic_registry(),
         };
-        runtime.commit_mixed_revision_guarded(transaction_id, &request, client_guard_digest)
+        runtime.commit_mixed_revision_guarded_with_dependencies_and_relational_observations(
+            transaction_id,
+            &request,
+            client_guard_digest,
+            guard_observation,
+            relational_observations,
+        )
     };
     match outcome {
         Ok(kernel_plan::DurableRuntimeCommitOutcome::Committed(receipt)) => {
@@ -3393,10 +4199,64 @@ pub struct ReadContext {
     revision: Option<kernel_revision::Revision>,
     factorized: Option<kernel_durability::DurableFactorizedReadSnapshot>,
     live_snapshot: Option<kernel_plan::RuntimeRevisionSnapshot>,
+    relational_causal_capture: Option<Arc<Mutex<RelationalCausalCapture>>>,
     pub(crate) authority: RuntimeAuthority,
 }
 
+#[derive(Debug, Default)]
+struct RelationalCausalCapture {
+    next_observation_id: u32,
+    observations: BTreeMap<
+        (kernel_types::RevisionId, Vec<u8>),
+        kernel_plan::RuntimeRelationalCausalObservation,
+    >,
+}
+
+impl RelationalCausalCapture {
+    fn record(&mut self, capsule: kernel_query::RelCausalCapsule) -> Result<()> {
+        let revision = capsule.revision();
+        let identity =
+            kernel_durability::canonical_rel_expr_identity(capsule.query()).map_err(|error| {
+                Error::new(
+                    ErrorKind::Internal,
+                    format!("relational causal observation identity failed: {error:?}"),
+                )
+            })?;
+        let key = (revision, identity);
+        if self.observations.contains_key(&key) {
+            return Ok(());
+        }
+        let observation_id = self.next_observation_id;
+        self.next_observation_id = self.next_observation_id.checked_add(1).ok_or_else(|| {
+            Error::new(
+                ErrorKind::ResourceLimit,
+                "transaction relational observation id space exhausted",
+            )
+        })?;
+        self.observations.insert(
+            key,
+            kernel_plan::RuntimeRelationalCausalObservation {
+                observation_id,
+                observed_revision: revision,
+                intent_prefix: kernel_durability::DurableIntentPrefix::empty(),
+                capsule,
+            },
+        );
+        Ok(())
+    }
+
+    fn values(&self) -> Vec<kernel_plan::RuntimeRelationalCausalObservation> {
+        let mut observations = self.observations.values().cloned().collect::<Vec<_>>();
+        observations.sort_by_key(|observation| observation.observation_id);
+        observations
+    }
+}
+
 impl ReadContext {
+    pub(crate) fn runtime_authority(&self) -> RuntimeAuthority {
+        self.authority.clone()
+    }
+
     pub(crate) const fn database_identity(&self) -> u64 {
         self.database_identity
     }
@@ -3414,7 +4274,72 @@ impl ReadContext {
     }
 
     pub(crate) fn live_snapshot_ref(&self) -> Option<&kernel_plan::RuntimeRevisionSnapshot> {
-        self.live_snapshot.as_ref()
+        self.live_snapshot.as_ref().filter(|snapshot| {
+            self.revision
+                .as_ref()
+                .is_some_and(|revision| revision.id() == snapshot.revision().id())
+        })
+    }
+
+    pub(crate) fn speculative_from_revision(&self, revision: kernel_revision::Revision) -> Self {
+        let mut context = self.clone();
+        context.revision = Some(revision);
+        context.factorized = None;
+        // Keep `live_snapshot` as the exact formation Plan source, but `live_snapshot_ref()`
+        // deliberately hides it from query scan-seed execution once the read world is speculative.
+        context
+    }
+
+    pub(crate) fn with_fresh_intent_relational_causal_capture(&self) -> Self {
+        self.with_intent_relational_causal_capture()
+    }
+
+    pub(crate) fn with_intent_relational_causal_capture(&self) -> Self {
+        let mut context = self.clone();
+        context.relational_causal_capture =
+            Some(Arc::new(Mutex::new(RelationalCausalCapture::default())));
+        context
+    }
+
+    pub(crate) fn without_intent_relational_causal_capture(&self) -> Self {
+        let mut context = self.clone();
+        context.relational_causal_capture = None;
+        context
+    }
+
+    pub(crate) fn relational_causal_observations(
+        &self,
+    ) -> Result<Vec<kernel_plan::RuntimeRelationalCausalObservation>> {
+        let Some(capture) = &self.relational_causal_capture else {
+            return Ok(Vec::new());
+        };
+        capture
+            .lock()
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Internal,
+                    "transaction relational observation capture poisoned",
+                )
+            })
+            .map(|capture| capture.values())
+    }
+
+    fn record_relational_causal_observation(
+        &self,
+        capsule: kernel_query::RelCausalCapsule,
+    ) -> Result<()> {
+        let Some(capture) = &self.relational_causal_capture else {
+            return Ok(());
+        };
+        capture
+            .lock()
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Internal,
+                    "transaction relational observation capture poisoned",
+                )
+            })?
+            .record(capsule)
     }
 
     pub(crate) fn kernel_revision(&self) -> &kernel_revision::Revision {
@@ -3551,6 +4476,10 @@ impl PreparedQuery {
         self.execute_unchecked(context)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep query execution operator lowering together."
+    )]
     fn execute_unchecked(&self, context: &ReadContext) -> Result<RelationResult> {
         let registry = context.runtime.semantic_registry();
         if let Some(factorized) = context.factorized.as_ref() {
@@ -3612,6 +4541,59 @@ impl PreparedQuery {
         } else {
             None
         };
+        if context.relational_causal_capture.is_some() {
+            let mut state = match seeded.as_ref() {
+                Some(seeds) => kernel_query::MaterializedRelPlanState::build_with_scan_seeds(
+                    self.inner.expression(),
+                    &context.kernel_revision().state().model,
+                    context.semantic_context(),
+                    registry,
+                    seeds,
+                ),
+                None => kernel_query::MaterializedRelPlanState::build(
+                    self.inner.expression(),
+                    &context.kernel_revision().state().model,
+                    context.semantic_context(),
+                    registry,
+                ),
+            }
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Query,
+                    format!("transaction query has no exact relational causal program: {error:?}"),
+                )
+                .with_query(self.node, self.source)
+            })?;
+            state
+                .bind_revision(context.kernel_revision().id())
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Internal,
+                        format!(
+                            "transaction relational observation revision binding failed: {error:?}"
+                        ),
+                    )
+                    .with_query(self.node, self.source)
+                })?;
+            let value = state
+                .output_value(context.semantic_context(), registry)
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Query,
+                        format!("transaction relational observation output failed: {error:?}"),
+                    )
+                    .with_query(self.node, self.source)
+                })?;
+            let capsule = kernel_query::RelCausalCapsule::capture(&state).map_err(|error| {
+                Error::new(
+                    ErrorKind::Internal,
+                    format!("transaction relational causal capsule capture failed: {error:?}"),
+                )
+                .with_query(self.node, self.source)
+            })?;
+            context.record_relational_causal_observation(capsule)?;
+            return Ok(value.into());
+        }
         match seeded {
             Some(seeds) => self.inner.evaluate_seeded(
                 &context.kernel_revision().state().model,

@@ -156,9 +156,10 @@ impl InstalledRelation {
         positions: &[usize],
     ) -> Result<NativeRelation, PhysicalExecutionError> {
         match &self.data {
-            NativeRelation::RowStore(rows) => Ok(NativeRelation::RowStore(
-                select_persistent_positions(rows, positions)?,
-            )),
+            NativeRelation::RowStore { rows, column_count } => Ok(NativeRelation::RowStore {
+                rows: select_persistent_positions(rows, positions)?,
+                column_count: *column_count,
+            }),
             NativeRelation::Columnar { columns, .. } => Ok(NativeRelation::Columnar {
                 columns: columns
                     .iter()

@@ -5,9 +5,16 @@ use std::{
 };
 
 use crate::{
-    CandidatePreview, Database, Error, ErrorKind, Plan, ReadContext, RelationColumnId, RelationId,
-    Result, RevisionId, Transaction, TransactionId,
+    CandidatePreview, Database, Error, ErrorKind, IntentJournal, Plan, ReadContext,
+    RelationColumnId, RelationId, Result, RevisionId, TransactionId,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct PublicationAuthorityFootprint {
+    pub(crate) relation_writes: BTreeSet<RelationId>,
+    pub(crate) field_writes: BTreeSet<(RelationId, RelationColumnId)>,
+    pub(crate) actions: BTreeSet<(RelationId, crate::plan::MutationAction)>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PrincipalId(u128);
@@ -191,6 +198,41 @@ impl PermissionSet {
             crate::plan::MutationAction::RelationshipMove => Permission::MoveRelationship(relation),
         };
         self.contains(permission)
+    }
+
+    fn require_publication_footprint(
+        &self,
+        principal: PrincipalId,
+        footprint: &PublicationAuthorityFootprint,
+    ) -> Result<()> {
+        if !self.has_write_entry() {
+            return Err(permission_denied(principal, "write authority"));
+        }
+        for relation in &footprint.relation_writes {
+            if !self.can_write_relation(*relation) {
+                return Err(permission_denied(
+                    principal,
+                    format!("write relation {}", relation.raw()),
+                ));
+            }
+        }
+        for (relation, field) in &footprint.field_writes {
+            if !self.can_write_field(*relation, *field) {
+                return Err(permission_denied(
+                    principal,
+                    format!("write field {}:{}", relation.raw(), field.raw()),
+                ));
+            }
+        }
+        for (relation, action) in &footprint.actions {
+            if !self.can_mutate_action(*relation, *action) {
+                return Err(permission_denied(
+                    principal,
+                    format!("{action:?} on relation {}", relation.raw()),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -443,38 +485,32 @@ impl Session {
         }
     }
 
-    fn require_write_field(&self, relation: RelationId, field: RelationColumnId) -> Result<()> {
-        let state = self.state.read().map_err(|_| session_state_poisoned())?;
-        if state.revoked {
-            return Err(session_revoked(self.principal));
-        }
-        if state.permissions.can_write_field(relation, field) {
-            Ok(())
-        } else {
-            Err(permission_denied(
-                self.principal,
-                format!("write field {}:{}", relation.raw(), field.raw()),
-            ))
-        }
-    }
-
-    fn require_mutation_action(
+    fn require_publication_footprint(
         &self,
-        relation: RelationId,
-        action: crate::plan::MutationAction,
+        footprint: &PublicationAuthorityFootprint,
     ) -> Result<()> {
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
         }
-        if state.permissions.can_mutate_action(relation, action) {
-            Ok(())
-        } else {
-            Err(permission_denied(
-                self.principal,
-                format!("{action:?} on relation {}", relation.raw()),
-            ))
+        state
+            .permissions
+            .require_publication_footprint(self.principal, footprint)
+    }
+
+    fn with_publication_authority<T>(
+        &self,
+        footprint: &PublicationAuthorityFootprint,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let state = self.state.read().map_err(|_| session_state_poisoned())?;
+        if state.revoked {
+            return Err(session_revoked(self.principal));
         }
+        state
+            .permissions
+            .require_publication_footprint(self.principal, footprint)?;
+        operation()
     }
 }
 
@@ -552,25 +588,24 @@ impl RuntimeAuthority {
         }
     }
 
-    pub(crate) fn require_write_field(
+    pub(crate) fn require_publication_footprint(
         &self,
-        relation: RelationId,
-        field: RelationColumnId,
+        footprint: &PublicationAuthorityFootprint,
     ) -> Result<()> {
         match self {
             Self::Unrestricted => Ok(()),
-            Self::Session(session) => session.require_write_field(relation, field),
+            Self::Session(session) => session.require_publication_footprint(footprint),
         }
     }
 
-    pub(crate) fn require_mutation_action(
+    pub(crate) fn with_publication_authority<T>(
         &self,
-        relation: RelationId,
-        action: crate::plan::MutationAction,
-    ) -> Result<()> {
+        footprint: &PublicationAuthorityFootprint,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         match self {
-            Self::Unrestricted => Ok(()),
-            Self::Session(session) => session.require_mutation_action(relation, action),
+            Self::Unrestricted => operation(),
+            Self::Session(session) => session.with_publication_authority(footprint, operation),
         }
     }
 }
@@ -614,6 +649,21 @@ impl SessionDatabase {
         self.snapshot().map(|view| view.revision())
     }
 
+    /// Atomically admits one bounded typed Context carrying this session's live authority.
+    ///
+    /// Admission itself does not require read permission: write-only principals may form a
+    /// Context and stage authorized writes. Individual reads, history, watches and publication
+    /// remain checked against the exact semantic coordinates they touch.
+    pub fn begin_context(&self) -> Result<crate::ContextAdmission> {
+        self.database
+            .begin_context_with_authority(self.authority.clone())
+    }
+
+    /// Binds a typed consumer contract to one session-authorized bounded working world.
+    pub fn context<S: crate::CfmdSchema>(&self) -> Result<crate::Context<S>> {
+        self.begin_context()?.context::<S>()
+    }
+
     fn operation_context(&self) -> Result<ReadContext> {
         self.database
             .snapshot_with_authority(self.authority.clone())
@@ -635,7 +685,7 @@ impl SessionDatabase {
     }
 
     /// Adds a historical inverse under this session's write authority.
-    pub fn undo(&self, transaction: &mut Transaction, entry: &crate::HistoryEntry) -> Result<()> {
+    pub fn undo(&self, transaction: &mut IntentJournal, entry: &crate::HistoryEntry) -> Result<()> {
         self.authority.require_write_entry()?;
         let plan = entry.undo_plan()?;
         if plan.authority != self.authority {
@@ -648,7 +698,7 @@ impl SessionDatabase {
     }
 
     /// Adds the current history head's inverse under this session's write authority.
-    pub fn undo_latest(&self, transaction: &mut Transaction) -> Result<()> {
+    pub fn undo_latest(&self, transaction: &mut IntentJournal) -> Result<()> {
         self.authority.require(Permission::HistoryRead)?;
         self.authority.require_write_entry()?;
         let history = self.history()?;
@@ -668,10 +718,7 @@ impl SessionDatabase {
         self.database.plan_with_authority(self.authority.clone())
     }
 
-    pub fn transaction_readiness(
-        &self,
-        transaction: &Transaction,
-    ) -> Result<crate::TransactionReadiness> {
+    pub fn intent_readiness(&self, transaction: &IntentJournal) -> Result<crate::IntentReadiness> {
         self.authority.require_write_entry()?;
         if transaction.authority() != Some(&self.authority) {
             return Err(Error::new(
@@ -679,10 +726,10 @@ impl SessionDatabase {
                 "transaction belongs to a different session authority",
             ));
         }
-        self.database.transaction_readiness(transaction)
+        self.database.intent_readiness(transaction)
     }
 
-    pub fn preview(&self, transaction: &Transaction) -> Result<CandidatePreview> {
+    pub fn preview(&self, transaction: &IntentJournal) -> Result<CandidatePreview> {
         self.authority.require_write_entry()?;
         if transaction.authority() != Some(&self.authority) {
             return Err(Error::new(
@@ -693,7 +740,7 @@ impl SessionDatabase {
         self.database.preview(transaction)
     }
 
-    pub fn commit(&self, transaction: &Transaction) -> Result<crate::CommitOutcome> {
+    pub fn commit(&self, transaction: &IntentJournal) -> Result<crate::CommitOutcome> {
         self.authority.require_write_entry()?;
         if transaction.authority() != Some(&self.authority) {
             return Err(Error::new(
@@ -708,11 +755,15 @@ impl SessionDatabase {
     pub fn commit_exact_relation_intent(
         &self,
         formation_revision: crate::RevisionId,
+        formation_schema_revision: u64,
+        formation_environment_revision: u64,
         transaction: TransactionId,
         mutations: &[crate::ExactRelationMutation],
     ) -> Result<crate::CommitOutcome> {
         self.database.commit_exact_relation_intent(
             formation_revision,
+            formation_schema_revision,
+            formation_environment_revision,
             transaction,
             mutations,
             &self.authority,
@@ -754,4 +805,50 @@ fn session_revoked(principal: PrincipalId) -> Error {
         ErrorKind::SessionRevoked,
         format!("session for principal {} has been revoked", principal.raw()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{TryLockError, mpsc};
+
+    #[test]
+    fn publication_authority_holds_generation_stable_until_publish_finishes() {
+        let relation = RelationId::new(91_001);
+        let session = Session::new(
+            PrincipalId::new(91_002),
+            PermissionSet::from([Permission::WriteRelation(relation)]),
+        );
+        let authority = RuntimeAuthority::Session(session.clone());
+        let footprint = PublicationAuthorityFootprint {
+            relation_writes: BTreeSet::from([relation]),
+            ..PublicationAuthorityFootprint::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            authority
+                .with_publication_authority(&footprint, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(matches!(
+            session.state.try_write(),
+            Err(TryLockError::WouldBlock)
+        ));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            session
+                .refresh_permissions(PermissionSet::from([Permission::Read]))
+                .unwrap(),
+            1
+        );
+    }
 }

@@ -59,7 +59,9 @@ pub use linear_island::{
 };
 #[cfg(test)]
 use maintained_delta_kernels::project_bag_delta_view;
-pub use maintained_plan::MaterializedRelPlanState;
+pub use maintained_plan::{
+    MaterializedRelPlanState, RelCausalCapsule, RelObservationForest, RelObservationForestNodeId,
+};
 use projection::{project_row, project_rows};
 use relation_oracles::{
     canonical_row_multiset_counts, rows_as_multisets_equivalent, rows_semantically_equal,

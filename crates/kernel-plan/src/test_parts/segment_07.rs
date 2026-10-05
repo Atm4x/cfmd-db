@@ -225,7 +225,12 @@ fn supervisor_reuses_bounded_physical_recovery_policy_on_reopen() {
     let dir = durable_test_dir("bounded-supervisor-recovery-policy");
     let (context, registry, relation, layout, mut root) =
         scan_runtime_bundle(5_177, 9_177, &[1, 2, 3, 4]);
-    let i64 = I64IndexBinding { relation, layout, key_column: 0, equivalence: sid(101) };
+    let i64 = I64IndexBinding {
+        relation,
+        layout,
+        key_column: 0,
+        equivalence: sid(101),
+    };
     root.physical_store_mut_for_test()
         .install_i64_index(i64, &context, &registry)
         .unwrap();
@@ -269,7 +274,12 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
     let dir = durable_test_dir("deferred-physical-recovery-resume");
     let (context, registry, relation, layout, mut root) =
         scan_runtime_bundle(5_178, 9_178, &[1, 2, 3, 4]);
-    let i64 = I64IndexBinding { relation, layout, key_column: 0, equivalence: sid(101) };
+    let i64 = I64IndexBinding {
+        relation,
+        layout,
+        key_column: 0,
+        equivalence: sid(101),
+    };
     root.physical_store_mut_for_test()
         .install_i64_index(i64, &context, &registry)
         .unwrap();
@@ -301,12 +311,7 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
     let after = runtime.snapshot().unwrap();
     assert_eq!(after.revision_id(), RevisionId::new(5_178));
     assert_eq!(after.root_version().raw(), source_version.raw() + 1);
-    assert!(
-        after
-            .physical_store()
-            .i64_index(i64)
-            .is_some()
-    );
+    assert!(after.physical_store().i64_index(i64).is_some());
     assert!(
         after
             .physical_store()
@@ -317,19 +322,11 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
 
     runtime.checkpoint().unwrap();
     drop(runtime);
-    let (reopened, second) = DurableRuntime::open_with_recovery_policy(
-        &dir,
-        PhysicalRecoveryPolicy::default(),
-    )
-    .unwrap();
+    let (reopened, second) =
+        DurableRuntime::open_with_recovery_policy(&dir, PhysicalRecoveryPolicy::default()).unwrap();
     assert!(second.deferred_advisor_artifacts().is_empty());
     let reopened_snapshot = reopened.snapshot().unwrap();
-    assert!(
-        reopened_snapshot
-            .physical_store()
-            .i64_index(i64)
-            .is_some()
-    );
+    assert!(reopened_snapshot.physical_store().i64_index(i64).is_some());
     drop(reopened);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -338,8 +335,7 @@ fn deferred_advisor_recovery_can_resume_after_runtime_starts_serving() {
 fn deferred_recovery_uses_live_telemetry_to_rank_optional_rebuilds() {
     let dir = durable_test_dir("deferred-recovery-live-benefit-ranking");
     let values = (1_i64..=16).collect::<Vec<_>>();
-    let (registry, preferred, other, root) =
-        advisor_i64_recovery_bundle(5_179, &values, &values);
+    let (registry, preferred, other, root) = advisor_i64_recovery_bundle(5_179, &values, &values);
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
 
     let (runtime, initial) = DurableRuntime::open_with_recovery_policy(
@@ -449,10 +445,16 @@ fn recovery_semantic_work_budget_distinguishes_same_cell_count_by_payload_size()
     )
     .unwrap();
     let snapshot = reopened.snapshot().unwrap();
-    assert!(snapshot
-        .physical_store()
-        .has_semantic_statistics_for_test(&short));
-    assert!(!snapshot.physical_store().has_semantic_statistics_for_test(&long));
+    assert!(
+        snapshot
+            .physical_store()
+            .has_semantic_statistics_for_test(&short)
+    );
+    assert!(
+        !snapshot
+            .physical_store()
+            .has_semantic_statistics_for_test(&long)
+    );
     assert_eq!(report.advisor_rebuild_key_evaluations, 2);
     assert_eq!(report.advisor_rebuild_semantic_work_units, 4);
     assert_eq!(report.skipped_semantic_work_budget.len(), 1);
@@ -522,7 +524,12 @@ fn deferred_recovery_never_replays_manual_or_incompatible_recipes() {
     assert_eq!(report.dropped_incompatible.len(), 1);
     let after = runtime.snapshot().unwrap();
     assert_eq!(after.root_version(), before);
-    assert!(after.physical_store().observable_atom_state(&manual).is_some());
+    assert!(
+        after
+            .physical_store()
+            .observable_atom_state(&manual)
+            .is_some()
+    );
     drop(after);
     drop(runtime);
     std::fs::remove_dir_all(dir).unwrap();
@@ -533,7 +540,12 @@ fn supervisor_can_resume_deferred_recovery_without_reopen() {
     let dir = durable_test_dir("deferred-supervisor-recovery-resume");
     let (context, registry, relation, layout, mut root) =
         scan_runtime_bundle(5_180, 9_180, &[1, 2, 3, 4]);
-    let i64 = I64IndexBinding { relation, layout, key_column: 0, equivalence: sid(101) };
+    let i64 = I64IndexBinding {
+        relation,
+        layout,
+        key_column: 0,
+        equivalence: sid(101),
+    };
     root.physical_store_mut_for_test()
         .install_i64_index(i64, &context, &registry)
         .unwrap();
@@ -557,12 +569,7 @@ fn supervisor_can_resume_deferred_recovery_without_reopen() {
         .unwrap();
     assert_eq!(resumed.rebuilt.len(), 1);
     let snapshot = supervisor.snapshot().unwrap();
-    assert!(
-        snapshot
-            .physical_store()
-            .i64_index(i64)
-            .is_some()
-    );
+    assert!(snapshot.physical_store().i64_index(i64).is_some());
     drop(supervisor);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -2179,7 +2186,10 @@ fn assert_reopened_effect_prerequisites(
 }
 
 #[test]
-#[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn multi_parent_coherent_resolution_persists_exact_parent_cut() {
     let dir = durable_test_dir("multi-parent-coherent-resolution");
     let (context, registry, relation, _, root) = scan_runtime_bundle(900, 1320, &[1]);
@@ -2653,7 +2663,15 @@ fn security_guard_dependency_is_sealed_with_residual_publication() {
     let entity = EntityId::new(9801);
     let mut registry = SemanticRegistry::default();
     let digest = registry.install_equivalence_revision(EquivalenceModule::TextExact, 11);
-    let context = migration_context(9801, 9801, relation, equivalence, entity_type, field, digest);
+    let context = migration_context(
+        9801,
+        9801,
+        relation,
+        equivalence,
+        entity_type,
+        field,
+        digest,
+    );
     let source = kernel_revision::Revision::build(
         RevisionId::new(9801),
         &context,
@@ -2693,15 +2711,12 @@ fn security_guard_dependency_is_sealed_with_residual_publication() {
         .model
         .fields
         .insert((field, entity), Value::I64(8));
-    let effect_target = kernel_revision::Revision::build(
-        RevisionId::new(9803),
-        &context,
-        &registry,
-        effect_state,
-    )
-    .unwrap();
+    let effect_target =
+        kernel_revision::Revision::build(RevisionId::new(9803), &context, &registry, effect_state)
+            .unwrap();
     let effect_delta = DurableModelDelta::between(guard_changed.state(), effect_target.state());
-    let effect_complement = DurableModelDelta::between(effect_target.state(), guard_changed.state());
+    let effect_complement =
+        DurableModelDelta::between(effect_target.state(), guard_changed.state());
     let request = MixedRevisionTransitionRequest {
         source_revision: guard_changed.id(),
         target_revision: &effect_target,
@@ -2733,13 +2748,19 @@ fn security_guard_dependency_is_sealed_with_residual_publication() {
         result,
         Err(DurableRuntimeCommitError::GuardDependencyConflict(_))
     ));
-    assert_eq!(runtime.snapshot().unwrap().revision().id(), guard_changed.id());
+    assert_eq!(
+        runtime.snapshot().unwrap().revision().id(),
+        guard_changed.id()
+    );
 
     drop(runtime);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[allow(clippy::too_many_arguments, reason = "Keep explicit semantic and durability inputs at this boundary.")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep explicit semantic and durability inputs at this boundary."
+)]
 fn p465_security_contexts(
     source_schema_revision: u64,
     target_schema_revision: u64,
@@ -2749,53 +2770,82 @@ fn p465_security_contexts(
     source_fields: [SemanticId; 3],
     target_fields: [SemanticId; 3],
     registry: &mut SemanticRegistry,
-) -> (SemanticContext, SemanticContext, kernel_transport::SchemaMigrationProgram) {
+) -> (
+    SemanticContext,
+    SemanticContext,
+    kernel_transport::SchemaMigrationProgram,
+) {
     let digest = registry.install_equivalence(kernel_semantics::EquivalenceModule::TextExact);
     let mut source_schema = Schema::new(SchemaRevisionId::new(source_schema_revision));
     for field in source_fields {
-        source_schema.define_field(FieldDef {
-            id: field,
-            owner: entity_type,
-            value: TypeExpr::Scalar(ScalarType::I64),
-        }).unwrap();
+        source_schema
+            .define_field(FieldDef {
+                id: field,
+                owner: entity_type,
+                value: TypeExpr::Scalar(ScalarType::I64),
+            })
+            .unwrap();
     }
-    source_schema.define_relation(RelationDef {
-        id: relation,
-        columns: vec![TypeExpr::Scalar(ScalarType::Text)],
-        semantics: RelationSemantics::Bag { column_equivalences: vec![equivalence] },
-    }).unwrap();
-    let mut source_environment = SemanticEnvironment::new(SemanticEnvId::new(source_schema_revision));
+    source_schema
+        .define_relation(RelationDef {
+            id: relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Bag {
+                column_equivalences: vec![equivalence],
+            },
+        })
+        .unwrap();
+    let mut source_environment =
+        SemanticEnvironment::new(SemanticEnvId::new(source_schema_revision));
     source_environment.pin_module(equivalence, digest);
-    let source = SemanticContext { schema: source_schema, environment: source_environment };
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: source_environment,
+    };
 
     let mut target_schema = Schema::new(SchemaRevisionId::new(target_schema_revision));
     for field in target_fields {
-        target_schema.define_field(FieldDef {
-            id: field,
-            owner: entity_type,
-            value: TypeExpr::Scalar(ScalarType::I64),
-        }).unwrap();
+        target_schema
+            .define_field(FieldDef {
+                id: field,
+                owner: entity_type,
+                value: TypeExpr::Scalar(ScalarType::I64),
+            })
+            .unwrap();
     }
-    target_schema.define_relation(RelationDef {
-        id: relation,
-        columns: vec![TypeExpr::Scalar(ScalarType::Text)],
-        semantics: RelationSemantics::Bag { column_equivalences: vec![equivalence] },
-    }).unwrap();
-    let mut target_environment = SemanticEnvironment::new(SemanticEnvId::new(target_schema_revision));
+    target_schema
+        .define_relation(RelationDef {
+            id: relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+            semantics: RelationSemantics::Bag {
+                column_equivalences: vec![equivalence],
+            },
+        })
+        .unwrap();
+    let mut target_environment =
+        SemanticEnvironment::new(SemanticEnvId::new(target_schema_revision));
     target_environment.pin_module(equivalence, digest);
-    let target = SemanticContext { schema: target_schema, environment: target_environment };
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: target_environment,
+    };
 
-    let rewrites = source_fields.into_iter().zip(target_fields).map(|(source_field, target_field)| {
-        kernel_transport::MigrationFieldRewrite {
-            source_fields: vec![source_field],
-            target_field,
-            transform: kernel_query::ExactQuery::new(kernel_query::Expr::ProductField {
-                input: Box::new(kernel_query::Expr::Input),
-                field: source_field,
-            }),
-        }
-    }).collect();
-    let program = kernel_transport::SchemaMigrationProgram::new(target.clone(), rewrites, Vec::new());
+    let rewrites = source_fields
+        .into_iter()
+        .zip(target_fields)
+        .map(
+            |(source_field, target_field)| kernel_transport::MigrationFieldRewrite {
+                source_fields: vec![source_field],
+                target_field,
+                transform: kernel_query::ExactQuery::new(kernel_query::Expr::ProductField {
+                    input: Box::new(kernel_query::Expr::Input),
+                    field: source_field,
+                }),
+            },
+        )
+        .collect();
+    let program =
+        kernel_transport::SchemaMigrationProgram::new(target.clone(), rewrites, Vec::new());
     (source, target, program)
 }
 
@@ -2809,16 +2859,30 @@ fn p465_security_state(
     let mut state = kernel_model::DatabaseState::default();
     state.lifecycle.entities.insert(entity);
     state.lifecycle.roots.insert(entity);
-    state.model.carriers.entry(entity_type).or_default().insert(entity);
+    state
+        .model
+        .carriers
+        .entry(entity_type)
+        .or_default()
+        .insert(entity);
     for (field, value) in fields.into_iter().zip(values) {
-        state.model.fields.insert((field, entity), Value::I64(value));
+        state
+            .model
+            .fields
+            .insert((field, entity), Value::I64(value));
     }
-    state.model.relations.insert(relation, vec![vec![Value::Text("security-anchor".into())]]);
+    state
+        .model
+        .relations
+        .insert(relation, vec![vec![Value::Text("security-anchor".into())]]);
     state
 }
 
 #[test]
-#[allow(clippy::too_many_lines, reason = "Keep the complete operator or protocol case analysis together.")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
 fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
     let dir = durable_test_dir("p465-schema-aware-field-walker");
     let relation = sid(9_801);
@@ -2830,10 +2894,24 @@ fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
     let entity = EntityId::new(9800);
     let mut registry = SemanticRegistry::default();
     let (source_context, target_context, program) = p465_security_contexts(
-        9800, 9801, relation, equivalence, entity_type, source_fields, target_fields, &mut registry,
+        9800,
+        9801,
+        relation,
+        equivalence,
+        entity_type,
+        source_fields,
+        target_fields,
+        &mut registry,
     );
     let (second_source_context, _, second_program) = p465_security_contexts(
-        9801, 9802, relation, equivalence, entity_type, target_fields, final_fields, &mut registry,
+        9801,
+        9802,
+        relation,
+        equivalence,
+        entity_type,
+        target_fields,
+        final_fields,
+        &mut registry,
     );
     assert_eq!(second_source_context, target_context);
     let source = kernel_revision::Revision::build(
@@ -2841,23 +2919,41 @@ fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
         &source_context,
         &registry,
         p465_security_state(entity_type, source_fields, relation, entity, [100, 0, 7]),
-    ).unwrap();
-    let runtime = create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+    )
+    .unwrap();
+    let runtime =
+        create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
 
     let mut source_after_state = source.state().clone();
-    source_after_state.model.fields.insert((source_fields[0], entity), Value::I64(200));
-    source_after_state.model.fields.insert((source_fields[1], entity), Value::I64(1));
+    source_after_state
+        .model
+        .fields
+        .insert((source_fields[0], entity), Value::I64(200));
+    source_after_state
+        .model
+        .fields
+        .insert((source_fields[1], entity), Value::I64(1));
     let source_after = kernel_revision::Revision::build(
-        RevisionId::new(98_099), &source_context, &registry, source_after_state,
-    ).unwrap();
+        RevisionId::new(98_099),
+        &source_context,
+        &registry,
+        source_after_state,
+    )
+    .unwrap();
     let client_delta = DurableModelDelta::between(source.state(), source_after.state());
     let guard = RuntimeGuardObservationFootprint::new(
         source.id(),
-        [RuntimeHistoryCoordinate::Field { field: source_fields[2], owner: entity }],
-    ).unwrap();
+        [RuntimeHistoryCoordinate::Field {
+            field: source_fields[2],
+            owner: entity,
+        }],
+    )
+    .unwrap();
 
     let transport = program.verify(&source_context, &registry).unwrap();
-    let migrated = transport.transport_revision(&source, RevisionId::new(9801), &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&source, RevisionId::new(9801), &registry)
+        .unwrap();
     let complement = DurableMigrationComplement::from_capsule(
         kernel_lens::ComplementCapsule {
             source_schema: source_context.schema.revision,
@@ -2869,12 +2965,17 @@ fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
         },
         kernel_lens::ComplementRetention::Forget,
     );
-    runtime.migrate_schema(
-        ClientTransactionId::new(0x9800),
-        &FullRevisionTransitionRequest { target_revision: &migrated, registry: &registry },
-        &program,
-        &complement,
-    ).unwrap();
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9800),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
 
     let digest = kernel_durability::ClientIntentGuardDigest::canonical(b"security-generation==7");
     let tx = ClientTransactionId::new(0x9801);
@@ -2885,18 +2986,36 @@ fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
         guard_observation: Some(&guard),
         client_guard_digest: Some(digest),
     };
-    let outcome = runtime.commit_schema_aware_field_intent(tx, &request).unwrap();
+    let prepared = runtime
+        .prepare_schema_aware_field_publication(&request, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(prepared.authorized_head_revision, migrated.id());
+    assert!(!prepared.current_model_delta().fields.is_empty());
+    let outcome = runtime
+        .commit_prepared_schema_aware_publication(tx, &prepared)
+        .unwrap();
     assert!(matches!(outcome, DurableRuntimeCommitOutcome::Committed(_)));
     let head = runtime.snapshot().unwrap();
-    assert_eq!(head.revision().state().model.fields[&(target_fields[0], entity)], Value::I64(200));
-    assert_eq!(head.revision().state().model.fields[&(target_fields[1], entity)], Value::I64(1));
-    assert_eq!(head.revision().state().model.fields[&(target_fields[2], entity)], Value::I64(7));
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[0], entity)],
+        Value::I64(200)
+    );
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[1], entity)],
+        Value::I64(1)
+    );
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[2], entity)],
+        Value::I64(7)
+    );
     drop(head);
 
     // Advance the realized world through another schema epoch. Retry identity must
     // remain the original A intent and must not be rebound to B or C semantics.
     let current = runtime.snapshot().unwrap().revision().clone();
-    let second_transport = second_program.verify(&second_source_context, &registry).unwrap();
+    let second_transport = second_program
+        .verify(&second_source_context, &registry)
+        .unwrap();
     let migrated_again = second_transport
         .transport_revision(&current, RevisionId::new(9803), &registry)
         .unwrap();
@@ -2911,12 +3030,17 @@ fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
         },
         kernel_lens::ComplementRetention::Forget,
     );
-    runtime.migrate_schema(
-        ClientTransactionId::new(0x9802),
-        &FullRevisionTransitionRequest { target_revision: &migrated_again, registry: &registry },
-        &second_program,
-        &second_complement,
-    ).unwrap();
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9802),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated_again,
+                registry: &registry,
+            },
+            &second_program,
+            &second_complement,
+        )
+        .unwrap();
     drop(runtime);
 
     let reopened = DurableRuntime::open(&dir).unwrap();
@@ -2948,8 +3072,13 @@ fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
         Value::I64(9),
     );
 
-    let retry = reopened.commit_schema_aware_field_intent(tx, &request).unwrap();
-    assert!(matches!(retry, DurableRuntimeCommitOutcome::AlreadyCommitted { .. }));
+    let retry = reopened
+        .commit_schema_aware_field_intent(tx, &request)
+        .unwrap();
+    assert!(matches!(
+        retry,
+        DurableRuntimeCommitOutcome::AlreadyCommitted { .. }
+    ));
     assert_eq!(
         reopened.snapshot().unwrap().revision().id(),
         RevisionId::new(migrated_again.id().raw() + 1),
@@ -2959,7 +3088,11 @@ fn p465_schema_aware_field_walker_transports_guarded_intent_atomically() {
 }
 
 #[test]
-fn p465_schema_aware_field_walker_rejects_guard_only_target_change() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p479_formation_world_seal_does_not_revalidate_a_guard_in_target_epoch() {
     let dir = durable_test_dir("p465-schema-aware-field-guard-conflict");
     let relation = sid(9_821);
     let equivalence = sid(9_822);
@@ -2969,23 +3102,53 @@ fn p465_schema_aware_field_walker_rejects_guard_only_target_change() {
     let entity = EntityId::new(9820);
     let mut registry = SemanticRegistry::default();
     let (source_context, _, program) = p465_security_contexts(
-        9820, 9821, relation, equivalence, entity_type, source_fields, target_fields, &mut registry,
+        9820,
+        9821,
+        relation,
+        equivalence,
+        entity_type,
+        source_fields,
+        target_fields,
+        &mut registry,
     );
     let source = kernel_revision::Revision::build(
-        RevisionId::new(9820), &source_context, &registry,
+        RevisionId::new(9820),
+        &source_context,
+        &registry,
         p465_security_state(entity_type, source_fields, relation, entity, [100, 0, 7]),
-    ).unwrap();
-    let runtime = create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+    )
+    .unwrap();
+    let runtime =
+        create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
     let mut source_after_state = source.state().clone();
-    source_after_state.model.fields.insert((source_fields[0], entity), Value::I64(200));
-    source_after_state.model.fields.insert((source_fields[1], entity), Value::I64(1));
-    let source_after = kernel_revision::Revision::build(RevisionId::new(98_299), &source_context, &registry, source_after_state).unwrap();
+    source_after_state
+        .model
+        .fields
+        .insert((source_fields[0], entity), Value::I64(200));
+    source_after_state
+        .model
+        .fields
+        .insert((source_fields[1], entity), Value::I64(1));
+    let source_after = kernel_revision::Revision::build(
+        RevisionId::new(98_299),
+        &source_context,
+        &registry,
+        source_after_state,
+    )
+    .unwrap();
     let client_delta = DurableModelDelta::between(source.state(), source_after.state());
     let guard = RuntimeGuardObservationFootprint::new(
-        source.id(), [RuntimeHistoryCoordinate::Field { field: source_fields[2], owner: entity }],
-    ).unwrap();
+        source.id(),
+        [RuntimeHistoryCoordinate::Field {
+            field: source_fields[2],
+            owner: entity,
+        }],
+    )
+    .unwrap();
     let transport = program.verify(&source_context, &registry).unwrap();
-    let migrated = transport.transport_revision(&source, RevisionId::new(9821), &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&source, RevisionId::new(9821), &registry)
+        .unwrap();
     let complement = DurableMigrationComplement::from_capsule(
         kernel_lens::ComplementCapsule {
             source_schema: source_context.schema.revision,
@@ -2997,33 +3160,690 @@ fn p465_schema_aware_field_walker_rejects_guard_only_target_change() {
         },
         kernel_lens::ComplementRetention::Forget,
     );
-    runtime.migrate_schema(ClientTransactionId::new(0x9820), &FullRevisionTransitionRequest { target_revision: &migrated, registry: &registry }, &program, &complement).unwrap();
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9820),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
 
     let current = runtime.snapshot().unwrap().revision().clone();
     let mut changed_state = current.state().clone();
-    changed_state.model.fields.insert((target_fields[2], entity), Value::I64(8));
-    let changed = kernel_revision::Revision::build(RevisionId::new(9822), current.semantic_context(), &registry, changed_state).unwrap();
+    changed_state
+        .model
+        .fields
+        .insert((target_fields[2], entity), Value::I64(8));
+    let changed = kernel_revision::Revision::build(
+        RevisionId::new(9822),
+        current.semantic_context(),
+        &registry,
+        changed_state,
+    )
+    .unwrap();
     let changed_delta = DurableModelDelta::between(current.state(), changed.state());
     let changed_complement = DurableModelDelta::between(changed.state(), current.state());
-    runtime.commit_mixed_revision(
-        ClientTransactionId::new(0x9821),
-        &MixedRevisionTransitionRequest {
-            source_revision: current.id(), target_revision: &changed, mutations: &[],
-            model_delta: &changed_delta, model_complement: &changed_complement, registry: &registry,
-        },
-    ).unwrap();
+    runtime
+        .commit_mixed_revision(
+            ClientTransactionId::new(0x9821),
+            &MixedRevisionTransitionRequest {
+                source_revision: current.id(),
+                target_revision: &changed,
+                mutations: &[],
+                model_delta: &changed_delta,
+                model_complement: &changed_complement,
+                registry: &registry,
+            },
+        )
+        .unwrap();
 
     let result = runtime.commit_schema_aware_field_intent(
         ClientTransactionId::new(0x9822),
         &SchemaAwareFieldTransitionRequest {
-            formation_revision: source.id(), formation_semantic_revision: source_context.revision(),
-            client_model_delta: &client_delta, guard_observation: Some(&guard),
-            client_guard_digest: Some(kernel_durability::ClientIntentGuardDigest::canonical(b"security-generation==7")),
+            formation_revision: source.id(),
+            formation_semantic_revision: source_context.revision(),
+            client_model_delta: &client_delta,
+            guard_observation: Some(&guard),
+            client_guard_digest: Some(kernel_durability::ClientIntentGuardDigest::canonical(
+                b"security-generation==7",
+            )),
         },
     );
-    assert!(matches!(result, Err(DurableRuntimeCommitError::GuardDependencyConflict(_))));
-    assert_eq!(runtime.snapshot().unwrap().revision().id(), changed.id());
+    assert!(matches!(
+        result,
+        Ok(DurableRuntimeCommitOutcome::Committed(_))
+    ));
+    let head = runtime.snapshot().unwrap();
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[0], entity)],
+        Value::I64(200)
+    );
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[1], entity)],
+        Value::I64(1)
+    );
+    // The B-native write happened after the logical A serialization point. It remains
+    // authoritative; the old A guard is not transported forward and re-evaluated in B.
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[2], entity)],
+        Value::I64(8)
+    );
+    drop(head);
     drop(runtime);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p479_formation_world_seal_rejects_guard_change_before_migration_boundary() {
+    let dir = durable_test_dir("p479-formation-guard-source-conflict");
+    let relation = sid(9_841);
+    let equivalence = sid(9_842);
+    let entity_type = sid(9_843);
+    let source_fields = [sid(9_844), sid(9_845), sid(9_846)];
+    let target_fields = [sid(9_854), sid(9_855), sid(9_856)];
+    let entity = EntityId::new(9840);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, _, program) = p465_security_contexts(
+        9840,
+        9841,
+        relation,
+        equivalence,
+        entity_type,
+        source_fields,
+        target_fields,
+        &mut registry,
+    );
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(9840),
+        &source_context,
+        &registry,
+        p465_security_state(entity_type, source_fields, relation, entity, [100, 0, 7]),
+    )
+    .unwrap();
+    let runtime =
+        create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+
+    let mut client_after_state = source.state().clone();
+    client_after_state
+        .model
+        .fields
+        .insert((source_fields[0], entity), Value::I64(200));
+    client_after_state
+        .model
+        .fields
+        .insert((source_fields[1], entity), Value::I64(1));
+    let client_after = kernel_revision::Revision::build(
+        RevisionId::new(98_499),
+        &source_context,
+        &registry,
+        client_after_state,
+    )
+    .unwrap();
+    let client_delta = DurableModelDelta::between(source.state(), client_after.state());
+    let guard = RuntimeGuardObservationFootprint::new(
+        source.id(),
+        [RuntimeHistoryCoordinate::Field {
+            field: source_fields[2],
+            owner: entity,
+        }],
+    )
+    .unwrap();
+
+    let mut changed_a_state = source.state().clone();
+    changed_a_state
+        .model
+        .fields
+        .insert((source_fields[2], entity), Value::I64(8));
+    let changed_a = kernel_revision::Revision::build(
+        RevisionId::new(9841),
+        &source_context,
+        &registry,
+        changed_a_state,
+    )
+    .unwrap();
+    let changed_a_delta = DurableModelDelta::between(source.state(), changed_a.state());
+    let changed_a_complement = DurableModelDelta::between(changed_a.state(), source.state());
+    runtime
+        .commit_mixed_revision(
+            ClientTransactionId::new(0x9840),
+            &MixedRevisionTransitionRequest {
+                source_revision: source.id(),
+                target_revision: &changed_a,
+                mutations: &[],
+                model_delta: &changed_a_delta,
+                model_complement: &changed_a_complement,
+                registry: &registry,
+            },
+        )
+        .unwrap();
+
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&changed_a, RevisionId::new(9842), &registry)
+        .unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_857)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_858)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9841),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
+
+    let result = runtime.commit_schema_aware_field_intent(
+        ClientTransactionId::new(0x9842),
+        &SchemaAwareFieldTransitionRequest {
+            formation_revision: source.id(),
+            formation_semantic_revision: source_context.revision(),
+            client_model_delta: &client_delta,
+            guard_observation: Some(&guard),
+            client_guard_digest: Some(kernel_durability::ClientIntentGuardDigest::canonical(
+                b"security-generation==7",
+            )),
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(DurableRuntimeCommitError::GuardDependencyConflict(_))
+    ));
+    let head = runtime.snapshot().unwrap();
+    assert_eq!(head.revision().id(), migrated.id());
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[2], entity)],
+        Value::I64(8)
+    );
+    drop(head);
+    drop(runtime);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p480_sealed_old_effect_cannot_reorder_before_later_b_causal_observation_after_reopen() {
+    let dir = durable_test_dir("p480-b-causal-observation-reorder");
+    let relation = sid(9_861);
+    let equivalence = sid(9_862);
+    let entity_type = sid(9_863);
+    let source_fields = [sid(9_864), sid(9_865), sid(9_866)];
+    let target_fields = [sid(9_874), sid(9_875), sid(9_876)];
+    let entity = EntityId::new(9860);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, _, program) = p465_security_contexts(
+        9860,
+        9861,
+        relation,
+        equivalence,
+        entity_type,
+        source_fields,
+        target_fields,
+        &mut registry,
+    );
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(9860),
+        &source_context,
+        &registry,
+        p465_security_state(entity_type, source_fields, relation, entity, [100, 0, 7]),
+    )
+    .unwrap();
+    let runtime =
+        create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+
+    let mut client_after_state = source.state().clone();
+    client_after_state
+        .model
+        .fields
+        .insert((source_fields[0], entity), Value::I64(200));
+    let client_after = kernel_revision::Revision::build(
+        RevisionId::new(98_699),
+        &source_context,
+        &registry,
+        client_after_state,
+    )
+    .unwrap();
+    let client_delta = DurableModelDelta::between(source.state(), client_after.state());
+
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&source, RevisionId::new(9861), &registry)
+        .unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_877)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_878)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9860),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
+
+    let current = runtime.snapshot().unwrap().revision().clone();
+    let mut b_after_state = current.state().clone();
+    b_after_state
+        .model
+        .fields
+        .insert((target_fields[2], entity), Value::I64(8));
+    let b_after = kernel_revision::Revision::build(
+        RevisionId::new(9862),
+        current.semantic_context(),
+        &registry,
+        b_after_state,
+    )
+    .unwrap();
+    let b_delta = DurableModelDelta::between(current.state(), b_after.state());
+    let b_complement = DurableModelDelta::between(b_after.state(), current.state());
+    let b_observation = RuntimeGuardObservationFootprint::new(
+        current.id(),
+        [RuntimeHistoryCoordinate::Field {
+            field: target_fields[0],
+            owner: entity,
+        }],
+    )
+    .unwrap();
+    runtime
+        .commit_mixed_revision_residual_guarded_with_dependencies(
+            ClientTransactionId::new(0x9861),
+            &MixedRevisionTransitionRequest {
+                source_revision: current.id(),
+                target_revision: &b_after,
+                mutations: &[],
+                model_delta: &b_delta,
+                model_complement: &b_complement,
+                registry: &registry,
+            },
+            &[],
+            &b_delta,
+            Some(kernel_durability::ClientIntentGuardDigest::canonical(
+                b"password==OLD",
+            )),
+            Some(&b_observation),
+        )
+        .unwrap();
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    let result = reopened.commit_schema_aware_field_intent(
+        ClientTransactionId::new(0x9862),
+        &SchemaAwareFieldTransitionRequest {
+            formation_revision: source.id(),
+            formation_semantic_revision: source_context.revision(),
+            client_model_delta: &client_delta,
+            guard_observation: None,
+            client_guard_digest: None,
+        },
+    );
+    let Err(DurableRuntimeCommitError::SchemaAwareTransitionConflict(conflict)) = result else {
+        panic!("retroactive sealed effect must not cross a later causal observation");
+    };
+    assert_eq!(conflict.conflicting_effects, Vec::<u128>::new());
+    assert_eq!(conflict.coordination_effects.len(), 1);
+    assert_eq!(
+        conflict.coordinates,
+        vec![RuntimeHistoryCoordinate::Field {
+            field: target_fields[0],
+            owner: entity
+        }],
+    );
+    let head = reopened.snapshot().unwrap();
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[0], entity)],
+        Value::I64(100)
+    );
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[2], entity)],
+        Value::I64(8)
+    );
+    drop(head);
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p482_predicate_certificate_allows_retroactive_value_change_that_preserves_later_requirement_after_reopen()
+ {
+    let dir = durable_test_dir("p482-predicate-preservation");
+    let relation = sid(9_861);
+    let equivalence = sid(9_862);
+    let entity_type = sid(9_863);
+    let source_fields = [sid(9_864), sid(9_865), sid(9_866)];
+    let target_fields = [sid(9_874), sid(9_875), sid(9_876)];
+    let entity = EntityId::new(9860);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, _, program) = p465_security_contexts(
+        9860,
+        9861,
+        relation,
+        equivalence,
+        entity_type,
+        source_fields,
+        target_fields,
+        &mut registry,
+    );
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(9860),
+        &source_context,
+        &registry,
+        p465_security_state(entity_type, source_fields, relation, entity, [100, 0, 7]),
+    )
+    .unwrap();
+    let runtime =
+        create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+
+    let mut client_after_state = source.state().clone();
+    client_after_state
+        .model
+        .fields
+        .insert((source_fields[0], entity), Value::I64(200));
+    let client_after = kernel_revision::Revision::build(
+        RevisionId::new(98_699),
+        &source_context,
+        &registry,
+        client_after_state,
+    )
+    .unwrap();
+    let client_delta = DurableModelDelta::between(source.state(), client_after.state());
+
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&source, RevisionId::new(9861), &registry)
+        .unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_877)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_878)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9860),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
+
+    let current = runtime.snapshot().unwrap().revision().clone();
+    let mut b_after_state = current.state().clone();
+    b_after_state
+        .model
+        .fields
+        .insert((target_fields[2], entity), Value::I64(8));
+    let b_after = kernel_revision::Revision::build(
+        RevisionId::new(9862),
+        current.semantic_context(),
+        &registry,
+        b_after_state,
+    )
+    .unwrap();
+    let b_delta = DurableModelDelta::between(current.state(), b_after.state());
+    let b_complement = DurableModelDelta::between(b_after.state(), current.state());
+    let b_observation = RuntimeGuardObservationFootprint::with_exact_values_and_rules(
+        current.id(),
+        [(
+            RuntimeHistoryCoordinate::Field {
+                field: target_fields[0],
+                owner: entity,
+            },
+            Some(Value::I64(100)),
+            Some(kernel_schema::SemanticRuleExpr::I64Range {
+                value: kernel_schema::RuleValueExpr::Input,
+                min: Some(50),
+                max: Some(250),
+            }),
+        )],
+    )
+    .unwrap();
+    runtime
+        .commit_mixed_revision_residual_guarded_with_dependencies(
+            ClientTransactionId::new(0x9861),
+            &MixedRevisionTransitionRequest {
+                source_revision: current.id(),
+                target_revision: &b_after,
+                mutations: &[],
+                model_delta: &b_delta,
+                model_complement: &b_complement,
+                registry: &registry,
+            },
+            &[],
+            &b_delta,
+            Some(kernel_durability::ClientIntentGuardDigest::canonical(
+                b"password==OLD",
+            )),
+            Some(&b_observation),
+        )
+        .unwrap();
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    let result = reopened.commit_schema_aware_field_intent(
+        ClientTransactionId::new(0x9862),
+        &SchemaAwareFieldTransitionRequest {
+            formation_revision: source.id(),
+            formation_semantic_revision: source_context.revision(),
+            client_model_delta: &client_delta,
+            guard_observation: None,
+            client_guard_digest: None,
+        },
+    );
+    result.expect("age/password-like value change inside the later unary requirement must commute");
+    let head = reopened.snapshot().unwrap();
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[0], entity)],
+        Value::I64(200)
+    );
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[2], entity)],
+        Value::I64(8)
+    );
+    drop(head);
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p482_predicate_certificate_rejects_retroactive_value_change_that_breaks_later_requirement_after_reopen()
+ {
+    let dir = durable_test_dir("p482-predicate-rejection");
+    let relation = sid(9_861);
+    let equivalence = sid(9_862);
+    let entity_type = sid(9_863);
+    let source_fields = [sid(9_864), sid(9_865), sid(9_866)];
+    let target_fields = [sid(9_874), sid(9_875), sid(9_876)];
+    let entity = EntityId::new(9860);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, _, program) = p465_security_contexts(
+        9860,
+        9861,
+        relation,
+        equivalence,
+        entity_type,
+        source_fields,
+        target_fields,
+        &mut registry,
+    );
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(9860),
+        &source_context,
+        &registry,
+        p465_security_state(entity_type, source_fields, relation, entity, [100, 0, 7]),
+    )
+    .unwrap();
+    let runtime =
+        create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+
+    let mut client_after_state = source.state().clone();
+    client_after_state
+        .model
+        .fields
+        .insert((source_fields[0], entity), Value::I64(300));
+    let client_after = kernel_revision::Revision::build(
+        RevisionId::new(98_699),
+        &source_context,
+        &registry,
+        client_after_state,
+    )
+    .unwrap();
+    let client_delta = DurableModelDelta::between(source.state(), client_after.state());
+
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&source, RevisionId::new(9861), &registry)
+        .unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_877)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_878)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9860),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
+
+    let current = runtime.snapshot().unwrap().revision().clone();
+    let mut b_after_state = current.state().clone();
+    b_after_state
+        .model
+        .fields
+        .insert((target_fields[2], entity), Value::I64(8));
+    let b_after = kernel_revision::Revision::build(
+        RevisionId::new(9862),
+        current.semantic_context(),
+        &registry,
+        b_after_state,
+    )
+    .unwrap();
+    let b_delta = DurableModelDelta::between(current.state(), b_after.state());
+    let b_complement = DurableModelDelta::between(b_after.state(), current.state());
+    let b_observation = RuntimeGuardObservationFootprint::with_exact_values_and_rules(
+        current.id(),
+        [(
+            RuntimeHistoryCoordinate::Field {
+                field: target_fields[0],
+                owner: entity,
+            },
+            Some(Value::I64(100)),
+            Some(kernel_schema::SemanticRuleExpr::I64Range {
+                value: kernel_schema::RuleValueExpr::Input,
+                min: Some(50),
+                max: Some(250),
+            }),
+        )],
+    )
+    .unwrap();
+    runtime
+        .commit_mixed_revision_residual_guarded_with_dependencies(
+            ClientTransactionId::new(0x9861),
+            &MixedRevisionTransitionRequest {
+                source_revision: current.id(),
+                target_revision: &b_after,
+                mutations: &[],
+                model_delta: &b_delta,
+                model_complement: &b_complement,
+                registry: &registry,
+            },
+            &[],
+            &b_delta,
+            Some(kernel_durability::ClientIntentGuardDigest::canonical(
+                b"password==OLD",
+            )),
+            Some(&b_observation),
+        )
+        .unwrap();
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    let result = reopened.commit_schema_aware_field_intent(
+        ClientTransactionId::new(0x9862),
+        &SchemaAwareFieldTransitionRequest {
+            formation_revision: source.id(),
+            formation_semantic_revision: source_context.revision(),
+            client_model_delta: &client_delta,
+            guard_observation: None,
+            client_guard_digest: None,
+        },
+    );
+    let Err(DurableRuntimeCommitError::SchemaAwareTransitionConflict(conflict)) = result else {
+        panic!("retroactive value outside the later unary requirement must require coordination");
+    };
+    assert_eq!(conflict.conflicting_effects, Vec::<u128>::new());
+    assert_eq!(conflict.coordination_effects.len(), 1);
+    let head = reopened.snapshot().unwrap();
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[0], entity)],
+        Value::I64(100)
+    );
+    assert_eq!(
+        head.revision().state().model.fields[&(target_fields[2], entity)],
+        Value::I64(8)
+    );
+    drop(head);
+    drop(reopened);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -3036,4 +3856,742 @@ fn benchmark_p473_retained_epoch_first_conflict_is_history_depth_flat() {
     eprintln!(
         "P473 retained epoch first-conflict lookup: depth=1k {shallow:?}, depth=100k {deep:?}, iterations={iterations}",
     );
+}
+
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+fn p474_row_local_relation_contexts(
+    source_schema_revision: u64,
+    target_schema_revision: u64,
+    relation: SemanticId,
+    eq_i64: SemanticId,
+    eq_f64: SemanticId,
+    registry: &mut SemanticRegistry,
+) -> (SemanticContext, kernel_transport::SchemaMigrationProgram) {
+    let i64_digest = registry.install_equivalence(kernel_semantics::EquivalenceModule::I64Exact);
+    let f64_digest = registry.install_equivalence(kernel_semantics::EquivalenceModule::F64Bitwise);
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(source_schema_revision));
+    source_schema
+        .define_relation(RelationDef {
+            id: relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+            semantics: RelationSemantics::Set {
+                column_equivalences: vec![eq_i64],
+            },
+        })
+        .unwrap();
+    let source_column = source_schema.relation_column_ids(relation).unwrap()[0];
+    let mut source_environment =
+        SemanticEnvironment::new(SemanticEnvId::new(source_schema_revision));
+    source_environment.pin_module(eq_i64, i64_digest);
+    source_environment.pin_module(eq_f64, f64_digest);
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: source_environment,
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(target_schema_revision));
+    target_schema
+        .define_relation(RelationDef {
+            id: relation,
+            columns: vec![TypeExpr::Scalar(ScalarType::F64)],
+            semantics: RelationSemantics::Set {
+                column_equivalences: vec![eq_f64],
+            },
+        })
+        .unwrap();
+    let target_column = target_schema.relation_column_ids(relation).unwrap()[0];
+    let mut target_environment =
+        SemanticEnvironment::new(SemanticEnvId::new(target_schema_revision));
+    target_environment.pin_module(eq_i64, i64_digest);
+    target_environment.pin_module(eq_f64, f64_digest);
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: target_environment,
+    };
+
+    let program = kernel_transport::SchemaMigrationProgram::new(
+        target,
+        Vec::new(),
+        vec![kernel_transport::MigrationRelationRewrite::Rows(
+            kernel_transport::MigrationRowRewrite {
+                source_relation: relation,
+                target_relation: relation,
+                columns: vec![kernel_transport::MigrationColumnRewrite {
+                    source_columns: vec![source_column],
+                    target_column,
+                    transform: kernel_query::ExactQuery::new(kernel_query::Expr::I64ToF64(
+                        Box::new(kernel_query::Expr::ProductField {
+                            input: Box::new(kernel_query::Expr::Input),
+                            field: source_column,
+                        }),
+                    )),
+                }],
+            },
+        )],
+    );
+    (source, program)
+}
+
+#[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p474_schema_aware_relation_walker_transports_row_local_delta_after_reopen() {
+    let dir = durable_test_dir("p474-schema-aware-row-local-relation");
+    let relation = sid(9_840);
+    let eq_i64 = sid(9_841);
+    let eq_f64 = sid(9_842);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, program) =
+        p474_row_local_relation_contexts(9_840, 9_841, relation, eq_i64, eq_f64, &mut registry);
+    let mut state = kernel_model::DatabaseState::default();
+    state
+        .model
+        .relations
+        .insert(relation, vec![vec![Value::I64(7)]]);
+    let source =
+        kernel_revision::Revision::build(RevisionId::new(9_840), &source_context, &registry, state)
+            .unwrap();
+    let mut physical = PhysicalStore::default();
+    physical
+        .install(
+            relation,
+            LayoutBinding::RECOVERY_ROW_STORE,
+            NativeRelation::row_store(vec![vec![Value::I64(7)]]),
+        )
+        .unwrap();
+    let root = RuntimeRevisionBundle::build(
+        source.clone(),
+        physical,
+        BTreeMap::from([(relation, LayoutBinding::RECOVERY_ROW_STORE)]),
+        &[],
+        &registry,
+    )
+    .unwrap();
+    let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&source, RevisionId::new(9_841), &registry)
+        .unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_843)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_844)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9840),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    let source_type = RelExpr::Scan(relation)
+        .typecheck(&source_context, &registry)
+        .unwrap();
+    let client_delta = RelationDelta {
+        inserted: vec![vec![Value::I64(8)]],
+        removed: vec![vec![Value::I64(7)]],
+        result_type: source_type,
+    };
+    let client_mutations = [RevisionRelationMutation {
+        relation,
+        delta: &client_delta,
+        object_field_writes: &[],
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
+    }];
+    assert_eq!(
+        reopened
+            .snapshot()
+            .unwrap()
+            .revision()
+            .state()
+            .model
+            .relations
+            .materialize_owned(&relation),
+        Some(vec![vec![Value::F64Bits(7.0_f64.to_bits())]]),
+    );
+    let transported_probe = program
+        .verify(&source_context, &registry)
+        .unwrap()
+        .transport_relation_delta_exact(relation, &client_delta, &registry)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .1;
+    reopened
+        .validate_relation_delta_at(RevisionId::new(9_841), relation, &transported_probe)
+        .unwrap();
+    let action_mutations = [RevisionRelationMutation {
+        relation,
+        delta: &client_delta,
+        object_field_writes: &[],
+        authorization: kernel_durability::DurableRelationAuthorization {
+            relationship_attach: true,
+            ..Default::default()
+        },
+    }];
+    let action_transport = reopened.prepare_schema_aware_publication(
+        source.id(),
+        source_context.revision(),
+        &action_mutations,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+    );
+    assert!(matches!(
+        action_transport,
+        Err(DurableRuntimeCommitError::MigrationTransport(
+            kernel_transport::TransportError::UnrepresentableSourceRelationEffect(candidate)
+        )) if candidate == relation
+    ));
+
+    let prepared = reopened
+        .prepare_schema_aware_publication(
+            source.id(),
+            source_context.revision(),
+            &client_mutations,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+        )
+        .unwrap();
+    let tx = ClientTransactionId::new(0x9841);
+    let outcome = reopened
+        .commit_prepared_schema_aware_publication(tx, &prepared)
+        .unwrap();
+    assert!(matches!(outcome, DurableRuntimeCommitOutcome::Committed(_)));
+    assert_eq!(
+        reopened
+            .snapshot()
+            .unwrap()
+            .revision()
+            .state()
+            .model
+            .relations
+            .materialize_owned(&relation),
+        Some(vec![vec![Value::F64Bits(8.0_f64.to_bits())]]),
+    );
+    assert!(matches!(
+        reopened
+            .commit_prepared_schema_aware_publication(tx, &prepared)
+            .unwrap(),
+        DurableRuntimeCommitOutcome::AlreadyCommitted { .. }
+    ));
+
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::similar_names,
+    reason = "Names distinguish related before and after states."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p498_retained_epoch_prefix_qualified_join_observation_is_restart_equivalent() {
+    let dir = durable_test_dir("p488-retained-epoch-join-observation-restart");
+    let relation = sid(9_860);
+    let eq_i64 = sid(9_861);
+    let eq_f64 = sid(9_862);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, program) =
+        p474_row_local_relation_contexts(9_860, 9_862, relation, eq_i64, eq_f64, &mut registry);
+    let formation_revision = RevisionId::new(9_860);
+    let later_revision = RevisionId::new(9_861);
+    let migrated_revision = RevisionId::new(9_862);
+
+    let mut state = kernel_model::DatabaseState::default();
+    state
+        .model
+        .relations
+        .insert(relation, vec![vec![Value::I64(7)]]);
+    let source =
+        kernel_revision::Revision::build(formation_revision, &source_context, &registry, state)
+            .unwrap();
+    let mut physical = PhysicalStore::default();
+    physical
+        .install(
+            relation,
+            LayoutBinding::RECOVERY_ROW_STORE,
+            NativeRelation::row_store(vec![vec![Value::I64(7)]]),
+        )
+        .unwrap();
+    let root = RuntimeRevisionBundle::build(
+        source,
+        physical,
+        BTreeMap::from([(relation, LayoutBinding::RECOVERY_ROW_STORE)]),
+        &[],
+        &registry,
+    )
+    .unwrap();
+    let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+
+    let source_type = RelExpr::Scan(relation)
+        .typecheck(&source_context, &registry)
+        .unwrap();
+    let join = RelExpr::JoinEq {
+        left: Box::new(RelExpr::Scan(relation)),
+        right: Box::new(RelExpr::Scan(relation)),
+        left_column: 0,
+        right_column: 0,
+        equivalence: eq_i64,
+    };
+    let snapshot = runtime.snapshot().unwrap();
+    let mut candidate_model = snapshot.revision().state().model.clone();
+    candidate_model
+        .relations
+        .insert(relation, vec![vec![Value::I64(7)], vec![Value::I64(2)]]);
+    let mut maintained =
+        MaterializedRelPlanState::build(&join, &candidate_model, &source_context, &registry)
+            .unwrap();
+    maintained.bind_revision(formation_revision).unwrap();
+    let capsule = kernel_query::RelCausalCapsule::capture(&maintained).unwrap();
+    let observation = RuntimeRelationalCausalObservation {
+        observation_id: 0,
+        observed_revision: formation_revision,
+        intent_prefix: kernel_durability::DurableIntentPrefix::empty().append(vec![
+            kernel_durability::DurableRelationMutation {
+                relation,
+                inserted: vec![vec![Value::I64(2)]],
+                removed: Vec::new(),
+                object_field_writes: Vec::new(),
+                authorization: kernel_durability::DurableRelationAuthorization::default(),
+            },
+        ]),
+        capsule,
+    };
+    drop(snapshot);
+
+    let later_delta = RelationDelta {
+        inserted: vec![vec![Value::I64(2)]],
+        removed: Vec::new(),
+        result_type: source_type.clone(),
+    };
+    let later_mutations = [RevisionRelationMutation {
+        relation,
+        delta: &later_delta,
+        object_field_writes: &[],
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
+    }];
+    runtime
+        .commit_derived_relation_data_guarded_with_dependencies_and_relational_observations(
+            ClientTransactionId::new(0x9860),
+            &DerivedRelationTransitionRequest {
+                source_revision: formation_revision,
+                target_revision: later_revision,
+                mutations: &later_mutations,
+            },
+            None,
+            None,
+            &[observation],
+        )
+        .unwrap();
+
+    let pre_migration = runtime.snapshot().unwrap().revision().clone();
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&pre_migration, migrated_revision, &registry)
+        .unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_863)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_864)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9861),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
+
+    let old_delta = RelationDelta {
+        inserted: vec![vec![Value::I64(8)]],
+        removed: vec![vec![Value::I64(7)]],
+        result_type: source_type,
+    };
+    let old_mutations = [RevisionRelationMutation {
+        relation,
+        delta: &old_delta,
+        object_field_writes: &[],
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
+    }];
+    let before = runtime.prepare_schema_aware_publication(
+        formation_revision,
+        source_context.revision(),
+        &old_mutations,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+    );
+    let Err(DurableRuntimeCommitError::SchemaAwareTransitionConflict(before_conflict)) = before
+    else {
+        panic!("retained A-native join observation must reject the retroactive A effect");
+    };
+    assert!(before_conflict.conflicting_effects.is_empty());
+    assert_eq!(before_conflict.coordination_effects.len(), 1);
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    let after = reopened.prepare_schema_aware_publication(
+        formation_revision,
+        source_context.revision(),
+        &old_mutations,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+    );
+    let Err(DurableRuntimeCommitError::SchemaAwareTransitionConflict(after_conflict)) = after
+    else {
+        panic!("reopen must reconstruct the retained relational capsule authority");
+    };
+    assert_eq!(before_conflict, after_conflict);
+    assert_eq!(
+        reopened
+            .snapshot()
+            .unwrap()
+            .revision()
+            .state()
+            .model
+            .relations
+            .materialize_owned(&relation),
+        Some(vec![
+            vec![Value::F64Bits(7.0_f64.to_bits())],
+            vec![Value::F64Bits(2.0_f64.to_bits())],
+        ]),
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p483_joint_multi_field_causal_predicate_is_evaluated_atomically_after_reopen() {
+    let dir = durable_test_dir("p483-joint-causal-predicate");
+    let relation = sid(9_881);
+    let equivalence = sid(9_882);
+    let entity_type = sid(9_883);
+    let source_fields = [sid(9_884), sid(9_885), sid(9_886)];
+    let target_fields = [sid(9_894), sid(9_895), sid(9_896)];
+    let entity = EntityId::new(9880);
+    let mut registry = SemanticRegistry::default();
+    let (source_context, _, program) = p465_security_contexts(
+        9880,
+        9881,
+        relation,
+        equivalence,
+        entity_type,
+        source_fields,
+        target_fields,
+        &mut registry,
+    );
+    let source = kernel_revision::Revision::build(
+        RevisionId::new(9880),
+        &source_context,
+        &registry,
+        p465_security_state(entity_type, source_fields, relation, entity, [0, 0, 7]),
+    )
+    .unwrap();
+    let runtime =
+        create_migration_runtime(&dir, relation, source.clone(), "security-anchor", &registry);
+    let transport = program.verify(&source_context, &registry).unwrap();
+    let migrated = transport
+        .transport_revision(&source, RevisionId::new(9881), &registry)
+        .unwrap();
+    let complement = DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: source_context.schema.revision,
+            target_schema: program.target().schema.revision,
+            lens_spec: kernel_lens::LensSpecId(sid(9_897)),
+            semantic_pins: kernel_lens::SemanticManifestId(sid(9_898)),
+            encoding_version: 1,
+            complement: Value::Unit,
+        },
+        kernel_lens::ComplementRetention::Forget,
+    );
+    runtime
+        .migrate_schema(
+            ClientTransactionId::new(0x9880),
+            &FullRevisionTransitionRequest {
+                target_revision: &migrated,
+                registry: &registry,
+            },
+            &program,
+            &complement,
+        )
+        .unwrap();
+
+    let current = runtime.snapshot().unwrap().revision().clone();
+    let mut later_state = current.state().clone();
+    later_state
+        .model
+        .fields
+        .insert((target_fields[2], entity), Value::I64(8));
+    let later = kernel_revision::Revision::build(
+        RevisionId::new(9882),
+        current.semantic_context(),
+        &registry,
+        later_state,
+    )
+    .unwrap();
+    let later_delta = DurableModelDelta::between(current.state(), later.state());
+    let later_complement = DurableModelDelta::between(later.state(), current.state());
+    let predicate = kernel_schema::SemanticRuleExpr::Or(vec![
+        kernel_schema::SemanticRuleExpr::I64Range {
+            value: kernel_schema::RuleValueExpr::Field(target_fields[0]),
+            min: Some(0),
+            max: Some(0),
+        },
+        kernel_schema::SemanticRuleExpr::I64Range {
+            value: kernel_schema::RuleValueExpr::Field(target_fields[1]),
+            min: Some(0),
+            max: Some(0),
+        },
+    ]);
+    let observation = RuntimeGuardObservationFootprint::with_exact_values_rules_and_groups(
+        current.id(),
+        [],
+        [RuntimeJointCausalObservationGroup {
+            group_id: 0,
+            relation,
+            owner: entity,
+            observed_fields: BTreeMap::from([
+                (target_fields[0], Value::I64(0)),
+                (target_fields[1], Value::I64(0)),
+            ]),
+            predicate,
+        }],
+    )
+    .unwrap();
+    runtime
+        .commit_mixed_revision_residual_guarded_with_dependencies(
+            ClientTransactionId::new(0x9881),
+            &MixedRevisionTransitionRequest {
+                source_revision: current.id(),
+                target_revision: &later,
+                mutations: &[],
+                model_delta: &later_delta,
+                model_complement: &later_complement,
+                registry: &registry,
+            },
+            &[],
+            &later_delta,
+            Some(kernel_durability::ClientIntentGuardDigest::canonical(
+                b"x==0||y==0",
+            )),
+            Some(&observation),
+        )
+        .unwrap();
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    let snapshot = reopened.snapshot().unwrap();
+    let one_change = snapshot
+        .certify_retroactive_exact_writes_against_causal_observations(
+            current.id(),
+            [
+                (
+                    RuntimeHistoryCoordinate::Field {
+                        field: target_fields[0],
+                        owner: entity,
+                    },
+                    Some(Value::I64(1)),
+                ),
+                (
+                    RuntimeHistoryCoordinate::Field {
+                        field: target_fields[1],
+                        owner: entity,
+                    },
+                    Some(Value::I64(0)),
+                ),
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        one_change,
+        RuntimeTransitionRebaseOutcome::Certified(_)
+    ));
+
+    let both_change = snapshot
+        .certify_retroactive_exact_writes_against_causal_observations(
+            current.id(),
+            [
+                (
+                    RuntimeHistoryCoordinate::Field {
+                        field: target_fields[0],
+                        owner: entity,
+                    },
+                    Some(Value::I64(1)),
+                ),
+                (
+                    RuntimeHistoryCoordinate::Field {
+                        field: target_fields[1],
+                        owner: entity,
+                    },
+                    Some(Value::I64(1)),
+                ),
+            ],
+        )
+        .unwrap();
+    let RuntimeTransitionRebaseOutcome::Conflict(conflict) = both_change else {
+        panic!(
+            "joint predicate must reject simultaneous writes that falsify the later observation"
+        );
+    };
+    assert_eq!(conflict.coordination_effects.len(), 1);
+    drop(snapshot);
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete operator or protocol case analysis together."
+)]
+fn p487_relational_causal_braid_verdict_is_restart_equivalent() {
+    let dir = durable_test_dir("p487-relational-causal-restart-equivalence");
+    let (context, registry, relation, _, root) = scan_runtime_bundle(9_900, 9_900, &[0]);
+    let runtime = DurableRuntime::create(root, &dir, &registry).unwrap();
+    let query = RelExpr::FilterEqConst {
+        input: Box::new(RelExpr::Scan(relation)),
+        column: 0,
+        value: Value::I64(1),
+        equivalence: sid(101),
+    };
+    let snapshot = runtime.snapshot().unwrap();
+    let mut maintained = MaterializedRelPlanState::build(
+        &query,
+        &snapshot.revision().state().model,
+        &context,
+        &registry,
+    )
+    .unwrap();
+    maintained.bind_revision(snapshot.revision().id()).unwrap();
+    let capsule = kernel_query::RelCausalCapsule::capture(&maintained).unwrap();
+    let observation = RuntimeRelationalCausalObservation {
+        observation_id: 0,
+        observed_revision: capsule.revision(),
+        intent_prefix: kernel_durability::DurableIntentPrefix::empty(),
+        capsule,
+    };
+    drop(snapshot);
+
+    let result_type = RelExpr::Scan(relation)
+        .typecheck(&context, &registry)
+        .unwrap();
+    let later_delta = RelationDelta {
+        inserted: vec![vec![Value::I64(2)]],
+        removed: Vec::new(),
+        result_type: result_type.clone(),
+    };
+    let later_mutations = [RevisionRelationMutation {
+        relation,
+        delta: &later_delta,
+        object_field_writes: &[],
+        authorization: kernel_durability::DurableRelationAuthorization::default(),
+    }];
+    runtime
+        .commit_derived_relation_data_guarded_with_dependencies_and_relational_observations(
+            ClientTransactionId::new(0x9901),
+            &DerivedRelationTransitionRequest {
+                source_revision: RevisionId::new(9_900),
+                target_revision: RevisionId::new(9_901),
+                mutations: &later_mutations,
+            },
+            None,
+            None,
+            &[observation],
+        )
+        .unwrap();
+
+    let changed_delta = RelationDelta {
+        inserted: vec![vec![Value::I64(1)]],
+        removed: Vec::new(),
+        result_type: result_type.clone(),
+    };
+    let preserved_delta = RelationDelta {
+        inserted: vec![vec![Value::I64(3)]],
+        removed: Vec::new(),
+        result_type,
+    };
+    let certify = |runtime: &DurableRuntime, delta: &RelationDelta| {
+        runtime
+            .certify_transition_rebase(
+                RevisionId::new(9_900),
+                &[RevisionRelationMutation {
+                    relation,
+                    delta,
+                    object_field_writes: &[],
+                    authorization: kernel_durability::DurableRelationAuthorization::default(),
+                }],
+                None,
+                None,
+            )
+            .unwrap()
+    };
+
+    let before_changed = certify(&runtime, &changed_delta);
+    let before_preserved = certify(&runtime, &preserved_delta);
+    assert!(matches!(
+        before_changed,
+        RuntimeTransitionRebaseOutcome::Conflict(_)
+    ));
+    assert!(matches!(
+        before_preserved,
+        RuntimeTransitionRebaseOutcome::Certified(_)
+    ));
+    drop(runtime);
+
+    let reopened = DurableRuntime::open(&dir).unwrap();
+    let after_changed = certify(&reopened, &changed_delta);
+    let after_preserved = certify(&reopened, &preserved_delta);
+    assert_eq!(before_changed, after_changed);
+    assert_eq!(before_preserved, after_preserved);
+    let RuntimeTransitionRebaseOutcome::Conflict(conflict) = after_changed else {
+        unreachable!();
+    };
+    assert_eq!(conflict.conflicting_effects, Vec::<u128>::new());
+    assert_eq!(conflict.coordination_effects.len(), 1);
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
 }
