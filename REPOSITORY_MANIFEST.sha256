@@ -900,7 +900,7 @@ e59a6fa52fad5cb6c850f4394f2c21d172a173b6db5c632b4d6317a65a8c8a5b  ./crates/cfmd-
 c413ea5993ae6f73cb5f17d89757954138dc2794657f752ccd469d2062a15cd5  ./crates/cfmd-secure-memory/tests/linux_resource_limits.rs
 8e401a3d7ee98b680f7537e47c5b193dd8dfc1c35fe781b67631322b6ec7977b  ./crates/cfmd-transport-local/Cargo.toml
 61c3df83ffc88001774005fb6551337807a2b8fb122e49ea1add07e5c0a9ca0a  ./crates/cfmd-transport-local/src/lib.rs
-0f3d003e1cf8b923ac3cedd8ae792695bb8d50090dc1b69e8e445375f4dc7a3d  ./crates/cfmd-transport-local/src/unix.rs
+29f92286c9ff3ce0fc5cdbb1b1bf6bf82f4738f4ec38b92fb123454db052d494  ./crates/cfmd-transport-local/src/unix.rs
 15099f099f107547c3e032cb1d5a3051c48a968cca8a06d0f9178db1f4c1d774  ./crates/cfmd-transport-local/tests/unix.rs
 2f06c65db227067503cb369fbbf3625cff5b54c8287a43af17d7381b54fc8996  ./crates/cfmd/Cargo.toml
 f132159b2c5f447547652bbec335d5dd9f398d27443483d656490a9a492c9c0d  ./crates/cfmd/examples/todo.rs

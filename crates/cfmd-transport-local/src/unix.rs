@@ -327,7 +327,7 @@ fn send_resource_limit(
     }
 }
 
-fn read_wire_frame(stream: &mut UnixStream, wire_limits: WireLimits) -> Result<Option<Vec<u8>>> {
+fn read_wire_frame(stream: &mut impl Read, wire_limits: WireLimits) -> Result<Option<Vec<u8>>> {
     let mut header = [0_u8; WIRE_HEADER_LEN];
     match stream.read(&mut header[..1]) {
         Ok(0) => return Ok(None),
@@ -336,6 +336,7 @@ fn read_wire_frame(stream: &mut UnixStream, wire_limits: WireLimits) -> Result<O
         Err(error) if error.kind() == io::ErrorKind::Interrupted => {
             return read_wire_frame(stream, wire_limits);
         }
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
         Err(error) => return Err(error.into()),
     }
     stream.read_exact(&mut header[1..])?;
@@ -348,4 +349,39 @@ fn read_wire_frame(stream: &mut UnixStream, wire_limits: WireLimits) -> Result<O
     frame.resize(start + payload_len, 0);
     stream.read_exact(&mut frame[start..])?;
     Ok(Some(frame))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ResetAfter<'a> {
+        prefix: &'a [u8],
+    }
+
+    impl Read for ResetAfter<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.prefix.is_empty() {
+                return Err(io::ErrorKind::ConnectionReset.into());
+            }
+            self.prefix.read(buffer)
+        }
+    }
+
+    #[test]
+    fn reset_between_frames_is_peer_disconnect() {
+        let mut reader = ResetAfter { prefix: &[] };
+        assert!(
+            read_wire_frame(&mut reader, WireLimits::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reset_during_a_frame_remains_an_io_error() {
+        let mut reader = ResetAfter { prefix: b"C" };
+        let error = read_wire_frame(&mut reader, WireLimits::default()).unwrap_err();
+        assert_eq!(error.code(), crate::LocalIpcErrorCode::Io);
+    }
 }
