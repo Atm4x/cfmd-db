@@ -106,13 +106,10 @@ mod journal_io;
 mod lifecycle;
 mod membership;
 mod replay;
-#[cfg_attr(not(test), allow(dead_code))]
 mod segments;
 mod semantic_snapshot;
 pub(crate) use semantic_snapshot::ReplicationAuthoritySemanticSnapshot;
 
-#[cfg(test)]
-pub(crate) use segments::collect_indexed_segment_object_chain_frames;
 pub(crate) use segments::{
     ReplicationAuthorityFrameSlice, ReplicationAuthorityFrameSource,
     ReplicationAuthorityLocatorRoot, ReplicationAuthoritySegmentExtent,

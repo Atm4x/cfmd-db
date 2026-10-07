@@ -8,8 +8,6 @@ use sha2::{Digest, Sha256};
 
 use crate::FORMAT_VERSION;
 use crate::descriptor::DurableRevisionDescriptor;
-#[cfg(test)]
-use crate::replication::authority::collect_indexed_segment_object_chain_frames;
 use crate::replication::authority::{
     ReplicationAuthorityFrameSource, ReplicationAuthorityJournal, ReplicationAuthorityLocatorRoot,
     ReplicationAuthoritySegmentExtent, ReplicationAuthoritySegmentId,
@@ -1130,17 +1128,6 @@ impl SingleFileContainer {
         self.root
             .replication_authority
             .map(|root| (root.segment_id.bytes(), root.offset, root.digest))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn portable_replication_authority_frames(
-        &mut self,
-    ) -> Result<Vec<Vec<u8>>, DurabilityError> {
-        let Some(authority_root) = self.root.replication_authority else {
-            return Ok(Vec::new());
-        };
-        let index = recover_locator_chain(&mut self.file, authority_root)?;
-        collect_indexed_segment_object_chain_frames(&mut self.file, &index, self.crypto.as_ref())
     }
 
     pub(crate) fn recover_replication_authority_journal(

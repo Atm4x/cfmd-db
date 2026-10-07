@@ -2018,3 +2018,9 @@ PASS592-A has removed physical replication frame-history from `CanonicalPersiste
 ## PASS592 COMPLETE handoff
 
 The replication-authority semantic-carrier architecture is now accepted: canonical persistence transfer carries exact current semantic authority instead of portable physical append history, semantic-base framing is bounded/authenticated, and ordinary deltas continue through the same evaluator/`CFAS/CFAO` path. The codec is decomposed by authority family and all relevant gates are green. The earlier statement that PASS593 must be an automatic cleanup checkpoint is superseded. PASS591 is the clean/Git-ready boundary for the completed persistence-lineage branch; the replication-authority branch may continue through further coherent architecture PASSes before its own cleanup boundary is selected.
+
+## PASS596 authoritative handoff — CLEAN / Git-ready
+
+The replication-authority semantic-carrier branch is consolidated and closed as a coherent Git-ready slice: PASS592 removed physical journal-history transfer, PASS593 bounded replay memory, PASS594 bounded semantic-base staging, and PASS595 reduced authenticated publication to the selected two-traversal lower bound. PASS596 removed stale buffered/raw convenience routes and the blanket segment dead-code suppression; production authority is one `FrameSource -> CFAS v2 -> CFAO -> CFLN` path with the existing single replication evaluator. Certified Set-CQ semantic interning from PASS594 remains production; Γ-factorized aggregate remains R&D/test-only.
+
+**NEXT CANDIDATE: PASS597 — Γ-factorized aggregate productionization R&D.** Build the JointMass capability bridge and hostile skew/high-distinct/self-join/multi-key admission frontier before activating a narrow certified equality-join COUNT / GROUP BY join-key + COUNT carrier.

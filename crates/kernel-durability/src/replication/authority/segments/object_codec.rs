@@ -1,9 +1,10 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
+#[cfg(test)]
+use super::ReplicationAuthorityFrameSlice;
 use super::{
     ReplicationAuthorityFrameSource, ReplicationAuthoritySegmentId,
-    ReplicationAuthoritySegmentPlan, collect_verified_segment_reader,
-    replay_verified_segment_reader, verify_segment_reader,
+    ReplicationAuthoritySegmentPlan, replay_verified_segment_reader, verify_segment_reader,
 };
 use crate::replication::authority::ReplicationAuthorityJournal;
 use crate::runtime::DurabilityError;
@@ -399,31 +400,6 @@ pub(super) fn verify_segment_object<R: Read>(
     recover_reader_error(&mut object, result)
 }
 
-pub(crate) fn collect_segment_object_frames<R: Read + Seek>(
-    reader: &mut R,
-    offset: u64,
-    stored_len: u64,
-    expected_id: ReplicationAuthoritySegmentId,
-    expected_parent: Option<ReplicationAuthoritySegmentId>,
-    crypto: Option<&StorageAeadCodec>,
-) -> Result<Vec<Vec<u8>>, DurabilityError> {
-    reader.seek(SeekFrom::Start(offset))?;
-    verify_segment_object(reader, stored_len, expected_id, expected_parent, crypto)?;
-    reader.seek(SeekFrom::Start(offset))?;
-    let mut object =
-        SegmentObjectReader::open(reader, stored_len, expected_id, expected_parent, crypto)?;
-    let plaintext_len = object.plaintext_len;
-    let result =
-        collect_verified_segment_reader(&mut object, plaintext_len, expected_id, expected_parent);
-    match result {
-        Ok(frames) => {
-            object.finish()?;
-            Ok(frames)
-        }
-        Err(error) => Err(object.take_pending_error().unwrap_or(error)),
-    }
-}
-
 pub(crate) fn replay_segment_object<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
@@ -586,13 +562,17 @@ mod tests {
     #[test]
     fn encrypted_object_preserves_plaintext_segment_identity_and_replays() {
         let frames = frames();
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
+        let plan = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         let crypto = codec();
         let mut nonces = StorageNonceSequence::random().unwrap();
         let mut stored = Vec::new();
         let stored_len = write_segment_object(
             &plan,
-            &frames,
+            &ReplicationAuthorityFrameSlice::new(&frames),
             Some(&crypto),
             Some(&mut nonces),
             &mut |bytes| {
@@ -639,13 +619,17 @@ mod tests {
     #[test]
     fn encrypted_object_rejects_ciphertext_and_aad_tamper() {
         let frames = frames();
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
+        let plan = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         let crypto = codec();
         let mut nonces = StorageNonceSequence::random().unwrap();
         let mut stored = Vec::new();
         let stored_len = write_segment_object(
             &plan,
-            &frames,
+            &ReplicationAuthorityFrameSlice::new(&frames),
             Some(&crypto),
             Some(&mut nonces),
             &mut |bytes| {
@@ -685,13 +669,17 @@ mod tests {
     #[test]
     fn encrypted_object_rejects_every_single_header_bit_tamper() {
         let frames = frames();
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
+        let plan = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         let crypto = codec();
         let mut nonces = StorageNonceSequence::random().unwrap();
         let mut stored = Vec::new();
         let stored_len = write_segment_object(
             &plan,
-            &frames,
+            &ReplicationAuthorityFrameSlice::new(&frames),
             Some(&crypto),
             Some(&mut nonces),
             &mut |bytes| {
@@ -723,14 +711,24 @@ mod tests {
     #[test]
     fn object_plan_mismatch_never_emits_beyond_frozen_plan() {
         let frames = frames();
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
+        let plan = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         let mut changed = frames.clone();
         changed.push(frames[0].clone());
         let mut emitted = 0_usize;
-        let error = write_segment_object(&plan, &changed, None, None, &mut |bytes| {
-            emitted += bytes.len();
-            Ok(())
-        })
+        let error = write_segment_object(
+            &plan,
+            &ReplicationAuthorityFrameSlice::new(&changed),
+            None,
+            None,
+            &mut |bytes| {
+                emitted += bytes.len();
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert!(matches!(error, DurabilityError::Corruption { .. }));
         assert_eq!(
@@ -743,7 +741,11 @@ mod tests {
     fn encrypted_object_streams_multi_chunk_segment_without_payload_sized_ciphertext() {
         let frame = frames().into_iter().next().unwrap();
         let frames = std::iter::repeat_n(frame, 3_000).collect::<Vec<_>>();
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
+        let plan = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         assert!(plan.encoded_len().unwrap() > OBJECT_CHUNK_SIZE_U64 * 2);
         let crypto = codec();
         let mut nonces = StorageNonceSequence::random().unwrap();
@@ -751,7 +753,7 @@ mod tests {
         let mut largest_emit = 0_usize;
         let stored_len = write_segment_object(
             &plan,
-            &frames,
+            &ReplicationAuthorityFrameSlice::new(&frames),
             Some(&crypto),
             Some(&mut nonces),
             &mut |bytes| {
@@ -794,14 +796,24 @@ mod tests {
     #[test]
     fn encryption_mode_is_fail_closed_and_plain_object_remains_valid() {
         let frames = frames();
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
+        let plan = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         let crypto = codec();
 
         let mut plaintext = Vec::new();
-        let plaintext_len = write_segment_object(&plan, &frames, None, None, &mut |bytes| {
-            plaintext.extend_from_slice(bytes);
-            Ok(())
-        })
+        let plaintext_len = write_segment_object(
+            &plan,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+            None,
+            None,
+            &mut |bytes| {
+                plaintext.extend_from_slice(bytes);
+                Ok(())
+            },
+        )
         .unwrap();
         verify_segment_object(
             &mut Cursor::new(&plaintext),
@@ -826,7 +838,7 @@ mod tests {
         let mut encrypted = Vec::new();
         let encrypted_len = write_segment_object(
             &plan,
-            &frames,
+            &ReplicationAuthorityFrameSlice::new(&frames),
             Some(&crypto),
             Some(&mut nonces),
             &mut |bytes| {
@@ -850,7 +862,11 @@ mod tests {
     #[test]
     fn encryption_nonce_and_relocation_do_not_change_segment_identity() {
         let frames = frames();
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
+        let plan = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         let crypto = codec();
         let mut first_nonces = StorageNonceSequence::random().unwrap();
         let mut second_nonces = StorageNonceSequence::random().unwrap();
@@ -858,7 +874,7 @@ mod tests {
         let mut second = Vec::new();
         let first_len = write_segment_object(
             &plan,
-            &frames,
+            &ReplicationAuthorityFrameSlice::new(&frames),
             Some(&crypto),
             Some(&mut first_nonces),
             &mut |bytes| {
@@ -869,7 +885,7 @@ mod tests {
         .unwrap();
         let second_len = write_segment_object(
             &plan,
-            &frames,
+            &ReplicationAuthorityFrameSlice::new(&frames),
             Some(&crypto),
             Some(&mut second_nonces),
             &mut |bytes| {

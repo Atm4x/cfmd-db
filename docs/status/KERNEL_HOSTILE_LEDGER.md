@@ -398,3 +398,12 @@ PASS590 is in progress. Authority grammar is now `DurableCut | VolatileFence`; i
 - VERIFIED: kernel-durability 280/0/2, kernel-plan 316/0/11, cfmd-runtime 30/0, workspace check and strict Clippy PASS.
 - OPEN MEASURED PAYER: encoded semantic carrier is still temporarily owned alongside decoded semantic authority. Next R&D may pursue bounded-memory streaming verification only if verify-before-publish semantics remain exact and no second evaluator appears.
 - ROADMAP CORRECTION: PASS593 is not automatically a cleanup PASS. Cleanup/Git checkpoints are selected at architectural branch boundaries when accumulated work warrants consolidation. PASS591 is the last clean/Git-ready checkpoint for the persistence-lineage branch.
+
+## PASS596 CLEAN checkpoint
+- CLOSED: buffered `SegmentPlan::from_frames/write_to` peer API; production publication is frame-source-only.
+- CLOSED: test-only CFAO chain collection back into `Vec<Vec<u8>>`; authoritative tests bind/replay the physical root instead.
+- CLOSED: blanket non-test dead-code suppression on replication segments. Raw CFAI codec/relocation and raw non-CFAO chain replay are explicitly `#[cfg(test)]`.
+- VERIFIED: no CFAS-v1 compatibility path, no semantic-base full-buffer staging fallback, no second replication evaluator.
+- RETAINED BY LAW: pending/live frame vectors represent actual incremental live replication deltas and streaming checkpoint cuts, not canonical semantic-base staging.
+- CLEAN / GIT-READY: PASS596 closes the PASS592–PASS595 replication semantic-carrier branch.
+- NEXT CANDIDATE BRANCH: PASS597 Γ-factorized aggregate productionization R&D, beginning with JointMass capability bridging and hostile admission frontiers.

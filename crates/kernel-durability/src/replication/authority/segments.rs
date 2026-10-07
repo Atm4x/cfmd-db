@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::io::SeekFrom;
+use std::io::{Read, Seek};
 
 use kernel_auth::Sha256Digest;
 use sha2::{Digest, Sha256};
@@ -20,9 +22,13 @@ const SEGMENT_FRAME_COUNT_OFFSET: usize = 80;
 const MAX_SEGMENT_DELTA_LEN: u64 = 1_u64 << 34;
 const MAX_SEGMENT_FRAME_COUNT: u32 = 1 << 20;
 
+#[cfg(test)]
 const INDEX_MAGIC: [u8; 4] = *b"CFAI";
+#[cfg(test)]
 const INDEX_VERSION: u8 = 1;
+#[cfg(test)]
 const INDEX_HEADER_LEN: usize = 48;
+#[cfg(test)]
 const INDEX_ENTRY_LEN: usize = 80;
 const MAX_INDEX_ENTRIES: usize = 65_535;
 
@@ -32,9 +38,7 @@ mod object_codec;
 pub(crate) use locator::{
     ReplicationAuthorityLocatorRoot, locator_stored_len, recover_locator_chain, write_locator_node,
 };
-pub(crate) use object_codec::{
-    collect_segment_object_frames, replay_segment_object, write_segment_object,
-};
+pub(crate) use object_codec::{replay_segment_object, write_segment_object};
 
 fn corruption(reason: &'static str) -> DurabilityError {
     DurabilityError::Corruption { offset: 0, reason }
@@ -84,6 +88,7 @@ impl ReplicationAuthoritySegmentIndex {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn root(&self) -> Option<ReplicationAuthoritySegmentId> {
         self.root
     }
@@ -136,6 +141,7 @@ impl ReplicationAuthoritySegmentIndex {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn relocate(
         &mut self,
         id: ReplicationAuthoritySegmentId,
@@ -250,6 +256,7 @@ impl ReplicationAuthoritySegmentIndex {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Result<Vec<u8>, DurabilityError> {
         self.validate_chain()?;
         let count = u32::try_from(self.entries.len()).map_err(|_| CodecError::LengthOverflow)?;
@@ -281,6 +288,7 @@ impl ReplicationAuthoritySegmentIndex {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DurabilityError> {
         if bytes.len() < INDEX_HEADER_LEN
             || bytes[0..4] != INDEX_MAGIC
@@ -356,38 +364,6 @@ pub(crate) trait ReplicationAuthorityFrameSource {
     ) -> Result<(), DurabilityError>;
 }
 
-impl ReplicationAuthorityFrameSource for Vec<Vec<u8>> {
-    fn is_empty(&self) -> bool {
-        Vec::is_empty(self)
-    }
-
-    fn for_each_frame(
-        &self,
-        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
-    ) -> Result<(), DurabilityError> {
-        for frame in self {
-            emit(frame)?;
-        }
-        Ok(())
-    }
-}
-
-impl ReplicationAuthorityFrameSource for [Vec<u8>] {
-    fn is_empty(&self) -> bool {
-        <[Vec<u8>]>::is_empty(self)
-    }
-
-    fn for_each_frame(
-        &self,
-        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
-    ) -> Result<(), DurabilityError> {
-        for frame in self {
-            emit(frame)?;
-        }
-        Ok(())
-    }
-}
-
 pub(crate) struct ReplicationAuthorityFrameSlice<'a> {
     frames: &'a [Vec<u8>],
 }
@@ -423,13 +399,6 @@ pub(crate) struct ReplicationAuthoritySegmentPlan {
 }
 
 impl ReplicationAuthoritySegmentPlan {
-    pub(crate) fn from_frames(
-        parent: Option<ReplicationAuthoritySegmentId>,
-        frames: &[Vec<u8>],
-    ) -> Result<Self, DurabilityError> {
-        Self::from_source(parent, &ReplicationAuthorityFrameSlice::new(frames))
-    }
-
     pub(crate) fn from_source<S: ReplicationAuthorityFrameSource + ?Sized>(
         parent: Option<ReplicationAuthoritySegmentId>,
         source: &S,
@@ -452,14 +421,6 @@ impl ReplicationAuthoritySegmentPlan {
             .map_err(|_| DurabilityError::PayloadTooLarge)?
             .checked_add(self.delta_len)
             .ok_or(DurabilityError::PayloadTooLarge)
-    }
-
-    pub(crate) fn write_to(
-        &self,
-        frames: &[Vec<u8>],
-        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
-    ) -> Result<(), DurabilityError> {
-        self.write_source_to(&ReplicationAuthorityFrameSlice::new(frames), emit)
     }
 
     pub(crate) fn write_source_to<S: ReplicationAuthorityFrameSource + ?Sized>(
@@ -721,68 +682,6 @@ fn verify_segment_reader(
     Ok(())
 }
 
-fn collect_verified_segment_reader(
-    reader: &mut dyn Read,
-    expected_len: u64,
-    expected_id: ReplicationAuthoritySegmentId,
-    expected_parent: Option<ReplicationAuthoritySegmentId>,
-) -> Result<Vec<Vec<u8>>, DurabilityError> {
-    let mut header = [0_u8; SEGMENT_HEADER_LEN];
-    reader.read_exact(&mut header)?;
-    let (id, parent, delta_len, frame_count) = decode_segment_header(&header)?;
-    if id != expected_id || parent != expected_parent {
-        return Err(corruption(
-            "verified replication authority segment binding changed before collection",
-        ));
-    }
-    let encoded_len = u64::try_from(SEGMENT_HEADER_LEN)
-        .map_err(|_| CodecError::LengthOverflow)?
-        .checked_add(delta_len)
-        .ok_or(CodecError::LengthOverflow)?;
-    if encoded_len != expected_len {
-        return Err(corruption(
-            "verified replication authority segment extent changed before collection",
-        ));
-    }
-    let mut frames =
-        Vec::with_capacity(usize::try_from(frame_count).map_err(|_| CodecError::LengthOverflow)?);
-    let mut consumed = 0_u64;
-    for _ in 0..frame_count {
-        let mut frame_header = [0_u8; FRAME_HEADER_LEN];
-        reader.read_exact(&mut frame_header)?;
-        let payload_len = usize::try_from(read_u32(&frame_header[8..12]))
-            .map_err(|_| CodecError::LengthOverflow)?;
-        if payload_len > MAX_PAYLOAD_LEN {
-            return Err(DurabilityError::PayloadTooLarge);
-        }
-        let frame_len = FRAME_HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or(CodecError::LengthOverflow)?;
-        consumed = consumed
-            .checked_add(u64::try_from(frame_len).map_err(|_| CodecError::LengthOverflow)?)
-            .ok_or(CodecError::LengthOverflow)?;
-        if consumed > delta_len {
-            return Err(corruption(
-                "verified replication authority segment frame exceeds delta length",
-            ));
-        }
-        let mut frame = Vec::new();
-        frame
-            .try_reserve_exact(frame_len)
-            .map_err(|_| DurabilityError::PayloadTooLarge)?;
-        frame.extend_from_slice(&frame_header);
-        frame.resize(frame_len, 0);
-        reader.read_exact(&mut frame[FRAME_HEADER_LEN..])?;
-        frames.push(frame);
-    }
-    if consumed != delta_len {
-        return Err(corruption(
-            "verified replication authority segment delta has trailing bytes",
-        ));
-    }
-    Ok(frames)
-}
-
 fn replay_verified_segment_reader(
     reader: &mut dyn Read,
     expected_len: u64,
@@ -845,6 +744,7 @@ fn replay_verified_segment_reader(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn replay_indexed_segment_chain<R: Read + Seek>(
     reader: &mut R,
     index: &ReplicationAuthoritySegmentIndex,
@@ -857,25 +757,6 @@ pub(crate) fn replay_indexed_segment_chain<R: Read + Seek>(
         replay_verified_segment_reader(reader, entry.extent.len, id, entry.parent, journal)?;
     }
     Ok(())
-}
-
-pub(crate) fn collect_indexed_segment_object_chain_frames<R: Read + Seek>(
-    reader: &mut R,
-    index: &ReplicationAuthoritySegmentIndex,
-    crypto: Option<&crate::storage_encryption::StorageAeadCodec>,
-) -> Result<Vec<Vec<u8>>, DurabilityError> {
-    let mut frames = Vec::new();
-    for (id, entry) in index.chain_oldest_first()? {
-        frames.extend(collect_segment_object_frames(
-            reader,
-            entry.extent.offset,
-            entry.extent.len,
-            id,
-            entry.parent,
-            crypto,
-        )?);
-    }
-    Ok(frames)
 }
 
 pub(crate) fn replay_indexed_segment_object_chain<R: Read + Seek>(
@@ -938,25 +819,37 @@ mod tests {
         source.commit_single_file_frames(second_frames.clone());
         let expected = ReplicationAuthoritySemanticSnapshot::capture(&source);
 
-        let first = ReplicationAuthoritySegmentPlan::from_frames(None, &first_frames)
-            .expect("plan first segment");
-        let second = ReplicationAuthoritySegmentPlan::from_frames(Some(first.id()), &second_frames)
-            .expect("plan second segment");
+        let first = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&first_frames),
+        )
+        .expect("plan first segment");
+        let second = ReplicationAuthoritySegmentPlan::from_source(
+            Some(first.id()),
+            &ReplicationAuthorityFrameSlice::new(&second_frames),
+        )
+        .expect("plan second segment");
 
         let mut physical = vec![0xA5; 37];
         let first_offset = u64::try_from(physical.len()).unwrap();
         first
-            .write_to(&first_frames, &mut |bytes| {
-                physical.extend_from_slice(bytes);
-                Ok(())
-            })
+            .write_source_to(
+                &ReplicationAuthorityFrameSlice::new(&first_frames),
+                &mut |bytes| {
+                    physical.extend_from_slice(bytes);
+                    Ok(())
+                },
+            )
             .expect("write first segment");
         let second_offset = u64::try_from(physical.len()).unwrap();
         second
-            .write_to(&second_frames, &mut |bytes| {
-                physical.extend_from_slice(bytes);
-                Ok(())
-            })
+            .write_source_to(
+                &ReplicationAuthorityFrameSlice::new(&second_frames),
+                &mut |bytes| {
+                    physical.extend_from_slice(bytes);
+                    Ok(())
+                },
+            )
             .expect("write second segment");
 
         let mut index = ReplicationAuthoritySegmentIndex::empty();
@@ -999,17 +892,23 @@ mod tests {
         let mut relocated_bytes = vec![0x5A; 113];
         let relocated_first = u64::try_from(relocated_bytes.len()).unwrap();
         first
-            .write_to(&first_frames, &mut |bytes| {
-                relocated_bytes.extend_from_slice(bytes);
-                Ok(())
-            })
+            .write_source_to(
+                &ReplicationAuthorityFrameSlice::new(&first_frames),
+                &mut |bytes| {
+                    relocated_bytes.extend_from_slice(bytes);
+                    Ok(())
+                },
+            )
             .unwrap();
         let relocated_second = u64::try_from(relocated_bytes.len()).unwrap();
         second
-            .write_to(&second_frames, &mut |bytes| {
-                relocated_bytes.extend_from_slice(bytes);
-                Ok(())
-            })
+            .write_source_to(
+                &ReplicationAuthorityFrameSlice::new(&second_frames),
+                &mut |bytes| {
+                    relocated_bytes.extend_from_slice(bytes);
+                    Ok(())
+                },
+            )
             .unwrap();
         let mut relocated_index = decoded_index.clone();
         relocated_index
@@ -1062,12 +961,19 @@ mod tests {
             })
             .unwrap();
         let frames = source.take_pending_single_file_frames();
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
+        let plan = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         let mut physical = Vec::new();
-        plan.write_to(&frames, &mut |bytes| {
-            physical.extend_from_slice(bytes);
-            Ok(())
-        })
+        plan.write_source_to(
+            &ReplicationAuthorityFrameSlice::new(&frames),
+            &mut |bytes| {
+                physical.extend_from_slice(bytes);
+                Ok(())
+            },
+        )
         .unwrap();
         *physical.last_mut().expect("non-empty segment") ^= 1;
 
@@ -1106,8 +1012,16 @@ mod tests {
             })
             .unwrap();
         let frames = source.take_pending_single_file_frames();
-        let base = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
-        let child = ReplicationAuthoritySegmentPlan::from_frames(Some(base.id()), &frames).unwrap();
+        let base = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
+        let child = ReplicationAuthoritySegmentPlan::from_source(
+            Some(base.id()),
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         let mut index = ReplicationAuthoritySegmentIndex::empty();
         index
             .insert(
@@ -1147,8 +1061,16 @@ mod tests {
             })
             .unwrap();
         let frames = source.take_pending_single_file_frames();
-        let base = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
-        let child = ReplicationAuthoritySegmentPlan::from_frames(Some(base.id()), &frames).unwrap();
+        let base = ReplicationAuthoritySegmentPlan::from_source(
+            None,
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
+        let child = ReplicationAuthoritySegmentPlan::from_source(
+            Some(base.id()),
+            &ReplicationAuthorityFrameSlice::new(&frames),
+        )
+        .unwrap();
         assert_ne!(base.id(), child.id());
     }
 }

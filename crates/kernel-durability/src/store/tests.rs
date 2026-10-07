@@ -7050,15 +7050,6 @@ fn single_file_replication_authority_replays_live_wal_and_survives_rotation() {
     assert_eq!(scan.durable_revision(), base.id());
     assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
     reopened.rotate_checkpoint(&base).unwrap();
-    assert!(
-        !reopened
-            .backend
-            .single_file_container()
-            .unwrap()
-            .portable_replication_authority_frames()
-            .unwrap()
-            .is_empty()
-    );
     let authority_binding = reopened
         .backend
         .single_file_container()

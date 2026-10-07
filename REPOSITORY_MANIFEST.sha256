@@ -5,7 +5,7 @@ f301333cf7734ca85a679d8948063b18ba174f2768a7bf30fa95ed2a1a8c425d  ./.github/pull
 3cb19cd7f3c7c6065976dde935fa63d01c7af82062716eacc9c1264517c25a2e  ./.github/workflows/lean.yml
 532aef6a0cad97bb92eaec9fdbc9431572ddd37bdb2914741e56a4dc595c6130  ./.github/workflows/rust.yml
 a9866414fb50193fc9f7c4af8b0898508db6fabd3c9c935c4f10144aa24367a8  ./.gitignore
-ebd4173697a7ceaad5c00f690b97d1fdd31fbc3f4dc1bd1d7b6fddd90f05beb6  ./CHANGELOG.md
+37f819db50dfd910d99cd99bf58a2ea382738758f8d6f397eab6ab584f4d0c06  ./CHANGELOG.md
 2eec174c7994184800b57bb8921ccb1302e48caa5b564282368121dbdf02704d  ./CONTRIBUTING.md
 4059cfc2c665b5aa7d52ac1d405cb655d14039a6bf5ffadbfbc79ee58136598e  ./Cargo.lock
 d0c706e953d9286dc4bb2a610e9b86b9dfd3aec01fad28784fb68251ec3e0294  ./Cargo.toml
@@ -981,7 +981,7 @@ c6aaab8db488ae2191cc3ae463ea54af987c111153d4ef34a4c67541c2fc55d0  ./crates/kerne
 84f111a28443ef60f7f75eacb3b703b5e1906135cafd4626ec22fad7dc50aaf1  ./crates/kernel-durability/src/platform_assurance.rs
 7f50e6549b450c6ac2be0d6768e43265684968970552c22094812f5bca7b63e9  ./crates/kernel-durability/src/realization.rs
 2b9c8d313183c55e79ea6a8a66a11bfcef35b4acc252473b4b53da1b31d7abd0  ./crates/kernel-durability/src/replication.rs
-7cc8f6ee88adf0b8474684f580d47812ef8bf46e9491826bd87be5adeaaff395  ./crates/kernel-durability/src/replication/authority.rs
+bba1f65bc6994cb8f6f1c3df994be8e936eab40eb40339abdc034bdb7e639e52  ./crates/kernel-durability/src/replication/authority.rs
 2511eccdcc9b93adf03f25a8cb9f921c575ba34c3df1e4f7ddcde66614d84233  ./crates/kernel-durability/src/replication/authority/authentication.rs
 6ba5c38e64174f84d873d9ce3dcaddfe34c5565bccaa08505a3929b2e45e7d27  ./crates/kernel-durability/src/replication/authority/availability.rs
 48e5566b46c6688a4294ca480ce3f006e1ae8c0ba3f58ef864299d448afe4f62  ./crates/kernel-durability/src/replication/authority/decision.rs
@@ -991,9 +991,9 @@ ace2715277b4a554b2398b27476419899b787f76709b8e6ea18d22e4e4e713fe  ./crates/kerne
 040ca6e2e8beb58afbb5798e11a8edc2b1d505673af9798a15a50b3b29f2abc9  ./crates/kernel-durability/src/replication/authority/lifecycle.rs
 b2447430465b4779d8ff20643ff8f02eb7153f5dcdf1e0cc2d978b0c8e813885  ./crates/kernel-durability/src/replication/authority/membership.rs
 0f5d1aa96714f192139a9b47f9f9885d83d8b66288bddcdbf98cdd828efad0b3  ./crates/kernel-durability/src/replication/authority/replay.rs
-96bfe8a93c0c08af7b79635910ca429096fb42a12d17766e0b4b5d40718ab401  ./crates/kernel-durability/src/replication/authority/segments.rs
+2a0a9b45ac4bd13102c5326b7d767ea6a87dde5696025146e048464b8ab70f44  ./crates/kernel-durability/src/replication/authority/segments.rs
 619ec365f827dc1eb21947e90dcf099b7a3f8231616f5b0c3a90d79f1d5b6d72  ./crates/kernel-durability/src/replication/authority/segments/locator.rs
-441c3db06a38cdcd049e51b89b69622e015272df3d0cada53bd15e2896015e07  ./crates/kernel-durability/src/replication/authority/segments/object_codec.rs
+2f16dfc0d9dc8f6fd68509bf3f041f8126beb81a56f00607500e46cba9c3d485  ./crates/kernel-durability/src/replication/authority/segments/object_codec.rs
 a37aec9dc2c98f276b64a9ab4655b27e130a2a64904f65b30c14da84cc09f912  ./crates/kernel-durability/src/replication/authority/semantic_snapshot.rs
 9ac17dcfa2bb55c34741afac35651047693e57fa27cd26dbc4c845482d783b51  ./crates/kernel-durability/src/replication/authority/semantic_snapshot/codec.rs
 e6869c7c2a1f445ead7e3a20c65f28b3d9261e7fbcd6cd7a7aab63576c874e0c  ./crates/kernel-durability/src/replication/codec.rs
@@ -1009,7 +1009,7 @@ e1e8215fee32e0cfd6b57ce5a79b10d44700193505f9d894f1a59ec7843fcca5  ./crates/kerne
 60356ca6e79cf68b06c802993e11fe597e1b3a5fa47483da90dbdca5672540f6  ./crates/kernel-durability/src/runtime/error.rs
 222378370425652c198506d9afdf73cd50362c6da7c3fd019139e6d537f6c1f3  ./crates/kernel-durability/src/runtime/protocol.rs
 8e3c42fe013a368a669c933faf2e338ce6ce26a7cc86c49fc531a9992f9310f9  ./crates/kernel-durability/src/runtime/recovery.rs
-e17aad0e94c4784614b0f240cf9a6ea02d1a15ee6aa93e8915ed5c4750810dbc  ./crates/kernel-durability/src/single_file.rs
+b01b3078f957ae925f3031e2ffe6fc76cf6cbd8bc573a62f1e211628cd00fdbb  ./crates/kernel-durability/src/single_file.rs
 99c528e187a00b84e201a37ee8834044aae35a905980cd2d92b9e4d2a10b74ac  ./crates/kernel-durability/src/single_file/compaction_io.rs
 a94e523db098958664c5667b4627943de7e9e37a14c31b2767aab66f68d1322e  ./crates/kernel-durability/src/single_file/compaction_protocol.rs
 3859bff2208c76944355909656768089ad68af978d7c7adbebaac82bde8a4029  ./crates/kernel-durability/src/storage_encryption.rs
@@ -1045,7 +1045,7 @@ c72f634a11088a63bea1cbee37027b3e3c6a17f763d20f684382b65d07a2c725  ./crates/kerne
 3ff4b78b5b9b0ba6a09dcf3b92b61603c66901d491469620e82ba5e582d82b40  ./crates/kernel-durability/src/store/semantic_deployment.rs
 6cdce0837dca97131b7647221804ade83eb88880d59bf8f58f1b3279f9e04146  ./crates/kernel-durability/src/store/single_file_backend.rs
 52354d9d5d80fdbccd2bec091a65c297979941a32e23429b8fc77ec23eece93c  ./crates/kernel-durability/src/store/streaming_checkpoint.rs
-9a755cb13a127fc03c4deef39ea120551b2141540806d26839624588eec56bd2  ./crates/kernel-durability/src/store/tests.rs
+7899940fbfbaa9b865c5c79cad25935c890317cb8361e61ba2259b1bf920adcb  ./crates/kernel-durability/src/store/tests.rs
 1d7511854539816d67022de31a70806b3c2ef6a7552aa39c5879f8cf7cd06245  ./crates/kernel-durability/src/store/transition.rs
 cd99faa76d31bacbe5fbf58366fb75d139d4da82a1925a4329a8d1773c42d8c4  ./crates/kernel-durability/src/tests.rs
 b113eef91c8a90baf08bc9ea0f53c8f088bf8c74fe1429a094cd2a73a533fb5e  ./crates/kernel-durability/src/wal.rs
@@ -2026,6 +2026,7 @@ c1e12cdd9866f6556b7d163d081d9f55ade51602c542140c7c1650f6fa7efa6b  ./docs/reports
 2078625b98fdbdf62f283023b83a3e092116071b0aeaf4fb616a8bcac86f67f6  ./docs/reports/current/PASS593_REPORT.md
 9ac6ddce23a3d36ad7ea945a5ac7cd7828d8b110484cdb7e2c062b66b3f4a3c9  ./docs/reports/current/PASS594_REPORT.md
 b5c0dddb5c43a907694fae4a8cdbf35a93c35ece8b67cb1978cf03f9f442a192  ./docs/reports/current/PASS595_REPORT.md
+5442cf01d339f3934df943e91659fb2f4bc54a3e6ce7c36290463aa5a64f48f9  ./docs/reports/current/PASS596_REPORT.md
 4b601c2cb0832bb1287368bf4e3550197cfea2da84fcea9a810ce2bf9aae6f9f  ./docs/reports/current/RELEASE_PREP_2026-09-28.md
 ff6fa569d832ac3a907069614631eb8cc88ac93c639a2f88e03a977913b203e7  ./docs/rnd/CFMD_BOUNDED_RELATION_DELTA_OVERLAY_PASS403.md
 ef736e48b8b7e71b47ff702864ff4e5e23b3f144c78d3b930eff74ca44ea6e01  ./docs/rnd/CFMD_BRIDGED_CONTEXT_ACTIVATION_PASS539.md
@@ -2090,11 +2091,11 @@ ee9a9ce18c2388f7f85098aec678d05a8b356d424c73bb57e0c85ce1198e4220  ./docs/rnd/SEC
 cfd81f82c06cf93a291c3b200977a7c45a02cfb72606ad5689101646a0111abe  ./docs/spec/CFMD_DURABLE_FORMAT_V1.md
 fa292a3e8bc5c26c7849d10b7c75a9797a62a4e9d055245786a8e190b383c5b4  ./docs/status/GITHUB_CHECKPOINT_PASS507.md
 daf7370f65f994917d0bd776f4a481069f8f0db1b23851c137490111c9235cc7  ./docs/status/HISTORICAL_PROBLEMS_LEDGER.md
-478059d2a9bf5c6843c9c63492a0e9e83bc8f67beb83599600805805cfd8ce03  ./docs/status/KERNEL_HOSTILE_LEDGER.md
+bbdd4fd7362fe9042ba51c590309dc5775d634427ea5472ba41cadd39a66bed1  ./docs/status/KERNEL_HOSTILE_LEDGER.md
 6385cb9188fbda828ba1808ca2a2250b239ee79185d5b42e575bd6d67277f9e6  ./docs/status/KERNEL_VERSION_COMPAT_INVENTORY.md
-b6fdd01ba09aab024807072368dedc2b7dba0baaefaf846a74586f4c17f194be  ./docs/status/POST_PASS400_MASTER_LEDGER.md
-babe8bb00b1c37e14ff07d14f79625e78f5bead218b3cf43df3502f8deadcdcd  ./docs/status/PRODUCTIZATION_LEDGER.md
-d641b51a7a77102bffa29b85d18e3c8a07a9f644d8dbd16a0574d71ee2f8d801  ./docs/status/PROJECT_STATUS.md
+4b2bf9bfa1d7f43e36f639abb903954b13c7d799ce33e3652013f17275ecb4f7  ./docs/status/POST_PASS400_MASTER_LEDGER.md
+9c415c1619837846eb0c1c5ce33008e2d68e760e7903a6fb2817da4a8517817a  ./docs/status/PRODUCTIZATION_LEDGER.md
+17f22b495f79ec93cef6b769a5a70bd1f08169a7847fa1656193d3d2eb2b0f72  ./docs/status/PROJECT_STATUS.md
 2590157500b0906d4ce994843276d6b92a48e737deea6482d9a9f90bbb01094c  ./docs/status/REPOSITORY_LAYOUT.md
 c2b3c75676b17f8f20927e0c533f84f66b22a4ea66f364dae5f970a14acf3ff7  ./docs/status/SEMANTIC_FIBER_UNIFICATION_LEDGER.md
 5c7727a4cd29fc4c09f229330f841ba5e90647137e052dad06acf1983b77c664  ./docs/status/SUPPORT_MATRIX.md

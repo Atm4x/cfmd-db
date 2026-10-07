@@ -858,3 +858,9 @@
 - Integrated proof-checked Set-CQ semantic interning for equivalent multi-root maintained observations without replacing structural/durable query identity.
 - Kept Γ-factorized aggregate work in R&D/test/example scope pending production admission proofs.
 - Added one replayable replication-authority frame-source abstraction and streamed semantic-base staging directly into existing `CFAS/CFAO` publication instead of retaining the complete encoded frame sequence in memory.
+
+## PASS596
+- Consolidated the PASS592–PASS595 replication semantic-carrier branch into a Git-ready checkpoint without adding feature semantics.
+- Removed buffered replication-segment convenience APIs and test-only CFAO frame collection from the active module surface.
+- Removed the blanket replication-segment dead-code suppression; raw CFAI codec/relocation and raw non-CFAO chain replay are explicitly test-only.
+- Verified one production replication-authority publication path: replayable frame source -> CFAS v2 -> CFAO -> CFLN.

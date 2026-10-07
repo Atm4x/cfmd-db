@@ -9830,3 +9830,36 @@ The active publication law now uses exactly two source traversals: one to know t
 - PASS594: bounded target staging + CQ interning integration — CLOSED.
 - PASS595: minimum-traversal authenticated publication — CLOSED.
 - PASS596: branch-level hostile consolidation / candidate CLEAN + Git-ready checkpoint — NEXT.
+
+## PASS596 — replication semantic-carrier branch hostile consolidation / CLEAN + Git-ready
+
+### LEDGER — GOAL
+Consolidate the completed PASS592–PASS595 replication-authority semantic-carrier branch plus the orthogonal PASS594 certified CQ integration. Add no new feature semantics. Remove stale buffered/raw physical routes, prove that CFAS v2 + CFAO + CFLN is the only production authority publication path, run full acceptance, and establish the next Git-ready repository checkpoint.
+
+### LEDGER — SELECTED CLEANUP
+- Keep one production `ReplicationAuthorityFrameSource` publication abstraction and the explicit `ReplicationAuthorityFrameSlice` adapter used by real incremental delta batches.
+- Remove buffered convenience APIs that made `Vec<Vec<u8>>` appear to be a peer physical publication path.
+- Keep raw CFAI index serialization/relocation and raw non-CFAO segment-chain replay only as unit-test substrate; they are not production format/runtime authority.
+- Remove the module-wide non-test `dead_code` suppression instead of hiding those distinctions.
+- Keep `pending_single_file_frames` / `live_single_file_frames`: they are the actual bounded incremental replication-delta/WAL authority used by live commits and streaming cuts, not a semantic-base staging fallback.
+
+### LEDGER — IMPLEMENTED
+- Removed `ReplicationAuthoritySegmentPlan::{from_frames, write_to}` and direct `ReplicationAuthorityFrameSource` implementations for `Vec<Vec<u8>>` / `[Vec<u8>]`; tests now exercise the same explicit frame-source adapter as production.
+- Removed the test-only authenticated-object-to-`Vec<Vec<u8>>` collection path and the `portable_replication_authority_frames` test hook.
+- Removed the blanket `#[cfg_attr(not(test), allow(dead_code))]` from the replication segment module.
+- Gated CFAI test codec helpers (`encode/decode/root/relocate`) and raw pre-CFAO segment replay to `#[cfg(test)]` explicitly.
+- Hostile search found no CFAS-v1 compatibility reader/writer, no semantic-base full-buffer staging route, and no second replication evaluator.
+- Confirmed Γ-factorized aggregate code remains `#[cfg(test)]`; PASS594 production integration contains only certified CQ semantic identity/intering.
+
+### CLOSED THIS CHECKPOINT
+- PASS592 semantic carrier: physical journal-history transfer payer.
+- PASS593 replay full-carrier buffer payer.
+- PASS594 semantic-base physical staging buffer payer.
+- PASS595 redundant replayable-source traversal payer; two traversals remain the selected lower-bound law under content-addressed authenticated-object publication.
+- Buffered/raw segment convenience API and blanket dead-code suppression discovered during consolidation.
+
+### CLEAN / GIT-READY AUTHORITY
+PASS596 is the Git-ready checkpoint for the replication semantic-carrier branch and the PASS594 certified CQ integration. The previous Git-ready checkpoint remains PASS591 for the persistence-lineage branch.
+
+### NEXT ARCHITECTURAL BRANCH
+PASS597 may open the Γ-factorized aggregate productionization line. Start with the `JointMass` capability bridge and hostile skew / high-distinct / self-join / multi-key frontiers. Production admission remains restricted to certified equality-join `COUNT` and `GROUP BY join-key + COUNT` shapes until exact laws justify any extension.
