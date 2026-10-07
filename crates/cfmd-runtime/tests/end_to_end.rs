@@ -17,6 +17,160 @@ fn temp_directory() -> std::path::PathBuf {
 }
 
 #[test]
+fn memory_database_promotes_in_place_without_semantic_revision_or_handle_cutover() {
+    let path = temp_directory().with_extension("cfmd");
+    let _ = fs::remove_file(&path);
+    let relation = RelationId::new(78_100);
+    let equivalence = EquivalenceId::new(78_101);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("build memory schema");
+    let database = Database::memory_from_schema(schema).expect("create memory database");
+    assert!(database.is_memory());
+
+    let retained_handle = database.clone();
+    let retained_snapshot = database.snapshot().expect("memory snapshot");
+    let source_revision = retained_snapshot.revision();
+    let mut plan = database.plan().expect("memory plan");
+    plan.insert(relation, vec![Value::I64(578)]);
+    database
+        .commit_plan(&plan, TransactionId::new(78_001))
+        .expect("memory commit");
+    let promoted_revision = database
+        .snapshot()
+        .expect("post-commit snapshot")
+        .revision();
+
+    database.persist(&path).expect("promote memory database");
+    assert!(!database.is_memory());
+    assert!(!retained_handle.is_memory());
+    assert_eq!(retained_snapshot.revision(), source_revision);
+    assert_eq!(
+        retained_handle
+            .snapshot()
+            .expect("retained handle snapshot")
+            .revision(),
+        promoted_revision
+    );
+
+    drop(retained_snapshot);
+    drop(retained_handle);
+    drop(database);
+    let reopened = Database::open(&path).expect("reopen promoted database");
+    let reopened_snapshot = reopened.snapshot().expect("promoted snapshot");
+    assert_eq!(reopened_snapshot.revision(), promoted_revision);
+    assert_eq!(
+        reopened_snapshot
+            .execute(&Query::scan(relation))
+            .expect("scan promoted database"),
+        RelationResult::Bag(vec![vec![Value::I64(578)]])
+    );
+
+    drop(reopened_snapshot);
+    drop(reopened);
+    fs::remove_file(path).expect("remove promoted database");
+}
+
+#[test]
+fn live_fork_copies_semantic_cut_but_refounds_retry_identity_and_diverges_independently() {
+    let path = temp_directory().with_extension("fork.cfmd");
+    let _ = fs::remove_file(&path);
+    let relation = RelationId::new(78_200);
+    let equivalence = EquivalenceId::new(78_201);
+    let schema = Schema::builder()
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("build fork schema");
+    let source = Database::memory_from_schema(schema).expect("create fork source");
+
+    let mut seed = source.plan().expect("seed source");
+    seed.insert(relation, vec![Value::I64(1)]);
+    source
+        .commit_plan(&seed, TransactionId::new(78_201_001))
+        .expect("seed source");
+
+    let fork = source
+        .fork_to(&path, &cfmd_runtime::Encryption::None)
+        .expect("fork live database");
+    assert_eq!(
+        source.snapshot().unwrap().revision(),
+        fork.snapshot().unwrap().revision()
+    );
+
+    let mut source_next = source.plan().expect("source divergence plan");
+    source_next.insert(relation, vec![Value::I64(2)]);
+    source
+        .commit_plan(&source_next, TransactionId::new(78_201_002))
+        .expect("source divergence commit");
+
+    let mut fork_next = fork.plan().expect("fork divergence plan");
+    fork_next.insert(relation, vec![Value::I64(3)]);
+    let fork_outcome = fork
+        .commit_plan(&fork_next, TransactionId::new(78_201_001))
+        .expect("source transaction id must be fresh in fork authority");
+    assert!(matches!(fork_outcome, CommitOutcome::Committed { .. }));
+
+    assert_eq!(
+        source
+            .snapshot()
+            .unwrap()
+            .execute(&Query::scan(relation))
+            .unwrap(),
+        RelationResult::Bag(vec![vec![Value::I64(1)], vec![Value::I64(2)]])
+    );
+    assert_eq!(
+        fork.snapshot()
+            .unwrap()
+            .execute(&Query::scan(relation))
+            .unwrap(),
+        RelationResult::Bag(vec![vec![Value::I64(1)], vec![Value::I64(3)]])
+    );
+
+    drop(fork);
+    let reopened = Database::open(&path).expect("reopen fork");
+    assert_eq!(
+        reopened
+            .snapshot()
+            .unwrap()
+            .execute(&Query::scan(relation))
+            .unwrap(),
+        RelationResult::Bag(vec![vec![Value::I64(1)], vec![Value::I64(3)]])
+    );
+    drop(reopened);
+    drop(source);
+    fs::remove_file(path).expect("remove fork target");
+}
+
+#[test]
+fn persistence_transition_is_one_way_and_rejects_second_target_before_creation() {
+    let first = temp_directory().with_extension("first.cfmd");
+    let second = temp_directory().with_extension("second.cfmd");
+    let _ = fs::remove_file(&first);
+    let _ = fs::remove_file(&second);
+    let schema = Schema::builder()
+        .revisions(578, 2)
+        .build()
+        .expect("build memory schema");
+    let database = Database::memory_from_schema(schema).expect("create memory database");
+    database
+        .persist(&first)
+        .expect("first persistence transition");
+    let error = database
+        .persist(&second)
+        .expect_err("durable database must not transition through memory persist again");
+    assert_eq!(error.kind(), cfmd_runtime::ErrorKind::InvalidPlan);
+    assert!(
+        !second.exists(),
+        "rejected transition must not stage a target"
+    );
+    drop(database);
+    fs::remove_file(first).expect("remove first target");
+}
+
+#[test]
 fn product_api_creates_opens_queries_and_commits_without_kernel_imports() {
     let directory = temp_directory();
     fs::create_dir_all(&directory).expect("create fixture directory");
@@ -2499,7 +2653,7 @@ fn provider_database_key_epoch_floor_rejects_complete_header_rollback() {
     let old_header = before[..4096].to_vec();
     assert_eq!(
         database
-            .rewrap_encryption(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(
+            .reconfigure_protection(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(
                 &next_provider,
             )))
             .expect("rewrap provider authority"),
@@ -2621,7 +2775,7 @@ fn provider_acknowledgement_failure_recovers_and_retries_pending_handoff() {
 
     assert!(
         database
-            .rewrap_encryption(&Encryption::aes256_gcm_siv_with_provider(pending))
+            .reconfigure_protection(&Encryption::aes256_gcm_siv_with_provider(pending))
             .is_err(),
         "external acknowledgement failure must be surfaced after local pending publication"
     );
@@ -2634,7 +2788,7 @@ fn provider_acknowledgement_failure_recovers_and_retries_pending_handoff() {
         .expect("old acknowledged authority remains recoverable while handoff is pending");
     assert_eq!(
         recovered
-            .rewrap_encryption(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(&next)))
+            .reconfigure_protection(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(&next)))
             .expect("retry pending handoff"),
         2
     );
@@ -2750,7 +2904,7 @@ fn provider_rotation_rewraps_dmk_without_rewriting_database_ciphertext() {
     let data_offset = 4096 * 3;
     let data_before = before[data_offset..].to_vec();
     let key_epoch = database
-        .rewrap_encryption(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(
+        .reconfigure_protection(&Encryption::aes256_gcm_siv_with_provider(Arc::clone(
             &new_provider,
         )))
         .expect("rewrap DMK");
@@ -3057,8 +3211,8 @@ fn history_inverse_preserves_object_action_authority_instead_of_raw_relation_wri
 }
 
 #[test]
-fn roles_flatten_into_exact_permissions_and_model_metadata_is_separate_authority() {
-    use cfmd_runtime::{ErrorKind, Object, Permission, PermissionSet, PrincipalId, Role, Session};
+fn exact_permissions_and_model_metadata_are_separate_authority() {
+    use cfmd_runtime::{ErrorKind, Object, Permission, PermissionSet, PrincipalId, Session};
 
     let directory = temp_directory();
     fs::create_dir_all(&directory).expect("create fixture directory");
@@ -3077,11 +3231,11 @@ fn roles_flatten_into_exact_permissions_and_model_metadata_is_separate_authority
         .expect("country relation")
         .column_ids()[1];
 
-    let reader = Role::new("country-code-reader").grant(Permission::ReadField {
+    let reader = PermissionSet::from([Permission::ReadField {
         relation: Country::relation_id(),
         field: code_field,
-    });
-    let observer = database.session(Session::from_roles(PrincipalId::new(442_001), [&reader]));
+    }]);
+    let observer = database.session(Session::new(PrincipalId::new(442_001), reader.clone()));
     let snapshot = observer.snapshot().expect("field reader snapshot");
     assert_eq!(snapshot.schema_revision(), 1);
     assert_eq!(
@@ -3092,10 +3246,9 @@ fn roles_flatten_into_exact_permissions_and_model_metadata_is_separate_authority
         ErrorKind::PermissionDenied
     );
 
-    let model_reader = Role::new("model-reader").grant(Permission::ModelRead);
-    let observer = database.session(Session::from_roles(
+    let observer = database.session(Session::new(
         PrincipalId::new(442_002),
-        [&reader, &model_reader],
+        reader.clone().with(Permission::ModelRead),
     ));
     let snapshot = observer.snapshot().expect("model reader snapshot");
     assert_eq!(
@@ -3106,13 +3259,194 @@ fn roles_flatten_into_exact_permissions_and_model_metadata_is_separate_authority
         snapshot.schema_revision()
     );
 
-    assert_eq!(reader.name(), "country-code-reader");
-    assert!(
-        PermissionSet::from_roles([&reader]).contains(Permission::ReadField {
-            relation: Country::relation_id(),
-            field: code_field,
-        })
+    assert!(reader.contains(Permission::ReadField {
+        relation: Country::relation_id(),
+        field: code_field,
+    }));
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+cfmd_runtime::cfmd_entity! {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AuthorizedTeam => AuthorizedTeamFields("example.auth.team") {
+        id pub id;
+        fields { pub name: String }
+        refs { }
+        optional_refs { }
+        many { pub members: AuthorizedMember }
+    }
+}
+
+cfmd_runtime::cfmd_entity! {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AuthorizedMember => AuthorizedMemberFields("example.auth.member") {
+        id pub id;
+        fields { pub label: String }
+        refs { }
+        optional_refs { }
+        many { }
+    }
+}
+
+#[test]
+fn schema_owned_role_capabilities_compile_to_exact_permissions_and_survive_reopen() {
+    use cfmd_runtime::{AccessCapability, Object, Permission, PrincipalId, Role, Session};
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+
+    let read_code = AccessCapability::new("example.cap.country-code-read")
+        .read_field::<Country, String, _>(CountryFields::code);
+    let edit_code = AccessCapability::new("example.cap.country-code-write")
+        .write_field::<Country, String, _>(CountryFields::code);
+    let reader = Role::new("example.role.country-reader").capability(&read_code);
+    let manager = Role::new("example.role.country-manager")
+        .include(&reader)
+        .capability(&edit_code);
+
+    let schema = Schema::builder()
+        .object::<Country>()
+        .access_capability(read_code.clone())
+        .access_capability(edit_code.clone())
+        .role(reader.clone())
+        .role(manager.clone())
+        .build()
+        .expect("schema policy");
+    let database = Database::create(&directory, schema).expect("create database");
+
+    let view = database
+        .snapshot()
+        .expect("snapshot")
+        .schema()
+        .expect("schema view");
+    let manager_permissions = view
+        .permissions_for_roles([manager.id()])
+        .expect("compile manager policy");
+    let country_relation = view
+        .relation(Country::relation_id())
+        .expect("country relation");
+    let code_field = country_relation.column_ids()[1];
+    assert!(manager_permissions.contains(Permission::ReadField {
+        relation: Country::relation_id(),
+        field: code_field,
+    }));
+    assert!(manager_permissions.contains(Permission::WriteField {
+        relation: Country::relation_id(),
+        field: code_field,
+    }));
+    assert!(!manager_permissions.contains(Permission::Read));
+    assert!(!manager_permissions.contains(Permission::Write));
+
+    let session = database.session(Session::new(
+        PrincipalId::new(442_010),
+        manager_permissions.clone(),
+    ));
+    assert_eq!(
+        session
+            .session()
+            .snapshot()
+            .expect("session authority snapshot")
+            .permissions(),
+        &manager_permissions
     );
+
+    drop(session);
+    drop(database);
+    let reopened = Database::open(&directory).expect("reopen database");
+    let reopened_permissions = reopened
+        .snapshot()
+        .expect("reopened snapshot")
+        .schema()
+        .expect("reopened schema")
+        .permissions_for_roles([manager.id()])
+        .expect("reopened manager policy");
+    assert_eq!(reopened_permissions, manager_permissions);
+
+    drop(reopened);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn declarative_schema_access_uses_typed_relationship_and_global_coordinates() {
+    use cfmd_runtime::{AccessCapability, Object, Permission, Role, SchemaAccess};
+
+    let relationship = cfmd_runtime::__many_relation_id::<AuthorizedTeam>("members");
+    let operations = AccessCapability::new("example.cap.team-operations")
+        .read_object::<AuthorizedTeam>()
+        .read_field::<AuthorizedTeam, String, _>(AuthorizedTeamFields::name)
+        .attach_relationship::<AuthorizedTeam, AuthorizedMember, _>(AuthorizedTeamFields::members)
+        .detach_relationship::<AuthorizedTeam, AuthorizedMember, _>(AuthorizedTeamFields::members)
+        .move_relationship::<AuthorizedTeam, AuthorizedMember, _>(AuthorizedTeamFields::members)
+        .model_read()
+        .historical_read()
+        .history_read()
+        .watch();
+    let operator = Role::new("example.role.team-operator").capability(&operations);
+    let policy = SchemaAccess::new()
+        .capability(operations)
+        .role(operator.clone());
+
+    let schema = Schema::builder()
+        .object::<AuthorizedTeam>()
+        .object::<AuthorizedMember>()
+        .access(policy)
+        .build()
+        .expect("schema-owned access");
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let database = Database::create(&directory, schema).expect("create database");
+    let snapshot = database.snapshot().expect("snapshot");
+    let view = snapshot.schema().expect("schema view");
+    let permissions = view
+        .permissions_for_roles([operator.id()])
+        .expect("compile role");
+    let restricted = database
+        .session_for_roles(cfmd_runtime::PrincipalId::new(532_001), [])
+        .expect("empty external assignment");
+    assert_eq!(
+        restricted
+            .session()
+            .snapshot()
+            .expect("session")
+            .generation(),
+        0
+    );
+    assert!(
+        !restricted
+            .session()
+            .snapshot()
+            .expect("session")
+            .permissions()
+            .contains(Permission::Watch)
+    );
+    assert_eq!(
+        restricted
+            .session()
+            .refresh_role_assignments([operator.id()])
+            .expect("refresh assigned roles"),
+        1
+    );
+    assert!(
+        restricted
+            .session()
+            .snapshot()
+            .expect("session")
+            .permissions()
+            .contains(Permission::Watch)
+    );
+
+    assert!(permissions.contains(Permission::ReadRelation(AuthorizedTeam::relation_id())));
+    assert!(permissions.contains(Permission::AttachRelationship(relationship)));
+    assert!(permissions.contains(Permission::DetachRelationship(relationship)));
+    assert!(permissions.contains(Permission::MoveRelationship(relationship)));
+    assert!(permissions.contains(Permission::ModelRead));
+    assert!(permissions.contains(Permission::HistoricalRead));
+    assert!(permissions.contains(Permission::HistoryRead));
+    assert!(permissions.contains(Permission::Watch));
+    assert!(!permissions.contains(Permission::Read));
+    assert!(!permissions.contains(Permission::Write));
 
     drop(database);
     fs::remove_dir_all(directory).expect("remove fixture directory");
@@ -3121,8 +3455,7 @@ fn roles_flatten_into_exact_permissions_and_model_metadata_is_separate_authority
 #[test]
 fn schema_migration_requires_dedicated_authority_not_generic_write() {
     use cfmd_runtime::{
-        ErrorKind, MigrationHistoryPolicy, MigrationModel, Permission, PermissionSet, PrincipalId,
-        Role, Session,
+        MigrationHistoryPolicy, MigrationModel, Permission, PermissionSet, PrincipalId, Session,
     };
 
     let directory = temp_directory();
@@ -3138,33 +3471,28 @@ fn schema_migration_requires_dedicated_authority_not_generic_write() {
         .expect("target schema");
     let migration = MigrationModel::new(442_443, target);
 
-    let generic_writer = database.session(Session::new(
+    let client = database.session(Session::new(
         PrincipalId::new(442_003),
         PermissionSet::from([Permission::Write]),
     ));
-    assert_eq!(
-        generic_writer
-            .migrate(
-                &migration,
-                TransactionId::new(9_442_001),
-                MigrationHistoryPolicy::Forget,
-            )
-            .expect_err("generic data write must not grant schema migration")
-            .kind(),
-        ErrorKind::PermissionDenied
-    );
+    let _ = client;
     assert_eq!(database.snapshot().expect("head").schema_revision(), 442);
 
-    let migrator = Role::new("schema-migrator").grant(Permission::SchemaMigrate);
-    let migration_session =
-        database.session(Session::from_roles(PrincipalId::new(442_004), [&migrator]));
-    migration_session
+    let control = cfmd_runtime::DatabaseControlCredential::authenticated(
+        PrincipalId::new(442_004),
+        cfmd_runtime::DatabaseControlPermissionSet::from([
+            cfmd_runtime::DatabaseControlPermission::SchemaPublish,
+            cfmd_runtime::DatabaseControlPermission::MigrationDataInspect,
+        ]),
+    );
+    database
+        .admin_session(control.session())
         .migrate(
             &migration,
             TransactionId::new(9_442_002),
             MigrationHistoryPolicy::Forget,
         )
-        .expect("dedicated migration authority");
+        .expect("dedicated control-plane migration authority");
     assert_eq!(
         database
             .snapshot()
@@ -3433,6 +3761,529 @@ fn stale_relation_intent_authorizes_transported_current_world_footprint() {
         &[vec![Value::I64(7)]]
     );
 
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn migratable_watch_crosses_definitionally_equivalent_schema_revision_without_rebuild() {
+    use cfmd_runtime::{ErrorKind, MigrationHistoryPolicy, MigrationModel};
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let relation = RelationId::new(533_100);
+    let equivalence = EquivalenceId::new(533_101);
+    let source = Schema::builder()
+        .revisions(533, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+
+    let query = Query::scan(relation);
+    let snapshot = database.snapshot().expect("watch snapshot");
+    let mut ordinary = snapshot.watch(&query).expect("ordinary watch");
+    drop(snapshot);
+    let mut migratable = database.migratable_watch(&query).expect("migratable watch");
+    assert_eq!(migratable.initial_schema_revision(), 533);
+    assert_eq!(migratable.schema_revision(), 533);
+    assert!(migratable.initial().rows().is_empty());
+
+    let target = Schema::builder()
+        .revisions(534, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::bag(relation, [Type::i64()], [equivalence]))
+        .build()
+        .expect("target schema");
+    database
+        .migrate(
+            &MigrationModel::new(533_534, target),
+            TransactionId::new(533_001),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("definitionally equivalent migration");
+
+    let ordinary_error = ordinary
+        .try_recv()
+        .expect_err("ordinary typed/materialized watch is schema-bound");
+    assert_eq!(ordinary_error.kind(), ErrorKind::WatchUnavailable);
+
+    assert!(
+        migratable
+            .try_recv()
+            .expect("migratable boundary")
+            .is_none(),
+        "definitionally equal schema cutover changes no observed rows"
+    );
+    assert_eq!(migratable.schema_revision(), 534);
+
+    let mut plan = database.plan().expect("target writer plan");
+    plan.insert(relation, vec![Value::I64(42)]);
+    database
+        .commit_plan(&plan, TransactionId::new(533_002))
+        .expect("target commit");
+    let event = migratable
+        .try_recv()
+        .expect("migratable event")
+        .expect("target data event");
+    assert_eq!(event.schema_revision(), 534);
+    assert_eq!(event.inserted(), &[vec![Value::I64(42)]]);
+    assert!(event.removed().is_empty());
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn migratable_watch_transports_row_identity_structural_descriptor_without_rebuild() {
+    use cfmd_runtime::{
+        ErrorKind, MigrationColumnRule, MigrationHistoryPolicy, MigrationModel,
+        MigrationRelationRule, MigrationValueExpr, RelationColumnId,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let relation = RelationId::new(533_200);
+    let source_column = RelationColumnId::new(533_201);
+    let target_column = RelationColumnId::new(533_202);
+    let equivalence = EquivalenceId::new(533_203);
+    let source = Schema::builder()
+        .revisions(535, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(source_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+    let mut seed = database.plan().expect("source seed plan");
+    seed.insert(relation, vec![Value::I64(7)]);
+    database
+        .commit_plan(&seed, TransactionId::new(533_200))
+        .expect("seed source row");
+    let mut watch = database
+        .migratable_watch(&Query::scan(relation))
+        .expect("migratable watch");
+    assert_eq!(watch.initial().rows(), &[vec![Value::I64(7)]]);
+
+    let target = Schema::builder()
+        .revisions(536, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(target_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("target schema");
+    let migration = MigrationModel::new(535_536, target).relation(MigrationRelationRule::Rows {
+        source: relation,
+        target: relation,
+        columns: vec![MigrationColumnRule {
+            source_columns: vec![0],
+            target_column: 0,
+            value: MigrationValueExpr::Column(0),
+        }],
+    });
+    database
+        .migrate(
+            &migration,
+            TransactionId::new(533_201),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("structural identity migration");
+
+    assert!(
+        watch
+            .try_recv()
+            .expect("structural descriptor transport")
+            .is_none(),
+        "descriptor-only transport must not fabricate a row event"
+    );
+    assert_eq!(watch.schema_revision(), 536);
+
+    let mut target_write = database.plan().expect("target plan");
+    target_write.insert(relation, vec![Value::I64(8)]);
+    database
+        .commit_plan(&target_write, TransactionId::new(533_202))
+        .expect("target insert");
+    let event = watch
+        .try_recv()
+        .expect("watch target delta")
+        .expect("target row event");
+    assert_eq!(event.inserted(), &[vec![Value::I64(8)]]);
+    assert_eq!(event.schema_revision(), 536);
+    let mismatch = event
+        .materialize_schema(535, |_, _| Ok(()))
+        .expect_err("caller must choose the matching schema branch");
+    assert_eq!(mismatch.kind(), ErrorKind::InvalidSchema);
+    let inserted = event
+        .materialize_schema(536, |inserted, _| Ok(inserted.to_vec()))
+        .expect("explicit target-schema materialization");
+    assert_eq!(inserted, vec![vec![Value::I64(8)]]);
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn migratable_watch_retargets_relation_coordinate_without_rebuilding_rows() {
+    use cfmd_runtime::{
+        MigrationColumnRule, MigrationHistoryPolicy, MigrationModel, MigrationRelationRule,
+        MigrationValueExpr, RelationColumnId,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let source_relation = RelationId::new(535_100);
+    let target_relation = RelationId::new(535_101);
+    let source_column = RelationColumnId::new(535_102);
+    let target_column = RelationColumnId::new(535_103);
+    let equivalence = EquivalenceId::new(535_104);
+    let source = Schema::builder()
+        .revisions(539, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            source_relation,
+            [(source_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+    let mut seed = database.plan().expect("source seed plan");
+    seed.insert(source_relation, vec![Value::I64(7)]);
+    database
+        .commit_plan(&seed, TransactionId::new(535_100))
+        .expect("seed source row");
+    let query = Query::scan(source_relation).filter_eq(0, Value::I64(7), equivalence);
+    let mut watch = database.migratable_watch(&query).expect("migratable watch");
+    assert_eq!(watch.initial().rows(), &[vec![Value::I64(7)]]);
+
+    let target = Schema::builder()
+        .revisions(540, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            target_relation,
+            [(target_column, Type::i64())],
+            [equivalence],
+        ))
+        .build()
+        .expect("target schema");
+    let migration = MigrationModel::new(539_540, target).relation(MigrationRelationRule::Rows {
+        source: source_relation,
+        target: target_relation,
+        columns: vec![MigrationColumnRule {
+            source_columns: vec![0],
+            target_column: 0,
+            value: MigrationValueExpr::Column(0),
+        }],
+    });
+    database
+        .migrate(
+            &migration,
+            TransactionId::new(535_101),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("relation-retarget migration");
+
+    assert!(
+        watch
+            .try_recv()
+            .expect("relation-coordinate transport")
+            .is_none(),
+        "coordinate-only transport must not fabricate a row event"
+    );
+    assert_eq!(watch.schema_revision(), 540);
+    assert_eq!(watch.initial().rows(), &[vec![Value::I64(7)]]);
+
+    let mut target_write = database.plan().expect("target plan");
+    target_write.remove(target_relation, vec![Value::I64(7)]);
+    target_write.insert(target_relation, vec![Value::I64(8)]);
+    database
+        .commit_plan(&target_write, TransactionId::new(535_102))
+        .expect("target insert");
+    let event = watch
+        .try_recv()
+        .expect("watch target delta")
+        .expect("target row event");
+    assert!(event.inserted().is_empty());
+    assert_eq!(event.removed(), &[vec![Value::I64(7)]]);
+    assert_eq!(event.schema_revision(), 540);
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn migratable_watch_rejects_value_changing_row_local_state_without_rebuild_fallback() {
+    use cfmd_runtime::{
+        ErrorKind, MigrationColumnRule, MigrationHistoryPolicy, MigrationModel,
+        MigrationRelationRule, MigrationValueExpr, RelationColumnId,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let relation = RelationId::new(536_100);
+    let source_column = RelationColumnId::new(536_101);
+    let target_column = RelationColumnId::new(536_102);
+    let source_equivalence = EquivalenceId::new(536_103);
+    let target_equivalence = EquivalenceId::new(536_104);
+    let source = Schema::builder()
+        .revisions(541, 1)
+        .equivalence(source_equivalence, PrimitiveEquivalence::I64Exact)
+        .equivalence(target_equivalence, PrimitiveEquivalence::F64Bitwise)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(source_column, Type::i64())],
+            [source_equivalence],
+        ))
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+    let mut seed = database.plan().expect("source seed plan");
+    seed.insert(relation, vec![Value::I64(7)]);
+    database
+        .commit_plan(&seed, TransactionId::new(536_100))
+        .expect("seed source row");
+    let mut watch = database
+        .migratable_watch(&Query::scan(relation))
+        .expect("migratable watch");
+    assert_eq!(watch.initial().rows(), &[vec![Value::I64(7)]]);
+
+    let target = Schema::builder()
+        .revisions(542, 1)
+        .equivalence(source_equivalence, PrimitiveEquivalence::I64Exact)
+        .equivalence(target_equivalence, PrimitiveEquivalence::F64Bitwise)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(target_column, Type::f64())],
+            [target_equivalence],
+        ))
+        .build()
+        .expect("target schema");
+    let migration = MigrationModel::new(541_542, target).relation(MigrationRelationRule::Rows {
+        source: relation,
+        target: relation,
+        columns: vec![MigrationColumnRule {
+            source_columns: vec![0],
+            target_column: 0,
+            value: MigrationValueExpr::I64ToF64(Box::new(MigrationValueExpr::Column(0))),
+        }],
+    });
+    database
+        .migrate(
+            &migration,
+            TransactionId::new(536_101),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("value-changing row-local migration");
+
+    let error = watch
+        .try_recv()
+        .expect_err("value-changing maintained state must not rebuild as a fallback");
+    assert_eq!(error.kind(), ErrorKind::WatchUnavailable);
+    assert!(
+        error
+            .message()
+            .contains("changes maintained row representation")
+    );
+    assert!(error.message().contains("zero-row-touch"));
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn migratable_watch_fails_closed_when_structural_migration_changes_row_representation() {
+    use cfmd_runtime::{
+        ErrorKind, MigrationColumnRule, MigrationHistoryPolicy, MigrationModel,
+        MigrationRelationRule, MigrationValueExpr, RelationColumnId,
+    };
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let relation = RelationId::new(533_300);
+    let source_a = RelationColumnId::new(533_301);
+    let source_b = RelationColumnId::new(533_302);
+    let target_a = RelationColumnId::new(533_303);
+    let target_b = RelationColumnId::new(533_304);
+    let equivalence = EquivalenceId::new(533_305);
+    let source = Schema::builder()
+        .revisions(537, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(source_a, Type::i64()), (source_b, Type::i64())],
+            [equivalence, equivalence],
+        ))
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+    let mut watch = database
+        .migratable_watch(&Query::scan(relation))
+        .expect("migratable watch");
+
+    let target = Schema::builder()
+        .revisions(538, 1)
+        .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+        .relation(RelationSchema::set_with_column_ids(
+            relation,
+            [(target_a, Type::i64()), (target_b, Type::i64())],
+            [equivalence, equivalence],
+        ))
+        .build()
+        .expect("target schema");
+    let migration = MigrationModel::new(537_538, target).relation(MigrationRelationRule::Rows {
+        source: relation,
+        target: relation,
+        columns: vec![
+            MigrationColumnRule {
+                source_columns: vec![1],
+                target_column: 0,
+                value: MigrationValueExpr::Column(1),
+            },
+            MigrationColumnRule {
+                source_columns: vec![0],
+                target_column: 1,
+                value: MigrationValueExpr::Column(0),
+            },
+        ],
+    });
+    database
+        .migrate(
+            &migration,
+            TransactionId::new(533_301),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("row permutation migration");
+
+    let error = watch
+        .try_recv()
+        .expect_err("row permutation must remain fail-closed");
+    assert_eq!(error.kind(), ErrorKind::WatchUnavailable);
+    assert!(error.message().contains("not migratable"));
+
+    drop(database);
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+cfmd_runtime::cfmd_entity! {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LifecycleTodo => LifecycleTodoFields("example.pass537.todo") {
+        id pub id;
+        fields { pub title: String, pub done: bool }
+        refs { }
+    }
+}
+
+struct LifecycleTodoSchema {
+    todos: cfmd_runtime::EntitySet<LifecycleTodo>,
+}
+
+impl cfmd_runtime::CfmdSchema for LifecycleTodoSchema {
+    type DefinitionAuthority = cfmd_runtime::SchemaAuthorityEmpty;
+
+    fn definition() -> cfmd_runtime::Result<cfmd_runtime::Schema> {
+        cfmd_runtime::Schema::builder()
+            .object::<LifecycleTodo>()
+            .build()
+    }
+
+    fn __bind(source: std::sync::Arc<cfmd_runtime::ContextSource>) -> cfmd_runtime::Result<Self> {
+        Ok(Self {
+            todos: cfmd_runtime::EntitySet::<LifecycleTodo>::__bind(source)?,
+        })
+    }
+}
+
+#[test]
+fn scoped_context_survives_schema_cutover_without_switching_formation_world() {
+    use cfmd_runtime::{Id, IntentJournal, MigrationHistoryPolicy, MigrationModel, TransactionId};
+
+    let directory = temp_directory();
+    fs::create_dir_all(&directory).expect("create fixture directory");
+    let source = Schema::builder()
+        .revisions(537, 1)
+        .object::<LifecycleTodo>()
+        .build()
+        .expect("source schema");
+    let database = Database::create(&directory, source).expect("create database");
+
+    let context = database
+        .context::<LifecycleTodoSchema>()
+        .expect("A context");
+    let formation = context.formation_revision();
+    assert_eq!(context.formation_schema_revision(), 537);
+
+    let target = Schema::builder()
+        .revisions(538, 1)
+        .object::<LifecycleTodo>()
+        .build()
+        .expect("target schema");
+    database
+        .migrate(
+            &MigrationModel::new(537_538, target),
+            TransactionId::new(537_538),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("publish A -> B");
+
+    let mut target_write = IntentJournal::new();
+    database
+        .objects::<LifecycleTodo>()
+        .expect("target todos")
+        .add(
+            &mut target_write,
+            LifecycleTodo {
+                id: Id::new(537_001),
+                title: "B-only after cutover".to_owned(),
+                done: false,
+            },
+        )
+        .expect("target add");
+    database.commit(&target_write).expect("target commit");
+
+    assert_eq!(context.formation_revision(), formation);
+    assert_eq!(context.formation_schema_revision(), 537);
+    assert!(
+        context
+            .todos
+            .get(Id::new(537_001))
+            .expect("bounded A read")
+            .is_none(),
+        "a running scoped Context must not silently switch to the B head"
+    );
+
+    context
+        .add(
+            |schema| &schema.todos,
+            LifecycleTodo {
+                id: Id::new(537_002),
+                title: "A intent transported forward".to_owned(),
+                done: false,
+            },
+        )
+        .expect("stage A intent after cutover");
+    context.commit().expect("transport A intent into B");
+
+    let next = database
+        .context::<LifecycleTodoSchema>()
+        .expect("new B context");
+    assert_eq!(next.formation_schema_revision(), 538);
+    assert!(next.todos.get(Id::new(537_001)).expect("B row").is_some());
+    assert!(
+        next.todos
+            .get(Id::new(537_002))
+            .expect("transported A row")
+            .is_some()
+    );
+
+    drop(next);
+    drop(context);
     drop(database);
     fs::remove_dir_all(directory).expect("remove fixture directory");
 }

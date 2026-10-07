@@ -1,25 +1,43 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
-// HOSTILE[P161][ACTIVE][PRIMARY]: SAMF/observable-atom semantic fiber authority.
+// HOSTILE[P581][ACTIVE][PRIMARY]: catalog-free SAMF over one store/revision atomic semantic-class
+// authority. Product identity is the exact tuple of atomic EqClassIds; local atom IDs are only
+// reconstructible routing tokens and never semantic/durable authority.
 pub struct MaterializedObservableAtomState {
     binding: SemanticIndexBinding,
     key_binding: kernel_semantic_index::SemanticIndexBinding,
-    pub(super) catalog: kernel_semantics::observable::RevisionObservableCatalog,
-    observables: Vec<kernel_types::RevisionObservableId>,
-    product_observable: kernel_types::RevisionObservableId,
-    projection: kernel_semantics::observable::CertifiedSemanticMorphism,
-    fabric: kernel_semantics::support_atom::SupportAtomFabric<PhysicalRowId>,
+    fabric: kernel_semantics::support_atom::SemanticSupportFabric<PhysicalRowId>,
+    semantic_class_catalog:
+        Arc<kernel_semantics::semantic_class_catalog::RevisionSemanticClassCatalog>,
 }
 
 impl MaterializedObservableAtomState {
-    fn build(
+    fn build_from_semantic_columns(
         binding: SemanticIndexBinding,
         relation: &InstalledRelation,
+        semantic_class_catalog: Arc<
+            kernel_semantics::semantic_class_catalog::RevisionSemanticClassCatalog,
+        >,
+        encoded_columns: &[Arc<RevisionSemanticEncodedColumn>],
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, PhysicalExecutionError> {
-        if binding.key_parts.is_empty() {
+        if binding.key_parts.is_empty() || encoded_columns.len() != binding.key_parts.len() {
             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
         }
+        if semantic_class_catalog.revision() != context.revision() {
+            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+        }
+        for (part, column) in binding.key_parts.iter().zip(encoded_columns) {
+            if column.relation != binding.relation
+                || column.layout != binding.layout
+                || column.column != part.column
+                || column.equivalence != part.equivalence
+            {
+                return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+            }
+            let _ = registry.equivalence_domain(context, part.equivalence)?;
+        }
+
         let (_, dependencies) = resolve_semantic_key_binding(&binding, context, registry)?;
         let structural_definitions = semantic_key_structural_definitions_for_equivalences(
             binding.key_parts.iter().map(|part| part.equivalence),
@@ -32,64 +50,36 @@ impl MaterializedObservableAtomState {
                 dependencies,
                 structural_definitions,
             );
-        let mut catalog = kernel_semantics::observable::RevisionObservableCatalog::new(context)
-            .map_err(observable_error_to_physical)?;
-        let observables = binding
-            .key_parts
-            .iter()
-            .map(|part| {
-                catalog
-                    .register_equivalence(registry, context, part.equivalence)
-                    .map_err(observable_error_to_physical)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let product_observable = catalog
-            .register_product(observables.clone())
-            .map_err(observable_error_to_physical)?;
-        let mut fabric = kernel_semantics::support_atom::SupportAtomFabric::new(
-            &catalog,
-            product_observable,
-            observables.clone(),
-        )
-        .map_err(support_atom_error_to_physical)?;
-
-        for row_index in relation.scan_positions() {
-            let row = materialize_native_row(&relation.data, row_index)?;
-            let classes = observe_atom_row_classes(
-                &binding,
-                &observables,
-                &mut catalog,
-                context,
-                registry,
-                &row,
-            )?;
-            let atom_class = catalog
-                .intern_product_class(product_observable, classes.clone())
-                .map_err(observable_error_to_physical)?;
+        let mut fabric = kernel_semantics::support_atom::SemanticSupportFabric::new(
+            context.revision(),
+            binding.key_parts.len(),
+        );
+        for position in relation.scan_positions() {
+            let row_id = relation.row_id_at(position)?;
+            let signature = encoded_columns
+                .iter()
+                .map(|column| {
+                    column
+                        .row_classes
+                        .get(&row_id)
+                        .copied()
+                        .ok_or(RelQueryError::InconsistentIncrementalDelta.into())
+                })
+                .collect::<Result<Vec<_>, PhysicalExecutionError>>()?;
+            for class in &signature {
+                if semantic_class_catalog.class_key(*class).is_none() {
+                    return Err(RelQueryError::InconsistentIncrementalDelta.into());
+                }
+            }
             fabric
-                .insert(
-                    &catalog,
-                    relation.row_id_at(row_index)?,
-                    atom_class,
-                    &classes,
-                )
-                .map_err(support_atom_error_to_physical)?;
+                .insert(row_id, &signature)
+                .map_err(semantic_support_fabric_error_to_physical)?;
         }
-        let projection =
-            kernel_semantics::observable::CertifiedSemanticMorphism::product_projection(
-                &catalog,
-                product_observable,
-                (0..observables.len()).collect(),
-            )
-            .map_err(observable_error_to_physical)?;
         Ok(Self {
             binding,
             key_binding,
-            catalog,
-            observables,
-            product_observable,
-            projection,
             fabric,
+            semantic_class_catalog,
         })
     }
 
@@ -97,92 +87,35 @@ impl MaterializedObservableAtomState {
         binding: SemanticIndexBinding,
         relation: &InstalledRelation,
         encoded_keys_by_ordinal: &[Vec<u8>],
+        semantic_class_catalog: Arc<
+            kernel_semantics::semantic_class_catalog::RevisionSemanticClassCatalog,
+        >,
+        encoded_columns: &[Arc<RevisionSemanticEncodedColumn>],
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Self, PhysicalExecutionError> {
-        if binding.key_parts.is_empty() {
-            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
-        }
-        let (_, dependencies) = resolve_semantic_key_binding(&binding, context, registry)?;
-        let structural_definitions = semantic_key_structural_definitions_for_equivalences(
-            binding.key_parts.iter().map(|part| part.equivalence),
+        let state = Self::build_from_semantic_columns(
+            binding,
+            relation,
+            semantic_class_catalog,
+            encoded_columns,
             context,
             registry,
         )?;
-        let key_binding =
-            kernel_semantic_index::SemanticIndexBinding::new_with_structural_definitions(
-                context,
-                dependencies,
-                structural_definitions,
-            );
-        let mut catalog = kernel_semantics::observable::RevisionObservableCatalog::new(context)
-            .map_err(observable_error_to_physical)?;
-        let observables = binding
-            .key_parts
-            .iter()
-            .map(|part| {
-                catalog
-                    .register_equivalence(registry, context, part.equivalence)
-                    .map_err(observable_error_to_physical)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let product_observable = catalog
-            .register_product(observables.clone())
-            .map_err(observable_error_to_physical)?;
-        let mut fabric = kernel_semantics::support_atom::SupportAtomFabric::new(
-            &catalog,
-            product_observable,
-            observables.clone(),
-        )
-        .map_err(support_atom_error_to_physical)?;
         let positions = relation.scan_positions().collect::<Vec<_>>();
         if positions.len() != encoded_keys_by_ordinal.len() {
             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
         }
-        for (row_index, encoded_tuple) in positions.into_iter().zip(encoded_keys_by_ordinal) {
-            let keys = kernel_semantics::decode_canonical_eq_key_tuple(encoded_tuple)
-                .map_err(|_| PhysicalExecutionError::PhysicalTypeMismatch)?;
-            if keys.len() != observables.len() {
+        for (position, durable) in positions.into_iter().zip(encoded_keys_by_ordinal) {
+            let row_id = relation.row_id_at(position)?;
+            let keys = state
+                .canonical_key_tuple_for_row(row_id)
+                .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
+            if kernel_semantics::encode_canonical_eq_key_tuple(&keys) != *durable {
                 return Err(PhysicalExecutionError::PhysicalTypeMismatch);
             }
-            let classes = observables
-                .iter()
-                .copied()
-                .zip(keys)
-                .map(|(observable, key)| {
-                    catalog
-                        .intern_canonical_equivalence_key(observable, key)
-                        .map_err(observable_error_to_physical)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let atom_class = catalog
-                .intern_product_class(product_observable, classes.clone())
-                .map_err(observable_error_to_physical)?;
-            fabric
-                .insert(
-                    &catalog,
-                    relation.row_id_at(row_index)?,
-                    atom_class,
-                    &classes,
-                )
-                .map_err(support_atom_error_to_physical)?;
         }
-        let projection =
-            kernel_semantics::observable::CertifiedSemanticMorphism::product_projection(
-                &catalog,
-                product_observable,
-                (0..observables.len()).collect(),
-            )
-            .map_err(observable_error_to_physical)?;
-        Ok(Self {
-            binding,
-            key_binding,
-            catalog,
-            observables,
-            product_observable,
-            projection,
-            fabric,
-        })
+        Ok(state)
     }
 
     fn durable_core(
@@ -214,7 +147,8 @@ impl MaterializedObservableAtomState {
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<bool, PhysicalExecutionError> {
         let (_, dependencies) = resolve_semantic_key_binding(&self.binding, context, registry)?;
-        if self.catalog.revision() != context.revision()
+        if self.fabric.revision() != context.revision()
+            || self.semantic_class_catalog.revision() != context.revision()
             || !self.key_binding.is_valid_for(context, &dependencies)
         {
             return Ok(false);
@@ -223,6 +157,23 @@ impl MaterializedObservableAtomState {
             let _ = registry.equivalence_domain(context, part.equivalence)?;
         }
         Ok(true)
+    }
+
+    fn refresh_semantic_catalog(
+        &mut self,
+        catalog: Arc<kernel_semantics::semantic_class_catalog::RevisionSemanticClassCatalog>,
+    ) {
+        self.semantic_class_catalog = catalog;
+    }
+
+    #[must_use]
+    pub fn semantic_revision(&self) -> kernel_types::SemanticRevision {
+        self.semantic_class_catalog.revision()
+    }
+
+    #[must_use]
+    pub fn arity(&self) -> usize {
+        self.fabric.arity()
     }
 
     #[must_use]
@@ -252,59 +203,37 @@ impl MaterializedObservableAtomState {
         &self,
         row_id: PhysicalRowId,
     ) -> Option<Vec<kernel_semantics::CanonicalEqKey>> {
-        let signature = self.fabric.row_signature(&row_id)?;
-        signature
+        self.fabric
+            .row_signature(&row_id)?
             .iter()
-            .map(|class| {
-                let record = self.catalog.class_record(*class).ok()?;
-                match &record.signature {
-                    kernel_semantics::observable::ObservableClassSignature::Canonical(key) => {
-                        Some(key.clone())
-                    }
-                    kernel_semantics::observable::ObservableClassSignature::Product(_) => None,
-                }
-            })
+            .map(|class| self.semantic_class_catalog.class_key(*class).cloned())
             .collect()
     }
 
     fn single_key_for(&self, row_id: PhysicalRowId) -> Option<kernel_semantics::CanonicalEqKey> {
-        if self.observables.len() != 1 {
+        if self.binding.key_parts.len() != 1 {
             return None;
         }
         self.canonical_key_tuple_for_row(row_id)?.into_iter().next()
     }
 
-    /// Exact Set-uniqueness violation measure induced by SAMF atom masses.
-    ///
-    /// Each product atom with row mass `m > 1` contributes violation mass
-    /// `m - 1`. This is reconstructible validation state, not durable authority.
+    /// Exact Set-uniqueness violation measure induced by catalog-free SAMF atom masses.
+    /// Product identity is the atomic semantic-class signature itself, not a second `EqClassId`.
     pub fn uniqueness_violation_measure(
         &self,
-    ) -> Result<kernel_violation::ViolationMeasure<kernel_types::EqClassId>, PhysicalExecutionError>
+    ) -> Result<kernel_violation::ViolationMeasure<Vec<kernel_types::EqClassId>>, PhysicalExecutionError>
     {
         let mut measure = kernel_violation::ViolationMeasure::new();
-        for (atom, mass) in self.fabric.atom_masses() {
+        for (signature, mass) in self.fabric.atom_masses() {
             if mass > 1 {
                 let violation_mass = u64::try_from(mass - 1)
                     .map_err(|_| PhysicalExecutionError::StatisticsCountOverflow)?;
                 measure
-                    .add(atom, violation_mass)
+                    .add(signature.to_vec(), violation_mass)
                     .map_err(|_| PhysicalExecutionError::StatisticsCountOverflow)?;
             }
         }
         Ok(measure)
-    }
-
-    #[must_use]
-    pub const fn product_observable(&self) -> kernel_types::RevisionObservableId {
-        self.product_observable
-    }
-
-    #[must_use]
-    pub const fn product_projection(
-        &self,
-    ) -> &kernel_semantics::observable::CertifiedSemanticMorphism {
-        &self.projection
     }
 
     fn probe_fiber_iter<'s, 'v, I>(
@@ -317,16 +246,19 @@ impl MaterializedObservableAtomState {
     where
         I: ExactSizeIterator<Item = &'v Value>,
     {
-        if values.len() != self.observables.len() {
+        if values.len() != self.binding.key_parts.len() {
             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
         }
+        if self.semantic_class_catalog.revision() != context.revision() {
+            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+        }
         classes.clear();
-        classes.reserve(self.observables.len());
-        for (observable, value) in self.observables.iter().copied().zip(values) {
+        classes.reserve(self.binding.key_parts.len());
+        for (part, value) in self.binding.key_parts.iter().zip(values) {
             let Some(class) = self
-                .catalog
-                .lookup_value_class(registry, context, observable, value)
-                .map_err(observable_error_to_physical)?
+                .semantic_class_catalog
+                .lookup_value(registry, context, part.equivalence, value)
+                .map_err(semantic_class_catalog_error_to_physical)?
             else {
                 return Ok(None);
             };
@@ -345,9 +277,6 @@ impl MaterializedObservableAtomState {
         self.probe_fiber_iter(values.iter().copied(), context, registry, &mut classes)
     }
 
-    // HOSTILE[P189][ACTIVE][CLEAN]: relation-delta full-row occurrence probes reuse the
-    // caller's observable-class scratch and consume the row directly; no per-removal
-    // Vec<&Value> or EqClassId buffer is allocated on the maintained-delta hot path.
     fn probe_row_fiber_with_scratch<'a>(
         &'a self,
         values: &[Value],
@@ -369,19 +298,20 @@ impl MaterializedObservableAtomState {
     where
         I: ExactSizeIterator<Item = usize>,
     {
-        if columns.len() != self.observables.len() {
+        if columns.len() != self.binding.key_parts.len() {
             return Err(PhysicalExecutionError::PhysicalTypeMismatch);
         }
+        if self.semantic_class_catalog.revision() != context.revision() {
+            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+        }
         classes.clear();
-        classes.reserve(self.observables.len());
-        for (observable, column) in self.observables.iter().copied().zip(columns) {
-            let value = row
-                .get(column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)?;
+        classes.reserve(self.binding.key_parts.len());
+        for (part, column) in self.binding.key_parts.iter().zip(columns) {
+            let value = row.get(column).ok_or(RelQueryError::ColumnOutOfBounds)?;
             let Some(class) = self
-                .catalog
-                .lookup_value_class(registry, context, observable, value)
-                .map_err(observable_error_to_physical)?
+                .semantic_class_catalog
+                .lookup_value(registry, context, part.equivalence, value)
+                .map_err(semantic_class_catalog_error_to_physical)?
             else {
                 return Ok(None);
             };
@@ -408,22 +338,22 @@ impl MaterializedObservableAtomState {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<Vec<PhysicalRowId>, PhysicalExecutionError> {
-        let observable = self
-            .observables
+        let part = self
+            .binding
+            .key_parts
             .get(slot)
-            .copied()
             .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
         let Some(class) = self
-            .catalog
-            .lookup_value_class(registry, context, observable, value)
-            .map_err(observable_error_to_physical)?
+            .semantic_class_catalog
+            .lookup_value(registry, context, part.equivalence, value)
+            .map_err(semantic_class_catalog_error_to_physical)?
         else {
             return Ok(Vec::new());
         };
         self.fabric
             .projected_fiber(slot, class)
             .map(|rows| rows.into_iter().collect())
-            .map_err(support_atom_error_to_physical)
+            .map_err(semantic_support_fabric_error_to_physical)
     }
 
     fn count_slot_value(
@@ -433,21 +363,21 @@ impl MaterializedObservableAtomState {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<usize, PhysicalExecutionError> {
-        let observable = self
-            .observables
+        let part = self
+            .binding
+            .key_parts
             .get(slot)
-            .copied()
             .ok_or(PhysicalExecutionError::PhysicalTypeMismatch)?;
         let Some(class) = self
-            .catalog
-            .lookup_value_class(registry, context, observable, value)
-            .map_err(observable_error_to_physical)?
+            .semantic_class_catalog
+            .lookup_value(registry, context, part.equivalence, value)
+            .map_err(semantic_class_catalog_error_to_physical)?
         else {
             return Ok(0);
         };
         self.fabric
             .projected_count(slot, class)
-            .map_err(support_atom_error_to_physical)
+            .map_err(semantic_support_fabric_error_to_physical)
     }
 
     fn validate_physical_delta(
@@ -456,154 +386,75 @@ impl MaterializedObservableAtomState {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<(), PhysicalExecutionError> {
-        for (row_id, row) in &delta.removed {
-            let classes = lookup_atom_row_classes(
-                &self.binding,
-                &self.observables,
-                &self.catalog,
-                context,
-                registry,
-                row,
-            )?
-            .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-            if self.fabric.row_signature(row_id) != Some(classes.as_slice()) {
+        if self.semantic_class_catalog.revision() != context.revision() {
+            return Err(PhysicalExecutionError::SemanticContextTransitionRequiresRebuild);
+        }
+        for part in &self.binding.key_parts {
+            let _ = registry.equivalence_domain(context, part.equivalence)?;
+        }
+        for (row_id, _) in &delta.removed {
+            if self.fabric.row_signature(row_id).is_none() {
                 return Err(RelQueryError::InconsistentIncrementalDelta.into());
             }
         }
-
-        let mut catalog = self.catalog.clone();
-        for (_, row) in &delta.inserted {
-            let classes = observe_atom_row_classes(
-                &self.binding,
-                &self.observables,
-                &mut catalog,
-                context,
-                registry,
-                row,
-            )?;
-            let _ = catalog
-                .intern_product_class(self.product_observable, classes)
-                .map_err(observable_error_to_physical)?;
+        for (row_id, row) in &delta.inserted {
+            if self.fabric.row_signature(row_id).is_some() {
+                return Err(RelQueryError::InconsistentIncrementalDelta.into());
+            }
+            for part in &self.binding.key_parts {
+                row.get(part.column).ok_or(RelQueryError::ColumnOutOfBounds)?;
+            }
         }
         Ok(())
     }
 
-    fn apply_physical_delta(
+    fn remove_delta_rows(
         &mut self,
         delta: &PhysicalRelationDelta,
-        context: &kernel_schema::SemanticContext,
-        registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<(), PhysicalExecutionError> {
-        let mut candidate = self.clone();
         for (row_id, _) in &delta.removed {
-            candidate
-                .fabric
+            self.fabric
                 .remove(row_id)
-                .map_err(support_atom_error_to_physical)?;
+                .map_err(semantic_support_fabric_error_to_physical)?;
         }
-        for (row_id, row) in &delta.inserted {
-            let classes = observe_atom_row_classes(
-                &candidate.binding,
-                &candidate.observables,
-                &mut candidate.catalog,
-                context,
-                registry,
-                row,
-            )?;
-            let atom_class = candidate
-                .catalog
-                .intern_product_class(candidate.product_observable, classes.clone())
-                .map_err(observable_error_to_physical)?;
-            candidate
-                .projection
-                .extend_product_projection_class(&candidate.catalog, atom_class, &classes)
-                .map_err(observable_error_to_physical)?;
-            candidate
-                .fabric
-                .insert(&candidate.catalog, *row_id, atom_class, &classes)
-                .map_err(support_atom_error_to_physical)?;
+        Ok(())
+    }
+
+    fn insert_delta_rows_from_columns(
+        &mut self,
+        delta: &PhysicalRelationDelta,
+        encoded_columns: &[Arc<RevisionSemanticEncodedColumn>],
+    ) -> Result<(), PhysicalExecutionError> {
+        if encoded_columns.len() != self.binding.key_parts.len() {
+            return Err(PhysicalExecutionError::PhysicalTypeMismatch);
         }
-        *self = candidate;
+        for (row_id, _) in &delta.inserted {
+            let signature = encoded_columns
+                .iter()
+                .map(|column| {
+                    column
+                        .row_classes
+                        .get(row_id)
+                        .copied()
+                        .ok_or(RelQueryError::InconsistentIncrementalDelta.into())
+                })
+                .collect::<Result<Vec<_>, PhysicalExecutionError>>()?;
+            self.fabric
+                .insert(*row_id, &signature)
+                .map_err(semantic_support_fabric_error_to_physical)?;
+        }
         Ok(())
     }
 }
 
-fn observe_atom_row_classes(
-    binding: &SemanticIndexBinding,
-    observables: &[kernel_types::RevisionObservableId],
-    catalog: &mut kernel_semantics::observable::RevisionObservableCatalog,
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-    row: &kernel_query::Row,
-) -> Result<Vec<kernel_types::EqClassId>, PhysicalExecutionError> {
-    binding
-        .key_parts
-        .iter()
-        .zip(observables)
-        .map(|(part, &observable)| {
-            let value = row
-                .get(part.column)
-                .ok_or(RelQueryError::ColumnOutOfBounds)?;
-            catalog
-                .observe_value(registry, context, observable, value)
-                .map_err(observable_error_to_physical)
-        })
-        .collect()
-}
-
-fn lookup_atom_row_classes(
-    binding: &SemanticIndexBinding,
-    observables: &[kernel_types::RevisionObservableId],
-    catalog: &kernel_semantics::observable::RevisionObservableCatalog,
-    context: &kernel_schema::SemanticContext,
-    registry: &kernel_semantics::SemanticRegistry,
-    row: &kernel_query::Row,
-) -> Result<Option<Vec<kernel_types::EqClassId>>, PhysicalExecutionError> {
-    let mut classes = Vec::with_capacity(observables.len());
-    for (part, &observable) in binding.key_parts.iter().zip(observables) {
-        let value = row
-            .get(part.column)
-            .ok_or(RelQueryError::ColumnOutOfBounds)?;
-        let Some(class) = catalog
-            .lookup_value_class(registry, context, observable, value)
-            .map_err(observable_error_to_physical)?
-        else {
-            return Ok(None);
-        };
-        classes.push(class);
-    }
-    Ok(Some(classes))
-}
-
-fn observable_error_to_physical(
-    error: kernel_semantics::observable::ObservableError,
+fn semantic_support_fabric_error_to_physical<RowId>(
+    _error: kernel_semantics::support_atom::SemanticSupportFabricError<RowId>,
 ) -> PhysicalExecutionError {
-    match error {
-        kernel_semantics::observable::ObservableError::Semantic(error) => error.into(),
-        kernel_semantics::observable::ObservableError::RevisionMismatch { .. }
-        | kernel_semantics::observable::ObservableError::ObservableCatalogMismatch => {
-            PhysicalExecutionError::SemanticContextTransitionRequiresRebuild
-        }
-        _ => PhysicalExecutionError::PhysicalTypeMismatch,
-    }
+    PhysicalExecutionError::PhysicalTypeMismatch
 }
 
-fn support_atom_error_to_physical<RowId>(
-    error: kernel_semantics::support_atom::SupportAtomError<RowId>,
-) -> PhysicalExecutionError {
-    match error {
-        kernel_semantics::support_atom::SupportAtomError::Observable(error) => {
-            observable_error_to_physical(error)
-        }
-        kernel_semantics::support_atom::SupportAtomError::CatalogMismatch => {
-            PhysicalExecutionError::SemanticContextTransitionRequiresRebuild
-        }
-        _ => PhysicalExecutionError::PhysicalTypeMismatch,
-    }
-}
-
-// HOSTILE[P472][ACTIVE][PRIMARY]: SAMF/observable atoms are the only semantic-fiber
-// execution authority. No legacy bucket-index routing remains.
+// Catalog-free SAMF remains the single semantic-fiber execution capability. The shared catalog
+// supplies canonical payload; the fabric supplies joint/projection retention only.
 pub(super) struct SemanticFiberCapability<'a>(&'a MaterializedObservableAtomState);
 
 pub(super) struct SemanticFiberProbe<'a>(

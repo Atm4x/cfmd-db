@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::rewrite::{
     CompiledRewriteCoordinationGraph, PairCoordinationDecision, PreparedRewrite,
-    PreparedRewriteCoordination, RewriteCoordinationRegistry, RewriteCoordinationRegistryError,
-    RewriteResidualCubeWitness, RewriteResidualFamilyRegistry, RewriteResidualPairResolver,
-    RewriteResidualResolutionAuthority, RewriteSequentialPairResolver, SharedPreparedRewrite,
+    PreparedRewriteCoordination, RewriteCoordinationRegistryError, RewriteResidualCubeWitness,
+    RewriteResidualFamilyRegistry, RewriteResidualPairResolver, RewriteResidualResolutionAuthority,
+    RewriteSequentialPairResolver, SharedPreparedRewrite,
 };
 
 use super::super::{RevisionEffect, RevisionEffectId, RevisionEffectIdeal};
@@ -213,14 +213,14 @@ impl<T: PartialEq + Eq, I: PartialEq + Eq> RevisionEffectIdeal<SharedPreparedRew
         })
     }
 
-    /// Compatibility convenience that compiles the exact semantic coordination
-    /// graph for this call. Hot/prepared callers should use
-    /// `certify_prepared_residual_frontier` and retain the prepared graph.
+    /// Test convenience that compiles the exact semantic coordination graph
+    /// for one call. Production callers retain a prepared graph.
+    #[cfg(test)]
     pub fn certify_compiled_residual_frontier(
         &self,
         other: &Self,
         residual_registry: &RewriteResidualFamilyRegistry,
-        coordination_registry: &RewriteCoordinationRegistry,
+        coordination_registry: &crate::rewrite::RewriteCoordinationRegistry,
         residuals: impl Fn(
             RevisionEffectId,
             RevisionEffectId,

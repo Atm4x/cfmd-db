@@ -13,12 +13,12 @@ use crate::descriptor::{
 
 impl DurableRevisionStore {
     #[must_use]
-    pub fn directory(&self) -> &Path {
+    pub fn directory(&self) -> Option<&Path> {
         self.backend.path()
     }
 
     #[must_use]
-    pub fn wal_path(&self) -> &Path {
+    pub fn wal_path(&self) -> Option<&Path> {
         self.wal.path()
     }
 

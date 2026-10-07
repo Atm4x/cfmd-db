@@ -18,6 +18,53 @@ fn try_execute_persisted_semantic_join(
         return Ok(None);
     };
     registry.equivalence_domain(context, equivalence)?;
+    if store.revision_semantic_columns_share_authority(
+        (left_relation, left_layout, left_column),
+        (right_relation, right_layout, right_column),
+        equivalence,
+        context,
+        registry,
+    ) {
+        let left_installed = store.installed(left_relation, left_layout)?;
+        let right_installed = store.installed(right_relation, right_layout)?;
+        let mut out = Vec::new();
+        for left_position in left_installed.scan_positions() {
+            let left_id = left_installed.row_id_at(left_position)?;
+            let class = store
+                .revision_semantic_class_for_row(
+                    left_relation,
+                    left_layout,
+                    left_column,
+                    equivalence,
+                    left_id,
+                )
+                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            stats.scanned_rows = stats.scanned_rows.saturating_add(1);
+            stats.values_read = stats.values_read.saturating_add(1);
+            let Some(right_ids) = store.revision_semantic_rows_for_class(
+                right_relation,
+                right_layout,
+                right_column,
+                equivalence,
+                class,
+            ) else {
+                continue;
+            };
+            let left_row = materialize_native_row(&left_installed.data, left_position)?;
+            for right_id in right_ids {
+                let right_position = right_installed
+                    .position(*right_id)
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+                let right_row = materialize_native_row(&right_installed.data, right_position)?;
+                let mut row = left_row.clone();
+                row.extend(right_row);
+                stats.values_read = stats.values_read.saturating_add(row.len());
+                out.push(row);
+            }
+        }
+        stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+        return Ok(Some(out));
+    }
     let binding =
         SemanticIndexBinding::single(right_relation, right_layout, right_column, equivalence);
     let Some(index) = store.semantic_fiber_capability(&binding, context, registry)? else {

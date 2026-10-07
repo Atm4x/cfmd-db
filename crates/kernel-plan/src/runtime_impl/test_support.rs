@@ -77,6 +77,35 @@ impl RuntimeRevisionSnapshot {
             .exact_effects
             .unique_storage_probe_against(&PersistentOrdMap::default())
     }
+
+    pub(crate) fn retained_schema_epoch_count_for_test(&self) -> usize {
+        self.root.historical.retained_schema_epochs.len()
+    }
+
+    pub(crate) fn retained_relation_delta_count_for_test(&self) -> usize {
+        self.root
+            .historical
+            .retained_schema_epochs
+            .iter()
+            .map(|(_, epoch)| {
+                epoch
+                    .index
+                    .relation_deltas
+                    .iter()
+                    .map(|(_, timeline)| timeline.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    pub(crate) fn retained_schema_epoch_effect_ids_for_test(&self) -> Vec<u128> {
+        self.root
+            .historical
+            .retained_schema_epochs
+            .iter()
+            .map(|(_, epoch)| epoch.effect_id)
+            .collect()
+    }
 }
 impl RuntimeRevisionBundle {
     pub(crate) fn physical_store_mut_for_test(&mut self) -> &mut PhysicalStore {
@@ -251,4 +280,63 @@ pub(crate) fn benchmark_retained_epoch_first_conflict_for_test(
     }
     std::hint::black_box(checksum);
     started.elapsed()
+}
+
+pub(crate) fn benchmark_relational_formation_lineage_for_test(
+    history_depth: u64,
+    relevant_delta_count: u64,
+    iterations: u64,
+) -> (std::time::Duration, usize) {
+    let relation = SemanticId::new(99_101);
+    let equivalence = SemanticId::new(99_102);
+    let mut index = RuntimeRetainedEpochIndex {
+        lineage_floor: Some(RevisionId::new(1)),
+        ..RuntimeRetainedEpochIndex::default()
+    };
+    let relevant_delta_count = relevant_delta_count.max(1).min(history_depth.max(1));
+    let stride = history_depth.max(1).div_ceil(relevant_delta_count);
+    let result_type = kernel_query::RelType {
+        columns: vec![kernel_schema::TypeExpr::Scalar(kernel_schema::ScalarType::I64)],
+        semantics: kernel_schema::RelationSemantics::Bag {
+            column_equivalences: vec![equivalence],
+        },
+    };
+    for offset in 1..=history_depth {
+        let revision = RevisionId::new(offset + 1);
+        index.exact_effects.insert(revision, u128::from(offset));
+        if offset % stride == 0 {
+            index.index_relation_delta(
+                revision,
+                relation,
+                RelationDelta {
+                    inserted: Vec::new(),
+                    removed: Vec::new(),
+                    result_type: result_type.clone(),
+                },
+            );
+        }
+    }
+    let sources = BTreeSet::from([relation]);
+    let started = std::time::Instant::now();
+    let mut checksum = 0usize;
+    for _ in 0..iterations {
+        checksum ^= index
+            .relation_deltas_between(
+                RevisionId::new(1),
+                RevisionId::new(history_depth + 1),
+                &sources,
+            )
+            .expect("retained lineage must cover the benchmark interval")
+            .len();
+    }
+    std::hint::black_box(checksum);
+    let selected = index
+        .relation_deltas_between(
+            RevisionId::new(1),
+            RevisionId::new(history_depth + 1),
+            &sources,
+        )
+        .expect("retained lineage must cover the benchmark interval")
+        .len();
+    (started.elapsed(), selected)
 }

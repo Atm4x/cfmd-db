@@ -212,6 +212,8 @@ impl RevisionDurability for DurableRevisionStore {
             .durability_barrier()
             .inspect_err(|_| self.poisoned = true)?;
         self.barrier_streaming_shadow();
+        self.capture_volatile_historical_epochs(std::slice::from_ref(&descriptor))
+            .inspect_err(|_| self.poisoned = true)?;
         authority.publish(self);
         self.prepared_transactions
             .retire_committed(prepared.prepare_lsn());
@@ -346,6 +348,10 @@ impl DurableRevisionStore {
             return DurableGroupCommitExecution::RecoveryRequired(error);
         }
         self.barrier_streaming_shadow();
+        if let Err(error) = self.capture_volatile_historical_epochs(&bound) {
+            self.poisoned = true;
+            return DurableGroupCommitExecution::RecoveryRequired(error);
+        }
         authority.publish(self);
         self.next_revision_effect_id = next_effect_id;
         self.semantic_registry = semantic_registry;

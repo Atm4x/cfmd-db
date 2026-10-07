@@ -1,8 +1,9 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
 use super::{
-    ReplicationAuthoritySegmentId, ReplicationAuthoritySegmentPlan, replay_verified_segment_reader,
-    verify_segment_reader,
+    ReplicationAuthorityFrameSource, ReplicationAuthoritySegmentId,
+    ReplicationAuthoritySegmentPlan, collect_verified_segment_reader,
+    replay_verified_segment_reader, verify_segment_reader,
 };
 use crate::replication::authority::ReplicationAuthorityJournal;
 use crate::runtime::DurabilityError;
@@ -89,9 +90,9 @@ fn chunk_aad(
     aad
 }
 
-pub(crate) fn write_segment_object(
+pub(crate) fn write_segment_object<S: ReplicationAuthorityFrameSource + ?Sized>(
     plan: &ReplicationAuthoritySegmentPlan,
-    frames: &[Vec<u8>],
+    source: &S,
     crypto: Option<&StorageAeadCodec>,
     nonce_sequence: Option<&mut StorageNonceSequence>,
     emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
@@ -102,18 +103,17 @@ pub(crate) fn write_segment_object(
             "immutable authority object nonce source does not match encryption mode",
         ));
     }
-    plan.validate_frames(frames)?;
     let header = object_header(plan, encrypted)?;
     emit(&header)?;
 
     match (crypto, nonce_sequence) {
         (None, None) => {
-            plan.write_validated_to(frames, emit)?;
+            plan.write_source_to(source, emit)?;
         }
         (Some(crypto), Some(nonce_sequence)) => {
             let mut chunk = Vec::with_capacity(OBJECT_CHUNK_SIZE);
             let mut chunk_index = 0_u32;
-            plan.write_validated_to(frames, &mut |mut bytes| {
+            plan.write_source_to(source, &mut |mut bytes| {
                 while !bytes.is_empty() {
                     let take = (OBJECT_CHUNK_SIZE - chunk.len()).min(bytes.len());
                     chunk.extend_from_slice(&bytes[..take]);
@@ -399,6 +399,31 @@ pub(super) fn verify_segment_object<R: Read>(
     recover_reader_error(&mut object, result)
 }
 
+pub(crate) fn collect_segment_object_frames<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    stored_len: u64,
+    expected_id: ReplicationAuthoritySegmentId,
+    expected_parent: Option<ReplicationAuthoritySegmentId>,
+    crypto: Option<&StorageAeadCodec>,
+) -> Result<Vec<Vec<u8>>, DurabilityError> {
+    reader.seek(SeekFrom::Start(offset))?;
+    verify_segment_object(reader, stored_len, expected_id, expected_parent, crypto)?;
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut object =
+        SegmentObjectReader::open(reader, stored_len, expected_id, expected_parent, crypto)?;
+    let plaintext_len = object.plaintext_len;
+    let result =
+        collect_verified_segment_reader(&mut object, plaintext_len, expected_id, expected_parent);
+    match result {
+        Ok(frames) => {
+            object.finish()?;
+            Ok(frames)
+        }
+        Err(error) => Err(object.take_pending_error().unwrap_or(error)),
+    }
+}
+
 pub(crate) fn replay_segment_object<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
@@ -426,6 +451,7 @@ pub(crate) fn replay_segment_object<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::io::Cursor;
 
@@ -450,6 +476,102 @@ mod tests {
             })
             .unwrap();
         source.take_pending_single_file_frames()
+    }
+
+    struct CountingFrameSource {
+        frames: Vec<Vec<u8>>,
+        traversals: Cell<usize>,
+    }
+
+    impl CountingFrameSource {
+        fn new(frames: Vec<Vec<u8>>) -> Self {
+            Self {
+                frames,
+                traversals: Cell::new(0),
+            }
+        }
+    }
+
+    impl ReplicationAuthorityFrameSource for CountingFrameSource {
+        fn is_empty(&self) -> bool {
+            self.frames.is_empty()
+        }
+
+        fn for_each_frame(
+            &self,
+            emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+        ) -> Result<(), DurabilityError> {
+            self.traversals.set(self.traversals.get() + 1);
+            for frame in &self.frames {
+                emit(frame)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn segment_object_publication_traverses_replayable_source_exactly_twice() {
+        let source = CountingFrameSource::new(frames());
+        let plan = ReplicationAuthoritySegmentPlan::from_source(None, &source).unwrap();
+        let mut stored = Vec::new();
+        write_segment_object(&plan, &source, None, None, &mut |bytes| {
+            stored.extend_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(source.traversals.get(), 2);
+        assert!(!stored.is_empty());
+    }
+
+    struct ChangingFrameSource {
+        first: Vec<Vec<u8>>,
+        second: Vec<Vec<u8>>,
+        traversals: Cell<usize>,
+    }
+
+    impl ReplicationAuthorityFrameSource for ChangingFrameSource {
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn for_each_frame(
+            &self,
+            emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+        ) -> Result<(), DurabilityError> {
+            let traversal = self.traversals.get();
+            self.traversals.set(traversal + 1);
+            let frames = if traversal == 0 {
+                &self.first
+            } else {
+                &self.second
+            };
+            for frame in frames {
+                emit(frame)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn segment_object_post_write_validation_rejects_changed_source() {
+        let first = frames();
+        let mut second = first.clone();
+        *second.last_mut().unwrap().last_mut().unwrap() ^= 1;
+        let source = ChangingFrameSource {
+            first,
+            second,
+            traversals: Cell::new(0),
+        };
+        let plan = ReplicationAuthoritySegmentPlan::from_source(None, &source).unwrap();
+        let mut stored = Vec::new();
+        assert!(
+            write_segment_object(&plan, &source, None, None, &mut |bytes| {
+                stored.extend_from_slice(bytes);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(source.traversals.get(), 2);
     }
 
     fn codec() -> StorageAeadCodec {
@@ -599,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn object_plan_mismatch_is_rejected_before_any_physical_bytes_are_emitted() {
+    fn object_plan_mismatch_never_emits_beyond_frozen_plan() {
         let frames = frames();
         let plan = ReplicationAuthoritySegmentPlan::from_frames(None, &frames).unwrap();
         let mut changed = frames.clone();
@@ -611,7 +733,10 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(error, DurabilityError::Corruption { .. }));
-        assert_eq!(emitted, 0);
+        assert_eq!(
+            emitted as u64,
+            object_stored_len(plan.encoded_len().unwrap(), false).unwrap()
+        );
     }
 
     #[test]

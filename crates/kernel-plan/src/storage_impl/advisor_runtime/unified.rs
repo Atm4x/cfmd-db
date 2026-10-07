@@ -8,7 +8,7 @@ pub(super) struct UnifiedObservableAdvisorInputs<'a> {
 
 struct UnifiedObservableAdvisorSelection {
     selection: advisor::AdmissionSelection<UnifiedArtifactId>,
-    prepared: BTreeMap<SemanticIndexBinding, MaterializedObservableAtomState>,
+    prepared: BTreeSet<SemanticIndexBinding>,
 }
 
 fn unified_observable_advisor_selection(
@@ -25,7 +25,7 @@ fn unified_observable_advisor_selection(
             .advisor_managed_artifacts
             .iter()
             .filter_map(|artifact| match artifact {
-                UnifiedArtifactId::ObservableAtom(binding) => Some(binding.clone()),
+                UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Observable } => Some(binding.clone()),
                 _ => None,
             }),
     );
@@ -40,16 +40,16 @@ fn unified_observable_advisor_selection(
             .filter(|(binding, _)| {
                 store
                     .advisor_managed_artifacts
-                    .contains(&UnifiedArtifactId::ObservableAtom((*binding).clone()))
+                    .contains(&UnifiedArtifactId::semantic_observable((*binding).clone()))
             })
             .map(|(_, state)| observable_atom_estimated_retained_bytes(state)),
     );
     let fixed_estimated_bytes = current_memory.saturating_sub(replaceable_observable_bytes);
-    let mut prepared = BTreeMap::<SemanticIndexBinding, MaterializedObservableAtomState>::new();
+    let mut prepared = BTreeSet::<SemanticIndexBinding>::new();
     let mut candidates = Vec::new();
 
     for binding in demanded {
-        let id = UnifiedArtifactId::ObservableAtom(binding.clone());
+        let id = UnifiedArtifactId::semantic_observable(binding.clone());
         let advisor_managed = store.advisor_managed_artifacts.contains(&id);
         let existing = store.observable_atom_states.get(&binding);
         if existing.is_some() && !advisor_managed {
@@ -69,15 +69,14 @@ fn unified_observable_advisor_selection(
         let estimated_bytes = if compatible_existing {
             existing.map_or(0, |state| observable_atom_estimated_retained_bytes(state))
         } else {
-            let relation = store.installed(binding.relation, binding.layout)?;
-            let state = MaterializedObservableAtomState::build(
+            let mut candidate_store = store.clone();
+            let state = candidate_store.build_catalog_free_observable_atom_state(
                 binding.clone(),
-                relation,
                 context,
                 registry,
             )?;
             let bytes = observable_atom_estimated_retained_bytes(&state);
-            prepared.insert(binding.clone(), state);
+            prepared.insert(binding.clone());
             bytes
         };
         let work = inputs.telemetry.get(&id).apply_to(
@@ -117,7 +116,7 @@ fn unified_observable_advisor_selection(
 fn observable_binding_ids(ids: Vec<UnifiedArtifactId>) -> Vec<SemanticIndexBinding> {
     ids.into_iter()
         .filter_map(|id| match id {
-            UnifiedArtifactId::ObservableAtom(binding) => Some(binding),
+            UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Observable } => Some(binding),
             _ => None,
         })
         .collect()
@@ -128,30 +127,32 @@ fn retire_advisor_legacy_for_observable(
     binding: &SemanticIndexBinding,
     report: &mut UnifiedObservableAdvisorReport,
 ) {
-    let statistics = UnifiedArtifactId::SemanticStatistics(binding.clone());
+    let statistics = UnifiedArtifactId::semantic_cardinality(binding.clone());
     if store.advisor_managed_artifacts.contains(&statistics) {
         store.semantic_statistics_mut_internal().remove(binding);
         store.advisor_managed_artifacts_mut().remove(&statistics);
-        report.retired_legacy_statistics.push(binding.clone());
+        report.retired_cardinality_profiles.push(binding.clone());
     }
-    let quotient = UnifiedArtifactId::SemanticQuotientFactor(binding.clone());
+    let quotient = UnifiedArtifactId::semantic_quotient(binding.clone());
     if store.advisor_managed_artifacts.contains(&quotient) {
         store.semantic_quotient_factors_mut().remove(binding);
         store.advisor_managed_artifacts_mut().remove(&quotient);
-        report.retired_legacy_quotient_factors.push(binding.clone());
+        report.retired_quotient_profiles.push(binding.clone());
     }
 }
 
 fn apply_unified_observable_selection(
     store: &mut PhysicalStore,
     mut selected: UnifiedObservableAdvisorSelection,
+    context: &kernel_schema::SemanticContext,
+    registry: &kernel_semantics::SemanticRegistry,
 ) -> Result<UnifiedObservableAdvisorReport, PhysicalExecutionError> {
     let selected_bindings = selected
         .selection
         .selected
         .iter()
         .filter_map(|id| match id {
-            UnifiedArtifactId::ObservableAtom(binding) => Some(binding.clone()),
+            UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Observable } => Some(binding.clone()),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
@@ -159,7 +160,7 @@ fn apply_unified_observable_selection(
         .advisor_managed_artifacts
         .iter()
         .filter_map(|artifact| match artifact {
-            UnifiedArtifactId::ObservableAtom(binding) if !selected_bindings.contains(binding) => {
+            UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Observable } if !selected_bindings.contains(binding) => {
                 Some(binding.clone())
             }
             _ => None,
@@ -167,14 +168,14 @@ fn apply_unified_observable_selection(
         .collect::<Vec<_>>();
     let selected_rebuild = selected_bindings
         .iter()
-        .any(|binding| selected.prepared.contains_key(binding));
+        .any(|binding| selected.prepared.contains(binding));
     let retires_legacy = selected_bindings.iter().any(|binding| {
         store
             .advisor_managed_artifacts
-            .contains(&UnifiedArtifactId::SemanticStatistics(binding.clone()))
+            .contains(&UnifiedArtifactId::semantic_cardinality(binding.clone()))
             || store
                 .advisor_managed_artifacts
-                .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()))
+                .contains(&UnifiedArtifactId::semantic_quotient(binding.clone()))
     });
     let changed = !evicted.is_empty() || selected_rebuild || retires_legacy;
     let next_epoch = if changed {
@@ -204,18 +205,23 @@ fn apply_unified_observable_selection(
         store.observable_atom_states_mut_internal().remove(&binding);
         store
             .advisor_managed_artifacts_mut()
-            .remove(&UnifiedArtifactId::ObservableAtom(binding.clone()));
+            .remove(&UnifiedArtifactId::semantic_observable(binding.clone()));
         report.evicted.push(binding);
     }
     for binding in selected_bindings {
-        if let Some(state) = selected.prepared.remove(&binding) {
+        if selected.prepared.remove(&binding) {
             let existed = store.observable_atom_states.contains_key(&binding);
+            let state = store.build_catalog_free_observable_atom_state(
+                binding.clone(),
+                context,
+                registry,
+            )?;
             store
                 .observable_atom_states_mut_internal()
                 .insert(binding.clone(), Arc::new(state));
             store
                 .advisor_managed_artifacts_mut()
-                .insert(UnifiedArtifactId::ObservableAtom(binding.clone()));
+                .insert(UnifiedArtifactId::semantic_observable(binding.clone()));
             if existed {
                 report.rebuilt.push(binding.clone());
             } else {

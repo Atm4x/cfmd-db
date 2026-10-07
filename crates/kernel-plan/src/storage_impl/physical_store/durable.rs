@@ -18,7 +18,7 @@ impl PhysicalStore {
                 key_parts: durable_semantic_key_parts(binding),
                 advisor_managed: self
                     .advisor_managed_artifacts
-                    .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone())),
+                    .contains(&UnifiedArtifactId::semantic_quotient(binding.clone())),
             });
         }
         for binding in self.semantic_statistics.keys() {
@@ -27,7 +27,7 @@ impl PhysicalStore {
                 key_parts: durable_semantic_key_parts(binding),
                 advisor_managed: self
                     .advisor_managed_artifacts
-                    .contains(&UnifiedArtifactId::SemanticStatistics(binding.clone())),
+                    .contains(&UnifiedArtifactId::semantic_cardinality(binding.clone())),
             });
         }
         for binding in self.observable_atom_states.keys() {
@@ -36,7 +36,7 @@ impl PhysicalStore {
                 key_parts: durable_semantic_key_parts(binding),
                 advisor_managed: self
                     .advisor_managed_artifacts
-                    .contains(&UnifiedArtifactId::ObservableAtom(binding.clone())),
+                    .contains(&UnifiedArtifactId::semantic_observable(binding.clone())),
             });
         }
         specs.sort();
@@ -251,10 +251,8 @@ impl PhysicalStore {
             PhysicalExecutionError::MissingRuntimeRelationBinding(relation),
         )?;
         let binding = recovered_semantic_index_binding(relation, layout, key_parts)?;
-        let relation_state = self.installed(binding.relation, binding.layout)?;
-        let state = MaterializedObservableAtomState::build_from_durable_core(
+        let state = self.build_catalog_free_observable_atom_state_from_durable(
             binding.clone(),
-            relation_state,
             encoded_keys_by_ordinal,
             context,
             registry,
@@ -263,7 +261,7 @@ impl PhysicalStore {
             .insert(binding.clone(), Arc::new(state));
         if advisor_managed {
             self.advisor_managed_artifacts_mut()
-                .insert(UnifiedArtifactId::ObservableAtom(binding));
+                .insert(UnifiedArtifactId::semantic_observable(binding));
         }
         Ok(())
     }
@@ -277,13 +275,13 @@ impl PhysicalStore {
                 BTreeSet::from([PhysicalCapability::PointLookup])
             }
             DurablePhysicalArtifactSpec::SemanticQuotientFactor { .. } => {
-                BTreeSet::from([PhysicalCapability::QuotientFiber])
+                SemanticFiberProfile::Quotient.capabilities()
             }
             DurablePhysicalArtifactSpec::SemanticStatistics { .. } => {
-                BTreeSet::from([PhysicalCapability::ExactCardinality])
+                SemanticFiberProfile::Cardinality.capabilities()
             }
             DurablePhysicalArtifactSpec::ObservableAtom { .. } => {
-                BTreeSet::from([PhysicalCapability::ObservableFiber])
+                SemanticFiberProfile::Observable.capabilities()
             }
         }
     }
@@ -314,7 +312,7 @@ impl PhysicalStore {
                 relation,
                 key_parts,
                 ..
-            } => Some(UnifiedArtifactId::SemanticQuotientFactor(
+            } => Some(UnifiedArtifactId::semantic_quotient(
                 recovered_semantic_index_binding(
                     *relation,
                     recovered_layout(*relation)?,
@@ -325,7 +323,7 @@ impl PhysicalStore {
                 relation,
                 key_parts,
                 ..
-            } => Some(UnifiedArtifactId::SemanticStatistics(
+            } => Some(UnifiedArtifactId::semantic_cardinality(
                 recovered_semantic_index_binding(
                     *relation,
                     recovered_layout(*relation)?,
@@ -336,7 +334,7 @@ impl PhysicalStore {
                 relation,
                 key_parts,
                 ..
-            } => Some(UnifiedArtifactId::ObservableAtom(
+            } => Some(UnifiedArtifactId::semantic_observable(
                 recovered_semantic_index_binding(
                     *relation,
                     recovered_layout(*relation)?,
@@ -517,7 +515,7 @@ impl PhysicalStore {
                     .insert(binding.clone(), Arc::new(state));
                 if *advisor_managed {
                     self.advisor_managed_artifacts_mut()
-                        .insert(UnifiedArtifactId::SemanticQuotientFactor(binding));
+                        .insert(UnifiedArtifactId::semantic_quotient(binding));
                 }
             }
             DurablePhysicalArtifactSpec::SemanticStatistics {
@@ -532,7 +530,7 @@ impl PhysicalStore {
                 self.install_semantic_statistics(binding.clone(), context, registry)?;
                 if *advisor_managed {
                     self.advisor_managed_artifacts_mut()
-                        .insert(UnifiedArtifactId::SemanticStatistics(binding));
+                        .insert(UnifiedArtifactId::semantic_cardinality(binding));
                 }
             }
             DurablePhysicalArtifactSpec::ObservableAtom {
@@ -547,7 +545,7 @@ impl PhysicalStore {
                 self.install_observable_atom_state(binding.clone(), context, registry)?;
                 if *advisor_managed {
                     self.advisor_managed_artifacts_mut()
-                        .insert(UnifiedArtifactId::ObservableAtom(binding));
+                        .insert(UnifiedArtifactId::semantic_observable(binding));
                 }
             }
         }
@@ -599,24 +597,24 @@ impl PhysicalStore {
         }
         for state in self.observable_atom_states.values() {
             add(
-                PhysicalArtifactFamily::ObservableAtom,
+                PhysicalArtifactFamily::SemanticFiber(SemanticFiberProfile::Observable),
                 observable_atom_estimated_retained_bytes(state),
                 false,
             );
         }
         for state in self.row_occurrence_atoms.values() {
             add(
-                PhysicalArtifactFamily::ObservableAtom,
+                PhysicalArtifactFamily::SemanticFiber(SemanticFiberProfile::Observable),
                 observable_atom_estimated_retained_bytes(state),
                 false,
             );
         }
         for (binding, state) in &self.semantic_quotient_factors {
             add(
-                PhysicalArtifactFamily::SemanticQuotientFactor,
+                PhysicalArtifactFamily::SemanticFiber(SemanticFiberProfile::Quotient),
                 quotient_factor_estimated_retained_bytes(state),
                 self.advisor_managed_artifacts
-                    .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone())),
+                    .contains(&UnifiedArtifactId::semantic_quotient(binding.clone())),
             );
         }
         for (binding, state) in &self.semantic_quotient_supports {
@@ -629,10 +627,10 @@ impl PhysicalStore {
         }
         for (binding, state) in &self.semantic_statistics {
             add(
-                PhysicalArtifactFamily::SemanticStatistics,
+                PhysicalArtifactFamily::SemanticFiber(SemanticFiberProfile::Cardinality),
                 semantic_statistics_estimated_retained_bytes(state),
                 self.advisor_managed_artifacts
-                    .contains(&UnifiedArtifactId::SemanticStatistics(binding.clone())),
+                    .contains(&UnifiedArtifactId::semantic_cardinality(binding.clone())),
             );
         }
         report

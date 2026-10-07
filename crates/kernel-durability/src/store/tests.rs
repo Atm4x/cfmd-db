@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{Signer, SigningKey};
 use kernel_auth::{
-    SignedFreshnessCut, TrustRootSet, freshness_record_digest, key_id, sign_freshness_cut,
+    FreshnessAuthorityState, FreshnessCut, SignedFreshnessAuthority, TrustRootSet,
+    freshness_authority_record_digest, key_id, sign_freshness_authority,
 };
 use kernel_model::{DatabaseState, Value};
 use kernel_realization::realize_database_state_factorized;
@@ -34,9 +35,8 @@ use crate::{
     ReplicationQuorumCertificate, ReplicationQuorumLoss, ReplicationRecoveryAck,
     ReplicationRecoveryCertificate, ReplicationTermPromise, ReplicationTransportFrame,
     ReplicationTransportIngress, ReplicationTransportPayload, SignedReplicationPeerEvidence,
-    SignedReplicationTransportFrame, SingleFileSectionKind, replicated_effect_id,
-    replication_membership_digest, replication_peer_evidence_signing_message,
-    replication_transport_signing_message,
+    SignedReplicationTransportFrame, replicated_effect_id, replication_membership_digest,
+    replication_peer_evidence_signing_message, replication_transport_signing_message,
 };
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
@@ -49,30 +49,30 @@ const CRASH_READY_FILE: &str = ".cfmd-crash-ready";
 #[derive(Debug)]
 struct TestFreshnessAuthority {
     signing: SigningKey,
-    current: Option<SignedFreshnessCut>,
+    current: Option<SignedFreshnessAuthority>,
 }
 
 impl ExternalFreshnessAuthority for TestFreshnessAuthority {
     fn read_signed(
         &mut self,
         _store_id: [u8; 32],
-    ) -> Result<Option<SignedFreshnessCut>, DurabilityError> {
+    ) -> Result<Option<SignedFreshnessAuthority>, DurabilityError> {
         Ok(self.current.clone())
     }
 
-    fn compare_and_advance_signed(
+    fn compare_and_set_signed(
         &mut self,
         expected_record: Option<AuthorityDigest>,
-        next: FreshnessCut,
-    ) -> Result<SignedFreshnessCut, DurabilityError> {
-        let current = self.current.as_ref().map(freshness_record_digest);
+        next: FreshnessAuthorityState,
+    ) -> Result<SignedFreshnessAuthority, DurabilityError> {
+        let current = self.current.as_ref().map(freshness_authority_record_digest);
         if current != expected_record {
             return Err(DurabilityError::Protocol {
                 offset: 0,
                 reason: "test freshness CAS mismatch",
             });
         }
-        let signed = sign_freshness_cut(&self.signing, next);
+        let signed = sign_freshness_authority(&self.signing, next);
         self.current = Some(signed.clone());
         Ok(signed)
     }
@@ -86,7 +86,7 @@ const FRESHNESS_FAIL_AFTER_APPLY: u8 = 3;
 #[derive(Debug, Clone)]
 struct SharedFreshnessAuthority {
     signing: SigningKey,
-    current: Arc<Mutex<Option<SignedFreshnessCut>>>,
+    current: Arc<Mutex<Option<SignedFreshnessAuthority>>>,
     failure_mode: Arc<AtomicU8>,
 }
 
@@ -111,21 +111,27 @@ impl SharedFreshnessAuthority {
 impl ExternalFreshnessAuthority for SharedFreshnessAuthority {
     fn read_signed(
         &mut self,
-        _store_id: [u8; 32],
-    ) -> Result<Option<SignedFreshnessCut>, DurabilityError> {
-        if self.failure_mode.swap(FRESHNESS_OK, Ordering::SeqCst) == FRESHNESS_FAIL_READ {
+        store_id: [u8; 32],
+    ) -> Result<Option<SignedFreshnessAuthority>, DurabilityError> {
+        if self.failure_mode.load(Ordering::SeqCst) == FRESHNESS_FAIL_READ {
+            self.failure_mode.store(FRESHNESS_OK, Ordering::SeqCst);
             return Err(DurabilityError::Io(std::io::Error::other(
                 "external freshness authority unavailable",
             )));
         }
-        Ok(self.current.lock().unwrap().clone())
+        Ok(self
+            .current
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|record| record.state.lineage_id() == store_id))
     }
 
-    fn compare_and_advance_signed(
+    fn compare_and_set_signed(
         &mut self,
         expected_record: Option<AuthorityDigest>,
-        next: FreshnessCut,
-    ) -> Result<SignedFreshnessCut, DurabilityError> {
+        next: FreshnessAuthorityState,
+    ) -> Result<SignedFreshnessAuthority, DurabilityError> {
         let mode = self.failure_mode.swap(FRESHNESS_OK, Ordering::SeqCst);
         if mode == FRESHNESS_FAIL_BEFORE_APPLY {
             return Err(DurabilityError::Io(std::io::Error::other(
@@ -133,18 +139,66 @@ impl ExternalFreshnessAuthority for SharedFreshnessAuthority {
             )));
         }
         let mut current = self.current.lock().unwrap();
-        if current.as_ref().map(freshness_record_digest) != expected_record {
+        if current.as_ref().map(freshness_authority_record_digest) != expected_record {
             return Err(DurabilityError::Protocol {
                 offset: 0,
                 reason: "shared freshness CAS mismatch",
             });
         }
-        let signed = sign_freshness_cut(&self.signing, next);
+        let signed = sign_freshness_authority(&self.signing, next);
         *current = Some(signed.clone());
         drop(current);
         if mode == FRESHNESS_FAIL_AFTER_APPLY {
             return Err(DurabilityError::Io(std::io::Error::other(
                 "external freshness response lost after CAS apply",
+            )));
+        }
+        Ok(signed)
+    }
+
+    fn compare_and_rebind_signed(
+        &mut self,
+        source_store_id: [u8; 32],
+        expected_source_record: AuthorityDigest,
+        next: FreshnessAuthorityState,
+    ) -> Result<SignedFreshnessAuthority, DurabilityError> {
+        let mode = self.failure_mode.swap(FRESHNESS_OK, Ordering::SeqCst);
+        if mode == FRESHNESS_FAIL_BEFORE_APPLY {
+            return Err(DurabilityError::Io(std::io::Error::other(
+                "external freshness rebind failed before CAS apply",
+            )));
+        }
+        let mut current = self.current.lock().unwrap();
+        let source = current.as_ref().ok_or(DurabilityError::Protocol {
+            offset: 0,
+            reason: "shared freshness rebind source missing",
+        })?;
+        let source_cut = source.durable_cut().ok_or(DurabilityError::Protocol {
+            offset: 0,
+            reason: "shared freshness rebind source is not durable",
+        })?;
+        let FreshnessAuthorityState::DurableCut(next_cut) = next else {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "shared freshness rebind target is not durable",
+            });
+        };
+        if source_cut.store_id != source_store_id
+            || freshness_authority_record_digest(source) != expected_source_record
+            || next_cut.previous_generation != Some(source_cut.generation_digest)
+            || next_cut.store_id == source_store_id
+        {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "shared freshness rebind CAS mismatch",
+            });
+        }
+        let signed = sign_freshness_authority(&self.signing, next);
+        *current = Some(signed.clone());
+        drop(current);
+        if mode == FRESHNESS_FAIL_AFTER_APPLY {
+            return Err(DurabilityError::Io(std::io::Error::other(
+                "external freshness rebind response lost after CAS apply",
             )));
         }
         Ok(signed)
@@ -616,8 +670,8 @@ fn external_freshness_recovers_cas_response_loss_before_and_after_apply() {
         .unwrap();
     let descriptor = committed_descriptor(&revision, &registry, relation, 1_201, 3);
     authority.fail_once(FRESHNESS_FAIL_AFTER_APPLY);
-    assert!(store.durably_prepare(&descriptor).is_err());
-    assert!(store.requires_recovery());
+    store.durably_prepare(&descriptor).unwrap();
+    assert!(!store.requires_recovery());
     drop(store);
     let (recovered, _) =
         DurableRevisionStore::open_with_external_freshness(&after_dir, config, authority.boxed())
@@ -777,9 +831,12 @@ fn external_freshness_rejects_authenticated_wal_prefix_fork() {
 
     {
         let mut current = authority.current.lock().unwrap();
-        let mut cut = current.as_ref().unwrap().cut;
+        let mut cut = current.as_ref().unwrap().durable_cut().unwrap();
         cut.wal_digest = AuthorityDigest([0xEE; 32]);
-        *current = Some(sign_freshness_cut(&authority.signing, cut));
+        *current = Some(sign_freshness_authority(
+            &authority.signing,
+            FreshnessAuthorityState::DurableCut(cut),
+        ));
     }
     assert!(matches!(
         DurableRevisionStore::open_with_external_freshness(&dir, config, authority.boxed()),
@@ -4167,6 +4224,78 @@ fn retry_gc_persists_watermark_and_keeps_causal_history_self_contained() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn satisfied_client_intent_seal_is_durable_without_advancing_semantic_revision() {
+    let dir = test_dir("satisfied-intent-seal-no-revision");
+    let (base, registry, relation) = setup_revision(450, &[1]);
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    let transaction_id = ClientTransactionId::new(0xA510);
+    let (hypothetical_target, _, _) = setup_revision(451, &[1, 2]);
+    let descriptor = DurableRevisionDescriptor::relation_data(
+        transaction_id,
+        RevisionId::new(450),
+        &hypothetical_target,
+        base.semantic_revision(),
+        vec![DurableRelationMutation {
+            relation,
+            inserted: vec![vec![Value::I64(2)]],
+            removed: Vec::new(),
+            object_field_writes: Vec::new(),
+            authorization: crate::DurableRelationAuthorization::default(),
+        }],
+        &registry,
+    )
+    .unwrap();
+    let client_intent = descriptor.intent.client_intent_owned();
+
+    assert_eq!(
+        store
+            .durably_seal_satisfied_client_intent(transaction_id, client_intent.clone())
+            .unwrap(),
+        crate::DurableSatisfiedIntentSealOutcome::Sealed {
+            revision: RevisionId::new(450)
+        }
+    );
+    assert_eq!(store.durable_head(), RevisionId::new(450));
+    assert_eq!(
+        store.transaction_outcome(transaction_id),
+        DurableTransactionOutcome::Committed {
+            target_revision: RevisionId::new(450)
+        }
+    );
+    assert!(
+        store
+            .revision_effect_frontier(RevisionId::new(450))
+            .is_some_and(BTreeSet::is_empty)
+    );
+    assert_eq!(
+        store
+            .durably_seal_satisfied_client_intent(transaction_id, client_intent)
+            .unwrap(),
+        crate::DurableSatisfiedIntentSealOutcome::AlreadySealed {
+            revision: RevisionId::new(450)
+        }
+    );
+    drop(store);
+
+    let (reopened, scan) = DurableRevisionStore::open(&dir).unwrap();
+    assert_eq!(scan.durable_revision(), RevisionId::new(450));
+    assert!(scan.committed().is_empty());
+    assert_eq!(reopened.durable_head(), RevisionId::new(450));
+    assert_eq!(
+        reopened.transaction_outcome(transaction_id),
+        DurableTransactionOutcome::Committed {
+            target_revision: RevisionId::new(450)
+        }
+    );
+    assert!(
+        reopened
+            .revision_effect_frontier(RevisionId::new(450))
+            .is_some_and(BTreeSet::is_empty)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
 macro_rules! replicated_relation_effect {
     ($origin:expr, $sequence:expr, $branch:expr, $source:expr, $target:expr, $deps:expr, $semantic:expr, $position:expr) => {{
         let origin = ReplicaId::new($origin);
@@ -5468,6 +5597,44 @@ fn replication_vote_once_rejects_conflicting_effects_across_leaders_and_survives
             ..
         })
     ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn replication_semantic_carrier_does_not_pay_superseded_term_promise_history() {
+    let dir = test_dir("replication-semantic-carrier-superseded-promises");
+    let (base, registry, _) = setup_revision(2_600, &[1]);
+    let mut store = DurableRevisionStore::create(&dir, &base, &registry).unwrap();
+    store
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+    for term in 1..=256 {
+        store
+            .durably_record_replication_term_promise(ReplicationTermPromise {
+                voter: ReplicaId::new(1),
+                membership_epoch: 1,
+                term,
+            })
+            .unwrap();
+    }
+    let physical_history_bytes =
+        usize::try_from(fs::metadata(store.replication.path()).unwrap().len())
+            .expect("replication journal length fits usize");
+    let semantic_carrier_bytes = store.replication.test_semantic_carrier_encoded_len();
+    let (record_count, canonical_len, max_record_len) =
+        store.replication.test_semantic_carrier_record_stats();
+    assert_eq!(
+        canonical_len,
+        u64::try_from(semantic_carrier_bytes).unwrap()
+    );
+    assert!(record_count > 4);
+    assert!(max_record_len <= crate::MAX_PAYLOAD_LEN);
+    assert!(u64::try_from(max_record_len).unwrap() < canonical_len);
+    assert!(
+        semantic_carrier_bytes * 8 < physical_history_bytes,
+        "semantic carrier {semantic_carrier_bytes} bytes did not materially beat {physical_history_bytes} bytes of append history"
+    );
+    drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -6884,20 +7051,35 @@ fn single_file_replication_authority_replays_live_wal_and_survives_rotation() {
     assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
     reopened.rotate_checkpoint(&base).unwrap();
     assert!(
+        !reopened
+            .backend
+            .single_file_container()
+            .unwrap()
+            .portable_replication_authority_frames()
+            .unwrap()
+            .is_empty()
+    );
+    let authority_binding = reopened
+        .backend
+        .single_file_container()
+        .unwrap()
+        .test_replication_authority_binding()
+        .unwrap();
+    reopened.rotate_checkpoint(&base).unwrap();
+    assert_eq!(
         reopened
             .backend
             .single_file_container()
             .unwrap()
-            .read_section(SingleFileSectionKind::ReplicationAuthority, 0)
-            .unwrap()
-            .is_none()
+            .test_replication_authority_binding(),
+        Some(authority_binding)
     );
     drop(reopened);
 
     let (reopened, scan) = DurableRevisionStore::open_single_file(&path).unwrap();
     assert_eq!(scan.durable_revision(), base.id());
     assert_eq!(reopened.current_replication_membership().unwrap().epoch, 1);
-    assert_eq!(reopened.generation(), 2);
+    assert_eq!(reopened.generation(), 3);
     let names = fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -7664,8 +7846,7 @@ fn single_file_streaming_checkpoint_carries_exact_wal_and_replication_suffix() {
             .backend
             .single_file_container()
             .unwrap()
-            .read_section(SingleFileSectionKind::ReplicationAuthority, 0)
-            .unwrap()
+            .test_replication_authority_binding()
             .is_none()
     );
 
@@ -7856,4 +8037,1383 @@ fn causal_history_release_publishes_head_root_and_preserves_effect_id_high_water
     );
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn canonical_persistence_image_stages_same_revision_with_retry_and_causal_authority() {
+    let source_dir = test_dir("persistence-image-source");
+    let target_dir = test_dir("persistence-image-target");
+    let target_path = target_dir.join("promoted.cfmd");
+    let (base, registry, relation) = setup_revision(55_000, &[1]);
+    let (target, descriptor) = transition_from(&base, &registry, relation, 55_001, 2);
+
+    let mut source = DurableRevisionStore::create(&source_dir, &base, &registry).unwrap();
+    let prepared = source.durably_prepare(&descriptor).unwrap();
+    source.durably_commit(prepared).unwrap();
+    let (_future, pending_descriptor) = transition_from(&target, &registry, relation, 55_002, 3);
+    let _pending_prepare = source.durably_prepare(&pending_descriptor).unwrap();
+    let expected_pending = source
+        .prepared_transactions
+        .descriptor_by_target_revision(RevisionId::new(55_002))
+        .unwrap()
+        .clone();
+    source
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+
+    let image = source.canonical_persistence_image(&target).unwrap();
+    assert_eq!(image.current_revision().id(), target.id());
+    assert_eq!(image.committed_retry_count(), 1);
+    assert_eq!(image.retained_effect_count(), 1);
+    assert_eq!(image.causal_coverage_root(), base.id());
+
+    let promoted = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &target_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+
+    assert_eq!(promoted.durable_head, target.id());
+    assert_eq!(promoted.checkpoint.id(), target.id());
+    assert_eq!(promoted.causal_coverage_root, source.causal_coverage_root);
+    assert_eq!(
+        promoted.committed_transactions,
+        source.committed_transactions
+    );
+    assert_eq!(promoted.revision_effects, source.revision_effects);
+    assert_eq!(
+        promoted.revision_effect_frontiers,
+        source.revision_effect_frontiers
+    );
+    assert_eq!(promoted.prepared_transactions.len(), 1);
+    assert_eq!(
+        promoted
+            .prepared_transactions
+            .descriptor_by_target_revision(RevisionId::new(55_002)),
+        Some(&expected_pending)
+    );
+    assert_eq!(promoted.current_replication_membership().unwrap().epoch, 1);
+
+    drop(promoted);
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn live_fork_preserves_semantic_history_but_refounds_operational_authority() {
+    let source_dir = test_dir("live-fork-source");
+    let target_dir = test_dir("live-fork-target");
+    let target_path = target_dir.join("fork.cfmd");
+    let (base, registry, relation) = setup_revision(55_005, &[1]);
+    let (target, descriptor) = transition_from(&base, &registry, relation, 55_006, 2);
+
+    let mut source = DurableRevisionStore::create(&source_dir, &base, &registry).unwrap();
+    let prepared = source.durably_prepare(&descriptor).unwrap();
+    source.durably_commit(prepared).unwrap();
+    let (_future, pending_descriptor) = transition_from(&target, &registry, relation, 55_007, 3);
+    let _pending_prepare = source.durably_prepare(&pending_descriptor).unwrap();
+    source
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+
+    let image = source.fork_persistence_image(&target).unwrap();
+    let fork = DurableRevisionStore::stage_single_file_from_fork_image(
+        &target_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+
+    assert_eq!(fork.durable_head, target.id());
+    assert_eq!(fork.checkpoint, target);
+    assert_eq!(fork.causal_coverage_root, source.causal_coverage_root);
+    assert_eq!(fork.revision_effects, source.revision_effects);
+    assert_eq!(
+        fork.revision_effect_frontiers,
+        source.revision_effect_frontiers
+    );
+    assert_eq!(fork.migration_complements, source.migration_complements);
+    assert_eq!(
+        fork.historical_epoch_anchors,
+        source.historical_epoch_anchors
+    );
+
+    assert_eq!(fork.current_idempotency_epoch, IdempotencyEpoch::ZERO);
+    assert_eq!(fork.minimum_retry_epoch, IdempotencyEpoch::ZERO);
+    assert!(fork.committed_transactions.is_empty());
+    assert!(fork.prepared_transactions.is_empty());
+    assert!(fork.current_replication_membership().is_none());
+
+    assert_eq!(source.committed_transactions.len(), 1);
+    assert!(!source.prepared_transactions.is_empty());
+    assert_eq!(source.current_replication_membership().unwrap().epoch, 1);
+
+    drop(fork);
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn externally_anchored_live_fork_bootstraps_independent_target_freshness_root() {
+    let source_dir = test_dir("live-fork-fresh-source");
+    let target_dir = test_dir("live-fork-fresh-target");
+    let source_path = source_dir.join("source.cfmd");
+    let target_path = target_dir.join("fork.cfmd");
+    let (revision, registry, _) = setup_revision(55_020, &[1]);
+    let (source_config, source_authority) = external_freshness_fixture([0x81; 32]);
+    let (target_config, target_authority) = external_freshness_fixture([0x82; 32]);
+
+    let mut source =
+        DurableRevisionStore::create_single_file(&source_path, &revision, &registry).unwrap();
+    source
+        .adopt_external_freshness(source_config.clone(), source_authority.boxed())
+        .unwrap();
+    let source_record_before = source_authority.current.lock().unwrap().clone().unwrap();
+    let image = source.fork_persistence_image(&revision).unwrap();
+
+    let rejected_path = target_dir.join("same-root.cfmd");
+    let (_, rejected_authority) = external_freshness_fixture(source_config.store_id);
+    assert!(matches!(
+        DurableRevisionStore::stage_single_file_from_fork_image_with_external_freshness_bootstrap(
+            &rejected_path,
+            &crate::StorageEncryption::None,
+            &image,
+            source_config.clone(),
+            rejected_authority.boxed(),
+        ),
+        Err(DurabilityError::Protocol {
+            reason: "live fork freshness bootstrap requires a distinct target store id",
+            ..
+        })
+    ));
+    assert!(!rejected_path.exists());
+
+    target_authority.fail_once(FRESHNESS_FAIL_AFTER_APPLY);
+    let (fork, scan) =
+        DurableRevisionStore::stage_single_file_from_fork_image_with_external_freshness_bootstrap(
+            &target_path,
+            &crate::StorageEncryption::None,
+            &image,
+            target_config.clone(),
+            target_authority.boxed(),
+        )
+        .unwrap();
+
+    assert_eq!(scan.durable_revision(), revision.id());
+    assert_eq!(fork.durable_head(), revision.id());
+    assert!(fork.external_freshness.is_some());
+    assert_eq!(fork.current_idempotency_epoch, IdempotencyEpoch::ZERO);
+    assert_eq!(fork.minimum_retry_epoch, IdempotencyEpoch::ZERO);
+    assert!(fork.committed_transactions.is_empty());
+    assert!(fork.prepared_transactions.is_empty());
+    assert!(fork.current_replication_membership().is_none());
+
+    let source_record_after = source_authority.current.lock().unwrap().clone().unwrap();
+    assert_eq!(source_record_after, source_record_before);
+    let target_record = target_authority.current.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        target_record.durable_cut().unwrap().store_id,
+        target_config.store_id
+    );
+    assert_ne!(
+        target_record.durable_cut().unwrap().store_id,
+        source_record_after.durable_cut().unwrap().store_id
+    );
+
+    drop(fork);
+    assert!(matches!(
+        DurableRevisionStore::open_single_file(&target_path),
+        Err(DurabilityError::Protocol {
+            reason: "externally anchored store requires freshness-aware open",
+            ..
+        })
+    ));
+    let (reopened, reopened_scan) =
+        DurableRevisionStore::open_single_file_with_external_freshness_and_encryption(
+            &target_path,
+            target_config,
+            target_authority.boxed(),
+            &crate::StorageEncryption::None,
+        )
+        .unwrap();
+    assert_eq!(reopened_scan.durable_revision(), revision.id());
+    assert_eq!(reopened.durable_head(), revision.id());
+
+    drop(reopened);
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn strict_backup_verify_and_fresh_restore_preserve_canonical_authority() {
+    let source_dir = test_dir("strict-backup-source");
+    let backup_dir = test_dir("strict-backup-artifact");
+    let restore_dir = test_dir("strict-backup-restore");
+    let backup_path = backup_dir.join("backup.cfmd");
+    let restore_path = restore_dir.join("restored.cfmd");
+    let (base, registry, relation) = setup_revision(55_010, &[1]);
+    let (target, descriptor) = transition_from(&base, &registry, relation, 55_011, 2);
+
+    let mut source = DurableRevisionStore::create(&source_dir, &base, &registry).unwrap();
+    let prepared = source.durably_prepare(&descriptor).unwrap();
+    source.durably_commit(prepared).unwrap();
+    source
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+    let image = source.canonical_persistence_image(&target).unwrap();
+    let backup = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &backup_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+    drop(backup);
+
+    assert_eq!(
+        DurableRevisionStore::verify_single_file_backup(
+            &backup_path,
+            &crate::StorageEncryption::None,
+        )
+        .unwrap(),
+        target.id()
+    );
+
+    let restored = DurableRevisionStore::restore_single_file_backup(
+        &backup_path,
+        &crate::StorageEncryption::None,
+        &restore_path,
+        &crate::StorageEncryption::None,
+    )
+    .unwrap();
+    assert_eq!(restored.durable_head(), target.id());
+    assert_eq!(
+        restored.causal_coverage_root(),
+        source.causal_coverage_root()
+    );
+    assert_eq!(
+        restored.committed_transactions,
+        source.committed_transactions
+    );
+    assert_eq!(restored.revision_effects, source.revision_effects);
+    assert_eq!(
+        restored.revision_effect_frontiers,
+        source.revision_effect_frontiers
+    );
+    assert_eq!(restored.current_replication_membership().unwrap().epoch, 1);
+
+    drop(restored);
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(backup_dir).unwrap();
+    fs::remove_dir_all(restore_dir).unwrap();
+}
+
+#[test]
+fn strict_backup_verification_fails_closed_on_corruption_and_truncation() {
+    let source_dir = test_dir("strict-backup-corrupt-source");
+    let backup_dir = test_dir("strict-backup-corrupt-artifacts");
+    let backup_path = backup_dir.join("backup.cfmd");
+    let corrupt_path = backup_dir.join("corrupt.cfmd");
+    let truncated_path = backup_dir.join("truncated.cfmd");
+    let (revision, registry, _) = setup_revision(55_012, &[1]);
+
+    let mut source = DurableRevisionStore::create(&source_dir, &revision, &registry).unwrap();
+    let image = source.canonical_persistence_image(&revision).unwrap();
+    let backup = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &backup_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+    drop(backup);
+
+    let mut corrupt = fs::read(&backup_path).unwrap();
+    corrupt[0] ^= 0x5a;
+    fs::write(&corrupt_path, corrupt).unwrap();
+    assert!(
+        DurableRevisionStore::verify_single_file_backup(
+            &corrupt_path,
+            &crate::StorageEncryption::None,
+        )
+        .is_err()
+    );
+
+    let mut truncated = fs::read(&backup_path).unwrap();
+    truncated.truncate(truncated.len() / 2);
+    fs::write(&truncated_path, truncated).unwrap();
+    assert!(
+        DurableRevisionStore::verify_single_file_backup(
+            &truncated_path,
+            &crate::StorageEncryption::None,
+        )
+        .is_err()
+    );
+
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(backup_dir).unwrap();
+}
+
+#[test]
+fn canonical_persistence_image_rejects_at_rest_encryption_downgrade() {
+    let source_dir = test_dir("persistence-image-encrypted-source");
+    let target_dir = test_dir("persistence-image-encrypted-target");
+    let source_path = source_dir.join("source.cfmd");
+    let plaintext_target = target_dir.join("plaintext.cfmd");
+    let encrypted_target = target_dir.join("encrypted.cfmd");
+    let (revision, registry, _) = setup_revision(55_025, &[1]);
+    let source_encryption = crate::StorageEncryption::aes256_gcm_siv(
+        crate::StorageEncryptionKey::try_new([0xA4; 32]).unwrap(),
+    );
+    let target_encryption = crate::StorageEncryption::aes256_gcm_siv(
+        crate::StorageEncryptionKey::try_new([0xA5; 32]).unwrap(),
+    );
+
+    let mut source = DurableRevisionStore::create_single_file_with_encryption(
+        &source_path,
+        &source_encryption,
+        &revision,
+        &registry,
+    )
+    .unwrap();
+    let image = source.canonical_persistence_image(&revision).unwrap();
+
+    assert!(matches!(
+        DurableRevisionStore::stage_single_file_from_persistence_image(
+            &plaintext_target,
+            &crate::StorageEncryption::None,
+            &image,
+        ),
+        Err(DurabilityError::Protocol {
+            reason: "persistence target weakens source at-rest protection authority",
+            ..
+        })
+    ));
+    assert!(!plaintext_target.exists());
+
+    let promoted = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &encrypted_target,
+        &target_encryption,
+        &image,
+    )
+    .unwrap();
+    assert_eq!(promoted.durable_head, revision.id());
+
+    drop(promoted);
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn canonical_persistence_image_preserves_external_key_authority_floor() {
+    let source_dir = test_dir("persistence-image-wrapped-source");
+    let target_dir = test_dir("persistence-image-wrapped-target");
+    let source_path = source_dir.join("source.cfmd");
+    let downgraded_target = target_dir.join("direct.cfmd");
+    let foreign_target = target_dir.join("foreign.cfmd");
+    let stale_target = target_dir.join("stale.cfmd");
+    let valid_target = target_dir.join("valid.cfmd");
+    let (revision, registry, _) = setup_revision(55_030, &[1]);
+    let provider_id = [0xB1; 16];
+    let source_encryption = crate::StorageEncryption::aes256_gcm_siv_wrapped(
+        crate::StorageEncryptionKey::try_new([0xB2; 32]).unwrap(),
+        provider_id,
+        7,
+    );
+
+    let mut source = DurableRevisionStore::create_single_file_with_encryption(
+        &source_path,
+        &source_encryption,
+        &revision,
+        &registry,
+    )
+    .unwrap();
+    let image = source.canonical_persistence_image(&revision).unwrap();
+
+    let direct = crate::StorageEncryption::aes256_gcm_siv(
+        crate::StorageEncryptionKey::try_new([0xB3; 32]).unwrap(),
+    );
+    let foreign = crate::StorageEncryption::aes256_gcm_siv_wrapped(
+        crate::StorageEncryptionKey::try_new([0xB4; 32]).unwrap(),
+        [0xBC; 16],
+        8,
+    );
+    let stale = crate::StorageEncryption::aes256_gcm_siv_wrapped(
+        crate::StorageEncryptionKey::try_new([0xB5; 32]).unwrap(),
+        provider_id,
+        6,
+    );
+    let valid = crate::StorageEncryption::aes256_gcm_siv_wrapped(
+        crate::StorageEncryptionKey::try_new([0xB6; 32]).unwrap(),
+        provider_id,
+        8,
+    );
+
+    for (path, encryption) in [
+        (&downgraded_target, &direct),
+        (&foreign_target, &foreign),
+        (&stale_target, &stale),
+    ] {
+        assert!(matches!(
+            DurableRevisionStore::stage_single_file_from_persistence_image(
+                path, encryption, &image,
+            ),
+            Err(DurabilityError::Protocol {
+                reason: "persistence target weakens source at-rest protection authority",
+                ..
+            })
+        ));
+        assert!(!path.exists());
+    }
+
+    let promoted = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &valid_target,
+        &valid,
+        &image,
+    )
+    .unwrap();
+    assert_eq!(promoted.durable_head, revision.id());
+
+    drop(promoted);
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn canonical_persistence_image_ignores_unpublished_streaming_checkpoint_work() {
+    let source_dir = test_dir("persistence-image-streaming-source");
+    let target_dir = test_dir("persistence-image-streaming-target");
+    let target_path = target_dir.join("promoted.cfmd");
+    let (revision, registry, _) = setup_revision(55_050, &[1]);
+    let mut source = DurableRevisionStore::create(&source_dir, &revision, &registry).unwrap();
+    source
+        .begin_streaming_checkpoint_with_chunk_size(&revision, 16)
+        .unwrap();
+    source.write_streaming_checkpoint_chunks(1).unwrap();
+    assert!(source.has_streaming_checkpoint());
+
+    let image = source.canonical_persistence_image(&revision).unwrap();
+    let promoted = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &target_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+    assert_eq!(promoted.durable_head, revision.id());
+    assert!(!promoted.has_streaming_checkpoint());
+
+    drop(promoted);
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn canonical_persistence_image_carries_retained_historical_authority_portably() {
+    let source_dir = test_dir("persistence-image-retained-history-source");
+    let target_dir = test_dir("persistence-image-retained-history-target");
+    let target_path = target_dir.join("promoted.cfmd");
+    let (base, registry, _) = setup_revision(55_100, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(55_101),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let complement = crate::DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: base.semantic_revision().schema,
+            target_schema: target.semantic_revision().schema,
+            lens_spec: kernel_lens::LensSpecId(SemanticId::new(55_102)),
+            semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(55_103)),
+            encoding_version: 1,
+            complement: Value::I64(7),
+        },
+        kernel_lens::ComplementRetention::Forever,
+    );
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(55_104),
+        base.id(),
+        &target,
+        complement,
+        &registry,
+    )
+    .unwrap();
+    let mut store = DurableRevisionStore::create(&source_dir, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let effect_id = store
+        .historical_epoch_anchors()
+        .keys()
+        .next()
+        .copied()
+        .unwrap();
+    let expected = store.historical_epoch_material(effect_id).unwrap().unwrap();
+
+    let image = store.canonical_persistence_image(&target).unwrap();
+    let mut promoted = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &target_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+
+    assert_eq!(
+        promoted.historical_epoch_anchors(),
+        store.historical_epoch_anchors()
+    );
+    let expected_encoded = super::portable_history::PortableHistoricalEpochClosure::from_material(
+        effect_id, &expected,
+    )
+    .encode()
+    .unwrap();
+    let expected_portable =
+        super::portable_history::PortableHistoricalEpochClosure::decode(&expected_encoded)
+            .unwrap()
+            .material()
+            .unwrap();
+    assert_eq!(
+        promoted.historical_epoch_material(effect_id).unwrap(),
+        Some(expected_portable)
+    );
+
+    drop(promoted);
+    drop(store);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn canonical_persistence_image_carries_compacted_single_file_replication_authority() {
+    let source_dir = test_dir("persistence-image-compacted-replication-source");
+    let target_dir = test_dir("persistence-image-compacted-replication-target");
+    let source_path = source_dir.join("source.cfmd");
+    let target_path = target_dir.join("promoted.cfmd");
+    let (revision, registry, _) = setup_revision(55_125, &[1]);
+
+    let mut source =
+        DurableRevisionStore::create_single_file(&source_path, &revision, &registry).unwrap();
+    source
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+    source.rotate_checkpoint(&revision).unwrap();
+    source.rotate_checkpoint(&revision).unwrap();
+
+    let image = source.canonical_persistence_image(&revision).unwrap();
+    let promoted = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &target_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+
+    assert_eq!(
+        promoted.current_replication_membership(),
+        source.current_replication_membership()
+    );
+
+    drop(promoted);
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn canonical_persistence_image_rebinds_external_freshness_without_copying_authority() {
+    let source_dir = test_dir("persistence-image-freshness-source");
+    let target_dir = test_dir("persistence-image-freshness-target");
+    let source_path = source_dir.join("source.cfmd");
+    let target_path = target_dir.join("promoted.cfmd");
+    let (revision, registry, _) = setup_revision(55_150, &[1]);
+    let (source_config, authority) = external_freshness_fixture([0x71; 32]);
+    let mut target_config = source_config.clone();
+    target_config.store_id = [0x72; 32];
+
+    let mut source =
+        DurableRevisionStore::create_single_file(&source_path, &revision, &registry).unwrap();
+    source
+        .adopt_external_freshness(source_config.clone(), authority.boxed())
+        .unwrap();
+    let image = source.canonical_persistence_image(&revision).unwrap();
+    let fork_image = source.fork_persistence_image(&revision).unwrap();
+    assert!(matches!(
+        DurableRevisionStore::stage_single_file_from_fork_image(
+            &target_path,
+            &crate::StorageEncryption::None,
+            &fork_image,
+        ),
+        Err(DurabilityError::Protocol {
+            reason: "live fork from externally anchored source requires independent target freshness bootstrap",
+            ..
+        })
+    ));
+    assert!(matches!(
+        DurableRevisionStore::stage_single_file_from_persistence_image(
+            &target_path,
+            &crate::StorageEncryption::None,
+            &image,
+        ),
+        Err(DurabilityError::Protocol {
+            reason: "persistence image with external freshness requires explicit trust-authority rebind",
+            ..
+        })
+    ));
+
+    authority.fail_once(FRESHNESS_FAIL_AFTER_APPLY);
+    let promoted = source
+        .transfer_external_freshness_to_single_file(
+            &revision,
+            &target_path,
+            &crate::StorageEncryption::None,
+            target_config.clone(),
+            authority.boxed(),
+        )
+        .unwrap();
+    assert!(source.requires_recovery());
+    drop(promoted);
+    drop(source);
+
+    assert!(
+        DurableRevisionStore::open_single_file_with_external_freshness(
+            &source_path,
+            source_config,
+            authority.boxed(),
+        )
+        .is_err()
+    );
+    let (reopened, _) = DurableRevisionStore::open_single_file_with_external_freshness(
+        &target_path,
+        target_config,
+        authority.boxed(),
+    )
+    .unwrap();
+    assert_eq!(reopened.durable_head, revision.id());
+    drop(reopened);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn external_freshness_transfer_failure_leaves_target_sealed_and_source_authoritative() {
+    let source_dir = test_dir("freshness-transfer-failure-source");
+    let target_dir = test_dir("freshness-transfer-failure-target");
+    let source_path = source_dir.join("source.cfmd");
+    let target_path = target_dir.join("sealed.cfmd");
+    let (revision, registry, _) = setup_revision(55_160, &[1]);
+    let (source_config, authority) = external_freshness_fixture([0x73; 32]);
+    let mut target_config = source_config.clone();
+    target_config.store_id = [0x74; 32];
+
+    let mut source =
+        DurableRevisionStore::create_single_file(&source_path, &revision, &registry).unwrap();
+    source
+        .adopt_external_freshness(source_config.clone(), authority.boxed())
+        .unwrap();
+    let image = source.canonical_persistence_image(&revision).unwrap();
+    authority.fail_once(FRESHNESS_FAIL_BEFORE_APPLY);
+    assert!(DurableRevisionStore::stage_single_file_from_persistence_image_with_external_freshness_rebind(
+        &target_path,
+        &crate::StorageEncryption::None,
+        &image,
+        target_config.clone(),
+        authority.boxed(),
+    )
+    .is_err());
+
+    assert!(matches!(
+        DurableRevisionStore::open_single_file(&target_path),
+        Err(DurabilityError::Protocol {
+            reason: "externally anchored store requires freshness-aware open",
+            ..
+        })
+    ));
+    assert!(
+        DurableRevisionStore::open_single_file_with_external_freshness(
+            &target_path,
+            target_config,
+            authority.boxed(),
+        )
+        .is_err()
+    );
+    drop(source);
+    let (source, _) = DurableRevisionStore::open_single_file_with_external_freshness(
+        &source_path,
+        source_config,
+        authority.boxed(),
+    )
+    .unwrap();
+    assert_eq!(source.durable_head(), revision.id());
+    drop(source);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn external_freshness_transfer_preserves_direct_encryption_floor() {
+    let source_dir = test_dir("freshness-transfer-direct-encryption-source");
+    let target_dir = test_dir("freshness-transfer-direct-encryption-target");
+    let source_path = source_dir.join("source.cfmd");
+    let plaintext_target = target_dir.join("plaintext.cfmd");
+    let target_path = target_dir.join("target.cfmd");
+    let (revision, registry, _) = setup_revision(55_170, &[1]);
+    let (source_config, authority) = external_freshness_fixture([0x75; 32]);
+    let mut target_config = source_config.clone();
+    target_config.store_id = [0x76; 32];
+    let source_encryption = crate::StorageEncryption::aes256_gcm_siv(
+        crate::StorageEncryptionKey::try_new([0xD1; 32]).unwrap(),
+    );
+    let target_encryption = crate::StorageEncryption::aes256_gcm_siv(
+        crate::StorageEncryptionKey::try_new([0xD2; 32]).unwrap(),
+    );
+    let wrong_target_encryption = crate::StorageEncryption::aes256_gcm_siv(
+        crate::StorageEncryptionKey::try_new([0xD3; 32]).unwrap(),
+    );
+
+    let mut source = DurableRevisionStore::create_single_file_with_encryption(
+        &source_path,
+        &source_encryption,
+        &revision,
+        &registry,
+    )
+    .unwrap();
+    source
+        .adopt_external_freshness(source_config.clone(), authority.boxed())
+        .unwrap();
+
+    assert!(matches!(
+        source.transfer_external_freshness_to_single_file(
+            &revision,
+            &plaintext_target,
+            &crate::StorageEncryption::None,
+            target_config.clone(),
+            authority.boxed(),
+        ),
+        Err(DurabilityError::Protocol {
+            reason: "persistence target weakens source at-rest protection authority",
+            ..
+        })
+    ));
+    assert!(!plaintext_target.exists());
+    assert!(!source.requires_recovery());
+
+    let target = source
+        .transfer_external_freshness_to_single_file(
+            &revision,
+            &target_path,
+            &target_encryption,
+            target_config.clone(),
+            authority.boxed(),
+        )
+        .unwrap();
+    assert!(source.requires_recovery());
+    drop(target);
+    drop(source);
+
+    assert!(
+        DurableRevisionStore::open_single_file_with_external_freshness_and_encryption(
+            &source_path,
+            source_config,
+            authority.boxed(),
+            &source_encryption,
+        )
+        .is_err()
+    );
+    assert!(
+        DurableRevisionStore::open_single_file_with_external_freshness_and_encryption(
+            &target_path,
+            target_config.clone(),
+            authority.boxed(),
+            &wrong_target_encryption,
+        )
+        .is_err()
+    );
+    let (target, _) =
+        DurableRevisionStore::open_single_file_with_external_freshness_and_encryption(
+            &target_path,
+            target_config,
+            authority.boxed(),
+            &target_encryption,
+        )
+        .unwrap();
+    assert_eq!(target.durable_head(), revision.id());
+    drop(target);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn external_freshness_transfer_preserves_wrapped_provider_authority_floor() {
+    let source_dir = test_dir("freshness-transfer-wrapped-source");
+    let target_dir = test_dir("freshness-transfer-wrapped-target");
+    let source_path = source_dir.join("source.cfmd");
+    let direct_target = target_dir.join("direct.cfmd");
+    let foreign_target = target_dir.join("foreign.cfmd");
+    let stale_target = target_dir.join("stale.cfmd");
+    let valid_target = target_dir.join("valid.cfmd");
+    let (revision, registry, _) = setup_revision(55_180, &[1]);
+    let (source_config, authority) = external_freshness_fixture([0x77; 32]);
+    let mut target_config = source_config.clone();
+    target_config.store_id = [0x78; 32];
+    let provider_id = [0xD4; 16];
+    let source_encryption = crate::StorageEncryption::aes256_gcm_siv_wrapped(
+        crate::StorageEncryptionKey::try_new([0xD5; 32]).unwrap(),
+        provider_id,
+        7,
+    );
+
+    let mut source = DurableRevisionStore::create_single_file_with_encryption(
+        &source_path,
+        &source_encryption,
+        &revision,
+        &registry,
+    )
+    .unwrap();
+    source
+        .adopt_external_freshness(source_config.clone(), authority.boxed())
+        .unwrap();
+
+    let direct = crate::StorageEncryption::aes256_gcm_siv(
+        crate::StorageEncryptionKey::try_new([0xD6; 32]).unwrap(),
+    );
+    let foreign = crate::StorageEncryption::aes256_gcm_siv_wrapped(
+        crate::StorageEncryptionKey::try_new([0xD7; 32]).unwrap(),
+        [0xD8; 16],
+        8,
+    );
+    let stale = crate::StorageEncryption::aes256_gcm_siv_wrapped(
+        crate::StorageEncryptionKey::try_new([0xD9; 32]).unwrap(),
+        provider_id,
+        6,
+    );
+    let valid = crate::StorageEncryption::aes256_gcm_siv_wrapped(
+        crate::StorageEncryptionKey::try_new([0xDA; 32]).unwrap(),
+        provider_id,
+        8,
+    );
+
+    for (path, encryption) in [
+        (&direct_target, &direct),
+        (&foreign_target, &foreign),
+        (&stale_target, &stale),
+    ] {
+        assert!(matches!(
+            source.transfer_external_freshness_to_single_file(
+                &revision,
+                path,
+                encryption,
+                target_config.clone(),
+                authority.boxed(),
+            ),
+            Err(DurabilityError::Protocol {
+                reason: "persistence target weakens source at-rest protection authority",
+                ..
+            })
+        ));
+        assert!(!path.exists());
+        assert!(!source.requires_recovery());
+    }
+
+    let target = source
+        .transfer_external_freshness_to_single_file(
+            &revision,
+            &valid_target,
+            &valid,
+            target_config.clone(),
+            authority.boxed(),
+        )
+        .unwrap();
+    assert!(source.requires_recovery());
+    drop(target);
+    drop(source);
+
+    assert!(
+        DurableRevisionStore::open_single_file_with_external_freshness_and_encryption(
+            &source_path,
+            source_config,
+            authority.boxed(),
+            &source_encryption,
+        )
+        .is_err()
+    );
+    let (target, _) =
+        DurableRevisionStore::open_single_file_with_external_freshness_and_encryption(
+            &valid_target,
+            target_config,
+            authority.boxed(),
+            &valid,
+        )
+        .unwrap();
+    assert_eq!(target.durable_head(), revision.id());
+    drop(target);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn external_freshness_transfer_never_rolls_back_to_source_after_target_corruption() {
+    let source_dir = test_dir("freshness-transfer-corrupt-source");
+    let target_dir = test_dir("freshness-transfer-corrupt-target");
+    let source_path = source_dir.join("source.cfmd");
+    let target_path = target_dir.join("target.cfmd");
+    let (revision, registry, _) = setup_revision(55_190, &[1]);
+    let (source_config, authority) = external_freshness_fixture([0x79; 32]);
+    let mut target_config = source_config.clone();
+    target_config.store_id = [0x7A; 32];
+
+    let mut source =
+        DurableRevisionStore::create_single_file(&source_path, &revision, &registry).unwrap();
+    source
+        .adopt_external_freshness(source_config.clone(), authority.boxed())
+        .unwrap();
+    let target = source
+        .transfer_external_freshness_to_single_file(
+            &revision,
+            &target_path,
+            &crate::StorageEncryption::None,
+            target_config.clone(),
+            authority.boxed(),
+        )
+        .unwrap();
+    drop(target);
+    drop(source);
+
+    let mut bytes = fs::read(&target_path).unwrap();
+    bytes[0] ^= 0xA5;
+    fs::write(&target_path, bytes).unwrap();
+
+    assert!(
+        DurableRevisionStore::open_single_file_with_external_freshness(
+            &source_path,
+            source_config,
+            authority.boxed(),
+        )
+        .is_err()
+    );
+    assert!(
+        DurableRevisionStore::open_single_file_with_external_freshness(
+            &target_path,
+            target_config,
+            authority.boxed(),
+        )
+        .is_err()
+    );
+
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn volatile_store_commits_through_canonical_authority_and_promotes_without_semantic_change() {
+    let target_dir = test_dir("volatile-authority-promotion-target");
+    let target_path = target_dir.join("promoted.cfmd");
+    let (base, registry, _) = setup_revision(55_200, &[1]);
+    let (target, _, _) = setup_revision(55_201, &[1, 2]);
+    let descriptor = DurableRevisionDescriptor::full_revision(
+        ClientTransactionId::new(55_202),
+        base.id(),
+        &target,
+        &registry,
+    )
+    .unwrap();
+
+    let mut volatile = DurableRevisionStore::create_volatile(&base, &registry).unwrap();
+    assert!(volatile.directory().is_none());
+    assert!(volatile.wal_path().is_none());
+    let prepared = volatile.durably_prepare(&descriptor).unwrap();
+    volatile.durably_commit(prepared).unwrap();
+    assert_eq!(volatile.durable_head(), target.id());
+    assert!(
+        volatile
+            .transaction_intent(ClientTransactionId::new(55_202))
+            .is_some()
+    );
+
+    let image = volatile.canonical_persistence_image(&target).unwrap();
+    let promoted = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &target_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+
+    assert_eq!(promoted.durable_head(), target.id());
+    assert_eq!(
+        promoted.causal_coverage_root(),
+        volatile.causal_coverage_root()
+    );
+    assert_eq!(
+        promoted.transaction_intent(ClientTransactionId::new(55_202)),
+        volatile.transaction_intent(ClientTransactionId::new(55_202)),
+    );
+
+    drop(promoted);
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn volatile_migration_history_and_replication_promote_as_one_canonical_authority() {
+    let target_dir = test_dir("volatile-migration-history-replication-promotion");
+    let target_path = target_dir.join("promoted.cfmd");
+    let (base, registry, _) = setup_revision(55_300, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(55_301),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let complement = crate::DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: base.semantic_revision().schema,
+            target_schema: target.semantic_revision().schema,
+            lens_spec: kernel_lens::LensSpecId(SemanticId::new(55_302)),
+            semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(55_303)),
+            encoding_version: 1,
+            complement: Value::I64(17),
+        },
+        kernel_lens::ComplementRetention::Forever,
+    );
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(55_304),
+        base.id(),
+        &target,
+        complement,
+        &registry,
+    )
+    .unwrap();
+
+    let mut volatile = DurableRevisionStore::create_volatile(&base, &registry).unwrap();
+    volatile
+        .durably_install_replication_membership(membership_change(1, &[1, 2, 3], 2, &[]))
+        .unwrap();
+    let prepared = volatile.durably_prepare(&descriptor).unwrap();
+    volatile.durably_commit(prepared).unwrap();
+
+    let effect_id = *volatile.historical_epoch_anchors().keys().next().unwrap();
+    let volatile_history = volatile
+        .historical_epoch_material(effect_id)
+        .unwrap()
+        .expect("volatile migration must retain RAM-native historical authority");
+    assert_eq!(volatile_history.checkpoint().id(), base.id());
+    assert_eq!(volatile.durable_head(), target.id());
+
+    let image = volatile.canonical_persistence_image(&target).unwrap();
+    let mut promoted = DurableRevisionStore::stage_single_file_from_persistence_image(
+        &target_path,
+        &crate::StorageEncryption::None,
+        &image,
+    )
+    .unwrap();
+
+    assert_eq!(promoted.durable_head(), target.id());
+    assert_eq!(
+        promoted.current_replication_membership(),
+        volatile.current_replication_membership()
+    );
+    let encoded = super::portable_history::PortableHistoricalEpochClosure::from_material(
+        effect_id,
+        &volatile_history,
+    )
+    .encode()
+    .unwrap();
+    let expected = super::portable_history::PortableHistoricalEpochClosure::decode(&encoded)
+        .unwrap()
+        .material()
+        .unwrap();
+    assert_eq!(
+        promoted.historical_epoch_material(effect_id).unwrap(),
+        Some(expected)
+    );
+
+    drop(promoted);
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn directory_demotion_materializes_retained_history_before_backend_retirement() {
+    let source_dir = test_dir("directory-demotion-retained-history-source");
+    let target_dir = test_dir("directory-demotion-retained-history-target");
+    let target_path = target_dir.join("repersisted.cfmd");
+    let (base, registry, _) = setup_revision(55_350, &[1]);
+    let mut target_context = base.semantic_context().clone();
+    target_context.schema.revision = SchemaRevisionId::new(2);
+    let target = Revision::build(
+        RevisionId::new(55_351),
+        &target_context,
+        &registry,
+        base.state().clone(),
+    )
+    .unwrap();
+    let complement = crate::DurableMigrationComplement::from_capsule(
+        kernel_lens::ComplementCapsule {
+            source_schema: base.semantic_revision().schema,
+            target_schema: target.semantic_revision().schema,
+            lens_spec: kernel_lens::LensSpecId(SemanticId::new(55_352)),
+            semantic_pins: kernel_lens::SemanticManifestId(SemanticId::new(55_353)),
+            encoding_version: 1,
+            complement: Value::I64(23),
+        },
+        kernel_lens::ComplementRetention::Forever,
+    );
+    let descriptor = DurableRevisionDescriptor::schema_migration(
+        ClientTransactionId::new(55_354),
+        base.id(),
+        &target,
+        complement,
+        &registry,
+    )
+    .unwrap();
+
+    let mut store = DurableRevisionStore::create(&source_dir, &base, &registry).unwrap();
+    let prepared = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(prepared).unwrap();
+    let effect_id = *store.historical_epoch_anchors().keys().next().unwrap();
+    let source_history = store.historical_epoch_material(effect_id).unwrap().unwrap();
+    let expected = super::portable_history::PortableHistoricalEpochClosure::from_material(
+        effect_id,
+        &source_history,
+    )
+    .encode()
+    .and_then(|bytes| super::portable_history::PortableHistoricalEpochClosure::decode(&bytes))
+    .and_then(|closure| closure.material())
+    .unwrap();
+
+    store.demote_to_volatile().unwrap();
+    assert!(store.is_volatile());
+    assert_eq!(
+        store.historical_epoch_material(effect_id).unwrap(),
+        Some(expected.clone())
+    );
+
+    let mut repersisted = store
+        .repersist_volatile_to_single_file(&target, &target_path, &crate::StorageEncryption::None)
+        .unwrap();
+    assert_eq!(
+        repersisted.historical_epoch_material(effect_id).unwrap(),
+        Some(expected)
+    );
+
+    drop(repersisted);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn durable_to_volatile_external_freshness_fences_old_source_and_keeps_hot_path_local() {
+    let dir = test_dir("durable-to-volatile-fence");
+    let (revision, registry, relation) = setup_revision(9_590, &[1]);
+    let (config, authority) = external_freshness_fixture([0x90; 32]);
+    let mut store = DurableRevisionStore::create(&dir, &revision, &registry).unwrap();
+    store
+        .adopt_external_freshness(config.clone(), authority.boxed())
+        .unwrap();
+    store.demote_to_volatile().unwrap();
+    assert!(store.backend.is_volatile());
+    assert!(
+        store
+            .external_freshness
+            .as_ref()
+            .is_some_and(ExternalFreshnessState::is_volatile_fence)
+    );
+    let fenced = authority.current.lock().unwrap().clone().unwrap();
+    assert!(matches!(
+        fenced.state,
+        FreshnessAuthorityState::VolatileFence(_)
+    ));
+
+    let descriptor = committed_descriptor(&revision, &registry, relation, 9_591, 2);
+    let token = store.durably_prepare(&descriptor).unwrap();
+    store.durably_commit(token).unwrap();
+    assert_eq!(authority.current.lock().unwrap().as_ref().unwrap(), &fenced);
+    assert!(matches!(
+        DurableRevisionStore::open_with_external_freshness(&dir, config, authority.boxed()),
+        Err(DurabilityError::Protocol {
+            reason: "durable source was retired by an external volatile fence",
+            ..
+        })
+    ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unanchored_durable_to_volatile_is_in_place_and_preserves_head() {
+    let dir = test_dir("durable-to-volatile-unanchored");
+    let (revision, registry, _) = setup_revision(9_592, &[1]);
+    let mut store = DurableRevisionStore::create(&dir, &revision, &registry).unwrap();
+    let head = store.durable_head();
+    let next_lsn = store.wal.next_lsn();
+    store.demote_to_volatile().unwrap();
+    assert!(store.backend.is_volatile());
+    assert_eq!(store.durable_head(), head);
+    assert_eq!(store.wal.next_lsn(), next_lsn);
+    assert!(store.external_freshness.is_none());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn volatile_fence_repersists_exact_authority_and_reopens_new_durable_target() {
+    let source_dir = test_dir("volatile-fence-repersist-source");
+    let target_dir = test_dir("volatile-fence-repersist-target");
+    let target_path = target_dir.join("repersisted.cfmd");
+    let (base, registry, _) = setup_revision(9_600, &[1]);
+    let (target, _, _) = setup_revision(9_601, &[1, 2]);
+    let descriptor = DurableRevisionDescriptor::full_revision(
+        ClientTransactionId::new(9_602),
+        base.id(),
+        &target,
+        &registry,
+    )
+    .unwrap();
+    let (config, authority) = external_freshness_fixture([0x91; 32]);
+    let mut source = DurableRevisionStore::create(&source_dir, &base, &registry).unwrap();
+    source
+        .adopt_external_freshness(config.clone(), authority.boxed())
+        .unwrap();
+    source.demote_to_volatile().unwrap();
+    let prepared = source.durably_prepare(&descriptor).unwrap();
+    source.durably_commit(prepared).unwrap();
+    assert_eq!(source.durable_head(), target.id());
+
+    let promoted = source
+        .repersist_volatile_to_single_file(&target, &target_path, &crate::StorageEncryption::None)
+        .unwrap();
+    assert!(source.requires_recovery());
+    assert_eq!(promoted.durable_head(), target.id());
+    assert_eq!(
+        promoted.transaction_intent(ClientTransactionId::new(9_602)),
+        source.transaction_intent(ClientTransactionId::new(9_602)),
+    );
+    assert!(matches!(
+        authority.current.lock().unwrap().as_ref().unwrap().state,
+        FreshnessAuthorityState::DurableCut(_)
+    ));
+
+    drop(promoted);
+    let (reopened, _) = DurableRevisionStore::open_single_file_with_external_freshness(
+        &target_path,
+        config,
+        authority.boxed(),
+    )
+    .unwrap();
+    assert_eq!(reopened.durable_head(), target.id());
+    drop(reopened);
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
+}
+
+#[test]
+fn volatile_fence_repersistence_reconciles_cas_response_loss_and_preserves_safe_retry() {
+    for (suffix, failure_mode, expect_first_success) in [
+        ("before", FRESHNESS_FAIL_BEFORE_APPLY, false),
+        ("after", FRESHNESS_FAIL_AFTER_APPLY, true),
+    ] {
+        let source_dir = test_dir(&format!("volatile-fence-repersist-{suffix}-source"));
+        let target_dir = test_dir(&format!("volatile-fence-repersist-{suffix}-target"));
+        let target_path = target_dir.join("repersisted.cfmd");
+        let (revision, registry, _) = setup_revision(9_610, &[1]);
+        let (config, authority) = external_freshness_fixture([0x92; 32]);
+        let mut source = DurableRevisionStore::create(&source_dir, &revision, &registry).unwrap();
+        source
+            .adopt_external_freshness(config.clone(), authority.boxed())
+            .unwrap();
+        source.demote_to_volatile().unwrap();
+        authority.fail_once(failure_mode);
+
+        let first = source.repersist_volatile_to_single_file(
+            &revision,
+            &target_path,
+            &crate::StorageEncryption::None,
+        );
+        if expect_first_success {
+            let promoted = first.expect("response loss after apply must reconcile to success");
+            assert!(source.requires_recovery());
+            assert!(matches!(
+                authority.current.lock().unwrap().as_ref().unwrap().state,
+                FreshnessAuthorityState::DurableCut(_)
+            ));
+            drop(promoted);
+        } else {
+            assert!(first.is_err());
+            assert!(!source.requires_recovery());
+            assert!(source.is_volatile());
+            assert!(!target_path.exists());
+            assert!(matches!(
+                authority.current.lock().unwrap().as_ref().unwrap().state,
+                FreshnessAuthorityState::VolatileFence(_)
+            ));
+            let promoted = source
+                .repersist_volatile_to_single_file(
+                    &revision,
+                    &target_path,
+                    &crate::StorageEncryption::None,
+                )
+                .unwrap();
+            drop(promoted);
+        }
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(target_dir).unwrap();
+    }
+}
+
+#[test]
+fn volatile_fence_repersistence_loses_stale_cas_and_poison_source_on_ambiguous_successor() {
+    let source_dir = test_dir("volatile-fence-stale-repersist-source");
+    let target_dir = test_dir("volatile-fence-stale-repersist-target");
+    let target_path = target_dir.join("repersisted.cfmd");
+    let (revision, registry, _) = setup_revision(9_620, &[1]);
+    let (config, authority) = external_freshness_fixture([0x93; 32]);
+    let mut source = DurableRevisionStore::create(&source_dir, &revision, &registry).unwrap();
+    source
+        .adopt_external_freshness(config, authority.boxed())
+        .unwrap();
+    source.demote_to_volatile().unwrap();
+    let fence = authority.current.lock().unwrap().clone().unwrap();
+    let fence_digest = freshness_authority_record_digest(&fence);
+    let FreshnessAuthorityState::VolatileFence(fence_state) = fence.state else {
+        panic!("demotion must publish volatile fence");
+    };
+    let competitor = FreshnessCut {
+        store_id: fence_state.lineage_id,
+        generation: 77,
+        previous_generation: Some(fence_state.source_generation_digest),
+        generation_digest: AuthorityDigest([0xA7; 32]),
+        wal_lsn: 0,
+        wal_digest: AuthorityDigest([0xB7; 32]),
+        trust_root_epoch: fence_state.trust_root_epoch,
+        deployment_policy_epoch: fence_state.deployment_policy_epoch,
+    };
+    let mut competing_authority = authority.clone();
+    competing_authority
+        .compare_and_set_signed(
+            Some(fence_digest),
+            FreshnessAuthorityState::DurableCut(competitor),
+        )
+        .unwrap();
+
+    assert!(
+        source
+            .repersist_volatile_to_single_file(
+                &revision,
+                &target_path,
+                &crate::StorageEncryption::None,
+            )
+            .is_err()
+    );
+    assert!(source.requires_recovery());
+    assert!(target_path.exists());
+
+    fs::remove_dir_all(source_dir).unwrap();
+    fs::remove_dir_all(target_dir).unwrap();
 }

@@ -13,7 +13,7 @@ use cfmd_host::{
 };
 use cfmd_protocol::{
     CommitRequest, HostedRequest, IdempotencyKey, OpenWatchRequest, ProtocolErrorCode,
-    ProtocolQuery, ProtocolValue, RelationMutation, SemanticRevision,
+    ProtocolQuery, ProtocolValue, RelationMutation, SemanticRevision, SnapshotTarget,
     wire::{
         ProtocolHello, WireLimits, WireResponse, decode_hello_ack_frame, decode_response_frame,
         encode_hello_frame, encode_request_frame,
@@ -210,6 +210,7 @@ fn disconnect_cancels_blocked_watch_and_in_flight_work_is_bounded() {
     negotiate(&connection, wire_limits);
 
     let open = HostedRequest::OpenWatch(OpenWatchRequest {
+        target: SnapshotTarget::Head,
         query: ProtocolQuery::Scan {
             relation: relation.raw(),
         },
@@ -370,6 +371,7 @@ fn authorization_refresh_revokes_watch_when_exact_read_footprint_disappears() {
     negotiate(&connection, wire_limits);
 
     let open = HostedRequest::OpenWatch(OpenWatchRequest {
+        target: SnapshotTarget::Head,
         query: ProtocolQuery::Scan {
             relation: relation.raw(),
         },
@@ -443,6 +445,7 @@ fn expiring_grant_can_be_scheduled_without_polling_and_wakes_waiters() {
     negotiate(&connection, wire_limits);
 
     let open = HostedRequest::OpenWatch(OpenWatchRequest {
+        target: SnapshotTarget::Head,
         query: ProtocolQuery::Scan {
             relation: relation.raw(),
         },

@@ -13,6 +13,14 @@ use crate::replication::{
     ReplicationPeerAuthPolicy, ReplicationQuorumAvailability, ReplicationQuorumCertificate,
 };
 
+mod codec;
+#[cfg(test)]
+use codec::roundtrip_records;
+pub(super) use codec::{
+    SemanticAuthorityRecordDecoder, decode_begin as decode_semantic_base_begin,
+    decode_end as decode_semantic_base_end,
+};
+
 /// Exact semantic state produced by replaying replication authority.
 ///
 /// Physical journal ownership, pending/live frame buffers and poison state are deliberately
@@ -21,7 +29,7 @@ use crate::replication::{
 /// exactly this state, rather than retaining historical frames merely because they happened to be
 /// the path by which the state was reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ReplicationAuthoritySemanticSnapshot {
+pub(crate) struct ReplicationAuthoritySemanticSnapshot {
     effects: BTreeMap<RevisionEffectId, ReplicatedEffectEnvelope>,
     branches: BTreeMap<ReplicationBranchId, ReplicationBranchHead>,
     revision_frontiers: BTreeMap<RevisionId, BTreeSet<RevisionEffectId>>,
@@ -53,7 +61,7 @@ pub(super) struct ReplicationAuthoritySemanticSnapshot {
 }
 
 impl ReplicationAuthoritySemanticSnapshot {
-    pub(super) fn capture(journal: &ReplicationAuthorityJournal) -> Self {
+    pub(crate) fn capture(journal: &ReplicationAuthorityJournal) -> Self {
         // Deliberately exhaustive: adding authority state to the journal must make this model stop
         // compiling until the semantic projection is updated. Physical-only fields are named and
         // discarded explicitly rather than hidden behind `..`.
@@ -63,6 +71,7 @@ impl ReplicationAuthoritySemanticSnapshot {
             single_file_capture: _,
             pending_single_file_frames: _,
             live_single_file_frames: _,
+            semantic_base_replay: _,
             effects,
             branches,
             revision_frontiers,
@@ -159,6 +168,7 @@ impl ReplicationAuthoritySemanticSnapshot {
     /// Returns history-bearing semantic cardinalities which cannot be assumed bounded merely
     /// because the append journal is compacted.  In particular, replicated effects remain part of
     /// the causal API and therefore establish a lower bound for any exact semantic snapshot.
+    #[cfg(test)]
     pub(super) fn retained_history_shape(&self) -> (usize, usize, usize, usize) {
         (
             self.effects.len(),
@@ -169,17 +179,55 @@ impl ReplicationAuthoritySemanticSnapshot {
     }
 }
 
+#[cfg(test)]
 impl ReplicationAuthorityJournal {
     pub(crate) fn test_semantic_snapshot_roundtrip(
         &self,
     ) -> Result<(), crate::runtime::DurabilityError> {
         let snapshot = ReplicationAuthoritySemanticSnapshot::capture(self);
         let expected = snapshot.clone();
-        let mut restored = Self::open_single_file(self.path(), &[], &[])?;
-        snapshot.restore(&mut restored);
+        let decoded = roundtrip_records(&snapshot)?;
+        assert_eq!(expected, decoded);
+        let mut direct = Self::open_single_file("semantic-carrier-direct", &[], &[])?;
+        snapshot.install_without_physical_carrier(&mut direct)?;
+        assert_eq!(direct.single_file_live_frame_count(), 0);
         assert_eq!(
             expected,
-            ReplicationAuthoritySemanticSnapshot::capture(&restored)
+            ReplicationAuthoritySemanticSnapshot::capture(&direct)
+        );
+
+        let mut restored = Self::open_single_file(self.path(), &[], &[])?;
+        snapshot.install_as_semantic_base(&mut restored)?;
+        let frames = restored
+            .single_file_live_frames_prefix(restored.single_file_live_frame_count())?
+            .to_vec();
+        let mut streamed = Vec::new();
+        snapshot.for_each_semantic_base_frame(&mut |frame| {
+            streamed.push(frame.to_vec());
+            Ok(())
+        })?;
+        assert_eq!(streamed, frames);
+        assert!(frames.len() >= 3);
+        let mut incomplete = Self::open_single_file("semantic-carrier-incomplete", &[], &[])?;
+        let empty = ReplicationAuthoritySemanticSnapshot::capture(&incomplete);
+        incomplete.replay_single_file_live_frames(&frames[..frames.len() - 1])?;
+        assert_eq!(
+            empty,
+            ReplicationAuthoritySemanticSnapshot::capture(&incomplete)
+        );
+        assert!(matches!(
+            incomplete.ensure_semantic_base_complete(),
+            Err(crate::runtime::DurabilityError::Corruption {
+                reason: "replication semantic authority base is truncated",
+                ..
+            })
+        ));
+
+        let mut replayed = Self::open_single_file("semantic-carrier-replay", &[], &[])?;
+        replayed.replay_single_file_live_frames(&frames)?;
+        assert_eq!(
+            expected,
+            ReplicationAuthoritySemanticSnapshot::capture(&replayed)
         );
         Ok(())
     }
@@ -188,5 +236,34 @@ impl ReplicationAuthorityJournal {
         &self,
     ) -> (usize, usize, usize, usize) {
         ReplicationAuthoritySemanticSnapshot::capture(self).retained_history_shape()
+    }
+
+    pub(crate) fn test_semantic_carrier_encoded_len(&self) -> usize {
+        usize::try_from(
+            ReplicationAuthoritySemanticSnapshot::capture(self)
+                .record_stats()
+                .expect("test semantic carrier record stats")
+                .1,
+        )
+        .expect("semantic carrier length fits usize")
+    }
+
+    pub(crate) fn test_semantic_carrier_record_stats(&self) -> (usize, u64, usize) {
+        ReplicationAuthoritySemanticSnapshot::capture(self)
+            .record_stats()
+            .expect("test semantic carrier record stats")
+    }
+}
+
+impl super::segments::ReplicationAuthorityFrameSource for ReplicationAuthoritySemanticSnapshot {
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn for_each_frame(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), crate::runtime::DurabilityError>,
+    ) -> Result<(), crate::runtime::DurabilityError> {
+        self.for_each_semantic_base_frame(emit)
     }
 }

@@ -7,14 +7,18 @@ use std::{
 };
 
 use cfmd::__private::{IntentJournal, TransactionId};
+use cfmd::dynamic::Plan;
 use cfmd::{
-    CfmdEntity, CommitOutcome, Database, Id, ObjectWatch, ObjectWatchEvent, OwnedMany, Plan, Ref,
-    Schema,
+    CfmdEntity, CommitOutcome, Database, ErrorDiagnosticExt, Id, ObjectWatch, ObjectWatchEvent,
+    OwnedMany, Ref, Schema,
     dynamic::{
         EquivalenceId, PrimitiveEquivalence, Query, RelationId, RelationSchema, Type, Value,
     },
 };
-use pyo3::{exceptions::PyRuntimeError, prelude::*};
+use pyo3::{
+    exceptions::{PyException, PyRuntimeError},
+    prelude::*,
+};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const LEFT_RELATION: RelationId = RelationId::new(99_100);
@@ -68,8 +72,75 @@ struct Asset {
     label: String,
 }
 
-fn runtime_error(error: impl std::fmt::Display) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+#[pyclass(frozen, skip_from_py_object, name = "CommitOutcome")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PyCommitOutcome {
+    #[pyo3(get)]
+    status: &'static str,
+    #[pyo3(get)]
+    revision: u64,
+}
+
+impl From<CommitOutcome> for PyCommitOutcome {
+    fn from(outcome: CommitOutcome) -> Self {
+        match outcome {
+            CommitOutcome::Committed { revision } => Self {
+                status: "Committed",
+                revision: revision.raw(),
+            },
+            CommitOutcome::AlreadySatisfied { revision } => Self {
+                status: "AlreadySatisfied",
+                revision: revision.raw(),
+            },
+            CommitOutcome::AlreadyCommitted { revision } => Self {
+                status: "AlreadyCommitted",
+                revision: revision.raw(),
+            },
+        }
+    }
+}
+
+#[pymethods]
+impl PyCommitOutcome {
+    fn __repr__(&self) -> String {
+        format!(
+            "CommitOutcome(status='{}', revision={})",
+            self.status, self.revision
+        )
+    }
+}
+
+#[pyclass(extends=PyException, name = "CfmdError")]
+#[derive(Debug)]
+struct PyCfmdError {
+    #[pyo3(get)]
+    code: String,
+    #[pyo3(get)]
+    message: String,
+}
+
+#[pymethods]
+impl PyCfmdError {
+    #[new]
+    fn new(code: String, message: String) -> Self {
+        Self { code, message }
+    }
+
+    fn __str__(&self) -> &str {
+        &self.message
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err owns the facade error; the Python translation consumes that boundary value."
+)]
+fn runtime_error(error: cfmd::Error) -> PyErr {
+    let diagnostic = error.diagnostic();
+    PyErr::new::<PyCfmdError, _>((
+        diagnostic.code().as_str().to_owned(),
+        diagnostic.message().to_owned(),
+    ))
 }
 
 fn relation(side: &str) -> PyResult<RelationId> {
@@ -245,26 +316,18 @@ struct ProbeDatabase {
 }
 
 impl ProbeDatabase {
-    fn commit_transaction(&self, transaction: &IntentJournal) -> PyResult<u64> {
+    fn commit_transaction(&self, transaction: &IntentJournal) -> PyResult<PyCommitOutcome> {
         let outcome = self.database.commit(transaction).map_err(runtime_error)?;
-        let revision = match outcome {
-            CommitOutcome::Committed { revision }
-            | CommitOutcome::AlreadyCommitted { revision } => revision,
-        };
-        Ok(revision.raw())
+        Ok(outcome.into())
     }
 
-    fn commit_plan(&self, plan: &Plan) -> PyResult<u64> {
+    fn commit_plan(&self, plan: &Plan) -> PyResult<PyCommitOutcome> {
         let transaction = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
         let outcome = self
             .database
             .commit_plan(plan, TransactionId::new(u128::from(transaction)))
             .map_err(runtime_error)?;
-        let revision = match outcome {
-            CommitOutcome::Committed { revision }
-            | CommitOutcome::AlreadyCommitted { revision } => revision,
-        };
-        Ok(revision.raw())
+        Ok(outcome.into())
     }
 }
 
@@ -299,7 +362,7 @@ impl ProbeDatabase {
         Ok(Self { database })
     }
 
-    fn insert(&self, side: &str, value: i64) -> PyResult<u64> {
+    fn insert(&self, side: &str, value: i64) -> PyResult<PyCommitOutcome> {
         let mut plan = self.database.plan().map_err(runtime_error)?;
         plan.insert(relation(side)?, vec![Value::I64(value)]);
         self.commit_plan(&plan)
@@ -317,7 +380,7 @@ impl ProbeDatabase {
         })
     }
 
-    fn todo_insert(&self, id: u128, title: String, done: bool) -> PyResult<u64> {
+    fn todo_insert(&self, id: u128, title: String, done: bool) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let plan = snapshot
             .objects::<Todo>()
@@ -353,7 +416,7 @@ impl ProbeDatabase {
         Ok(values.iter().map(todo_tuple).collect())
     }
 
-    fn todo_update_title(&self, id: u128, title: &str) -> PyResult<u64> {
+    fn todo_update_title(&self, id: u128, title: &str) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let plan = snapshot
             .objects::<Todo>()
@@ -368,7 +431,7 @@ impl ProbeDatabase {
         self.commit_plan(&plan)
     }
 
-    fn todo_set_done(&self, id: u128, done: bool) -> PyResult<u64> {
+    fn todo_set_done(&self, id: u128, done: bool) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let plan = snapshot
             .objects::<Todo>()
@@ -383,7 +446,7 @@ impl ProbeDatabase {
         self.commit_plan(&plan)
     }
 
-    fn todo_delete(&self, id: u128) -> PyResult<u64> {
+    fn todo_delete(&self, id: u128) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let plan = snapshot
             .objects::<Todo>()
@@ -413,7 +476,7 @@ impl ProbeDatabase {
         })
     }
 
-    fn user_insert(&self, id: u128, name: String) -> PyResult<u64> {
+    fn user_insert(&self, id: u128, name: String) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let plan = snapshot
             .objects::<User>()
@@ -427,7 +490,7 @@ impl ProbeDatabase {
         self.commit_plan(&plan)
     }
 
-    fn task_insert(&self, id: u128, title: String, owner_id: u128) -> PyResult<u64> {
+    fn task_insert(&self, id: u128, title: String, owner_id: u128) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let plan = snapshot
             .objects::<Task>()
@@ -463,7 +526,7 @@ impl ProbeDatabase {
         owner_name: String,
         asset_id: u128,
         asset_label: String,
-    ) -> PyResult<u64> {
+    ) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let plan = snapshot
             .objects::<Owner>()
@@ -481,7 +544,7 @@ impl ProbeDatabase {
         self.commit_plan(&plan)
     }
 
-    fn owner_insert_empty(&self, owner_id: u128, owner_name: String) -> PyResult<u64> {
+    fn owner_insert_empty(&self, owner_id: u128, owner_name: String) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let plan = snapshot
             .objects::<Owner>()
@@ -496,7 +559,12 @@ impl ProbeDatabase {
         self.commit_plan(&plan)
     }
 
-    fn owner_move_asset(&self, source: u128, target: u128, asset: u128) -> PyResult<u64> {
+    fn owner_move_asset(
+        &self,
+        source: u128,
+        target: u128,
+        asset: u128,
+    ) -> PyResult<PyCommitOutcome> {
         let snapshot = self.database.snapshot().map_err(runtime_error)?;
         let owners = snapshot.objects::<Owner>().map_err(runtime_error)?;
         let source = owners.require(Id::new(source)).map_err(runtime_error)?;
@@ -548,7 +616,7 @@ impl ProbeDatabase {
         let orphaned = preview.derived().orphan_entities_deleted();
         let normalized = preview.derived().normalized_rows_removed();
         drop(snapshot);
-        let revision = self.commit_transaction(&transaction)?;
+        let revision = self.commit_transaction(&transaction)?.revision;
         Ok((orphaned, normalized, revision))
     }
 
@@ -571,7 +639,7 @@ impl ProbeDatabase {
             .len())
     }
 
-    fn undo_latest(&self) -> PyResult<u64> {
+    fn undo_latest(&self) -> PyResult<PyCommitOutcome> {
         let mut transaction = IntentJournal::new();
         self.database
             .undo_latest(&mut transaction)
@@ -689,6 +757,8 @@ impl ProbeTodoWatch {
 
 #[pymodule]
 fn cfmd_async_probe(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyCommitOutcome>()?;
+    module.add_class::<PyCfmdError>()?;
     module.add_class::<ProbeDatabase>()?;
     module.add_class::<ProbeWatch>()?;
     module.add_class::<ProbeTodoWatch>()?;

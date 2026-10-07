@@ -82,6 +82,7 @@ pub struct RuntimeHistoryEffect {
     pub model_delta: Option<DurableModelDelta>,
     pub model_complement: Option<DurableModelDelta>,
     pub semantic_change: Option<SemanticChangeEvent>,
+    pub schema_migration_program: Option<kernel_transport::SchemaMigrationProgram>,
     pub causal_observations: Vec<RuntimeHistoryCoordinate>,
     pub causal_observation_values: BTreeMap<RuntimeHistoryCoordinate, Value>,
     pub causal_observation_predicates:
@@ -752,6 +753,12 @@ impl RuntimeHistoryEffect {
     )]
     fn from_durable(record: &DurableRevisionEffectRecord) -> Self {
         let semantic_change = record.semantic_change_event();
+        let schema_migration_program = match &record.change {
+            kernel_durability::DurableRevisionChange::SchemaMigration { program } => {
+                Some(program.clone())
+            }
+            _ => None,
+        };
         let kind = match &record.intent {
             DurableTransactionIntent::RelationData { .. } => RuntimeHistoryEffectKind::RelationData,
             DurableTransactionIntent::RelationRewrite { .. } => {
@@ -843,6 +850,7 @@ impl RuntimeHistoryEffect {
             model_delta,
             model_complement,
             semantic_change,
+            schema_migration_program,
             causal_observations: record
                 .intent
                 .causal_observations()
@@ -1326,6 +1334,16 @@ pub struct SchemaAwareFieldTransitionRequest<'a> {
 /// One kernel-certified current-world publication prepared from an exact relation intent
 /// formed in an older semantic epoch. Effect transport and required-authority transport are
 /// derived in the same retained-epoch walk and are bound to `authorized_head_revision`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeModelAuthorityFootprint {
+    pub carrier_presence: BTreeSet<SemanticId>,
+    pub carrier_members: BTreeSet<(SemanticId, kernel_types::EntityId)>,
+    pub lifecycle_entities: BTreeSet<kernel_types::EntityId>,
+    pub lifecycle_roots: BTreeSet<kernel_types::EntityId>,
+    pub keeps_alive_presence: BTreeSet<kernel_types::EntityId>,
+    pub keeps_alive_edges: BTreeSet<(kernel_types::EntityId, kernel_types::EntityId)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedSchemaAwarePublication {
     pub formation_revision: RevisionId,
@@ -1336,6 +1354,7 @@ pub struct PreparedSchemaAwarePublication {
     pub field_writes: BTreeSet<(SemanticId, SemanticId)>,
     pub relation_authorizations:
         BTreeMap<SemanticId, kernel_durability::DurableRelationAuthorization>,
+    pub model_authority: RuntimeModelAuthorityFootprint,
     pub client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
     pub(crate) source_model_delta: DurableModelDelta,
     pub(crate) current_model_delta: DurableModelDelta,
@@ -1352,7 +1371,175 @@ pub struct PreparedSchemaAwarePublication {
     )>,
 }
 
+/// Bounded proof material for the semantic world in which a stale client intent was formed.
+///
+/// The witness is derived from the current root plus retained schema-epoch authority; constructing
+/// it never materializes the historical database state at `formation_revision`.
+#[derive(Debug, Clone)]
+pub struct SchemaAwareFormationContextWitness {
+    pub(crate) formation_revision: RevisionId,
+    pub(crate) authorized_head_revision: RevisionId,
+    pub(crate) semantic_context: kernel_schema::SemanticContext,
+    retained_epochs: Vec<RuntimeRetainedSchemaEpoch>,
+}
+
+/// Verified current-world bridge chain from one retained source schema language
+/// to the authoritative head schema. It contains semantic transport certificates
+/// only; no historical database state is reconstructed or exposed as current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentSchemaBridge {
+    source_context: kernel_schema::SemanticContext,
+    target_context: kernel_schema::SemanticContext,
+    steps: Vec<kernel_transport::SchemaBridge>,
+}
+
+impl CurrentSchemaBridge {
+    pub(crate) fn new(
+        source_context: kernel_schema::SemanticContext,
+        target_context: kernel_schema::SemanticContext,
+        steps: Vec<kernel_transport::SchemaBridge>,
+    ) -> Self {
+        Self {
+            source_context,
+            target_context,
+            steps,
+        }
+    }
+
+    #[must_use]
+    pub const fn source_context(&self) -> &kernel_schema::SemanticContext {
+        &self.source_context
+    }
+
+    #[must_use]
+    pub const fn target_context(&self) -> &kernel_schema::SemanticContext {
+        &self.target_context
+    }
+
+    #[must_use]
+    pub fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn compile_read_exact(
+        &self,
+        source_query: &kernel_query::RelExpr,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<kernel_query::RelExpr, kernel_transport::TransportError> {
+        let mut query = source_query.clone();
+        for step in &self.steps {
+            query = step.compile_read_exact(&query, registry)?;
+        }
+        Ok(query)
+    }
+
+    /// Transports one exact relation intent through every retained schema step.
+    /// Each step is bounded to the existing exact row-local delta theorem; a
+    /// global/query rewrite fails closed rather than reconstructing source state.
+    pub fn transport_relation_delta_exact(
+        &self,
+        source_relation: SemanticId,
+        delta: &RelationDelta,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Vec<(SemanticId, RelationDelta)>, kernel_transport::TransportError> {
+        let mut effects = vec![(source_relation, delta.clone())];
+        for step in &self.steps {
+            let mut next = Vec::new();
+            for (relation, effect) in effects {
+                next.extend(step.transport_relation_delta_exact(relation, &effect, registry)?);
+            }
+            effects = next;
+        }
+        Ok(effects)
+    }
+
+    /// Transports the exact relation-column write footprint through the same
+    /// bridge chain. Authorization remains a target-world concern; this method
+    /// only derives semantic coordinates and never transports grants.
+    pub fn transport_relation_write_footprint_exact(
+        &self,
+        source_relation: SemanticId,
+        source_columns: &BTreeSet<SemanticId>,
+    ) -> Result<Vec<kernel_transport::MigrationRelationWriteFootprint>, kernel_transport::TransportError> {
+        let mut footprints = vec![kernel_transport::MigrationRelationWriteFootprint {
+            target_relation: source_relation,
+            target_columns: source_columns.clone(),
+        }];
+        for step in &self.steps {
+            let mut next = Vec::new();
+            for footprint in footprints {
+                next.extend(step.transport_relation_write_footprint_exact(
+                    footprint.target_relation,
+                    &footprint.target_columns,
+                )?);
+            }
+            footprints = next;
+        }
+        Ok(footprints)
+    }
+
+    pub fn transport_relation_identity_exact(
+        &self,
+        source_relation: SemanticId,
+    ) -> Result<SemanticId, kernel_transport::TransportError> {
+        let mut relation = source_relation;
+        for step in &self.steps {
+            relation = step.transport_relation_identity_exact(relation)?;
+        }
+        Ok(relation)
+    }
+
+    pub fn transport_owned_relationship_exact(
+        &self,
+        source_relation: SemanticId,
+    ) -> Result<kernel_schema::OwnedRelationshipDef, kernel_transport::TransportError> {
+        let mut relation = source_relation;
+        let mut target = None;
+        for step in &self.steps {
+            let definition = step.transport_owned_relationship_exact(relation)?;
+            relation = definition.relation;
+            target = Some(definition);
+        }
+        target.ok_or(kernel_transport::TransportError::UnrepresentableOwnedRelationship(
+            source_relation,
+        ))
+    }
+
+    pub fn transport_field_identity_exact(
+        &self,
+        source_field: SemanticId,
+    ) -> Result<SemanticId, kernel_transport::TransportError> {
+        let mut field = source_field;
+        for step in &self.steps {
+            field = step.transport_field_identity_exact(field)?;
+        }
+        Ok(field)
+    }
+}
+
+impl SchemaAwareFormationContextWitness {
+    #[must_use]
+    pub const fn formation_revision(&self) -> RevisionId {
+        self.formation_revision
+    }
+
+    #[must_use]
+    pub const fn authorized_head_revision(&self) -> RevisionId {
+        self.authorized_head_revision
+    }
+
+    #[must_use]
+    pub const fn semantic_context(&self) -> &kernel_schema::SemanticContext {
+        &self.semantic_context
+    }
+}
+
 impl PreparedSchemaAwarePublication {
+    #[must_use]
+    pub const fn current_model_authority_footprint(&self) -> &RuntimeModelAuthorityFootprint {
+        &self.model_authority
+    }
+
     #[must_use]
     pub fn current_model_delta(&self) -> &DurableModelDelta {
         &self.current_model_delta
@@ -1413,7 +1600,32 @@ pub enum RuntimePublicationEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableRuntimeCommitOutcome {
     Committed(DurableRuntimeCommitReceipt),
+    AlreadySatisfied { target_revision: RevisionId },
     AlreadyCommitted { target_revision: RevisionId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedHistoricalEpoch {
+    effect_id: u128,
+    source_revision: RevisionId,
+    source_schema: kernel_types::SchemaRevisionId,
+}
+
+impl RetainedHistoricalEpoch {
+    #[must_use]
+    pub const fn effect_id(self) -> u128 {
+        self.effect_id
+    }
+
+    #[must_use]
+    pub const fn source_revision(self) -> RevisionId {
+        self.source_revision
+    }
+
+    #[must_use]
+    pub const fn source_schema(self) -> kernel_types::SchemaRevisionId {
+        self.source_schema
+    }
 }
 
 #[derive(Debug)]
@@ -1488,7 +1700,7 @@ impl From<kernel_revision::RevisionError> for RuntimeRecoveryError {
 ///
 /// The target is an already validated `kernel_revision::Revision`. The source
 /// revision and pinned semantic context come from the live runtime bundle.
-pub struct RevisionTransitionRequest<'a> {
+pub(crate) struct RevisionTransitionRequest<'a> {
     pub target_revision: &'a kernel_revision::Revision,
     pub mutations: &'a [RevisionRelationMutation<'a>],
     pub registry: &'a kernel_semantics::SemanticRegistry,

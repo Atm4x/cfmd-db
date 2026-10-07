@@ -292,14 +292,11 @@ fn benchmark_revision_bound_model_rule_full_runtime_publication_100k_rows() {
     let row_count = 100_000usize;
     let (mut context, registry, relation) = planning_context();
     let column = context.schema.relation_column_id(relation, 0).unwrap();
-    context.schema.add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-        relation,
-        predicate: kernel_schema::SemanticRuleExpr::I64Range {
+    context.schema.add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure { constraint: kernel_schema::ExactMeasureConstraint::Range { measure: kernel_schema::ExactAggregateMeasureExpr::Count { relation, predicate: (kernel_schema::SemanticRuleExpr::I64Range {
             value: kernel_schema::RuleValueExpr::Field(column),
             min: Some(0),
             max: Some(2_000_000),
-        },
-    }).unwrap();
+        }).negate() }, range: kernel_schema::ExactAggregateRange::Count { min: 0, max: Some(0) } } }).unwrap();
     let values = (0..row_count).map(|value| i64::try_from(value).expect("fixture value fits i64")).collect::<Vec<_>>();
     let binding = LayoutBinding {
         id: LayoutId(9_980_451),
@@ -380,14 +377,11 @@ fn benchmark_production_derived_runtime_publication_1m_rows() {
     let row_count = 1_000_000usize;
     let (mut context, registry, relation) = planning_context();
     let column = context.schema.relation_column_id(relation, 0).unwrap();
-    context.schema.add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-        relation,
-        predicate: kernel_schema::SemanticRuleExpr::I64Range {
+    context.schema.add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure { constraint: kernel_schema::ExactMeasureConstraint::Range { measure: kernel_schema::ExactAggregateMeasureExpr::Count { relation, predicate: (kernel_schema::SemanticRuleExpr::I64Range {
             value: kernel_schema::RuleValueExpr::Field(column),
             min: Some(0),
             max: Some(2_000_000),
-        },
-    }).unwrap();
+        }).negate() }, range: kernel_schema::ExactAggregateRange::Count { min: 0, max: Some(0) } } }).unwrap();
     let values = (0..row_count).map(|value| i64::try_from(value % 2).expect("fixture value fits i64")).collect::<Vec<_>>();
     let binding = LayoutBinding {
         id: LayoutId(9_980_454),
@@ -844,10 +838,10 @@ fn two_text_recovery_bundle(
         .unwrap();
     physical
         .advisor_managed_artifacts_mut()
-        .insert(UnifiedArtifactId::SemanticStatistics(short.clone()));
+        .insert(UnifiedArtifactId::semantic_cardinality(short.clone()));
     physical
         .advisor_managed_artifacts_mut()
-        .insert(UnifiedArtifactId::SemanticStatistics(long.clone()));
+        .insert(UnifiedArtifactId::semantic_cardinality(long.clone()));
     let root = RuntimeRevisionBundle::build(
         revision,
         physical,
@@ -2123,14 +2117,14 @@ fn semantic_statistics_publish_as_reconstructible_runtime_state() {
     assert_eq!(
         old_reader
             .physical_store()
-            .semantic_statistics(&binding, &context, &registry)
+            .semantic_cardinality(&binding, &context, &registry)
             .unwrap(),
         None
     );
     assert_eq!(
         new_reader
             .physical_store()
-            .semantic_statistics(&binding, &context, &registry)
+            .semantic_cardinality(&binding, &context, &registry)
             .unwrap(),
         Some(statistics)
     );
@@ -2167,7 +2161,7 @@ fn observable_atom_state_publishes_as_reconstructible_runtime_state() {
         .unwrap();
     assert_eq!(state.row_count(), 32);
     assert_eq!(state.atom_count(), 32);
-    assert_eq!(state.catalog.revision(), context.revision());
+    assert_eq!(state.semantic_revision(), context.revision());
 }
 
 

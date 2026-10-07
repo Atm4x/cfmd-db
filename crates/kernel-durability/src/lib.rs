@@ -2,6 +2,7 @@ mod binary_codec;
 mod checkpoint;
 mod descriptor;
 mod domain;
+mod durable_format;
 mod freshness_tcp;
 mod metadata;
 mod platform_assurance;
@@ -36,8 +37,12 @@ pub use domain::{
     HistoricalRestoreError, IdempotencyEpoch, LocalHistoricalComplementChain,
     MigrationPhysicalAuthority, SchemaMigrationPhysicalState, SemanticChangeEvent,
 };
+pub use durable_format::{
+    DurableFormatCompatibility, DurableFormatSupport, FORMAT_COMPATIBILITY,
+    FORMAT_DOWNGRADE_TARGETS, FORMAT_UPGRADE_SOURCES, FORMAT_VERSION, durable_format_support,
+};
 pub use freshness_tcp::{TcpExternalFreshnessAuthority, TcpExternalFreshnessAuthorityServer};
-pub use wal_frame::{FORMAT_VERSION, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN};
+pub use wal_frame::{HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN};
 pub use wal_payload::MUTATION_FORMAT_TAG;
 
 /// Canonical structural identity bytes for a relational expression.
@@ -47,6 +52,20 @@ pub fn canonical_rel_expr_identity(
 ) -> Result<Vec<u8>, runtime::CodecError> {
     let mut out = Vec::new();
     metadata::query_codec::encode_rel_expr(&mut out, expr, 0)?;
+    Ok(out)
+}
+
+/// Canonical durable identity bytes for one schema migration program.
+///
+/// This is the same codec used by durable revision metadata. Callers may hash
+/// these bytes together with the source revision when they need a sealed
+/// approval/certification identity; no separate migration serialization is
+/// permitted to define security meaning.
+pub fn canonical_schema_migration_program_identity(
+    program: &kernel_transport::SchemaMigrationProgram,
+) -> Result<Vec<u8>, runtime::CodecError> {
+    let mut out = Vec::new();
+    metadata::encode_schema_migration_program(&mut out, program)?;
     Ok(out)
 }
 
@@ -111,9 +130,10 @@ pub use storage_encryption::{
     StorageEncryptionKey, StorageEncryptionKeyInitError,
 };
 pub use store::{
-    DurableBatchEnqueueOutcome, DurableCommitBatchPolicy, DurableCommitBatcher,
-    DurableGenerationReceipt, DurableRevisionStore, ExternalFreshnessAuthority,
-    ExternalFreshnessConfig, HistoricalEpochMaterial, PreparedCutCapsule,
+    CanonicalPersistenceImage, DurableBatchEnqueueOutcome, DurableCommitBatchPolicy,
+    DurableCommitBatcher, DurableGenerationReceipt, DurableRevisionStore,
+    DurableSatisfiedIntentSealOutcome, ExternalFreshnessAuthority, ExternalFreshnessConfig,
+    ExternalFreshnessHandoff, ForkPersistenceImage, HistoricalEpochMaterial, PreparedCutCapsule,
     StreamingCheckpointProgress,
 };
 pub use wal::{FileRevisionWal, SimulatedRevisionWal, scan_wal};

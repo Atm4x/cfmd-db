@@ -34,6 +34,7 @@ impl ReplicationAuthorityJournal {
             single_file_capture: false,
             pending_single_file_frames: Vec::new(),
             live_single_file_frames: Vec::new(),
+            semantic_base_replay: None,
             effects: BTreeMap::new(),
             branches: BTreeMap::new(),
             revision_frontiers: BTreeMap::new(),
@@ -65,6 +66,7 @@ impl ReplicationAuthorityJournal {
             poisoned: false,
         };
         let (last_good, original_len) = journal.replay_file()?;
+        journal.ensure_semantic_base_complete()?;
         if last_good < original_len {
             let file = journal
                 .file
@@ -92,6 +94,7 @@ impl ReplicationAuthorityJournal {
             single_file_capture: true,
             pending_single_file_frames: Vec::new(),
             live_single_file_frames: Vec::new(),
+            semantic_base_replay: None,
             effects: BTreeMap::new(),
             branches: BTreeMap::new(),
             revision_frontiers: BTreeMap::new(),
@@ -139,12 +142,57 @@ impl ReplicationAuthorityJournal {
         Ok(())
     }
 
+    pub(crate) fn ensure_semantic_base_complete(&self) -> Result<(), DurabilityError> {
+        if self.semantic_base_replay.is_some() {
+            Err(DurabilityError::Corruption {
+                offset: 0,
+                reason: "replication semantic authority base is truncated",
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn take_pending_single_file_frames(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_single_file_frames)
     }
 
     pub(crate) fn commit_single_file_frames(&mut self, frames: Vec<Vec<u8>>) {
         self.live_single_file_frames.extend(frames);
+    }
+
+    pub(crate) fn is_empty_authority(&self) -> bool {
+        self.pending_single_file_frames.is_empty()
+            && self.live_single_file_frames.is_empty()
+            && self.effects.is_empty()
+            && self.branches.is_empty()
+            && self.revision_frontiers.is_empty()
+            && self.ordered_slots.is_empty()
+            && self.sequencer_epochs.is_empty()
+            && self.memberships.is_empty()
+            && self.current_membership_epoch.is_none()
+            && self.quorum_certificates.is_empty()
+            && self.effect_votes.is_empty()
+            && self.membership_votes.is_empty()
+            && self.membership_vote_successors.is_empty()
+            && self.promised_terms.is_empty()
+            && self.highest_promised_terms.is_empty()
+            && self.leader_votes.is_empty()
+            && self.leader_certificates.is_empty()
+            && self.decision_votes.is_empty()
+            && self.decision_locks.is_empty()
+            && self.highest_decision_lock_term == 0
+            && self.joint_membership_certificates.is_empty()
+            && self.peer_auth_policy.is_none()
+            && self.authenticated_evidence.is_empty()
+            && self.authenticated_evidence_index.is_empty()
+            && self.joint_membership_acks.is_empty()
+            && self.recovery_acks.is_empty()
+            && self.recovery_lock_frontiers.is_empty()
+            && self.quorum_availability.is_none()
+            && self.published_effects.is_empty()
+            && self.published_branches.is_empty()
+            && !self.poisoned
     }
 
     pub(crate) fn single_file_live_frame_count(&self) -> usize {

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use kernel_model::Value;
 
 pub type Row = Vec<Value>;
@@ -193,4 +195,43 @@ pub enum RelExpr {
         k: usize,
     },
     PromoteToBag(Box<Self>),
+}
+
+impl RelExpr {
+    /// Retargets every scan coordinate through one exact relation map while
+    /// preserving the relational operator tree verbatim.
+    ///
+    /// Callers must independently prove row-representation identity and
+    /// typecheck the rewritten expression in the target semantic context.
+    pub fn retarget_scan_relations_exact(
+        &self,
+        relation_map: &BTreeMap<kernel_types::SemanticId, kernel_types::SemanticId>,
+    ) -> Result<Self, RelQueryError> {
+        let mut retargeted = self.clone();
+        match &mut retargeted {
+            Self::Scan(relation) => {
+                *relation = *relation_map
+                    .get(relation)
+                    .ok_or(RelQueryError::UnknownRelation(*relation))?;
+            }
+            Self::FilterEqConst { input, .. }
+            | Self::FilterOrderConst { input, .. }
+            | Self::FilterEqColumns { input, .. }
+            | Self::Project { input, .. }
+            | Self::Distinct { input, .. }
+            | Self::Group { input, .. }
+            | Self::TopKWithTies { input, .. }
+            | Self::PromoteToBag(input) => {
+                **input = input.retarget_scan_relations_exact(relation_map)?;
+            }
+            Self::JoinEq { left, right, .. }
+            | Self::Difference { left, right }
+            | Self::Union { left, right }
+            | Self::AntiJoin { left, right, .. } => {
+                **left = left.retarget_scan_relations_exact(relation_map)?;
+                **right = right.retarget_scan_relations_exact(relation_map)?;
+            }
+        }
+        Ok(retargeted)
+    }
 }

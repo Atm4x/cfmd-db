@@ -4,12 +4,12 @@
 
 use std::path::Path;
 
-use cfmd::dynamic::{Query, QueryWatch, RelationId, WatchEvent};
+use cfmd::dynamic::{Plan, Query, QueryWatch, RelationId, WatchEvent};
 use cfmd::{
     Candidate, CandidateDerivedEffects, CfmdEntity, CfmdSchema, Context, ContextAdmission,
-    Database, DatabaseBuilder, Diagnostic, EntitySet, Error, ErrorDiagnosticExt, Id, Many, Object,
-    ObjectQuery, Plan, PrincipalId, QueryNodeId, QuerySource, Ref, Result, Schema, Snapshot,
-    Storage,
+    Database, DatabaseBuilder, Diagnostic, EntitySet, Error, ErrorDiagnosticExt, ExternalFreshness,
+    Id, Many, Object, ObjectQuery, PrincipalId, QueryNodeId, QuerySource, RecoveryAuthority,
+    RecoveryDiagnostic, RecoveryOperation, RecoveryReason, Ref, Result, Schema, Snapshot, Storage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -109,6 +109,16 @@ fn public_types_exist(
 ) {
 }
 
+fn recovery_types_exist(
+    _recovery: Option<RecoveryDiagnostic>,
+    _operation: RecoveryOperation,
+    _authority: RecoveryAuthority,
+    _reason: RecoveryReason,
+) {
+}
+
+fn external_freshness_type_exists(_freshness: Option<ExternalFreshness>) {}
+
 #[test]
 fn public_contract_compiles_as_documented() {
     let _ = database_builder as fn(&Path) -> DatabaseBuilder;
@@ -131,4 +141,6 @@ fn public_contract_compiles_as_documented() {
     let _ = derived_preview_api as fn(CandidateDerivedEffects) -> (usize, usize);
     let _ = scoped_context_api as fn(&Database) -> Result<()>;
     let _ = public_types_exist;
+    let _ = recovery_types_exist;
+    let _ = external_freshness_type_exists;
 }

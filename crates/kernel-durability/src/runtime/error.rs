@@ -2,6 +2,7 @@ use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurableFormatComponent {
+    SingleFile,
     Manifest,
     CheckpointFile,
     MetadataFile,

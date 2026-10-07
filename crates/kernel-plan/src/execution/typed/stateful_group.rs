@@ -6,7 +6,7 @@ fn produce_typed_group(
 ) -> Result<Option<OwnedTypedBatch>, PhysicalExecutionError> {
     if let Some(selection) = execute_typed_batch_selection(input, store, env.context, env.registry)?
     {
-        return produce_group_from_raw_selection(selection, spec, env).map(Some);
+        return produce_group_from_raw_selection(selection, spec, store, env).map(Some);
     }
     let Some(batch) = try_produce_typed_stateful_batch(input, store, env)? else {
         return Ok(None);
@@ -17,6 +17,7 @@ fn produce_typed_group(
 fn produce_group_from_raw_selection(
     selection: TypedBatchSelection<'_>,
     spec: GroupBatchSpec<'_>,
+    store: &PhysicalStore,
     env: &StatefulBatchEnv<'_>,
 ) -> Result<OwnedTypedBatch, PhysicalExecutionError> {
     validate_group_batch_spec(spec)?;
@@ -29,6 +30,18 @@ fn produce_group_from_raw_selection(
         return Err(PhysicalExecutionError::UnsupportedPhysicalPlan);
     };
     let physical_group_columns = resolve_group_columns(&program.columns, spec.group_columns)?;
+    if let Some(output_columns) = try_produce_revision_semantic_group_columns(
+        &program,
+        columns,
+        &positions,
+        &physical_group_columns,
+        spec,
+        store,
+        env,
+        &mut stats,
+    )? {
+        return OwnedTypedBatch::dense(output_columns, stats);
+    }
     let output_columns = produce_group_columns(
         columns,
         &program.columns,
@@ -40,6 +53,105 @@ fn produce_group_from_raw_selection(
     )?
     .ok_or(PhysicalExecutionError::UnsupportedPhysicalPlan)?;
     OwnedTypedBatch::dense(output_columns, stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_produce_revision_semantic_group_columns(
+    program: &TypedBatchProgram<'_>,
+    columns: &[NativeColumn],
+    positions: &[usize],
+    physical_group_columns: &[usize],
+    spec: GroupBatchSpec<'_>,
+    store: &PhysicalStore,
+    env: &StatefulBatchEnv<'_>,
+    stats: &mut ExecutionStats,
+) -> Result<Option<Vec<NativeColumn>>, PhysicalExecutionError> {
+    if physical_group_columns.is_empty()
+        || physical_group_columns.len() != spec.group_equivalences.len()
+        || !physical_group_columns
+            .iter()
+            .copied()
+            .zip(spec.group_equivalences.iter().copied())
+            .all(|(column, equivalence)| {
+                store
+                    .revision_semantic_column_distinct(
+                        program.relation,
+                        program.layout,
+                        column,
+                        equivalence,
+                        env.context,
+                        env.registry,
+                    )
+                    .is_some()
+            })
+    {
+        return Ok(None);
+    }
+
+    let mut lookup = BTreeMap::<Vec<kernel_types::EqClassId>, usize>::new();
+    let mut representatives = Vec::<Vec<Value>>::new();
+    let mut aggregates = Vec::<TypedGroupState>::new();
+    for &position in positions {
+        let row_id = program.installed.row_id_at(position)?;
+        let mut class = Vec::with_capacity(physical_group_columns.len());
+        for (&physical_column, &equivalence) in physical_group_columns
+            .iter()
+            .zip(spec.group_equivalences)
+        {
+            class.push(
+                store
+                    .revision_semantic_class_for_row(
+                        program.relation,
+                        program.layout,
+                        physical_column,
+                        equivalence,
+                        row_id,
+                    )
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?,
+            );
+        }
+        stats.values_read = stats
+            .values_read
+            .saturating_add(physical_group_columns.len());
+        let index = if let Some(index) = lookup.get(&class).copied() {
+            index
+        } else {
+            let mut representative = Vec::with_capacity(physical_group_columns.len());
+            for &physical_column in physical_group_columns {
+                representative.push(
+                    columns
+                        .get(physical_column)
+                        .ok_or(RelQueryError::ColumnOutOfBounds)?
+                        .value_at(position),
+                );
+            }
+            let index = representatives.len();
+            lookup.insert(class, index);
+            representatives.push(representative);
+            aggregates.push(new_typed_group_state(spec.aggregate));
+            index
+        };
+        if !update_typed_group_state(
+            &mut aggregates[index],
+            spec.aggregate,
+            &program.columns,
+            columns,
+            position,
+            stats,
+        )? {
+            return Ok(None);
+        }
+    }
+
+    stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+    finish_primitive_group_columns(
+        columns,
+        physical_group_columns,
+        spec.aggregate,
+        &representatives,
+        aggregates,
+    )
+    .map(Some)
 }
 
 fn produce_group_from_owned_batch(

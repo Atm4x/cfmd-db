@@ -11,6 +11,7 @@ kernel-exact = { path = "../kernel-exact" }
 kernel-fixpoint = { path = "../kernel-fixpoint" }
 kernel-model = { path = "../kernel-model" }
 kernel-persistent = { path = "../kernel-persistent" }
+kernel-proof = { path = "../kernel-proof" }
 kernel-schema = { path = "../kernel-schema" }
 kernel-semantic-index = { path = "../kernel-semantic-index" }
 kernel-semantics = { path = "../kernel-semantics" }

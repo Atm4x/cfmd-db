@@ -139,6 +139,53 @@ impl fmt::Debug for StorageEncryptionKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageProtectionProfile {
+    Unencrypted,
+    Direct {
+        algorithm: StorageAeadAlgorithm,
+    },
+    ExternalWrapped {
+        algorithm: StorageAeadAlgorithm,
+        provider_key_id: [u8; 16],
+        provider_key_epoch: u64,
+    },
+}
+
+impl StorageProtectionProfile {
+    #[must_use]
+    pub(crate) fn accepts_target(self, target: Self) -> bool {
+        match (self, target) {
+            (Self::Unencrypted, _) => true,
+            (
+                Self::Direct { algorithm: source },
+                Self::Direct { algorithm: target }
+                | Self::ExternalWrapped {
+                    algorithm: target, ..
+                },
+            ) => source as u8 == target as u8,
+            (
+                Self::ExternalWrapped {
+                    algorithm: source_algorithm,
+                    provider_key_id: source_provider,
+                    provider_key_epoch: source_epoch,
+                },
+                Self::ExternalWrapped {
+                    algorithm: target_algorithm,
+                    provider_key_id: target_provider,
+                    provider_key_epoch: target_epoch,
+                },
+            ) => {
+                source_algorithm as u8 == target_algorithm as u8
+                    && source_provider == target_provider
+                    && target_epoch >= source_epoch
+            }
+            (Self::Direct { .. } | Self::ExternalWrapped { .. }, Self::Unencrypted)
+            | (Self::ExternalWrapped { .. }, Self::Direct { .. }) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum StorageEncryption {
     #[default]
@@ -220,6 +267,26 @@ impl StorageEncryption {
         match self {
             Self::None => None,
             Self::Direct { algorithm, .. } | Self::Wrapped { algorithm, .. } => Some(*algorithm),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn protection_profile(&self) -> StorageProtectionProfile {
+        match self {
+            Self::None => StorageProtectionProfile::Unencrypted,
+            Self::Direct { algorithm, .. } => StorageProtectionProfile::Direct {
+                algorithm: *algorithm,
+            },
+            Self::Wrapped {
+                algorithm,
+                provider_key_id,
+                provider_key_epoch,
+                ..
+            } => StorageProtectionProfile::ExternalWrapped {
+                algorithm: *algorithm,
+                provider_key_id: *provider_key_id,
+                provider_key_epoch: *provider_key_epoch,
+            },
         }
     }
 }

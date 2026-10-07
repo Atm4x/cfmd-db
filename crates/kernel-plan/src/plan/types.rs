@@ -3,7 +3,7 @@ use super::{
     ExecutionStats, I64IndexBinding, LayoutBinding, LayoutId, OrderComparison, OrderDirection,
     PhysicalCapability, PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy,
     PhysicalRecoveryReport, PhysicalStore, PreparedPlan, RelExpr, RelQueryError, RelType,
-    RelationValue, SemanticId, SemanticIndexBinding, TelemetryDecayPolicy, UnifiedAdvisorPolicy,
+    RelationValue, SemanticFiberProfile, SemanticId, SemanticIndexBinding, TelemetryDecayPolicy, UnifiedAdvisorPolicy,
     UnifiedArtifactId, Value,
 };
 use crate::execution::{
@@ -272,8 +272,8 @@ pub struct ObservableAtomConvergenceReport {
     pub rebuilt: bool,
     pub retained_manual_observable: bool,
     pub capabilities: BTreeSet<PhysicalCapability>,
-    pub retired_legacy_statistics: Vec<SemanticIndexBinding>,
-    pub retired_legacy_quotient_factors: Vec<SemanticIndexBinding>,
+    pub retired_cardinality_profiles: Vec<SemanticIndexBinding>,
+    pub retired_quotient_profiles: Vec<SemanticIndexBinding>,
 }
 
 pub(super) type UnifiedAdvisorTelemetry = AdvisorTelemetry<UnifiedArtifactId>;
@@ -281,20 +281,19 @@ pub(super) type UnifiedAdvisorTelemetry = AdvisorTelemetry<UnifiedArtifactId>;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PhysicalArtifactTelemetryTarget {
     I64Index(I64IndexBinding),
-    ObservableAtom(SemanticIndexBinding),
-    SemanticQuotientFactor(SemanticIndexBinding),
-    SemanticStatistics(SemanticIndexBinding),
+    SemanticFiber {
+        binding: SemanticIndexBinding,
+        profile: SemanticFiberProfile,
+    },
 }
 
 impl PhysicalArtifactTelemetryTarget {
     fn into_unified(self) -> UnifiedArtifactId {
         match self {
             Self::I64Index(binding) => UnifiedArtifactId::I64Index(binding),
-            Self::ObservableAtom(binding) => UnifiedArtifactId::ObservableAtom(binding),
-            Self::SemanticQuotientFactor(binding) => {
-                UnifiedArtifactId::SemanticQuotientFactor(binding)
+            Self::SemanticFiber { binding, profile } => {
+                UnifiedArtifactId::semantic_fiber(binding, profile)
             }
-            Self::SemanticStatistics(binding) => UnifiedArtifactId::SemanticStatistics(binding),
         }
     }
 }
@@ -305,8 +304,8 @@ pub struct UnifiedObservableAdvisorReport {
     pub rebuilt: Vec<SemanticIndexBinding>,
     pub retained: Vec<SemanticIndexBinding>,
     pub evicted: Vec<SemanticIndexBinding>,
-    pub retired_legacy_statistics: Vec<SemanticIndexBinding>,
-    pub retired_legacy_quotient_factors: Vec<SemanticIndexBinding>,
+    pub retired_cardinality_profiles: Vec<SemanticIndexBinding>,
+    pub retired_quotient_profiles: Vec<SemanticIndexBinding>,
     pub rejected_unprofitable: Vec<SemanticIndexBinding>,
     pub rejected_budget: Vec<SemanticIndexBinding>,
     pub rejected_pressure: Vec<SemanticIndexBinding>,
@@ -424,10 +423,8 @@ pub enum PhysicalArtifactFamily {
     RelationLayout,
     SharedDenseIdentityMap,
     I64Index,
-    ObservableAtom,
-    SemanticQuotientFactor,
+    SemanticFiber(SemanticFiberProfile),
     SemanticQuotientSupport,
-    SemanticStatistics,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

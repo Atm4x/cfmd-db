@@ -24,6 +24,7 @@ use super::single_file_backend::{
 use super::{DurableGenerationReceipt, DurableRevisionStore, StreamingCheckpointProgress};
 use crate::binary_codec::{crc32c, crc32c_update};
 use crate::realization::DurableFactorizedRealization;
+use crate::replication::authority::ReplicationAuthorityFrameSlice;
 use crate::runtime::{CodecError, DurabilityError, TailStatus};
 use crate::single_file::{
     CarriedWalPublication, HistoricalGenerationArchive, SingleFileSectionInput,
@@ -721,7 +722,7 @@ impl DurableRevisionStore {
         self.generation = job.generation;
         self.checkpoint = job.cut_revision;
         self.checkpoint_realization = physical_realization;
-        self.wal = shadow_wal;
+        self.wal = shadow_wal.into();
         self.advance_external_freshness_generation_with_digest(
             published_generation,
             published_tail_lsn,
@@ -773,8 +774,14 @@ impl DurableRevisionStore {
         let checkpoint_source = RevisionSectionSource(&job.cut_revision);
         let metadata_source = MetadataSectionSource(metadata_record);
         let replication_frames = replication_prefix(&self.replication, replication_cut_frames)?;
+        let replication_source = ReplicationAuthorityFrameSlice::new(replication_frames);
         let retained_historical_generations =
             self.pinned_historical_generations_for(physical_realization.as_ref());
+        let retained_historical_effects = self
+            .historical_epoch_anchors
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let archive_outgoing = retained_historical_generations
             .contains(&self.generation)
             .then_some(HistoricalGenerationArchive {
@@ -809,7 +816,7 @@ impl DurableRevisionStore {
         let container = backend.single_file_container()?;
         let view = container
             .publish_generation_with_carried_wal(
-                wal,
+                wal.file_mut()?,
                 CarriedWalPublication {
                     start_offset: carry_start_offset,
                     first_lsn: job.wal_first_lsn,
@@ -818,9 +825,10 @@ impl DurableRevisionStore {
                     seeded_prepares: &seeds,
                 },
                 &sections,
-                replication_frames,
+                &replication_source,
                 archive_outgoing,
                 &retained_historical_generations,
+                &retained_historical_effects,
             )
             .inspect_err(|_| self.poisoned = true)?;
         let (wal, reopened_scan) = container
@@ -841,7 +849,7 @@ impl DurableRevisionStore {
         self.generation = view.generation;
         self.checkpoint = job.cut_revision;
         self.checkpoint_realization = physical_realization;
-        self.wal = wal;
+        self.wal = wal.into();
         self.replication
             .advance_single_file_generation_prefix(replication_cut_frames);
         let freshness_digest = self.wal.freshness_digest();

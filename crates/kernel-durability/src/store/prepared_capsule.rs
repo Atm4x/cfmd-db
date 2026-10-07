@@ -59,6 +59,16 @@ impl PreparedCutCapsule {
         self.entries.iter().map(|entry| entry.prepare_lsn)
     }
 
+    pub(super) fn matches_recovery_scan(&self, scan: &crate::runtime::RecoveryScan) -> bool {
+        let expected = self.scan_seeds();
+        let actual = scan
+            .unresolved_prepares()
+            .iter()
+            .map(|(lsn, descriptor, crc)| (*lsn, descriptor.clone(), *crc))
+            .collect::<Vec<_>>();
+        expected == actual
+    }
+
     pub(super) fn scan_seeds(&self) -> Vec<(u64, DurableRevisionDescriptor, u32)> {
         self.entries
             .iter()

@@ -4,6 +4,7 @@
 //! Internal `kernel-*` types are implementation details and never appear in public signatures.
 
 mod candidate;
+mod control;
 mod entity;
 mod error;
 mod history;
@@ -14,6 +15,7 @@ mod notification;
 mod object;
 mod plan;
 mod query;
+mod retention;
 mod runtime;
 mod schema;
 mod schema_model;
@@ -28,48 +30,67 @@ pub use candidate::{
     CandidateObjectSet, CandidatePreview, CandidateProjectionQuery, CandidateReadiness,
     RelationChange,
 };
+pub use control::{
+    AdminDatabase, DatabaseControlCredential, DatabaseControlPermission,
+    DatabaseControlPermissionSet, DatabaseControlSession, DatabaseControlSnapshot,
+    MigrationSecurityApproval,
+};
 pub use entity::{
     Id, ManyCount, ManyCountPredicate, ManyField, ManyPredicate, OptionalRefField,
     OptionalRefIsSome, PathField, PathPredicate, Ref, RefField, RefPath, RefPredicate,
 };
-pub use error::{Error, ErrorKind, Result};
+pub use error::{
+    Error, ErrorKind, RecoveryAuthority, RecoveryDiagnostic, RecoveryOperation, RecoveryReason,
+    Result,
+};
 pub use history::{
     History, HistoryBoundaryAuthority, HistoryEffectKind, HistoryEntry, HistoryRelationChange,
     HistoryReversibility, HistorySemanticChange, HistoryUndoReadiness,
 };
 pub use ids::{
-    EquivalenceId, FieldId, OrderingId, RelationColumnId, RelationId, RevisionId, TransactionId,
-    TypeId, VariantTagId,
+    AccessCapabilityId, EquivalenceId, FieldId, ModelEntityId, ModelSemanticId, OrderingId,
+    RelationColumnId, RelationId, RevisionId, RoleId, TransactionId, TypeId, VariantTagId,
 };
 #[doc(hidden)]
 pub use intent_journal::{IntentJournal, IntentReadiness};
 pub use migration::{
-    MigrationColumnRule, MigrationFieldRule, MigrationHistoryPolicy, MigrationModel,
-    MigrationRelationRule, MigrationValueExpr,
+    MigrationAccessChange, MigrationAccessChangeKind, MigrationAccessSubject, MigrationColumnRule,
+    MigrationCoordinate, MigrationCostClass, MigrationCutover, MigrationDataDependency,
+    MigrationDeclassificationEdge, MigrationDiagnostic, MigrationDiagnosticCode,
+    MigrationDiagnosticDomain, MigrationDiagnosticReason, MigrationDiagnosticSeverity,
+    MigrationFieldRule, MigrationHistoryPolicy, MigrationIntegrityPolicyCoordinate, MigrationModel,
+    MigrationObservation, MigrationObservationFlow, MigrationObservationState, MigrationPlan,
+    MigrationPreview, MigrationRelationRule, MigrationSecurityImpact,
+    MigrationSecurityImpactDigest, MigrationValidation, MigrationValueExpr, MigrationWorkflowStage,
+    PreparedMigration,
 };
 pub use notification::{InProcessPublicationNotifier, PublicationNotifier};
 pub use object::{
     __row_shape_error, GroupedAggregateQuery, Many, ManySelection, Object, ObjectEquivalence,
     ObjectFieldRole, ObjectFieldSchema, ObjectGroupQuery, ObjectManyFieldSchema, ObjectPatchField,
-    ObjectProjectionQuery, ObjectProxy, ObjectQuery, ObjectRelationshipCardinality, ObjectSet,
-    ObjectValue, OrderedObjectValue, OwnedMany, OwnedManySelection, ScopedRelationship,
+    ObjectProjectionQuery, ObjectProxy, ObjectQuery, ObjectRelationshipCardinality,
+    ObjectRuleField, ObjectSet, ObjectValue, OrderedObjectValue, OwnedMany, OwnedManySelection,
+    ScopedRelationship,
 };
 pub use plan::{CommitOutcome, OrphanPolicy, Plan};
 pub use query::{
     OrderComparison, OrderDirection, PreparedQuery, Query, QueryNode, QueryNodeId, QueryNodeKind,
     QuerySource, RelationResult,
 };
+pub use retention::{HistoryRetentionPin, HistoryRetentionReason};
 #[doc(hidden)]
 pub use runtime::ExactRelationMutation;
 pub use runtime::{
-    Database, DatabaseBuilder, Encryption, EncryptionKey, EncryptionKeyAcknowledgement,
-    EncryptionKeyDestination, EncryptionKeyId, EncryptionKeyOperation, EncryptionKeyProvider,
-    EncryptionProviderKeyMetadata, ReadContext, Storage,
+    BackupVerification, Database, DatabaseBuilder, Encryption, EncryptionKey,
+    EncryptionKeyAcknowledgement, EncryptionKeyDestination, EncryptionKeyId,
+    EncryptionKeyOperation, EncryptionKeyProvider, EncryptionProviderKeyMetadata,
+    ExternalFreshness, ReadContext, Storage,
 };
 pub use schema::{
-    FieldRule, PrimitiveEquivalence, PrimitiveOrdering, RelationSchema, RelationSemantics,
-    RuleValueExpr, ScalarType, Schema, SchemaBuilder, SchemaView, SemanticRuleExpr,
-    StructuralEquivalence, TextPattern, Type,
+    ExactAggregateMeasureExpr, FieldRule, FiniteF64, ModelRuleExpr, OrderedExtremumKind,
+    OrderedStatisticBound, OrderedStatisticSelector, PrimitiveEquivalence, PrimitiveOrdering,
+    RelationSchema, RelationSemantics, RuleOrderComparison, RuleValueExpr, ScalarType, Schema,
+    SchemaBuilder, SchemaView, SemanticRuleExpr, StructuralEquivalence, TextPattern, Type,
 };
 #[doc(hidden)]
 pub use schema_model::{
@@ -80,14 +101,15 @@ pub use schema_model::{
     CfmdSchema, Context, ContextAdmission, ContextSource, DatabaseDefinition, EntitySet, Snapshot,
 };
 pub use security::{
-    Permission, PermissionSet, PrincipalId, Role, Session, SessionDatabase, SessionSnapshot,
+    AccessCapability, Permission, PermissionCoordinate, PermissionSet, PrincipalId, Role,
+    SchemaAccess, Session, SessionDatabase, SessionSnapshot,
 };
 pub use value::{EntityRef, Row, Value};
 pub use watch::{
-    GroupedAggregateWatch, GroupedAggregateWatchEvent, ObjectWatch, ObjectWatchEvent,
-    ProjectionWatch, ProjectionWatchEvent, QueryWatch, WatchAuthorization, WatchCancellation,
-    WatchDrain, WatchEvent, WatchNext, WatchReadiness, WatchReadinessSourceId, WatchStatus,
-    WatchSubscriptionId, WatchWake,
+    GroupedAggregateWatch, GroupedAggregateWatchEvent, MigratableQueryWatch, MigratableWatchEvent,
+    ObjectWatch, ObjectWatchEvent, ProjectionWatch, ProjectionWatchEvent, QueryWatch,
+    WatchAuthorization, WatchCancellation, WatchDrain, WatchEvent, WatchNext, WatchReadiness,
+    WatchReadinessSourceId, WatchStatus, WatchSubscriptionId, WatchWake,
 };
 
 pub use object::{

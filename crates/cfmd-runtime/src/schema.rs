@@ -51,6 +51,14 @@ pub enum RuleValueExpr {
     Field(FieldId),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RuleOrderComparison {
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticRuleExpr {
     True,
@@ -75,6 +83,202 @@ pub enum SemanticRuleExpr {
     TextMatches {
         value: RuleValueExpr,
         pattern: TextPattern,
+    },
+    Equivalent {
+        left: RuleValueExpr,
+        right: RuleValueExpr,
+        equivalence: EquivalenceId,
+    },
+    Ordered {
+        left: RuleValueExpr,
+        right: RuleValueExpr,
+        ordering: OrderingId,
+        comparison: RuleOrderComparison,
+    },
+}
+
+impl SemanticRuleExpr {
+    /// Conjoins two deterministic semantic predicates without introducing a host callback.
+    #[must_use]
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::And(mut left), Self::And(right)) => {
+                left.extend(right);
+                Self::And(left)
+            }
+            (Self::And(mut left), right) => {
+                left.push(right);
+                Self::And(left)
+            }
+            (left, Self::And(mut right)) => {
+                right.insert(0, left);
+                Self::And(right)
+            }
+            (left, right) => Self::And(vec![left, right]),
+        }
+    }
+
+    /// Disjoins two deterministic semantic predicates without introducing a host callback.
+    #[must_use]
+    pub fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Or(mut left), Self::Or(right)) => {
+                left.extend(right);
+                Self::Or(left)
+            }
+            (Self::Or(mut left), right) => {
+                left.push(right);
+                Self::Or(left)
+            }
+            (left, Self::Or(mut right)) => {
+                right.insert(0, left);
+                Self::Or(right)
+            }
+            (left, right) => Self::Or(vec![left, right]),
+        }
+    }
+
+    /// Negates one deterministic semantic predicate.
+    #[must_use]
+    pub fn negate(self) -> Self {
+        Self::Not(Box::new(self))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FiniteF64(u64);
+
+impl FiniteF64 {
+    #[must_use]
+    pub fn new(value: f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        let normalized = if value == 0.0 { 0.0 } else { value };
+        Some(Self(normalized.to_bits()))
+    }
+
+    #[must_use]
+    pub fn from_bits(bits: u64) -> Option<Self> {
+        Self::new(f64::from_bits(bits))
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn value(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OrderedExtremumKind {
+    Min,
+    Max,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OrderedStatisticBound {
+    Unit,
+    Bool(bool),
+    I64(i64),
+    F64Bits(u64),
+    Text(String),
+    HistoricalEntityRef(crate::EntityRef),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OrderedStatisticSelector {
+    FromStart(u64),
+    FromEnd(u64),
+    LowerQuantile { numerator: u64, denominator: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExactAggregateMeasureExpr {
+    Count {
+        relation: RelationId,
+        predicate: SemanticRuleExpr,
+    },
+    F64Sum {
+        relation: RelationId,
+        column: RelationColumnId,
+        predicate: SemanticRuleExpr,
+    },
+    OrderedStatistic {
+        relation: RelationId,
+        column: RelationColumnId,
+        predicate: SemanticRuleExpr,
+        ordering: OrderingId,
+        selector: OrderedStatisticSelector,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ModelRuleExpr {
+    RelationExactCountRange {
+        relation: RelationId,
+        predicate: SemanticRuleExpr,
+        min: u64,
+        max: Option<u64>,
+    },
+    RelationExactF64SumRange {
+        relation: RelationId,
+        column: RelationColumnId,
+        predicate: SemanticRuleExpr,
+        min: Option<FiniteF64>,
+        max: Option<FiniteF64>,
+    },
+    ExactAggregateCompare {
+        left: ExactAggregateMeasureExpr,
+        right: ExactAggregateMeasureExpr,
+        comparison: RuleOrderComparison,
+    },
+    ExactOrderedStatisticRange {
+        measure: ExactAggregateMeasureExpr,
+        min: Option<OrderedStatisticBound>,
+        max: Option<OrderedStatisticBound>,
+    },
+    RelationGroupedExactCountRange {
+        relation: RelationId,
+        group_columns: Vec<RelationColumnId>,
+        group_equivalences: Vec<EquivalenceId>,
+        predicate: SemanticRuleExpr,
+        min: u64,
+        max: Option<u64>,
+    },
+    RelationGroupedExactF64SumRange {
+        relation: RelationId,
+        group_columns: Vec<RelationColumnId>,
+        group_equivalences: Vec<EquivalenceId>,
+        column: RelationColumnId,
+        predicate: SemanticRuleExpr,
+        min: Option<FiniteF64>,
+        max: Option<FiniteF64>,
+    },
+    RelationGroupedExactOrderedStatisticRange {
+        relation: RelationId,
+        group_columns: Vec<RelationColumnId>,
+        group_equivalences: Vec<EquivalenceId>,
+        measure: ExactAggregateMeasureExpr,
+        min: Option<OrderedStatisticBound>,
+        max: Option<OrderedStatisticBound>,
+    },
+    RelationGroupedExactAggregateCompare {
+        relation: RelationId,
+        group_columns: Vec<RelationColumnId>,
+        group_equivalences: Vec<EquivalenceId>,
+        left: ExactAggregateMeasureExpr,
+        right: ExactAggregateMeasureExpr,
+        comparison: RuleOrderComparison,
     },
 }
 
@@ -288,10 +492,14 @@ pub struct Schema {
     pub(crate) structural_equivalences: BTreeMap<EquivalenceId, StructuralEquivalence>,
     pub(crate) orderings: BTreeMap<OrderingId, PrimitiveOrdering>,
     pub(crate) relations: BTreeMap<RelationId, RelationSchema>,
+    pub(crate) owned_relationships: BTreeMap<RelationId, (RelationId, crate::OrphanPolicy)>,
     pub(crate) entity_fields: BTreeMap<FieldId, (TypeId, Type)>,
     pub(crate) field_rules: BTreeMap<FieldId, Vec<FieldRule>>,
     pub(crate) relation_column_rules: BTreeMap<(RelationId, usize), Vec<FieldRule>>,
     pub(crate) entity_rules: BTreeMap<TypeId, Vec<SemanticRuleExpr>>,
+    pub(crate) model_rules: Vec<ModelRuleExpr>,
+    pub(crate) access_capabilities: BTreeMap<crate::AccessCapabilityId, crate::AccessCapability>,
+    pub(crate) access_roles: BTreeMap<crate::RoleId, crate::Role>,
 }
 
 impl Schema {
@@ -313,11 +521,15 @@ pub struct SchemaBuilder {
     structural_equivalences: BTreeMap<EquivalenceId, StructuralEquivalence>,
     orderings: BTreeMap<OrderingId, PrimitiveOrdering>,
     relations: BTreeMap<RelationId, RelationSchema>,
+    owned_relationships: BTreeMap<RelationId, (RelationId, crate::OrphanPolicy)>,
     entity_types: BTreeSet<TypeId>,
     entity_fields: BTreeMap<FieldId, (TypeId, Type)>,
     field_rules: BTreeMap<FieldId, Vec<FieldRule>>,
     relation_column_rules: BTreeMap<(RelationId, usize), Vec<FieldRule>>,
     entity_rules: BTreeMap<TypeId, Vec<SemanticRuleExpr>>,
+    model_rules: Vec<ModelRuleExpr>,
+    access_capabilities: BTreeMap<crate::AccessCapabilityId, crate::AccessCapability>,
+    access_roles: BTreeMap<crate::RoleId, crate::Role>,
     duplicates: BTreeSet<u128>,
     invalid_schema: Vec<String>,
     required_relations: BTreeMap<RelationId, String>,
@@ -351,11 +563,15 @@ impl SchemaBuilder {
                 ),
             ]),
             relations: BTreeMap::new(),
+            owned_relationships: BTreeMap::new(),
             entity_types: BTreeSet::new(),
             entity_fields: BTreeMap::new(),
             field_rules: BTreeMap::new(),
             relation_column_rules: BTreeMap::new(),
             entity_rules: BTreeMap::new(),
+            model_rules: Vec::new(),
+            access_capabilities: BTreeMap::new(),
+            access_roles: BTreeMap::new(),
             duplicates: BTreeSet::new(),
             invalid_schema: Vec::new(),
             required_relations: BTreeMap::new(),
@@ -427,6 +643,44 @@ impl SchemaBuilder {
         self
     }
 
+    /// Adds a deterministic database-wide invariant compiled into the kernel rule engine.
+    #[must_use]
+    pub fn model_rule(mut self, rule: ModelRuleExpr) -> Self {
+        self.model_rules.push(rule);
+        self
+    }
+
+    /// Adds the authoritative Access contract owned by this schema.
+    #[must_use]
+    pub fn access(mut self, access: crate::SchemaAccess) -> Self {
+        let (capabilities, roles) = access.into_parts();
+        for capability in capabilities {
+            self = self.access_capability(capability);
+        }
+        for role in roles {
+            self = self.role(role);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn access_capability(mut self, capability: crate::AccessCapability) -> Self {
+        let id = capability.id();
+        if self.access_capabilities.insert(id, capability).is_some() {
+            self.duplicates.insert(id.raw());
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn role(mut self, role: crate::Role) -> Self {
+        let id = role.id();
+        if self.access_roles.insert(id, role).is_some() {
+            self.duplicates.insert(id.raw());
+        }
+        self
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn __relation_column_rule(
@@ -471,6 +725,24 @@ impl SchemaBuilder {
     #[must_use]
     pub fn __require_relation(mut self, relation: RelationId, message: String) -> Self {
         self.required_relations.entry(relation).or_insert(message);
+        self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __owned_relationship(
+        mut self,
+        relation: RelationId,
+        target_relation: RelationId,
+        orphan_policy: crate::OrphanPolicy,
+    ) -> Self {
+        if self
+            .owned_relationships
+            .insert(relation, (target_relation, orphan_policy))
+            .is_some()
+        {
+            self.duplicates.insert(relation.raw());
+        }
         self
     }
 
@@ -521,6 +793,8 @@ impl SchemaBuilder {
             .chain(self.relations.keys().map(|id| id.raw()))
             .chain(self.entity_types.iter().map(|id| id.raw()))
             .chain(self.entity_fields.keys().map(|id| id.raw()))
+            .chain(self.access_capabilities.keys().map(|id| id.raw()))
+            .chain(self.access_roles.keys().map(|id| id.raw()))
         {
             if !seen.insert(raw) {
                 return Err(crate::Error::new(
@@ -536,10 +810,14 @@ impl SchemaBuilder {
             structural_equivalences: self.structural_equivalences,
             orderings: self.orderings,
             relations: self.relations,
+            owned_relationships: self.owned_relationships,
             entity_fields: self.entity_fields,
             field_rules: self.field_rules,
             relation_column_rules: self.relation_column_rules,
             entity_rules: self.entity_rules,
+            model_rules: self.model_rules,
+            access_capabilities: self.access_capabilities,
+            access_roles: self.access_roles,
         })
     }
 }
@@ -548,6 +826,7 @@ impl SchemaBuilder {
 pub struct SchemaView {
     revision: u64,
     relations: Vec<RelationSchema>,
+    role_permissions: BTreeMap<crate::RoleId, crate::PermissionSet>,
 }
 
 impl SchemaView {
@@ -557,6 +836,21 @@ impl SchemaView {
             relations: schema
                 .relations()
                 .map(|relation| relation_from_kernel(schema, relation))
+                .collect(),
+            role_permissions: schema
+                .schema_access()
+                .roles
+                .keys()
+                .copied()
+                .map(|role| {
+                    let permissions: crate::PermissionSet = schema
+                        .resolve_access_roles([role])
+                        .expect("validated schema access must resolve every persisted role")
+                        .into_iter()
+                        .map(crate::security::permission_from_kernel)
+                        .collect();
+                    (crate::RoleId::new(role.raw()), permissions)
+                })
                 .collect(),
         }
     }
@@ -569,6 +863,23 @@ impl SchemaView {
     pub fn relations(&self) -> &[RelationSchema] {
         &self.relations
     }
+    pub fn permissions_for_roles(
+        &self,
+        roles: impl IntoIterator<Item = crate::RoleId>,
+    ) -> crate::Result<crate::PermissionSet> {
+        let mut permissions = BTreeSet::new();
+        for role in roles {
+            let role_permissions = self.role_permissions.get(&role).ok_or_else(|| {
+                crate::Error::new(
+                    crate::ErrorKind::InvalidSchema,
+                    format!("unknown authorization role {}", role.raw()),
+                )
+            })?;
+            permissions.extend(role_permissions.iter());
+        }
+        Ok(permissions.into_iter().collect())
+    }
+
     #[must_use]
     pub fn relation(&self, id: RelationId) -> Option<&RelationSchema> {
         self.relations.iter().find(|relation| relation.id == id)
@@ -630,6 +941,103 @@ pub(crate) fn semantic_rule_to_kernel(rule: SemanticRuleExpr) -> kernel_schema::
             kernel_schema::SemanticRuleExpr::TextMatches {
                 value: rule_value_to_kernel(value),
                 pattern: text_pattern_to_kernel(pattern),
+            }
+        }
+        SemanticRuleExpr::Equivalent {
+            left,
+            right,
+            equivalence,
+        } => kernel_schema::SemanticRuleExpr::Equivalent {
+            left: rule_value_to_kernel(left),
+            right: rule_value_to_kernel(right),
+            equivalence: equivalence.into(),
+        },
+        SemanticRuleExpr::Ordered {
+            left,
+            right,
+            ordering,
+            comparison,
+        } => kernel_schema::SemanticRuleExpr::Ordered {
+            left: rule_value_to_kernel(left),
+            right: rule_value_to_kernel(right),
+            ordering: ordering.into(),
+            comparison: match comparison {
+                RuleOrderComparison::Less => kernel_schema::RuleOrderComparison::Less,
+                RuleOrderComparison::LessOrEqual => kernel_schema::RuleOrderComparison::LessOrEqual,
+                RuleOrderComparison::Greater => kernel_schema::RuleOrderComparison::Greater,
+                RuleOrderComparison::GreaterOrEqual => {
+                    kernel_schema::RuleOrderComparison::GreaterOrEqual
+                }
+            },
+        },
+    }
+}
+
+pub(crate) fn exact_aggregate_measure_to_kernel(
+    measure: ExactAggregateMeasureExpr,
+) -> kernel_schema::ExactAggregateMeasureExpr {
+    match measure {
+        ExactAggregateMeasureExpr::Count {
+            relation,
+            predicate,
+        } => kernel_schema::ExactAggregateMeasureExpr::Count {
+            relation: relation.into(),
+            predicate: semantic_rule_to_kernel(predicate),
+        },
+        ExactAggregateMeasureExpr::F64Sum {
+            relation,
+            column,
+            predicate,
+        } => kernel_schema::ExactAggregateMeasureExpr::F64Sum {
+            relation: relation.into(),
+            column: column.into(),
+            predicate: semantic_rule_to_kernel(predicate),
+        },
+        ExactAggregateMeasureExpr::OrderedStatistic {
+            relation,
+            column,
+            predicate,
+            ordering,
+            selector,
+        } => kernel_schema::ExactAggregateMeasureExpr::OrderedStatistic {
+            relation: relation.into(),
+            column: column.into(),
+            predicate: semantic_rule_to_kernel(predicate),
+            ordering: ordering.into(),
+            selector: match selector {
+                OrderedStatisticSelector::FromStart(rank) => {
+                    kernel_schema::OrderedStatisticSelector::FromStart(rank)
+                }
+                OrderedStatisticSelector::FromEnd(rank) => {
+                    kernel_schema::OrderedStatisticSelector::FromEnd(rank)
+                }
+                OrderedStatisticSelector::LowerQuantile {
+                    numerator,
+                    denominator,
+                } => kernel_schema::OrderedStatisticSelector::LowerQuantile {
+                    numerator,
+                    denominator,
+                },
+            },
+        },
+    }
+}
+
+pub(crate) fn ordered_statistic_bound_to_kernel(
+    value: OrderedStatisticBound,
+) -> kernel_schema::OrderedStatisticBound {
+    match value {
+        OrderedStatisticBound::Unit => kernel_schema::OrderedStatisticBound::Unit,
+        OrderedStatisticBound::Bool(value) => kernel_schema::OrderedStatisticBound::Bool(value),
+        OrderedStatisticBound::I64(value) => kernel_schema::OrderedStatisticBound::I64(value),
+        OrderedStatisticBound::F64Bits(value) => {
+            kernel_schema::OrderedStatisticBound::F64Bits(value)
+        }
+        OrderedStatisticBound::Text(value) => kernel_schema::OrderedStatisticBound::Text(value),
+        OrderedStatisticBound::HistoricalEntityRef(value) => {
+            kernel_schema::OrderedStatisticBound::HistoricalEntityId {
+                entity_type: value.entity_type.into(),
+                id: kernel_types::EntityId::new(value.id),
             }
         }
     }

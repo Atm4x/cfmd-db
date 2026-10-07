@@ -109,6 +109,20 @@ fn try_execute_typed_distinct(
             return Ok(Some((unique, selection.stats)));
         }
     }
+    if let Some(rows) = try_distinct_revision_semantic_batch(
+        &selection.program,
+        columns,
+        &selection.positions,
+        column_equivalences,
+        store,
+        env,
+        &mut selection.stats,
+    )? {
+        selection.stats.typed_stateful_batch_hits =
+            selection.stats.typed_stateful_batch_hits.saturating_add(1);
+        return Ok(Some((rows, selection.stats)));
+    }
+
     let mut seen = BTreeSet::<Vec<kernel_semantics::CanonicalEqKey>>::new();
     for position in selection.positions {
         let row = materialize_typed_batch_row(
@@ -126,6 +140,66 @@ fn try_execute_typed_distinct(
     selection.stats.typed_stateful_batch_hits =
         selection.stats.typed_stateful_batch_hits.saturating_add(1);
     Ok(Some((unique, selection.stats)))
+}
+
+fn try_distinct_revision_semantic_batch(
+    program: &TypedBatchProgram<'_>,
+    columns: &[NativeColumn],
+    positions: &[usize],
+    column_equivalences: &[SemanticId],
+    store: &PhysicalStore,
+    env: &StatefulBatchEnv<'_>,
+    stats: &mut ExecutionStats,
+) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
+    if program.columns.len() != column_equivalences.len()
+        || !program
+            .columns
+            .iter()
+            .copied()
+            .zip(column_equivalences.iter().copied())
+            .all(|(column, equivalence)| {
+                store
+                    .revision_semantic_column_distinct(
+                        program.relation,
+                        program.layout,
+                        column,
+                        equivalence,
+                        env.context,
+                        env.registry,
+                    )
+                    .is_some()
+            })
+    {
+        return Ok(None);
+    }
+
+    let mut seen = BTreeSet::<Vec<kernel_types::EqClassId>>::new();
+    let mut unique = Vec::new();
+    for &position in positions {
+        let row_id = program.installed.row_id_at(position)?;
+        let mut class = Vec::with_capacity(program.columns.len());
+        for (&physical_column, &equivalence) in
+            program.columns.iter().zip(column_equivalences.iter())
+        {
+            class.push(
+                store
+                    .revision_semantic_class_for_row(
+                        program.relation,
+                        program.layout,
+                        physical_column,
+                        equivalence,
+                        row_id,
+                    )
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?,
+            );
+        }
+        stats.values_read = stats.values_read.saturating_add(program.columns.len());
+        if seen.insert(class) {
+            unique.push(materialize_typed_batch_row(program, columns, position, stats)?);
+        }
+    }
+    stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+    Ok(Some(unique))
 }
 
 fn try_execute_typed_group(
@@ -147,6 +221,7 @@ fn try_execute_typed_group(
         columns,
         &selection.positions,
         spec,
+        store,
         env,
         &mut selection.stats,
     )?;
@@ -306,6 +381,7 @@ fn group_typed_batch_selection(
     columns: &[NativeColumn],
     positions: &[usize],
     spec: GroupBatchSpec<'_>,
+    store: &PhysicalStore,
     env: &StatefulBatchEnv<'_>,
     stats: &mut ExecutionStats,
 ) -> Result<Vec<kernel_query::Row>, PhysicalExecutionError> {
@@ -335,6 +411,20 @@ fn group_typed_batch_selection(
         ),
         AggregateSpec::Count { .. } => None,
     };
+
+    if let Some(rows) = try_group_revision_semantic_batch(
+        program,
+        columns,
+        positions,
+        &physical_group_columns,
+        physical_sum_column,
+        spec,
+        store,
+        env,
+        stats,
+    )? {
+        return Ok(rows);
+    }
 
     let mut groups: Vec<(Vec<Value>, TypedGroupState)> = Vec::new();
     let mut group_by_class = BTreeMap::<Vec<kernel_semantics::CanonicalEqKey>, usize>::new();
@@ -386,6 +476,102 @@ fn group_typed_batch_selection(
         }
     }
     finish_typed_groups(groups)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_group_revision_semantic_batch(
+    program: &TypedBatchProgram<'_>,
+    columns: &[NativeColumn],
+    positions: &[usize],
+    physical_group_columns: &[usize],
+    physical_sum_column: Option<usize>,
+    spec: GroupBatchSpec<'_>,
+    store: &PhysicalStore,
+    env: &StatefulBatchEnv<'_>,
+    stats: &mut ExecutionStats,
+) -> Result<Option<Vec<kernel_query::Row>>, PhysicalExecutionError> {
+    if physical_group_columns.is_empty()
+        || physical_group_columns.len() != spec.group_equivalences.len()
+        || !physical_group_columns
+            .iter()
+            .copied()
+            .zip(spec.group_equivalences.iter().copied())
+            .all(|(column, equivalence)| {
+                store
+                    .revision_semantic_column_distinct(
+                        program.relation,
+                        program.layout,
+                        column,
+                        equivalence,
+                        env.context,
+                        env.registry,
+                    )
+                    .is_some()
+            })
+    {
+        return Ok(None);
+    }
+
+    let mut group_by_class = BTreeMap::<Vec<kernel_types::EqClassId>, usize>::new();
+    let mut groups: Vec<(Vec<Value>, TypedGroupState)> = Vec::new();
+    for &position in positions {
+        let row_id = program.installed.row_id_at(position)?;
+        let mut class = Vec::with_capacity(physical_group_columns.len());
+        for (&physical_column, &equivalence) in physical_group_columns
+            .iter()
+            .zip(spec.group_equivalences)
+        {
+            class.push(
+                store
+                    .revision_semantic_class_for_row(
+                        program.relation,
+                        program.layout,
+                        physical_column,
+                        equivalence,
+                        row_id,
+                    )
+                    .ok_or(RelQueryError::InconsistentIncrementalDelta)?,
+            );
+        }
+        stats.values_read = stats
+            .values_read
+            .saturating_add(physical_group_columns.len());
+        let index = if let Some(index) = group_by_class.get(&class).copied() {
+            index
+        } else {
+            let mut representative = Vec::with_capacity(physical_group_columns.len());
+            for &physical_column in physical_group_columns {
+                representative.push(
+                    columns
+                        .get(physical_column)
+                        .ok_or(RelQueryError::ColumnOutOfBounds)?
+                        .value_at(position),
+                );
+            }
+            let index = groups.len();
+            group_by_class.insert(class, index);
+            groups.push((representative, new_typed_group_state(spec.aggregate)));
+            index
+        };
+        match (&mut groups[index].1, spec.aggregate) {
+            (TypedGroupState::Count(count), AggregateSpec::Count { .. }) => count.add_one(),
+            (TypedGroupState::ExactF64Sum(sum), AggregateSpec::ExactF64Sum { .. }) => {
+                let physical_column =
+                    physical_sum_column.ok_or(RelQueryError::ColumnOutOfBounds)?;
+                let Some(NativeColumn::F64Bits(values)) = columns.get(physical_column) else {
+                    return Err(PhysicalExecutionError::PhysicalTypeMismatch);
+                };
+                let bits = *values
+                    .get(position)
+                    .ok_or(PhysicalExecutionError::ColumnShapeMismatch)?;
+                stats.values_read = stats.values_read.saturating_add(1);
+                sum.add(f64::from_bits(bits)).map_err(RelQueryError::from)?;
+            }
+            _ => return Err(RelQueryError::TypeMismatch.into()),
+        }
+    }
+    stats.persisted_index_hits = stats.persisted_index_hits.saturating_add(1);
+    finish_typed_groups(groups).map(Some)
 }
 
 fn top_k_typed_batch_selection(

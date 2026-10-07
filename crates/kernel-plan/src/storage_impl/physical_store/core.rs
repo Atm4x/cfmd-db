@@ -34,7 +34,7 @@ impl PhysicalStore {
             for binding in self.semantic_quotient_factors.keys() {
                 register(
                     (binding.relation, binding.layout.id),
-                    DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticQuotientFactor(
+                    DerivedArtifactTarget::Artifact(UnifiedArtifactId::semantic_quotient(
                         binding.clone(),
                     )),
                 );
@@ -42,7 +42,7 @@ impl PhysicalStore {
             for binding in self.semantic_statistics.keys() {
                 register(
                     (binding.relation, binding.layout.id),
-                    DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticStatistics(
+                    DerivedArtifactTarget::Artifact(UnifiedArtifactId::semantic_cardinality(
                         binding.clone(),
                     )),
                 );
@@ -50,7 +50,7 @@ impl PhysicalStore {
             for binding in self.observable_atom_states.keys() {
                 register(
                     (binding.relation, binding.layout.id),
-                    DerivedArtifactTarget::Artifact(UnifiedArtifactId::ObservableAtom(
+                    DerivedArtifactTarget::Artifact(UnifiedArtifactId::semantic_observable(
                         binding.clone(),
                     )),
                 );

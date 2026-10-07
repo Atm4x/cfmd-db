@@ -135,9 +135,9 @@ impl<T: Clone + Ord> SetChange<T> {
         self.inserted.is_empty() && self.removed.is_empty()
     }
 
-    /// Compatibility adapter. This adapter is only for exact Rust-ordered
-    /// sets; Γ-class-aware collections must construct their endpoint through
-    /// the pinned semantic module before creating `FineChange`.
+    /// Test convenience for exact Rust-ordered sets. Γ-class-aware production
+    /// collections construct endpoints through their pinned semantic module.
+    #[cfg(test)]
     #[must_use]
     pub fn into_fine(&self, old: &BTreeSet<T>) -> FineChange<BTreeSet<T>> {
         FineChange::new(FineChangeKind::Set, self.apply(old))
@@ -177,6 +177,7 @@ impl<T: Clone> SeqSplice<T> {
         Ok(next)
     }
 
+    #[cfg(test)]
     pub fn into_fine(&self, old: &[T]) -> Result<FineChange<Vec<T>>, SeqChangeError> {
         Ok(FineChange::new(FineChangeKind::Seq, self.apply(old)?))
     }

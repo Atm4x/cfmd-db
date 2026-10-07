@@ -6,17 +6,18 @@ use super::{
     PhysicalArtifactMemoryReport, PhysicalCapability, PhysicalExecutionError,
     PhysicalPressurePolicy, PhysicalPressureSample, PhysicalRecoveryPolicy, PhysicalRecoveryReport,
     PhysicalRowId, PhysicalWorkEstimate, Plan, RelQueryError, RelType, RelationDelta,
-    ResourceFootprint, RevisionId, SemanticAccessCostModel, SemanticId, SemanticIndexBinding,
-    SemanticIndexKeyPart, SemanticIndexWorkloadSample, SemanticQuotientFactorAdvisorReport,
-    SemanticQuotientFactorWorkloadSample, StorageResolvedRelationDelta, UnifiedAdvisorPolicy,
-    UnifiedAdvisorTelemetry, UnifiedArtifactId, UnifiedObservableAdvisorReport, Value, advisor,
-    installed_relation_estimated_retained_bytes, saturating_usize_sum,
+    ResourceFootprint, RevisionId, SemanticAccessCostModel, SemanticFiberProfile, SemanticId,
+    SemanticIndexBinding, SemanticIndexKeyPart, SemanticIndexWorkloadSample,
+    SemanticQuotientFactorAdvisorReport, SemanticQuotientFactorWorkloadSample,
+    StorageResolvedRelationDelta, UnifiedAdvisorPolicy, UnifiedAdvisorTelemetry, UnifiedArtifactId,
+    UnifiedObservableAdvisorReport, Value, advisor, installed_relation_estimated_retained_bytes,
+    saturating_usize_sum,
 };
 use crate::filter_shape::collect_direct_filter_chain;
 use crate::join_shape::direct_join_advice_summary;
 use crate::native_relation::{
-    materialize_native_row, native_i64_column, native_row_count, validate_indexable_i64_relation,
-    validate_native_row,
+    materialize_native_row, native_i64_column, native_row_count, native_value_at,
+    validate_indexable_i64_relation, validate_native_row,
 };
 use crate::physical_delta::PhysicalRelationDelta;
 use crate::recovery::{
@@ -35,6 +36,7 @@ use crate::semantic_quotient_store::SemanticQuotientStoreView;
 use crate::semantic_rows::semantic_rows_equal;
 include!("storage_impl/derived_artifact.rs");
 include!("storage_impl/physical_store_types.rs");
+include!("storage_impl/relation_semantic_encoding.rs");
 include!("storage_impl/recovery_types.rs");
 include!("storage_impl/physical_store.rs");
 include!("storage_impl/physical_indexes.rs");

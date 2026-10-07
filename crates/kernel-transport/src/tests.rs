@@ -1387,6 +1387,21 @@ fn schema_migration_row_rewrite_changes_relation_column_type_without_host_callba
     )
     .unwrap();
 
+    assert_eq!(
+        migration
+            .classify_observation_relation_transport_exact(relation)
+            .unwrap(),
+        ObservationRelationTransport::RowLocalStateTransform {
+            target_relation: relation,
+        }
+    );
+    assert_eq!(
+        migration
+            .transport_observation_relation_identity_exact(relation)
+            .unwrap_err(),
+        TransportError::UnrepresentableObservationRelation(relation)
+    );
+
     let source_type = RelExpr::Scan(relation)
         .typecheck(&source, &registry)
         .unwrap();
@@ -1883,5 +1898,530 @@ fn migration_write_authority_footprint_fans_out_and_fails_closed_for_global_rewr
             &BTreeSet::from([source_column]),
         ),
         Err(TransportError::MigrationSliceNotRowLocal(global_target))
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete bridge read/write proof fixture together."
+)]
+fn schema_bridge_compiles_row_identity_read_and_exact_relation_intent_to_target_world() {
+    let source_relation = SemanticId::new(32_000);
+    let target_relation = SemanticId::new(32_001);
+    let source_column = SemanticId::new(32_010);
+    let target_column = SemanticId::new(32_011);
+    let equality = SemanticId::new(32_020);
+
+    let mut registry = SemanticRegistry::default();
+    let equality_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(32_100));
+    source_schema
+        .define_relation_with_column_ids(
+            kernel_schema::RelationDef {
+                id: source_relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: kernel_schema::RelationSemantics::Set {
+                    column_equivalences: vec![equality],
+                },
+            },
+            vec![source_column],
+        )
+        .unwrap();
+    let mut source_environment = SemanticEnvironment::new(SemanticEnvId::new(32_200));
+    source_environment.pin_module(equality, equality_digest);
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: source_environment,
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(32_101));
+    target_schema
+        .define_relation_with_column_ids(
+            kernel_schema::RelationDef {
+                id: target_relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: kernel_schema::RelationSemantics::Set {
+                    column_equivalences: vec![equality],
+                },
+            },
+            vec![target_column],
+        )
+        .unwrap();
+    let mut target_environment = SemanticEnvironment::new(SemanticEnvId::new(32_200));
+    target_environment.pin_module(equality, equality_digest);
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: target_environment,
+    };
+
+    let program = SchemaMigrationProgram::new(
+        target.clone(),
+        vec![],
+        vec![MigrationRelationRewrite::Rows(MigrationRowRewrite {
+            source_relation,
+            target_relation,
+            columns: vec![MigrationColumnRewrite {
+                source_columns: vec![source_column],
+                target_column,
+                transform: ExactQuery::new(kernel_query::Expr::ProductField {
+                    input: Box::new(kernel_query::Expr::Input),
+                    field: source_column,
+                }),
+            }],
+        })],
+    );
+    let bridge = SchemaBridge::verify(&program, &source, &registry).unwrap();
+    let source_query = RelExpr::FilterEqConst {
+        input: Box::new(RelExpr::Scan(source_relation)),
+        column: 0,
+        value: kernel_model::Value::I64(7),
+        equivalence: equality,
+    };
+    let bridged = bridge.compile_read_exact(&source_query, &registry).unwrap();
+    assert_eq!(
+        bridged,
+        RelExpr::FilterEqConst {
+            input: Box::new(RelExpr::Scan(target_relation)),
+            column: 0,
+            value: kernel_model::Value::I64(7),
+            equivalence: equality,
+        }
+    );
+
+    let source_type = RelExpr::Scan(source_relation)
+        .typecheck(&source, &registry)
+        .unwrap();
+    let transported = bridge
+        .transport_relation_delta_exact(
+            source_relation,
+            &RelationDelta {
+                inserted: vec![vec![kernel_model::Value::I64(8)]],
+                removed: vec![vec![kernel_model::Value::I64(7)]],
+                result_type: source_type,
+            },
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(transported.len(), 1);
+    assert_eq!(transported[0].0, target_relation);
+    assert_eq!(
+        transported[0].1.inserted,
+        vec![vec![kernel_model::Value::I64(8)]]
+    );
+    assert_eq!(
+        transported[0].1.removed,
+        vec![vec![kernel_model::Value::I64(7)]]
+    );
+    assert_eq!(
+        bridge
+            .transport_relation_write_footprint_exact(
+                source_relation,
+                &BTreeSet::from([source_column]),
+            )
+            .unwrap(),
+        vec![MigrationRelationWriteFootprint {
+            target_relation,
+            target_columns: BTreeSet::from([target_column]),
+        }]
+    );
+}
+
+#[test]
+fn schema_bridge_transports_owned_relationship_only_with_exact_orphan_policy() {
+    let source_relation = SemanticId::new(32_500);
+    let target_relation = SemanticId::new(32_501);
+    let source_column = SemanticId::new(32_510);
+    let target_column = SemanticId::new(32_511);
+    let equality = SemanticId::new(32_520);
+    let mut registry = SemanticRegistry::default();
+    let digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+
+    let context = |revision, relation, column, policy| {
+        let mut schema = Schema::new(SchemaRevisionId::new(revision));
+        schema
+            .define_relation_with_column_ids(
+                kernel_schema::RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                    semantics: kernel_schema::RelationSemantics::Set {
+                        column_equivalences: vec![equality],
+                    },
+                },
+                vec![column],
+            )
+            .unwrap();
+        schema
+            .define_owned_relationship(kernel_schema::OwnedRelationshipDef {
+                relation,
+                target_relation: relation,
+                orphan_policy: policy,
+            })
+            .unwrap();
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(32_600));
+        environment.pin_module(equality, digest);
+        SemanticContext {
+            schema,
+            environment,
+        }
+    };
+    let source = context(
+        32_700,
+        source_relation,
+        source_column,
+        kernel_schema::OrphanPolicyDef::Keep,
+    );
+    let target = context(
+        32_701,
+        target_relation,
+        target_column,
+        kernel_schema::OrphanPolicyDef::Keep,
+    );
+    let program = SchemaMigrationProgram::new(
+        target,
+        vec![],
+        vec![MigrationRelationRewrite::Rows(MigrationRowRewrite {
+            source_relation,
+            target_relation,
+            columns: vec![MigrationColumnRewrite {
+                source_columns: vec![source_column],
+                target_column,
+                transform: ExactQuery::new(kernel_query::Expr::ProductField {
+                    input: Box::new(kernel_query::Expr::Input),
+                    field: source_column,
+                }),
+            }],
+        })],
+    );
+    let bridge = SchemaBridge::verify(&program, &source, &registry).unwrap();
+    assert_eq!(
+        bridge
+            .transport_owned_relationship_exact(source_relation)
+            .unwrap()
+            .relation,
+        target_relation
+    );
+
+    let changed = context(
+        32_702,
+        target_relation,
+        target_column,
+        kernel_schema::OrphanPolicyDef::DeleteIfUnowned,
+    );
+    let changed_program =
+        SchemaMigrationProgram::new(changed, vec![], program.relation_rewrites().to_vec());
+    let changed_bridge = SchemaBridge::verify(&changed_program, &source, &registry).unwrap();
+    assert_eq!(
+        changed_bridge.transport_owned_relationship_exact(source_relation),
+        Err(TransportError::UnrepresentableOwnedRelationship(
+            source_relation
+        ))
+    );
+}
+
+#[test]
+#[allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "Keep the complete value-changing read/declassification proof fixture together."
+)]
+fn schema_bridge_rejects_value_changing_read_even_when_exact_delta_transport_exists() {
+    let relation = SemanticId::new(33_000);
+    let source_column = SemanticId::new(33_010);
+    let target_column = SemanticId::new(33_011);
+    let eq_i64 = SemanticId::new(33_020);
+    let eq_f64 = SemanticId::new(33_021);
+    let capability = SemanticId::new(33_030);
+    let role = SemanticId::new(33_031);
+    let mut registry = SemanticRegistry::default();
+    let i64_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+    let f64_digest = registry.install_equivalence(EquivalenceModule::F64Bitwise);
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(33_100));
+    source_schema
+        .define_relation_with_column_ids(
+            kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: kernel_schema::RelationSemantics::Set {
+                    column_equivalences: vec![eq_i64],
+                },
+            },
+            vec![source_column],
+        )
+        .unwrap();
+    source_schema
+        .set_schema_access(kernel_schema::SchemaAccess {
+            capabilities: BTreeMap::from([(
+                capability,
+                kernel_schema::AccessCapabilityDef {
+                    id: capability,
+                    permissions: BTreeSet::from([
+                        kernel_schema::PermissionCoordinate::ReadRelation { relation },
+                    ]),
+                },
+            )]),
+            roles: BTreeMap::from([(
+                role,
+                kernel_schema::AccessRoleDef {
+                    id: role,
+                    capabilities: BTreeSet::from([capability]),
+                    includes: BTreeSet::new(),
+                },
+            )]),
+        })
+        .unwrap();
+    let mut source_environment = SemanticEnvironment::new(SemanticEnvId::new(33_200));
+    source_environment.pin_module(eq_i64, i64_digest);
+    source_environment.pin_module(eq_f64, f64_digest);
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: source_environment,
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(33_101));
+    target_schema
+        .define_relation_with_column_ids(
+            kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::F64)],
+                semantics: kernel_schema::RelationSemantics::Set {
+                    column_equivalences: vec![eq_f64],
+                },
+            },
+            vec![target_column],
+        )
+        .unwrap();
+    target_schema
+        .set_schema_access(source.schema.schema_access().clone())
+        .unwrap();
+    let mut target_environment = SemanticEnvironment::new(SemanticEnvId::new(33_200));
+    target_environment.pin_module(eq_i64, i64_digest);
+    target_environment.pin_module(eq_f64, f64_digest);
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: target_environment,
+    };
+
+    let program = SchemaMigrationProgram::new(
+        target,
+        vec![],
+        vec![MigrationRelationRewrite::Rows(MigrationRowRewrite {
+            source_relation: relation,
+            target_relation: relation,
+            columns: vec![MigrationColumnRewrite {
+                source_columns: vec![source_column],
+                target_column,
+                transform: ExactQuery::new(kernel_query::Expr::I64ToF64(Box::new(
+                    kernel_query::Expr::ProductField {
+                        input: Box::new(kernel_query::Expr::Input),
+                        field: source_column,
+                    },
+                ))),
+            }],
+        })],
+    );
+    let transport = program.verify(&source, &registry).unwrap();
+    let certification = transport.certify_access_noninterference();
+    assert_eq!(certification.declassification_edges().len(), 1);
+    assert_eq!(certification.declassification_edges()[0].role(), role);
+    assert_eq!(
+        certification.declassification_edges()[0].target(),
+        kernel_schema::PermissionCoordinate::ReadRelation { relation }
+    );
+    let bridge = SchemaBridge::verify(&program, &source, &registry).unwrap();
+    assert_eq!(
+        bridge.compile_read_exact(&RelExpr::Scan(relation), &registry),
+        Err(TransportError::UnrepresentableReadRelation(relation))
+    );
+}
+
+#[test]
+fn schema_migration_requires_exact_schema_owned_access_preservation() {
+    let relation = SemanticId::new(54_600);
+    let equality = SemanticId::new(54_601);
+    let capability = SemanticId::new(54_602);
+    let role = SemanticId::new(54_603);
+    let mut registry = SemanticRegistry::default();
+    let equality_digest = registry.install_equivalence(EquivalenceModule::I64Exact);
+
+    let build_context = |revision: u64, write: bool, include_capability: bool| {
+        let mut schema = Schema::new(SchemaRevisionId::new(revision));
+        schema
+            .define_relation(kernel_schema::RelationDef {
+                id: relation,
+                columns: vec![TypeExpr::Scalar(ScalarType::I64)],
+                semantics: kernel_schema::RelationSemantics::Set {
+                    column_equivalences: vec![equality],
+                },
+            })
+            .unwrap();
+        let mut permissions =
+            BTreeSet::from([kernel_schema::PermissionCoordinate::ReadRelation { relation }]);
+        if write {
+            permissions.insert(kernel_schema::PermissionCoordinate::WriteRelation { relation });
+        }
+        let role_capabilities = if include_capability {
+            BTreeSet::from([capability])
+        } else {
+            BTreeSet::new()
+        };
+        schema
+            .set_schema_access(kernel_schema::SchemaAccess {
+                capabilities: BTreeMap::from([(
+                    capability,
+                    kernel_schema::AccessCapabilityDef {
+                        id: capability,
+                        permissions,
+                    },
+                )]),
+                roles: BTreeMap::from([(
+                    role,
+                    kernel_schema::AccessRoleDef {
+                        id: role,
+                        capabilities: role_capabilities,
+                        includes: BTreeSet::new(),
+                    },
+                )]),
+            })
+            .unwrap();
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(54_600));
+        environment.pin_module(equality, equality_digest);
+        SemanticContext {
+            schema,
+            environment,
+        }
+    };
+
+    let source = build_context(54_600, false, true);
+    let exact_target = build_context(54_601, false, true);
+    let exact = SchemaMigrationProgram::new(exact_target, vec![], vec![]);
+    let exact_transport = exact.verify(&source, &registry).unwrap();
+    assert!(
+        exact_transport
+            .certify_access_noninterference()
+            .is_noninterfering()
+    );
+
+    let widened_target = build_context(54_602, true, true);
+    let widened = SchemaMigrationProgram::new(widened_target, vec![], vec![]);
+    let widened_transport = widened.verify(&source, &registry).unwrap();
+    assert_eq!(widened_transport.access_policy_changes().len(), 1);
+    assert_eq!(
+        widened_transport.access_policy_changes()[0].kind(),
+        AccessPolicyChangeKind::CapabilityWidened
+    );
+    assert_eq!(
+        widened_transport.access_policy_changes()[0].affected_roles(),
+        &BTreeSet::from([role])
+    );
+    assert!(
+        widened_transport
+            .certify_access_noninterference()
+            .is_noninterfering(),
+        "adding write authority is an access-policy change, not data declassification"
+    );
+
+    let changed_role_target = build_context(54_603, false, false);
+    let changed_role = SchemaMigrationProgram::new(changed_role_target, vec![], vec![]);
+    let role_transport = changed_role.verify(&source, &registry).unwrap();
+    assert_eq!(
+        role_transport.access_policy_changes()[0].kind(),
+        AccessPolicyChangeKind::RoleNarrowed
+    );
+}
+
+#[test]
+fn schema_migration_widens_sum_by_stable_variant_identity_without_rewriting_value() {
+    let entity_type = SemanticId::new(9_800);
+    let field = SemanticId::new(9_801);
+    let idle = SemanticId::new(9_802);
+    let running = SemanticId::new(9_803);
+    let entity = kernel_types::EntityId::new(77);
+    let registry = SemanticRegistry::default();
+
+    let source_variants = BTreeMap::from([(idle, TypeExpr::Scalar(ScalarType::Unit))]);
+    let target_variants = BTreeMap::from([
+        (idle, TypeExpr::Scalar(ScalarType::Unit)),
+        (running, TypeExpr::Scalar(ScalarType::Unit)),
+    ]);
+
+    let mut source_schema = Schema::new(SchemaRevisionId::new(9_800));
+    source_schema
+        .define_field(FieldDef {
+            id: field,
+            owner: entity_type,
+            value: TypeExpr::Sum(source_variants),
+        })
+        .unwrap();
+    let source = SemanticContext {
+        schema: source_schema,
+        environment: SemanticEnvironment::new(SemanticEnvId::new(9_800)),
+    };
+
+    let mut target_schema = Schema::new(SchemaRevisionId::new(9_801));
+    target_schema
+        .define_field(FieldDef {
+            id: field,
+            owner: entity_type,
+            value: TypeExpr::Sum(target_variants.clone()),
+        })
+        .unwrap();
+    let target = SemanticContext {
+        schema: target_schema,
+        environment: SemanticEnvironment::new(SemanticEnvId::new(9_800)),
+    };
+
+    let transform = ExactQuery::new(kernel_query::Expr::WidenSum {
+        input: Box::new(kernel_query::Expr::ProductField {
+            input: Box::new(kernel_query::Expr::Input),
+            field,
+        }),
+        target_variants,
+    });
+    let migration = SchemaMigrationTransport::verify(
+        &source,
+        &target,
+        &registry,
+        vec![MigrationFieldRewrite {
+            source_fields: vec![field],
+            target_field: field,
+            transform,
+        }],
+        vec![],
+    )
+    .unwrap();
+
+    let value = kernel_model::Value::Variant {
+        tag: idle,
+        value: Box::new(kernel_model::Value::Unit),
+    };
+    let mut state = DatabaseState::default();
+    state.lifecycle.entities.insert(entity);
+    state.lifecycle.roots.insert(entity);
+    state
+        .model
+        .carriers
+        .insert(entity_type, BTreeSet::from([entity]));
+    state.model.fields.insert((field, entity), value.clone());
+    let source_revision = kernel_revision::Revision::build(
+        kernel_types::RevisionId::new(9_800),
+        &source,
+        &registry,
+        state,
+    )
+    .unwrap();
+    let target_revision = migration
+        .transport_revision(
+            &source_revision,
+            kernel_types::RevisionId::new(9_801),
+            &registry,
+        )
+        .unwrap();
+
+    assert_eq!(
+        target_revision.state().model.fields[&(field, entity)],
+        value
     );
 }

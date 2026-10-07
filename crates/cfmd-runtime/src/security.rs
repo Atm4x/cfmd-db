@@ -14,6 +14,12 @@ pub(crate) struct PublicationAuthorityFootprint {
     pub(crate) relation_writes: BTreeSet<RelationId>,
     pub(crate) field_writes: BTreeSet<(RelationId, RelationColumnId)>,
     pub(crate) actions: BTreeSet<(RelationId, crate::plan::MutationAction)>,
+    pub(crate) carrier_presence: BTreeSet<crate::ModelSemanticId>,
+    pub(crate) carrier_members: BTreeSet<(crate::ModelSemanticId, crate::ModelEntityId)>,
+    pub(crate) lifecycle_entities: BTreeSet<crate::ModelEntityId>,
+    pub(crate) lifecycle_roots: BTreeSet<crate::ModelEntityId>,
+    pub(crate) keeps_alive_presence: BTreeSet<crate::ModelEntityId>,
+    pub(crate) keeps_alive_edges: BTreeSet<(crate::ModelEntityId, crate::ModelEntityId)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,7 +40,6 @@ impl PrincipalId {
 #[non_exhaustive]
 pub enum Permission {
     ModelRead,
-    SchemaMigrate,
     Read,
     ReadRelation(RelationId),
     ReadField {
@@ -55,43 +60,440 @@ pub enum Permission {
     AttachRelationship(RelationId),
     DetachRelationship(RelationId),
     MoveRelationship(RelationId),
+    WriteCarrierPresence(crate::ModelSemanticId),
+    WriteCarrierMember {
+        carrier: crate::ModelSemanticId,
+        member: crate::ModelEntityId,
+    },
+    WriteLifecycleEntity(crate::ModelEntityId),
+    WriteLifecycleRoot(crate::ModelEntityId),
+    WriteKeepsAlivePresence(crate::ModelEntityId),
+    WriteKeepsAliveEdge {
+        parent: crate::ModelEntityId,
+        child: crate::ModelEntityId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PermissionCoordinate {
+    ModelRead,
+    ReadRelation(RelationId),
+    ReadField {
+        relation: RelationId,
+        field: RelationColumnId,
+    },
+    HistoricalRead,
+    HistoryRead,
+    Watch,
+    WriteRelation(RelationId),
+    WriteField {
+        relation: RelationId,
+        field: RelationColumnId,
+    },
+    CreateObject(RelationId),
+    DeleteObject(RelationId),
+    AttachRelationship(RelationId),
+    DetachRelationship(RelationId),
+    MoveRelationship(RelationId),
+    WriteCarrierPresence(crate::ModelSemanticId),
+    WriteCarrierMember {
+        carrier: crate::ModelSemanticId,
+        member: crate::ModelEntityId,
+    },
+    WriteLifecycleEntity(crate::ModelEntityId),
+    WriteLifecycleRoot(crate::ModelEntityId),
+    WriteKeepsAlivePresence(crate::ModelEntityId),
+    WriteKeepsAliveEdge {
+        parent: crate::ModelEntityId,
+        child: crate::ModelEntityId,
+    },
+}
+
+impl PermissionCoordinate {
+    #[must_use]
+    pub const fn into_permission(self) -> Permission {
+        match self {
+            Self::ModelRead => Permission::ModelRead,
+            Self::ReadRelation(relation) => Permission::ReadRelation(relation),
+            Self::ReadField { relation, field } => Permission::ReadField { relation, field },
+            Self::HistoricalRead => Permission::HistoricalRead,
+            Self::HistoryRead => Permission::HistoryRead,
+            Self::Watch => Permission::Watch,
+            Self::WriteRelation(relation) => Permission::WriteRelation(relation),
+            Self::WriteField { relation, field } => Permission::WriteField { relation, field },
+            Self::CreateObject(relation) => Permission::CreateObject(relation),
+            Self::DeleteObject(relation) => Permission::DeleteObject(relation),
+            Self::AttachRelationship(relation) => Permission::AttachRelationship(relation),
+            Self::DetachRelationship(relation) => Permission::DetachRelationship(relation),
+            Self::MoveRelationship(relation) => Permission::MoveRelationship(relation),
+            Self::WriteCarrierPresence(carrier) => Permission::WriteCarrierPresence(carrier),
+            Self::WriteCarrierMember { carrier, member } => {
+                Permission::WriteCarrierMember { carrier, member }
+            }
+            Self::WriteLifecycleEntity(entity) => Permission::WriteLifecycleEntity(entity),
+            Self::WriteLifecycleRoot(entity) => Permission::WriteLifecycleRoot(entity),
+            Self::WriteKeepsAlivePresence(parent) => Permission::WriteKeepsAlivePresence(parent),
+            Self::WriteKeepsAliveEdge { parent, child } => {
+                Permission::WriteKeepsAliveEdge { parent, child }
+            }
+        }
+    }
+}
+
+impl crate::AccessCapabilityId {
+    #[must_use]
+    pub const fn from_key(key: &str) -> Self {
+        Self::new(crate::object::__semantic_id(
+            "cfmd.authorization.capability.v1",
+            key,
+            "",
+        ))
+    }
+}
+
+impl crate::RoleId {
+    #[must_use]
+    pub const fn from_key(key: &str) -> Self {
+        Self::new(crate::object::__semantic_id(
+            "cfmd.authorization.role.v1",
+            key,
+            "",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Role {
-    name: String,
-    permissions: PermissionSet,
+pub struct AccessCapability {
+    id: crate::AccessCapabilityId,
+    permissions: BTreeSet<PermissionCoordinate>,
 }
 
-impl Role {
+impl AccessCapability {
     #[must_use]
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(key: &str) -> Self {
         Self {
-            name: name.into(),
-            permissions: PermissionSet::new(),
+            id: crate::AccessCapabilityId::from_key(key),
+            permissions: BTreeSet::new(),
         }
     }
 
     #[must_use]
-    pub fn grant(mut self, permission: Permission) -> Self {
-        self.permissions.0.insert(permission);
+    pub const fn id(&self) -> crate::AccessCapabilityId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn grant(mut self, permission: PermissionCoordinate) -> Self {
+        self.permissions.insert(permission);
+        self
+    }
+
+    /// Grants exact authority to inspect the authoritative semantic model.
+    #[must_use]
+    pub fn model_read(self) -> Self {
+        self.grant(PermissionCoordinate::ModelRead)
+    }
+
+    /// Grants exact historical-revision materialization authority.
+    #[must_use]
+    pub fn historical_read(self) -> Self {
+        self.grant(PermissionCoordinate::HistoricalRead)
+    }
+
+    /// Grants exact history-log read authority.
+    #[must_use]
+    pub fn history_read(self) -> Self {
+        self.grant(PermissionCoordinate::HistoryRead)
+    }
+
+    /// Grants exact subscription/watch authority.
+    #[must_use]
+    pub fn watch(self) -> Self {
+        self.grant(PermissionCoordinate::Watch)
+    }
+
+    pub fn permissions(&self) -> impl Iterator<Item = PermissionCoordinate> + '_ {
+        self.permissions.iter().copied()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SchemaAccess {
+    capabilities: Vec<AccessCapability>,
+    roles: Vec<Role>,
+}
+
+impl SchemaAccess {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            capabilities: Vec::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn capability(mut self, capability: AccessCapability) -> Self {
+        self.capabilities.push(capability);
         self
     }
 
     #[must_use]
-    pub fn grants(mut self, permissions: impl IntoIterator<Item = Permission>) -> Self {
-        self.permissions.0.extend(permissions);
+    pub fn role(mut self, role: Role) -> Self {
+        self.roles.push(role);
+        self
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<AccessCapability>, Vec<Role>) {
+        (self.capabilities, self.roles)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Role {
+    id: crate::RoleId,
+    capabilities: BTreeSet<crate::AccessCapabilityId>,
+    includes: BTreeSet<crate::RoleId>,
+}
+
+impl Role {
+    #[must_use]
+    pub fn new(key: &str) -> Self {
+        Self {
+            id: crate::RoleId::from_key(key),
+            capabilities: BTreeSet::new(),
+            includes: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> crate::RoleId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn capability(mut self, capability: &AccessCapability) -> Self {
+        self.capabilities.insert(capability.id());
         self
     }
 
     #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn include(mut self, role: &Self) -> Self {
+        self.includes.insert(role.id());
+        self
     }
 
-    #[must_use]
-    pub const fn permissions(&self) -> &PermissionSet {
-        &self.permissions
+    pub fn capabilities(&self) -> impl Iterator<Item = crate::AccessCapabilityId> + '_ {
+        self.capabilities.iter().copied()
+    }
+
+    pub fn includes(&self) -> impl Iterator<Item = crate::RoleId> + '_ {
+        self.includes.iter().copied()
+    }
+}
+
+pub(crate) fn permission_coordinate_to_kernel(
+    permission: PermissionCoordinate,
+) -> kernel_schema::PermissionCoordinate {
+    match permission {
+        PermissionCoordinate::ModelRead => kernel_schema::PermissionCoordinate::ModelRead,
+        PermissionCoordinate::ReadRelation(relation) => {
+            kernel_schema::PermissionCoordinate::ReadRelation {
+                relation: relation.into(),
+            }
+        }
+        PermissionCoordinate::ReadField { relation, field } => {
+            kernel_schema::PermissionCoordinate::ReadField {
+                relation: relation.into(),
+                column: field.into(),
+            }
+        }
+        PermissionCoordinate::HistoricalRead => kernel_schema::PermissionCoordinate::HistoricalRead,
+        PermissionCoordinate::HistoryRead => kernel_schema::PermissionCoordinate::HistoryRead,
+        PermissionCoordinate::Watch => kernel_schema::PermissionCoordinate::Watch,
+        PermissionCoordinate::WriteRelation(relation) => {
+            kernel_schema::PermissionCoordinate::WriteRelation {
+                relation: relation.into(),
+            }
+        }
+        PermissionCoordinate::WriteField { relation, field } => {
+            kernel_schema::PermissionCoordinate::WriteField {
+                relation: relation.into(),
+                column: field.into(),
+            }
+        }
+        PermissionCoordinate::CreateObject(relation) => {
+            kernel_schema::PermissionCoordinate::CreateObject {
+                relation: relation.into(),
+            }
+        }
+        PermissionCoordinate::DeleteObject(relation) => {
+            kernel_schema::PermissionCoordinate::DeleteObject {
+                relation: relation.into(),
+            }
+        }
+        PermissionCoordinate::AttachRelationship(relation) => {
+            kernel_schema::PermissionCoordinate::AttachRelationship {
+                relation: relation.into(),
+            }
+        }
+        PermissionCoordinate::DetachRelationship(relation) => {
+            kernel_schema::PermissionCoordinate::DetachRelationship {
+                relation: relation.into(),
+            }
+        }
+        PermissionCoordinate::MoveRelationship(relation) => {
+            kernel_schema::PermissionCoordinate::MoveRelationship {
+                relation: relation.into(),
+            }
+        }
+        PermissionCoordinate::WriteCarrierPresence(carrier) => {
+            kernel_schema::PermissionCoordinate::WriteCarrierPresence {
+                carrier: kernel_types::SemanticId::new(carrier.raw()),
+            }
+        }
+        PermissionCoordinate::WriteCarrierMember { carrier, member } => {
+            kernel_schema::PermissionCoordinate::WriteCarrierMember {
+                carrier: kernel_types::SemanticId::new(carrier.raw()),
+                member: kernel_types::SemanticId::new(member.raw()),
+            }
+        }
+        PermissionCoordinate::WriteLifecycleEntity(entity) => {
+            kernel_schema::PermissionCoordinate::WriteLifecycleEntity {
+                entity: kernel_types::SemanticId::new(entity.raw()),
+            }
+        }
+        PermissionCoordinate::WriteLifecycleRoot(entity) => {
+            kernel_schema::PermissionCoordinate::WriteLifecycleRoot {
+                entity: kernel_types::SemanticId::new(entity.raw()),
+            }
+        }
+        PermissionCoordinate::WriteKeepsAlivePresence(parent) => {
+            kernel_schema::PermissionCoordinate::WriteKeepsAlivePresence {
+                parent: kernel_types::SemanticId::new(parent.raw()),
+            }
+        }
+        PermissionCoordinate::WriteKeepsAliveEdge { parent, child } => {
+            kernel_schema::PermissionCoordinate::WriteKeepsAliveEdge {
+                parent: kernel_types::SemanticId::new(parent.raw()),
+                child: kernel_types::SemanticId::new(child.raw()),
+            }
+        }
+    }
+}
+
+pub(crate) fn permission_from_kernel(
+    permission: kernel_schema::PermissionCoordinate,
+) -> Permission {
+    match permission {
+        kernel_schema::PermissionCoordinate::ModelRead => Permission::ModelRead,
+        kernel_schema::PermissionCoordinate::ReadRelation { relation } => {
+            Permission::ReadRelation(RelationId::new(relation.raw()))
+        }
+        kernel_schema::PermissionCoordinate::ReadField { relation, column } => {
+            Permission::ReadField {
+                relation: RelationId::new(relation.raw()),
+                field: RelationColumnId::new(column.raw()),
+            }
+        }
+        kernel_schema::PermissionCoordinate::HistoricalRead => Permission::HistoricalRead,
+        kernel_schema::PermissionCoordinate::HistoryRead => Permission::HistoryRead,
+        kernel_schema::PermissionCoordinate::Watch => Permission::Watch,
+        kernel_schema::PermissionCoordinate::WriteRelation { relation } => {
+            Permission::WriteRelation(RelationId::new(relation.raw()))
+        }
+        kernel_schema::PermissionCoordinate::WriteField { relation, column } => {
+            Permission::WriteField {
+                relation: RelationId::new(relation.raw()),
+                field: RelationColumnId::new(column.raw()),
+            }
+        }
+        kernel_schema::PermissionCoordinate::CreateObject { relation } => {
+            Permission::CreateObject(RelationId::new(relation.raw()))
+        }
+        kernel_schema::PermissionCoordinate::DeleteObject { relation } => {
+            Permission::DeleteObject(RelationId::new(relation.raw()))
+        }
+        kernel_schema::PermissionCoordinate::AttachRelationship { relation } => {
+            Permission::AttachRelationship(RelationId::new(relation.raw()))
+        }
+        kernel_schema::PermissionCoordinate::DetachRelationship { relation } => {
+            Permission::DetachRelationship(RelationId::new(relation.raw()))
+        }
+        kernel_schema::PermissionCoordinate::MoveRelationship { relation } => {
+            Permission::MoveRelationship(RelationId::new(relation.raw()))
+        }
+        kernel_schema::PermissionCoordinate::WriteCarrierPresence { carrier } => {
+            Permission::WriteCarrierPresence(crate::ModelSemanticId::new(carrier.raw()))
+        }
+        kernel_schema::PermissionCoordinate::WriteCarrierMember { carrier, member } => {
+            Permission::WriteCarrierMember {
+                carrier: crate::ModelSemanticId::new(carrier.raw()),
+                member: crate::ModelEntityId::new(member.raw()),
+            }
+        }
+        kernel_schema::PermissionCoordinate::WriteLifecycleEntity { entity } => {
+            Permission::WriteLifecycleEntity(crate::ModelEntityId::new(entity.raw()))
+        }
+        kernel_schema::PermissionCoordinate::WriteLifecycleRoot { entity } => {
+            Permission::WriteLifecycleRoot(crate::ModelEntityId::new(entity.raw()))
+        }
+        kernel_schema::PermissionCoordinate::WriteKeepsAlivePresence { parent } => {
+            Permission::WriteKeepsAlivePresence(crate::ModelEntityId::new(parent.raw()))
+        }
+        kernel_schema::PermissionCoordinate::WriteKeepsAliveEdge { parent, child } => {
+            Permission::WriteKeepsAliveEdge {
+                parent: crate::ModelEntityId::new(parent.raw()),
+                child: crate::ModelEntityId::new(child.raw()),
+            }
+        }
+    }
+}
+
+pub(crate) fn permission_coordinate_from_kernel(
+    permission: kernel_schema::PermissionCoordinate,
+) -> PermissionCoordinate {
+    match permission_from_kernel(permission) {
+        Permission::ModelRead => PermissionCoordinate::ModelRead,
+        Permission::ReadRelation(relation) => PermissionCoordinate::ReadRelation(relation),
+        Permission::ReadField { relation, field } => {
+            PermissionCoordinate::ReadField { relation, field }
+        }
+        Permission::HistoricalRead => PermissionCoordinate::HistoricalRead,
+        Permission::HistoryRead => PermissionCoordinate::HistoryRead,
+        Permission::Watch => PermissionCoordinate::Watch,
+        Permission::WriteRelation(relation) => PermissionCoordinate::WriteRelation(relation),
+        Permission::WriteField { relation, field } => {
+            PermissionCoordinate::WriteField { relation, field }
+        }
+        Permission::CreateObject(relation) => PermissionCoordinate::CreateObject(relation),
+        Permission::DeleteObject(relation) => PermissionCoordinate::DeleteObject(relation),
+        Permission::AttachRelationship(relation) => {
+            PermissionCoordinate::AttachRelationship(relation)
+        }
+        Permission::DetachRelationship(relation) => {
+            PermissionCoordinate::DetachRelationship(relation)
+        }
+        Permission::MoveRelationship(relation) => PermissionCoordinate::MoveRelationship(relation),
+        Permission::WriteCarrierPresence(carrier) => {
+            PermissionCoordinate::WriteCarrierPresence(carrier)
+        }
+        Permission::WriteCarrierMember { carrier, member } => {
+            PermissionCoordinate::WriteCarrierMember { carrier, member }
+        }
+        Permission::WriteLifecycleEntity(entity) => {
+            PermissionCoordinate::WriteLifecycleEntity(entity)
+        }
+        Permission::WriteLifecycleRoot(entity) => PermissionCoordinate::WriteLifecycleRoot(entity),
+        Permission::WriteKeepsAlivePresence(parent) => {
+            PermissionCoordinate::WriteKeepsAlivePresence(parent)
+        }
+        Permission::WriteKeepsAliveEdge { parent, child } => {
+            PermissionCoordinate::WriteKeepsAliveEdge { parent, child }
+        }
+        Permission::Read | Permission::Write => {
+            unreachable!("kernel permissions are always exact coordinates")
+        }
     }
 }
 
@@ -108,21 +510,6 @@ impl PermissionSet {
     pub fn with(mut self, permission: Permission) -> Self {
         self.0.insert(permission);
         self
-    }
-
-    #[must_use]
-    pub fn with_role(mut self, role: &Role) -> Self {
-        self.0.extend(role.permissions.iter());
-        self
-    }
-
-    #[must_use]
-    pub fn from_roles<'a>(roles: impl IntoIterator<Item = &'a Role>) -> Self {
-        let mut permissions = Self::new();
-        for role in roles {
-            permissions.0.extend(role.permissions.iter());
-        }
-        permissions
     }
 
     #[must_use]
@@ -155,6 +542,12 @@ impl PermissionSet {
                     | Permission::AttachRelationship(_)
                     | Permission::DetachRelationship(_)
                     | Permission::MoveRelationship(_)
+                    | Permission::WriteCarrierPresence(_)
+                    | Permission::WriteCarrierMember { .. }
+                    | Permission::WriteLifecycleEntity(_)
+                    | Permission::WriteLifecycleRoot(_)
+                    | Permission::WriteKeepsAlivePresence(_)
+                    | Permission::WriteKeepsAliveEdge { .. }
             )
         })
     }
@@ -232,7 +625,67 @@ impl PermissionSet {
                 ));
             }
         }
+        for carrier in &footprint.carrier_presence {
+            if !self.contains(Permission::WriteCarrierPresence(*carrier)) {
+                return Err(permission_denied(
+                    principal,
+                    format!("write carrier presence {}", carrier.raw()),
+                ));
+            }
+        }
+        for (carrier, member) in &footprint.carrier_members {
+            if !self.contains(Permission::WriteCarrierMember {
+                carrier: *carrier,
+                member: *member,
+            }) {
+                return Err(permission_denied(
+                    principal,
+                    format!("write carrier member {}:{}", carrier.raw(), member.raw()),
+                ));
+            }
+        }
+        for entity in &footprint.lifecycle_entities {
+            if !self.contains(Permission::WriteLifecycleEntity(*entity)) {
+                return Err(permission_denied(
+                    principal,
+                    format!("write lifecycle entity {}", entity.raw()),
+                ));
+            }
+        }
+        for entity in &footprint.lifecycle_roots {
+            if !self.contains(Permission::WriteLifecycleRoot(*entity)) {
+                return Err(permission_denied(
+                    principal,
+                    format!("write lifecycle root {}", entity.raw()),
+                ));
+            }
+        }
+        for parent in &footprint.keeps_alive_presence {
+            if !self.contains(Permission::WriteKeepsAlivePresence(*parent)) {
+                return Err(permission_denied(
+                    principal,
+                    format!("write keeps-alive presence {}", parent.raw()),
+                ));
+            }
+        }
+        for (parent, child) in &footprint.keeps_alive_edges {
+            if !self.contains(Permission::WriteKeepsAliveEdge {
+                parent: *parent,
+                child: *child,
+            }) {
+                return Err(permission_denied(
+                    principal,
+                    format!("write keeps-alive edge {}:{}", parent.raw(), child.raw()),
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+impl FromIterator<Permission> for PermissionSet {
+    fn from_iter<T: IntoIterator<Item = Permission>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
     }
 }
 
@@ -271,12 +724,15 @@ struct SessionState {
     generation: u64,
     permissions: PermissionSet,
     revoked: bool,
+    schema_roles: Option<BTreeSet<crate::RoleId>>,
+    access_schema_revision: Option<u64>,
 }
 
 #[derive(Clone)]
 pub struct Session {
     principal: PrincipalId,
     state: Arc<RwLock<SessionState>>,
+    role_runtime: Option<Arc<kernel_plan::DurableRuntime>>,
 }
 
 impl fmt::Debug for Session {
@@ -306,16 +762,101 @@ impl Session {
                 generation: 0,
                 permissions,
                 revoked: false,
+                schema_roles: None,
+                access_schema_revision: None,
             })),
+            role_runtime: None,
         }
     }
 
-    #[must_use]
-    pub fn from_roles<'a>(
+    pub(crate) fn for_schema_roles(
         principal: PrincipalId,
-        roles: impl IntoIterator<Item = &'a Role>,
-    ) -> Self {
-        Self::new(principal, PermissionSet::from_roles(roles))
+        runtime: Arc<kernel_plan::DurableRuntime>,
+        roles: BTreeSet<crate::RoleId>,
+    ) -> Result<Self> {
+        let (schema_revision, permissions) = resolve_schema_roles(&runtime, &roles, principal)?;
+        Ok(Self {
+            principal,
+            state: Arc::new(RwLock::new(SessionState {
+                generation: 0,
+                permissions,
+                revoked: false,
+                schema_roles: Some(roles),
+                access_schema_revision: Some(schema_revision),
+            })),
+            role_runtime: Some(runtime),
+        })
+    }
+
+    fn refresh_schema_roles_if_needed(&self) -> Result<()> {
+        let Some(runtime) = &self.role_runtime else {
+            return Ok(());
+        };
+        let snapshot = runtime.snapshot().map_err(|error| {
+            Error::new(
+                ErrorKind::Internal,
+                format!("schema-role authority snapshot failed: {error:?}"),
+            )
+        })?;
+        let schema_revision = snapshot.revision().semantic_revision().schema.raw();
+        let roles = {
+            let state = self.state.read().map_err(|_| session_state_poisoned())?;
+            if state.revoked {
+                return Err(session_revoked(self.principal));
+            }
+            if state.access_schema_revision == Some(schema_revision) {
+                return Ok(());
+            }
+            state
+                .schema_roles
+                .clone()
+                .expect("role-bound session retains external role assignments")
+        };
+        let permissions =
+            resolve_schema_roles_from_revision(snapshot.revision(), &roles, self.principal)?;
+        let mut state = self.state.write().map_err(|_| session_state_poisoned())?;
+        if state.revoked {
+            return Err(session_revoked(self.principal));
+        }
+        if state.access_schema_revision != Some(schema_revision) {
+            state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Internal,
+                    "session authority generation overflowed",
+                )
+            })?;
+            state.permissions = permissions;
+            state.access_schema_revision = Some(schema_revision);
+        }
+        Ok(())
+    }
+
+    pub fn refresh_role_assignments(
+        &self,
+        roles: impl IntoIterator<Item = crate::RoleId>,
+    ) -> Result<u64> {
+        let Some(runtime) = &self.role_runtime else {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "explicit-permission session has no schema-role assignment",
+            ));
+        };
+        let roles: BTreeSet<_> = roles.into_iter().collect();
+        let (schema_revision, permissions) = resolve_schema_roles(runtime, &roles, self.principal)?;
+        let mut state = self.state.write().map_err(|_| session_state_poisoned())?;
+        if state.revoked {
+            return Err(session_revoked(self.principal));
+        }
+        state.generation = state.generation.checked_add(1).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Internal,
+                "session authority generation overflowed",
+            )
+        })?;
+        state.permissions = permissions;
+        state.schema_roles = Some(roles);
+        state.access_schema_revision = Some(schema_revision);
+        Ok(state.generation)
     }
 
     #[must_use]
@@ -324,6 +865,7 @@ impl Session {
     }
 
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         Ok(SessionSnapshot {
             generation: state.generation,
@@ -333,6 +875,12 @@ impl Session {
     }
 
     pub fn refresh_permissions(&self, permissions: PermissionSet) -> Result<u64> {
+        if self.role_runtime.is_some() {
+            return Err(Error::new(
+                ErrorKind::InvalidPlan,
+                "schema-role sessions must refresh external role assignments, not flattened permissions",
+            ));
+        }
         let mut state = self.state.write().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -363,6 +911,7 @@ impl Session {
     }
 
     pub fn require(&self, permission: Permission) -> Result<()> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -374,22 +923,8 @@ impl Session {
         }
     }
 
-    fn with_permission<T>(
-        &self,
-        permission: Permission,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        let state = self.state.read().map_err(|_| session_state_poisoned())?;
-        if state.revoked {
-            return Err(session_revoked(self.principal));
-        }
-        if !state.permissions.contains(permission) {
-            return Err(permission_denied(self.principal, format!("{permission:?}")));
-        }
-        operation()
-    }
-
     fn require_read_entry(&self) -> Result<()> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -402,6 +937,7 @@ impl Session {
     }
 
     fn require_write_entry(&self) -> Result<()> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -414,6 +950,7 @@ impl Session {
     }
 
     fn require_read_footprint(&self, footprint: &kernel_query::RelReadFootprint) -> Result<()> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -441,6 +978,7 @@ impl Session {
     }
 
     fn require_read_relation(&self, relation: RelationId) -> Result<()> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -456,6 +994,7 @@ impl Session {
     }
 
     fn require_read_field(&self, relation: RelationId, field: RelationColumnId) -> Result<()> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -471,6 +1010,7 @@ impl Session {
     }
 
     fn require_write_relation(&self, relation: RelationId) -> Result<()> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -489,6 +1029,7 @@ impl Session {
         &self,
         footprint: &PublicationAuthorityFootprint,
     ) -> Result<()> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -503,6 +1044,7 @@ impl Session {
         footprint: &PublicationAuthorityFootprint,
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        self.refresh_schema_roles_if_needed()?;
         let state = self.state.read().map_err(|_| session_state_poisoned())?;
         if state.revoked {
             return Err(session_revoked(self.principal));
@@ -512,6 +1054,49 @@ impl Session {
             .require_publication_footprint(self.principal, footprint)?;
         operation()
     }
+}
+
+fn resolve_schema_roles(
+    runtime: &Arc<kernel_plan::DurableRuntime>,
+    roles: &BTreeSet<crate::RoleId>,
+    principal: PrincipalId,
+) -> Result<(u64, PermissionSet)> {
+    let snapshot = runtime.snapshot().map_err(|error| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("schema-role authority snapshot failed: {error:?}"),
+        )
+    })?;
+    let schema_revision = snapshot.revision().semantic_revision().schema.raw();
+    let permissions = resolve_schema_roles_from_revision(snapshot.revision(), roles, principal)?;
+    Ok((schema_revision, permissions))
+}
+
+fn resolve_schema_roles_from_revision(
+    revision: &kernel_revision::Revision,
+    roles: &BTreeSet<crate::RoleId>,
+    principal: PrincipalId,
+) -> Result<PermissionSet> {
+    revision
+        .semantic_context()
+        .schema
+        .resolve_access_roles(
+            roles
+                .iter()
+                .map(|role| kernel_types::SemanticId::new(role.raw())),
+        )
+        .map_err(|_| {
+            permission_denied(
+                principal,
+                "current authoritative Schema.Access role assignment",
+            )
+        })
+        .map(|permissions| {
+            permissions
+                .into_iter()
+                .map(permission_from_kernel)
+                .collect()
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -525,17 +1110,6 @@ impl RuntimeAuthority {
         match self {
             Self::Unrestricted => Ok(()),
             Self::Session(session) => session.require(permission),
-        }
-    }
-
-    pub(crate) fn with_permission<T>(
-        &self,
-        permission: Permission,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        match self {
-            Self::Unrestricted => operation(),
-            Self::Session(session) => session.with_permission(permission, operation),
         }
     }
 
@@ -638,6 +1212,32 @@ impl SessionDatabase {
             .snapshot_with_authority(self.authority.clone())
     }
 
+    /// Opens current authoritative HEAD while interpreting incoming queries in one retained
+    /// contract schema language. The returned context contains only a verified semantic bridge;
+    /// no historical source-world state is materialized.
+    pub fn snapshot_for_contract(&self, source_schema_revision: u64) -> Result<ReadContext> {
+        self.authority.require_read_entry()?;
+        let current = self
+            .database
+            .snapshot_with_authority(self.authority.clone())?;
+        if current.schema_revision() == source_schema_revision {
+            return Ok(current);
+        }
+        let bridge = self
+            .database
+            .current_schema_bridge(source_schema_revision)?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::ContractNotRepresentable,
+                    format!(
+                        "no retained exact current-world bridge from schema revision {source_schema_revision} to current schema revision {}",
+                        current.schema_revision(),
+                    ),
+                )
+            })?;
+        current.with_current_schema_bridge(bridge)
+    }
+
     pub fn at(&self, revision: RevisionId) -> Result<ReadContext> {
         self.authority.require_read_entry()?;
         self.authority.require(Permission::HistoricalRead)?;
@@ -672,16 +1272,6 @@ impl SessionDatabase {
     pub fn history(&self) -> Result<crate::History> {
         self.authority.require(Permission::HistoryRead)?;
         self.snapshot()?.history()
-    }
-
-    pub fn migrate(
-        &self,
-        model: &crate::MigrationModel,
-        transaction: TransactionId,
-        history: crate::MigrationHistoryPolicy,
-    ) -> Result<crate::CommitOutcome> {
-        self.database
-            .migrate_with_authority(model, transaction, history, &self.authority)
     }
 
     /// Adds a historical inverse under this session's write authority.
@@ -810,7 +1400,182 @@ fn session_revoked(principal: PrincipalId) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{TryLockError, mpsc};
+    use std::{
+        fs,
+        path::Path,
+        sync::{Arc, TryLockError, mpsc},
+    };
+
+    #[derive(Debug)]
+    struct PanicEncryptionProvider;
+
+    #[derive(Debug)]
+    struct StaticEncryptionProvider;
+
+    impl crate::EncryptionKeyProvider for StaticEncryptionProvider {
+        fn provide_key(
+            &self,
+            _path: &Path,
+            _operation: crate::EncryptionKeyOperation,
+            destination: &mut crate::EncryptionKeyDestination<'_>,
+        ) -> Result<crate::EncryptionProviderKeyMetadata> {
+            destination.write(&[0x79; 32]);
+            Ok(crate::EncryptionProviderKeyMetadata::new(
+                crate::EncryptionKeyId::from_bytes([0x79; 16]),
+                1,
+            ))
+        }
+    }
+
+    impl crate::EncryptionKeyProvider for PanicEncryptionProvider {
+        fn provide_key(
+            &self,
+            _path: &Path,
+            _operation: crate::EncryptionKeyOperation,
+            _destination: &mut crate::EncryptionKeyDestination<'_>,
+        ) -> Result<crate::EncryptionProviderKeyMetadata> {
+            panic!("encryption provider must not run before administration authorization")
+        }
+    }
+
+    #[test]
+    fn schema_access_cannot_mint_database_control_authority() {
+        let fake_admin = AccessCapability::new("cfmd.database.admin.export").model_read();
+        let operator = Role::new("database.operator").capability(&fake_admin);
+        let operator_id = operator.id();
+        let schema = crate::Schema::builder()
+            .revisions(582, 1)
+            .access(SchemaAccess::new().capability(fake_admin).role(operator))
+            .build()
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "cfmd-runtime-two-plane-schema-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let database = Database::create(&path, schema).unwrap();
+        let restricted = database
+            .session_for_roles(PrincipalId::new(582_001), [operator_id])
+            .unwrap();
+        let permissions = restricted.session().snapshot().unwrap();
+        assert!(permissions.permissions().contains(Permission::ModelRead));
+
+        let backup = path.with_extension("denied-backup");
+        let control = crate::DatabaseControlCredential::authenticated(
+            PrincipalId::new(582_002),
+            crate::DatabaseControlPermissionSet::new(),
+        );
+        let admin = database.admin_session(control.session());
+        let error = admin
+            .backup_to(&backup, &crate::Encryption::None)
+            .expect_err("Schema.Access must not imply control-plane export");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(!backup.exists());
+        drop(admin);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn protection_reconfigure_control_gate_precedes_provider_resolution() {
+        let path = std::env::temp_dir().join(format!(
+            "cfmd-runtime-control-protection-denied-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let database = Database::create(
+            &path,
+            crate::Schema::builder().revisions(582, 2).build().unwrap(),
+        )
+        .unwrap();
+        let control = crate::DatabaseControlCredential::authenticated(
+            PrincipalId::new(582_003),
+            crate::DatabaseControlPermissionSet::new(),
+        );
+        let admin = database.admin_session(control.session());
+        let encryption =
+            crate::Encryption::aes256_gcm_siv_with_provider(Arc::new(PanicEncryptionProvider));
+        let error = admin
+            .reconfigure_protection(&encryption)
+            .expect_err("control denial must precede provider resolution");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        drop(admin);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn authorized_control_reaches_existing_protection_authority() {
+        let path = std::env::temp_dir().join(format!(
+            "cfmd-runtime-control-protection-authorized-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let database = Database::create(
+            &path,
+            crate::Schema::builder().revisions(582, 3).build().unwrap(),
+        )
+        .unwrap();
+        let control = crate::DatabaseControlCredential::authenticated(
+            PrincipalId::new(582_004),
+            crate::DatabaseControlPermissionSet::from([
+                crate::DatabaseControlPermission::ProtectionReconfigure,
+            ]),
+        );
+        let admin = database.admin_session(control.session());
+        let encryption =
+            crate::Encryption::aes256_gcm_siv_with_provider(Arc::new(StaticEncryptionProvider));
+        let error = admin
+            .reconfigure_protection(&encryption)
+            .expect_err("plaintext store has no wrapped-key authority");
+        assert_eq!(error.kind(), ErrorKind::Recovery);
+        assert_eq!(
+            error.recovery_diagnostic().unwrap().operation(),
+            crate::RecoveryOperation::ProtectionReconfigure
+        );
+        drop(admin);
+        database
+            .snapshot()
+            .expect("invalid request must not poison source");
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn model_coordinate_authority_is_exact_and_generic_write_does_not_cover_it() {
+        let carrier = crate::ModelSemanticId::new(91_100);
+        let member = crate::ModelEntityId::new(91_101);
+        let parent = crate::ModelEntityId::new(91_102);
+        let child = crate::ModelEntityId::new(91_103);
+        let footprint = PublicationAuthorityFootprint {
+            carrier_presence: BTreeSet::from([carrier]),
+            carrier_members: BTreeSet::from([(carrier, member)]),
+            lifecycle_entities: BTreeSet::from([member]),
+            lifecycle_roots: BTreeSet::from([member]),
+            keeps_alive_presence: BTreeSet::from([parent]),
+            keeps_alive_edges: BTreeSet::from([(parent, child)]),
+            ..PublicationAuthorityFootprint::default()
+        };
+        let principal = PrincipalId::new(91_104);
+        assert_eq!(
+            PermissionSet::from([Permission::Write])
+                .require_publication_footprint(principal, &footprint)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        let exact = PermissionSet::from([
+            Permission::WriteCarrierPresence(carrier),
+            Permission::WriteCarrierMember { carrier, member },
+            Permission::WriteLifecycleEntity(member),
+            Permission::WriteLifecycleRoot(member),
+            Permission::WriteKeepsAlivePresence(parent),
+            Permission::WriteKeepsAliveEdge { parent, child },
+        ]);
+        exact
+            .require_publication_footprint(principal, &footprint)
+            .expect("exact model-coordinate authority");
+    }
 
     #[test]
     fn publication_authority_holds_generation_stable_until_publish_finishes() {

@@ -21,14 +21,10 @@ impl UnifiedArtifactId {
     fn capabilities(&self) -> BTreeSet<PhysicalCapability> {
         match self {
             Self::I64Index(_) => BTreeSet::from([PhysicalCapability::PointLookup]),
-            Self::ObservableAtom(_) => BTreeSet::from([
-                PhysicalCapability::ObservableFiber,
-                PhysicalCapability::ExactCardinality,
-            ]),
-            Self::SemanticQuotientFactor(_) | Self::SemanticQuotientSupport(_) => {
-                BTreeSet::from([PhysicalCapability::QuotientFiber])
+            Self::SemanticFiber { profile, .. } => profile.capabilities(),
+            Self::SemanticQuotientSupport(_) => {
+                BTreeSet::from([PhysicalCapability::RowCanonicalKey])
             }
-            Self::SemanticStatistics(_) => BTreeSet::from([PhysicalCapability::ExactCardinality]),
         }
     }
 
@@ -37,9 +33,7 @@ impl UnifiedArtifactId {
             Self::I64Index(binding) => {
                 binding.relation == relation && binding.layout.id == layout.id
             }
-            Self::ObservableAtom(binding)
-            | Self::SemanticQuotientFactor(binding)
-            | Self::SemanticStatistics(binding) => {
+            Self::SemanticFiber { binding, .. } => {
                 binding.relation == relation && binding.layout.id == layout.id
             }
             Self::SemanticQuotientSupport(binding) => binding.leaves.iter().any(|candidate| {

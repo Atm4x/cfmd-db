@@ -151,7 +151,28 @@ pub(super) fn right_scan_join_access_decision(
 
     let binding =
         SemanticIndexBinding::single(right_relation, right_layout, right_column, equivalence);
-    let retained_statistics = store.semantic_statistics(&binding, context, registry)?;
+    if let Some(distinct) = store.revision_semantic_column_distinct(
+        right_relation,
+        right_layout,
+        right_column,
+        equivalence,
+        context,
+        registry,
+    ) {
+        consider_join_access_candidate(
+            &mut best,
+            JoinAccessDecision {
+                family: JoinAccessFamily::PersistedSemantic,
+                work: SemanticAccessCostModel::persisted_join_access_work(left_rows, 1),
+                estimated_output_rows: SemanticAccessCostModel::estimated_join_output_rows(
+                    left_rows,
+                    right_rows,
+                    distinct.max(1),
+                ),
+            },
+        );
+    }
+    let retained_statistics = store.semantic_cardinality(&binding, context, registry)?;
     let transient_distinct = retained_statistics.map_or(right_rows, |statistics| {
         statistics.distinct_key_count.max(1)
     });

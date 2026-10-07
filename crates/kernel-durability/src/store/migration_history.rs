@@ -402,6 +402,10 @@ impl DurableRevisionStore {
         let Some(anchor) = self.historical_epoch_anchors.remove(&effect_id) else {
             return Ok(None);
         };
+        let portable_history = self.portable_historical_epochs.remove(&effect_id);
+        if self.backend.is_volatile() {
+            return Ok(None);
+        }
         let previous_realization = self.checkpoint_realization.clone();
         if let Some(realization) = self.checkpoint_realization.as_mut() {
             realization.release_historical_root(effect_id);
@@ -409,6 +413,10 @@ impl DurableRevisionStore {
         let result = self.rotate_checkpoint_current_specs_with_hook(revision, hook);
         if result.is_err() && !self.poisoned {
             self.historical_epoch_anchors.insert(effect_id, anchor);
+            if let Some(portable_history) = portable_history {
+                self.portable_historical_epochs
+                    .insert(effect_id, portable_history);
+            }
             self.checkpoint_realization = previous_realization;
         }
         result.map(Some)

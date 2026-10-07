@@ -13,7 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(test)]
-use kernel_auth::{AuthorityDigest, FreshnessCut};
+use kernel_auth::AuthorityDigest;
 use kernel_change::RevisionEffectId;
 use kernel_revision::Revision;
 use kernel_semantics::SemanticRegistry;
@@ -27,7 +27,7 @@ use crate::domain::{
     DurableTransactionIntent, DurableTransactionKey, HistoricalEpochAnchor, IdempotencyEpoch,
 };
 use crate::replication::authority::ReplicationAuthorityJournal;
-use crate::wal::FileRevisionWal;
+use crate::wal::RuntimeRevisionWal;
 
 #[cfg(test)]
 use crate::binary_codec::crc32c;
@@ -42,6 +42,12 @@ use migration_history::MigrationComplementIndex;
 pub struct DurableGenerationReceipt {
     pub generation: u64,
     pub base_revision: RevisionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableSatisfiedIntentSealOutcome {
+    Sealed { revision: RevisionId },
+    AlreadySealed { revision: RevisionId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +66,7 @@ pub struct DurableRevisionStore {
     generation: u64,
     checkpoint: Revision,
     durable_head: RevisionId,
-    wal: FileRevisionWal,
+    wal: RuntimeRevisionWal,
     semantic_registry: SemanticRegistry,
     materialization_specs: Vec<DurableMaterializationSpec>,
     physical_artifact_specs: Vec<DurablePhysicalArtifactSpec>,
@@ -69,6 +75,7 @@ pub struct DurableRevisionStore {
     migration_complements: Vec<DurableMigrationComplement>,
     migration_complement_index: MigrationComplementIndex,
     historical_epoch_anchors: BTreeMap<RevisionEffectId, HistoricalEpochAnchor>,
+    portable_historical_epochs: BTreeMap<RevisionEffectId, Vec<u8>>,
     current_idempotency_epoch: IdempotencyEpoch,
     minimum_retry_epoch: IdempotencyEpoch,
     committed_transactions: BTreeMap<DurableTransactionKey, DurableCommittedTransaction>,
@@ -98,6 +105,9 @@ mod manifest;
 mod metadata_storage;
 mod migration_history;
 mod observe;
+mod persistence_image;
+pub use persistence_image::{CanonicalPersistenceImage, ForkPersistenceImage};
+mod portable_history;
 mod prepare_validation;
 mod prepared_capsule;
 mod prepared_lifecycle;
@@ -116,7 +126,9 @@ pub use commit_batcher::{
     DurableBatchEnqueueOutcome, DurableCommitBatchPolicy, DurableCommitBatcher,
 };
 use freshness::ExternalFreshnessState;
-pub use freshness::{ExternalFreshnessAuthority, ExternalFreshnessConfig};
+pub use freshness::{
+    ExternalFreshnessAuthority, ExternalFreshnessConfig, ExternalFreshnessHandoff,
+};
 pub use prepared_capsule::PreparedCutCapsule;
 #[cfg(test)]
 use publication_protocol::{StoreFaultHook, StoreFaultPoint};

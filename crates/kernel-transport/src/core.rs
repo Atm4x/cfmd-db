@@ -132,6 +132,13 @@ fn transport_expr(
             Box::new(transport_expr(identity, right)?),
         ),
         Expr::I64ToF64(input) => Expr::I64ToF64(Box::new(transport_expr(identity, input)?)),
+        Expr::WidenSum {
+            input,
+            target_variants,
+        } => Expr::WidenSum {
+            input: Box::new(transport_expr(identity, input)?),
+            target_variants: target_variants.clone(),
+        },
         Expr::If {
             condition,
             when_true,

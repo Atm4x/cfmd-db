@@ -40,6 +40,17 @@ pub enum Expr {
     SeqSumI64(Box<Self>),
     AddI64(Box<Self>, Box<Self>),
     I64ToF64(Box<Self>),
+    /// Canonical coproduct injection from one semantic sum into a target sum.
+    ///
+    /// Existing variant semantic IDs and their payload types must be preserved
+    /// exactly. The target may add variants, but no source variant may be
+    /// removed, retagged, or change payload meaning. Runtime values therefore
+    /// pass through unchanged; only the static sum carrier widens.
+    WidenSum {
+        input: Box<Self>,
+        target_variants:
+            std::collections::BTreeMap<kernel_types::SemanticId, kernel_schema::TypeExpr>,
+    },
     If {
         condition: Box<Self>,
         when_true: Box<Self>,
@@ -140,6 +151,20 @@ impl Expr {
                     return Err(QueryError::TypeMismatch);
                 };
                 Ok(EvalValue::Owned(Value::F64Bits((*value as f64).to_bits())))
+            }
+            Self::WidenSum {
+                input: source,
+                target_variants,
+            } => {
+                let value = source.evaluate_internal(input)?;
+                let Value::Variant { tag, .. } = value.as_ref() else {
+                    return Err(QueryError::TypeMismatch);
+                };
+                if target_variants.contains_key(tag) {
+                    Ok(value)
+                } else {
+                    Err(QueryError::TypeMismatch)
+                }
             }
             Self::If {
                 condition,
@@ -245,6 +270,24 @@ impl Expr {
             Self::I64ToF64(source) => {
                 if source.typecheck(input_type)? == TypeExpr::Scalar(ScalarType::I64) {
                     Ok(TypeExpr::Scalar(ScalarType::F64))
+                } else {
+                    Err(QueryTypeError::TypeMismatch)
+                }
+            }
+            Self::WidenSum {
+                input,
+                target_variants,
+            } => {
+                let TypeExpr::Sum(source_variants) = input.typecheck(input_type)? else {
+                    return Err(QueryTypeError::TypeMismatch);
+                };
+                let preserves_every_source_variant = source_variants.iter().all(|(tag, source)| {
+                    target_variants
+                        .get(tag)
+                        .is_some_and(|target| target == source)
+                });
+                if preserves_every_source_variant {
+                    Ok(TypeExpr::Sum(target_variants.clone()))
                 } else {
                     Err(QueryTypeError::TypeMismatch)
                 }
@@ -385,6 +428,78 @@ mod migration_numeric_conversion_tests {
         assert_eq!(
             query.evaluate(&Value::I64(42)),
             Ok(Value::F64Bits(42.0_f64.to_bits()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod migration_sum_widening_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use kernel_types::SemanticId;
+
+    #[test]
+    fn sum_widening_preserves_variant_identity_and_payload_without_rewrite() {
+        let idle = SemanticId::new(101);
+        let running = SemanticId::new(202);
+        let source = kernel_schema::TypeExpr::Sum(BTreeMap::from([(
+            idle,
+            kernel_schema::TypeExpr::Scalar(kernel_schema::ScalarType::Unit),
+        )]));
+        let target_variants = BTreeMap::from([
+            (
+                idle,
+                kernel_schema::TypeExpr::Scalar(kernel_schema::ScalarType::Unit),
+            ),
+            (
+                running,
+                kernel_schema::TypeExpr::Scalar(kernel_schema::ScalarType::I64),
+            ),
+        ]);
+        let query = ExactQuery::new(Expr::WidenSum {
+            input: Box::new(Expr::Input),
+            target_variants: target_variants.clone(),
+        });
+        let value = Value::Variant {
+            tag: idle,
+            value: Box::new(Value::Unit),
+        };
+
+        assert_eq!(
+            query.typecheck(&source),
+            Ok(kernel_schema::TypeExpr::Sum(target_variants))
+        );
+        assert_eq!(query.evaluate(&value), Ok(value));
+    }
+
+    #[test]
+    fn sum_widening_rejects_removed_or_retyped_source_variant() {
+        let idle = SemanticId::new(101);
+        let source = kernel_schema::TypeExpr::Sum(BTreeMap::from([(
+            idle,
+            kernel_schema::TypeExpr::Scalar(kernel_schema::ScalarType::Unit),
+        )]));
+
+        let removed = ExactQuery::new(Expr::WidenSum {
+            input: Box::new(Expr::Input),
+            target_variants: BTreeMap::new(),
+        });
+        assert_eq!(
+            removed.typecheck(&source),
+            Err(QueryTypeError::TypeMismatch)
+        );
+
+        let retyped = ExactQuery::new(Expr::WidenSum {
+            input: Box::new(Expr::Input),
+            target_variants: BTreeMap::from([(
+                idle,
+                kernel_schema::TypeExpr::Scalar(kernel_schema::ScalarType::I64),
+            )]),
+        });
+        assert_eq!(
+            retyped.typecheck(&source),
+            Err(QueryTypeError::TypeMismatch)
         );
     }
 }

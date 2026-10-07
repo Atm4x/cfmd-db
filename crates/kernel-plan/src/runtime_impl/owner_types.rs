@@ -28,6 +28,10 @@ struct RuntimeRetainedEpochIndex {
     lineage_floor: Option<RevisionId>,
     relation_supports:
         PersistentOrdMap<SemanticId, PersistentOrdMap<RevisionId, RelationSupportWitness>>,
+    relation_deltas: PersistentOrdMap<
+        SemanticId,
+        PersistentOrdMap<RevisionId, RelationDelta>,
+    >,
     writes: PersistentOrdMap<
         RuntimeHistoryCoordinate,
         PersistentOrdMap<RevisionId, RuntimeIndexedHistoryAction>,
@@ -52,6 +56,7 @@ struct RuntimeRetainedEpochIndex {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeRetainedSchemaEpoch {
+    effect_id: u128,
     source_revision: RevisionId,
     target_revision: RevisionId,
     source_context: kernel_schema::SemanticContext,
@@ -66,6 +71,10 @@ struct RuntimeHistoricalDerivedIndex {
     floor_opaque_effect: Option<u128>,
     relation_supports:
         PersistentOrdMap<SemanticId, PersistentOrdMap<RevisionId, RelationSupportWitness>>,
+    relation_deltas: PersistentOrdMap<
+        SemanticId,
+        PersistentOrdMap<RevisionId, RelationDelta>,
+    >,
     writes: PersistentOrdMap<
         RuntimeHistoryCoordinate,
         PersistentOrdMap<RevisionId, RuntimeIndexedHistoryAction>,
@@ -139,10 +148,9 @@ pub struct RuntimeRevisionCell {
     root: RwLock<RuntimeRevisionCellState>,
 }
 
-/// Unified production owner for one reader-visible runtime lineage and its
-/// authoritative durable generation/WAL. Keeping the store paired with the
-/// runtime prevents callers from accidentally committing one runtime through
-/// an unrelated durable head.
+/// One runtime lineage owns exactly one durable-store authority. Persistence
+/// state lives in the store backend itself; no duplicate runtime state wrapper
+/// is permitted here.
 #[derive(Debug)]
 pub struct DurableRuntime {
     cell: RuntimeRevisionCell,

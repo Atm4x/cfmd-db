@@ -306,7 +306,7 @@ impl DurableRevisionStore {
         self.generation = generation;
         self.checkpoint = revision.clone();
         self.checkpoint_realization = physical_realization.cloned();
-        self.wal = wal;
+        self.wal = wal.into();
         self.materialization_specs = materialization_specs.to_vec();
         self.physical_artifact_specs = physical_artifact_specs;
         self.artifact_cores = artifact_cores.to_vec();

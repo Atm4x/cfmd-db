@@ -3,10 +3,12 @@ impl DurableRuntime {
         &self,
         transaction_id: ClientTransactionId,
         client_semantic_revision: kernel_types::SemanticRevision,
+        client_mutations: &[RevisionRelationMutation<'_>],
         client_model_delta: &DurableModelDelta,
         client_guard_digest: Option<kernel_durability::ClientIntentGuardDigest>,
         requested_target: RevisionId,
     ) -> Result<Option<RevisionId>, DurableRuntimeCommitError> {
+        let durable_client_mutations = Self::canonical_durable_relation_mutations(client_mutations)?;
         let durability = self.durability.lock().map_err(|_| {
             let _ = self.cell.force_recovery_required();
             DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
@@ -16,7 +18,7 @@ impl DurableRuntime {
         };
         if committed_intent.matches_mixed_client_intent(
             client_semantic_revision,
-            &[],
+            &durable_client_mutations,
             client_model_delta,
             client_guard_digest,
         ) {
@@ -29,51 +31,31 @@ impl DurableRuntime {
         })
     }
 
-    pub fn commit_revision(
+    /// Test-only adapter for the retired arbitrary-target relation commit API.
+    ///
+    /// Production durability accepts relation-data intent only through
+    /// `DerivedRelationTransitionRequest`, where the runtime derives the target
+    /// from the authoritative source plus exact deltas. Keeping this adapter
+    /// under `cfg(test)` lets old hostile regressions exercise the same law
+    /// without retaining a production compatibility path or full-target WAL
+    /// witness.
+    #[cfg(test)]
+    pub(crate) fn commit_revision(
         &self,
         transaction_id: ClientTransactionId,
         request: &RevisionTransitionRequest<'_>,
     ) -> Result<DurableRuntimeCommitOutcome, DurableRuntimeCommitError> {
-        let requested_intent =
-            DurableTransactionIntent::revision(request.target_revision, &self.registry)
-                .map_err(DurabilityError::Encode)
-                .map_err(DurableRuntimeCommitError::PrepareDurability)?;
-        let mut durability = self.durability.lock().map_err(|_| {
-            let _ = self.cell.force_recovery_required();
-            DurableRuntimeCommitError::PrepareDurability(DurabilityError::Poisoned)
-        })?;
-        if let Some(committed_intent) = durability.transaction_intent(transaction_id) {
-            if committed_intent.same_client_intent(&requested_intent) {
-                return Ok(DurableRuntimeCommitOutcome::AlreadyCommitted {
-                    target_revision: committed_intent.target_revision(),
-                });
-            }
-            return Err(DurableRuntimeCommitError::TransactionIdConflict {
-                transaction_id,
-                committed_target: committed_intent.target_revision(),
-                requested_target: requested_intent.target_revision(),
-            });
-        }
-        let authorized_request = RevisionTransitionRequest {
-            target_revision: request.target_revision,
-            mutations: request.mutations,
-            registry: &self.registry,
-        };
-        self.cell
-            .commit_revision_durable_full_exact(
-                transaction_id,
-                &authorized_request,
-                &mut *durability,
-            )
-            .map(|receipt| {
-                let relations = request
-                    .mutations
-                    .iter()
-                    .map(|mutation| mutation.relation)
-                    .collect::<Vec<_>>();
-                self.signal_relation_publication(&relations);
-                DurableRuntimeCommitOutcome::Committed(receipt)
-            })
+        let snapshot = self.snapshot()?;
+        let source_revision = snapshot.revision_id();
+        drop(snapshot);
+        self.commit_derived_relation_data(
+            transaction_id,
+            &DerivedRelationTransitionRequest {
+                source_revision,
+                target_revision: request.target_revision.id(),
+                mutations: request.mutations,
+            },
+        )
     }
 
     /// Atomically commits a validated mixed logical revision while applying

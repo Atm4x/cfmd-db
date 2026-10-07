@@ -5,24 +5,30 @@ impl PhysicalStore {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
     ) -> Result<(), PhysicalExecutionError> {
-        let relation = self.installed(binding.relation, binding.layout)?;
-        let state =
-            MaterializedObservableAtomState::build(binding.clone(), relation, context, registry)?;
+        let mut candidate = self.clone();
+        let state = candidate.build_catalog_free_observable_atom_state(
+            binding.clone(),
+            context,
+            registry,
+        )?;
         let next_epoch = self
             .transition_epoch
             .checked_add(1)
             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
-        self.advisor_managed_artifacts_mut()
-            .remove(&UnifiedArtifactId::ObservableAtom(binding.clone()));
-        self.observable_atom_states_mut_internal()
+        candidate
+            .advisor_managed_artifacts_mut()
+            .remove(&UnifiedArtifactId::semantic_observable(binding.clone()));
+        candidate
+            .observable_atom_states_mut_internal()
             .insert(binding, Arc::new(state));
-        self.transition_epoch = next_epoch;
-        self.state_identity = Arc::new(());
+        candidate.transition_epoch = next_epoch;
+        candidate.state_identity = Arc::new(());
+        *self = candidate;
         Ok(())
     }
 
     /// Publishes one advisor-selected SAMF observable-atom capability and retires only
-    /// advisor-owned legacy duplicates for the same semantic binding. Manual pins are
+    /// advisor-owned alternate duplicates for the same semantic binding. Manual pins are
     /// preserved. Replacement happens only after the SAMF candidate has been built and
     /// validated against the pinned semantic context.
     pub fn converge_observable_atom_candidate(
@@ -34,83 +40,71 @@ impl PhysicalStore {
         let existing_manual = self.observable_atom_states.contains_key(&binding)
             && !self
                 .advisor_managed_artifacts
-                .contains(&UnifiedArtifactId::ObservableAtom(binding.clone()));
+                .contains(&UnifiedArtifactId::semantic_observable(binding.clone()));
         let compatible_existing = match self.observable_atom_states.get(&binding) {
             Some(state) => state.compatible_with(context, registry)?,
             None => false,
         };
-        let prepared = if compatible_existing {
-            None
-        } else {
-            let relation = self.installed(binding.relation, binding.layout)?;
-            Some(MaterializedObservableAtomState::build(
-                binding.clone(),
-                relation,
-                context,
-                registry,
-            )?)
-        };
-
-        let retire_legacy_statistics = self
+        let retire_alternate_statistics = self
             .advisor_managed_artifacts
-            .contains(&UnifiedArtifactId::SemanticStatistics(binding.clone()));
-        let retire_legacy_quotient = self
+            .contains(&UnifiedArtifactId::semantic_cardinality(binding.clone()));
+        let retire_alternate_quotient = self
             .advisor_managed_artifacts
-            .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()));
-        let changed = prepared.is_some() || retire_legacy_statistics || retire_legacy_quotient;
-        let next_epoch = if changed {
-            Some(
-                self.transition_epoch
-                    .checked_add(1)
-                    .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?,
-            )
-        } else {
-            None
-        };
-
+            .contains(&UnifiedArtifactId::semantic_quotient(binding.clone()));
+        let changed = !compatible_existing || retire_alternate_statistics || retire_alternate_quotient;
         let mut report = ObservableAtomConvergenceReport {
             retained_manual_observable: existing_manual && compatible_existing,
-            capabilities: UnifiedArtifactId::ObservableAtom(binding.clone()).capabilities(),
+            capabilities: UnifiedArtifactId::semantic_observable(binding.clone()).capabilities(),
             ..ObservableAtomConvergenceReport::default()
         };
-        if let Some(state) = prepared {
-            let existed = self.observable_atom_states.contains_key(&binding);
-            self.observable_atom_states_mut_internal()
+        if !changed {
+            if !existing_manual {
+                self.advisor_managed_artifacts_mut()
+                    .insert(UnifiedArtifactId::semantic_observable(binding));
+            }
+            return Ok(report);
+        }
+
+        let mut candidate = self.clone();
+        if !compatible_existing {
+            let state = candidate.build_catalog_free_observable_atom_state(
+                binding.clone(),
+                context,
+                registry,
+            )?;
+            let existed = candidate.observable_atom_states.contains_key(&binding);
+            candidate
+                .observable_atom_states_mut_internal()
                 .insert(binding.clone(), Arc::new(state));
             if existing_manual {
-                self.advisor_managed_artifacts_mut()
-                    .remove(&UnifiedArtifactId::ObservableAtom(binding.clone()));
+                candidate.advisor_managed_artifacts_mut()
+                    .remove(&UnifiedArtifactId::semantic_observable(binding.clone()));
             } else {
-                self.advisor_managed_artifacts_mut()
-                    .insert(UnifiedArtifactId::ObservableAtom(binding.clone()));
+                candidate.advisor_managed_artifacts_mut()
+                    .insert(UnifiedArtifactId::semantic_observable(binding.clone()));
             }
-            if existed {
-                report.rebuilt = true;
-            } else {
-                report.created = true;
-            }
+            if existed { report.rebuilt = true; } else { report.created = true; }
         } else if !existing_manual {
-            self.advisor_managed_artifacts_mut()
-                .insert(UnifiedArtifactId::ObservableAtom(binding.clone()));
+            candidate.advisor_managed_artifacts_mut()
+                .insert(UnifiedArtifactId::semantic_observable(binding.clone()));
         }
-
-        if retire_legacy_statistics {
-            self.semantic_statistics_mut_internal().remove(&binding);
-            self.advisor_managed_artifacts_mut()
-                .remove(&UnifiedArtifactId::SemanticStatistics(binding.clone()));
-            report.retired_legacy_statistics.push(binding.clone());
+        if retire_alternate_statistics {
+            candidate.semantic_statistics_mut_internal().remove(&binding);
+            candidate.advisor_managed_artifacts_mut()
+                .remove(&UnifiedArtifactId::semantic_cardinality(binding.clone()));
+            report.retired_cardinality_profiles.push(binding.clone());
         }
-        if retire_legacy_quotient {
-            self.semantic_quotient_factors_mut().remove(&binding);
-            self.advisor_managed_artifacts_mut()
-                .remove(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()));
-            report.retired_legacy_quotient_factors.push(binding);
+        if retire_alternate_quotient {
+            candidate.semantic_quotient_factors_mut().remove(&binding);
+            candidate.advisor_managed_artifacts_mut()
+                .remove(&UnifiedArtifactId::semantic_quotient(binding.clone()));
+            report.retired_quotient_profiles.push(binding);
         }
-
-        if let Some(next_epoch) = next_epoch {
-            self.transition_epoch = next_epoch;
-            self.state_identity = Arc::new(());
-        }
+        candidate.transition_epoch = self.transition_epoch
+            .checked_add(1)
+            .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
+        candidate.state_identity = Arc::new(());
+        *self = candidate;
         Ok(report)
     }
 
@@ -127,7 +121,7 @@ impl PhysicalStore {
     ) -> Result<UnifiedObservableAdvisorReport, PhysicalExecutionError> {
         let selected =
             unified_observable_advisor_selection(self, workload, inputs, context, registry)?;
-        apply_unified_observable_selection(self, selected)
+        apply_unified_observable_selection(self, selected, context, registry)
     }
 
     pub fn observable_atom_probe_values(
@@ -209,7 +203,7 @@ impl PhysicalStore {
             .advisor_managed_artifacts
             .iter()
             .filter_map(|artifact| match artifact {
-                UnifiedArtifactId::SemanticQuotientFactor(binding)
+                UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Quotient }
                     if !selected.contains(binding) =>
                 {
                     Some(binding.clone())
@@ -231,7 +225,7 @@ impl PhysicalStore {
         for binding in &evicted {
             self.semantic_quotient_factors_mut().remove(binding);
             self.advisor_managed_artifacts_mut()
-                .remove(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()));
+                .remove(&UnifiedArtifactId::semantic_quotient(binding.clone()));
             report.evicted.push(binding.clone());
         }
         for (binding, state) in prepared_states {
@@ -239,7 +233,7 @@ impl PhysicalStore {
             self.semantic_quotient_factors_mut()
                 .insert(binding.clone(), Arc::new(state));
             self.advisor_managed_artifacts_mut()
-                .insert(UnifiedArtifactId::SemanticQuotientFactor(binding.clone()));
+                .insert(UnifiedArtifactId::semantic_quotient(binding.clone()));
             if existed {
                 report.rebuilt.push(binding);
             } else {
@@ -252,7 +246,7 @@ impl PhysicalStore {
             }
             if self
                 .advisor_managed_artifacts
-                .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()))
+                .contains(&UnifiedArtifactId::semantic_quotient(binding.clone()))
             {
                 report.retained.push(binding);
             } else {
@@ -298,10 +292,14 @@ impl PhysicalStore {
         if compatible {
             return Ok(());
         }
-        let relation = self.installed(binding.relation, binding.layout)?;
-        let state =
-            MaterializedObservableAtomState::build(binding.clone(), relation, context, registry)?;
-        self.row_occurrence_atoms_mut().insert(key, Arc::new(state));
+        let mut candidate = self.clone();
+        let state = candidate.build_catalog_free_observable_atom_state(
+            binding.clone(),
+            context,
+            registry,
+        )?;
+        candidate.row_occurrence_atoms_mut().insert(key, Arc::new(state));
+        *self = candidate;
         Ok(())
     }
 

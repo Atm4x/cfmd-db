@@ -4,6 +4,82 @@ use kernel_types::SemanticId;
 
 use crate::TypeExpr;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PermissionCoordinate {
+    ModelRead,
+    ReadRelation {
+        relation: SemanticId,
+    },
+    ReadField {
+        relation: SemanticId,
+        column: SemanticId,
+    },
+    HistoricalRead,
+    HistoryRead,
+    Watch,
+    WriteRelation {
+        relation: SemanticId,
+    },
+    WriteField {
+        relation: SemanticId,
+        column: SemanticId,
+    },
+    CreateObject {
+        relation: SemanticId,
+    },
+    DeleteObject {
+        relation: SemanticId,
+    },
+    AttachRelationship {
+        relation: SemanticId,
+    },
+    DetachRelationship {
+        relation: SemanticId,
+    },
+    MoveRelationship {
+        relation: SemanticId,
+    },
+    WriteCarrierPresence {
+        carrier: SemanticId,
+    },
+    WriteCarrierMember {
+        carrier: SemanticId,
+        member: SemanticId,
+    },
+    WriteLifecycleEntity {
+        entity: SemanticId,
+    },
+    WriteLifecycleRoot {
+        entity: SemanticId,
+    },
+    WriteKeepsAlivePresence {
+        parent: SemanticId,
+    },
+    WriteKeepsAliveEdge {
+        parent: SemanticId,
+        child: SemanticId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessCapabilityDef {
+    pub id: SemanticId,
+    pub permissions: BTreeSet<PermissionCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessRoleDef {
+    pub id: SemanticId,
+    pub capabilities: BTreeSet<SemanticId>,
+    pub includes: BTreeSet<SemanticId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SchemaAccess {
+    pub capabilities: BTreeMap<SemanticId, AccessCapabilityDef>,
+    pub roles: BTreeMap<SemanticId, AccessRoleDef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityDef {
     pub id: SemanticId,
@@ -41,6 +117,19 @@ pub struct RelationDef {
     pub id: SemanticId,
     pub columns: Vec<TypeExpr>,
     pub semantics: RelationSemantics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPolicyDef {
+    Keep,
+    DeleteIfUnowned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedRelationshipDef {
+    pub relation: SemanticId,
+    pub target_relation: SemanticId,
+    pub orphan_policy: OrphanPolicyDef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -122,10 +122,17 @@ mod tests {
         let relation = SemanticId::new(3);
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationCardinality {
-                relation,
-                min: 2,
-                max: Some(3),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: kernel_schema::SemanticRuleExpr::True,
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count {
+                        min: 2,
+                        max: Some(3),
+                    },
+                },
             })
             .unwrap();
 
@@ -207,27 +214,40 @@ mod tests {
         };
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExists {
-                relation,
-                predicate: predicate.clone(),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: predicate.clone(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count { min: 1, max: None },
+                },
             })
             .unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-                relation,
-                predicate,
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: (predicate).negate(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count {
+                        min: 0,
+                        max: Some(0),
+                    },
+                },
             })
             .unwrap();
 
         let plan = crate::CompiledRulePlan::compile(&context);
-        assert_eq!(plan.model_rules()[0].dependency().relation(), relation);
+        assert_eq!(plan.model_rules()[0].dependencies()[0].relation(), relation);
         assert_eq!(
-            plan.model_rules()[0].dependency().columns(),
+            plan.model_rules()[0].dependencies()[0].columns(),
             &BTreeSet::from([text_column])
         );
         assert_eq!(
-            plan.model_rules()[1].dependency().columns(),
+            plan.model_rules()[1].dependencies()[0].columns(),
             &BTreeSet::from([text_column])
         );
         assert_eq!(validate_state(&context, &registry, &state), Ok(()));
@@ -297,12 +317,21 @@ mod tests {
         let unrelated = context.schema.relation_column_id(relation, 1).unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-                relation,
-                predicate: kernel_schema::SemanticRuleExpr::TextLength {
-                    value: kernel_schema::RuleValueExpr::Field(guarded),
-                    min: 2,
-                    max: None,
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: (kernel_schema::SemanticRuleExpr::TextLength {
+                            value: kernel_schema::RuleValueExpr::Field(guarded),
+                            min: 2,
+                            max: None,
+                        })
+                        .negate(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count {
+                        min: 0,
+                        max: Some(0),
+                    },
                 },
             })
             .unwrap();
@@ -381,12 +410,21 @@ mod tests {
             let column = context.schema.relation_column_id(relation, 0).unwrap();
             context
                 .schema
-                .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-                    relation,
-                    predicate: kernel_schema::SemanticRuleExpr::TextLength {
-                        value: kernel_schema::RuleValueExpr::Field(column),
-                        min: 2,
-                        max: Some(2),
+                .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                    constraint: kernel_schema::ExactMeasureConstraint::Range {
+                        measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                            relation,
+                            predicate: (kernel_schema::SemanticRuleExpr::TextLength {
+                                value: kernel_schema::RuleValueExpr::Field(column),
+                                min: 2,
+                                max: Some(2),
+                            })
+                            .negate(),
+                        },
+                        range: kernel_schema::ExactAggregateRange::Count {
+                            min: 0,
+                            max: Some(0),
+                        },
                     },
                 })
                 .unwrap();
@@ -419,7 +457,7 @@ mod tests {
         use std::time::Instant;
 
         let rows = 1_000_000usize;
-        let (mut context, _registry, mut state) = fixture();
+        let (mut context, registry, mut state) = fixture();
         let relation = SemanticId::new(706);
         let text_eq = SemanticId::new(4);
         context
@@ -439,16 +477,25 @@ mod tests {
         let column = context.schema.relation_column_id(relation, 0).unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-                relation,
-                predicate: kernel_schema::SemanticRuleExpr::TextLength {
-                    value: kernel_schema::RuleValueExpr::Field(column),
-                    min: 2,
-                    max: Some(2),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: (kernel_schema::SemanticRuleExpr::TextLength {
+                            value: kernel_schema::RuleValueExpr::Field(column),
+                            min: 2,
+                            max: Some(2),
+                        })
+                        .negate(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count {
+                        min: 0,
+                        max: Some(0),
+                    },
                 },
             })
             .unwrap();
-        let witnesses = crate::ModelRuleWitnessState::build(&context, &state).unwrap();
+        let witnesses = crate::ModelRuleWitnessState::build(&context, &registry, &state).unwrap();
         let removed = vec![Value::Text("ok".into())];
         let inserted = vec![Value::Text("x".into())];
         let footprint = crate::RelationMutationFootprint::fields([column]);
@@ -505,16 +552,29 @@ mod tests {
         };
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExists {
-                relation,
-                predicate: predicate.clone(),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: predicate.clone(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count { min: 1, max: None },
+                },
             })
             .unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-                relation,
-                predicate,
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: (predicate).negate(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count {
+                        min: 0,
+                        max: Some(0),
+                    },
+                },
             })
             .unwrap();
 
@@ -574,16 +634,23 @@ mod tests {
         let one = kernel_schema::FiniteF64::new(1.0).unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactF64SumRange {
-                relation,
-                column,
-                min: Some(one),
-                max: Some(one),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::F64Sum {
+                        relation,
+                        column,
+                        predicate: kernel_schema::SemanticRuleExpr::True,
+                    },
+                    range: kernel_schema::ExactAggregateRange::F64Sum {
+                        min: Some(one),
+                        max: Some(one),
+                    },
+                },
             })
             .unwrap();
         let plan = crate::CompiledRulePlan::compile(&context);
         let rule = &plan.model_rules()[0];
-        assert_eq!(rule.dependency().columns(), &BTreeSet::from([column]));
+        assert_eq!(rule.dependencies()[0].columns(), &BTreeSet::from([column]));
         assert!(rule.is_satisfied(&state).unwrap());
         assert_eq!(rule.violation_mass(&state).unwrap(), 0);
         assert_eq!(validate_state(&context, &registry, &state), Ok(()));
@@ -595,6 +662,16 @@ mod tests {
             .push(vec![Value::F64Bits(0.5_f64.to_bits())]);
         assert!(!rule.is_satisfied(&state).unwrap());
         assert_eq!(rule.violation_mass(&state).unwrap(), 1);
+    }
+
+    fn maintained_witness_rows(first: &str, second: &str) -> Vec<Vec<Value>> {
+        vec![
+            vec![Value::Text(first.into()), Value::F64Bits(1.0_f64.to_bits())],
+            vec![
+                Value::Text(second.into()),
+                Value::F64Bits(2.0_f64.to_bits()),
+            ],
+        ]
     }
 
     #[test]
@@ -627,36 +704,53 @@ mod tests {
         };
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExists {
-                relation,
-                predicate: predicate.clone(),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: predicate.clone(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count { min: 1, max: None },
+                },
             })
             .unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-                relation,
-                predicate,
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: (predicate).negate(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count {
+                        min: 0,
+                        max: Some(0),
+                    },
+                },
             })
             .unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactF64SumRange {
-                relation,
-                column: sum_column,
-                min: Some(kernel_schema::FiniteF64::new(3.0).unwrap()),
-                max: Some(kernel_schema::FiniteF64::new(3.0).unwrap()),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::F64Sum {
+                        relation,
+                        column: sum_column,
+                        predicate: kernel_schema::SemanticRuleExpr::True,
+                    },
+                    range: kernel_schema::ExactAggregateRange::F64Sum {
+                        min: Some(kernel_schema::FiniteF64::new(3.0).unwrap()),
+                        max: Some(kernel_schema::FiniteF64::new(3.0).unwrap()),
+                    },
+                },
             })
             .unwrap();
-        state.model.relations.insert(
-            relation,
-            vec![
-                vec![Value::Text("ok".into()), Value::F64Bits(1.0_f64.to_bits())],
-                vec![Value::Text("bad".into()), Value::F64Bits(2.0_f64.to_bits())],
-            ],
-        );
+        state
+            .model
+            .relations
+            .insert(relation, maintained_witness_rows("ok", "bad"));
 
-        let witnesses = crate::ModelRuleWitnessState::build(&context, &state).unwrap();
+        let witnesses = crate::ModelRuleWitnessState::build(&context, &registry, &state).unwrap();
         assert_eq!(witnesses.violation_mass(&context, 0).unwrap(), 0);
         assert_eq!(witnesses.violation_mass(&context, 1).unwrap(), 1);
         assert_eq!(witnesses.violation_mass(&context, 2).unwrap(), 0);
@@ -678,14 +772,11 @@ mod tests {
         assert_eq!(next.violation_mass(&context, 2).unwrap(), 0);
 
         let mut target = state.clone();
-        target.model.relations.insert(
-            relation,
-            vec![
-                vec![Value::Text("ok".into()), Value::F64Bits(1.0_f64.to_bits())],
-                vec![Value::Text("ok".into()), Value::F64Bits(2.0_f64.to_bits())],
-            ],
-        );
-        let rebuilt = crate::ModelRuleWitnessState::build(&context, &target).unwrap();
+        target
+            .model
+            .relations
+            .insert(relation, maintained_witness_rows("ok", "ok"));
+        let rebuilt = crate::ModelRuleWitnessState::build(&context, &registry, &target).unwrap();
         assert_eq!(next, rebuilt);
     }
 
@@ -1335,5 +1426,355 @@ mod entity_rule_hostile_tests {
             }),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod pass522_grouped_exact_invariant_tests {
+    use kernel_model::{DatabaseState, Value};
+    use kernel_schema::{
+        ExactAggregateMeasureExpr, ExactAggregateRange, ExactMeasureConstraint, ModelRuleExpr,
+        RelationDef, RelationSemantics, ScalarType, Schema, SemanticContext, SemanticEnvironment,
+        SemanticRuleExpr, TypeExpr,
+    };
+    use kernel_semantics::{EquivalenceModule, SemanticRegistry};
+    use kernel_types::{SchemaRevisionId, SemanticEnvId, SemanticId};
+
+    use crate::{
+        ModelRuleWitnessState, RelationMutationFootprint, ValidationError, validate_state,
+    };
+
+    #[test]
+    fn grouped_count_uses_gamma_canonical_key_and_updates_only_touched_bucket() {
+        let relation = SemanticId::new(1_522_001);
+        let key_column = SemanticId::new(1_522_002);
+        let key_equivalence = SemanticId::new(1_522_003);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(1));
+        environment.pin_module(key_equivalence, digest);
+
+        let mut schema = Schema::new(SchemaRevisionId::new(1));
+        schema
+            .define_relation_with_column_ids(
+                RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![key_equivalence],
+                    },
+                },
+                vec![key_column],
+            )
+            .unwrap();
+        schema
+            .add_model_rule(ModelRuleExpr::RelationGroupedExactMeasure {
+                group_columns: vec![key_column],
+                group_equivalences: vec![key_equivalence],
+                constraint: ExactMeasureConstraint::Range {
+                    measure: ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: SemanticRuleExpr::True,
+                    },
+                    range: ExactAggregateRange::Count {
+                        min: 0,
+                        max: Some(1),
+                    },
+                },
+            })
+            .unwrap();
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let mut state = DatabaseState::default();
+        state.model.relations.insert(
+            relation,
+            vec![
+                vec![Value::Text("ALICE".into())],
+                vec![Value::Text("alice".into())],
+            ],
+        );
+
+        assert_eq!(
+            validate_state(&context, &registry, &state),
+            Err(ValidationError::ModelRuleViolation { rule_index: 0 })
+        );
+        let witness = ModelRuleWitnessState::build(&context, &registry, &state).unwrap();
+        assert_eq!(witness.violation_mass(&context, 0), Ok(1));
+
+        let next = witness
+            .apply_relation_delta_semantic(
+                &context,
+                &registry,
+                relation,
+                &RelationMutationFootprint::full(),
+                &[vec![Value::Text("alice".into())]],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(next.violation_mass(&context, 0), Ok(0));
+    }
+}
+
+#[cfg(test)]
+mod pass524_grouped_measure_product_tests {
+    use std::collections::BTreeSet;
+
+    use kernel_model::{DatabaseState, Value};
+    use kernel_schema::{
+        ExactAggregateMeasureExpr, ExactAggregateRange, ExactMeasureConstraint, ModelRuleExpr,
+        OrderedStatisticBound, OrderedStatisticSelector, RelationDef, RelationSemantics,
+        RuleOrderComparison, RuleValueExpr, ScalarType, Schema, SemanticContext,
+        SemanticEnvironment, SemanticRuleExpr, TypeExpr,
+    };
+    use kernel_semantics::{EquivalenceModule, OrderingModule, SemanticRegistry};
+    use kernel_types::{SchemaRevisionId, SemanticEnvId, SemanticId};
+
+    use crate::{ModelRuleWitnessState, RelationMutationFootprint};
+
+    #[test]
+    fn grouped_measure_product_rejects_cross_domain_or_mixed_measure_types() {
+        let left_relation = SemanticId::new(1_524_101);
+        let right_relation = SemanticId::new(1_524_102);
+        let left_column = SemanticId::new(1_524_103);
+        let right_column = SemanticId::new(1_524_104);
+        let equivalence = SemanticId::new(1_524_105);
+        let mut schema = Schema::new(SchemaRevisionId::new(1));
+        for (relation, column) in [(left_relation, left_column), (right_relation, right_column)] {
+            schema
+                .define_relation_with_column_ids(
+                    RelationDef {
+                        id: relation,
+                        columns: vec![TypeExpr::Scalar(ScalarType::F64)],
+                        semantics: RelationSemantics::Bag {
+                            column_equivalences: vec![equivalence],
+                        },
+                    },
+                    vec![column],
+                )
+                .unwrap();
+        }
+
+        let cross_domain = ModelRuleExpr::RelationGroupedExactMeasure {
+            group_columns: vec![left_column],
+            group_equivalences: vec![equivalence],
+            constraint: ExactMeasureConstraint::Compare {
+                left: ExactAggregateMeasureExpr::Count {
+                    relation: left_relation,
+                    predicate: SemanticRuleExpr::True,
+                },
+                right: ExactAggregateMeasureExpr::Count {
+                    relation: right_relation,
+                    predicate: SemanticRuleExpr::True,
+                },
+                comparison: RuleOrderComparison::LessOrEqual,
+            },
+        };
+        assert!(schema.add_model_rule(cross_domain).is_err());
+
+        let mixed = ModelRuleExpr::RelationGroupedExactMeasure {
+            group_columns: vec![left_column],
+            group_equivalences: vec![equivalence],
+            constraint: ExactMeasureConstraint::Compare {
+                left: ExactAggregateMeasureExpr::Count {
+                    relation: left_relation,
+                    predicate: SemanticRuleExpr::True,
+                },
+                right: ExactAggregateMeasureExpr::F64Sum {
+                    relation: left_relation,
+                    column: left_column,
+                    predicate: SemanticRuleExpr::True,
+                },
+                comparison: RuleOrderComparison::LessOrEqual,
+            },
+        };
+        assert!(schema.add_model_rule(mixed).is_err());
+    }
+
+    #[test]
+    fn grouped_measure_product_uses_one_gamma_canonical_domain() {
+        let relation = SemanticId::new(1_524_001);
+        let key_column = SemanticId::new(1_524_002);
+        let key_equivalence = SemanticId::new(1_524_003);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_equivalence(EquivalenceModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(1));
+        environment.pin_module(key_equivalence, digest);
+
+        let mut schema = Schema::new(SchemaRevisionId::new(1));
+        schema
+            .define_relation_with_column_ids(
+                RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![key_equivalence],
+                    },
+                },
+                vec![key_column],
+            )
+            .unwrap();
+        let alice_only = SemanticRuleExpr::TextOneOf {
+            value: RuleValueExpr::Field(key_column),
+            allowed: BTreeSet::from(["ALICE".to_owned()]),
+        };
+        schema
+            .add_model_rule(ModelRuleExpr::RelationGroupedExactMeasure {
+                group_columns: vec![key_column],
+                group_equivalences: vec![key_equivalence],
+                constraint: ExactMeasureConstraint::Compare {
+                    left: ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: alice_only,
+                    },
+                    right: ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: SemanticRuleExpr::True,
+                    },
+                    comparison: RuleOrderComparison::Less,
+                },
+            })
+            .unwrap();
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+        let mut state = DatabaseState::default();
+        state.model.relations.insert(
+            relation,
+            vec![
+                vec![Value::Text("ALICE".into())],
+                vec![Value::Text("alice".into())],
+            ],
+        );
+
+        let witness = ModelRuleWitnessState::build(&context, &registry, &state).unwrap();
+        assert_eq!(witness.violation_mass(&context, 0), Ok(0));
+
+        let next = witness
+            .apply_relation_delta_semantic(
+                &context,
+                &registry,
+                relation,
+                &RelationMutationFootprint::full(),
+                &[vec![Value::Text("alice".into())]],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(next.violation_mass(&context, 0), Ok(1));
+    }
+
+    #[test]
+    fn ordered_statistic_range_canonicalizes_bound_under_pinned_ordering_once_per_witness() {
+        let relation = SemanticId::new(1_529_001);
+        let column = SemanticId::new(1_529_002);
+        let equivalence = SemanticId::new(1_529_003);
+        let ordering = SemanticId::new(1_529_004);
+        let mut registry = SemanticRegistry::default();
+        let eq_digest = registry.install_equivalence(EquivalenceModule::TextExact);
+        let order_digest = registry.install_ordering(OrderingModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(1));
+        environment.pin_module(equivalence, eq_digest);
+        environment.pin_module(ordering, order_digest);
+
+        let mut schema = Schema::new(SchemaRevisionId::new(1));
+        schema
+            .define_relation_with_column_ids(
+                RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![equivalence],
+                    },
+                },
+                vec![column],
+            )
+            .unwrap();
+        schema
+            .add_model_rule(ModelRuleExpr::RelationExactMeasure {
+                constraint: ExactMeasureConstraint::Range {
+                    measure: ExactAggregateMeasureExpr::OrderedStatistic {
+                        relation,
+                        column,
+                        predicate: SemanticRuleExpr::True,
+                        ordering,
+                        selector: OrderedStatisticSelector::FromStart(0),
+                    },
+                    range: ExactAggregateRange::OrderedStatistic {
+                        min: Some(OrderedStatisticBound::Text("ALICE".into())),
+                        max: Some(OrderedStatisticBound::Text("ALICE".into())),
+                    },
+                },
+            })
+            .unwrap();
+        let context = SemanticContext {
+            schema,
+            environment,
+        };
+
+        let empty = DatabaseState::default();
+        let empty_witness = ModelRuleWitnessState::build(&context, &registry, &empty).unwrap();
+        assert_eq!(empty_witness.violation_mass(&context, 0), Ok(0));
+
+        let mut state = DatabaseState::default();
+        state
+            .model
+            .relations
+            .insert(relation, vec![vec![Value::Text("alice".into())]]);
+        let witness = ModelRuleWitnessState::build(&context, &registry, &state).unwrap();
+        assert_eq!(witness.violation_mass(&context, 0), Ok(0));
+
+        let next = witness
+            .apply_relation_delta_semantic(
+                &context,
+                &registry,
+                relation,
+                &RelationMutationFootprint::full(),
+                &[vec![Value::Text("alice".into())]],
+                &[vec![Value::Text("bob".into())]],
+            )
+            .unwrap();
+        assert_eq!(next.violation_mass(&context, 0), Ok(1));
+    }
+
+    #[test]
+    fn semantic_ordered_multiset_uses_canonical_order_classes_and_deletes_extrema_locally() {
+        use kernel_aggregate::ExactOrderedMultiset;
+        use kernel_semantics::OrderingModule;
+
+        let ordering = SemanticId::new(1_527_001);
+        let mut registry = SemanticRegistry::default();
+        let digest = registry.install_ordering(OrderingModule::TextAsciiCaseInsensitive);
+        let mut environment = SemanticEnvironment::new(SemanticEnvId::new(1));
+        environment.pin_module(ordering, digest);
+        let context = SemanticContext {
+            schema: Schema::new(SchemaRevisionId::new(1)),
+            environment,
+        };
+
+        let key = |value: &str| {
+            registry
+                .canonical_order_key(&context, ordering, &Value::Text(value.into()))
+                .unwrap()
+        };
+        let alice_upper = key("ALICE");
+        let alice_lower = key("alice");
+        let bob = key("bob");
+        assert_eq!(alice_upper, alice_lower);
+
+        let mut witness = ExactOrderedMultiset::default();
+        witness.add_one(bob.clone());
+        witness.add_one(alice_upper.clone());
+        witness.add_one(alice_lower.clone());
+        assert_eq!(witness.distinct_len(), 2);
+        assert_eq!(witness.min_key(), Some(&alice_upper));
+        assert_eq!(witness.max_key(), Some(&bob));
+
+        witness.remove_one(&alice_lower).unwrap();
+        assert_eq!(witness.min_key(), Some(&alice_upper));
+        witness.remove_one(&alice_upper).unwrap();
+        assert_eq!(witness.min_key(), Some(&bob));
+        assert_eq!(witness.max_key(), Some(&bob));
     }
 }

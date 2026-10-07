@@ -17,6 +17,7 @@ impl SubscriptionId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenWatchRequest {
+    pub target: crate::SnapshotTarget,
     pub query: crate::ProtocolQuery,
 }
 

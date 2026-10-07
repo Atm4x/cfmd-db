@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod access;
 mod blocker;
 mod composition;
+mod cq_semantic_identity;
 mod delta_abi;
 mod delta_kernels;
 mod delta_materialization;
@@ -9,6 +10,8 @@ mod differential_api;
 mod differential_program;
 mod exact_measure;
 mod execgraph;
+#[cfg(test)]
+mod factorized_count_rnd;
 mod group;
 mod join;
 mod linear_island;

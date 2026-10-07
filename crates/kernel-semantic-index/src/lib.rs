@@ -2,7 +2,7 @@ use kernel_persistent::{PersistentOrdMap, PersistentOrdMapIter};
 use kernel_schema::{ModuleDigest, SemanticContext, StructuralEquivalenceDef};
 use kernel_types::{SemanticId, SemanticRevision};
 
-pub const KEY_ENCODING_REVISION: u64 = 2;
+pub const KEY_ENCODING_REVISION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticIndexCompatibility {

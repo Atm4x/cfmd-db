@@ -104,7 +104,7 @@ rotate_needles = [
     'publish_manifest_with_hook(',
     'self.generation = generation;',
     'self.checkpoint = revision.clone();',
-    'self.wal = wal;',
+    'self.wal = wal.into();',
     'self.advance_external_freshness_generation_with_digest(generation, 0, freshness_digest)?;',
 ]
 pos = [rotate.find(n) for n in rotate_needles]

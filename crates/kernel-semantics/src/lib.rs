@@ -4,11 +4,14 @@ mod contracts;
 mod deployment;
 mod equivalence;
 mod error;
+pub mod fiber_carrier;
+pub mod fiber_retention;
 mod implementation_descriptor;
 mod module_digest;
 pub mod observable;
 mod ordering;
 mod registry;
+pub mod semantic_class_catalog;
 pub mod support_atom;
 mod tokenizer;
 
@@ -1908,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_eq_key_v2_has_golden_bytes_independent_of_rust_layout() {
+    fn canonical_eq_key_v1_has_golden_bytes_independent_of_rust_layout() {
         let key = CanonicalEqKey::Product(vec![
             (
                 SemanticId::new(1),
@@ -1919,7 +1922,7 @@ mod tests {
         assert_eq!(
             encode_canonical_eq_key(&key),
             vec![
-                67, 69, 75, 0, 0, 0, 0, 2, 8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                67, 69, 75, 0, 0, 0, 0, 1, 8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 1, 5, 0, 0, 0, 0, 0, 0, 0, 1, 97, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 2, 2, 255, 255, 255, 255, 255, 255, 255, 255,
             ]

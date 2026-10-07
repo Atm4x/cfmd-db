@@ -47,6 +47,53 @@ fn descriptor(source: u64, target: u64, value: Value) -> DurableRevisionDescript
 }
 
 #[test]
+fn released_format_matrix_is_v1_read_write_only() {
+    assert_eq!(FORMAT_VERSION, 1);
+    assert_eq!(
+        FORMAT_COMPATIBILITY,
+        [DurableFormatCompatibility {
+            version: 1,
+            readable: true,
+            writable: true,
+        }]
+    );
+    assert_eq!(durable_format_support(1), DurableFormatSupport::ReadWrite);
+    assert_eq!(
+        durable_format_support(0),
+        DurableFormatSupport::UnsupportedOlder
+    );
+    assert_eq!(
+        durable_format_support(2),
+        DurableFormatSupport::UnsupportedNewer
+    );
+}
+
+#[test]
+fn pre_release_checkpoint_codec_versions_are_not_compatibility_surface() {
+    let registry = SemanticRegistry::default();
+    let context = SemanticContext {
+        schema: Schema::new(SchemaRevisionId::new(70)),
+        environment: SemanticEnvironment::new(SemanticEnvId::new(90)),
+    };
+    let revision = kernel_revision::Revision::build(
+        RevisionId::new(1),
+        &context,
+        &registry,
+        DatabaseState::default(),
+    )
+    .unwrap();
+    let mut bytes = crate::checkpoint::encode_revision(&revision).unwrap();
+    bytes[..2].copy_from_slice(&6_u16.to_le_bytes());
+    assert!(matches!(
+        crate::checkpoint::decode_revision(&bytes, &registry),
+        Err(DurabilityError::Corruption {
+            reason: "unsupported checkpoint codec version",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn client_intent_identity_survives_revision_recertification() {
     let first = descriptor(1, 2, Value::I64(7));
     let rebased = descriptor(9, 10, Value::I64(7));

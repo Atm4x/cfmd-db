@@ -667,6 +667,41 @@ impl PartialEq for RelationBaseWitness {
 impl Eq for RelationBaseWitness {}
 
 impl RelationBaseWitness {
+    /// Rebinds a maintained row-identical observation to a new semantic
+    /// context without rescanning or re-canonicalizing rows.
+    ///
+    /// Callers must already hold a structural transport certificate proving
+    /// that the relation's row representation is unchanged. This method still
+    /// independently verifies the target relation type and compiled
+    /// equivalence semantics before reusing the persistent occurrence roots.
+    pub fn rebind_observation_identity_context(
+        &self,
+        target_relation: kernel_types::SemanticId,
+        target: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<Self, RelQueryError> {
+        let relation = target
+            .schema
+            .relation(target_relation)
+            .ok_or(RelQueryError::UnknownRelation(target_relation))?;
+        let target_type = RelType {
+            columns: relation.columns.clone(),
+            semantics: relation.semantics.clone(),
+        };
+        if target_type != self.result_type {
+            return Err(RelQueryError::TypeMismatch);
+        }
+        let canonicalizers = Self::compile_canonicalizers(&target_type, target, registry)?;
+        if canonicalizers != self.canonicalizers {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        let mut rebound = self.clone();
+        rebound.relation = target_relation;
+        rebound.semantic_context = target.clone();
+        rebound.canonicalizers = canonicalizers;
+        Ok(rebound)
+    }
+
     /// O(1) restricted projection of this persistent Γ occurrence root for
     /// support-only validation/history transport.
     #[must_use]

@@ -28,6 +28,21 @@ impl RuntimeHistoricalDerivedIndex {
         self.relation_supports.insert(relation, timeline);
     }
 
+    fn index_relation_delta(
+        &mut self,
+        target_revision: RevisionId,
+        relation: SemanticId,
+        delta: RelationDelta,
+    ) {
+        let mut timeline = self
+            .relation_deltas
+            .get(&relation)
+            .cloned()
+            .unwrap_or_default();
+        timeline.insert(target_revision, delta);
+        self.relation_deltas.insert(relation, timeline);
+    }
+
     fn support_at(
         &self,
         revision: RevisionId,
@@ -74,6 +89,7 @@ impl RuntimeHistoricalDerivedIndex {
         let index = RuntimeRetainedEpochIndex {
             lineage_floor: self.lineage_floor,
             relation_supports: self.relation_supports.clone(),
+            relation_deltas: self.relation_deltas.clone(),
             writes: self.writes.clone(),
             observations: self.observations.clone(),
             joint_observation_groups: self.joint_observation_groups.clone(),
@@ -86,6 +102,7 @@ impl RuntimeHistoricalDerivedIndex {
         self.retained_schema_epochs.insert(
             source_revision,
             RuntimeRetainedSchemaEpoch {
+                effect_id,
                 source_revision,
                 target_revision,
                 source_context: self_context,
@@ -348,6 +365,57 @@ impl RuntimeHistoricalDerivedIndex {
 }
 
 impl RuntimeRetainedEpochIndex {
+    fn index_relation_delta(
+        &mut self,
+        target_revision: RevisionId,
+        relation: SemanticId,
+        delta: RelationDelta,
+    ) {
+        let mut timeline = self
+            .relation_deltas
+            .get(&relation)
+            .cloned()
+            .unwrap_or_default();
+        timeline.insert(target_revision, delta);
+        self.relation_deltas.insert(relation, timeline);
+    }
+
+    fn relation_deltas_between(
+        &self,
+        source_revision: RevisionId,
+        boundary_revision: RevisionId,
+        relations: &BTreeSet<SemanticId>,
+    ) -> Option<BTreeMap<RevisionId, BTreeMap<SemanticId, RelationDelta>>> {
+        let lineage_floor = self.lineage_floor?;
+        if source_revision < lineage_floor || boundary_revision < source_revision {
+            return None;
+        }
+        let mut out = BTreeMap::<RevisionId, BTreeMap<SemanticId, RelationDelta>>::new();
+        for relation in relations {
+            let Some(timeline) = self.relation_deltas.get(relation) else {
+                continue;
+            };
+            let mut rank = timeline.rank_before(&source_revision);
+            if timeline.get(&source_revision).is_some() {
+                rank += 1;
+            }
+            while rank < timeline.len() {
+                let revision = *timeline.key_at_rank(rank)?;
+                if revision > boundary_revision {
+                    break;
+                }
+                let delta = timeline.get(&revision)?.clone();
+                out.entry(revision).or_default().insert(*relation, delta);
+                rank += 1;
+            }
+        }
+        Some(out)
+    }
+
+    fn exact_effect_at(&self, target_revision: RevisionId) -> Option<u128> {
+        self.exact_effects.get(&target_revision).copied()
+    }
+
     fn index_causal_observation_groups(
         &mut self,
         target_revision: RevisionId,
@@ -643,6 +711,11 @@ impl RuntimeRetainedEpochIndex {
                     removed: mutation.removed.clone(),
                     result_type: support.result_type().clone(),
                 };
+                out.index_relation_delta(
+                    effect.target_revision,
+                    mutation.relation,
+                    transition.clone(),
+                );
                 let rewound = support
                     .rewind_exact(effect.source_revision, &transition, registry)
                     .map_err(PhysicalExecutionError::from)?;
@@ -727,6 +800,10 @@ impl RuntimeRevisionBundle {
                 .reset_at(target_revision, Some(effect_id), &self.relation_bases);
             return Ok(());
         };
+        for (&relation, delta) in relation_deltas {
+            self.historical
+                .index_relation_delta(target_revision, relation, delta.clone());
+        }
         let mut footprint = RuntimeHistoryFootprint::default();
         for (&relation, delta) in relation_deltas {
             if let Some(field_writes) = descriptor.object_field_writes.get(&relation)
@@ -929,6 +1006,11 @@ impl RuntimeRevisionBundle {
                     removed: mutation.removed.clone(),
                     result_type: support.result_type().clone(),
                 };
+                index.index_relation_delta(
+                    effect.target_revision,
+                    mutation.relation,
+                    transition.clone(),
+                );
                 let rewound = support
                     .rewind_exact(effect.source_revision, &transition, registry)
                     .map_err(PhysicalExecutionError::from)?;
@@ -1487,6 +1569,7 @@ mod p488_relational_capsule_rebuild_scaling_tests {
                 model_delta: None,
                 model_complement: None,
                 semantic_change: None,
+                schema_migration_program: None,
                 causal_observations: Vec::new(),
                 causal_observation_values: BTreeMap::new(),
                 causal_observation_predicates: BTreeMap::new(),

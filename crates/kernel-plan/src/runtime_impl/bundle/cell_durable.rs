@@ -24,47 +24,6 @@ impl RuntimeRevisionCell {
         self.commit_prepared_durable(transaction_id, prepared, request.registry, durability)
     }
 
-    /// Exact compatibility path for the legacy relation-data API that accepts
-    /// an independently supplied target Revision. The runtime publication can
-    /// still use the incremental prepared transition, but durable idempotency
-    /// must retain the complete target witness because `RevisionId` is nominal.
-    pub(crate) fn commit_revision_durable_full_exact<D: RevisionDurability>(
-        &self,
-        transaction_id: ClientTransactionId,
-        request: &RevisionTransitionRequest<'_>,
-        durability: &mut D,
-    ) -> Result<DurableRuntimeCommitReceipt, DurableRuntimeCommitError> {
-        let prepared = self.prepare_revision(request)?;
-        let descriptor = DurableRevisionDescriptor::full_revision(
-            transaction_id,
-            prepared.descriptor().source_revision(),
-            prepared.descriptor().target(),
-            request.registry,
-        )
-        .map_err(DurabilityError::Encode)
-        .map_err(DurableRuntimeCommitError::PrepareDurability)?;
-        let durable_prepare = durability
-            .durably_prepare(&descriptor)
-            .map_err(DurableRuntimeCommitError::PrepareDurability)?;
-        let prepared = prepared.bind_committed_history_effect(
-            durable_prepare.revision_effect_id().0,
-            request.registry,
-        )?;
-        let sealed = prepared.seal(self)?;
-        let durable = match durability.durably_commit(durable_prepare) {
-            Ok(durable) => durable,
-            Err(error) => {
-                sealed.require_recovery();
-                return Err(DurableRuntimeCommitError::CommitDurabilityUncertain(error));
-            }
-        };
-        let output_deltas = sealed.publish();
-        Ok(DurableRuntimeCommitReceipt {
-            durable,
-            publication: RuntimePublicationEffect::Incremental(output_deltas),
-        })
-    }
-
     pub(crate) fn commit_full_revision_durable<D: RevisionDurability>(
         &self,
         transaction_id: ClientTransactionId,

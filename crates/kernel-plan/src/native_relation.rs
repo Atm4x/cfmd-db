@@ -133,6 +133,50 @@ pub(super) fn native_row_count(data: &NativeRelation) -> usize {
     }
 }
 
+pub(super) fn native_value_at(
+    data: &NativeRelation,
+    column_index: usize,
+    row_index: usize,
+) -> Result<Value, PhysicalExecutionError> {
+    match data {
+        NativeRelation::RowStore { rows, .. } => rows
+            .get(row_index)
+            .and_then(|row| row.get(column_index))
+            .cloned()
+            .ok_or(PhysicalExecutionError::ColumnShapeMismatch),
+        NativeRelation::Columnar { columns, row_count } => {
+            if row_index >= *row_count {
+                return Err(PhysicalExecutionError::ColumnShapeMismatch);
+            }
+            columns
+                .get(column_index)
+                .and_then(|column| column.get(row_index))
+                .cloned()
+                .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
+        }
+        NativeRelation::I64Columnar { columns, row_count } => {
+            if row_index >= *row_count {
+                return Err(PhysicalExecutionError::ColumnShapeMismatch);
+            }
+            columns
+                .get(column_index)
+                .and_then(|column| column.get(row_index))
+                .copied()
+                .map(Value::I64)
+                .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
+        }
+        NativeRelation::TypedColumnar { columns, row_count } => {
+            if row_index >= *row_count {
+                return Err(PhysicalExecutionError::ColumnShapeMismatch);
+            }
+            columns
+                .get(column_index)
+                .map(|column| column.value_at(row_index))
+                .ok_or(PhysicalExecutionError::ColumnShapeMismatch)
+        }
+    }
+}
+
 pub(super) fn materialize_native_row(
     data: &NativeRelation,
     row_index: usize,

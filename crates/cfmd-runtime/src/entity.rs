@@ -220,8 +220,19 @@ impl<E: Object> crate::ObjectValue for Ref<E> {
     }
 }
 
-impl<E: Object> crate::OrderedObjectValue for Id<E> {}
-impl<E: Object> crate::OrderedObjectValue for Ref<E> {}
+impl<E: Object> crate::OrderedObjectValue for Id<E> {
+    fn __into_ordered_statistic_bound(self) -> crate::OrderedStatisticBound {
+        crate::OrderedStatisticBound::HistoricalEntityRef(crate::EntityRef {
+            entity_type: E::type_id(),
+            id: self.raw(),
+        })
+    }
+}
+impl<E: Object> crate::OrderedObjectValue for Ref<E> {
+    fn __into_ordered_statistic_bound(self) -> crate::OrderedStatisticBound {
+        self.id().__into_ordered_statistic_bound()
+    }
+}
 
 impl<E: Object> ValueCodec for Option<Ref<E>> {
     fn into_value(self) -> Value {
@@ -803,6 +814,12 @@ impl<S: Object, T: Object> ManyField<S, T> {
             error,
             marker: PhantomData,
         }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __relation_id(&self) -> crate::RelationId {
+        self.relation
     }
 
     #[must_use]

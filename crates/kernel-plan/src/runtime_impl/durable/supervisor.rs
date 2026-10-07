@@ -153,7 +153,8 @@ impl DurableRuntimeSupervisor {
             .retry_horizon()
     }
 
-    pub fn commit_revision(
+    #[cfg(test)]
+    pub(crate) fn commit_revision(
         &self,
         transaction_id: ClientTransactionId,
         request: &RevisionTransitionRequest<'_>,

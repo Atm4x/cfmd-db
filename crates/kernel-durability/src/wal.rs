@@ -1,12 +1,16 @@
 mod file;
 mod recovery;
+mod runtime;
 mod simulated;
+mod volatile;
 
 pub use file::FileRevisionWal;
 pub(crate) use file::WalRegionRecovery;
 pub use recovery::scan_wal;
 pub(crate) use recovery::{WalRegionScanSpec, scan_wal_stream_seeded};
+pub(crate) use runtime::RuntimeRevisionWal;
 pub use simulated::SimulatedRevisionWal;
+pub(crate) use volatile::VolatileRevisionWal;
 
 pub(crate) const WAL_FRESHNESS_PREFIX_DOMAIN: &[u8] = b"CFMD-WAL-FRESHNESS-PREFIX-v1\0";
 pub(crate) fn wal_aad_context(

@@ -56,7 +56,7 @@ fn multiway_right_access_estimate(
         predicate.equivalence,
     );
     let allow_ephemeral = store
-        .semantic_statistics(&binding, context, registry)?
+        .semantic_cardinality(&binding, context, registry)?
         .is_some();
     right_scan_join_access_decision(
         RightJoinAccessRequest {

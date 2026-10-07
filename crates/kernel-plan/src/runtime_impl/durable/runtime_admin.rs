@@ -1,4 +1,12 @@
 impl DurableRuntime {
+    pub fn persistence_path(&self) -> Result<Option<std::path::PathBuf>, DurabilityError> {
+        let durability = self
+            .durability
+            .lock()
+            .map_err(|_| DurabilityError::Poisoned)?;
+        Ok(durability.directory().map(std::path::Path::to_path_buf))
+    }
+
     pub fn rewrap_storage_encryption(
         &self,
         next: &kernel_durability::StorageEncryption,
@@ -72,7 +80,7 @@ impl DurableRuntime {
     ///
     /// No historical snapshot is persisted separately: the current immutable
     /// revision plus the Γ-REIC effect ideal and exact forward/reverse deltas
-    /// are the sole authority. Non-reversible legacy/full/schema boundaries
+    /// are the sole authority. Non-reversible full/schema boundaries
     /// fail closed instead of synthesizing an approximate state.
     pub fn factorized_read_snapshot_at(
         &self,
@@ -682,6 +690,44 @@ impl DurableRuntime {
             }))
     }
 
+
+    /// Returns the exact committed semantic migration on one revision edge, when present.
+    ///
+    /// This is an indexed projection over the existing durable causal frontier, not a history
+    /// scan and not a second migration-status store.
+    pub fn semantic_schema_migration_at(
+        &self,
+        source_revision: kernel_types::RevisionId,
+        target_revision: kernel_types::RevisionId,
+        lens_spec: kernel_types::SemanticId,
+    ) -> Result<Option<kernel_durability::SemanticChangeEvent>, DurabilityError> {
+        let durability = self
+            .durability
+            .lock()
+            .map_err(|_| DurabilityError::Poisoned)?;
+        let Some(frontier) = durability.revision_effect_frontier(target_revision) else {
+            return Ok(None);
+        };
+        for effect_id in frontier {
+            let record = durability
+                .revision_effect_record(*effect_id)
+                .ok_or(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "durable revision frontier references a missing migration effect",
+                })?;
+            if record.source_revision != source_revision || record.target_revision != target_revision {
+                continue;
+            }
+            let Some(event) = record.semantic_change_event() else {
+                continue;
+            };
+            if event.lens_spec.0 == lens_spec {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn causal_coverage_root(&self) -> Result<RevisionId, DurabilityError> {
         let durability = self
             .durability
@@ -752,6 +798,68 @@ impl DurableRuntime {
             DurableRuntimeCheckpointError::DurabilityUncertain(DurabilityError::Poisoned)
         })?;
         self.cell.checkpoint_durable(&mut durability)
+    }
+
+    /// Enumerates the durable historical epoch pins currently retained by the
+    /// live persistence authority. These are storage-neutral semantic-boundary
+    /// pins, not reader snapshot handles.
+    pub fn retained_historical_epochs(
+        &self,
+    ) -> Result<Vec<RetainedHistoricalEpoch>, DurabilityError> {
+        let durability = self.durability.lock().map_err(|_| DurabilityError::Poisoned)?;
+        Ok(durability
+            .historical_epoch_anchors()
+            .values()
+            .map(|anchor| RetainedHistoricalEpoch {
+                effect_id: anchor.effect_id.0,
+                source_revision: anchor.source_revision,
+                source_schema: anchor.source_schema,
+            })
+            .collect())
+    }
+
+    /// Releases one retained schema epoch from the durable historical root and
+    /// the matching runtime-derived proof root in the same operation. Old
+    /// reader snapshots may keep the persistent lineage alive until they drop,
+    /// but the live root no longer retains or serves it.
+    pub fn release_historical_epoch_authority(
+        &self,
+        effect_id: u128,
+    ) -> Result<Option<DurableGenerationReceipt>, DurableRuntimeCheckpointError> {
+        let snapshot = self
+            .snapshot()
+            .map_err(DurableRuntimeCheckpointError::Runtime)?;
+        let revision = snapshot.revision().clone();
+        drop(snapshot);
+        let mut durability = self.durability.lock().map_err(|_| {
+            let _ = self.cell.force_recovery_required();
+            DurableRuntimeCheckpointError::DurabilityUncertain(DurabilityError::Poisoned)
+        })?;
+        let was_retained = durability
+            .historical_epoch_anchors()
+            .contains_key(&kernel_change::RevisionEffectId(effect_id));
+        let receipt = durability
+            .release_historical_epoch_authority(
+                &revision,
+                kernel_change::RevisionEffectId(effect_id),
+            )
+            .map_err(|error| {
+                if durability.requires_recovery() {
+                    let _ = self.cell.force_recovery_required();
+                    DurableRuntimeCheckpointError::DurabilityUncertain(error)
+                } else {
+                    DurableRuntimeCheckpointError::Durability(error)
+                }
+            })?;
+        if was_retained {
+            self.cell
+                .release_retained_schema_epoch(effect_id)
+                .map_err(|error| {
+                    let _ = self.cell.force_recovery_required();
+                    DurableRuntimeCheckpointError::Runtime(error)
+                })?;
+        }
+        Ok(receipt)
     }
 
     /// Irreversibly expires local causal replay before the current head and
@@ -1192,7 +1300,7 @@ fn apply_runtime_history_effect(
     )?)
 }
 
-fn proposed_transition_footprint(
+pub(super) fn proposed_transition_footprint(
     source_revision: RevisionId,
     semantic_context: &kernel_schema::SemanticContext,
     mutations: &[RevisionRelationMutation<'_>],
@@ -1343,31 +1451,31 @@ fn add_model_delta_footprint(
 fn add_carrier_delta_footprint(
     writes: &mut BTreeMap<RuntimeHistoryCoordinate, kernel_change::RewriteActionLaw>,
     delta: &DurableModelDelta,
-    complement: Option<&DurableModelDelta>,
+    _complement: Option<&DurableModelDelta>,
 ) {
-    let complement_carriers = complement
-        .into_iter()
-        .flat_map(|delta| delta.carriers.iter())
-        .map(|patch| (patch.carrier, patch.target_present))
-        .collect::<BTreeMap<_, _>>();
     for patch in &delta.carriers {
-        if complement_carriers
-            .get(&patch.carrier)
-            .is_some_and(|source_present| *source_present != patch.target_present)
-        {
+        insert_runtime_history_action(
+            writes,
+            RuntimeHistoryCoordinate::CarrierPresence {
+                carrier: patch.carrier,
+            },
+            if patch.target_present {
+                kernel_change::RewriteActionLaw::EnsurePresent
+            } else {
+                kernel_change::RewriteActionLaw::EnsureAbsent
+            },
+        );
+        for entity in &patch.inserted {
             insert_runtime_history_action(
                 writes,
-                RuntimeHistoryCoordinate::CarrierPresence {
+                RuntimeHistoryCoordinate::CarrierMember {
                     carrier: patch.carrier,
+                    entity: *entity,
                 },
-                if patch.target_present {
-                    kernel_change::RewriteActionLaw::EnsurePresent
-                } else {
-                    kernel_change::RewriteActionLaw::EnsureAbsent
-                },
+                kernel_change::RewriteActionLaw::Opaque,
             );
         }
-        for entity in patch.inserted.iter().chain(&patch.removed) {
+        for entity in &patch.removed {
             insert_runtime_history_action(
                 writes,
                 RuntimeHistoryCoordinate::CarrierMember {
@@ -1435,30 +1543,20 @@ fn add_field_and_lifecycle_delta_footprint(
 fn add_keeps_alive_delta_footprint(
     writes: &mut BTreeMap<RuntimeHistoryCoordinate, kernel_change::RewriteActionLaw>,
     delta: &DurableModelDelta,
-    complement: Option<&DurableModelDelta>,
+    _complement: Option<&DurableModelDelta>,
 ) {
-    let complement_keeps_alive = complement
-        .into_iter()
-        .flat_map(|delta| delta.lifecycle_keeps_alive.iter())
-        .map(|patch| (patch.parent, patch.target_present))
-        .collect::<BTreeMap<_, _>>();
     for patch in &delta.lifecycle_keeps_alive {
-        if complement_keeps_alive
-            .get(&patch.parent)
-            .is_some_and(|source_present| *source_present != patch.target_present)
-        {
-            insert_runtime_history_action(
-                writes,
-                RuntimeHistoryCoordinate::KeepsAlivePresence {
-                    parent: patch.parent,
-                },
-                if patch.target_present {
-                    kernel_change::RewriteActionLaw::EnsurePresent
-                } else {
-                    kernel_change::RewriteActionLaw::EnsureAbsent
-                },
-            );
-        }
+        insert_runtime_history_action(
+            writes,
+            RuntimeHistoryCoordinate::KeepsAlivePresence {
+                parent: patch.parent,
+            },
+            if patch.target_present {
+                kernel_change::RewriteActionLaw::EnsurePresent
+            } else {
+                kernel_change::RewriteActionLaw::EnsureAbsent
+            },
+        );
         for (children, action) in [
             (
                 &patch.inserted,

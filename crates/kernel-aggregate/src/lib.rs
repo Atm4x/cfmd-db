@@ -10,7 +10,7 @@ pub enum AggregateError {
 }
 
 /// Aggregate-domain wrapper around the shared exact natural coefficient.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct ExactCount(ExactNatural);
 
 impl ExactCount {
@@ -46,6 +46,19 @@ impl ExactCount {
         }
     }
 
+    pub fn remove_count(&mut self, amount: &Self) -> Result<(), AggregateError> {
+        self.remove_exact(&amount.0)
+    }
+
+    pub fn scale_floor_ratio(&mut self, numerator: u64, denominator: u64) -> Option<()> {
+        if denominator == 0 {
+            return None;
+        }
+        self.0.multiply_u64_assign(numerator);
+        self.0.div_rem_u64_assign(denominator)?;
+        Some(())
+    }
+
     #[must_use]
     pub fn is_zero(&self) -> bool {
         self.0.is_zero()
@@ -61,11 +74,349 @@ impl ExactCount {
         Self(ExactNatural::from_u128(value))
     }
 
+    pub fn finish_u64(&self) -> Result<u64, AggregateError> {
+        self.0.to_u64().ok_or(AggregateError::CountOverflow)
+    }
+
     pub fn finish_i64(&self) -> Result<i64, AggregateError> {
-        self.0
-            .to_u64()
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or(AggregateError::CountOverflow)
+        self.finish_u64()
+            .and_then(|value| i64::try_from(value).map_err(|_| AggregateError::CountOverflow))
+    }
+}
+
+/// Exact multiplicity index over an already-canonical ordered key.
+///
+/// The key type owns ordering semantics. This AVL order-statistics tree is the single
+/// multiplicity authority: each node stores its exact local multiplicity and the exact
+/// multiplicity of its subtree. Insert/remove/rank/select are O(log D) in the number of
+/// distinct canonical keys, including deletion of the current extrema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactOrderedMultiset<K> {
+    root: Option<Box<ExactOrderNode<K>>>,
+    distinct_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactOrderNode<K> {
+    key: K,
+    multiplicity: ExactCount,
+    subtree_count: ExactCount,
+    height: i16,
+    left: Option<Box<Self>>,
+    right: Option<Box<Self>>,
+}
+
+type ExactOrderMutation<K> = Result<(Option<Box<ExactOrderNode<K>>>, bool), AggregateError>;
+
+impl<K> ExactOrderNode<K> {
+    fn new(key: K) -> Self {
+        let multiplicity = ExactCount::from_u128(1);
+        Self {
+            key,
+            subtree_count: multiplicity.clone(),
+            multiplicity,
+            height: 1,
+            left: None,
+            right: None,
+        }
+    }
+
+    fn height(node: Option<&Self>) -> i16 {
+        node.map_or(0, |node| node.height)
+    }
+
+    fn subtree_count(node: Option<&Self>) -> ExactCount {
+        node.map_or_else(ExactCount::default, |node| node.subtree_count.clone())
+    }
+
+    fn refresh(&mut self) {
+        self.height =
+            1 + Self::height(self.left.as_deref()).max(Self::height(self.right.as_deref()));
+        self.subtree_count = self.multiplicity.clone();
+        self.subtree_count
+            .merge(&Self::subtree_count(self.left.as_deref()));
+        self.subtree_count
+            .merge(&Self::subtree_count(self.right.as_deref()));
+    }
+
+    fn balance_factor(&self) -> i16 {
+        Self::height(self.left.as_deref()) - Self::height(self.right.as_deref())
+    }
+}
+
+impl<K> Default for ExactOrderedMultiset<K> {
+    fn default() -> Self {
+        Self {
+            root: None,
+            distinct_len: 0,
+        }
+    }
+}
+
+impl<K: Ord + Clone> ExactOrderedMultiset<K> {
+    fn rotate_left(mut root: Box<ExactOrderNode<K>>) -> Box<ExactOrderNode<K>> {
+        let mut pivot = root
+            .right
+            .take()
+            .expect("AVL left rotation requires right child");
+        root.right = pivot.left.take();
+        root.refresh();
+        pivot.left = Some(root);
+        pivot.refresh();
+        pivot
+    }
+
+    fn rotate_right(mut root: Box<ExactOrderNode<K>>) -> Box<ExactOrderNode<K>> {
+        let mut pivot = root
+            .left
+            .take()
+            .expect("AVL right rotation requires left child");
+        root.left = pivot.right.take();
+        root.refresh();
+        pivot.right = Some(root);
+        pivot.refresh();
+        pivot
+    }
+
+    fn rebalance(mut node: Box<ExactOrderNode<K>>) -> Box<ExactOrderNode<K>> {
+        node.refresh();
+        if node.balance_factor() > 1 {
+            if node
+                .left
+                .as_ref()
+                .is_some_and(|left| left.balance_factor() < 0)
+            {
+                let left = node.left.take().map(Self::rotate_left);
+                node.left = left;
+            }
+            return Self::rotate_right(node);
+        }
+        if node.balance_factor() < -1 {
+            if node
+                .right
+                .as_ref()
+                .is_some_and(|right| right.balance_factor() > 0)
+            {
+                let right = node.right.take().map(Self::rotate_right);
+                node.right = right;
+            }
+            return Self::rotate_left(node);
+        }
+        node
+    }
+
+    fn insert_node(
+        node: Option<Box<ExactOrderNode<K>>>,
+        key: K,
+    ) -> (Option<Box<ExactOrderNode<K>>>, bool) {
+        let Some(mut node) = node else {
+            return (Some(Box::new(ExactOrderNode::new(key))), true);
+        };
+        let inserted_distinct = match key.cmp(&node.key) {
+            Ordering::Less => {
+                let (left, inserted) = Self::insert_node(node.left.take(), key);
+                node.left = left;
+                inserted
+            }
+            Ordering::Greater => {
+                let (right, inserted) = Self::insert_node(node.right.take(), key);
+                node.right = right;
+                inserted
+            }
+            Ordering::Equal => {
+                node.multiplicity.add_one();
+                false
+            }
+        };
+        (Some(Self::rebalance(node)), inserted_distinct)
+    }
+
+    fn take_min(
+        mut node: Box<ExactOrderNode<K>>,
+    ) -> (Option<Box<ExactOrderNode<K>>>, K, ExactCount) {
+        let Some(left) = node.left.take() else {
+            return (node.right.take(), node.key, node.multiplicity);
+        };
+        let (new_left, key, multiplicity) = Self::take_min(left);
+        node.left = new_left;
+        (Some(Self::rebalance(node)), key, multiplicity)
+    }
+
+    fn remove_node(node: Option<Box<ExactOrderNode<K>>>, key: &K) -> ExactOrderMutation<K> {
+        let Some(mut node) = node else {
+            return Err(AggregateError::CountUnderflow);
+        };
+        match key.cmp(&node.key) {
+            Ordering::Less => {
+                let (left, removed_distinct) = Self::remove_node(node.left.take(), key)?;
+                node.left = left;
+                Ok((Some(Self::rebalance(node)), removed_distinct))
+            }
+            Ordering::Greater => {
+                let (right, removed_distinct) = Self::remove_node(node.right.take(), key)?;
+                node.right = right;
+                Ok((Some(Self::rebalance(node)), removed_distinct))
+            }
+            Ordering::Equal => {
+                if !node.multiplicity.is_one() {
+                    node.multiplicity.remove_one()?;
+                    return Ok((Some(Self::rebalance(node)), false));
+                }
+                match (node.left.take(), node.right.take()) {
+                    (None, None) => Ok((None, true)),
+                    (Some(left), None) => Ok((Some(left), true)),
+                    (None, Some(right)) => Ok((Some(right), true)),
+                    (Some(left), Some(right)) => {
+                        let (new_right, successor_key, successor_multiplicity) =
+                            Self::take_min(right);
+                        node.key = successor_key;
+                        node.multiplicity = successor_multiplicity;
+                        node.left = Some(left);
+                        node.right = new_right;
+                        Ok((Some(Self::rebalance(node)), true))
+                    }
+                }
+            }
+        }
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        let mut node = self.root.as_deref();
+        while let Some(current) = node {
+            match key.cmp(&current.key) {
+                Ordering::Less => node = current.left.as_deref(),
+                Ordering::Greater => node = current.right.as_deref(),
+                Ordering::Equal => return true,
+            }
+        }
+        false
+    }
+
+    pub fn add_one(&mut self, key: K) {
+        let (root, inserted_distinct) = Self::insert_node(self.root.take(), key);
+        self.root = root;
+        if inserted_distinct {
+            self.distinct_len += 1;
+        }
+    }
+
+    pub fn remove_one(&mut self, key: &K) -> Result<(), AggregateError> {
+        if !self.contains_key(key) {
+            return Err(AggregateError::CountUnderflow);
+        }
+        let (root, removed_distinct) = Self::remove_node(self.root.take(), key)
+            .expect("prechecked ordered-multiset key must remain removable");
+        self.root = root;
+        if removed_distinct {
+            self.distinct_len -= 1;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn min_key(&self) -> Option<&K> {
+        let mut node = self.root.as_deref()?;
+        while let Some(left) = node.left.as_deref() {
+            node = left;
+        }
+        Some(&node.key)
+    }
+
+    #[must_use]
+    pub fn max_key(&self) -> Option<&K> {
+        let mut node = self.root.as_deref()?;
+        while let Some(right) = node.right.as_deref() {
+            node = right;
+        }
+        Some(&node.key)
+    }
+
+    #[must_use]
+    pub fn total_count(&self) -> ExactCount {
+        self.root
+            .as_ref()
+            .map_or_else(ExactCount::default, |root| root.subtree_count.clone())
+    }
+
+    #[must_use]
+    pub fn select_zero_based(&self, rank: &ExactCount) -> Option<&K> {
+        let root = self.root.as_deref()?;
+        if rank >= &root.subtree_count {
+            return None;
+        }
+        let mut remaining = rank.clone();
+        let mut node = root;
+        loop {
+            let left_count = ExactOrderNode::subtree_count(node.left.as_deref());
+            if remaining < left_count {
+                node = node.left.as_deref()?;
+                continue;
+            }
+            remaining.remove_count(&left_count).ok()?;
+            if remaining < node.multiplicity {
+                return Some(&node.key);
+            }
+            remaining.remove_count(&node.multiplicity).ok()?;
+            node = node.right.as_deref()?;
+        }
+    }
+
+    #[must_use]
+    pub fn select_from_start(&self, rank: u64) -> Option<&K> {
+        self.select_zero_based(&ExactCount::from_u128(u128::from(rank)))
+    }
+
+    #[must_use]
+    pub fn select_from_end(&self, rank: u64) -> Option<&K> {
+        let mut zero_based = self.total_count();
+        zero_based.remove_one().ok()?;
+        zero_based
+            .remove_count(&ExactCount::from_u128(u128::from(rank)))
+            .ok()?;
+        self.select_zero_based(&zero_based)
+    }
+
+    /// Selects the lower exact quantile at `p = numerator / denominator`.
+    ///
+    /// The selected zero-based rank is `floor(p * (n - 1))`; therefore `0/1` is the
+    /// minimum, `1/1` is the maximum, and `1/2` is the lower median. Invalid fractions
+    /// and empty multisets return `None`.
+    #[must_use]
+    pub fn select_lower_quantile(&self, numerator: u64, denominator: u64) -> Option<&K> {
+        if denominator == 0 || numerator > denominator || self.is_empty() {
+            return None;
+        }
+        let mut rank = self.total_count();
+        rank.remove_one().ok()?;
+        rank.scale_floor_ratio(numerator, denominator)?;
+        self.select_zero_based(&rank)
+    }
+
+    #[must_use]
+    pub fn rank_lt(&self, key: &K) -> ExactCount {
+        let mut result = ExactCount::default();
+        let mut node = self.root.as_deref();
+        while let Some(current) = node {
+            match key.cmp(&current.key) {
+                Ordering::Less | Ordering::Equal => node = current.left.as_deref(),
+                Ordering::Greater => {
+                    result.merge(&ExactOrderNode::subtree_count(current.left.as_deref()));
+                    result.merge(&current.multiplicity);
+                    node = current.right.as_deref();
+                }
+            }
+        }
+        result
+    }
+
+    #[must_use]
+    pub const fn distinct_len(&self) -> usize {
+        self.distinct_len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
     }
 }
 
@@ -149,6 +500,19 @@ impl ExactF64Sum {
             Ok(Ordering::Less)
         } else {
             Ok(Ordering::Greater)
+        }
+    }
+
+    #[must_use]
+    pub fn cmp_exact(&self, rhs: &Self) -> Ordering {
+        if self.magnitude.is_zero() && rhs.magnitude.is_zero() {
+            return Ordering::Equal;
+        }
+        match (self.negative, rhs.negative) {
+            (false, true) => Ordering::Greater,
+            (true, false) => Ordering::Less,
+            (false, false) => self.magnitude.cmp(&rhs.magnitude),
+            (true, true) => rhs.magnitude.cmp(&self.magnitude),
         }
     }
 
@@ -375,5 +739,107 @@ mod tests {
         assert_eq!(sum.cmp_f64_exact(1.0), Ok(Ordering::Equal));
         assert_eq!(sum.cmp_f64_exact(2.0), Ok(Ordering::Less));
         assert_eq!(sum.cmp_f64_exact(0.0), Ok(Ordering::Greater));
+    }
+
+    #[test]
+    fn exact_sums_compare_without_rounding_through_f64() {
+        let mut left = ExactF64Sum::default();
+        left.add(1.0e16).unwrap();
+        left.add(1.0).unwrap();
+        left.add(-1.0e16).unwrap();
+        let mut right = ExactF64Sum::default();
+        right.add(1.0).unwrap();
+        assert_eq!(left.cmp_exact(&right), Ordering::Equal);
+
+        right.add(f64::MIN_POSITIVE).unwrap();
+        assert_eq!(left.cmp_exact(&right), Ordering::Less);
+
+        let mut negative = ExactF64Sum::default();
+        negative.add(-2.0).unwrap();
+        assert_eq!(negative.cmp_exact(&left), Ordering::Less);
+    }
+
+    #[test]
+    fn exact_ordered_multiset_rank_select_and_quantile_are_logarithmic_state_queries() {
+        let mut values = ExactOrderedMultiset::default();
+        for value in [10_i64, 5, 5, 20, 30, 30, 30] {
+            values.add_one(value);
+        }
+        assert_eq!(values.total_count(), ExactCount::from_u128(7));
+        assert_eq!(values.rank_lt(&20), ExactCount::from_u128(3));
+        assert_eq!(values.select_from_start(0), Some(&5));
+        assert_eq!(values.select_from_start(2), Some(&10));
+        assert_eq!(values.select_from_end(0), Some(&30));
+        assert_eq!(values.select_lower_quantile(1, 2), Some(&20));
+        assert_eq!(values.select_lower_quantile(0, 1), Some(&5));
+        assert_eq!(values.select_lower_quantile(1, 1), Some(&30));
+        assert_eq!(values.select_lower_quantile(2, 1), None);
+
+        values.remove_one(&20).unwrap();
+        assert_eq!(values.select_lower_quantile(1, 2), Some(&10));
+    }
+
+    #[test]
+    #[ignore = "diagnostic release benchmark"]
+    fn benchmark_ordered_multiset_rank_select_against_scan_sort() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: i64 = 200_000;
+        const QUERIES: usize = 50_000;
+        const MUTATIONS: usize = 20_000;
+
+        let mut values = ExactOrderedMultiset::default();
+        for value in (0..N).rev() {
+            values.add_one(value);
+        }
+
+        let query_start = Instant::now();
+        for i in 0..QUERIES {
+            let key = ((i as u64).wrapping_mul(48_271) % N as u64).cast_signed();
+            black_box(values.rank_lt(&key));
+            black_box(values.select_from_start(key.cast_unsigned()));
+        }
+        let query_elapsed = query_start.elapsed();
+
+        let mutation_start = Instant::now();
+        for i in 0..MUTATIONS {
+            let key = ((i as u64).wrapping_mul(69_069) % N as u64).cast_signed();
+            values.remove_one(&key).unwrap();
+            values.add_one(key);
+        }
+        let mutation_elapsed = mutation_start.elapsed();
+
+        let mut source = (0..N).rev().collect::<Vec<_>>();
+        let scan_sort_start = Instant::now();
+        source.sort_unstable();
+        black_box(source[source.len() / 2]);
+        let scan_sort_elapsed = scan_sort_start.elapsed();
+
+        println!(
+            "PASS529 ordered-stat N={N}: rank+select {query_elapsed:?}/{QUERIES}, delete+insert {mutation_elapsed:?}/{MUTATIONS}, one scan+sort median {scan_sort_elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn exact_ordered_multiset_deletes_current_extrema_without_rescan_state() {
+        let mut values = ExactOrderedMultiset::default();
+        values.add_one(10_i64);
+        values.add_one(5_i64);
+        values.add_one(5_i64);
+        values.add_one(20_i64);
+        assert_eq!(values.min_key(), Some(&5));
+        assert_eq!(values.max_key(), Some(&20));
+        assert_eq!(values.distinct_len(), 3);
+
+        values.remove_one(&5).unwrap();
+        assert_eq!(values.min_key(), Some(&5));
+        values.remove_one(&5).unwrap();
+        assert_eq!(values.min_key(), Some(&10));
+        values.remove_one(&20).unwrap();
+        assert_eq!(values.max_key(), Some(&10));
+        assert_eq!(values.remove_one(&20), Err(AggregateError::CountUnderflow));
+        assert_eq!(values.min_key(), Some(&10));
+        assert_eq!(values.max_key(), Some(&10));
     }
 }

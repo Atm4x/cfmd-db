@@ -24,6 +24,10 @@ id_type!(OrderingId, u128);
 id_type!(TypeId, u128);
 id_type!(FieldId, u128);
 id_type!(VariantTagId, u128);
+id_type!(ModelSemanticId, u128);
+id_type!(ModelEntityId, u128);
+id_type!(AccessCapabilityId, u128);
+id_type!(RoleId, u128);
 id_type!(RevisionId, u64);
 id_type!(TransactionId, u128);
 

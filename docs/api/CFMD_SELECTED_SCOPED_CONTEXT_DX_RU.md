@@ -671,3 +671,43 @@ hosting:
 ```
 
 This is the baseline DX model to use for subsequent runtime/frontend R&D unless a concrete semantic or performance counterexample invalidates it.
+
+---
+
+## PASS537 clarification — bounded lifecycle vs post-cutover old-client bridge
+
+PASS537 executable coverage freezes the scoped lifecycle law:
+
+- a `Context<A>` admitted before `A -> B` remains on its exact A formation/Candidate for the rest of that scope;
+- it does not observe B-only HEAD changes by silently refreshing;
+- its exact staged A intent may still commit after cutover through the existing formation seal + forward effect transport;
+- the next admission observes B;
+- typed binding incompatibility is exposed as stable `ContractNotRepresentable` rather than an accidental low-level schema/type error.
+
+This closes the lifecycle of an **already-admitted** scope, but deliberately does not pretend that a **new A-only client arriving after B publication** is solved. Such a client requires a certified current-world `SchemaBridge<A,B>`-class read/write representation theorem. Historical-A reads, dual live schemas, name fallback and per-query migration routing remain forbidden.
+
+---
+
+## PASS538 clarification — current-world SchemaBridge kernel
+
+PASS538 introduces the kernel bridge authority required by the post-cutover old-client case without changing the selected scoped Context ownership model.
+
+```text
+new A-only client arrives while B is authoritative
+        |
+        v
+retained verified migration lineage
+        |
+        v
+CurrentSchemaBridge<A,current>
+        |
+        +-- compile representable A read -> current-native read
+        +-- transport exact relation intent/write coordinates -> current coordinates
+        `-- fail closed when the law is not proved
+```
+
+The first exact read class is row-representation identity, including certified relation-coordinate retargeting. Query operators remain unchanged and the target expression must typecheck to the identical result type. Value-changing row transforms are intentionally not decoded back into A unless a separate read-factorization theorem exists.
+
+The bridge is resolved from retained migration metadata and contains no historical source data. Authorization is always checked on the resulting current-schema coordinates.
+
+Product `Context<A>` activation over this bridge remains the next step; PASS538 freezes the semantic compiler before wiring it into object/model-field DX.

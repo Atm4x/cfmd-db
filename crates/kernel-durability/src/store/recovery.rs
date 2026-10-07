@@ -41,7 +41,7 @@ use crate::platform_assurance::{
     certify_supported_durability_platform,
 };
 use crate::runtime::{DurabilityError, RecoveryScan};
-use crate::wal::FileRevisionWal;
+use crate::wal::{FileRevisionWal, RuntimeRevisionWal};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoricalEpochMaterial {
@@ -49,6 +49,7 @@ pub struct HistoricalEpochMaterial {
     checkpoint: Revision,
     recovery_scan: RecoveryScan,
     semantic_registry: SemanticRegistry,
+    metadata: metadata::DurableStoreMetadata,
 }
 
 impl HistoricalEpochMaterial {
@@ -70,6 +71,26 @@ impl HistoricalEpochMaterial {
     #[must_use]
     pub const fn semantic_registry(&self) -> &SemanticRegistry {
         &self.semantic_registry
+    }
+
+    pub(crate) const fn metadata(&self) -> &metadata::DurableStoreMetadata {
+        &self.metadata
+    }
+
+    pub(crate) fn portable(
+        generation: u64,
+        checkpoint: Revision,
+        recovery_scan: RecoveryScan,
+        semantic_registry: SemanticRegistry,
+        metadata: metadata::DurableStoreMetadata,
+    ) -> Self {
+        Self {
+            generation,
+            checkpoint,
+            recovery_scan,
+            semantic_registry,
+            metadata,
+        }
     }
 }
 
@@ -98,7 +119,7 @@ impl CanonicalDurableState {
         self,
         backend: super::backend::DurabilityBackend,
         generation: u64,
-        wal: FileRevisionWal,
+        wal: RuntimeRevisionWal,
         replication: ReplicationAuthorityJournal,
     ) -> DurableRevisionStore {
         DurableRevisionStore {
@@ -115,6 +136,7 @@ impl CanonicalDurableState {
             migration_complements: self.migration_complements,
             migration_complement_index: self.migration_complement_index,
             historical_epoch_anchors: self.historical_epoch_anchors,
+            portable_historical_epochs: BTreeMap::new(),
             current_idempotency_epoch: self.current_idempotency_epoch,
             minimum_retry_epoch: self.minimum_retry_epoch,
             committed_transactions: self.committed_transactions,
@@ -494,6 +516,42 @@ impl DurableRevisionStore {
             return Ok(None);
         };
 
+        if let Some(bytes) = self.portable_historical_epochs.get(&effect_id) {
+            let closure = super::portable_history::PortableHistoricalEpochClosure::decode(bytes)?;
+            if closure.effect_id != effect_id
+                || closure.checkpoint.id() != anchor.source_revision
+                    && !closure.recovery_scan.committed().iter().any(|revision| {
+                        revision.descriptor.target_revision == anchor.source_revision
+                    })
+            {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "RAM portable historical closure does not contain anchor source revision",
+                });
+            }
+            return closure.material().map(Some);
+        }
+
+        if self.backend.is_single_file() {
+            let container = self.backend.single_file_container()?;
+            if let Some(bytes) = container.read_portable_historical_epoch(effect_id)? {
+                let closure =
+                    super::portable_history::PortableHistoricalEpochClosure::decode(&bytes)?;
+                if closure.effect_id != effect_id
+                    || closure.checkpoint.id() != anchor.source_revision
+                        && !closure.recovery_scan.committed().iter().any(|revision| {
+                            revision.descriptor.target_revision == anchor.source_revision
+                        })
+                {
+                    return Err(DurabilityError::Protocol {
+                        offset: 0,
+                        reason: "portable historical closure does not contain anchor source revision",
+                    });
+                }
+                return closure.material().map(Some);
+            }
+        }
+
         let (generation, metadata, checkpoint, scan) = if self.backend.is_single_file() {
             let active_generation = self.generation;
             let container = self.backend.single_file_container()?;
@@ -598,7 +656,8 @@ impl DurableRevisionStore {
         };
 
         let initial_registry = rebuild_semantic_registry(&metadata)?;
-        let _canonical = recover_canonical_state(metadata, checkpoint.clone(), &scan, generation)?;
+        let _canonical =
+            recover_canonical_state(metadata.clone(), checkpoint.clone(), &scan, generation)?;
         let mut historical_registry = initial_registry;
         let mut source_present = anchor.source_revision == checkpoint.id();
         if !source_present {
@@ -624,6 +683,7 @@ impl DurableRevisionStore {
             checkpoint,
             recovery_scan: scan,
             semantic_registry: historical_registry,
+            metadata,
         }))
     }
 
@@ -696,7 +756,7 @@ impl DurableRevisionStore {
         let mut store = canonical.into_store(
             super::backend::DurabilityBackend::directory(directory, directory_lock),
             manifest.generation,
-            wal,
+            wal.into(),
             replication,
         );
         store.checkpoint_realization = checkpoint_realization_binding

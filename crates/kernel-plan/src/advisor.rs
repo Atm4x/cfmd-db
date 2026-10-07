@@ -2,17 +2,86 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Semantic/physical capability supplied by a reconstructible candidate.
 ///
-/// The enum is intentionally family-neutral: a legacy index, a SAMF overlay,
+/// The enum is intentionally family-neutral: an alternate index capability, a SAMF overlay,
 /// or a future backend may supply the same capability without becoming a new
 /// semantic ontology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PhysicalCapability {
     PointLookup,
-    ExactCardinality,
-    QuotientFiber,
-    ObservableFiber,
+    GlobalCardinality,
+    JointMass,
+    RowCanonicalKey,
+    JointRows,
+    SlotMass,
+    SlotRows,
     Annotation,
     OrderedCut,
+}
+
+/// Transitional coarse retention bundle for one semantic-fiber artifact identity.
+///
+/// These names are not the physical observation lattice: exact observations are
+/// represented independently by `PhysicalCapability`. A later retention compiler
+/// may therefore replace these bundles without changing semantic identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SemanticFiberProfile {
+    Cardinality,
+    Quotient,
+    Observable,
+}
+
+impl SemanticFiberProfile {
+    #[must_use]
+    pub fn capabilities(self) -> BTreeSet<PhysicalCapability> {
+        match self {
+            Self::Cardinality => BTreeSet::from([PhysicalCapability::GlobalCardinality]),
+            Self::Quotient => BTreeSet::from([
+                PhysicalCapability::GlobalCardinality,
+                PhysicalCapability::JointMass,
+                PhysicalCapability::RowCanonicalKey,
+            ]),
+            Self::Observable => BTreeSet::from([
+                PhysicalCapability::GlobalCardinality,
+                PhysicalCapability::JointMass,
+                PhysicalCapability::RowCanonicalKey,
+                PhysicalCapability::JointRows,
+                PhysicalCapability::SlotMass,
+                PhysicalCapability::SlotRows,
+            ]),
+        }
+    }
+}
+
+/// Exact semantic-fiber observation demanded by one consumer.
+///
+/// Satisfaction is set inclusion over observations, never profile ordinal order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SemanticFiberDemand {
+    GlobalCardinality,
+    JointMass,
+    RowCanonicalKey,
+    JointRows,
+    SlotMass(usize),
+    SlotRows(usize),
+}
+
+impl SemanticFiberDemand {
+    #[must_use]
+    pub const fn capability(self) -> PhysicalCapability {
+        match self {
+            Self::GlobalCardinality => PhysicalCapability::GlobalCardinality,
+            Self::JointMass => PhysicalCapability::JointMass,
+            Self::RowCanonicalKey => PhysicalCapability::RowCanonicalKey,
+            Self::JointRows => PhysicalCapability::JointRows,
+            Self::SlotMass(_) => PhysicalCapability::SlotMass,
+            Self::SlotRows(_) => PhysicalCapability::SlotRows,
+        }
+    }
+
+    #[must_use]
+    pub fn is_satisfied_by(self, profile: SemanticFiberProfile) -> bool {
+        profile.capabilities().contains(&self.capability())
+    }
 }
 
 /// Deterministic policy work estimate. These are planning units, never
@@ -45,8 +114,8 @@ impl PhysicalWorkEstimate {
 ///
 /// Two candidates may name the same resource atom. Union cost counts that atom
 /// once, which is the production hook needed by the Γ-SRE shared-resource
-/// model. Current legacy adapters use unique atoms, preserving Pass80 byte
-/// accounting until SAMF overlays begin sharing backing structures explicitly.
+/// model. Current non-shared candidates use unique atoms; SAMF overlays may share
+/// backing structures explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceFootprint<R: Ord> {
     atoms: BTreeMap<R, usize>,

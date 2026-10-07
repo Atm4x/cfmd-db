@@ -3,7 +3,7 @@ use kernel_types::{ClientTransactionId, RevisionId};
 
 use crate::binary_codec::{Cursor, push_u16, push_u64, push_u128, read_u32, read_u64};
 use crate::descriptor::DurableRevisionDescriptor;
-use crate::domain::IdempotencyEpoch;
+use crate::domain::{DurableCommittedTransaction, DurableTransactionKey, IdempotencyEpoch};
 use crate::metadata;
 use crate::runtime::CodecError;
 
@@ -13,12 +13,43 @@ use crate::runtime::CodecError;
 /// the one maintained layout; older internal pass layouts fail closed instead of
 /// creating compatibility branches in the active runtime.
 pub const MUTATION_FORMAT_TAG: u16 = 0xC469;
+pub const INTENT_SEAL_FORMAT_TAG: u16 = 0xC510;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitRecord {
     pub(crate) target_revision: RevisionId,
     pub(crate) prepare_lsn: u64,
     pub(crate) prepare_payload_crc32c: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IntentSealRecord {
+    pub(crate) key: DurableTransactionKey,
+    pub(crate) committed: DurableCommittedTransaction,
+}
+
+pub(crate) fn encode_intent_seal_payload(record: &IntentSealRecord) -> Result<Vec<u8>, CodecError> {
+    let mut out = Vec::new();
+    push_u16(&mut out, INTENT_SEAL_FORMAT_TAG);
+    push_u128(&mut out, record.key.transaction_id.raw());
+    push_u64(&mut out, record.key.epoch.raw());
+    metadata::encode_committed_transaction(&mut out, &record.committed)?;
+    Ok(out)
+}
+
+pub(crate) fn decode_intent_seal_payload(payload: &[u8]) -> Result<IntentSealRecord, &'static str> {
+    let mut cursor = Cursor::new(payload);
+    if cursor.u16()? != INTENT_SEAL_FORMAT_TAG {
+        return Err("unsupported pre-release intent-seal payload format");
+    }
+    let transaction_id = ClientTransactionId::new(cursor.u128()?);
+    let epoch = IdempotencyEpoch::new(cursor.u64()?);
+    let committed = metadata::decode_committed_transaction(&mut cursor)?;
+    cursor.finish()?;
+    Ok(IntentSealRecord {
+        key: DurableTransactionKey::new(epoch, transaction_id),
+        committed,
+    })
 }
 
 pub(crate) fn encode_commit_payload(record: &CommitRecord) -> Vec<u8> {

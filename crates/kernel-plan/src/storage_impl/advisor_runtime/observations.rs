@@ -9,9 +9,13 @@ fn observable_atom_state_for_advice<'a>(
     {
         return Ok(std::borrow::Cow::Borrowed(existing));
     }
-    let relation = store.installed(binding.relation, binding.layout)?;
+    let mut candidate = store.clone();
     Ok(std::borrow::Cow::Owned(
-        MaterializedObservableAtomState::build(binding.clone(), relation, context, registry)?,
+        candidate.build_catalog_free_observable_atom_state(
+            binding.clone(),
+            context,
+            registry,
+        )?,
     ))
 }
 

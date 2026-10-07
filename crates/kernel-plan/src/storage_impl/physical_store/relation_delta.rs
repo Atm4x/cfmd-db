@@ -8,20 +8,21 @@ impl PhysicalStore {
     ) -> Result<(), PhysicalExecutionError> {
         for target in self.derived_artifact_targets(relation, layout) {
             let compatible = match target {
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticQuotientFactor(
+                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticFiber {
                     binding,
-                )) => self
+                    profile: SemanticFiberProfile::Quotient,
+                }) => self
                     .semantic_quotient_factors
                     .get(binding)
                     .expect("derived quotient factor dependency points to missing artifact")
                     .compatible_with(context, registry)?,
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticStatistics(binding)) => {
+                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Cardinality }) => {
                     self.semantic_statistics
                         .get(binding)
                         .expect("derived statistics dependency points to missing artifact")
                         .compatible_with(context, registry)?
                 }
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::ObservableAtom(binding)) => self
+                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Observable }) => self
                     .observable_atom_states
                     .get(binding)
                     .expect("derived observable dependency points to missing artifact")
@@ -57,20 +58,21 @@ impl PhysicalStore {
                     .get(binding)
                     .expect("derived I64 index dependency points to missing artifact")
                     .validate_physical_delta(delta)?,
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticQuotientFactor(
+                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticFiber {
                     binding,
-                )) => self
+                    profile: SemanticFiberProfile::Quotient,
+                }) => self
                     .semantic_quotient_factors
                     .get(binding)
                     .expect("derived quotient factor dependency points to missing artifact")
                     .validate_physical_delta(delta, context, registry)?,
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticStatistics(binding)) => {
+                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Cardinality }) => {
                     self.semantic_statistics
                         .get(binding)
                         .expect("derived statistics dependency points to missing artifact")
                         .validate_physical_delta(delta)?;
                 }
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::ObservableAtom(binding)) => self
+                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Observable }) => self
                     .observable_atom_states
                     .get(binding)
                     .expect("derived observable dependency points to missing artifact")
@@ -107,39 +109,33 @@ impl PhysicalStore {
                         .expect("derived I64 index dependency points to missing artifact");
                     Arc::make_mut(state).apply_physical_delta(delta)?;
                 }
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticQuotientFactor(
+                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticFiber {
                     binding,
-                )) => {
+                    profile: SemanticFiberProfile::Quotient,
+                }) => {
                     let state = self
                         .semantic_quotient_factors
                         .get_mut(&binding)
                         .expect("derived quotient factor dependency points to missing artifact");
                     Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
                 }
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticStatistics(binding)) => {
+                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticFiber { binding, profile: SemanticFiberProfile::Cardinality }) => {
                     let state = self
                         .semantic_statistics
                         .get_mut(&binding)
                         .expect("derived statistics dependency points to missing artifact");
                     Arc::make_mut(state).apply_physical_delta(delta)?;
                 }
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::ObservableAtom(binding)) => {
-                    let state = self
-                        .observable_atom_states
-                        .get_mut(&binding)
-                        .expect("derived observable dependency points to missing artifact");
-                    Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
-                }
-                DerivedArtifactTarget::Artifact(UnifiedArtifactId::SemanticQuotientSupport(_)) => {
-                    // QCN support consumes the resolved physical delta in the dedicated
-                    // multi-leaf maintenance phase below.
-                }
-                DerivedArtifactTarget::RowOccurrenceAtom(target_relation, target_layout) => {
-                    let state = self
-                        .row_occurrence_atoms
-                        .get_mut(&(target_relation, target_layout))
-                        .expect("derived row-occurrence dependency points to missing artifact");
-                    Arc::make_mut(state).apply_physical_delta(delta, context, registry)?;
+                DerivedArtifactTarget::Artifact(
+                    UnifiedArtifactId::SemanticFiber {
+                        profile: SemanticFiberProfile::Observable,
+                        ..
+                    }
+                    | UnifiedArtifactId::SemanticQuotientSupport(_),
+                )
+                | DerivedArtifactTarget::RowOccurrenceAtom(_, _) => {
+                    // These derived owners consume the resolved delta in their dedicated shared
+                    // semantic-lane/fabric maintenance phases below rather than mutating here.
                 }
             }
         }
@@ -330,6 +326,7 @@ impl PhysicalStore {
             registry,
         )?;
         self.validate_relation_derived_delta(relation, layout, &physical_delta, context, registry)?;
+        self.remove_semantic_fabric_rows_for_relation(relation, layout, &physical_delta)?;
         let next_epoch = self
             .transition_epoch
             .checked_add(1)
@@ -342,7 +339,17 @@ impl PhysicalStore {
             },
         )?;
         apply_planned_relation_delta(Arc::make_mut(installed), &physical_delta)?;
+        let deferred_semantic_releases = self
+            .apply_revision_semantic_columns_delta_deferred_release(
+                relation,
+                layout,
+                &physical_delta,
+                context,
+                registry,
+            )?;
         self.apply_relation_derived_delta(relation, layout, &physical_delta, context, registry)?;
+        self.insert_semantic_fabric_rows_for_relation(relation, layout, &physical_delta)?;
+        self.finalize_revision_semantic_releases(deferred_semantic_releases)?;
         self.transition_epoch = next_epoch;
         self.state_identity = Arc::new(());
         let resolved_delta = RelationDelta {

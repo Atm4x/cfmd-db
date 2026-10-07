@@ -39,11 +39,19 @@ use kernel_types::{ClientTransactionId, EqClassId, RevisionId, RevisionObservabl
 
 pub mod advisor;
 pub mod algebraic_native;
+pub mod fiber_retention_physical;
+pub mod fiber_retention_plan;
 
 pub use advisor::{
     AdvisorTelemetry, ArtifactTelemetry, PhysicalCapability, PhysicalPressurePolicy,
     PhysicalPressureSample, PhysicalWorkEstimate, ResourceFootprint, ResourceFootprintError,
-    TelemetryDecayPolicy, UnifiedAdvisorPolicy,
+    SemanticFiberDemand, SemanticFiberProfile, TelemetryDecayPolicy, UnifiedAdvisorPolicy,
+};
+pub use fiber_retention_physical::{FiberPhysicalAtom, physical_resource_spec};
+pub use fiber_retention_plan::{
+    CompiledFiberRetentionPlan, FiberObservationDemand, FiberObservationKey, FiberPlanOrigin,
+    FiberReadWorkEnvelope, FiberRealizerRule, FiberResourceCost, FiberResourceSpec,
+    FiberRetentionCompileError, FiberRetentionCompiler, ProtectedFiberPlan,
 };
 
 // HOSTILE inventory markers remain intentionally terse and grep-able while the mechanical
@@ -85,18 +93,20 @@ mod runtime_impl;
 // HOSTILE[P171][ACTIVE][CLEAN]: revision/commit/runtime protocol ownership now lives in
 // runtime_impl/types.rs; this root re-export preserves the established crate API only.
 #[cfg(test)]
+pub(crate) use runtime_impl::RevisionTransitionRequest;
+#[cfg(test)]
 pub(crate) use runtime_impl::benchmark_retained_epoch_first_conflict_for_test;
 pub use runtime_impl::{
-    DerivedRelationRewriteTransitionRequest, DerivedRelationTransitionRequest,
+    CurrentSchemaBridge, DerivedRelationRewriteTransitionRequest, DerivedRelationTransitionRequest,
     DurableMaterializationConfigOutcome, DurableRuntime, DurableRuntimeCheckpointError,
     DurableRuntimeCommitError, DurableRuntimeCommitOutcome, DurableRuntimeCommitReceipt,
     DurableRuntimeHistoricalError, DurableRuntimeSupervisor, FullRevisionTransitionRequest,
     InProcessRevisionPublicationNotifier, MixedRevisionTransitionRequest,
     PreparedCoherentResolutionTransition, PreparedRuntimeRevisionTransition,
     PreparedSchemaAwarePublication, RepairCandidateProvider, RepairSearchOutcome,
-    RepairSearchPolicy, RepairSearchReport, RevisionAndMaterializationsTransitionRequest,
-    RevisionCommitChange, RevisionCommitDescriptor, RevisionRelationMutation,
-    RevisionRelationRewrite, RevisionRewriteTransitionRequest, RevisionTransitionRequest,
+    RepairSearchPolicy, RepairSearchReport, RetainedHistoricalEpoch,
+    RevisionAndMaterializationsTransitionRequest, RevisionCommitChange, RevisionCommitDescriptor,
+    RevisionRelationMutation, RevisionRelationRewrite, RevisionRewriteTransitionRequest,
     RuntimeDurabilityBackend, RuntimeGuardObservationFootprint, RuntimeHistoricalSnapshotError,
     RuntimeHistoryCoordinate, RuntimeHistoryEffect, RuntimeHistoryEffectKind,
     RuntimeHistoryFootprint, RuntimeHistoryRebaseCertificate, RuntimeHistoryRebaseConflict,
@@ -110,7 +120,7 @@ pub use runtime_impl::{
     RuntimeRevisionSnapshot, RuntimeRewriteIntent, RuntimeRootVersion, RuntimeStorageOptions,
     RuntimeTransitionRebaseCertificate, RuntimeTransitionRebaseConflict,
     RuntimeTransitionRebaseOutcome, RuntimeViolationState, SchemaAwareFieldTransitionRequest,
-    SchemaEpochFormationSeal, SealedRuntimeRevisionTransition,
+    SchemaAwareFormationContextWitness, SchemaEpochFormationSeal, SealedRuntimeRevisionTransition,
 };
 
 mod recovery;

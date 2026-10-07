@@ -15,6 +15,7 @@ use kernel_types::{EntityId, SemanticId};
 
 mod factorized;
 mod one_shot;
+mod sum;
 pub use factorized::{
     CarrierSegmentCoordinate, DirectFactorizedFieldRoot, DirectFactorizedRealizationRoot,
     DirectFactorizedRelationRoot, FactorizedFieldExpr, FactorizedFieldNativeChunk,
@@ -26,6 +27,7 @@ pub use factorized::{
     relation_compaction_decision,
 };
 pub use one_shot::{RelExecutionSink, RelExecutionSource, evaluate_relation_expr_factorized};
+pub use sum::{PackedSumColumn, PackedSumFieldSegment, PackedSumRelationSegment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PhysicalAtomId(u128);
@@ -50,6 +52,8 @@ pub enum PhysicalCodec {
     RelationRows,
     FieldColumnSegment,
     RelationColumnSegment,
+    PackedSumFieldSegment,
+    PackedSumRelationSegment,
     Lifecycle,
 }
 
@@ -61,6 +65,8 @@ pub enum PhysicalAtomPayload {
     RelationRows(Vec<Vec<Value>>),
     FieldColumnSegment(FieldColumnSegment),
     RelationColumnSegment(RelationColumnSegment),
+    PackedSumFieldSegment(PackedSumFieldSegment),
+    PackedSumRelationSegment(PackedSumRelationSegment),
     Lifecycle(LifecycleGraph),
 }
 
@@ -74,6 +80,8 @@ impl PhysicalAtomPayload {
             Self::RelationRows(_) => PhysicalCodec::RelationRows,
             Self::FieldColumnSegment(_) => PhysicalCodec::FieldColumnSegment,
             Self::RelationColumnSegment(_) => PhysicalCodec::RelationColumnSegment,
+            Self::PackedSumFieldSegment(_) => PhysicalCodec::PackedSumFieldSegment,
+            Self::PackedSumRelationSegment(_) => PhysicalCodec::PackedSumRelationSegment,
             Self::Lifecycle(_) => PhysicalCodec::Lifecycle,
         }
     }
@@ -621,6 +629,15 @@ pub enum RealizationError {
     GeneralRelationRewriteRequiresPreparedRealization(SemanticId),
     PreparedRelationMismatch(SemanticId),
     RelationDeltaOverlayUnavailable(SemanticId),
+    PackedSumRequiresVariants,
+    PackedSumTooManyVariants,
+    PackedSumPayloadTooLarge(SemanticId),
+    PackedSumPayloadShapeMismatch(SemanticId),
+    PackedSumVariantLayoutInvalid,
+    PackedSumRowOutOfBounds {
+        row: usize,
+        len: usize,
+    },
     CompactionCostOverflow,
     OneShotRelationArityMismatch,
     SemanticMismatch,

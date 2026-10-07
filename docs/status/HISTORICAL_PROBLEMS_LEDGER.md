@@ -1,5 +1,7 @@
 # Historical Problems Ledger
 
+> **Authority note (PASS589 reconciliation):** this file is an archival closure ledger for the original 22-problem campaign. It is not an active next-work queue. Current work authority is `PRODUCTIZATION_LEDGER.md` + `KERNEL_HOSTILE_LEDGER.md`; closed historical claims below remain historical evidence and are not reopened merely because later productization added new surfaces.
+
 Status after Pass120 destructive certification and Pass121 repository hardening.
 
 ## PROD CLOSED — 22 / 22

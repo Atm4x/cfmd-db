@@ -7,11 +7,15 @@ mod types;
 
 pub use context::{ContextError, ModuleDigest, SemanticContext, SemanticEnvironment};
 pub use definitions::{
-    CapabilityDef, FieldDef, FieldRule, RelationDef, RelationSemantics, StructuralEquivalenceDef,
-    StructuralOrderingDef,
+    AccessCapabilityDef, AccessRoleDef, CapabilityDef, FieldDef, FieldRule, OrphanPolicyDef,
+    OwnedRelationshipDef, PermissionCoordinate, RelationDef, RelationSemantics, SchemaAccess,
+    StructuralEquivalenceDef, StructuralOrderingDef,
 };
 pub use rules::{
-    FiniteF64, ModelRuleExpr, RuleValueExpr, SemanticRuleExpr, SemanticRuleTypeError, TextPattern,
+    ExactAggregateMeasureExpr, ExactAggregateRange, ExactMeasureConstraint, FiniteF64,
+    ModelRuleExpr, OrderedStatisticBound, OrderedStatisticSelector, RuleOrderComparison,
+    RuleValueExpr, SemanticRuleExpr, SemanticRuleTypeError, TextPattern,
+    canonical_semantic_rule_bytes,
 };
 pub use schema::{Schema, SchemaError};
 pub use subtype::SubtypeClosure;
@@ -303,5 +307,163 @@ mod semantic_rule_persistence_tests {
             .unwrap();
 
         assert_eq!(schema.entity_rules(person).len(), 1);
+    }
+
+    #[test]
+    fn canonical_semantic_rule_identity_is_commutative_and_idempotent() {
+        let age = SemanticId::new(7);
+        let name = SemanticId::new(8);
+        let adult = SemanticRuleExpr::I64Range {
+            value: RuleValueExpr::Field(age),
+            min: Some(-2),
+            max: Some(9),
+        };
+        let name_pattern = SemanticRuleExpr::TextMatches {
+            value: RuleValueExpr::Field(name),
+            pattern: TextPattern::Alternate(vec![
+                TextPattern::Literal("ab".to_owned()),
+                TextPattern::AnyScalar,
+                TextPattern::Literal("ab".to_owned()),
+            ]),
+        };
+        let left = SemanticRuleExpr::And(vec![
+            adult.clone(),
+            name_pattern.clone(),
+            SemanticRuleExpr::False,
+            adult.clone(),
+        ]);
+        let right = SemanticRuleExpr::And(vec![
+            SemanticRuleExpr::False,
+            SemanticRuleExpr::TextMatches {
+                value: RuleValueExpr::Field(name),
+                pattern: TextPattern::Alternate(vec![
+                    TextPattern::AnyScalar,
+                    TextPattern::Literal("ab".to_owned()),
+                ]),
+            },
+            adult,
+        ]);
+
+        assert_eq!(
+            canonical_semantic_rule_bytes(&left),
+            canonical_semantic_rule_bytes(&right)
+        );
+        assert_ne!(
+            canonical_semantic_rule_bytes(&right),
+            canonical_semantic_rule_bytes(&name_pattern)
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_rule_identity_keeps_released_guard_frame_bytes() {
+        let expression = SemanticRuleExpr::And(vec![
+            SemanticRuleExpr::I64Range {
+                value: RuleValueExpr::Field(SemanticId::new(7)),
+                min: Some(-2),
+                max: Some(9),
+            },
+            SemanticRuleExpr::TextMatches {
+                value: RuleValueExpr::Field(SemanticId::new(8)),
+                pattern: TextPattern::Alternate(vec![
+                    TextPattern::Literal("ab".to_owned()),
+                    TextPattern::AnyScalar,
+                    TextPattern::Literal("ab".to_owned()),
+                ]),
+            },
+            SemanticRuleExpr::False,
+        ]);
+        let expected = vec![
+            2, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 36, 0, 0, 0, 0, 0, 0, 0, 5, 1, 7,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 254, 255, 255, 255, 255, 255, 255, 255,
+            1, 9, 0, 0, 0, 0, 0, 0, 0, 55, 0, 0, 0, 0, 0, 0, 0, 8, 1, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 5, 2, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0,
+            0, 0, 0, 97, 98, 1, 0, 0, 0, 0, 0, 0, 0, 3,
+        ];
+
+        assert_eq!(canonical_semantic_rule_bytes(&expression), expected);
+    }
+}
+
+#[cfg(test)]
+mod schema_access_tests {
+    use super::*;
+    use kernel_types::{SchemaRevisionId, SemanticId};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn role_capability_union_is_monotone_and_cycles_fail_closed() {
+        let relation = SemanticId::new(50_001);
+        let column = SemanticId::new(50_002);
+        let read_cap = SemanticId::new(50_010);
+        let write_cap = SemanticId::new(50_011);
+        let reader = SemanticId::new(50_020);
+        let manager = SemanticId::new(50_021);
+        let mut schema = Schema::new(SchemaRevisionId::new(1));
+        schema
+            .define_relation_with_column_ids(
+                RelationDef {
+                    id: relation,
+                    columns: vec![TypeExpr::Scalar(ScalarType::Text)],
+                    semantics: RelationSemantics::Bag {
+                        column_equivalences: vec![SemanticId::new(9)],
+                    },
+                },
+                vec![column],
+            )
+            .unwrap();
+        let mut policy = SchemaAccess::default();
+        policy.capabilities.insert(
+            read_cap,
+            AccessCapabilityDef {
+                id: read_cap,
+                permissions: BTreeSet::from([PermissionCoordinate::ReadField { relation, column }]),
+            },
+        );
+        policy.capabilities.insert(
+            write_cap,
+            AccessCapabilityDef {
+                id: write_cap,
+                permissions: BTreeSet::from([PermissionCoordinate::WriteField {
+                    relation,
+                    column,
+                }]),
+            },
+        );
+        policy.roles.insert(
+            reader,
+            AccessRoleDef {
+                id: reader,
+                capabilities: BTreeSet::from([read_cap]),
+                includes: BTreeSet::new(),
+            },
+        );
+        policy.roles.insert(
+            manager,
+            AccessRoleDef {
+                id: manager,
+                capabilities: BTreeSet::from([write_cap]),
+                includes: BTreeSet::from([reader]),
+            },
+        );
+        schema.set_schema_access(policy).unwrap();
+        assert_eq!(
+            schema.resolve_access_roles([manager]).unwrap(),
+            BTreeSet::from([
+                PermissionCoordinate::ReadField { relation, column },
+                PermissionCoordinate::WriteField { relation, column },
+            ])
+        );
+
+        let mut cyclic = schema.schema_access().clone();
+        cyclic
+            .roles
+            .get_mut(&reader)
+            .unwrap()
+            .includes
+            .insert(manager);
+        assert!(matches!(
+            schema.set_schema_access(cyclic),
+            Err(SchemaError::AccessRoleCycle(_))
+        ));
     }
 }

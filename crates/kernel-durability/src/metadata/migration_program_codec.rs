@@ -56,7 +56,7 @@ pub(crate) fn decode_schema_migration_program(
     cursor: &mut impl BinarySource,
 ) -> Result<SchemaMigrationProgram, &'static str> {
     let context_version = cursor.u16()?;
-    if !(1..=checkpoint::CHECKPOINT_CODEC_VERSION).contains(&context_version) {
+    if context_version != checkpoint::CHECKPOINT_CODEC_VERSION {
         return Err("unsupported migration semantic-context codec version");
     }
     let target = checkpoint::decode_context(cursor, context_version)
@@ -110,7 +110,8 @@ pub(crate) fn decode_schema_migration_program(
             _ => return Err("unknown migration relation rewrite tag"),
         });
     }
-    Ok(SchemaMigrationProgram::new(target, fields, relations))
+    let program = SchemaMigrationProgram::new(target, fields, relations);
+    Ok(program)
 }
 
 fn encode_exact_query(
@@ -168,6 +169,18 @@ fn encode_expr(out: &mut impl BinarySink, expr: &Expr, depth: usize) -> Result<(
             encode_expr(out, when_true, depth + 1)?;
             encode_expr(out, when_false, depth + 1)?;
         }
+        Expr::WidenSum {
+            input,
+            target_variants,
+        } => {
+            out.push(9);
+            encode_expr(out, input, depth + 1)?;
+            push_len(out, target_variants.len())?;
+            for (tag, ty) in target_variants {
+                push_u128(out, tag.raw());
+                checkpoint::encode_type_expr(out, ty, 0)?;
+            }
+        }
     }
     Ok(())
 }
@@ -207,6 +220,23 @@ fn decode_expr(cursor: &mut impl BinarySource, depth: usize) -> Result<Expr, &'s
             when_true: Box::new(decode_expr(cursor, depth + 1)?),
             when_false: Box::new(decode_expr(cursor, depth + 1)?),
         },
+        9 => {
+            let input = Box::new(decode_expr(cursor, depth + 1)?);
+            let count = cursor.len()?;
+            let mut target_variants = std::collections::BTreeMap::new();
+            for _ in 0..count {
+                let tag = kernel_types::SemanticId::new(cursor.u128()?);
+                let ty = checkpoint::decode_type_expr(cursor, 0)
+                    .map_err(|_| "invalid widened sum target type")?;
+                if target_variants.insert(tag, ty).is_some() {
+                    return Err("duplicate widened sum target variant");
+                }
+            }
+            Expr::WidenSum {
+                input,
+                target_variants,
+            }
+        }
         _ => return Err("unknown migration scalar expression tag"),
     })
 }

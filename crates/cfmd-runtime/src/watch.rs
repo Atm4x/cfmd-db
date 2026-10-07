@@ -219,6 +219,12 @@ pub enum WatchStatus {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchMigrationMode {
+    SchemaBound,
+    DefinitionallyEquivalent,
+}
+
 #[derive(Debug)]
 pub struct QueryWatch {
     runtime: Weak<kernel_plan::DurableRuntime>,
@@ -231,6 +237,8 @@ pub struct QueryWatch {
     readiness: WatchReadiness,
     initial: RelationResult,
     authorization: WatchAuthorization,
+    migration_mode: WatchMigrationMode,
+    schema_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -245,10 +253,29 @@ impl WatchAuthorization {
         self.authority.require(crate::Permission::Watch)?;
         self.authority.require_read_footprint(&self.footprint)
     }
+
+    fn replace_footprint(&mut self, footprint: kernel_query::RelReadFootprint) -> Result<()> {
+        self.authority.require(crate::Permission::Watch)?;
+        self.authority.require_read_footprint(&footprint)?;
+        self.footprint = footprint;
+        Ok(())
+    }
 }
 
 impl QueryWatch {
     pub(crate) fn new(context: &crate::ReadContext, query: &Query) -> Result<Self> {
+        Self::new_with_mode(context, query, WatchMigrationMode::SchemaBound)
+    }
+
+    pub(crate) fn new_migratable(context: &crate::ReadContext, query: &Query) -> Result<Self> {
+        Self::new_with_mode(context, query, WatchMigrationMode::DefinitionallyEquivalent)
+    }
+
+    fn new_with_mode(
+        context: &crate::ReadContext,
+        query: &Query,
+        migration_mode: WatchMigrationMode,
+    ) -> Result<Self> {
         context.authority.require(crate::Permission::Watch)?;
         if !context.is_live() {
             return Err(Error::new(
@@ -272,7 +299,7 @@ impl QueryWatch {
         let revision = context.kernel_revision();
         let seeded = if let Some(snapshot) = context.live_snapshot_ref() {
             let mut seeds = std::collections::BTreeMap::new();
-            for relation in query.inner.scan_relations() {
+            for relation in prepared.inner.expression().scan_relations() {
                 let seed = snapshot
                     .relation_scan_occurrence_seed(relation)
                     .map_err(|error| {
@@ -295,14 +322,14 @@ impl QueryWatch {
         };
         let state = match seeded.as_ref() {
             Some(seeds) => kernel_query::MaterializedRelPlanState::build_with_scan_seeds(
-                &query.inner,
+                prepared.inner.expression(),
                 &revision.state().model,
                 revision.semantic_context(),
                 runtime.semantic_registry(),
                 seeds,
             ),
             None => kernel_query::MaterializedRelPlanState::build(
-                &query.inner,
+                prepared.inner.expression(),
                 &revision.state().model,
                 revision.semantic_context(),
                 runtime.semantic_registry(),
@@ -314,7 +341,7 @@ impl QueryWatch {
                 format!("query has no exact maintained watch program: {error:?}"),
             )
         })?;
-        let initial = context.execute(query)?;
+        let initial = prepared.execute(context)?;
         let dependencies = state.scan_relations();
         let wait_handle =
             runtime.revision_publication_wait_handle_for_relations(dependencies.iter().copied());
@@ -338,6 +365,8 @@ impl QueryWatch {
             readiness,
             initial,
             authorization,
+            migration_mode,
+            schema_revision: context.schema_revision(),
         })
     }
 
@@ -366,6 +395,11 @@ impl QueryWatch {
     #[must_use]
     pub const fn revision(&self) -> RevisionId {
         self.cursor_revision
+    }
+
+    #[must_use]
+    pub const fn schema_revision(&self) -> u64 {
+        self.schema_revision
     }
 
     #[must_use]
@@ -524,10 +558,8 @@ impl QueryWatch {
         let source = historical_revision(runtime, effect.source_revision, "source")?;
         let target = historical_revision(runtime, effect.target_revision, "target")?;
         if source.semantic_context() != target.semantic_context() {
-            return Err(Error::new(
-                ErrorKind::WatchUnavailable,
-                "watch cannot cross a semantic schema revision",
-            ));
+            self.advance_schema_migration(runtime, &effect, &source, &target)?;
+            return Ok(None);
         }
         let deltas = watch_input_deltas(&self.state, runtime, &source, &effect)?;
         let output = if deltas.is_empty() {
@@ -565,6 +597,274 @@ impl QueryWatch {
         self.observable_revision = target_revision;
         Ok(Some(event))
     }
+
+    fn advance_schema_migration(
+        &mut self,
+        runtime: &kernel_plan::DurableRuntime,
+        effect: &kernel_plan::RuntimeHistoryEffect,
+        source: &kernel_revision::Revision,
+        target: &kernel_revision::Revision,
+    ) -> Result<()> {
+        if effect.kind != kernel_plan::RuntimeHistoryEffectKind::SchemaMigration
+            || self.migration_mode != WatchMigrationMode::DefinitionallyEquivalent
+        {
+            return Err(Error::new(
+                ErrorKind::WatchUnavailable,
+                "watch cannot cross a semantic schema revision",
+            ));
+        }
+        let definitional = self.state.rebind_definitionally_equivalent_context(
+            target.semantic_context(),
+            runtime.semantic_registry(),
+        );
+        if let Err(definitional_error) = definitional {
+            let program = effect.schema_migration_program.as_ref().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::WatchUnavailable,
+                    "watch contract is not migratable: migration program is unavailable",
+                )
+            })?;
+            let transport = program
+                .verify(source.semantic_context(), runtime.semantic_registry())
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::WatchUnavailable,
+                        format!(
+                            "watch contract is not migratable across this schema boundary: {error:?}"
+                        ),
+                    )
+                })?;
+            let mut relation_map = BTreeMap::new();
+            let mut target_relations = BTreeSet::new();
+            for relation in self.state.scan_relations() {
+                let target_relation = match transport
+                    .classify_observation_relation_transport_exact(relation)
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::WatchUnavailable,
+                            format!(
+                                "watch contract is not migratable across this schema boundary: {error:?}"
+                            ),
+                        )
+                    })? {
+                    kernel_transport::ObservationRelationTransport::RowIdentity {
+                        target_relation,
+                    } => target_relation,
+                    kernel_transport::ObservationRelationTransport::RowLocalStateTransform {
+                        target_relation,
+                    } => {
+                        return Err(Error::new(
+                            ErrorKind::WatchUnavailable,
+                            format!(
+                                "watch contract is not migratable across this schema boundary: row-local rewrite {relation:?} -> {target_relation:?} changes maintained row representation; exact future delta transport exists, but the current maintained state has no zero-row-touch value-domain transport theorem"
+                            ),
+                        ));
+                    }
+                };
+                if !target_relations.insert(target_relation) {
+                    return Err(Error::new(
+                        ErrorKind::WatchUnavailable,
+                        "watch contract structural transport aliases distinct source relations onto one target relation",
+                    ));
+                }
+                relation_map.insert(relation, target_relation);
+            }
+            self.state
+                .retarget_row_identity_migration_context(
+                    &relation_map,
+                    target.semantic_context(),
+                    runtime.semantic_registry(),
+                )
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::WatchUnavailable,
+                        format!(
+                            "watch contract is not migratable across this schema boundary: {definitional_error:?}; structural identity rebind failed: {error:?}"
+                        ),
+                    )
+                })?;
+        }
+        let footprint = self
+            .state
+            .query()
+            .prepare(target.semantic_context(), runtime.semantic_registry())
+            .and_then(|prepared| prepared.read_footprint())
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::WatchUnavailable,
+                    format!("transported watch authorization footprint failed: {error:?}"),
+                )
+            })?;
+        self.authorization.replace_footprint(footprint)?;
+        self.cursor_revision = effect.target_revision.into();
+        self.schema_revision = target.semantic_context().schema.revision.raw();
+        Ok(())
+    }
+}
+
+/// Schema-neutral exact watch whose maintained observation may cross only a
+/// definitionally equivalent schema boundary. Typed/object materialization is
+/// intentionally delayed until the caller inspects `schema_revision()`.
+#[derive(Debug)]
+pub struct MigratableQueryWatch {
+    inner: QueryWatch,
+    initial_schema_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratableWatchEvent {
+    source_revision: RevisionId,
+    target_revision: RevisionId,
+    schema_revision: u64,
+    inserted: Vec<Row>,
+    removed: Vec<Row>,
+}
+
+impl MigratableWatchEvent {
+    #[must_use]
+    pub const fn source_revision(&self) -> RevisionId {
+        self.source_revision
+    }
+
+    #[must_use]
+    pub const fn target_revision(&self) -> RevisionId {
+        self.target_revision
+    }
+
+    #[must_use]
+    pub const fn schema_revision(&self) -> u64 {
+        self.schema_revision
+    }
+
+    #[must_use]
+    pub fn inserted(&self) -> &[Row] {
+        &self.inserted
+    }
+
+    #[must_use]
+    pub fn removed(&self) -> &[Row] {
+        &self.removed
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inserted.is_empty() && self.removed.is_empty()
+    }
+
+    /// Materializes this schema-neutral delta only after the caller has
+    /// explicitly selected the event's schema branch.
+    ///
+    /// The watch never owns or mutates a "current type". Typical callers
+    /// match `schema_revision()` first, select the matching typed Context, and
+    /// pass that Context's decoder here. A branch mismatch fails closed before
+    /// user materialization code runs.
+    pub fn materialize_schema<T>(
+        &self,
+        expected_schema_revision: u64,
+        materialize: impl FnOnce(&[Row], &[Row]) -> Result<T>,
+    ) -> Result<T> {
+        if self.schema_revision != expected_schema_revision {
+            return Err(Error::new(
+                ErrorKind::InvalidSchema,
+                format!(
+                    "migratable watch event belongs to schema {}, not requested schema {}",
+                    self.schema_revision, expected_schema_revision
+                ),
+            ));
+        }
+        materialize(&self.inserted, &self.removed)
+    }
+}
+
+impl MigratableQueryWatch {
+    pub(crate) fn new(context: &crate::ReadContext, query: &Query) -> Result<Self> {
+        let inner = QueryWatch::new_migratable(context, query)?;
+        Ok(Self {
+            initial_schema_revision: inner.schema_revision(),
+            inner,
+        })
+    }
+
+    #[must_use]
+    pub const fn initial_schema_revision(&self) -> u64 {
+        self.initial_schema_revision
+    }
+
+    #[must_use]
+    pub const fn initial(&self) -> &RelationResult {
+        self.inner.initial()
+    }
+
+    #[must_use]
+    pub const fn schema_revision(&self) -> u64 {
+        self.inner.schema_revision()
+    }
+
+    #[must_use]
+    pub const fn subscription_id(&self) -> WatchSubscriptionId {
+        self.inner.subscription_id()
+    }
+
+    #[must_use]
+    pub fn readiness(&self) -> WatchReadiness {
+        self.inner.readiness()
+    }
+
+    pub fn try_recv(&mut self) -> Result<Option<MigratableWatchEvent>> {
+        let event = self.inner.try_recv()?;
+        Ok(event.map(|event| MigratableWatchEvent {
+            source_revision: event.source_revision,
+            target_revision: event.target_revision,
+            schema_revision: self.inner.schema_revision(),
+            inserted: event.inserted,
+            removed: event.removed,
+        }))
+    }
+
+    pub fn recv(&mut self) -> Result<MigratableWatchEvent> {
+        loop {
+            if let Some(event) = self.try_recv()? {
+                return Ok(event);
+            }
+            match self
+                .inner
+                .cancellation
+                .inner
+                .wait_after(self.inner.publication_generation)
+            {
+                kernel_plan::RuntimeRevisionPublicationWaitOutcome::Woken(generation) => {
+                    self.inner.publication_generation = generation;
+                }
+                kernel_plan::RuntimeRevisionPublicationWaitOutcome::Cancelled => {
+                    self.inner.authorization.reauthorize()?;
+                    return Err(watch_closed("watch was cancelled"));
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> WatchNext<'_, Self> {
+        WatchNext::new(self)
+    }
+
+    #[must_use]
+    pub fn cancellation(&self) -> WatchCancellation {
+        self.inner.cancellation()
+    }
+
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    pub fn close(&self) {
+        self.inner.close();
+    }
+
+    pub fn status(&self) -> Result<WatchStatus> {
+        self.inner.status()
+    }
 }
 
 fn next_effect(
@@ -593,14 +893,10 @@ fn next_effect(
             "current head is not exactly reachable from the watch anchor",
         )
     })?;
-    if matches!(
-        effect.kind,
-        kernel_plan::RuntimeHistoryEffectKind::FullRevision
-            | kernel_plan::RuntimeHistoryEffectKind::SchemaMigration
-    ) {
+    if effect.kind == kernel_plan::RuntimeHistoryEffectKind::FullRevision {
         return Err(Error::new(
             ErrorKind::WatchUnavailable,
-            "watch cannot cross an opaque/full/schema historical transition",
+            "watch cannot cross an opaque/full historical transition",
         ));
     }
     Ok(effect.clone())
@@ -1081,6 +1377,19 @@ impl WatchReceiver for QueryWatch {
 
     fn try_recv(&mut self) -> Result<Option<Self::Event>> {
         QueryWatch::try_recv(self)
+    }
+}
+
+impl watch_receiver_sealed::Sealed for MigratableQueryWatch {}
+impl WatchReceiver for MigratableQueryWatch {
+    type Event = MigratableWatchEvent;
+
+    fn readiness(&self) -> WatchReadiness {
+        MigratableQueryWatch::readiness(self)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<Self::Event>> {
+        MigratableQueryWatch::try_recv(self)
     }
 }
 

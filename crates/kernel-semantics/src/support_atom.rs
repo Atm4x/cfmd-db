@@ -334,6 +334,263 @@ impl<RowId: Ord + Clone> SupportAtomFabric<RowId> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SemanticSupportAtomId(u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticSupportFabricError<RowId> {
+    ArityMismatch { expected: usize, actual: usize },
+    AtomIdExhausted,
+    DuplicateRow(RowId),
+    UnknownRow(RowId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticSupportAtom<RowId: Ord + Clone> {
+    signature: Vec<EqClassId>,
+    rows: PersistentOrdSet<RowId>,
+}
+
+/// Catalog-free support partition over already-authoritative atomic semantic classes.
+///
+/// Coordinate `EqClassId`s are supplied by a store/revision semantic class authority. Product
+/// atoms are deliberately local physical identities: the exact product class is the signature
+/// itself, and `SemanticSupportAtomId` is only a compact routing token inside this fabric.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticSupportFabric<RowId: Ord + Clone> {
+    revision: SemanticRevision,
+    arity: usize,
+    next_atom: u64,
+    signature_to_atom: PersistentOrdMap<Vec<EqClassId>, SemanticSupportAtomId>,
+    atoms: PersistentOrdMap<SemanticSupportAtomId, SemanticSupportAtom<RowId>>,
+    row_to_atom: PersistentOrdMap<RowId, SemanticSupportAtomId>,
+    inverse: Vec<PersistentOrdMap<EqClassId, PersistentOrdSet<SemanticSupportAtomId>>>,
+}
+
+impl<RowId: Ord + Clone> SemanticSupportFabric<RowId> {
+    #[must_use]
+    pub fn new(revision: SemanticRevision, arity: usize) -> Self {
+        Self {
+            revision,
+            arity,
+            next_atom: 1,
+            signature_to_atom: PersistentOrdMap::default(),
+            atoms: PersistentOrdMap::default(),
+            row_to_atom: PersistentOrdMap::default(),
+            inverse: vec![PersistentOrdMap::default(); arity],
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> SemanticRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn arity(&self) -> usize {
+        self.arity
+    }
+
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.row_to_atom.len()
+    }
+
+    #[must_use]
+    pub fn atom_count(&self) -> usize {
+        self.atoms.len()
+    }
+
+    pub fn atom_masses(&self) -> impl Iterator<Item = (&[EqClassId], usize)> + '_ {
+        self.atoms
+            .values()
+            .map(|atom| (atom.signature.as_slice(), atom.rows.len()))
+    }
+
+    #[must_use]
+    pub fn projection_atom_reference_count(&self) -> usize {
+        self.inverse
+            .iter()
+            .map(|classes| classes.values().map(PersistentOrdSet::len).sum::<usize>())
+            .sum()
+    }
+
+    #[must_use]
+    pub fn projected_class_count(&self) -> usize {
+        self.inverse.iter().map(PersistentOrdMap::len).sum()
+    }
+
+    pub fn insert(
+        &mut self,
+        row: RowId,
+        signature: &[EqClassId],
+    ) -> Result<SemanticSupportAtomId, SemanticSupportFabricError<RowId>> {
+        self.validate_arity(signature)?;
+        if self.row_to_atom.contains_key(&row) {
+            return Err(SemanticSupportFabricError::DuplicateRow(row));
+        }
+
+        let atom_id =
+            if let Some(atom_id) = self.signature_to_atom.get(&signature.to_vec()).copied() {
+                let mut atom = self
+                    .atoms
+                    .get(&atom_id)
+                    .cloned()
+                    .expect("signature routing references an existing semantic support atom");
+                atom.rows.insert(row.clone());
+                self.atoms.insert(atom_id, atom);
+                atom_id
+            } else {
+                let atom_id = SemanticSupportAtomId(self.next_atom);
+                self.next_atom = self
+                    .next_atom
+                    .checked_add(1)
+                    .ok_or(SemanticSupportFabricError::AtomIdExhausted)?;
+                self.signature_to_atom.insert(signature.to_vec(), atom_id);
+                for (slot, class) in signature.iter().copied().enumerate() {
+                    let mut atom_ids = self.inverse[slot].get(&class).cloned().unwrap_or_default();
+                    atom_ids.insert(atom_id);
+                    self.inverse[slot].insert(class, atom_ids);
+                }
+                self.atoms.insert(
+                    atom_id,
+                    SemanticSupportAtom {
+                        signature: signature.to_vec(),
+                        rows: [row.clone()].into_iter().collect(),
+                    },
+                );
+                atom_id
+            };
+        self.row_to_atom.insert(row, atom_id);
+        Ok(atom_id)
+    }
+
+    pub fn remove(
+        &mut self,
+        row: &RowId,
+    ) -> Result<Vec<EqClassId>, SemanticSupportFabricError<RowId>> {
+        let atom_id = self
+            .row_to_atom
+            .remove(row)
+            .ok_or_else(|| SemanticSupportFabricError::UnknownRow(row.clone()))?;
+        let mut atom = self
+            .atoms
+            .get(&atom_id)
+            .cloned()
+            .expect("row routing references an existing semantic support atom");
+        atom.rows.remove(row);
+        let signature = atom.signature.clone();
+        if atom.rows.is_empty() {
+            self.atoms.remove(&atom_id);
+            self.signature_to_atom.remove(&signature);
+            for (slot, class) in signature.iter().copied().enumerate() {
+                let mut atom_ids = self.inverse[slot]
+                    .get(&class)
+                    .cloned()
+                    .expect("inverse projection references every live semantic support atom");
+                atom_ids.remove(&atom_id);
+                if atom_ids.is_empty() {
+                    self.inverse[slot].remove(&class);
+                } else {
+                    self.inverse[slot].insert(class, atom_ids);
+                }
+            }
+        } else {
+            self.atoms.insert(atom_id, atom);
+        }
+        Ok(signature)
+    }
+
+    #[must_use]
+    pub fn row_signature(&self, row: &RowId) -> Option<&[EqClassId]> {
+        let atom_id = self.row_to_atom.get(row)?;
+        self.atoms
+            .get(atom_id)
+            .map(|atom| atom.signature.as_slice())
+    }
+
+    #[must_use]
+    pub fn joint_fiber(&self, signature: &[EqClassId]) -> Option<&PersistentOrdSet<RowId>> {
+        let atom_id = self.signature_to_atom.get(&signature.to_vec())?;
+        self.atoms.get(atom_id).map(|atom| &atom.rows)
+    }
+
+    pub fn projected_fiber(
+        &self,
+        slot: usize,
+        class: EqClassId,
+    ) -> Result<BTreeSet<RowId>, SemanticSupportFabricError<RowId>> {
+        self.validate_slot(slot)?;
+        let mut rows = BTreeSet::new();
+        if let Some(atom_ids) = self.inverse[slot].get(&class) {
+            for atom_id in atom_ids {
+                rows.extend(
+                    self.atoms
+                        .get(atom_id)
+                        .expect("inverse projection references an existing semantic support atom")
+                        .rows
+                        .iter()
+                        .cloned(),
+                );
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn projected_count(
+        &self,
+        slot: usize,
+        class: EqClassId,
+    ) -> Result<usize, SemanticSupportFabricError<RowId>> {
+        self.validate_slot(slot)?;
+        Ok(self.inverse[slot]
+            .get(&class)
+            .into_iter()
+            .flatten()
+            .map(|atom_id| {
+                self.atoms
+                    .get(atom_id)
+                    .expect("inverse projection references an existing semantic support atom")
+                    .rows
+                    .len()
+            })
+            .sum())
+    }
+
+    pub fn distinct_classes(
+        &self,
+        slot: usize,
+    ) -> Result<BTreeSet<EqClassId>, SemanticSupportFabricError<RowId>> {
+        self.validate_slot(slot)?;
+        Ok(self.inverse[slot].keys().copied().collect())
+    }
+
+    fn validate_arity(
+        &self,
+        signature: &[EqClassId],
+    ) -> Result<(), SemanticSupportFabricError<RowId>> {
+        if signature.len() == self.arity {
+            Ok(())
+        } else {
+            Err(SemanticSupportFabricError::ArityMismatch {
+                expected: self.arity,
+                actual: signature.len(),
+            })
+        }
+    }
+
+    fn validate_slot(&self, slot: usize) -> Result<(), SemanticSupportFabricError<RowId>> {
+        if slot < self.arity {
+            Ok(())
+        } else {
+            Err(SemanticSupportFabricError::ArityMismatch {
+                expected: self.arity,
+                actual: slot.saturating_add(1),
+            })
+        }
+    }
+}
+
 /// Reconstructible per-atom annotations layered over one support fabric.
 ///
 /// The annotation payload is physical/derived state. Atom identity remains revision-local and
@@ -681,6 +938,50 @@ mod tests {
             SupportAtomOrderedOverlay::build(&fabric, [(10_u64, 1_i64), (11_u64, 1_i64)]).unwrap();
         assert_eq!(overlay.order_key(atom), Some(&1));
         assert!(overlay.compatible_with(&fabric));
+    }
+
+    #[test]
+    fn semantic_support_fabric_factors_global_atomic_classes_without_observable_catalog() {
+        let (context, _, _, _) = fixture();
+        let left_a = EqClassId::new(10_001);
+        let left_b = EqClassId::new(10_002);
+        let right_x = EqClassId::new(20_001);
+        let right_y = EqClassId::new(20_002);
+        let mut fabric = SemanticSupportFabric::new(context.revision(), 2);
+
+        fabric.insert(1_u64, &[left_a, right_x]).unwrap();
+        fabric.insert(2_u64, &[left_a, right_y]).unwrap();
+        fabric.insert(3_u64, &[left_b, right_x]).unwrap();
+        fabric.insert(4_u64, &[left_a, right_x]).unwrap();
+
+        assert_eq!(fabric.row_count(), 4);
+        assert_eq!(fabric.atom_count(), 3);
+        assert_eq!(fabric.row_signature(&1_u64), Some(&[left_a, right_x][..]));
+        assert_eq!(
+            fabric
+                .joint_fiber(&[left_a, right_x])
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(fabric.projected_count(0, left_a).unwrap(), 3);
+        assert_eq!(
+            fabric
+                .projected_fiber(1, right_x)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        assert_eq!(fabric.distinct_classes(0).unwrap(), [left_a, left_b].into());
+
+        assert_eq!(fabric.remove(&1_u64).unwrap(), vec![left_a, right_x]);
+        assert_eq!(fabric.atom_count(), 3);
+        assert_eq!(fabric.remove(&4_u64).unwrap(), vec![left_a, right_x]);
+        assert_eq!(fabric.atom_count(), 2);
+        assert!(fabric.joint_fiber(&[left_a, right_x]).is_none());
     }
 
     #[test]

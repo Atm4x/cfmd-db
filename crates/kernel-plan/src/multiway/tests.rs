@@ -11,7 +11,7 @@ use crate::semantic_quotient_physical::test_support::{
 use crate::storage_impl::test_support::PhysicalStoreTestExt as _;
 use crate::{
     LayoutFamily, LayoutId, NativeColumn, NativeRelation, PhysicalCatalog, PreparedPlan,
-    UnifiedArtifactId, prepare_with_catalog,
+    SemanticFiberProfile, UnifiedArtifactId, prepare_with_catalog,
 };
 use kernel_model::Value;
 use kernel_query::{RelExpr, RelationDelta};
@@ -34,6 +34,26 @@ fn only_semantic_quotient_support_for_test(
         .values()
         .next()
         .unwrap()
+}
+
+fn assert_maintained_quotient_support_is_consumable(
+    prepared: &PreparedPlan,
+    store: &PhysicalStore,
+    context: &SemanticContext,
+    registry: &SemanticRegistry,
+) {
+    let mut stats = ExecutionStats::default();
+    let rows = super::test_support::execute_order_preserving_quotient_join_for_test(
+        prepared.physical(),
+        prepared.semantic_quotient_program.as_ref(),
+        store,
+        context,
+        registry,
+        &mut stats,
+    )
+    .unwrap();
+    assert!(rows.is_some());
+    assert_eq!(stats.multiway_join_maintained_quotient_support_hits, 1);
 }
 
 #[test]
@@ -500,8 +520,10 @@ fn quotient_materialization_invalidates_warmed_derived_dependency_cache() {
     assert!(store.derived_artifact_cache_initialized_for_test());
     assert!(before.iter().all(|id| !matches!(
         id,
-        UnifiedArtifactId::SemanticQuotientFactor(_)
-            | UnifiedArtifactId::SemanticQuotientSupport(_)
+        UnifiedArtifactId::SemanticFiber {
+            profile: SemanticFiberProfile::Quotient,
+            ..
+        } | UnifiedArtifactId::SemanticQuotientSupport(_)
     )));
 
     assert!(
@@ -512,11 +534,13 @@ fn quotient_materialization_invalidates_warmed_derived_dependency_cache() {
     );
 
     let after = store.derived_artifact_ids_for_test(relation, layout.id);
-    assert!(
-        after
-            .iter()
-            .any(|id| matches!(id, UnifiedArtifactId::SemanticQuotientFactor(_)))
-    );
+    assert!(after.iter().any(|id| matches!(
+        id,
+        UnifiedArtifactId::SemanticFiber {
+            profile: SemanticFiberProfile::Quotient,
+            ..
+        }
+    )));
     assert!(
         after
             .iter()
@@ -859,8 +883,9 @@ fn gamma_quotient_support_uses_local_dq_for_arbitrary_deletions() {
     );
     assert_eq!(
         suffix_stats.multiway_join_maintained_quotient_support_hits,
-        1
+        0
     );
+    assert_maintained_quotient_support_is_consumable(&prepared, &store, &context, &registry);
 
     let interior_delete = scan_delta(c, &[], &[10], &context, &registry);
     store
@@ -879,8 +904,9 @@ fn gamma_quotient_support_uses_local_dq_for_arbitrary_deletions() {
         prepared.execute_native_pinned(&store, &registry).unwrap();
     assert_eq!(
         interior_stats.multiway_join_maintained_quotient_support_hits,
-        1
+        0
     );
+    assert_maintained_quotient_support_is_consumable(&prepared, &store, &context, &registry);
     assert_eq!(
         after_interior,
         logical.evaluate(&model, &context, &registry).unwrap()
@@ -903,8 +929,9 @@ fn gamma_quotient_support_uses_local_dq_for_arbitrary_deletions() {
     );
     assert_eq!(
         duplicate_stats.multiway_join_maintained_quotient_support_hits,
-        1
+        0
     );
+    assert_maintained_quotient_support_is_consumable(&prepared, &store, &context, &registry);
 
     let insertion = scan_delta(c, &[21], &[], &context, &registry);
     store
@@ -943,9 +970,15 @@ fn gamma_quotient_dense_projection_is_read_boundary_only() {
     );
 
     let _ = prepared.execute_native_pinned(&store, &registry).unwrap();
+    assert_eq!(
+        dense_projections_for_test(),
+        0,
+        "shared encoded-lane execution must not force a QCN dense projection"
+    );
+    assert_maintained_quotient_support_is_consumable(&prepared, &store, &context, &registry);
     assert!(
         dense_projections_for_test() > 0,
-        "dense quotient projection belongs to the executor read boundary"
+        "a QCN read may materialize its dense projection, but writes may not"
     );
 }
 
@@ -1098,7 +1131,8 @@ fn gamma_quotient_local_insertion_resurrects_greatest_fixed_point() {
         restored,
         logical.evaluate(&model, &context, &registry).unwrap()
     );
-    assert_eq!(stats.multiway_join_maintained_quotient_support_hits, 1);
+    assert_eq!(stats.multiway_join_maintained_quotient_support_hits, 0);
+    assert_maintained_quotient_support_is_consumable(&prepared, &store, &context, &registry);
 }
 
 #[test]
@@ -1140,7 +1174,8 @@ fn gamma_quotient_mixed_delta_refreshes_only_affected_component() {
         without_support,
         logical.evaluate(&model, &context, &registry).unwrap()
     );
-    assert_eq!(stats.multiway_join_maintained_quotient_support_hits, 1);
+    assert_eq!(stats.multiway_join_maintained_quotient_support_hits, 0);
+    assert_maintained_quotient_support_is_consumable(&prepared, &store, &context, &registry);
 
     let restore_support_remove_dead = scan_delta(a, &[1], &[21], &context, &registry);
     store
@@ -1175,7 +1210,8 @@ fn gamma_quotient_mixed_delta_refreshes_only_affected_component() {
         restored,
         logical.evaluate(&model, &context, &registry).unwrap()
     );
-    assert_eq!(stats.multiway_join_maintained_quotient_support_hits, 1);
+    assert_eq!(stats.multiway_join_maintained_quotient_support_hits, 0);
+    assert_maintained_quotient_support_is_consumable(&prepared, &store, &context, &registry);
 }
 
 #[test]

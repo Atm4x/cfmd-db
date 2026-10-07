@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 use kernel_types::RevisionId;
 use sha2::{Digest, Sha256};
 
+use crate::FORMAT_VERSION;
 use crate::descriptor::DurableRevisionDescriptor;
+#[cfg(test)]
+use crate::replication::authority::collect_indexed_segment_object_chain_frames;
 use crate::replication::authority::{
-    ReplicationAuthorityJournal, ReplicationAuthorityLocatorRoot,
+    ReplicationAuthorityFrameSource, ReplicationAuthorityJournal, ReplicationAuthorityLocatorRoot,
     ReplicationAuthoritySegmentExtent, ReplicationAuthoritySegmentId,
     ReplicationAuthoritySegmentPlan, locator_stored_len, recover_locator_chain,
     replay_indexed_segment_object_chain, write_locator_node, write_segment_object,
@@ -45,7 +48,6 @@ const DATA_OFFSET: u64 = PAGE_SIZE * 3;
 const HEADER_MAGIC: [u8; 8] = *b"CFMDSF01";
 const ROOT_MAGIC: [u8; 4] = *b"CFSR";
 const GENERATION_MAGIC: [u8; 4] = *b"CFSG";
-const FORMAT_VERSION: u16 = 3;
 const HEADER_DIGEST_OFFSET: usize = 96;
 const KEY_SLOT_MAGIC: [u8; 4] = *b"CFKW";
 const KEY_SLOT_VERSION: u8 = 1;
@@ -77,7 +79,6 @@ pub enum SingleFileSectionKind {
     Checkpoint = 1,
     Metadata = 2,
     PreparedCapsule = 3,
-    ReplicationAuthority = 4,
     PhysicalArtifact = 5,
     Auxiliary = 6,
     HistoricalEpochDescriptor = 7,
@@ -85,6 +86,8 @@ pub enum SingleFileSectionKind {
     HistoricalMetadata = 9,
     HistoricalPreparedCapsule = 10,
     HistoricalWal = 11,
+    PortableHistoricalEpochDescriptor = 12,
+    PortableHistoricalEpoch = 13,
 }
 
 impl SingleFileSectionKind {
@@ -93,7 +96,6 @@ impl SingleFileSectionKind {
             1 => Ok(Self::Checkpoint),
             2 => Ok(Self::Metadata),
             3 => Ok(Self::PreparedCapsule),
-            4 => Ok(Self::ReplicationAuthority),
             5 => Ok(Self::PhysicalArtifact),
             6 => Ok(Self::Auxiliary),
             7 => Ok(Self::HistoricalEpochDescriptor),
@@ -101,6 +103,8 @@ impl SingleFileSectionKind {
             9 => Ok(Self::HistoricalMetadata),
             10 => Ok(Self::HistoricalPreparedCapsule),
             11 => Ok(Self::HistoricalWal),
+            12 => Ok(Self::PortableHistoricalEpochDescriptor),
+            13 => Ok(Self::PortableHistoricalEpoch),
             _ => Err(corruption("single-file section kind is unsupported")),
         }
     }
@@ -969,6 +973,24 @@ impl SingleFileContainer {
         self.root.generation
     }
 
+    #[must_use]
+    pub(crate) fn protection_profile(&self) -> crate::storage_encryption::StorageProtectionProfile {
+        let Some(crypto) = self.crypto.as_ref() else {
+            return crate::storage_encryption::StorageProtectionProfile::Unencrypted;
+        };
+        if let Some(state) = self.wrapped_key_state.as_ref() {
+            crate::storage_encryption::StorageProtectionProfile::ExternalWrapped {
+                algorithm: crypto.algorithm(),
+                provider_key_id: state.slot.provider_key_id,
+                provider_key_epoch: state.slot.provider_key_epoch,
+            }
+        } else {
+            crate::storage_encryption::StorageProtectionProfile::Direct {
+                algorithm: crypto.algorithm(),
+            }
+        }
+    }
+
     pub fn rewrap_database_master_key(
         &mut self,
         next: &StorageEncryption,
@@ -1103,6 +1125,24 @@ impl SingleFileContainer {
         read_generation_view(&mut self.file, self.root)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_replication_authority_binding(&self) -> Option<([u8; 32], u64, [u8; 32])> {
+        self.root
+            .replication_authority
+            .map(|root| (root.segment_id.bytes(), root.offset, root.digest))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn portable_replication_authority_frames(
+        &mut self,
+    ) -> Result<Vec<Vec<u8>>, DurabilityError> {
+        let Some(authority_root) = self.root.replication_authority else {
+            return Ok(Vec::new());
+        };
+        let index = recover_locator_chain(&mut self.file, authority_root)?;
+        collect_indexed_segment_object_chain_frames(&mut self.file, &index, self.crypto.as_ref())
+    }
+
     pub(crate) fn recover_replication_authority_journal(
         &mut self,
         live_frames: &[Vec<u8>],
@@ -1118,6 +1158,7 @@ impl SingleFileContainer {
             )?;
         }
         journal.replay_single_file_live_frames(live_frames)?;
+        journal.ensure_semantic_base_complete()?;
         Ok(journal)
     }
 
@@ -1340,6 +1381,7 @@ impl SingleFileContainer {
         next_lsn: u64,
         archive_outgoing: Option<HistoricalGenerationArchive>,
         retained_generations: &BTreeSet<u64>,
+        retained_effects: &BTreeSet<kernel_change::RevisionEffectId>,
     ) -> Result<HistoricalPublicationSources, DurabilityError> {
         let current_view = read_generation_view(&mut self.file, self.root)?;
         let mut retained_ordinals = BTreeSet::new();
@@ -1366,9 +1408,39 @@ impl SingleFileContainer {
                 );
             }
         }
+        let mut retained_portable_ordinals = BTreeSet::new();
+        let portable_descriptors: Vec<_> = current_view
+            .sections
+            .iter()
+            .filter(|section| {
+                section.kind == SingleFileSectionKind::PortableHistoricalEpochDescriptor
+            })
+            .cloned()
+            .collect();
+        for section in portable_descriptors {
+            let bytes = self
+                .read_section(
+                    SingleFileSectionKind::PortableHistoricalEpochDescriptor,
+                    section.ordinal,
+                )?
+                .ok_or_else(|| corruption("portable historical epoch descriptor is missing"))?;
+            if bytes.len() != 16 {
+                return Err(corruption(
+                    "portable historical epoch descriptor length mismatch",
+                ));
+            }
+            let effect = kernel_change::RevisionEffectId(u128::from_le_bytes(
+                bytes.as_slice().try_into().map_err(|_| {
+                    corruption("portable historical epoch descriptor length mismatch")
+                })?,
+            ));
+            if retained_effects.contains(&effect) {
+                retained_portable_ordinals.insert(section.ordinal);
+            }
+        }
         let mut carried = Vec::new();
         for section in &current_view.sections {
-            if retained_ordinals.contains(&section.ordinal)
+            let ordinary_historical = retained_ordinals.contains(&section.ordinal)
                 && matches!(
                     section.kind,
                     SingleFileSectionKind::HistoricalEpochDescriptor
@@ -1376,8 +1448,14 @@ impl SingleFileContainer {
                         | SingleFileSectionKind::HistoricalMetadata
                         | SingleFileSectionKind::HistoricalPreparedCapsule
                         | SingleFileSectionKind::HistoricalWal
-                )
-            {
+                );
+            let portable_historical = retained_portable_ordinals.contains(&section.ordinal)
+                && matches!(
+                    section.kind,
+                    SingleFileSectionKind::PortableHistoricalEpochDescriptor
+                        | SingleFileSectionKind::PortableHistoricalEpoch
+                );
+            if ordinary_historical || portable_historical {
                 carried.push((
                     section.kind,
                     section.ordinal,
@@ -1520,9 +1598,10 @@ impl SingleFileContainer {
         &mut self,
         wal: &mut FileRevisionWal,
         sections: &[SingleFileSectionInput<'_>],
-        replication_frames: &[Vec<u8>],
+        replication_source: &dyn ReplicationAuthorityFrameSource,
         archive_outgoing: Option<HistoricalGenerationArchive>,
         retained_historical_generations: &BTreeSet<u64>,
+        retained_historical_effects: &BTreeSet<kernel_change::RevisionEffectId>,
     ) -> Result<SingleFileGenerationView, DurabilityError> {
         if wal.path() != self.path || wal.start_offset() != self.root.journal_offset {
             return Err(DurabilityError::Protocol {
@@ -1533,12 +1612,13 @@ impl SingleFileContainer {
         let next_lsn = wal.seal_for_generation_rotation()?;
         let old_journal_end = self.seal_journal_boundary(next_lsn)?;
         let replication_authority =
-            self.append_replication_authority_segment(replication_frames)?;
+            self.append_replication_authority_segment(replication_source)?;
         let historical_sources = self.prepare_historical_publication_sources(
             old_journal_end,
             next_lsn,
             archive_outgoing,
             retained_historical_generations,
+            retained_historical_effects,
         )?;
         let mut historical_inputs = Vec::new();
         historical_sources.append_inputs(&mut historical_inputs);
@@ -1549,17 +1629,19 @@ impl SingleFileContainer {
     }
 
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "Keep the complete operator or protocol case analysis together."
+        reason = "Keep the complete generation-publication protocol case analysis together."
     )]
     pub(crate) fn publish_generation_with_carried_wal(
         &mut self,
         wal: &mut FileRevisionWal,
         carry: CarriedWalPublication<'_>,
         sections: &[SingleFileSectionInput<'_>],
-        replication_frames: &[Vec<u8>],
+        replication_source: &dyn ReplicationAuthorityFrameSource,
         archive_outgoing: Option<HistoricalGenerationArchive>,
         retained_historical_generations: &BTreeSet<u64>,
+        retained_historical_effects: &BTreeSet<kernel_change::RevisionEffectId>,
     ) -> Result<SingleFileGenerationView, DurabilityError> {
         if wal.path() != self.path || wal.start_offset() != self.root.journal_offset {
             return Err(DurabilityError::Protocol {
@@ -1585,13 +1667,14 @@ impl SingleFileContainer {
             });
         }
         let replication_authority =
-            self.append_replication_authority_segment(replication_frames)?;
+            self.append_replication_authority_segment(replication_source)?;
 
         let historical_sources = self.prepare_historical_publication_sources(
             old_journal_end,
             next_lsn,
             archive_outgoing,
             retained_historical_generations,
+            retained_historical_effects,
         )?;
         let mut historical_inputs = Vec::new();
         historical_sources.append_inputs(&mut historical_inputs);
@@ -1720,9 +1803,9 @@ impl SingleFileContainer {
 
     fn append_replication_authority_segment(
         &mut self,
-        frames: &[Vec<u8>],
+        source: &dyn ReplicationAuthorityFrameSource,
     ) -> Result<Option<ReplicationAuthorityLocatorRoot>, DurabilityError> {
-        if frames.is_empty() {
+        if source.is_empty() {
             return Ok(self.root.replication_authority);
         }
         if self.root.journal_end == 0 {
@@ -1732,48 +1815,58 @@ impl SingleFileContainer {
             });
         }
         let parent = self.root.replication_authority.map(|root| root.segment_id);
-        let plan = ReplicationAuthoritySegmentPlan::from_frames(parent, frames)?;
+        let plan = ReplicationAuthoritySegmentPlan::from_source(parent, source)?;
         let object_offset = self.file.metadata()?.len();
         self.file.seek(SeekFrom::Start(object_offset))?;
-        let crypto = self.crypto.clone();
-        let mut nonce_sequence = crypto
-            .as_ref()
-            .map(|_| StorageNonceSequence::random())
-            .transpose()?;
-        let object_len = write_segment_object(
-            &plan,
-            frames,
-            crypto.as_ref(),
-            nonce_sequence.as_mut(),
-            &mut |bytes| {
-                self.file.write_all(bytes)?;
-                Ok(())
-            },
-        )?;
-        let locator_offset = object_offset
-            .checked_add(object_len)
-            .ok_or(DurabilityError::PayloadTooLarge)?;
-        if self.file.stream_position()? != locator_offset {
-            return Err(corruption(
-                "replication authority object writer length mismatch",
-            ));
+        let publication = (|| {
+            let crypto = self.crypto.clone();
+            let mut nonce_sequence = crypto
+                .as_ref()
+                .map(|_| StorageNonceSequence::random())
+                .transpose()?;
+            let object_len = write_segment_object(
+                &plan,
+                source,
+                crypto.as_ref(),
+                nonce_sequence.as_mut(),
+                &mut |bytes| {
+                    self.file.write_all(bytes)?;
+                    Ok(())
+                },
+            )?;
+            let locator_offset = object_offset
+                .checked_add(object_len)
+                .ok_or(DurabilityError::PayloadTooLarge)?;
+            if self.file.stream_position()? != locator_offset {
+                return Err(corruption(
+                    "replication authority object writer length mismatch",
+                ));
+            }
+            let root = write_locator_node(
+                locator_offset,
+                plan.id(),
+                plan.parent(),
+                ReplicationAuthoritySegmentExtent {
+                    offset: object_offset,
+                    len: object_len,
+                },
+                self.root.replication_authority,
+                &mut |bytes| {
+                    self.file.write_all(bytes)?;
+                    Ok(())
+                },
+            )?;
+            self.file.sync_all()?;
+            Ok(root)
+        })();
+        match publication {
+            Ok(root) => Ok(Some(root)),
+            Err(error) => {
+                self.file.set_len(object_offset)?;
+                self.file.seek(SeekFrom::Start(object_offset))?;
+                Err(error)
+            }
         }
-        let root = write_locator_node(
-            locator_offset,
-            plan.id(),
-            plan.parent(),
-            ReplicationAuthoritySegmentExtent {
-                offset: object_offset,
-                len: object_len,
-            },
-            self.root.replication_authority,
-            &mut |bytes| {
-                self.file.write_all(bytes)?;
-                Ok(())
-            },
-        )?;
-        self.file.sync_all()?;
-        Ok(Some(root))
     }
 
     fn historical_archive_descriptor(
@@ -1827,6 +1920,46 @@ impl SingleFileContainer {
             return Ok(None);
         };
         self.read_section(kind, ordinal)
+    }
+
+    pub(crate) fn read_portable_historical_epoch(
+        &mut self,
+        effect_id: kernel_change::RevisionEffectId,
+    ) -> Result<Option<Vec<u8>>, DurabilityError> {
+        let view = self.generation_view()?;
+        let descriptors: Vec<_> = view
+            .sections
+            .iter()
+            .filter(|section| {
+                section.kind == SingleFileSectionKind::PortableHistoricalEpochDescriptor
+            })
+            .cloned()
+            .collect();
+        for section in descriptors {
+            let Some(bytes) = self.read_section(
+                SingleFileSectionKind::PortableHistoricalEpochDescriptor,
+                section.ordinal,
+            )?
+            else {
+                continue;
+            };
+            if bytes.len() != 16 {
+                return Err(corruption(
+                    "portable historical epoch descriptor length mismatch",
+                ));
+            }
+            let raw: [u8; 16] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| corruption("portable historical epoch descriptor length mismatch"))?;
+            if kernel_change::RevisionEffectId(u128::from_le_bytes(raw)) == effect_id {
+                return self.read_section(
+                    SingleFileSectionKind::PortableHistoricalEpoch,
+                    section.ordinal,
+                );
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn scan_historical_epoch_journal(
@@ -3010,8 +3143,12 @@ fn read_and_validate_header(
     if page[0..8] != HEADER_MAGIC {
         return Err(corruption("single-file header magic mismatch"));
     }
-    if get_u16(&page[8..10]) != FORMAT_VERSION {
-        return Err(corruption("single-file format version is unsupported"));
+    let format_version = get_u16(&page[8..10]);
+    if format_version != FORMAT_VERSION {
+        return Err(DurabilityError::UnsupportedDurableFormat {
+            component: crate::DurableFormatComponent::SingleFile,
+            version: format_version,
+        });
     }
     if get_u16(&page[10..12]) != 0
         || get_u32(&page[12..16]) != PAGE_SIZE_U32
@@ -4953,5 +5090,31 @@ mod tests {
             })
         ));
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn future_or_unreleased_single_file_format_fails_closed_at_outer_header() {
+        let path = test_file("future-format");
+        let store =
+            SingleFileContainer::create(&path, &sections(b"checkpoint", b"metadata")).unwrap();
+        drop(store);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(8)).unwrap();
+        file.write_all(&(FORMAT_VERSION + 1).to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert!(matches!(
+            SingleFileContainer::open(&path),
+            Err(DurabilityError::UnsupportedDurableFormat {
+                component: crate::DurableFormatComponent::SingleFile,
+                version,
+            }) if version == FORMAT_VERSION + 1
+        ));
+        fs::remove_file(path).unwrap();
     }
 }

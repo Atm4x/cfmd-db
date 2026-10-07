@@ -21,6 +21,17 @@ pub trait CfmdSchema: Sized {
 
     fn definition() -> Result<Schema>;
 
+    /// Schema revision whose typed language this contract was generated for.
+    ///
+    /// `None` keeps the contract current-schema-only. Generated/remote contracts
+    /// that require post-cutover activation must carry this exact revision so
+    /// admission can resolve one retained verified bridge without guessing from
+    /// names or shape.
+    #[must_use]
+    fn contract_schema_revision() -> Option<u64> {
+        None
+    }
+
     #[doc(hidden)]
     fn __bind(source: Arc<ContextSource>) -> Result<Self>;
 }
@@ -196,6 +207,8 @@ impl ScopedContextCore {
     }
 
     fn require<E: Object>(&self, entity: crate::Id<E>, expression: SemanticRuleExpr) -> Result<()> {
+        let relation = self.formation.bridged_relation_identity(E::relation_id())?;
+        let expression = self.formation.bridge_rule_expression_exact(expression)?;
         let mut state = self.lock_state()?;
         if state.published {
             return Err(crate::Error::new(
@@ -204,7 +217,9 @@ impl ScopedContextCore {
             ));
         }
         Self::note_candidate_observations(&mut state, self.formation.revision())?;
-        state.journal.require(entity, expression)?;
+        state
+            .journal
+            .require_on_relation(entity, relation, expression)?;
         Ok(())
     }
 
@@ -354,6 +369,10 @@ impl<E: Object> EntitySet<E> {
     pub fn remove(&self, transaction: &mut IntentJournal, value: E) -> Result<()> {
         self.current()?.remove(transaction, value)
     }
+
+    pub fn remove_id(&self, transaction: &mut IntentJournal, id: crate::Id<E>) -> Result<()> {
+        self.current()?.remove_id(transaction, id)
+    }
 }
 
 /// One exact immutable semantic world projected through the same typed consumer surface.
@@ -368,9 +387,29 @@ pub struct Snapshot<S: CfmdSchema> {
     surface: S,
 }
 
+fn bind_consumer_surface<S: CfmdSchema>(
+    source: Arc<ContextSource>,
+    schema_revision: u64,
+) -> Result<S> {
+    S::__bind(source).map_err(|error| match error.kind() {
+        crate::ErrorKind::InvalidSchema | crate::ErrorKind::TypeMismatch => crate::Error::new(
+            crate::ErrorKind::ContractNotRepresentable,
+            format!(
+                "typed consumer contract {} is not representable in schema revision {schema_revision}: {}",
+                std::any::type_name::<S>(),
+                error.message(),
+            ),
+        ),
+        _ => error,
+    })
+}
+
 impl<S: CfmdSchema> Snapshot<S> {
     fn bind(database: Arc<Database>, context: ReadContext) -> Result<Self> {
-        let surface = S::__bind(Arc::new(ContextSource::Snapshot(context.clone())))?;
+        let surface = bind_consumer_surface::<S>(
+            Arc::new(ContextSource::Snapshot(context.clone())),
+            context.schema_revision(),
+        )?;
         Ok(Self {
             database,
             context,
@@ -431,15 +470,50 @@ impl<S: CfmdSchema> std::fmt::Debug for Context<S> {
 
 impl<S: CfmdSchema> Context<S> {
     fn bind_admission(admission: ContextAdmission) -> Result<Self> {
-        let core =
-            ScopedContextCore::from_formation(Arc::new(admission.database), &admission.formation);
-        let surface = S::__bind(Arc::new(ContextSource::Scoped(Arc::clone(&core))))?;
+        let ContextAdmission {
+            database,
+            formation,
+        } = admission;
+        let schema_revision = formation.schema_revision();
+        let database = Arc::new(database);
+
+        if let Some(source_schema_revision) = S::contract_schema_revision()
+            && source_schema_revision != schema_revision
+        {
+            let bridge = database
+                .current_schema_bridge(source_schema_revision)?
+                .ok_or_else(|| {
+                    crate::Error::new(
+                        crate::ErrorKind::ContractNotRepresentable,
+                        format!(
+                            "typed consumer contract {} has no retained exact bridge from schema revision {source_schema_revision} to current schema revision {schema_revision}",
+                            std::any::type_name::<S>(),
+                        ),
+                    )
+                })?;
+            let bridged_formation = formation.with_current_schema_bridge(bridge)?;
+            let core = ScopedContextCore::from_formation(database, &bridged_formation);
+            let surface = bind_consumer_surface::<S>(
+                Arc::new(ContextSource::Scoped(Arc::clone(&core))),
+                source_schema_revision,
+            )?;
+            return Ok(Self { core, surface });
+        }
+
+        let core = ScopedContextCore::from_formation(Arc::clone(&database), &formation);
+        let surface = bind_consumer_surface::<S>(
+            Arc::new(ContextSource::Scoped(Arc::clone(&core))),
+            schema_revision,
+        )?;
         Ok(Self { core, surface })
     }
 
     fn bind_snapshot(database: Arc<Database>, formation: &ReadContext) -> Result<Self> {
         let core = ScopedContextCore::from_snapshot(database, formation);
-        let surface = S::__bind(Arc::new(ContextSource::Scoped(Arc::clone(&core))))?;
+        let surface = bind_consumer_surface::<S>(
+            Arc::new(ContextSource::Scoped(Arc::clone(&core))),
+            formation.schema_revision(),
+        )?;
         Ok(Self { core, surface })
     }
 
@@ -536,6 +610,39 @@ impl<S: CfmdSchema> Context<S> {
         })
     }
 
+    /// Stages an identity-owned delete without requiring an exact/full consumer object shape.
+    pub fn remove_id<E, F>(&self, collection: F, id: crate::Id<E>) -> Result<()>
+    where
+        E: Object,
+        F: FnOnce(&S) -> &EntitySet<E>,
+    {
+        let _ = collection(&self.surface);
+        self.core.stage(move |journal, proposed| {
+            proposed.projected_objects::<E>()?.remove_id(journal, id)
+        })
+    }
+
+    /// Stages deletion of every object matching a typed predicate.
+    ///
+    /// Selection is evaluated through the consumer contract, then lowered to stable identities;
+    /// canonical stored rows are resolved only inside the mutation path. Partial Contexts therefore
+    /// never reconstruct hidden fields as truncated Rust objects.
+    pub fn remove_where<E, C, F, P>(&self, collection: C, predicate: F) -> Result<()>
+    where
+        E: Object,
+        C: FnOnce(&S) -> &EntitySet<E>,
+        F: FnOnce(&E::Proxy) -> P,
+        P: crate::ObjectPredicate<E>,
+    {
+        let _ = collection(&self.surface);
+        self.core.stage(move |journal, proposed| {
+            proposed
+                .projected_objects::<E>()?
+                .where_(predicate)
+                .delete(journal)
+        })
+    }
+
     /// Stages a semantic field patch without exposing the internal IntentJournal/intent journal.
     pub fn set<E, V, C, F, P>(
         &self,
@@ -566,7 +673,8 @@ impl<S: CfmdSchema> Context<S> {
         R: crate::ScopedRelationship<T>,
     {
         self.core.stage(|journal, proposed| {
-            journal.add_plan(relationship.__scoped_attach_plan(proposed, target)?)
+            let plan = relationship.__scoped_attach_plan(proposed, target)?;
+            journal.add_plan(proposed.bridge_plan_exact(plan)?)
         })
     }
 
@@ -577,7 +685,8 @@ impl<S: CfmdSchema> Context<S> {
         R: crate::ScopedRelationship<T>,
     {
         self.core.stage(|journal, proposed| {
-            journal.add_plan(relationship.__scoped_detach_plan(proposed, target)?)
+            let plan = relationship.__scoped_detach_plan(proposed, target)?;
+            journal.add_plan(proposed.bridge_plan_exact(plan)?)
         })
     }
 
@@ -593,7 +702,8 @@ impl<S: CfmdSchema> Context<S> {
         R: crate::ScopedRelationship<T>,
     {
         self.core.stage(|journal, proposed| {
-            journal.add_plan(relationship.__scoped_move_to_plan(proposed, target, destination)?)
+            let plan = relationship.__scoped_move_to_plan(proposed, target, destination)?;
+            journal.add_plan(proposed.bridge_plan_exact(plan)?)
         })
     }
 
@@ -604,7 +714,8 @@ impl<S: CfmdSchema> Context<S> {
         R: crate::ScopedRelationship<T>,
     {
         self.core.stage(|journal, proposed| {
-            journal.add_plan(relationship.__scoped_move_all_to_plan(proposed, destination)?)
+            let plan = relationship.__scoped_move_all_to_plan(proposed, destination)?;
+            journal.add_plan(proposed.bridge_plan_exact(plan)?)
         })
     }
 
@@ -615,7 +726,8 @@ impl<S: CfmdSchema> Context<S> {
         R: crate::ScopedRelationship<T>,
     {
         self.core.stage(|journal, proposed| {
-            journal.add_plan(relationship.__scoped_detach_all_plan(proposed)?)
+            let plan = relationship.__scoped_detach_all_plan(proposed)?;
+            journal.add_plan(proposed.bridge_plan_exact(plan)?)
         })
     }
 
@@ -631,7 +743,8 @@ impl<S: CfmdSchema> Context<S> {
     {
         let ids = ids.into_iter().collect::<Vec<_>>();
         self.core.stage(move |journal, proposed| {
-            journal.add_plan(relationship.__scoped_detach_ids_plan(proposed, ids)?)
+            let plan = relationship.__scoped_detach_ids_plan(proposed, ids)?;
+            journal.add_plan(proposed.bridge_plan_exact(plan)?)
         })
     }
 
@@ -648,7 +761,8 @@ impl<S: CfmdSchema> Context<S> {
     {
         let ids = ids.into_iter().collect::<Vec<_>>();
         self.core.stage(move |journal, proposed| {
-            journal.add_plan(relationship.__scoped_move_ids_to_plan(proposed, ids, destination)?)
+            let plan = relationship.__scoped_move_ids_to_plan(proposed, ids, destination)?;
+            journal.add_plan(proposed.bridge_plan_exact(plan)?)
         })
     }
 
@@ -739,7 +853,11 @@ impl Database {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
-    use crate::{MigrationHistoryPolicy, MigrationModel, TransactionId};
+    use crate::{
+        EquivalenceId, MigrationColumnRule, MigrationHistoryPolicy, MigrationModel,
+        MigrationRelationRule, MigrationValueExpr, PrimitiveEquivalence, Query, RelationColumnId,
+        RelationId, RelationSchema, TransactionId, Type, Value,
+    };
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
@@ -758,6 +876,70 @@ mod admission_tests {
 
         fn __bind(_source: Arc<ContextSource>) -> Result<Self> {
             Ok(Self)
+        }
+    }
+
+    struct VersionedEmptyConsumer;
+
+    impl CfmdSchema for VersionedEmptyConsumer {
+        type DefinitionAuthority = SchemaAuthorityEmpty;
+
+        fn definition() -> Result<Schema> {
+            Schema::builder().revisions(380, 1).build()
+        }
+
+        fn contract_schema_revision() -> Option<u64> {
+            Some(380)
+        }
+
+        fn __bind(_source: Arc<ContextSource>) -> Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    struct BridgedRelationConsumer {
+        source: Arc<ContextSource>,
+    }
+
+    impl BridgedRelationConsumer {
+        fn rows(&self) -> Result<Vec<Vec<Value>>> {
+            let context = match self.source.as_ref() {
+                ContextSource::Scoped(core) => core.current()?,
+                ContextSource::Snapshot(snapshot) => snapshot.clone(),
+            };
+            Ok(context
+                .execute(&Query::scan(RelationId::new(539_100)))?
+                .rows()
+                .to_vec())
+        }
+    }
+
+    impl CfmdSchema for BridgedRelationConsumer {
+        type DefinitionAuthority = SchemaAuthorityEmpty;
+
+        fn definition() -> Result<Schema> {
+            Schema::builder()
+                .revisions(539, 1)
+                .equivalence(EquivalenceId::new(539_104), PrimitiveEquivalence::I64Exact)
+                .relation(RelationSchema::set_with_column_ids(
+                    RelationId::new(539_100),
+                    [(RelationColumnId::new(539_102), Type::i64())],
+                    [EquivalenceId::new(539_104)],
+                ))
+                .build()
+        }
+
+        fn contract_schema_revision() -> Option<u64> {
+            Some(539)
+        }
+
+        fn __bind(source: Arc<ContextSource>) -> Result<Self> {
+            let context = match source.as_ref() {
+                ContextSource::Scoped(core) => core.current()?,
+                ContextSource::Snapshot(snapshot) => snapshot.clone(),
+            };
+            let _ = context.relation::<()>(RelationId::new(539_100))?;
+            Ok(Self { source })
         }
     }
 
@@ -798,6 +980,326 @@ mod admission_tests {
         assert_ne!(next.formation_revision(), admitted_revision);
 
         drop(old_context);
+        drop(database);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    fn bridged_field_auth_fixture() -> (std::path::PathBuf, Database, RelationId, RelationId) {
+        let path = std::env::temp_dir().join(format!(
+            "cfmd-context-bridged-field-auth-{}-{}",
+            std::process::id(),
+            NEXT_ADMISSION_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_relation = RelationId::new(540_100);
+        let target_relation = RelationId::new(540_101);
+        let id_eq = EquivalenceId::new(540_106);
+        let value_eq = EquivalenceId::new(540_107);
+        let source = Schema::builder()
+            .revisions(540, 1)
+            .equivalence(id_eq, PrimitiveEquivalence::I64Exact)
+            .equivalence(value_eq, PrimitiveEquivalence::I64Exact)
+            .relation(RelationSchema::set_with_column_ids(
+                source_relation,
+                [
+                    (RelationColumnId::new(540_102), Type::i64()),
+                    (RelationColumnId::new(540_103), Type::i64()),
+                ],
+                [id_eq, value_eq],
+            ))
+            .__owned_relationship(source_relation, source_relation, crate::OrphanPolicy::Keep)
+            .build()
+            .unwrap();
+        let database = Database::create(&path, source).unwrap();
+        let mut seed = database.plan().unwrap();
+        seed.insert(source_relation, vec![Value::I64(1), Value::I64(10)]);
+        database
+            .commit_plan(&seed, TransactionId::new(540_100))
+            .unwrap();
+        let target = Schema::builder()
+            .revisions(541, 1)
+            .equivalence(id_eq, PrimitiveEquivalence::I64Exact)
+            .equivalence(value_eq, PrimitiveEquivalence::I64Exact)
+            .relation(RelationSchema::set_with_column_ids(
+                target_relation,
+                [
+                    (RelationColumnId::new(540_104), Type::i64()),
+                    (RelationColumnId::new(540_105), Type::i64()),
+                ],
+                [id_eq, value_eq],
+            ))
+            .__owned_relationship(target_relation, target_relation, crate::OrphanPolicy::Keep)
+            .build()
+            .unwrap();
+        let migration =
+            MigrationModel::new(540_541, target).relation(MigrationRelationRule::Rows {
+                source: source_relation,
+                target: target_relation,
+                columns: vec![
+                    MigrationColumnRule {
+                        source_columns: vec![0],
+                        target_column: 0,
+                        value: MigrationValueExpr::Column(0),
+                    },
+                    MigrationColumnRule {
+                        source_columns: vec![1],
+                        target_column: 1,
+                        value: MigrationValueExpr::Column(1),
+                    },
+                ],
+            });
+        database
+            .migrate(
+                &migration,
+                TransactionId::new(540_101),
+                MigrationHistoryPolicy::Forget,
+            )
+            .unwrap();
+        (path, database, source_relation, target_relation)
+    }
+
+    #[test]
+    fn bridged_object_and_owned_relationship_plan_require_exact_lifecycle_contract() {
+        let (path, database, source_relation, target_relation) = bridged_field_auth_fixture();
+        let admission = database.begin_context().unwrap();
+        let bridge = database.current_schema_bridge(540).unwrap().unwrap();
+        let formation = admission
+            .formation
+            .with_current_schema_bridge(bridge)
+            .unwrap();
+
+        let mut plan = formation.plan().unwrap();
+        plan.insert_semantic(
+            source_relation,
+            vec![Value::I64(2), Value::I64(20)],
+            crate::plan::MutationAction::ObjectCreate,
+        );
+        plan.register_object_contract(crate::plan::ObjectContract {
+            relation: source_relation,
+            entity_type: crate::TypeId::new(540_300),
+            identity_column: 0,
+            identity_type: crate::TypeId::new(540_300),
+            references: Vec::new(),
+        });
+        let bridged = formation.bridge_plan_exact(plan).unwrap();
+        assert!(!bridged.mutations.contains_key(&source_relation));
+        assert!(bridged.mutations.contains_key(&target_relation));
+        assert!(bridged.object_contracts.contains_key(&target_relation));
+        assert!(bridged.mutation_actions.contains_key(&(
+            target_relation,
+            crate::plan::MutationDirection::Insert,
+            0,
+        )));
+
+        let mut owned = formation.plan().unwrap();
+        owned.register_owned_relation(crate::plan::OwnedRelationContract {
+            relation: source_relation,
+            target_relation: source_relation,
+            target_identity_column: 0,
+            orphan_policy: crate::plan::OrphanPolicy::Keep,
+        });
+        let bridged_owned = formation.bridge_plan_exact(owned).unwrap();
+        assert!(!bridged_owned.owned_relations.contains_key(&source_relation));
+        let target_owned = bridged_owned.owned_relations.get(&target_relation).unwrap();
+        assert_eq!(target_owned.target_relation, target_relation);
+        assert_eq!(target_owned.orphan_policy, crate::plan::OrphanPolicy::Keep);
+
+        let mut wrong_policy = formation.plan().unwrap();
+        wrong_policy.register_owned_relation(crate::plan::OwnedRelationContract {
+            relation: source_relation,
+            target_relation: source_relation,
+            target_identity_column: 0,
+            orphan_policy: crate::plan::OrphanPolicy::DeleteIfUnowned,
+        });
+        let error = formation
+            .bridge_plan_exact(wrong_policy)
+            .expect_err("typed ownership policy must match source authoritative schema");
+        assert_eq!(error.kind(), crate::ErrorKind::ContractNotRepresentable);
+        let diagnostic = error
+            .migration_diagnostic()
+            .expect("ownership failure must preserve structured migration diagnostic");
+        assert_eq!(
+            diagnostic.domain(),
+            crate::MigrationDiagnosticDomain::Lifecycle
+        );
+        assert_eq!(
+            diagnostic.reason(),
+            crate::MigrationDiagnosticReason::OwnershipContractChanged
+        );
+        assert_eq!(
+            diagnostic.coordinates(),
+            &[crate::MigrationCoordinate::Relation(source_relation)]
+        );
+
+        drop(database);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn bridged_patch_authorization_uses_current_target_relation_field_coordinate() {
+        let (path, database, source_relation, target_relation) = bridged_field_auth_fixture();
+        let stage = |permission: crate::Permission, tx: u128, value: i64| -> Result<()> {
+            let session_db = database.session(crate::Session::new(
+                crate::PrincipalId::new(tx),
+                crate::PermissionSet::from([permission]),
+            ));
+            let admission = session_db.begin_context()?;
+            let bridge = database.current_schema_bridge(540)?.ok_or_else(|| {
+                crate::Error::new(
+                    crate::ErrorKind::ContractNotRepresentable,
+                    "missing retained bridge",
+                )
+            })?;
+            let formation = admission.formation.with_current_schema_bridge(bridge)?;
+            assert_eq!(
+                formation.bridged_relation_identity(source_relation)?,
+                target_relation
+            );
+            let mut plan = formation.plan()?;
+            plan.patch_object_field(
+                target_relation,
+                1,
+                0,
+                Value::I64(1),
+                1,
+                Value::I64(value),
+                kernel_types::EntityId::new(1),
+                kernel_types::SemanticId::new(540_108),
+            )?;
+            let mut journal = IntentJournal::new();
+            journal.add_plan(plan)?;
+            database.commit(&journal).map(|_| ())
+        };
+
+        let denied = stage(
+            crate::Permission::WriteField {
+                relation: source_relation,
+                field: RelationColumnId::new(540_108),
+            },
+            540_200,
+            20,
+        )
+        .expect_err("source-world field grant must not authorize current B publication");
+        assert_eq!(denied.kind(), crate::ErrorKind::PermissionDenied);
+        stage(
+            crate::Permission::WriteField {
+                relation: target_relation,
+                field: RelationColumnId::new(540_108),
+            },
+            540_201,
+            20,
+        )
+        .expect("target-world field grant must authorize bridged patch");
+        assert_eq!(
+            database
+                .snapshot()
+                .unwrap()
+                .execute(&Query::scan(target_relation))
+                .unwrap()
+                .rows(),
+            &[vec![Value::I64(1), Value::I64(20)]]
+        );
+        drop(database);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn explicit_old_contract_revision_uses_bridge_even_when_current_shape_still_binds() {
+        let path = std::env::temp_dir().join(format!(
+            "cfmd-context-explicit-contract-{}-{}",
+            std::process::id(),
+            NEXT_ADMISSION_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = Schema::builder().revisions(380, 1).build().unwrap();
+        let database = Database::create(&path, source).unwrap();
+        let target = Schema::builder().revisions(381, 1).build().unwrap();
+        database
+            .migrate(
+                &MigrationModel::new(380_381, target),
+                TransactionId::new(380_381),
+                MigrationHistoryPolicy::Forget,
+            )
+            .unwrap();
+
+        let context = database
+            .context::<VersionedEmptyConsumer>()
+            .expect("explicit retained contract must activate through its verified bridge");
+        assert_eq!(context.formation_schema_revision(), 381);
+        assert!(context.core.formation.is_schema_bridged());
+
+        drop(context);
+        drop(database);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn post_cutover_old_contract_reads_current_world_through_retained_schema_bridge() {
+        let path = std::env::temp_dir().join(format!(
+            "cfmd-context-current-bridge-{}-{}",
+            std::process::id(),
+            NEXT_ADMISSION_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_relation = RelationId::new(539_100);
+        let target_relation = RelationId::new(539_101);
+        let source_column = RelationColumnId::new(539_102);
+        let target_column = RelationColumnId::new(539_103);
+        let equivalence = EquivalenceId::new(539_104);
+        let source = Schema::builder()
+            .revisions(539, 1)
+            .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+            .relation(RelationSchema::set_with_column_ids(
+                source_relation,
+                [(source_column, Type::i64())],
+                [equivalence],
+            ))
+            .build()
+            .unwrap();
+        let database = Database::create(&path, source).unwrap();
+        let mut seed = database.plan().unwrap();
+        seed.insert(source_relation, vec![Value::I64(7)]);
+        database
+            .commit_plan(&seed, TransactionId::new(539_100))
+            .unwrap();
+
+        let target = Schema::builder()
+            .revisions(540, 1)
+            .equivalence(equivalence, PrimitiveEquivalence::I64Exact)
+            .relation(RelationSchema::set_with_column_ids(
+                target_relation,
+                [(target_column, Type::i64())],
+                [equivalence],
+            ))
+            .build()
+            .unwrap();
+        let migration =
+            MigrationModel::new(539_540, target).relation(MigrationRelationRule::Rows {
+                source: source_relation,
+                target: target_relation,
+                columns: vec![MigrationColumnRule {
+                    source_columns: vec![0],
+                    target_column: 0,
+                    value: MigrationValueExpr::Column(0),
+                }],
+            });
+        database
+            .migrate(
+                &migration,
+                TransactionId::new(539_101),
+                MigrationHistoryPolicy::Forget,
+            )
+            .unwrap();
+
+        let context = database
+            .context::<BridgedRelationConsumer>()
+            .expect("old contract must activate against current B through retained bridge");
+        assert_eq!(context.formation_schema_revision(), 540);
+        assert!(context.core.formation.is_schema_bridged());
+        assert_eq!(context.rows().unwrap(), vec![vec![Value::I64(7)]]);
+
+        drop(context);
         drop(database);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&path);

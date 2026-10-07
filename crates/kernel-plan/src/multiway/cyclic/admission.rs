@@ -374,10 +374,10 @@ fn leaf_pair_distinct_estimate(
         predicate.right.column,
         predicate.equivalence,
     );
-    let Some(left) = store.semantic_statistics(&left_binding, context, registry)? else {
+    let Some(left) = store.semantic_cardinality(&left_binding, context, registry)? else {
         return Ok(None);
     };
-    let Some(right) = store.semantic_statistics(&right_binding, context, registry)? else {
+    let Some(right) = store.semantic_cardinality(&right_binding, context, registry)? else {
         return Ok(None);
     };
     Ok(Some((

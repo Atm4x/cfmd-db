@@ -6,14 +6,14 @@ use crate::descriptor::DurableRevisionDescriptor;
 use crate::domain::DurableTransactionKey;
 use crate::runtime::{DurablePrepareToken, RecoveryScan};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedTransactionEntry {
     descriptor: DurableRevisionDescriptor,
     payload_crc32c: u32,
     commit_capable: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct PreparedTransactionLedger {
     by_lsn: BTreeMap<u64, PreparedTransactionEntry>,
     lsns_by_retry_key: BTreeMap<DurableTransactionKey, BTreeSet<u64>>,
@@ -21,6 +21,38 @@ pub(super) struct PreparedTransactionLedger {
 }
 
 impl PreparedTransactionLedger {
+    pub(super) fn from_portable_seeds(seeds: &[(u64, DurableRevisionDescriptor, u32)]) -> Self {
+        let mut ledger = Self::default();
+        for (prepare_lsn, descriptor, payload_crc32c) in seeds {
+            ledger.insert_portable(*prepare_lsn, descriptor.clone(), *payload_crc32c);
+        }
+        ledger
+    }
+
+    fn insert_portable(
+        &mut self,
+        prepare_lsn: u64,
+        descriptor: DurableRevisionDescriptor,
+        payload_crc32c: u32,
+    ) {
+        let key =
+            DurableTransactionKey::new(descriptor.idempotency_epoch, descriptor.transaction_id);
+        self.lsns_by_retry_key
+            .entry(key)
+            .or_default()
+            .insert(prepare_lsn);
+        self.retry_key_by_target_revision
+            .entry(descriptor.target_revision)
+            .or_insert(key);
+        self.by_lsn.insert(
+            prepare_lsn,
+            PreparedTransactionEntry {
+                descriptor,
+                payload_crc32c,
+                commit_capable: true,
+            },
+        );
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.by_lsn.is_empty()
     }

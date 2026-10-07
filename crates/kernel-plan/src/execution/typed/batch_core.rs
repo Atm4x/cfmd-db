@@ -1,5 +1,7 @@
 #[derive(Debug)]
 struct TypedBatchProgram<'a> {
+    relation: SemanticId,
+    layout: LayoutBinding,
     installed: &'a InstalledRelation,
     columns: Vec<usize>,
     predicates: Vec<TypedBatchPredicate>,
@@ -373,6 +375,8 @@ fn build_typed_batch_program<'a>(
             };
             validate_typed_columnar_schema(context, *relation, columns)?;
             Ok(Some(TypedBatchProgram {
+                relation: *relation,
+                layout: *layout,
                 installed,
                 columns: (0..columns.len()).collect(),
                 predicates: Vec::new(),

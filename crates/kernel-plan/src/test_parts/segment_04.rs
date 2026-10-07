@@ -298,10 +298,7 @@ fn assert_quotient_support_cache_survives_delta(
     );
     let (cached, cached_stats) = prepared.execute_native_pinned(store, registry).unwrap();
     assert_eq!(cached, before);
-    assert_eq!(
-        cached_stats.multiway_join_maintained_quotient_support_hits,
-        1
-    );
+    assert_eq!(cached_stats.multiway_join_maintained_quotient_support_hits, 1);
     assert_eq!(cached_stats.multiway_join_maintained_quotient_key_hits, 0);
 
     let (relation, layout) = target;
@@ -325,19 +322,29 @@ fn assert_quotient_support_cache_survives_delta(
         .push(vec![Value::I64(21)]);
     let (after, after_stats) = prepared.execute_native_pinned(store, registry).unwrap();
     assert_eq!(after, logical.evaluate(model, context, registry).unwrap());
-    assert_eq!(after_stats.multiway_join_prepared_quotient_hits, 1);
-    assert_eq!(
-        after_stats.multiway_join_maintained_quotient_support_hits,
-        1
-    );
+    assert_eq!(after_stats.multiway_join_prepared_quotient_hits, 0);
+    assert_eq!(after_stats.multiway_join_maintained_quotient_support_hits, 0);
     assert_eq!(after_stats.multiway_join_maintained_quotient_key_hits, 0);
+    let mut forced_stats = ExecutionStats::default();
+    let forced_rows = execute_order_preserving_quotient_join_for_test(
+        prepared.physical(),
+        prepared.semantic_quotient_program.as_ref(),
+        store,
+        context,
+        registry,
+        &mut forced_stats,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(forced_rows.len(), after.rows().len());
+    assert_eq!(forced_stats.multiway_join_maintained_quotient_support_hits, 1);
 }
 
 fn assert_quotient_artifact_memory_inventory(store: &PhysicalStore) {
     let memory = store.artifact_memory_report();
     for (family, expected) in [
-        (PhysicalArtifactFamily::SemanticStatistics, 3),
-        (PhysicalArtifactFamily::SemanticQuotientFactor, 3),
+        (PhysicalArtifactFamily::SemanticFiber(SemanticFiberProfile::Cardinality), 3),
+        (PhysicalArtifactFamily::SemanticFiber(SemanticFiberProfile::Quotient), 3),
         (PhysicalArtifactFamily::SemanticQuotientSupport, 1),
     ] {
         assert_eq!(
@@ -447,7 +454,7 @@ fn quotient_factor_advisor_amortizes_build_and_evicts_only_owned_factors() {
         store
             .artifact_memory_report()
             .families
-            .get(&PhysicalArtifactFamily::SemanticQuotientFactor)
+            .get(&PhysicalArtifactFamily::SemanticFiber(SemanticFiberProfile::Quotient))
             .map(|memory| memory.advisor_managed_artifacts),
         Some(3)
     );
@@ -581,7 +588,7 @@ fn manual_quotient_factor_materialization_pins_advisor_owned_factors() {
         store
             .artifact_memory_report()
             .families
-            .get(&PhysicalArtifactFamily::SemanticQuotientFactor)
+            .get(&PhysicalArtifactFamily::SemanticFiber(SemanticFiberProfile::Quotient))
             .map(|memory| memory.advisor_managed_artifacts),
         Some(0)
     );
@@ -1253,7 +1260,7 @@ fn pass44_multiway_join_reassociation_benchmark() {
 }
 
 #[test]
-fn join_access_decision_unifies_persisted_and_ephemeral_i64_families() {
+fn join_access_decision_preserves_shared_revision_lane_after_samf_removal() {
     let (context, registry, relation) = planning_context();
     let layout = LayoutBinding {
         id: LayoutId(1_044),
@@ -1316,8 +1323,8 @@ fn join_access_decision_unifies_persisted_and_ephemeral_i64_families() {
     .unwrap();
     assert_eq!(semantic_only.family, JoinAccessKind::PersistedSemantic);
 
-    // With the legacy semantic-index family removed, SAMF/ObservableAtom is the
-    // sole persisted semantic-fiber candidate. Removing it leaves only ephemeral access.
+    // PASS581 made the revision semantic lane a shared store substrate rather than
+    // SAMF-owned state. Removing SAMF must not discard that independently useful lane.
     store.remove_observable_atom_state(&semantic_binding);
     let transient = observe_right_join_access_for_test(
         JoinAccessProbe {
@@ -1333,7 +1340,7 @@ fn join_access_decision_unifies_persisted_and_ephemeral_i64_families() {
         &registry,
     )
     .unwrap();
-    assert_eq!(transient.family, JoinAccessKind::EphemeralI64);
+    assert_eq!(transient.family, JoinAccessKind::PersistedSemantic);
 }
 
 #[test]
@@ -1476,7 +1483,7 @@ fn semantic_statistics_are_maintained_with_relation_delta() {
         .unwrap();
     assert_eq!(
         store
-            .semantic_statistics(&binding, &context, &registry)
+            .semantic_cardinality(&binding, &context, &registry)
             .unwrap(),
         Some(SemanticKeyStatistics {
             row_count: 3,
@@ -1489,7 +1496,7 @@ fn semantic_statistics_are_maintained_with_relation_delta() {
         .unwrap();
     assert_eq!(
         store
-            .semantic_statistics(&binding, &context, &registry)
+            .semantic_cardinality(&binding, &context, &registry)
             .unwrap(),
         Some(SemanticKeyStatistics {
             row_count: 3,
@@ -1505,7 +1512,7 @@ fn semantic_statistics_are_maintained_with_relation_delta() {
         .unwrap();
     assert_eq!(
         store
-            .semantic_statistics(&binding, &context, &registry)
+            .semantic_cardinality(&binding, &context, &registry)
             .unwrap(),
         None
     );
@@ -1534,7 +1541,7 @@ fn inconsistent_statistics_are_ignored_as_non_authoritative_physical_state() {
     store.set_semantic_statistics_row_count(&binding, 99);
     assert_eq!(
         store
-            .semantic_statistics(&binding, &context, &registry)
+            .semantic_cardinality(&binding, &context, &registry)
             .unwrap(),
         None
     );

@@ -16,7 +16,9 @@ use crate::wal_frame::{
     DecodedFrame, FrameRead, HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN, RecordKind, read_frame,
     validate_frame_header,
 };
-use crate::wal_payload::{CommitRecord, decode_commit_payload, decode_prepare_payload};
+use crate::wal_payload::{
+    CommitRecord, decode_commit_payload, decode_intent_seal_payload, decode_prepare_payload,
+};
 
 use super::{WAL_FRESHNESS_PREFIX_DOMAIN, wal_aad_context};
 
@@ -416,6 +418,8 @@ struct ScanState {
     prepare_identity: BTreeMap<RevisionId, usize>,
     prepare_transaction_identity: BTreeMap<DurableTransactionKey, usize>,
     committed_transaction_keys: BTreeSet<DurableTransactionKey>,
+    sealed_transactions:
+        BTreeMap<DurableTransactionKey, crate::domain::DurableCommittedTransaction>,
     commits: BTreeMap<RevisionId, CommitRecord>,
     committed: Vec<ScanCommittedRevision>,
     replication_authority_frames: Vec<Vec<u8>>,
@@ -431,6 +435,7 @@ impl ScanState {
             prepare_identity: BTreeMap::new(),
             prepare_transaction_identity: BTreeMap::new(),
             committed_transaction_keys: BTreeSet::new(),
+            sealed_transactions: BTreeMap::new(),
             commits: BTreeMap::new(),
             committed: Vec::new(),
             replication_authority_frames: Vec::new(),
@@ -441,6 +446,7 @@ impl ScanState {
         match frame.kind {
             RecordKind::PrepareRevision => self.accept_prepare(frame),
             RecordKind::CommitRevision => self.accept_commit(frame),
+            RecordKind::SealClientIntent => self.accept_intent_seal(frame),
             RecordKind::ReplicationAuthority => {
                 if frame.revision != RevisionId::new(0) {
                     return Err(DurabilityError::Corruption {
@@ -530,6 +536,16 @@ impl ScanState {
             })?;
         let transaction_key =
             DurableTransactionKey::new(descriptor.idempotency_epoch, descriptor.transaction_id);
+        if let Some(sealed) = self.sealed_transactions.get(&transaction_key) {
+            return Err(DurabilityError::Protocol {
+                offset: frame.offset,
+                reason: if sealed.same_client_intent(&descriptor.intent) {
+                    "transaction id is already durably sealed"
+                } else {
+                    "transaction id is durably sealed to another exact intent"
+                },
+            });
+        }
         if self.committed_transaction_keys.contains(&transaction_key)
             && self.prepare_owners[*self
                 .prepare_transaction_identity
@@ -656,6 +672,51 @@ impl ScanState {
         Ok(())
     }
 
+    fn accept_intent_seal(&mut self, frame: &DecodedFrame<'_>) -> Result<(), DurabilityError> {
+        let record = decode_intent_seal_payload(frame.payload).map_err(|reason| {
+            DurabilityError::Corruption {
+                offset: frame.offset,
+                reason,
+            }
+        })?;
+        if record.committed.target_revision() != frame.revision {
+            return Err(DurabilityError::Protocol {
+                offset: frame.offset,
+                reason: "intent seal header revision does not match sealed satisfaction revision",
+            });
+        }
+        if frame.revision != self.durable_head {
+            return Err(DurabilityError::Protocol {
+                offset: frame.offset,
+                reason: "intent seal satisfaction revision does not match durable head",
+            });
+        }
+        if self.committed_transaction_keys.contains(&record.key) {
+            return Err(DurabilityError::Protocol {
+                offset: frame.offset,
+                reason: "intent seal reuses a revision-committed transaction key",
+            });
+        }
+        if self.prepare_transaction_identity.contains_key(&record.key) {
+            return Err(DurabilityError::Protocol {
+                offset: frame.offset,
+                reason: "intent seal reuses a prepared transaction key",
+            });
+        }
+        if let Some(existing) = self.sealed_transactions.get(&record.key) {
+            if existing != &record.committed {
+                return Err(DurabilityError::Protocol {
+                    offset: frame.offset,
+                    reason: "conflicting duplicate durable intent seal",
+                });
+            }
+            return Ok(());
+        }
+        self.sealed_transactions
+            .insert(record.key, record.committed);
+        Ok(())
+    }
+
     fn finish(
         self,
         last_good_offset: usize,
@@ -708,6 +769,10 @@ impl ScanState {
                 prepare_payload_crc32c: revision.prepare_payload_crc32c,
                 commit_lsn: revision.commit_lsn,
             });
+        }
+        for (key, sealed) in self.sealed_transactions {
+            let previous = committed_transactions.insert(key, sealed.clone());
+            debug_assert!(previous.is_none());
         }
         RecoveryScan::recovered(
             base_revision,

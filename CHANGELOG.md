@@ -1,3 +1,70 @@
+- PASS595: replaced the five-traversal replication-authority frame-source publication path with a stream-composable CFAS v2 identity and exactly two traversals (plan + write/proof), added source-drift rejection and unpublished-tail rollback, and scheduled PASS596 as the branch-level hostile/Git-ready consolidation checkpoint.
+- PASS591: mandatory persistence-transition hostile cleanup removed the redundant runtime persistence wrapper, fixed loss of disk-only retained historical epochs during durable -> volatile backend retirement by materializing the exact retained closure first, corrected the demotion complexity law, and selected canonical semantic replication-authority transfer as the next payer.
+- PASS588: hostile replication-authority cutover audit confirmed that production checkpoint/recovery/compaction already uses the immutable `CFAS/CFAO + CFLN` closure; removed the dead generation `ReplicationAuthority` section discriminator from the active SingleFile grammar, refreshed current architecture/spec wording, and strengthened rotation coverage around an empty authority delta.
+- PASS587: hostile Rust productization audit restored the full kernel-plan acceptance gate after PASS581 encoded semantic lanes invalidated stale physical-owner assertions; QCN exact-delta state remains directly consumable, shared encoded lanes own normal execution where admitted, strict all-target kernel-plan Clippy is clean without suppressions, and no new engine/fallback was introduced.
+- PASS581: integrated catalog-free SAMF over one shared revision/store semantic-class catalog and encoded relation lanes; removed SAMF-local product class authority, preserved canonical durable tuples, fixed same-revision equivalence-drift lane reuse and replacement-time class release, and kept retention-profile synthesis paused.
+- PASS578: exposed the proven Memory -> Durable theorem as `Database::memory::<S>()` / `persist`, preserved live Context/clone identity across same-revision promotion, moved persistence-location truth into the runtime owner, enforced `PersistenceTransition` before provider/staging side effects, and kept Durable -> Volatile absent.
+## PASS568 — pre-release format normalization + durable compatibility removal
+
+- PASS577: exposed certified sealed external-freshness authority transfer through the product boundary. Freshness-aware reopen reuses the ordinary recovery path; transfer requires exclusive runtime ownership, mutates the same Database handle into the target, enforces Schema-owned `AuthorityTransfer` before restricted side effects, and projects failures through structured recovery diagnostics. FORMAT V1 is unchanged.
+- Corrected PASS557 policy: CFMD has not shipped a compatibility release. `FORMAT_VERSION = 1` remains the selected release-candidate discriminator, but pre-release snapshots carry no backward-compatibility promise.
+- Reset pass-era current-only checkpoint `7 -> 1`, physical-realization `4 -> 1`, and CanonicalEqKey/semantic-index `2 -> 1`; old decoder ladders were already absent, so these numbers carried no semantic compatibility value.
+- Removed production arbitrary-target relation commit (`commit_revision_durable_full_exact` and durable/supervisor `commit_revision` edge). Current relation durability derives its endpoint from source + exact deltas.
+- Moved several compatibility conveniences that were used only by regressions behind `cfg(test)` and renamed misleading legacy terminology in active query/advisor code.
+
+## PASS567 — kernel version/compatibility re-inventory
+
+- Added `docs/status/KERNEL_VERSION_COMPAT_INVENTORY.md` and a project rule requiring every future `vN`/legacy/compat discovery to be classified in-repository during the discovering PASS.
+- Re-audited active `kernel-*` version tags after FORMAT V1: checkpoint codec 7, realization codec 4 and CanonicalEqKey encoding 2 are current-only/fail-closed contracts, not live decoder stacks.
+- Confirmed query legacy-delta/BFC adapters are test-only oracles and the PASS472 `LegacyIndex` execution family remains absent.
+- Identified two real follow-ups: generic `commit_revision_durable_full_exact` compatibility commit, and advisor-owned statistics/quotient-factor families that are still current cyclic-optimizer capabilities rather than removable dead code.
+- Replaced the sealed-freshness checkpoint positional argument bundle with `SingleFileCheckpointAuthority`; full kernel-durability Clippy is warning-free without a new suppression.
+- Full Clippy then found and closed a kernel-plan volatile-owner `map(...).unwrap_or(false)` hygiene debt via `Result::is_ok_and`.
+
+## PASS558 — public history-retention contract
+
+- Exposed existing migration historical anchors as `HistoryRetentionPin` with explicit `SchemaMigration` reason; no new persisted retention table and no FORMAT V1 byte change.
+- Added irreversible/idempotent `Database::release_history_retention`, preserving causal migration, retry and replication authority while retiring only exact source-epoch materialization.
+- Fixed volatile release split-brain: runtime retained epoch retirement now follows canonical anchor existence rather than the presence of a durable checkpoint receipt.
+- Kept watch/read/GC semantics exact and fail-closed: no reconstruct-on-release or reader-reference-count fallback.
+
+## PASS557 — first released durable FORMAT_VERSION V1
+
+- Froze `kernel_durability::FORMAT_VERSION = 1` as the first public on-disk compatibility boundary after re-auditing Schema.Access, enum/sum and Memory -> Durable pre-format ledgers.
+- Unified single-file and directory outer durable envelopes on released V1; earlier PASS-era `3/2/1` component tags are no longer compatibility ancestors.
+- Removed unreleased checkpoint semantic codec V1-V6 decoder branches; released V1 accepts the current codec V7 only, including nested migration/historical semantic contexts.
+- Added an explicit public read/write compatibility matrix, no released upgrade sources, no downgrade targets, and fail-closed unknown/future single-file format admission.
+- Documented current persisted subcodecs as part of the V1 byte-language obligation and selected staged reopen-verified authority transfer as the only future format-upgrade law.
+
+## PASS544 — structured migration/bridge diagnostics
+- PASS545: closed migration observe/cut-over as an indexed projection of authoritative causal history; no migration progress state machine.
+
+- Added a single runtime-owned structured migration diagnostic algebra with domain, reason and exact semantic coordinates; frontends no longer need to parse kernel `TransportError` prose.
+- Attached exact diagnostics to migration validation/preview transport failures and current-world read/write/lifecycle bridge failures.
+- Preserved `ErrorKind` as the coarse control-flow category while exposing optional structured migration detail through `Error::migration_diagnostic()` and the public `cfmd::Diagnostic`.
+- Kept the ubiquitous runtime `Error` compact by storing migration diagnostics indirectly; strict Clippy caught and rejected the first inline representation because it inflated every `Result<_, Error>`.
+- Added stable Access/preparation diagnostic domains for the selected Schema-Owned Access and workflow lines without implementing a second policy/migration evaluator.
+
+## PASS540 — bridged remote activation + current-world authorization
+
+- Added hosted `ContractHead { schema_revision }` query activation: old-language remote reads compile through retained verified `CurrentSchemaBridge` and authorize only against current-schema footprints.
+- Hardened explicit old typed contracts so `#[cfmd(schema_revision = A)]` with `A != current` always resolves through verified bridge rather than attempting shape-compatible direct bind first.
+- Added restricted-Session bridged field-patch regression proving source-world grants cannot authorize current-target publication.
+- Imported three R&D source notes into `docs/rnd/` and added abstract long-horizon authorization, semantic-kernel and embedded-DX directions to the productization ledger.
+- Kept bridged create/delete/relationship/precondition transport fail-closed pending exact object/lifecycle/relationship coordinate laws; no generic fallback was added.
+
+## PASS539 — bridged typed Context activation
+
+- Added admission-scoped `CurrentSchemaBridge` activation for explicitly-versioned old `CfmdSchema` contracts; old queries compile to current-world IR before authorization/execution.
+- Added `#[cfmd(schema_revision = N)]` and exact relation/model-field identity transport for bridged field-patch lowering.
+- Kept create/delete/relationship/precondition compatibility fail-closed until separate exact lifecycle/coordinate laws exist; no historical-schema or generic fallback was added.
+
+## PASS523 — Γ-keyed grouped exact-measure generalization
+
+- Generalized sparse grouped validation buckets from count-specific state to one exact-measure witness while preserving separate live membership authority.
+- Added grouped selected `ExactF64Sum` with Γ-canonical keys, delta-local maintenance, typed object-first DX and durable reopen.
+- Kept cross-relation grouped comparison fail-closed pending an explicit group-domain alignment theorem; no query/HAVING fallback or implicit missing-group semantics were introduced.
+
 ## PASS379 — stable field identity across Rust renames
 
 ## 2026-10-04 — PASS507 GitHub checkpoint sync
@@ -491,3 +558,303 @@
 - Generalized ordinary `group_by` from a single field to one typed group-key law; `(field_a, field_b)` and three-field tuple keys lower directly to kernel `Group { group_columns, group_equivalences }`.
 - Composite grouped count/sum keep exact, Candidate, maintained-watch, and `top`/`bottom` semantics on the same query expression; aggregate ordering uses the column after the complete group key.
 - No `group_by2/group_by3`, host-language map regrouping, or tuple-specific execution engine was introduced.
+
+### PASS508
+- Unified schema-aware prepared publication for mixed relation + field effects.
+- Added bounded `SchemaAwareFormationContextWitness`; hosted stale commit no longer uses historical `revision_at(base_revision)` for formation typing.
+- Routed unguarded field-only stale publication through the unified prepared walker; retained guard-specific sealing path remains exact and separate.
+
+### PASS510
+- Added durable retry-only `SealClientIntent` WAL authority for already-satisfied exact intents without synthetic semantic revisions.
+- Recovery/checkpoint retry authority now includes no-op seals in the existing committed-transaction ledger.
+- Schema-aware relation/mixed publication seals empty residuals and safely accepts certified same-idempotent model overlaps.
+- Schema-aware intent readiness now preserves structured conflict/coordination diagnostics from kernel preparation.
+
+## PASS512
+- Added stable formation-proof diagnostic categories distinct from current-world transaction conflict.
+- Replaced relational formation-seal global causal-history replay with persistent retained relation-delta lineage.
+- Added recovery coverage and release benchmark showing cost tracks relevant relation deltas rather than total retained revisions.
+
+## PASS514 — binding outcome/diagnostic closure
+
+- Added stable `DiagnosticCode::as_str()` spellings for language bindings.
+- Python PyO3 probe now exposes structured `CfmdError(code, message)` and exact commit outcomes including `AlreadySatisfied` versus retry `AlreadyCommitted`.
+- Built and clean-installed a real CPython 3.13 wheel with maturin 1.15.0; the full asyncio/product hostile probe passes.
+- Hosted protocol now preserves `FormationProofUnavailable` and `FormationProofInvalidated` through append-only wire error tags instead of collapsing them to `Internal`.
+- Retained the selected migratable-watch DX under `docs/api/CFMD_MIGRATABLE_WATCH_DX_RU.md` without treating the current validation probe syntax as final product API.
+- Hostile audit selected granular carrier/lifecycle/keeps-alive publication authorization as the next semantic/security closure.
+
+
+### PASS515 — exact model-coordinate authorization
+- Added exact current-world publication permissions for carrier presence/member, lifecycle entity/root, and keeps-alive presence/edge.
+- Generic write authority no longer covers these model coordinates; stale schema-aware publication is checked against the transported exact footprint.
+- Added stale A->B runtime/session regression for preview, readiness and commit authorization.
+
+## PASS516
+- Exposed deterministic database-wide `ModelRuleExpr` and normalized `FiniteF64` through the public Rust facade.
+- Added `SchemaBuilder::model_rule`, lowering into the existing kernel validation/invariant-closure engine.
+- Added `#[cfmd(matches = <TextPattern expression>)]` for deterministic persisted text-pattern validation.
+- Added public regressions for pattern enforcement and model invariant persistence across reopen.
+
+## PASS517
+- Added typed object invariant composition (`Object::rule`, `Field::rule`, `ObjectRuleField`, deterministic `and/or/negate`).
+- Added object-first model-rule constructors and `SchemaBuilder::object_rule` lowering to existing `RelationAll` kernel semantics.
+- Typed rule coordinates now honor persisted `semantic_name`/`bind` identity; raw semantic IDs are no longer required for normal object invariant DX.
+
+## PASS518
+- Added persisted semantic field-to-field equivalence and ordering predicates backed by explicit equivalence/ordering module IDs.
+- Removed the late registry-free VMF model-rule evaluation seam; runtime/recovery use the pinned semantic registry.
+- Added typed scalar/bool binary-rule DX and root-only direct/optional-reference rule coordinates without exposing deep traversal as row-local validation.
+- Added durable reopen and public regressions for ordered, bool-equivalence and reference-equivalence invariants.
+
+## PASS519 — selected exact aggregate invariant measure
+
+- Generalized the exact finite-f64 model invariant from an unconditional column sum to a persisted row-selected measure: `sum(P(row) * value(row))`, where `P` is the existing deterministic `SemanticRuleExpr`.
+- Existing `object_exact_f64_sum_range` lowers to the same law with `P=True`; added typed `object_exact_f64_sum_where_range` for selected aggregates without raw relation/column IDs.
+- Maintained witnesses update in O(delta rows), using exact inverse removal/addition from `kernel-aggregate::ExactF64Sum`; selector fields join the aggregate column in the exact dependency footprint.
+- Semantic selector predicates use the same pinned `SemanticRegistry`; registry-free witness maintenance fails closed to authenticated rebuild rather than comparing through Rust or replaying a query.
+- Checkpoint/reopen persistence carries the selector expression with the aggregate invariant.\n\n## PASS520\n- Unified relation cardinality/exists/all into persisted `RelationExactCountRange` backed by `ExactCount`; removed the three legacy variants and their checkpoint tags.\n- Added typed `object_exact_count_where_range`; cardinality/exists/all now lower to the same selected-count law.\n- Preserved exact VMF mass, semantic selector authority, O(delta) witness maintenance, durable reopen, and zero-overhead `count(True)` specialization.\n
+
+## PASS521
+- Added persisted exact aggregate-to-aggregate comparison over independently maintained count and finite-f64-sum measures.
+- Generalized model-rule dependency indexing to multiple relations and exact touched-side delta maintenance.
+- Added exact `ExactF64Sum` witness comparison without host-f64 rounding.
+- Added object-first count/sum comparator constructors and durable cross-relation reopen coverage.
+
+## PASS522
+- Added persisted Γ-keyed `RelationGroupedExactCountRange` model invariants with sparse exact per-group membership/selected-count witnesses and maintained global violation mass.
+- Added semantic-equivalence canonical group keys, delta-local bucket maintenance, checkpoint/reopen support, and typed `object_group_exact_count_where_range`.
+- Grouped validation does not use SQL `GROUP BY/HAVING`, query replay, host equality/hash, or dense all-group rescans.
+
+## PASS524 — same-domain Γ-keyed grouped exact measure-product comparison
+- Added persisted grouped exact aggregate comparison only for a definitionally shared live group domain: one relation, one group-coordinate tuple, and one Γ-equivalence tuple.
+- Each live bucket maintains exact membership plus left/right exact aggregate witnesses and one local comparator contribution; row deltas touch one canonical bucket only.
+- Added count/count and exact-f64-sum/sum object-first grouped comparator constructors, durable reopen coverage, and fail-closed schema rejection for cross-relation domains or mixed measure types.
+- Group identity remains owned by `SemanticRegistry`; no query join, zero-fill, host hash/equality, or GROUP BY/HAVING fallback was introduced.
+
+
+## PASS525
+- Normalized kernel-persisted grouped invariants to one `RelationGroupedExactMeasure` law with typed exact range/compare constraints.
+- Removed duplicated grouped relation metadata and unreleased grouped checkpoint tags; relation authority is derived and schema-validated from exact measures.
+- Kept object-first runtime APIs as presentation sugar and retained specialized compiled grouped count/sum/compare hot paths with unchanged sparse Γ-bucket maintenance.
+
+## PASS526 — kernel-wide exact-measure persistence normalization
+- Replaced the three kernel-persisted global exact invariant variants with one `RelationExactMeasure { constraint }` law.
+- Renamed the grouped-only constraint type to kernel-wide `ExactMeasureConstraint`; global and grouped persistence now share typed Range/Compare vocabulary.
+- Preserved global cross-relation homogeneous comparison while applying same-relation/domain alignment only to grouped constraints.
+- Checkpoint encoding now has one global exact-rule tag and one grouped exact-rule tag; unreleased legacy global tags were removed.
+- Runtime object-first APIs remain presentation sugar; `kernel-validation` still compiles to specialized count/sum/compare hot paths before row maintenance.
+
+
+## PASS527 — Exact ordered multiplicity / extrema
+- Added `ExactOrderedMultiset<K>`: exact multiplicities in an ordered sparse index; insert/delete O(log D), min/max from the index without source rescans.
+- Ordered extrema canonicalize values through `SemanticRegistry::canonical_order_key`; host `Ord` is used only on the resulting semantic `CanonicalOrderKey`.
+- `ExactAggregateMeasureExpr::OrderedExtremum { Min|Max }` reuses the normalized exact-measure persistence/compare substrate; no parallel top-level model-rule variant.
+- Partial extrema comparison is support-aligned: None/None satisfies, Some/Some compares, mismatched definedness violates. Non-emptiness remains an explicit count law.
+- Registry-free extrema maintenance is fail-closed; semantic ordering authority is mandatory.
+- Deleting the current min/max updates the ordered multiplicity witness locally and survives durable reopen.
+- OPEN next: hostile-R&D exact order-statistics / quantiles. Do not accept row rescans, SQL MIN/MAX/ORDER BY fallback, host value ordering, or dense rank arrays.
+
+
+## PASS528 — exact order statistics
+- Rebuilt `ExactOrderedMultiset` as one exact AVL order-statistics tree with subtree cardinalities; rank/select and deletion-safe extrema are O(log D) with no second index.
+- Added exact lower-quantile selector `floor(p * (n - 1))` using integer arithmetic, and normalized persisted extrema into generic ordered-statistic selectors.
+- Added object-first ordered-statistic comparison and durable reopen regression; failed missing-key deletion now preserves the witness atomically.
+
+## PASS530
+- Closed Γ-grouped ordered-statistic range invariants over sparse canonical group buckets and exact AVL order-statistics witnesses.
+- Added object-first grouped ordered-statistic range DX and durable reopen regression.
+- Marked the current deterministic Semantic Rules line functionally complete; next line is schema-owned authorization policy.
+
+## PASS531
+- Added persisted authoritative-schema Role -> AccessCapability -> exact PermissionCoordinate policy.
+- Removed ephemeral Role-as-permission-bag product semantics; schema roles compose capabilities/roles by monotone union with cycle rejection.
+- Added current-schema role resolution to PermissionSet and typed object capability coordinate helpers.
+- Authorization policy survives checkpoint/reopen; runtime enforcement remains the existing exact P503-P515 engine.
+
+
+## PASS532
+- Added authoring-only `AuthorizationPolicy` bundle and `SchemaBuilder::authorization`.
+- Added typed many-relationship attach/detach/move capability selectors plus exact global operation helpers.
+- Added current-schema `session_for_roles` / `refresh_session_roles` helpers for external role assignments; assignment remains non-persisted.
+- Kept PASS531/P503-P515 as the only persisted policy/enforcement authorities; entity/field role metadata is explicitly not a second security model.
+
+## PASS533
+- Closed Authorization frontend without adding a duplicate policy macro DSL.
+- Added schema-neutral `MigratableQueryWatch` / `MigratableWatchEvent` and `Database::migratable_watch`.
+- Added zero-row-rebuild definitionally-equivalent maintained-plan context rebind; ordinary watch stays schema-bound and structural migration fails closed.
+
+## PASS534
+- Added retained-program structural MigratableWatch transport for exact row-observation identity migrations.
+- Column semantic-ID changes can cross without row/result rebuild when the migration proves same-ordinal identity rows.
+- Transported read footprints are reauthorized against target authority.
+- Added explicit `MigratableWatchEvent::materialize_schema` late materialization; row permutation/value-changing migrations remain fail-closed.
+
+## PASS535
+- MigratableWatch now supports exact relation-coordinate retargeting (`source relation A -> target relation B`) for certified row-identity migrations.
+- Retargeting rewrites only semantic scan coordinates and reconstructible differential metadata; maintained rows/canonical lookup are preserved without scan/rebuild.
+- Persistent relation base witnesses retarget their relation coordinate while independently checking target row type and canonicalizer identity.
+- Added E2E regression over a nested filter query proving a pre-migration row can be removed through the target relation after cutover.
+
+## PASS536
+- Added verified observation-transport classification separating row-identity metadata transport from row-local transforms that require maintained-state value conversion.
+- Kept value/shape-changing MigratableWatch cutover fail-closed rather than adding query/result rebuild or old-schema routing fallback.
+- Added exact regression for `i64 -> f64`: future row-local delta transport remains valid, while already-maintained state is rejected until a non-O(rows) state homomorphism exists.
+- Documented the only clean future generalization as factorized observation-state realization; DB 1.0 proceeds to Context/client lifecycle closure instead.
+
+## PASS537 — bounded Context lifecycle and contract representability
+- Locked scoped Context behavior across schema cutover: an admitted A Context remains A for the scope, while exact intent publication transports forward into current B.
+- Added stable `ContractNotRepresentable` runtime/protocol diagnostics for typed consumer binding incompatibility.
+- Isolated post-cutover newly arriving old-client compatibility as the next certified current-world SchemaBridge theorem; no old-schema live routing fallback was introduced.
+
+## PASS538 — certified current-world SchemaBridge foundation
+- Added verified `SchemaBridge` read compilation for row-representation-identity migrations, including exact relation-coordinate retargeting with unchanged operator trees and result types.
+- Added retained-lineage `CurrentSchemaBridge` resolution to authoritative HEAD without historical state materialization.
+- Unified bridge-side exact relation delta/write-footprint transport with the existing migration transport theorem; value-changing old-language reads remain fail-closed.
+
+## PASS541
+- Added exact admission-scoped object/reference/non-owned relationship and semantic-precondition bridge lowering into current authoritative schema coordinates.
+- Added remote `ContractHead` watch activation and fixed maintained watch state to build from the compiled target expression.
+- Kept owned relationship/orphan-policy transport fail-closed pending its own lifecycle certificate.
+- Selected Schema-Owned Access Report 2 as the active authorization/DX R&D source.
+
+## PASS542
+- Persisted schema-owned exclusive ownership/orphan contracts and added exact migration bridge certification for `OwnedMany`.
+- Bridged ownership now requires identity preservation of the relationship relation and target object relation plus exact orphan-policy equality; policy changes fail closed.
+- Checkpoint semantic-context codec advanced to unreleased v7 so ownership semantics survive reopen and retained migration lineage.
+- Closed the remaining P0 zero-downtime Context/client/watch lifecycle gap; next line is migration frontend/diagnostics.
+
+## PASS543 — exact prepared migration workflow foundation
+- Added runtime-owned `MigrationPlan`, `MigrationValidation`, `MigrationPreview` and opaque `PreparedMigration` surfaces.
+- Planning/validation avoid target-data construction; preview constructs and validates the exact target without publication.
+- Prepared execution is bound to database/source revision and fails stale rather than recompiling against a moved HEAD.
+- Existing immediate `migrate` now uses the same prepare/execute implementation.
+- Session migration workflow reuses the same `SchemaMigrate` authority and runtime semantics.
+- Added structural migration cost classification and initial stable migration diagnostics vocabulary.
+
+## PASS546 — authoritative Schema.Access migration contract
+- Replaced the active `AuthorizationPolicy`/`SchemaBuilder::authorization` mental model with authoritative `SchemaAccess` / `SchemaBuilder::access`; the existing PermissionSet evaluator remains unchanged.
+- Migration verification now proves exact capability realization and role-composition preservation against the independently authoritative target Schema.Access.
+- Access widening/narrowing or role-definition changes fail closed with structured Access-domain migration diagnostics.
+- Deferred public `FORMAT_VERSION` until intentional Access policy changes have one explicit durable migration theorem, avoiding immediate released-format churn.
+
+## PASS547
+- Added exact Schema.Access migration diff classification, transitive affected-role closure and durable per-capability/per-role policy-change approvals.
+- Approved Access changes are encoded in the canonical migration program and reverified on recovery; unused approvals fail closed.
+- Added structured runtime projection for approved Access changes.
+- Recorded native enum/sum semantics and physical representation as the final pre-format blocker.
+
+## PASS548
+- Added exact semantic-sum widening migration: stable variant IDs survive additive enum evolution without rewriting existing values.
+- Persisted the widening expression in canonical schema-migration durability metadata and verified reopen.
+- Kept sum widening read-only for lens inversion unless a separate certified backward law exists.
+- Selected the Memory -> Durable same-revision persistence transition architecture in `docs/rnd/CFMD_MEMORY_TO_DURABLE_TRANSITION_PASS548.md`.
+
+## PASS549
+- Added layout-local bit-packed physical tags for sum/enum columns while preserving stable semantic variant IDs.
+- Added dense per-variant payload carriers and zero per-row payload metadata for fully fieldless enums.
+- Persisted packed sum physical atoms in current unreleased realization codec v4; removed old unreleased v1-v3 decode compatibility.
+
+## PASS550
+- Added source-independent `CanonicalPersistenceImage` as the durability bootstrap seam for same-revision persistence realization.
+- Added exact single-file staging/reopen verification preserving causal history, retry/idempotency outcomes and current factorized realization when available.
+- Memory -> Durable remains fail-closed for retained historical archives, unresolved prepares, replication authority, external freshness and active streaming checkpoint publication until PASS551 closes their image/handoff law.
+
+## PASS551
+- Canonical persistence promotion now preserves unresolved prepared-cut and replication authority.
+- Active streaming checkpoint work no longer blocks promotion because unpublished checkpoint staging is non-authoritative physical work.
+- Retained historical closure and external freshness remain explicit fail-closed boundaries pending portable closure / trust-anchor handoff laws.
+
+## PASS569 — semantic capability lattice / cyclic convergence
+
+- cyclic/query costing now consumes representation-neutral exact semantic cardinality rather than naming the retained statistics family;
+- quotient projections expose their exact maintained cardinality, so retaining quotient state no longer requires a duplicate statistics artifact for costing;
+- SAMF/ObservableAtom capability metadata now reflects its existing quotient-fiber and exact-cardinality semantics;
+- added in-repository R&D and compatibility/hostile/productization ledger updates for the remaining semantic-fiber physical-profile convergence.
+
+## PASS570
+- Unified statistics, quotient and SAMF artifact identity as one semantic-fiber artifact with explicit physical profiles.
+- Centralized profile capability declarations and unified telemetry/memory-family vocabulary.
+- Restored full green `kernel-plan` suite by rewriting inherited arbitrary-target retry regressions against the derived durable request law.
+- Added measured retained-memory profile frontier demonstrating non-monotone cost by capability strength.
+
+
+## PASS571
+- Added `kernel-semantics::fiber_carrier::FiniteFiberCarrier` R&D implementation with Measure/ExactFibers/ProjectedFibers profiles, coordinate-class interning, shared joint-fiber signatures, and exhaustive forgetful-law tests.
+- Added semantic-fiber build/memory/delta frontier probe; ExactFibers materially reduces quotient retained structure while ProjectedFibers remains memory-gated against SAMF.
+- Added `docs/rnd/CFMD_FINITE_FIBER_CARRIER_PASS571.md` and `docs/status/SEMANTIC_FIBER_UNIFICATION_LEDGER.md`.
+
+## PASS572
+- Added exact `RowKeyMassRetention` semantic-fiber realizer and moved production quotient retention off unused joint-row buckets.
+- Reframed semantic-fiber demand as exact observation capabilities rather than ordinal profile strength.
+- Corrected SAMF memory accounting for `RevisionObservableCatalog` and added hostile distribution frontier evidence.
+- Adopted retention synthesis / exact-realizer selection as the continuation architecture; SAMF remains until workload/resource selection can replace it without regression.
+
+## PASS573 — competitive semantic-fiber retention compiler
+
+- Added exact observation/resource retention-plan compilation with shared `ResourceFootprint` accounting and deterministic realizer witnesses.
+- Added protected-reference performance firewall using conservative read envelopes plus lifecycle/peak guards.
+- Protected exact implementations remain selectable even when synthesis has no rule for an observation yet.
+- Split global cardinality from keyed joint mass and made slot demands coordinate-indexed.
+- Imported the competitive-retention R&D continuation and carried the semantic-fiber ledger forward.
+
+## PASS574
+- Decomposed semantic-fiber shared-key retention into `CanonicalJointKeyPool` plus independent `SharedRowKeyRoute` while preserving production quotient semantics.
+- Added maintenance-closed physical resource atoms and cycle-safe dependency closure to the exact retention compiler.
+- Added a standalone release calibration harness; shared Text256 routing is promising and materially below SAMF, but conservative owned/shared envelopes still overlap, so no protected latency point was removed.
+
+## PASS575
+- Restored a protected direct `RowCanonicalKey + JointMass` production engine after fair shared-key calibration showed a real workload crossover; shared canonical retention remains a gated candidate rather than the global quotient lowering.
+- Kept the PASS572 removal of unused quotient joint-row buckets.
+- Demoted arbitrary-target `RevisionTransitionRequest` from the public `kernel-plan` API to crate-private/test-only preparation machinery.
+- Paused further production retention-synthesis expansion pending stable R&D evidence.
+
+## PASS576
+- Added structured public FORMAT V1 recovery diagnostics for reopen, backup, strict verification and fresh restore.
+- Preserved typed operation/authority/reason plus exact durable-format version and corruption/protocol byte offsets where available; frontends no longer need to parse debug prose.
+- Kept all recovery acceptance, FORMAT V1 bytes and restore semantics unchanged; no salvage or second recovery state machine was introduced.
+- Kept external-freshness disaster recovery out of the public vocabulary until its certified kernel transfer has a real product authority-transfer entrypoint.
+
+
+## PASS579
+- Renamed the pre-release product key-rotation operation to `Database::reconfigure_protection(...)` and added the restricted `SessionDatabase` equivalent under `DatabaseAdministration::ProtectionReconfigure`.
+- Added `RecoveryOperation::ProtectionReconfigure` so durability failures preserve structured PASS576 diagnostics.
+- Kept protection administration distinct from schema migration, persistence transition and external-freshness authority transfer.
+- Rejected invalid rewrap source/target/algorithm requests before the durability poison boundary; caller misuse no longer poisons healthy committed storage.
+- PASS580: restored a fully green Rust product acceptance frontier by separating identity-free `cfmd_object!` value mutation from identity-bearing entity deletion. Exact full-shape value-object deletes now remove selected persisted row values without inventing semantic identity; a field named `id` remains ordinary data. Live `save_as = backup + open` was rejected because persistence images carry operational authority that cannot be duplicated into a concurrently live fork without a separate theorem.
+
+## PASS582 — strict security authority separation
+- Split client/data authority (`Schema.Access`, `SessionDatabase`) from database control authority (`DatabaseControlSession`, `AdminDatabase`).
+- Removed Schema-owned migration/admin permissions and migration self-approval.
+- Added independent schema-publication, access-policy, declassification and migration-data-inspection control claims.
+- Added epoch-bound Schema-role session re-resolution.
+
+## PASS583
+- Added sealed `MigrationSecurityImpact` with exact source-data/integrity dependencies, per-role observation flows and explicit declassification edges.
+- Replaced change-kind-based declassification gating with the exact noninterference factorization theorem.
+- Bound migration security identity to canonical durable program bytes + source revision + migration id.
+- Made `MigrationDataInspect` conditional on actual sealed source-data dependencies rather than all prepare operations.
+
+
+## PASS584 — sealed migration approval / control credential lifecycle
+- Split mutable database-control credential roots from use-only control sessions: `DatabaseControlCredential` alone rotates/revokes claims, while `DatabaseControlSession` can only consume live claims.
+- Added exact `MigrationSecurityApproval`, bound to one live database authority, source revision, migration identity, complete `MigrationSecurityImpact`, impact digest, approver principal and control generation.
+- Security-sensitive hosted migration now requires explicit `validate -> approve -> prepare_migration_approved`; approval may come from a different control credential than the publisher.
+- Prepare and execute both revalidate approval liveness; credential rotation/revocation invalidates already-prepared publication before side effects.
+- Added hostile coverage for independent declassification approval, generation invalidation, exact-impact mismatch and cross-database replay rejection.
+
+## PASS585 — live fork operational identity
+- Added an exact live-fork image that carries semantic/history state while re-founding retry, prepared and replication authority through normal store bootstrap.
+- Added `Database::fork_to`, `AdminDatabase::fork_to`, `DatabaseControlPermission::Fork` and structured Fork recovery diagnostics.
+- External-freshness sources remain fail-closed pending an independent freshness-root bootstrap theorem.
+
+## PASS586
+- Closed the externally anchored live-fork exception with independent target freshness-root bootstrap; the source freshness authority is neither copied nor rebound.
+- Added sealed first-generation freshness binding and exact response-loss reconciliation for bootstrap publication.
+- Added `Database::fork_to_with_external_freshness(...)` and the restricted `AdminDatabase` projection under the existing `Fork` control authority.
+- Preserved PASS585 fresh retry/prepared/replication roots and source at-rest protection floor; ordinary open of the anchored target remains fail-closed.
+
+## PASS594
+- Integrated proof-checked Set-CQ semantic interning for equivalent multi-root maintained observations without replacing structural/durable query identity.
+- Kept Γ-factorized aggregate work in R&D/test/example scope pending production admission proofs.
+- Added one replayable replication-authority frame-source abstraction and streamed semantic-base staging directly into existing `CFAS/CFAO` publication instead of retaining the complete encoded frame sequence in memory.

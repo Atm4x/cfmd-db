@@ -1,8 +1,11 @@
 use crate::{
     Error, ErrorKind, Field, GroupKey, Plan, PrimitiveEquivalence, PrimitiveOrdering, Projection,
-    Query, ReadContext, Relation, RelationId, RelationQuery, Result, RowCodec, SchemaBuilder, Type,
-    TypedQuery, Value, ValueCodec,
+    Query, ReadContext, Relation, RelationColumnId, RelationId, RelationQuery, Result, RowCodec,
+    RuleValueExpr, SchemaBuilder, SemanticRuleExpr, TextPattern, Type, TypedQuery, Value,
+    ValueCodec,
 };
+use std::collections::BTreeSet;
+use std::marker::PhantomData;
 
 const FNV128_OFFSET: u128 = 144_066_263_297_769_815_596_495_629_667_062_367_629;
 const FNV128_PRIME: u128 = 309_485_009_821_345_068_724_781_371;
@@ -106,10 +109,13 @@ impl<S: Object, V: ObjectValue> ObjectPatchField<S, V> for Field<S, V> {
     }
 }
 
-pub trait OrderedObjectValue: ObjectValue {}
+pub trait OrderedObjectValue: ObjectValue + Sized {
+    #[doc(hidden)]
+    fn __into_ordered_statistic_bound(self) -> crate::OrderedStatisticBound;
+}
 
 macro_rules! scalar_object_value {
-    ($rust:ty, $type_expr:expr, $equivalence:expr, $ordering:expr) => {
+    ($rust:ty, $type_expr:expr, $equivalence:expr, $ordering:expr, $bound:expr) => {
         impl ObjectValue for $rust {
             fn object_type() -> Type {
                 $type_expr
@@ -122,7 +128,11 @@ macro_rules! scalar_object_value {
                 Some($ordering)
             }
         }
-        impl OrderedObjectValue for $rust {}
+        impl OrderedObjectValue for $rust {
+            fn __into_ordered_statistic_bound(self) -> crate::OrderedStatisticBound {
+                ($bound)(self)
+            }
+        }
     };
 }
 
@@ -130,31 +140,36 @@ scalar_object_value!(
     (),
     Type::unit(),
     PrimitiveEquivalence::UnitExact,
-    PrimitiveOrdering::UnitExact
+    PrimitiveOrdering::UnitExact,
+    |()| crate::OrderedStatisticBound::Unit
 );
 scalar_object_value!(
     bool,
     Type::bool(),
     PrimitiveEquivalence::BoolExact,
-    PrimitiveOrdering::BoolAscending
+    PrimitiveOrdering::BoolAscending,
+    crate::OrderedStatisticBound::Bool
 );
 scalar_object_value!(
     i64,
     Type::i64(),
     PrimitiveEquivalence::I64Exact,
-    PrimitiveOrdering::I64Ascending
+    PrimitiveOrdering::I64Ascending,
+    crate::OrderedStatisticBound::I64
 );
 scalar_object_value!(
     f64,
     Type::f64(),
     PrimitiveEquivalence::F64Bitwise,
-    PrimitiveOrdering::F64Total
+    PrimitiveOrdering::F64Total,
+    |value: f64| crate::OrderedStatisticBound::F64Bits(value.to_bits())
 );
 scalar_object_value!(
     String,
     Type::text(),
     PrimitiveEquivalence::TextExact,
-    PrimitiveOrdering::TextBinary
+    PrimitiveOrdering::TextBinary,
+    crate::OrderedStatisticBound::Text
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1427,6 +1442,21 @@ pub trait Object: RowCodec + Sized + 'static {
 
     fn proxy(relation: Relation<Self>) -> Self::Proxy;
 
+    /// Builds one deterministic object predicate from generated typed field coordinates.
+    ///
+    /// The closure is executed only while constructing the schema/intent expression. It does not
+    /// become a runtime validator or persisted callback; generated fields lower immediately into
+    /// the same stable `SemanticRuleExpr` vocabulary used by the kernel.
+    #[must_use]
+    fn rule<F>(build: F) -> SemanticRuleExpr
+    where
+        F: FnOnce(&Self::Proxy) -> SemanticRuleExpr,
+    {
+        let relation = symbolic_relation::<Self>();
+        let proxy = Self::proxy(relation);
+        build(&proxy)
+    }
+
     #[must_use]
     fn type_id() -> crate::TypeId {
         crate::TypeId::new(__semantic_id("cfmd.object.type.v1", Self::KEY, "type"))
@@ -1456,6 +1486,755 @@ pub trait Object: RowCodec + Sized + 'static {
             Self::KEY,
             semantic_name,
         ))
+    }
+}
+
+/// Typed object-field coordinate for deterministic semantic-rule construction.
+///
+/// This is a frontend-only handle. It carries the stable persisted field/column identities and
+/// lowers immediately into `RuleValueExpr` / `ModelRuleExpr`; it is never persisted as a separate
+/// rule representation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ObjectRuleField<E: Object, V: ObjectValue> {
+    field: crate::FieldId,
+    column: RelationColumnId,
+    equivalence: crate::EquivalenceId,
+    ordering: Option<crate::OrderingId>,
+    marker: PhantomData<fn() -> (E, V)>,
+}
+
+impl<E: Object, V: ObjectValue> Copy for ObjectRuleField<E, V> {}
+
+impl<E: Object, V: ObjectValue> Clone for ObjectRuleField<E, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E: Object, V: ObjectValue> ObjectRuleField<E, V> {
+    fn from_field(field: Field<E, V>) -> Self {
+        assert_eq!(
+            field.relation_id(),
+            E::relation_id(),
+            "CFMD object rule fields must originate from the object's generated relation"
+        );
+        let fields = E::fields();
+        let schema = fields
+            .get(field.column())
+            .expect("generated CFMD object rule field must exist in its descriptor");
+        let raw = __semantic_id(
+            "cfmd.object.kernel-field.v1",
+            E::KEY,
+            schema.semantic_name(),
+        );
+        Self {
+            field: crate::FieldId::new(raw),
+            column: RelationColumnId::new(raw),
+            equivalence: crate::EquivalenceId::new(__semantic_id(
+                "cfmd.object.field-equivalence.v1",
+                E::KEY,
+                schema.semantic_name(),
+            )),
+            ordering: schema.ordering().map(|_| {
+                crate::OrderingId::new(__semantic_id(
+                    "cfmd.object.field-ordering.v1",
+                    E::KEY,
+                    schema.semantic_name(),
+                ))
+            }),
+            marker: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn relation_column_id(self) -> RelationColumnId {
+        self.column
+    }
+
+    #[must_use]
+    pub(crate) fn ordering_id(self) -> crate::OrderingId
+    where
+        V: OrderedObjectValue,
+    {
+        self.ordering.expect(
+            "OrderedObjectValue must expose a canonical ordering in its object field descriptor",
+        )
+    }
+    /// Compares two fields through the declared CFMD equivalence semantics of the left field.
+    #[must_use]
+    pub fn equivalent_to(self, other: Self) -> SemanticRuleExpr {
+        SemanticRuleExpr::Equivalent {
+            left: RuleValueExpr::Field(self.field),
+            right: RuleValueExpr::Field(other.field),
+            equivalence: self.equivalence,
+        }
+    }
+
+    /// Negated semantic equivalence; this is not host-language `PartialEq`.
+    #[must_use]
+    pub fn not_equivalent_to(self, other: Self) -> SemanticRuleExpr {
+        self.equivalent_to(other).negate()
+    }
+}
+
+impl<E: Object, V: ObjectValue> Field<E, V> {
+    /// Converts a generated typed query field into its deterministic semantic-rule coordinate.
+    #[must_use]
+    pub fn rule(self) -> ObjectRuleField<E, V> {
+        ObjectRuleField::from_field(self)
+    }
+}
+
+impl<E: Object, V: OrderedObjectValue> ObjectRuleField<E, V> {
+    fn ordered_against(
+        self,
+        other: Self,
+        comparison: crate::RuleOrderComparison,
+    ) -> SemanticRuleExpr {
+        let ordering = self.ordering.expect(
+            "OrderedObjectValue must expose a canonical ordering in its object field descriptor",
+        );
+        SemanticRuleExpr::Ordered {
+            left: RuleValueExpr::Field(self.field),
+            right: RuleValueExpr::Field(other.field),
+            ordering,
+            comparison,
+        }
+    }
+
+    #[must_use]
+    pub fn less_than_field(self, other: Self) -> SemanticRuleExpr {
+        self.ordered_against(other, crate::RuleOrderComparison::Less)
+    }
+
+    #[must_use]
+    pub fn less_than_or_equal_field(self, other: Self) -> SemanticRuleExpr {
+        self.ordered_against(other, crate::RuleOrderComparison::LessOrEqual)
+    }
+
+    #[must_use]
+    pub fn greater_than_field(self, other: Self) -> SemanticRuleExpr {
+        self.ordered_against(other, crate::RuleOrderComparison::Greater)
+    }
+
+    #[must_use]
+    pub fn greater_than_or_equal_field(self, other: Self) -> SemanticRuleExpr {
+        self.ordered_against(other, crate::RuleOrderComparison::GreaterOrEqual)
+    }
+}
+
+impl<E: Object> ObjectRuleField<E, i64> {
+    #[must_use]
+    pub fn range(self, min: Option<i64>, max: Option<i64>) -> SemanticRuleExpr {
+        SemanticRuleExpr::I64Range {
+            value: RuleValueExpr::Field(self.field),
+            min,
+            max,
+        }
+    }
+}
+
+impl<E: Object> ObjectRuleField<E, String> {
+    #[must_use]
+    pub fn length(self, min: usize, max: Option<usize>) -> SemanticRuleExpr {
+        SemanticRuleExpr::TextLength {
+            value: RuleValueExpr::Field(self.field),
+            min,
+            max,
+        }
+    }
+
+    #[must_use]
+    pub fn one_of<I, S>(self, allowed: I) -> SemanticRuleExpr
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        SemanticRuleExpr::TextOneOf {
+            value: RuleValueExpr::Field(self.field),
+            allowed: allowed.into_iter().map(Into::into).collect::<BTreeSet<_>>(),
+        }
+    }
+
+    #[must_use]
+    pub fn matches(self, pattern: TextPattern) -> SemanticRuleExpr {
+        SemanticRuleExpr::TextMatches {
+            value: RuleValueExpr::Field(self.field),
+            pattern,
+        }
+    }
+}
+
+impl SchemaBuilder {
+    /// Adds one object-row invariant using generated typed field coordinates.
+    ///
+    /// Objects are persisted as semantic relations, so this lowers to the existing database-wide
+    /// the exact selected-count model-rule authority rather than to the separate kernel entity-field rule
+    /// subsystem used by model/lifecycle entities.
+    #[must_use]
+    pub fn object_rule<E, F>(self, build: F) -> Self
+    where
+        E: Object,
+        F: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        self.model_rule(crate::ModelRuleExpr::object_all::<E, F>(build))
+    }
+}
+
+impl crate::ModelRuleExpr {
+    #[must_use]
+    pub fn object_group_exact_count_where_range<E, G, K, P>(
+        group: K,
+        predicate: P,
+        min: u64,
+        max: Option<u64>,
+    ) -> Self
+    where
+        E: Object,
+        G: GroupKey<E>,
+        K: FnOnce(&E::Proxy) -> G,
+        P: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation.clone());
+        let group = group(&proxy);
+        assert!(
+            group.belongs_to(E::relation_id()),
+            "CFMD grouped model-rule key must belong to the object's generated relation"
+        );
+        let fields = E::fields();
+        let group_columns = group
+            .columns()
+            .into_iter()
+            .map(|ordinal| {
+                let field = fields
+                    .get(ordinal)
+                    .expect("generated CFMD grouped rule field must exist in its descriptor");
+                crate::RelationColumnId::new(__semantic_id(
+                    "cfmd.object.kernel-field.v1",
+                    E::KEY,
+                    field.semantic_name(),
+                ))
+            })
+            .collect();
+        Self::RelationGroupedExactCountRange {
+            relation: E::relation_id(),
+            group_columns,
+            group_equivalences: group.equivalences(),
+            predicate: E::rule(predicate),
+            min,
+            max,
+        }
+    }
+
+    #[must_use]
+    pub fn object_group_exact_f64_sum_where_range<E, G, K, S, P>(
+        group: K,
+        select: S,
+        predicate: P,
+        min: Option<crate::FiniteF64>,
+        max: Option<crate::FiniteF64>,
+    ) -> Self
+    where
+        E: Object,
+        G: GroupKey<E>,
+        K: FnOnce(&E::Proxy) -> G,
+        S: FnOnce(&E::Proxy) -> Field<E, f64>,
+        P: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let group = group(&proxy);
+        assert!(
+            group.belongs_to(E::relation_id()),
+            "CFMD grouped model-rule key must belong to the object's generated relation"
+        );
+        let fields = E::fields();
+        let group_columns = group
+            .columns()
+            .into_iter()
+            .map(|ordinal| {
+                let field = fields
+                    .get(ordinal)
+                    .expect("generated CFMD grouped rule field must exist in its descriptor");
+                crate::RelationColumnId::new(__semantic_id(
+                    "cfmd.object.kernel-field.v1",
+                    E::KEY,
+                    field.semantic_name(),
+                ))
+            })
+            .collect();
+        let column = select(&proxy).rule().relation_column_id();
+        Self::RelationGroupedExactF64SumRange {
+            relation: E::relation_id(),
+            group_columns,
+            group_equivalences: group.equivalences(),
+            column,
+            predicate: E::rule(predicate),
+            min,
+            max,
+        }
+    }
+
+    #[must_use]
+    pub fn object_group_exact_order_statistic_range<E, G, V, K, S, P>(
+        group: K,
+        select: S,
+        predicate: P,
+        selector: crate::OrderedStatisticSelector,
+        min: Option<V>,
+        max: Option<V>,
+    ) -> Self
+    where
+        E: Object,
+        G: GroupKey<E>,
+        V: OrderedObjectValue,
+        K: FnOnce(&E::Proxy) -> G,
+        S: FnOnce(&E::Proxy) -> Field<E, V>,
+        P: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let group = group(&proxy);
+        assert!(
+            group.belongs_to(E::relation_id()),
+            "CFMD grouped model-rule key must belong to the object's generated relation"
+        );
+        let fields = E::fields();
+        let group_columns = group
+            .columns()
+            .into_iter()
+            .map(|ordinal| {
+                let field = fields
+                    .get(ordinal)
+                    .expect("generated CFMD grouped rule field must exist in its descriptor");
+                crate::RelationColumnId::new(__semantic_id(
+                    "cfmd.object.kernel-field.v1",
+                    E::KEY,
+                    field.semantic_name(),
+                ))
+            })
+            .collect();
+        let field = select(&proxy).rule();
+        Self::RelationGroupedExactOrderedStatisticRange {
+            relation: E::relation_id(),
+            group_columns,
+            group_equivalences: group.equivalences(),
+            measure: crate::ExactAggregateMeasureExpr::OrderedStatistic {
+                relation: E::relation_id(),
+                column: field.relation_column_id(),
+                predicate: E::rule(predicate),
+                ordering: field.ordering_id(),
+                selector,
+            },
+            min: min.map(OrderedObjectValue::__into_ordered_statistic_bound),
+            max: max.map(OrderedObjectValue::__into_ordered_statistic_bound),
+        }
+    }
+
+    #[must_use]
+    pub fn object_group_exact_count_compare<E, G, K, LP, RP>(
+        group: K,
+        left: LP,
+        comparison: crate::RuleOrderComparison,
+        right: RP,
+    ) -> Self
+    where
+        E: Object,
+        G: GroupKey<E>,
+        K: FnOnce(&E::Proxy) -> G,
+        LP: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+        RP: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let group = group(&proxy);
+        assert!(
+            group.belongs_to(E::relation_id()),
+            "CFMD grouped model-rule key must belong to the object's generated relation"
+        );
+        let fields = E::fields();
+        let group_columns = group
+            .columns()
+            .into_iter()
+            .map(|ordinal| {
+                let field = fields
+                    .get(ordinal)
+                    .expect("generated CFMD grouped rule field must exist in its descriptor");
+                crate::RelationColumnId::new(__semantic_id(
+                    "cfmd.object.kernel-field.v1",
+                    E::KEY,
+                    field.semantic_name(),
+                ))
+            })
+            .collect();
+        Self::RelationGroupedExactAggregateCompare {
+            relation: E::relation_id(),
+            group_columns,
+            group_equivalences: group.equivalences(),
+            left: crate::ExactAggregateMeasureExpr::Count {
+                relation: E::relation_id(),
+                predicate: E::rule(left),
+            },
+            right: crate::ExactAggregateMeasureExpr::Count {
+                relation: E::relation_id(),
+                predicate: E::rule(right),
+            },
+            comparison,
+        }
+    }
+
+    #[must_use]
+    pub fn object_group_exact_f64_sum_compare<E, G, K, LS, LP, RS, RP>(
+        group: K,
+        left_select: LS,
+        left_predicate: LP,
+        comparison: crate::RuleOrderComparison,
+        right_select: RS,
+        right_predicate: RP,
+    ) -> Self
+    where
+        E: Object,
+        G: GroupKey<E>,
+        K: FnOnce(&E::Proxy) -> G,
+        LS: FnOnce(&E::Proxy) -> Field<E, f64>,
+        LP: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+        RS: FnOnce(&E::Proxy) -> Field<E, f64>,
+        RP: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let group = group(&proxy);
+        assert!(
+            group.belongs_to(E::relation_id()),
+            "CFMD grouped model-rule key must belong to the object's generated relation"
+        );
+        let fields = E::fields();
+        let group_columns = group
+            .columns()
+            .into_iter()
+            .map(|ordinal| {
+                let field = fields
+                    .get(ordinal)
+                    .expect("generated CFMD grouped rule field must exist in its descriptor");
+                crate::RelationColumnId::new(__semantic_id(
+                    "cfmd.object.kernel-field.v1",
+                    E::KEY,
+                    field.semantic_name(),
+                ))
+            })
+            .collect();
+        let left_column = left_select(&proxy).rule().relation_column_id();
+        let right_column = right_select(&proxy).rule().relation_column_id();
+        Self::RelationGroupedExactAggregateCompare {
+            relation: E::relation_id(),
+            group_columns,
+            group_equivalences: group.equivalences(),
+            left: crate::ExactAggregateMeasureExpr::F64Sum {
+                relation: E::relation_id(),
+                column: left_column,
+                predicate: E::rule(left_predicate),
+            },
+            right: crate::ExactAggregateMeasureExpr::F64Sum {
+                relation: E::relation_id(),
+                column: right_column,
+                predicate: E::rule(right_predicate),
+            },
+            comparison,
+        }
+    }
+
+    #[must_use]
+    pub fn object_exact_count_where_range<E, F>(build: F, min: u64, max: Option<u64>) -> Self
+    where
+        E: Object,
+        F: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        Self::RelationExactCountRange {
+            relation: E::relation_id(),
+            predicate: E::rule(build),
+            min,
+            max,
+        }
+    }
+
+    #[must_use]
+    pub fn object_cardinality<E: Object>(min: u64, max: Option<u64>) -> Self {
+        Self::RelationExactCountRange {
+            relation: E::relation_id(),
+            predicate: SemanticRuleExpr::True,
+            min,
+            max,
+        }
+    }
+
+    #[must_use]
+    pub fn object_exists<E, F>(build: F) -> Self
+    where
+        E: Object,
+        F: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        Self::object_exact_count_where_range::<E, F>(build, 1, None)
+    }
+
+    #[must_use]
+    pub fn object_all<E, F>(build: F) -> Self
+    where
+        E: Object,
+        F: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        let predicate = E::rule(build).negate();
+        Self::RelationExactCountRange {
+            relation: E::relation_id(),
+            predicate,
+            min: 0,
+            max: Some(0),
+        }
+    }
+
+    #[must_use]
+    pub fn object_exact_f64_sum_range<E, F>(
+        select: F,
+        min: Option<crate::FiniteF64>,
+        max: Option<crate::FiniteF64>,
+    ) -> Self
+    where
+        E: Object,
+        F: FnOnce(&E::Proxy) -> Field<E, f64>,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let column = select(&proxy).rule().relation_column_id();
+        Self::RelationExactF64SumRange {
+            relation: E::relation_id(),
+            column,
+            predicate: SemanticRuleExpr::True,
+            min,
+            max,
+        }
+    }
+
+    #[must_use]
+    pub fn object_exact_f64_sum_where_range<E, S, P>(
+        select: S,
+        predicate: P,
+        min: Option<crate::FiniteF64>,
+        max: Option<crate::FiniteF64>,
+    ) -> Self
+    where
+        E: Object,
+        S: FnOnce(&E::Proxy) -> Field<E, f64>,
+        P: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let column = select(&proxy).rule().relation_column_id();
+        Self::RelationExactF64SumRange {
+            relation: E::relation_id(),
+            column,
+            predicate: E::rule(predicate),
+            min,
+            max,
+        }
+    }
+
+    #[must_use]
+    pub fn object_exact_count_compare<L, R, LF, RF>(
+        left: LF,
+        comparison: crate::RuleOrderComparison,
+        right: RF,
+    ) -> Self
+    where
+        L: Object,
+        R: Object,
+        LF: FnOnce(&L::Proxy) -> SemanticRuleExpr,
+        RF: FnOnce(&R::Proxy) -> SemanticRuleExpr,
+    {
+        Self::ExactAggregateCompare {
+            left: crate::ExactAggregateMeasureExpr::Count {
+                relation: L::relation_id(),
+                predicate: L::rule(left),
+            },
+            right: crate::ExactAggregateMeasureExpr::Count {
+                relation: R::relation_id(),
+                predicate: R::rule(right),
+            },
+            comparison,
+        }
+    }
+
+    #[must_use]
+    pub fn object_exact_f64_sum_compare<L, R, LS, LP, RS, RP>(
+        left_select: LS,
+        left_predicate: LP,
+        comparison: crate::RuleOrderComparison,
+        right_select: RS,
+        right_predicate: RP,
+    ) -> Self
+    where
+        L: Object,
+        R: Object,
+        LS: FnOnce(&L::Proxy) -> Field<L, f64>,
+        LP: FnOnce(&L::Proxy) -> SemanticRuleExpr,
+        RS: FnOnce(&R::Proxy) -> Field<R, f64>,
+        RP: FnOnce(&R::Proxy) -> SemanticRuleExpr,
+    {
+        let left_relation = symbolic_relation::<L>();
+        let left_proxy = L::proxy(left_relation);
+        let left_column = left_select(&left_proxy).rule().relation_column_id();
+        let right_relation = symbolic_relation::<R>();
+        let right_proxy = R::proxy(right_relation);
+        let right_column = right_select(&right_proxy).rule().relation_column_id();
+        Self::ExactAggregateCompare {
+            left: crate::ExactAggregateMeasureExpr::F64Sum {
+                relation: L::relation_id(),
+                column: left_column,
+                predicate: L::rule(left_predicate),
+            },
+            right: crate::ExactAggregateMeasureExpr::F64Sum {
+                relation: R::relation_id(),
+                column: right_column,
+                predicate: R::rule(right_predicate),
+            },
+            comparison,
+        }
+    }
+
+    #[must_use]
+    pub fn object_exact_order_statistic_compare<L, R, V, LS, LP, RS, RP>(
+        left_select: LS,
+        left_predicate: LP,
+        left_selector: crate::OrderedStatisticSelector,
+        comparison: crate::RuleOrderComparison,
+        right_select: RS,
+        right_predicate: RP,
+        right_selector: crate::OrderedStatisticSelector,
+    ) -> Self
+    where
+        L: Object,
+        R: Object,
+        V: OrderedObjectValue,
+        LS: FnOnce(&L::Proxy) -> Field<L, V>,
+        LP: FnOnce(&L::Proxy) -> SemanticRuleExpr,
+        RS: FnOnce(&R::Proxy) -> Field<R, V>,
+        RP: FnOnce(&R::Proxy) -> SemanticRuleExpr,
+    {
+        let left_relation = symbolic_relation::<L>();
+        let left_proxy = L::proxy(left_relation);
+        let left_rule = left_select(&left_proxy).rule();
+        let ordering = left_rule.ordering_id();
+        let right_relation = symbolic_relation::<R>();
+        let right_proxy = R::proxy(right_relation);
+        let right_rule = right_select(&right_proxy).rule();
+        Self::ExactAggregateCompare {
+            left: crate::ExactAggregateMeasureExpr::OrderedStatistic {
+                relation: L::relation_id(),
+                column: left_rule.relation_column_id(),
+                predicate: L::rule(left_predicate),
+                ordering,
+                selector: left_selector,
+            },
+            right: crate::ExactAggregateMeasureExpr::OrderedStatistic {
+                relation: R::relation_id(),
+                column: right_rule.relation_column_id(),
+                predicate: R::rule(right_predicate),
+                ordering,
+                selector: right_selector,
+            },
+            comparison,
+        }
+    }
+
+    #[must_use]
+    pub fn object_exact_order_statistic_range<E, V, S, P>(
+        select: S,
+        predicate: P,
+        selector: crate::OrderedStatisticSelector,
+        min: Option<V>,
+        max: Option<V>,
+    ) -> Self
+    where
+        E: Object,
+        V: OrderedObjectValue,
+        S: FnOnce(&E::Proxy) -> Field<E, V>,
+        P: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let field = select(&proxy).rule();
+        Self::ExactOrderedStatisticRange {
+            measure: crate::ExactAggregateMeasureExpr::OrderedStatistic {
+                relation: E::relation_id(),
+                column: field.relation_column_id(),
+                predicate: E::rule(predicate),
+                ordering: field.ordering_id(),
+                selector,
+            },
+            min: min.map(OrderedObjectValue::__into_ordered_statistic_bound),
+            max: max.map(OrderedObjectValue::__into_ordered_statistic_bound),
+        }
+    }
+
+    #[must_use]
+    pub fn object_exact_extremum_range<E, V, S, P>(
+        select: S,
+        predicate: P,
+        kind: crate::OrderedExtremumKind,
+        min: Option<V>,
+        max: Option<V>,
+    ) -> Self
+    where
+        E: Object,
+        V: OrderedObjectValue,
+        S: FnOnce(&E::Proxy) -> Field<E, V>,
+        P: FnOnce(&E::Proxy) -> SemanticRuleExpr,
+    {
+        Self::object_exact_order_statistic_range::<E, V, _, _>(
+            select,
+            predicate,
+            match kind {
+                crate::OrderedExtremumKind::Min => crate::OrderedStatisticSelector::FromStart(0),
+                crate::OrderedExtremumKind::Max => crate::OrderedStatisticSelector::FromEnd(0),
+            },
+            min,
+            max,
+        )
+    }
+
+    #[must_use]
+    pub fn object_exact_extremum_compare<L, R, V, LS, LP, RS, RP>(
+        left_select: LS,
+        left_predicate: LP,
+        left_kind: crate::OrderedExtremumKind,
+        comparison: crate::RuleOrderComparison,
+        right_select: RS,
+        right_predicate: RP,
+        right_kind: crate::OrderedExtremumKind,
+    ) -> Self
+    where
+        L: Object,
+        R: Object,
+        V: OrderedObjectValue,
+        LS: FnOnce(&L::Proxy) -> Field<L, V>,
+        LP: FnOnce(&L::Proxy) -> SemanticRuleExpr,
+        RS: FnOnce(&R::Proxy) -> Field<R, V>,
+        RP: FnOnce(&R::Proxy) -> SemanticRuleExpr,
+    {
+        Self::object_exact_order_statistic_compare::<L, R, V, _, _, _, _>(
+            left_select,
+            left_predicate,
+            match left_kind {
+                crate::OrderedExtremumKind::Min => crate::OrderedStatisticSelector::FromStart(0),
+                crate::OrderedExtremumKind::Max => crate::OrderedStatisticSelector::FromEnd(0),
+            },
+            comparison,
+            right_select,
+            right_predicate,
+            match right_kind {
+                crate::OrderedExtremumKind::Min => crate::OrderedStatisticSelector::FromStart(0),
+                crate::OrderedExtremumKind::Max => crate::OrderedStatisticSelector::FromEnd(0),
+            },
+        )
     }
 }
 
@@ -1605,6 +2384,13 @@ pub(crate) fn register_object<E: Object>(mut builder: SchemaBuilder) -> SchemaBu
                 many.target_relation().raw()
             ),
         );
+        if let Some(orphan_policy) = many.orphan_policy() {
+            builder = builder.__owned_relationship(
+                many.relation(),
+                many.target_relation(),
+                orphan_policy,
+            );
+        }
     }
     builder
 }
@@ -2401,38 +3187,30 @@ pub(crate) fn object_contract<E: Object>() -> Result<Option<crate::plan::ObjectC
     let mut references = Vec::new();
     for (column, field) in fields.iter().enumerate() {
         match field.role() {
-            ObjectFieldRole::Reference {
-                target_type,
-                target_relation,
-                target_identity_column,
-            } => references.push(crate::plan::ReferenceContract {
-                column,
-                field: crate::FieldId::new(__semantic_id(
-                    "cfmd.object.kernel-field.v1",
-                    E::KEY,
-                    field.semantic_name(),
-                )),
-                target_type,
-                target_relation,
-                target_identity_column,
-                optional: false,
-            }),
-            ObjectFieldRole::OptionalReference {
-                target_type,
-                target_relation,
-                target_identity_column,
-            } => references.push(crate::plan::ReferenceContract {
-                column,
-                field: crate::FieldId::new(__semantic_id(
-                    "cfmd.object.kernel-field.v1",
-                    E::KEY,
-                    field.semantic_name(),
-                )),
-                target_type,
-                target_relation,
-                target_identity_column,
-                optional: true,
-            }),
+            ObjectFieldRole::Reference { target_type, .. } => {
+                references.push(crate::plan::ReferenceContract {
+                    column,
+                    field: crate::FieldId::new(__semantic_id(
+                        "cfmd.object.kernel-field.v1",
+                        E::KEY,
+                        field.semantic_name(),
+                    )),
+                    target_type,
+                    optional: false,
+                });
+            }
+            ObjectFieldRole::OptionalReference { target_type, .. } => {
+                references.push(crate::plan::ReferenceContract {
+                    column,
+                    field: crate::FieldId::new(__semantic_id(
+                        "cfmd.object.kernel-field.v1",
+                        E::KEY,
+                        field.semantic_name(),
+                    )),
+                    target_type,
+                    optional: true,
+                });
+            }
             _ => {}
         }
     }
@@ -2443,6 +3221,82 @@ pub(crate) fn object_contract<E: Object>() -> Result<Option<crate::plan::ObjectC
         identity_type: E::type_id(),
         references,
     }))
+}
+
+fn persisted_object_contract<E: Object>(
+    context: &ReadContext,
+    persisted: &Relation<E>,
+) -> Result<crate::plan::ObjectContract> {
+    let identity_local = E::identity_column().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidSchema,
+            format!("object {} has no identity", E::KEY),
+        )
+    })?;
+    let identity_name = E::fields()
+        .get(identity_local)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidSchema, "identity field is out of bounds"))?
+        .semantic_name();
+    let identity_equivalence = crate::EquivalenceId::new(__semantic_id(
+        "cfmd.object.field-equivalence.v1",
+        E::KEY,
+        identity_name,
+    ));
+    let matching_columns = persisted
+        .equivalences()
+        .iter()
+        .enumerate()
+        .filter_map(|(column, equivalence)| {
+            (*equivalence == identity_equivalence).then_some(column)
+        })
+        .collect::<Vec<_>>();
+    let [identity_column] = matching_columns.as_slice() else {
+        return Err(Error::new(
+            ErrorKind::InvalidSchema,
+            if matching_columns.is_empty() {
+                format!("persisted object {} has no semantic identity field", E::KEY)
+            } else {
+                format!(
+                    "persisted object {} has duplicate semantic identity fields",
+                    E::KEY
+                )
+            },
+        ));
+    };
+    let column_ids = context.relation_column_ids(persisted.id())?;
+    if column_ids.len() != persisted.width() {
+        return Err(Error::new(
+            ErrorKind::InvalidSchema,
+            "persisted object relation lost stable column identity",
+        ));
+    }
+    let mut references = Vec::new();
+    for (column, ty) in persisted.column_types().iter().enumerate() {
+        if column == *identity_column {
+            continue;
+        }
+        let (target_type, optional) = match ty {
+            Type::Scalar(crate::ScalarType::HistoricalEntityRef(target)) => (*target, false),
+            Type::Option(inner) => match inner.as_ref() {
+                Type::Scalar(crate::ScalarType::HistoricalEntityRef(target)) => (*target, true),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        references.push(crate::plan::ReferenceContract {
+            column,
+            field: crate::FieldId::new(column_ids[column].raw()),
+            target_type,
+            optional,
+        });
+    }
+    Ok(crate::plan::ObjectContract {
+        relation: persisted.id(),
+        entity_type: E::type_id(),
+        identity_column: *identity_column,
+        identity_type: E::type_id(),
+        references,
+    })
 }
 
 pub(crate) fn symbolic_relation<E: Object>() -> Relation<E> {
@@ -2511,6 +3365,12 @@ impl<E: Object> ObjectProxy<E> {
 
     #[doc(hidden)]
     #[must_use]
+    pub fn __ref_rule<T: Object>(&self, name: &str) -> ObjectRuleField<E, crate::Ref<T>> {
+        self.__field::<crate::Ref<T>>(name).rule()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
     pub fn __optional_ref<T: Object>(&self, name: &str) -> crate::OptionalRefField<E, T> {
         let column = E::fields()
             .iter()
@@ -2521,6 +3381,15 @@ impl<E: Object> ObjectProxy<E> {
             .equivalence_at(column)
             .expect("validated object optional reference has equivalence semantics");
         crate::OptionalRefField::new(&self.relation, column, equivalence)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __optional_ref_rule<T: Object>(
+        &self,
+        name: &str,
+    ) -> ObjectRuleField<E, Option<crate::Ref<T>>> {
+        self.__field::<Option<crate::Ref<T>>>(name).rule()
     }
 
     #[doc(hidden)]
@@ -2887,15 +3756,17 @@ impl<E: Object> ObjectSet<E> {
                 "persisted identity column is outside the object row",
             )
         })?;
+        let target_relation = context.bridged_relation_identity(persisted.id())?;
         let mut plan = context.plan()?;
         let owner = crate::runtime::lifecycle_entity_id(E::type_id(), id.raw());
-        let semantic_field = kernel_types::SemanticId::new(__semantic_id(
+        let source_semantic_field = kernel_types::SemanticId::new(__semantic_id(
             "cfmd.object.kernel-field.v1",
             E::KEY,
             schema_field.semantic_name(),
         ));
+        let semantic_field = context.bridged_field_identity(source_semantic_field)?;
         plan.patch_object_field(
-            persisted.id(),
+            target_relation,
             id.raw(),
             identity_column,
             identity_value,
@@ -2929,6 +3800,7 @@ impl<E: Object> ObjectSet<E> {
     ///
     /// The collection names the database resource, `transaction` names the atomic change set, and
     /// `value` is the payload. Plan construction remains internal to the ordinary CRUD path.
+    #[doc(hidden)]
     pub fn add(&self, transaction: &mut crate::IntentJournal, value: E) -> Result<()> {
         if !self.exact_shape {
             return Err(Error::new(
@@ -2942,6 +3814,7 @@ impl<E: Object> ObjectSet<E> {
     }
 
     /// Removes one exact entity value as part of `transaction`.
+    #[doc(hidden)]
     pub fn remove(&self, transaction: &mut crate::IntentJournal, value: E) -> Result<()> {
         if !self.exact_shape {
             return Err(Error::new(
@@ -2954,20 +3827,72 @@ impl<E: Object> ObjectSet<E> {
         transaction.add_plan(collection.remove_plan(value)?)
     }
 
+    /// Removes one object by stable identity without requiring the consumer contract to materialize
+    /// every persisted field. The canonical row is read only through the mutation-internal path;
+    /// hidden fields never become observable consumer data.
+    #[doc(hidden)]
+    pub fn remove_id(
+        &self,
+        transaction: &mut crate::IntentJournal,
+        id: crate::Id<E>,
+    ) -> Result<()> {
+        let context = transaction.operation_context(&self.context)?;
+        let persisted = context.relation::<E>(E::relation_id())?;
+        let contract = persisted_object_contract::<E>(&context, &persisted)?;
+        let identity_column = contract.identity_column;
+        let identity_equivalence = persisted.equivalence_at(identity_column).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                "persisted identity has no equivalence",
+            )
+        })?;
+        let query = Query::scan(persisted.id()).filter_eq(
+            identity_column,
+            id.into_value(),
+            identity_equivalence,
+        );
+        let result = context.execute_for_mutation(&query)?;
+        let [row] = result.rows() else {
+            return match result.rows().len() {
+                0 => Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("{} identity {} was not found", E::KEY, id.raw()),
+                )),
+                count => Err(Error::new(
+                    ErrorKind::Cardinality,
+                    format!("{} identity {} matched {count} rows", E::KEY, id.raw()),
+                )),
+            };
+        };
+
+        let mut plan = context.plan()?;
+        plan.register_object_contract(contract);
+        crate::object::register_object_relationship_contracts::<E>(&mut plan)?;
+        plan.remove_semantic(
+            persisted.id(),
+            row.clone(),
+            crate::plan::MutationAction::ObjectDelete,
+        );
+        transaction.add_plan(context.bridge_plan_exact(plan)?)
+    }
+
     /// Advanced exact-plan construction for tooling/bindings. Normal application code should use
     /// [`ObjectSet::add`].
+    #[doc(hidden)]
     pub fn insert(&self, value: E) -> Result<Plan> {
         self.insert_plan(value)
     }
 
     /// Advanced exact-plan construction for tooling/bindings.
+    #[doc(hidden)]
     pub fn insert_plan(&self, value: E) -> Result<Plan> {
         let mut plan = self.context.plan()?;
         E::__append_insert(value, &self.context, &mut plan)?;
-        Ok(plan)
+        self.context.bridge_plan_exact(plan)
     }
 
     /// Advanced exact-plan construction for tooling/bindings.
+    #[doc(hidden)]
     pub fn remove_plan(&self, value: E) -> Result<Plan> {
         let mut plan = self.context.plan()?;
         if let Some(contract) = crate::object::object_contract::<E>()? {
@@ -2980,7 +3905,7 @@ impl<E: Object> ObjectSet<E> {
             row,
             crate::plan::MutationAction::ObjectDelete,
         );
-        Ok(plan)
+        self.context.bridge_plan_exact(plan)
     }
 }
 
@@ -3151,24 +4076,20 @@ impl<E: Object> ObjectQuery<E> {
     }
 
     /// Deletes every object selected by this exact query as part of `transaction`.
+    #[doc(hidden)]
     pub fn delete(&self, transaction: &mut crate::IntentJournal) -> Result<()> {
         let context = transaction.operation_context(&self.context)?;
-        if !self.exact_shape {
-            return Err(Error::new(
-                ErrorKind::InvalidPlan,
-                "partial entity queries cannot delete persisted rows until operation authority is checked by identity",
-            ));
-        }
         let query = ObjectQuery {
             context: context.clone(),
             relation: context.relation::<E>(E::relation_id())?,
             inner: self.inner.clone(),
-            exact_shape: true,
+            exact_shape: self.exact_shape,
         };
-        transaction.add_plan(query.delete_plan()?)
+        transaction.add_plan(query.delete_plan_in(&context)?)
     }
 
     /// Rewrites every object selected by this exact query as part of `transaction`.
+    #[doc(hidden)]
     pub fn update<F>(&self, transaction: &mut crate::IntentJournal, rewrite: F) -> Result<()>
     where
         F: FnMut(E) -> E,
@@ -3191,31 +4112,94 @@ impl<E: Object> ObjectQuery<E> {
     }
 
     /// Advanced exact-plan construction for query deletion.
+    #[doc(hidden)]
     pub fn delete_plan(&self) -> Result<Plan> {
-        if !self.exact_shape {
+        self.delete_plan_in(&self.context)
+    }
+
+    fn delete_plan_in(&self, context: &ReadContext) -> Result<Plan> {
+        if E::identity_column().is_none() {
+            if !self.exact_shape {
+                return Err(Error::new(
+                    ErrorKind::InvalidPlan,
+                    "partial value-object queries cannot delete without semantic identity",
+                ));
+            }
+            let rows = context
+                .execute_for_mutation(&self.inner.clone().raw())?
+                .rows()
+                .to_vec();
+            let mut plan = context.plan()?;
+            for row in rows {
+                plan.remove(self.relation.id(), row);
+            }
+            return context.bridge_plan_exact(plan);
+        }
+
+        let ids = ObjectQuery {
+            context: context.clone(),
+            relation: self.relation.clone(),
+            inner: self.inner.clone(),
+            exact_shape: self.exact_shape,
+        }
+        .identity_ids()?;
+        let mut ids = ids.into_iter().map(crate::Id::<E>::raw).collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+
+        let persisted = context.relation::<E>(E::relation_id())?;
+        let contract = persisted_object_contract::<E>(context, &persisted)?;
+        let identity_column = contract.identity_column;
+        let identity_equivalence = persisted.equivalence_at(identity_column).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidSchema,
+                "persisted identity has no equivalence",
+            )
+        })?;
+
+        let mut plan = context.plan()?;
+        plan.register_object_contract(contract);
+        crate::object::register_object_relationship_contracts::<E>(&mut plan)?;
+        if ids.is_empty() {
+            return context.bridge_plan_exact(plan);
+        }
+
+        let mut selected_rows = ids.iter().copied().map(|raw| {
+            Query::scan(persisted.id()).filter_eq(
+                identity_column,
+                crate::Id::<E>::new(raw).into_value(),
+                identity_equivalence,
+            )
+        });
+        let mut row_query = selected_rows
+            .next()
+            .expect("non-empty identities have a first query");
+        for selected in selected_rows {
+            row_query = row_query.union(selected);
+        }
+        let rows = context.execute_for_mutation(&row_query)?.rows().to_vec();
+        if rows.len() != ids.len() {
             return Err(Error::new(
-                ErrorKind::InvalidPlan,
-                "partial entity query cannot build a full-row delete plan",
+                ErrorKind::InvariantViolation,
+                format!(
+                    "selected {} identities resolved to {} canonical object rows",
+                    ids.len(),
+                    rows.len(),
+                ),
             ));
         }
-        let values = self.all()?;
-        let mut plan = self.context.plan()?;
-        if let Some(contract) = crate::object::object_contract::<E>()? {
-            plan.register_object_contract(contract);
-        }
-        crate::object::register_object_relationship_contracts::<E>(&mut plan)?;
-        for value in values {
-            let row = self.relation.encode_row(value)?;
+        for row in rows {
             plan.remove_semantic(
-                self.relation.id(),
+                persisted.id(),
                 row,
                 crate::plan::MutationAction::ObjectDelete,
             );
         }
-        Ok(plan)
+        context.bridge_plan_exact(plan)
     }
 
     /// Advanced exact-plan construction for query rewrite.
+    #[doc(hidden)]
     pub fn update_plan<F>(&self, mut rewrite: F) -> Result<Plan>
     where
         F: FnMut(E) -> E,
@@ -3728,4 +4712,112 @@ macro_rules! cfmd_entity {
             }
         }
     };
+}
+
+impl crate::AccessCapability {
+    /// Grants read authority for one authoritative object relation.
+    #[must_use]
+    pub fn read_object<E: Object>(self) -> Self {
+        self.grant(crate::PermissionCoordinate::ReadRelation(E::relation_id()))
+    }
+
+    /// Grants write authority for one authoritative object relation.
+    #[must_use]
+    pub fn write_object<E: Object>(self) -> Self {
+        self.grant(crate::PermissionCoordinate::WriteRelation(E::relation_id()))
+    }
+
+    /// Grants exact read authority for one generated semantic object field.
+    #[must_use]
+    pub fn read_field<E, V, F>(self, select: F) -> Self
+    where
+        E: Object,
+        V: ObjectValue,
+        F: FnOnce(&E::Proxy) -> Field<E, V>,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let field = select(&proxy).rule().relation_column_id();
+        self.grant(crate::PermissionCoordinate::ReadField {
+            relation: E::relation_id(),
+            field,
+        })
+    }
+
+    /// Grants exact write authority for one generated semantic object field.
+    #[must_use]
+    pub fn write_field<E, V, F>(self, select: F) -> Self
+    where
+        E: Object,
+        V: ObjectValue,
+        F: FnOnce(&E::Proxy) -> Field<E, V>,
+    {
+        let relation = symbolic_relation::<E>();
+        let proxy = E::proxy(relation);
+        let field = select(&proxy).rule().relation_column_id();
+        self.grant(crate::PermissionCoordinate::WriteField {
+            relation: E::relation_id(),
+            field,
+        })
+    }
+
+    /// Grants exact object-create action authority without widening to relation write.
+    #[must_use]
+    pub fn create_object<E: Object>(self) -> Self {
+        self.grant(crate::PermissionCoordinate::CreateObject(E::relation_id()))
+    }
+
+    /// Grants exact object-delete action authority without widening to relation write.
+    #[must_use]
+    pub fn delete_object<E: Object>(self) -> Self {
+        self.grant(crate::PermissionCoordinate::DeleteObject(E::relation_id()))
+    }
+
+    /// Grants exact attach authority for one generated many-valued relationship.
+    #[must_use]
+    pub fn attach_relationship<S, T, F>(self, select: F) -> Self
+    where
+        S: Object,
+        T: Object,
+        F: FnOnce(&S::Proxy) -> crate::ManyField<S, T>,
+    {
+        self.relationship_permission(select, crate::PermissionCoordinate::AttachRelationship)
+    }
+
+    /// Grants exact detach authority for one generated many-valued relationship.
+    #[must_use]
+    pub fn detach_relationship<S, T, F>(self, select: F) -> Self
+    where
+        S: Object,
+        T: Object,
+        F: FnOnce(&S::Proxy) -> crate::ManyField<S, T>,
+    {
+        self.relationship_permission(select, crate::PermissionCoordinate::DetachRelationship)
+    }
+
+    /// Grants exact move authority for one generated many-valued relationship.
+    #[must_use]
+    pub fn move_relationship<S, T, F>(self, select: F) -> Self
+    where
+        S: Object,
+        T: Object,
+        F: FnOnce(&S::Proxy) -> crate::ManyField<S, T>,
+    {
+        self.relationship_permission(select, crate::PermissionCoordinate::MoveRelationship)
+    }
+
+    fn relationship_permission<S, T, F>(
+        self,
+        select: F,
+        permission: fn(RelationId) -> crate::PermissionCoordinate,
+    ) -> Self
+    where
+        S: Object,
+        T: Object,
+        F: FnOnce(&S::Proxy) -> crate::ManyField<S, T>,
+    {
+        let relation = symbolic_relation::<S>();
+        let proxy = S::proxy(relation);
+        self.grant(permission(select(&proxy).__relation_id()))
+    }
 }

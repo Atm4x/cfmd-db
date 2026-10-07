@@ -84,12 +84,16 @@ pub fn validate_state_with_extents(
         for entity in entity_types.entities(owner) {
             for (rule_index, rule) in compiled_rules.entity_rules(owner).iter().enumerate() {
                 let matches = rule
-                    .matches(&|coordinate| match coordinate {
-                        kernel_schema::RuleValueExpr::Input => None,
-                        kernel_schema::RuleValueExpr::Field(field) => {
-                            state.model.fields.get(&(*field, entity))
-                        }
-                    })
+                    .matches_semantic(
+                        &|coordinate| match coordinate {
+                            kernel_schema::RuleValueExpr::Input => None,
+                            kernel_schema::RuleValueExpr::Field(field) => {
+                                state.model.fields.get(&(*field, entity))
+                            }
+                        },
+                        context,
+                        registry,
+                    )
                     .unwrap_or(false);
                 if !matches {
                     return Err(ValidationError::EntityRuleViolation {
@@ -164,7 +168,7 @@ pub fn validate_state_with_extents(
 
     for (rule_index, rule) in compiled_rules.model_rules().iter().enumerate() {
         if !rule
-            .is_satisfied(state)
+            .is_satisfied_semantic(context, registry, state)
             .map_err(|_| ValidationError::ModelRuleEvaluation)?
         {
             return Err(ValidationError::ModelRuleViolation { rule_index });
@@ -266,7 +270,7 @@ pub fn validate_relations_with_extents_selective(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    validate_model_rules_for_relation_mutations(context, state, &effective_footprints)
+    validate_model_rules_for_relation_mutations(context, registry, state, &effective_footprints)
 }
 
 /// Validates only newly inserted rows for an exact relation delta.
@@ -415,6 +419,7 @@ pub fn validate_relations_structural_with_extents_selective(
 
 pub fn validate_model_rules_for_relation_mutations(
     context: &SemanticContext,
+    registry: &SemanticRegistry,
     state: &DatabaseState,
     footprints: &BTreeMap<SemanticId, crate::RelationMutationFootprint>,
 ) -> Result<(), ValidationError> {
@@ -422,7 +427,7 @@ pub fn validate_model_rules_for_relation_mutations(
     for (relation, footprint) in footprints {
         for (rule_index, rule) in compiled_rules.model_rules_for_mutation(*relation, footprint) {
             if !rule
-                .is_satisfied(state)
+                .is_satisfied_semantic(context, registry, state)
                 .map_err(|_| ValidationError::ModelRuleEvaluation)?
             {
                 return Err(ValidationError::ModelRuleViolation { rule_index });
@@ -453,6 +458,7 @@ pub fn validate_model_rule_witnesses_for_relation_mutations(
 
 pub fn validate_model_rules_for_relation_mutation(
     context: &SemanticContext,
+    registry: &SemanticRegistry,
     state: &DatabaseState,
     relation: SemanticId,
     footprint: &crate::RelationMutationFootprint,
@@ -460,7 +466,7 @@ pub fn validate_model_rules_for_relation_mutation(
     let compiled_rules = crate::CompiledRulePlan::compile(context);
     for (rule_index, rule) in compiled_rules.model_rules_for_mutation(relation, footprint) {
         if !rule
-            .is_satisfied(state)
+            .is_satisfied_semantic(context, registry, state)
             .map_err(|_| ValidationError::ModelRuleEvaluation)?
         {
             return Err(ValidationError::ModelRuleViolation { rule_index });

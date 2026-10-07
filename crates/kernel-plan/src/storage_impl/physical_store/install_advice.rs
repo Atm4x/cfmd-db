@@ -157,14 +157,18 @@ impl PhysicalStore {
             .checked_add(1)
             .ok_or(PhysicalExecutionError::TransitionEpochExhausted)?;
         self.advisor_managed_artifacts_mut()
-            .remove(&UnifiedArtifactId::SemanticStatistics(binding.clone()));
+            .remove(&UnifiedArtifactId::semantic_cardinality(binding.clone()));
         self.semantic_statistics_mut_internal()
             .insert(binding, Arc::new(state));
         self.transition_epoch = next_epoch;
         self.state_identity = Arc::new(());
         Ok(snapshot)
     }
-    pub fn semantic_statistics(
+    /// Resolves the exact semantic-cardinality capability independent of its physical
+    /// representation. SAMF/ObservableAtom is the strongest owner; a retained quotient
+    /// projection can answer the same law without a separate statistics artifact; the
+    /// cardinality-only representation remains the cheapest implementation when selected.
+    pub fn semantic_cardinality(
         &self,
         binding: &SemanticIndexBinding,
         context: &kernel_schema::SemanticContext,
@@ -176,14 +180,18 @@ impl PhysicalStore {
                 distinct_key_count: capability.distinct_key_count(),
             }));
         }
+        let relation = self.installed(binding.relation, binding.layout)?;
+        let expected_rows = native_row_count(&relation.data);
+        if let Some(state) = self.semantic_quotient_factors.get(binding)
+            && state.compatible_with(context, registry)?
+            && state.row_count() == expected_rows
+        {
+            return Ok(Some(state.statistics_snapshot()));
+        }
         let Some(state) = self.semantic_statistics.get(binding) else {
             return Ok(None);
         };
-        if !state.compatible_with(context, registry)? {
-            return Ok(None);
-        }
-        let relation = self.installed(binding.relation, binding.layout)?;
-        if state.row_count != native_row_count(&relation.data) {
+        if !state.compatible_with(context, registry)? || state.row_count != expected_rows {
             return Ok(None);
         }
         Ok(Some(state.snapshot()))

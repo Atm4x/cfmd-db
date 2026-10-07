@@ -9,7 +9,8 @@ use cfmd_protocol::{
     wire::{
         CAP_QUERY, ProtocolHello, WIRE_HEADER_LEN, WireFrameKind, WireHostedSession, WireLimits,
         WireResponse, decode_header, decode_hello_ack_frame, decode_request_payload,
-        decode_response_frame, encode_hello_frame, encode_request_frame, negotiate,
+        decode_response_frame, encode_error_response_frame, encode_hello_frame,
+        encode_request_frame, negotiate,
     },
 };
 use cfmd_runtime::{
@@ -33,6 +34,29 @@ fn fixture() -> (std::path::PathBuf, Database, RelationId) {
         .expect("schema");
     let database = Database::create(&directory, schema).expect("database");
     (directory, database, relation)
+}
+
+#[test]
+fn formation_proof_error_codes_roundtrip_without_collapsing_to_internal() {
+    let limits = WireLimits::default();
+    for code in [
+        ProtocolErrorCode::FormationProofUnavailable,
+        ProtocolErrorCode::FormationProofInvalidated,
+        ProtocolErrorCode::ContractNotRepresentable,
+    ] {
+        let frame = encode_error_response_frame(91, code, "formation proof", limits)
+            .expect("encode error response");
+        let (request_id, response) =
+            decode_response_frame(&frame, limits).expect("decode error response");
+        assert_eq!(request_id, 91);
+        assert_eq!(
+            response,
+            WireResponse::Error {
+                code,
+                message: "formation proof".to_owned(),
+            }
+        );
+    }
 }
 
 fn wire_session(database: &Database) -> WireHostedSession {
@@ -70,6 +94,20 @@ fn canonical_request_roundtrip_and_negotiation() {
     assert_eq!(
         frame,
         encode_request_frame(11, &request, limits).expect("canonical encode")
+    );
+
+    let contract_request = HostedRequest::Query(QueryRequest {
+        target: SnapshotTarget::ContractHead {
+            schema_revision: 539,
+        },
+        query: ProtocolQuery::Scan { relation: 7 },
+    });
+    let contract_frame =
+        encode_request_frame(12, &contract_request, limits).expect("contract request");
+    assert_eq!(
+        decode_request_payload(&contract_frame[WIRE_HEADER_LEN..], limits)
+            .expect("decode contract request"),
+        contract_request
     );
 
     let ack = negotiate(ProtocolHello {

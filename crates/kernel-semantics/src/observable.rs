@@ -354,6 +354,67 @@ impl RevisionObservableCatalog {
             Some((*id, components.as_slice()))
         })
     }
+
+    /// Estimated owned heap retained by this catalog. The inline `Self` bytes are
+    /// intentionally excluded so an embedding physical state can account them once.
+    #[must_use]
+    pub fn estimated_heap_bytes_with(
+        &self,
+        canonical_key_heap_bytes: impl Fn(&CanonicalEqKey) -> usize + Copy,
+    ) -> usize {
+        fn definition_heap_bytes(definition: &SemanticObservableDefinition) -> usize {
+            match definition {
+                SemanticObservableDefinition::PinnedEquivalence(_)
+                | SemanticObservableDefinition::PinnedEquivalenceCoordinate { .. } => 0,
+                SemanticObservableDefinition::Product(components) => components
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<RevisionObservableId>()),
+            }
+        }
+
+        fn signature_heap_bytes(
+            signature: &ObservableClassSignature,
+            canonical_key_heap_bytes: impl Fn(&CanonicalEqKey) -> usize + Copy,
+        ) -> usize {
+            match signature {
+                ObservableClassSignature::Canonical(key) => canonical_key_heap_bytes(key),
+                ObservableClassSignature::Product(components) => components
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<EqClassId>()),
+            }
+        }
+
+        let definitions_heap = self
+            .definitions
+            .values()
+            .map(definition_heap_bytes)
+            .fold(0_usize, usize::saturating_add);
+        let definition_ids_heap = self
+            .definition_ids
+            .keys()
+            .map(definition_heap_bytes)
+            .fold(0_usize, usize::saturating_add);
+        let classes_heap = self
+            .classes
+            .keys()
+            .map(|(_, signature)| signature_heap_bytes(signature, canonical_key_heap_bytes))
+            .fold(0_usize, usize::saturating_add);
+        let class_records_heap = self
+            .class_records
+            .values()
+            .map(|record| signature_heap_bytes(&record.signature, canonical_key_heap_bytes))
+            .fold(0_usize, usize::saturating_add);
+
+        self.definitions
+            .estimated_heap_bytes()
+            .saturating_add(self.definition_ids.estimated_heap_bytes())
+            .saturating_add(self.classes.estimated_heap_bytes())
+            .saturating_add(self.class_records.estimated_heap_bytes())
+            .saturating_add(definitions_heap)
+            .saturating_add(definition_ids_heap)
+            .saturating_add(classes_heap)
+            .saturating_add(class_records_heap)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

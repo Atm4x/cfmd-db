@@ -10,9 +10,9 @@ use crate::replication::codec::FRAME_HEADER_LEN;
 use crate::runtime::{CodecError, DurabilityError};
 use crate::wal_frame::MAX_PAYLOAD_LEN;
 
-const SEGMENT_DOMAIN: &[u8] = b"CFMD/replication-authority-segment/v1";
+const SEGMENT_DOMAIN: &[u8] = b"CFMD/replication-authority-segment/v2";
 const SEGMENT_MAGIC: [u8; 4] = *b"CFAS";
-const SEGMENT_VERSION: u8 = 1;
+const SEGMENT_VERSION: u8 = 2;
 const SEGMENT_HEADER_LEN: usize = 88;
 const SEGMENT_ID_OFFSET: usize = 40;
 const SEGMENT_DELTA_LEN_OFFSET: usize = 72;
@@ -32,7 +32,9 @@ mod object_codec;
 pub(crate) use locator::{
     ReplicationAuthorityLocatorRoot, locator_stored_len, recover_locator_chain, write_locator_node,
 };
-pub(crate) use object_codec::{replay_segment_object, write_segment_object};
+pub(crate) use object_codec::{
+    collect_segment_object_frames, replay_segment_object, write_segment_object,
+};
 
 fn corruption(reason: &'static str) -> DurabilityError {
     DurabilityError::Corruption { offset: 0, reason }
@@ -345,6 +347,73 @@ impl ReplicationAuthoritySegmentIndex {
     }
 }
 
+pub(crate) trait ReplicationAuthorityFrameSource {
+    fn is_empty(&self) -> bool;
+
+    fn for_each_frame(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+    ) -> Result<(), DurabilityError>;
+}
+
+impl ReplicationAuthorityFrameSource for Vec<Vec<u8>> {
+    fn is_empty(&self) -> bool {
+        Vec::is_empty(self)
+    }
+
+    fn for_each_frame(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+    ) -> Result<(), DurabilityError> {
+        for frame in self {
+            emit(frame)?;
+        }
+        Ok(())
+    }
+}
+
+impl ReplicationAuthorityFrameSource for [Vec<u8>] {
+    fn is_empty(&self) -> bool {
+        <[Vec<u8>]>::is_empty(self)
+    }
+
+    fn for_each_frame(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+    ) -> Result<(), DurabilityError> {
+        for frame in self {
+            emit(frame)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct ReplicationAuthorityFrameSlice<'a> {
+    frames: &'a [Vec<u8>],
+}
+
+impl<'a> ReplicationAuthorityFrameSlice<'a> {
+    pub(crate) const fn new(frames: &'a [Vec<u8>]) -> Self {
+        Self { frames }
+    }
+}
+
+impl ReplicationAuthorityFrameSource for ReplicationAuthorityFrameSlice<'_> {
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn for_each_frame(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
+    ) -> Result<(), DurabilityError> {
+        for frame in self.frames {
+            emit(frame)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationAuthoritySegmentPlan {
     id: ReplicationAuthoritySegmentId,
@@ -358,39 +427,16 @@ impl ReplicationAuthoritySegmentPlan {
         parent: Option<ReplicationAuthoritySegmentId>,
         frames: &[Vec<u8>],
     ) -> Result<Self, DurabilityError> {
-        let frame_count = u32::try_from(frames.len()).map_err(|_| CodecError::LengthOverflow)?;
-        if frame_count == 0 || frame_count > MAX_SEGMENT_FRAME_COUNT {
-            return Err(DurabilityError::PayloadTooLarge);
-        }
-        let mut delta_len = 0_u64;
-        let mut hasher = Sha256::new();
-        hasher.update(SEGMENT_DOMAIN);
-        hasher.update(parent.map_or(
-            ReplicationAuthoritySegmentId::ZERO_BYTES,
-            ReplicationAuthoritySegmentId::bytes,
-        ));
-        for frame in frames {
-            validate_frame_shape(frame)?;
-            let len = u64::try_from(frame.len()).map_err(|_| CodecError::LengthOverflow)?;
-            delta_len = delta_len
-                .checked_add(len)
-                .ok_or(DurabilityError::PayloadTooLarge)?;
-        }
-        if delta_len > MAX_SEGMENT_DELTA_LEN {
-            return Err(DurabilityError::PayloadTooLarge);
-        }
-        hasher.update(delta_len.to_le_bytes());
-        hasher.update(frame_count.to_le_bytes());
-        for frame in frames {
-            hasher.update(frame);
-        }
-        let id = ReplicationAuthoritySegmentId::from_bytes(hasher.finalize().into())?;
-        Ok(Self {
-            id,
-            parent,
-            delta_len,
-            frame_count,
-        })
+        Self::from_source(parent, &ReplicationAuthorityFrameSlice::new(frames))
+    }
+
+    pub(crate) fn from_source<S: ReplicationAuthorityFrameSource + ?Sized>(
+        parent: Option<ReplicationAuthoritySegmentId>,
+        source: &S,
+    ) -> Result<Self, DurabilityError> {
+        let mut measurement = ReplicationAuthoritySegmentMeasurement::new();
+        source.for_each_frame(&mut |frame| measurement.observe(frame))?;
+        measurement.finish(parent)
     }
 
     pub(crate) fn id(&self) -> ReplicationAuthoritySegmentId {
@@ -413,26 +459,12 @@ impl ReplicationAuthoritySegmentPlan {
         frames: &[Vec<u8>],
         emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
     ) -> Result<(), DurabilityError> {
-        self.validate_frames(frames)?;
-        self.write_validated_to(frames, emit)
+        self.write_source_to(&ReplicationAuthorityFrameSlice::new(frames), emit)
     }
 
-    fn validate_frames(&self, frames: &[Vec<u8>]) -> Result<(), DurabilityError> {
-        let recomputed = Self::from_frames(self.parent, frames)?;
-        if recomputed.id != self.id
-            || recomputed.delta_len != self.delta_len
-            || recomputed.frame_count != self.frame_count
-        {
-            return Err(corruption(
-                "replication authority segment plan no longer matches frames",
-            ));
-        }
-        Ok(())
-    }
-
-    fn write_validated_to(
+    pub(crate) fn write_source_to<S: ReplicationAuthorityFrameSource + ?Sized>(
         &self,
-        frames: &[Vec<u8>],
+        source: &S,
         emit: &mut dyn FnMut(&[u8]) -> Result<(), DurabilityError>,
     ) -> Result<(), DurabilityError> {
         let mut header = [0_u8; SEGMENT_HEADER_LEN];
@@ -447,10 +479,88 @@ impl ReplicationAuthoritySegmentPlan {
         header[SEGMENT_FRAME_COUNT_OFFSET..SEGMENT_FRAME_COUNT_OFFSET + 4]
             .copy_from_slice(&self.frame_count.to_le_bytes());
         emit(&header)?;
-        for frame in frames {
-            emit(frame)?;
+
+        let mut measurement = ReplicationAuthoritySegmentMeasurement::new();
+        source.for_each_frame(&mut |frame| {
+            measurement.observe(frame)?;
+            if measurement.delta_len > self.delta_len || measurement.frame_count > self.frame_count
+            {
+                return Err(corruption(
+                    "replication authority segment source exceeded its frozen plan",
+                ));
+            }
+            emit(frame)
+        })?;
+        let actual = measurement.finish(self.parent)?;
+        if actual.id != self.id
+            || actual.delta_len != self.delta_len
+            || actual.frame_count != self.frame_count
+        {
+            return Err(corruption(
+                "replication authority segment plan no longer matches frame source",
+            ));
         }
         Ok(())
+    }
+}
+
+struct ReplicationAuthoritySegmentMeasurement {
+    delta_len: u64,
+    frame_count: u32,
+    frame_hasher: Sha256,
+}
+
+impl ReplicationAuthoritySegmentMeasurement {
+    fn new() -> Self {
+        Self {
+            delta_len: 0,
+            frame_count: 0,
+            frame_hasher: Sha256::new(),
+        }
+    }
+
+    fn observe(&mut self, frame: &[u8]) -> Result<(), DurabilityError> {
+        validate_frame_shape(frame)?;
+        let len = u64::try_from(frame.len()).map_err(|_| CodecError::LengthOverflow)?;
+        self.delta_len = self
+            .delta_len
+            .checked_add(len)
+            .ok_or(DurabilityError::PayloadTooLarge)?;
+        self.frame_count = self
+            .frame_count
+            .checked_add(1)
+            .ok_or(DurabilityError::PayloadTooLarge)?;
+        if self.delta_len > MAX_SEGMENT_DELTA_LEN || self.frame_count > MAX_SEGMENT_FRAME_COUNT {
+            return Err(DurabilityError::PayloadTooLarge);
+        }
+        self.frame_hasher.update(frame);
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        parent: Option<ReplicationAuthoritySegmentId>,
+    ) -> Result<ReplicationAuthoritySegmentPlan, DurabilityError> {
+        if self.frame_count == 0 {
+            return Err(DurabilityError::PayloadTooLarge);
+        }
+        let frame_digest: [u8; 32] = self.frame_hasher.finalize().into();
+        let mut hasher = Sha256::new();
+        hasher.update(SEGMENT_DOMAIN);
+        hasher.update(parent.map_or(
+            ReplicationAuthoritySegmentId::ZERO_BYTES,
+            ReplicationAuthoritySegmentId::bytes,
+        ));
+        hasher.update(self.delta_len.to_le_bytes());
+        hasher.update(self.frame_count.to_le_bytes());
+        hasher.update(frame_digest);
+        let id = ReplicationAuthoritySegmentId::from_bytes(hasher.finalize().into())?;
+        Ok(ReplicationAuthoritySegmentPlan {
+            id,
+            parent,
+            delta_len: self.delta_len,
+            frame_count: self.frame_count,
+        })
     }
 }
 
@@ -549,15 +659,7 @@ fn verify_segment_reader(
             "replication authority segment extent length mismatch",
         ));
     }
-    let mut hasher = Sha256::new();
-    hasher.update(SEGMENT_DOMAIN);
-    hasher.update(parent.map_or(
-        ReplicationAuthoritySegmentId::ZERO_BYTES,
-        ReplicationAuthoritySegmentId::bytes,
-    ));
-    hasher.update(delta_len.to_le_bytes());
-    hasher.update(frame_count.to_le_bytes());
-
+    let mut frame_hasher = Sha256::new();
     let mut consumed = 0_u64;
     for _ in 0..frame_count {
         if delta_len.saturating_sub(consumed)
@@ -586,13 +688,13 @@ fn verify_segment_reader(
                 "replication authority segment frame exceeds delta length",
             ));
         }
-        hasher.update(frame_header);
+        frame_hasher.update(frame_header);
         let mut remaining = payload_len;
         let mut buffer = [0_u8; 16 * 1024];
         while remaining != 0 {
             let take = remaining.min(buffer.len());
             reader.read_exact(&mut buffer[..take])?;
-            hasher.update(&buffer[..take]);
+            frame_hasher.update(&buffer[..take]);
             remaining -= take;
         }
         consumed = next_consumed;
@@ -602,11 +704,83 @@ fn verify_segment_reader(
             "replication authority segment delta has unframed trailing bytes",
         ));
     }
+    let frame_digest: [u8; 32] = frame_hasher.finalize().into();
+    let mut hasher = Sha256::new();
+    hasher.update(SEGMENT_DOMAIN);
+    hasher.update(parent.map_or(
+        ReplicationAuthoritySegmentId::ZERO_BYTES,
+        ReplicationAuthoritySegmentId::bytes,
+    ));
+    hasher.update(delta_len.to_le_bytes());
+    hasher.update(frame_count.to_le_bytes());
+    hasher.update(frame_digest);
     let actual = ReplicationAuthoritySegmentId::from_bytes(hasher.finalize().into())?;
     if actual != id {
         return Err(corruption("replication authority segment digest mismatch"));
     }
     Ok(())
+}
+
+fn collect_verified_segment_reader(
+    reader: &mut dyn Read,
+    expected_len: u64,
+    expected_id: ReplicationAuthoritySegmentId,
+    expected_parent: Option<ReplicationAuthoritySegmentId>,
+) -> Result<Vec<Vec<u8>>, DurabilityError> {
+    let mut header = [0_u8; SEGMENT_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    let (id, parent, delta_len, frame_count) = decode_segment_header(&header)?;
+    if id != expected_id || parent != expected_parent {
+        return Err(corruption(
+            "verified replication authority segment binding changed before collection",
+        ));
+    }
+    let encoded_len = u64::try_from(SEGMENT_HEADER_LEN)
+        .map_err(|_| CodecError::LengthOverflow)?
+        .checked_add(delta_len)
+        .ok_or(CodecError::LengthOverflow)?;
+    if encoded_len != expected_len {
+        return Err(corruption(
+            "verified replication authority segment extent changed before collection",
+        ));
+    }
+    let mut frames =
+        Vec::with_capacity(usize::try_from(frame_count).map_err(|_| CodecError::LengthOverflow)?);
+    let mut consumed = 0_u64;
+    for _ in 0..frame_count {
+        let mut frame_header = [0_u8; FRAME_HEADER_LEN];
+        reader.read_exact(&mut frame_header)?;
+        let payload_len = usize::try_from(read_u32(&frame_header[8..12]))
+            .map_err(|_| CodecError::LengthOverflow)?;
+        if payload_len > MAX_PAYLOAD_LEN {
+            return Err(DurabilityError::PayloadTooLarge);
+        }
+        let frame_len = FRAME_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(CodecError::LengthOverflow)?;
+        consumed = consumed
+            .checked_add(u64::try_from(frame_len).map_err(|_| CodecError::LengthOverflow)?)
+            .ok_or(CodecError::LengthOverflow)?;
+        if consumed > delta_len {
+            return Err(corruption(
+                "verified replication authority segment frame exceeds delta length",
+            ));
+        }
+        let mut frame = Vec::new();
+        frame
+            .try_reserve_exact(frame_len)
+            .map_err(|_| DurabilityError::PayloadTooLarge)?;
+        frame.extend_from_slice(&frame_header);
+        frame.resize(frame_len, 0);
+        reader.read_exact(&mut frame[FRAME_HEADER_LEN..])?;
+        frames.push(frame);
+    }
+    if consumed != delta_len {
+        return Err(corruption(
+            "verified replication authority segment delta has trailing bytes",
+        ));
+    }
+    Ok(frames)
 }
 
 fn replay_verified_segment_reader(
@@ -683,6 +857,25 @@ pub(crate) fn replay_indexed_segment_chain<R: Read + Seek>(
         replay_verified_segment_reader(reader, entry.extent.len, id, entry.parent, journal)?;
     }
     Ok(())
+}
+
+pub(crate) fn collect_indexed_segment_object_chain_frames<R: Read + Seek>(
+    reader: &mut R,
+    index: &ReplicationAuthoritySegmentIndex,
+    crypto: Option<&crate::storage_encryption::StorageAeadCodec>,
+) -> Result<Vec<Vec<u8>>, DurabilityError> {
+    let mut frames = Vec::new();
+    for (id, entry) in index.chain_oldest_first()? {
+        frames.extend(collect_segment_object_frames(
+            reader,
+            entry.extent.offset,
+            entry.extent.len,
+            id,
+            entry.parent,
+            crypto,
+        )?);
+    }
+    Ok(frames)
 }
 
 pub(crate) fn replay_indexed_segment_object_chain<R: Read + Seek>(

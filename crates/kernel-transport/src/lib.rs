@@ -1,6 +1,12 @@
 use kernel_query::{QueryError, QueryTypeError, RelQueryError};
 use kernel_semantics::SemanticError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccessPolicySubject {
+    Capability(kernel_types::SemanticId),
+    Role(kernel_types::SemanticId),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     SourceSemantics(SemanticError),
@@ -34,6 +40,12 @@ pub enum TransportError {
     MissingMigrationSourceValue(kernel_types::SemanticId),
     UnrepresentableSourceFieldDependency(kernel_types::SemanticId),
     UnrepresentableSourceRelationEffect(kernel_types::SemanticId),
+    UnrepresentableObservationRelation(kernel_types::SemanticId),
+    UnrepresentableReadRelation(kernel_types::SemanticId),
+    AliasedReadTarget(kernel_types::SemanticId),
+    ReadResultTypeMismatch,
+    AmbiguousObservationRelation(kernel_types::SemanticId),
+    UnrepresentableOwnedRelationship(kernel_types::SemanticId),
     SourceRelationDeltaTypeMismatch(kernel_types::SemanticId),
     MigrationSliceNotRowLocal(kernel_types::SemanticId),
     NotConservativeSemanticExtension,

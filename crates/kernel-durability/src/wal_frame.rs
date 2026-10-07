@@ -4,7 +4,7 @@ use crate::binary_codec::{crc32c, read_u16, read_u32, read_u64};
 use crate::runtime::{DurabilityError, TailStatus};
 
 pub const MAGIC: [u8; 4] = *b"CFMW";
-pub const FORMAT_VERSION: u16 = 1;
+const WAL_FRAME_FORMAT_VERSION: u16 = 1;
 pub const HEADER_LEN: usize = 36;
 pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 
@@ -14,6 +14,7 @@ pub(crate) enum RecordKind {
     PrepareRevision = 1,
     CommitRevision = 2,
     ReplicationAuthority = 3,
+    SealClientIntent = 4,
 }
 
 impl TryFrom<u8> for RecordKind {
@@ -24,6 +25,7 @@ impl TryFrom<u8> for RecordKind {
             1 => Ok(Self::PrepareRevision),
             2 => Ok(Self::CommitRevision),
             3 => Ok(Self::ReplicationAuthority),
+            4 => Ok(Self::SealClientIntent),
             _ => Err(()),
         }
     }
@@ -122,7 +124,7 @@ pub(crate) fn validate_frame_header(
     offset: usize,
     expected_lsn: u64,
 ) -> Result<(), DurabilityError> {
-    if read_u16(&header[4..6]) != FORMAT_VERSION {
+    if read_u16(&header[4..6]) != WAL_FRAME_FORMAT_VERSION {
         return Err(DurabilityError::Corruption {
             offset,
             reason: "unsupported/corrupt frame version",
@@ -166,7 +168,7 @@ pub(crate) fn encode_frame(
     let payload_crc32c = crc32c(payload);
     let mut header = [0_u8; HEADER_LEN];
     header[0..4].copy_from_slice(&MAGIC);
-    header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header[4..6].copy_from_slice(&WAL_FRAME_FORMAT_VERSION.to_le_bytes());
     header[6] = kind as u8;
     header[7] = 0;
     header[8..12].copy_from_slice(&payload_len.to_le_bytes());

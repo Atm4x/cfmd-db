@@ -116,7 +116,19 @@ logical parent identity  = stable digest / segment id
 physical extent          = relocatable storage implementation
 ```
 
-## Next implementation step
+## Production status after PASS588
+
+The selected architecture is now the sole active SingleFile checkpoint authority path. Checkpoint rotation appends only a new immutable `CFAS` delta inside `CFAO` plus one `CFLN` locator when the live authority prefix is non-empty; an empty delta preserves the previous authority root. Recovery authenticates and replays the root-reachable chain through the existing journal evaluator. Compaction copies each reachable `CFAO` byte-for-byte, rebuilds physical locators, validates the relocated closure, and publishes the relocated root before reclaim. The unreleased generation-contained `ReplicationAuthority` section discriminator has been deleted from the active grammar, so P323 archive copying cannot be selected as a fallback.
+
+Cost law now implemented:
+
+```text
+ordinary checkpoint authority work = O(new authority delta)
+explicit physical compaction       = O(reachable retained authority)
+recovery                            = O(reachable retained authority + live WAL suffix)
+```
+
+## Historical implementation sequence
 
 P325 should introduce a first-class `ReplicationAuthoritySegmentId` and a bounded segment envelope,
 plus a root-local segment index that can be relocated during single-file compaction.  The first

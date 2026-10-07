@@ -3,9 +3,11 @@ use std::io::Read;
 
 use kernel_revision::Revision;
 use kernel_schema::{
-    CapabilityDef, FieldDef, FieldRule, FiniteF64, ModelRuleExpr, ModuleDigest, RelationDef,
-    RelationSemantics, RuleValueExpr, Schema, SemanticContext, SemanticEnvironment,
-    SemanticRuleExpr, Symbol, TextPattern,
+    AccessCapabilityDef, AccessRoleDef, CapabilityDef, ExactAggregateMeasureExpr,
+    ExactAggregateRange, ExactMeasureConstraint, FieldDef, FieldRule, FiniteF64, ModelRuleExpr,
+    ModuleDigest, OrphanPolicyDef, OwnedRelationshipDef, PermissionCoordinate, RelationDef,
+    RelationSemantics, RuleOrderComparison, RuleValueExpr, Schema, SchemaAccess, SemanticContext,
+    SemanticEnvironment, SemanticRuleExpr, Symbol, TextPattern,
 };
 use kernel_semantics::SemanticRegistry;
 use kernel_types::{RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
@@ -23,7 +25,7 @@ use super::semantic_codec::{
 };
 use super::state_codec::{decode_state, decode_type_expr, encode_state, encode_type_expr};
 
-pub(crate) const CHECKPOINT_CODEC_VERSION: u16 = 5;
+pub(crate) const CHECKPOINT_CODEC_VERSION: u16 = 1;
 
 pub(crate) fn encode_revision(revision: &Revision) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::new();
@@ -79,7 +81,7 @@ fn decode_revision_from_cursor(
     registry: &SemanticRegistry,
 ) -> Result<Revision, DurabilityError> {
     let version = cursor.u16().map_err(corrupt)?;
-    if !(1..=CHECKPOINT_CODEC_VERSION).contains(&version) {
+    if version != CHECKPOINT_CODEC_VERSION {
         return Err(corrupt("unsupported checkpoint codec version"));
     }
     let revision_id = RevisionId::new(cursor.u64().map_err(corrupt)?);
@@ -181,60 +183,35 @@ pub(crate) fn encode_context(
         }
     }
 
+    encode_schema_access(out, schema.schema_access())?;
+
+    let owned_relationships: Vec<_> = schema.owned_relationships().collect();
+    push_len(out, owned_relationships.len())?;
+    for definition in owned_relationships {
+        push_u128(out, definition.relation.raw());
+        push_u128(out, definition.target_relation.raw());
+        out.push(match definition.orphan_policy {
+            OrphanPolicyDef::Keep => 0,
+            OrphanPolicyDef::DeleteIfUnowned => 1,
+        });
+    }
+
     push_len(out, schema.model_rules().len())?;
     for rule in schema.model_rules() {
         match rule {
-            ModelRuleExpr::RelationCardinality { relation, min, max } => {
+            ModelRuleExpr::RelationExactMeasure { constraint } => {
                 out.push(0);
-                push_u128(out, relation.raw());
-                push_u64(out, *min);
-                match max {
-                    Some(max) => {
-                        out.push(1);
-                        push_u64(out, *max);
-                    }
-                    None => out.push(0),
-                }
+                encode_exact_measure_constraint(out, constraint)?;
             }
-            ModelRuleExpr::RelationExists {
-                relation,
-                predicate,
+            ModelRuleExpr::RelationGroupedExactMeasure {
+                group_columns,
+                group_equivalences,
+                constraint,
             } => {
                 out.push(1);
-                push_u128(out, relation.raw());
-                encode_semantic_rule_expr(out, predicate, 0)?;
-            }
-            ModelRuleExpr::RelationAll {
-                relation,
-                predicate,
-            } => {
-                out.push(2);
-                push_u128(out, relation.raw());
-                encode_semantic_rule_expr(out, predicate, 0)?;
-            }
-            ModelRuleExpr::RelationExactF64SumRange {
-                relation,
-                column,
-                min,
-                max,
-            } => {
-                out.push(3);
-                push_u128(out, relation.raw());
-                push_u128(out, column.raw());
-                match min {
-                    Some(value) => {
-                        out.push(1);
-                        push_u64(out, value.bits());
-                    }
-                    None => out.push(0),
-                }
-                match max {
-                    Some(value) => {
-                        out.push(1);
-                        push_u64(out, value.bits());
-                    }
-                    None => out.push(0),
-                }
+                encode_semantic_ids(out, group_columns)?;
+                encode_semantic_ids(out, group_equivalences)?;
+                encode_exact_measure_constraint(out, constraint)?;
             }
         }
     }
@@ -282,34 +259,258 @@ pub(crate) fn decode_context(
     cursor: &mut impl BinarySource,
     version: u16,
 ) -> Result<SemanticContext, DurabilityError> {
+    if version != CHECKPOINT_CODEC_VERSION {
+        return Err(corrupt("unsupported semantic-context codec version"));
+    }
     let mut schema = Schema::new(SchemaRevisionId::new(cursor.u64().map_err(corrupt)?));
     decode_symbols(cursor, &mut schema)?;
     decode_types(cursor, &mut schema)?;
     decode_capabilities(cursor, &mut schema)?;
     decode_fields(cursor, &mut schema)?;
-    if version >= 3 {
-        decode_field_rules(cursor, &mut schema)?;
-    }
-    if version >= 4 {
-        decode_entity_rules(cursor, &mut schema)?;
-    }
+    decode_field_rules(cursor, &mut schema)?;
+    decode_entity_rules(cursor, &mut schema)?;
     decode_relations(cursor, &mut schema)?;
-    if version >= 5 {
-        decode_model_rules(cursor, &mut schema)?;
-    }
-    if version >= 3 {
-        decode_relation_column_rules(cursor, &mut schema)?;
-    }
+    decode_schema_access(cursor, &mut schema)?;
+    decode_owned_relationships(cursor, &mut schema)?;
+    decode_model_rules(cursor, &mut schema)?;
+    decode_relation_column_rules(cursor, &mut schema)?;
     decode_structural_equivalences(cursor, &mut schema)?;
-    if version >= 2 {
-        decode_structural_orderings(cursor, &mut schema)?;
-    }
+    decode_structural_orderings(cursor, &mut schema)?;
     decode_inclusions(cursor, &mut schema)?;
     let environment = decode_environment(cursor)?;
     Ok(SemanticContext {
         schema,
         environment,
     })
+}
+
+fn encode_permission_coordinate(out: &mut impl BinarySink, permission: PermissionCoordinate) {
+    match permission {
+        PermissionCoordinate::ModelRead => out.push(0),
+        PermissionCoordinate::ReadRelation { relation } => {
+            out.push(2);
+            push_u128(out, relation.raw());
+        }
+        PermissionCoordinate::ReadField { relation, column } => {
+            out.push(3);
+            push_u128(out, relation.raw());
+            push_u128(out, column.raw());
+        }
+        PermissionCoordinate::HistoricalRead => out.push(4),
+        PermissionCoordinate::HistoryRead => out.push(5),
+        PermissionCoordinate::Watch => out.push(6),
+        PermissionCoordinate::WriteRelation { relation } => {
+            out.push(7);
+            push_u128(out, relation.raw());
+        }
+        PermissionCoordinate::WriteField { relation, column } => {
+            out.push(8);
+            push_u128(out, relation.raw());
+            push_u128(out, column.raw());
+        }
+        PermissionCoordinate::CreateObject { relation } => {
+            out.push(9);
+            push_u128(out, relation.raw());
+        }
+        PermissionCoordinate::DeleteObject { relation } => {
+            out.push(10);
+            push_u128(out, relation.raw());
+        }
+        PermissionCoordinate::AttachRelationship { relation } => {
+            out.push(11);
+            push_u128(out, relation.raw());
+        }
+        PermissionCoordinate::DetachRelationship { relation } => {
+            out.push(12);
+            push_u128(out, relation.raw());
+        }
+        PermissionCoordinate::MoveRelationship { relation } => {
+            out.push(13);
+            push_u128(out, relation.raw());
+        }
+        PermissionCoordinate::WriteCarrierPresence { carrier } => {
+            out.push(14);
+            push_u128(out, carrier.raw());
+        }
+        PermissionCoordinate::WriteCarrierMember { carrier, member } => {
+            out.push(15);
+            push_u128(out, carrier.raw());
+            push_u128(out, member.raw());
+        }
+        PermissionCoordinate::WriteLifecycleEntity { entity } => {
+            out.push(16);
+            push_u128(out, entity.raw());
+        }
+        PermissionCoordinate::WriteLifecycleRoot { entity } => {
+            out.push(17);
+            push_u128(out, entity.raw());
+        }
+        PermissionCoordinate::WriteKeepsAlivePresence { parent } => {
+            out.push(18);
+            push_u128(out, parent.raw());
+        }
+        PermissionCoordinate::WriteKeepsAliveEdge { parent, child } => {
+            out.push(19);
+            push_u128(out, parent.raw());
+            push_u128(out, child.raw());
+        }
+    }
+}
+
+fn decode_permission_coordinate(
+    cursor: &mut impl BinarySource,
+) -> Result<PermissionCoordinate, DurabilityError> {
+    fn id(cursor: &mut impl BinarySource) -> Result<SemanticId, DurabilityError> {
+        cursor.u128().map(SemanticId::new).map_err(corrupt)
+    }
+    Ok(match cursor.u8().map_err(corrupt)? {
+        0 => PermissionCoordinate::ModelRead,
+        1 => return Err(corrupt("retired schema-control permission tag")),
+        2 => PermissionCoordinate::ReadRelation {
+            relation: id(cursor)?,
+        },
+        3 => PermissionCoordinate::ReadField {
+            relation: id(cursor)?,
+            column: id(cursor)?,
+        },
+        4 => PermissionCoordinate::HistoricalRead,
+        5 => PermissionCoordinate::HistoryRead,
+        6 => PermissionCoordinate::Watch,
+        7 => PermissionCoordinate::WriteRelation {
+            relation: id(cursor)?,
+        },
+        8 => PermissionCoordinate::WriteField {
+            relation: id(cursor)?,
+            column: id(cursor)?,
+        },
+        9 => PermissionCoordinate::CreateObject {
+            relation: id(cursor)?,
+        },
+        10 => PermissionCoordinate::DeleteObject {
+            relation: id(cursor)?,
+        },
+        11 => PermissionCoordinate::AttachRelationship {
+            relation: id(cursor)?,
+        },
+        12 => PermissionCoordinate::DetachRelationship {
+            relation: id(cursor)?,
+        },
+        13 => PermissionCoordinate::MoveRelationship {
+            relation: id(cursor)?,
+        },
+        14 => PermissionCoordinate::WriteCarrierPresence {
+            carrier: id(cursor)?,
+        },
+        15 => PermissionCoordinate::WriteCarrierMember {
+            carrier: id(cursor)?,
+            member: id(cursor)?,
+        },
+        16 => PermissionCoordinate::WriteLifecycleEntity {
+            entity: id(cursor)?,
+        },
+        17 => PermissionCoordinate::WriteLifecycleRoot {
+            entity: id(cursor)?,
+        },
+        18 => PermissionCoordinate::WriteKeepsAlivePresence {
+            parent: id(cursor)?,
+        },
+        19 => PermissionCoordinate::WriteKeepsAliveEdge {
+            parent: id(cursor)?,
+            child: id(cursor)?,
+        },
+        _ => return Err(corrupt("unknown authorization permission coordinate tag")),
+    })
+}
+
+fn decode_owned_relationships(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
+    let count = cursor.len().map_err(corrupt)?;
+    for _ in 0..count {
+        let relation = SemanticId::new(cursor.u128().map_err(corrupt)?);
+        let target_relation = SemanticId::new(cursor.u128().map_err(corrupt)?);
+        let orphan_policy = match cursor.u8().map_err(corrupt)? {
+            0 => OrphanPolicyDef::Keep,
+            1 => OrphanPolicyDef::DeleteIfUnowned,
+            _ => return Err(corrupt("invalid owned relationship orphan policy")),
+        };
+        schema
+            .define_owned_relationship(OwnedRelationshipDef {
+                relation,
+                target_relation,
+                orphan_policy,
+            })
+            .map_err(|_| corrupt("invalid owned relationship schema"))?;
+    }
+    Ok(())
+}
+
+fn encode_schema_access(
+    out: &mut impl BinarySink,
+    policy: &SchemaAccess,
+) -> Result<(), CodecError> {
+    push_len(out, policy.capabilities.len())?;
+    for capability in policy.capabilities.values() {
+        push_u128(out, capability.id.raw());
+        push_len(out, capability.permissions.len())?;
+        for permission in &capability.permissions {
+            encode_permission_coordinate(out, *permission);
+        }
+    }
+    push_len(out, policy.roles.len())?;
+    for role in policy.roles.values() {
+        push_u128(out, role.id.raw());
+        encode_semantic_ids(out, &role.capabilities.iter().copied().collect::<Vec<_>>())?;
+        encode_semantic_ids(out, &role.includes.iter().copied().collect::<Vec<_>>())?;
+    }
+    Ok(())
+}
+
+fn decode_schema_access(
+    cursor: &mut impl BinarySource,
+    schema: &mut Schema,
+) -> Result<(), DurabilityError> {
+    let capability_count = cursor.len().map_err(corrupt)?;
+    let mut capabilities = BTreeMap::new();
+    let mut previous = None;
+    for _ in 0..capability_count {
+        let id = ordered_semantic_id(
+            cursor,
+            &mut previous,
+            "authorization capabilities not strictly sorted",
+        )?;
+        let permission_count = cursor.len().map_err(corrupt)?;
+        let mut permissions = BTreeSet::new();
+        for _ in 0..permission_count {
+            permissions.insert(decode_permission_coordinate(cursor)?);
+        }
+        capabilities.insert(id, AccessCapabilityDef { id, permissions });
+    }
+    let role_count = cursor.len().map_err(corrupt)?;
+    let mut roles = BTreeMap::new();
+    previous = None;
+    for _ in 0..role_count {
+        let id = ordered_semantic_id(
+            cursor,
+            &mut previous,
+            "authorization roles not strictly sorted",
+        )?;
+        roles.insert(
+            id,
+            AccessRoleDef {
+                id,
+                capabilities: decode_semantic_ids(cursor)?.into_iter().collect(),
+                includes: decode_semantic_ids(cursor)?.into_iter().collect(),
+            },
+        );
+    }
+    schema
+        .set_schema_access(SchemaAccess {
+            capabilities,
+            roles,
+        })
+        .map_err(|_| corrupt("invalid checkpoint schema access"))
 }
 
 fn decode_model_rules(
@@ -319,50 +520,14 @@ fn decode_model_rules(
     let count = cursor.len().map_err(corrupt)?;
     for _ in 0..count {
         let rule = match cursor.u8().map_err(corrupt)? {
-            0 => {
-                let relation = SemanticId::new(cursor.u128().map_err(corrupt)?);
-                let min = cursor.u64().map_err(corrupt)?;
-                let max = match cursor.u8().map_err(corrupt)? {
-                    0 => None,
-                    1 => Some(cursor.u64().map_err(corrupt)?),
-                    _ => return Err(corrupt("invalid model cardinality max tag")),
-                };
-                ModelRuleExpr::RelationCardinality { relation, min, max }
-            }
-            1 => ModelRuleExpr::RelationExists {
-                relation: SemanticId::new(cursor.u128().map_err(corrupt)?),
-                predicate: decode_semantic_rule_expr(cursor, 0)?,
+            0 => ModelRuleExpr::RelationExactMeasure {
+                constraint: decode_exact_measure_constraint(cursor)?,
             },
-            2 => ModelRuleExpr::RelationAll {
-                relation: SemanticId::new(cursor.u128().map_err(corrupt)?),
-                predicate: decode_semantic_rule_expr(cursor, 0)?,
+            1 => ModelRuleExpr::RelationGroupedExactMeasure {
+                group_columns: decode_semantic_ids(cursor)?,
+                group_equivalences: decode_semantic_ids(cursor)?,
+                constraint: decode_exact_measure_constraint(cursor)?,
             },
-            3 => {
-                let relation = SemanticId::new(cursor.u128().map_err(corrupt)?);
-                let column = SemanticId::new(cursor.u128().map_err(corrupt)?);
-                let min = match cursor.u8().map_err(corrupt)? {
-                    0 => None,
-                    1 => Some(
-                        FiniteF64::from_bits(cursor.u64().map_err(corrupt)?)
-                            .ok_or_else(|| corrupt("non-finite model sum min"))?,
-                    ),
-                    _ => return Err(corrupt("invalid model sum min tag")),
-                };
-                let max = match cursor.u8().map_err(corrupt)? {
-                    0 => None,
-                    1 => Some(
-                        FiniteF64::from_bits(cursor.u64().map_err(corrupt)?)
-                            .ok_or_else(|| corrupt("non-finite model sum max"))?,
-                    ),
-                    _ => return Err(corrupt("invalid model sum max tag")),
-                };
-                ModelRuleExpr::RelationExactF64SumRange {
-                    relation,
-                    column,
-                    min,
-                    max,
-                }
-            }
             _ => return Err(corrupt("unknown model rule tag")),
         };
         schema
@@ -370,6 +535,268 @@ fn decode_model_rules(
             .map_err(|_| corrupt("invalid checkpoint model rule"))?;
     }
     Ok(())
+}
+
+fn encode_exact_measure_constraint(
+    out: &mut impl BinarySink,
+    constraint: &ExactMeasureConstraint,
+) -> Result<(), CodecError> {
+    match constraint {
+        ExactMeasureConstraint::Range { measure, range } => {
+            out.push(0);
+            encode_exact_aggregate_measure(out, measure)?;
+            match range {
+                ExactAggregateRange::Count { min, max } => {
+                    out.push(0);
+                    push_u64(out, *min);
+                    match max {
+                        Some(max) => {
+                            out.push(1);
+                            push_u64(out, *max);
+                        }
+                        None => out.push(0),
+                    }
+                }
+                ExactAggregateRange::F64Sum { min, max } => {
+                    out.push(1);
+                    encode_optional_finite_f64(out, *min);
+                    encode_optional_finite_f64(out, *max);
+                }
+                ExactAggregateRange::OrderedStatistic { min, max } => {
+                    out.push(2);
+                    encode_optional_ordered_statistic_bound(out, min.as_ref())?;
+                    encode_optional_ordered_statistic_bound(out, max.as_ref())?;
+                }
+            }
+        }
+        ExactMeasureConstraint::Compare {
+            left,
+            right,
+            comparison,
+        } => {
+            out.push(1);
+            encode_exact_aggregate_measure(out, left)?;
+            encode_exact_aggregate_measure(out, right)?;
+            out.push(match comparison {
+                RuleOrderComparison::Less => 0,
+                RuleOrderComparison::LessOrEqual => 1,
+                RuleOrderComparison::Greater => 2,
+                RuleOrderComparison::GreaterOrEqual => 3,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn decode_exact_measure_constraint(
+    cursor: &mut impl BinarySource,
+) -> Result<ExactMeasureConstraint, DurabilityError> {
+    match cursor.u8().map_err(corrupt)? {
+        0 => {
+            let measure = decode_exact_aggregate_measure(cursor)?;
+            let range = match cursor.u8().map_err(corrupt)? {
+                0 => {
+                    let min = cursor.u64().map_err(corrupt)?;
+                    let max = match cursor.u8().map_err(corrupt)? {
+                        0 => None,
+                        1 => Some(cursor.u64().map_err(corrupt)?),
+                        _ => return Err(corrupt("invalid grouped exact-count max tag")),
+                    };
+                    ExactAggregateRange::Count { min, max }
+                }
+                1 => ExactAggregateRange::F64Sum {
+                    min: decode_optional_finite_f64(cursor)?,
+                    max: decode_optional_finite_f64(cursor)?,
+                },
+                2 => ExactAggregateRange::OrderedStatistic {
+                    min: decode_optional_ordered_statistic_bound(cursor)?,
+                    max: decode_optional_ordered_statistic_bound(cursor)?,
+                },
+                _ => return Err(corrupt("invalid exact aggregate range tag")),
+            };
+            Ok(ExactMeasureConstraint::Range { measure, range })
+        }
+        1 => Ok(ExactMeasureConstraint::Compare {
+            left: decode_exact_aggregate_measure(cursor)?,
+            right: decode_exact_aggregate_measure(cursor)?,
+            comparison: match cursor.u8().map_err(corrupt)? {
+                0 => RuleOrderComparison::Less,
+                1 => RuleOrderComparison::LessOrEqual,
+                2 => RuleOrderComparison::Greater,
+                3 => RuleOrderComparison::GreaterOrEqual,
+                _ => return Err(corrupt("invalid grouped aggregate comparison tag")),
+            },
+        }),
+        _ => Err(corrupt("invalid grouped aggregate constraint tag")),
+    }
+}
+
+fn encode_optional_ordered_statistic_bound(
+    out: &mut impl BinarySink,
+    value: Option<&kernel_schema::OrderedStatisticBound>,
+) -> Result<(), CodecError> {
+    let Some(value) = value else {
+        out.push(0);
+        return Ok(());
+    };
+    out.push(1);
+    match value {
+        kernel_schema::OrderedStatisticBound::Unit => out.push(0),
+        kernel_schema::OrderedStatisticBound::Bool(value) => {
+            out.push(1);
+            out.push(u8::from(*value));
+        }
+        kernel_schema::OrderedStatisticBound::I64(value) => {
+            out.push(2);
+            push_u64(out, (*value).cast_unsigned());
+        }
+        kernel_schema::OrderedStatisticBound::F64Bits(value) => {
+            out.push(3);
+            push_u64(out, *value);
+        }
+        kernel_schema::OrderedStatisticBound::Text(value) => {
+            out.push(4);
+            push_bytes(out, value.as_bytes())?;
+        }
+        kernel_schema::OrderedStatisticBound::LiveEntityId { entity_type, id } => {
+            out.push(5);
+            push_u128(out, entity_type.raw());
+            push_u128(out, id.raw());
+        }
+        kernel_schema::OrderedStatisticBound::HistoricalEntityId { entity_type, id } => {
+            out.push(6);
+            push_u128(out, entity_type.raw());
+            push_u128(out, id.raw());
+        }
+    }
+    Ok(())
+}
+
+fn decode_optional_ordered_statistic_bound(
+    cursor: &mut impl BinarySource,
+) -> Result<Option<kernel_schema::OrderedStatisticBound>, DurabilityError> {
+    match cursor.u8().map_err(corrupt)? {
+        0 => Ok(None),
+        1 => Ok(Some(match cursor.u8().map_err(corrupt)? {
+            0 => kernel_schema::OrderedStatisticBound::Unit,
+            1 => {
+                kernel_schema::OrderedStatisticBound::Bool(match cursor.u8().map_err(corrupt)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(corrupt("invalid ordered statistic bool bound")),
+                })
+            }
+            2 => kernel_schema::OrderedStatisticBound::I64(
+                cursor.u64().map_err(corrupt)?.cast_signed(),
+            ),
+            3 => kernel_schema::OrderedStatisticBound::F64Bits(cursor.u64().map_err(corrupt)?),
+            4 => kernel_schema::OrderedStatisticBound::Text(cursor.string().map_err(corrupt)?),
+            5 => kernel_schema::OrderedStatisticBound::LiveEntityId {
+                entity_type: SemanticId::new(cursor.u128().map_err(corrupt)?),
+                id: kernel_types::EntityId::new(cursor.u128().map_err(corrupt)?),
+            },
+            6 => kernel_schema::OrderedStatisticBound::HistoricalEntityId {
+                entity_type: SemanticId::new(cursor.u128().map_err(corrupt)?),
+                id: kernel_types::EntityId::new(cursor.u128().map_err(corrupt)?),
+            },
+            _ => return Err(corrupt("invalid ordered statistic bound tag")),
+        })),
+        _ => Err(corrupt("invalid optional ordered statistic bound tag")),
+    }
+}
+
+fn encode_exact_aggregate_measure(
+    out: &mut impl BinarySink,
+    measure: &ExactAggregateMeasureExpr,
+) -> Result<(), CodecError> {
+    match measure {
+        ExactAggregateMeasureExpr::Count {
+            relation,
+            predicate,
+        } => {
+            out.push(0);
+            push_u128(out, relation.raw());
+            encode_semantic_rule_expr(out, predicate, 0)?;
+        }
+        ExactAggregateMeasureExpr::F64Sum {
+            relation,
+            column,
+            predicate,
+        } => {
+            out.push(1);
+            push_u128(out, relation.raw());
+            push_u128(out, column.raw());
+            encode_semantic_rule_expr(out, predicate, 0)?;
+        }
+        ExactAggregateMeasureExpr::OrderedStatistic {
+            relation,
+            column,
+            predicate,
+            ordering,
+            selector,
+        } => {
+            out.push(2);
+            push_u128(out, relation.raw());
+            push_u128(out, column.raw());
+            encode_semantic_rule_expr(out, predicate, 0)?;
+            push_u128(out, ordering.raw());
+            match selector {
+                kernel_schema::OrderedStatisticSelector::FromStart(rank) => {
+                    out.push(0);
+                    push_u64(out, *rank);
+                }
+                kernel_schema::OrderedStatisticSelector::FromEnd(rank) => {
+                    out.push(1);
+                    push_u64(out, *rank);
+                }
+                kernel_schema::OrderedStatisticSelector::LowerQuantile {
+                    numerator,
+                    denominator,
+                } => {
+                    out.push(2);
+                    push_u64(out, *numerator);
+                    push_u64(out, *denominator);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_exact_aggregate_measure(
+    cursor: &mut impl BinarySource,
+) -> Result<ExactAggregateMeasureExpr, DurabilityError> {
+    match cursor.u8().map_err(corrupt)? {
+        0 => Ok(ExactAggregateMeasureExpr::Count {
+            relation: SemanticId::new(cursor.u128().map_err(corrupt)?),
+            predicate: decode_semantic_rule_expr(cursor, 0)?,
+        }),
+        1 => Ok(ExactAggregateMeasureExpr::F64Sum {
+            relation: SemanticId::new(cursor.u128().map_err(corrupt)?),
+            column: SemanticId::new(cursor.u128().map_err(corrupt)?),
+            predicate: decode_semantic_rule_expr(cursor, 0)?,
+        }),
+        2 => Ok(ExactAggregateMeasureExpr::OrderedStatistic {
+            relation: SemanticId::new(cursor.u128().map_err(corrupt)?),
+            column: SemanticId::new(cursor.u128().map_err(corrupt)?),
+            predicate: decode_semantic_rule_expr(cursor, 0)?,
+            ordering: SemanticId::new(cursor.u128().map_err(corrupt)?),
+            selector: match cursor.u8().map_err(corrupt)? {
+                0 => kernel_schema::OrderedStatisticSelector::FromStart(
+                    cursor.u64().map_err(corrupt)?,
+                ),
+                1 => {
+                    kernel_schema::OrderedStatisticSelector::FromEnd(cursor.u64().map_err(corrupt)?)
+                }
+                2 => kernel_schema::OrderedStatisticSelector::LowerQuantile {
+                    numerator: cursor.u64().map_err(corrupt)?,
+                    denominator: cursor.u64().map_err(corrupt)?,
+                },
+                _ => return Err(corrupt("invalid ordered statistic selector")),
+            },
+        }),
+        _ => Err(corrupt("invalid exact aggregate measure tag")),
+    }
 }
 
 fn decode_symbols(
@@ -563,6 +990,29 @@ fn decode_optional_i64(cursor: &mut impl BinarySource) -> Result<Option<i64>, Du
     }
 }
 
+fn encode_optional_finite_f64(out: &mut impl BinarySink, value: Option<FiniteF64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            push_u64(out, value.bits());
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_optional_finite_f64(
+    cursor: &mut impl BinarySource,
+) -> Result<Option<FiniteF64>, DurabilityError> {
+    match cursor.u8().map_err(corrupt)? {
+        0 => Ok(None),
+        1 => Ok(Some(
+            FiniteF64::from_bits(cursor.u64().map_err(corrupt)?)
+                .ok_or_else(|| corrupt("non-finite grouped model sum bound"))?,
+        )),
+        _ => Err(corrupt("invalid optional finite-f64 rule tag")),
+    }
+}
+
 fn decode_field_rule(cursor: &mut impl BinarySource) -> Result<FieldRule, DurabilityError> {
     match cursor.u8().map_err(corrupt)? {
         0 => Ok(FieldRule::I64Range {
@@ -685,6 +1135,33 @@ pub(crate) fn encode_semantic_rule_expr(
             encode_rule_value_expr(out, value);
             encode_text_pattern(out, pattern)?;
         }
+        SemanticRuleExpr::Equivalent {
+            left,
+            right,
+            equivalence,
+        } => {
+            out.push(9);
+            encode_rule_value_expr(out, left);
+            encode_rule_value_expr(out, right);
+            push_u128(out, equivalence.raw());
+        }
+        SemanticRuleExpr::Ordered {
+            left,
+            right,
+            ordering,
+            comparison,
+        } => {
+            out.push(10);
+            encode_rule_value_expr(out, left);
+            encode_rule_value_expr(out, right);
+            push_u128(out, ordering.raw());
+            out.push(match comparison {
+                RuleOrderComparison::Less => 0,
+                RuleOrderComparison::LessOrEqual => 1,
+                RuleOrderComparison::Greater => 2,
+                RuleOrderComparison::GreaterOrEqual => 3,
+            });
+        }
     }
     Ok(())
 }
@@ -749,6 +1226,29 @@ pub(crate) fn decode_semantic_rule_expr(
             value: decode_rule_value_expr(cursor)?,
             pattern: decode_text_pattern(cursor, 0)?,
         }),
+        9 => Ok(SemanticRuleExpr::Equivalent {
+            left: decode_rule_value_expr(cursor)?,
+            right: decode_rule_value_expr(cursor)?,
+            equivalence: SemanticId::new(cursor.u128().map_err(corrupt)?),
+        }),
+        10 => {
+            let left = decode_rule_value_expr(cursor)?;
+            let right = decode_rule_value_expr(cursor)?;
+            let ordering = SemanticId::new(cursor.u128().map_err(corrupt)?);
+            let comparison = match cursor.u8().map_err(corrupt)? {
+                0 => RuleOrderComparison::Less,
+                1 => RuleOrderComparison::LessOrEqual,
+                2 => RuleOrderComparison::Greater,
+                3 => RuleOrderComparison::GreaterOrEqual,
+                _ => return Err(corrupt("invalid semantic rule order comparison tag")),
+            };
+            Ok(SemanticRuleExpr::Ordered {
+                left,
+                right,
+                ordering,
+                comparison,
+            })
+        }
         _ => Err(corrupt("unknown semantic rule expression tag")),
     }
 }

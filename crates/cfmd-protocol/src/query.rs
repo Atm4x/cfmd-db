@@ -3,6 +3,12 @@ use crate::{ProtocolValue, Row};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotTarget {
     Head,
+    /// Execute a query expressed in one retained schema language directly against current HEAD.
+    /// The server compiles the query through the verified current-world schema bridge; it does
+    /// not open historical data or revive the source schema as a live world.
+    ContractHead {
+        schema_revision: u64,
+    },
     Revision(u64),
 }
 

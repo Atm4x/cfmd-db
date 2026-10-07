@@ -12,8 +12,8 @@ use kernel_transport::{SchemaMigrationProgram, TransportError};
 use kernel_types::{EntityId, RevisionId, SemanticId, StableRowHandle};
 
 use crate::{
-    PhysicalAtomId, PhysicalAtomPayload, PhysicalAtomStore, PhysicalCodec, RealizationError,
-    atom_payload,
+    PackedSumFieldSegment, PackedSumRelationSegment, PhysicalAtomId, PhysicalAtomPayload,
+    PhysicalAtomStore, PhysicalCodec, RealizationError, atom_payload,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +194,41 @@ impl FieldColumnSegment {
     }
 }
 
+fn insert_field_column_atom(
+    atoms: &mut PhysicalAtomStore,
+    entries: Vec<(EntityId, Value)>,
+) -> Result<PhysicalAtomId, RealizationError> {
+    if entries
+        .iter()
+        .all(|(_, value)| matches!(value, Value::Variant { .. }))
+    {
+        return Ok(atoms.insert(PhysicalAtomPayload::PackedSumFieldSegment(
+            PackedSumFieldSegment::new(entries)?,
+        )));
+    }
+    Ok(atoms.insert(PhysicalAtomPayload::FieldColumnSegment(
+        FieldColumnSegment::from_sorted(entries)?,
+    )))
+}
+
+fn insert_relation_column_atom(
+    atoms: &mut PhysicalAtomStore,
+    start_row: usize,
+    values: Vec<Value>,
+) -> Result<PhysicalAtomId, RealizationError> {
+    if values
+        .iter()
+        .all(|value| matches!(value, Value::Variant { .. }))
+    {
+        return Ok(atoms.insert(PhysicalAtomPayload::PackedSumRelationSegment(
+            PackedSumRelationSegment::with_start_row(start_row, values)?,
+        )));
+    }
+    Ok(atoms.insert(PhysicalAtomPayload::RelationColumnSegment(
+        RelationColumnSegment::with_start_row(start_row, values),
+    )))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FactorizedFieldExpr {
     Direct(PhysicalAtomId),
@@ -224,20 +259,28 @@ impl FactorizedFieldExpr {
         entity: EntityId,
     ) -> Result<Value, RealizationError> {
         match self {
-            Self::Direct(atom) => match atom_payload(atoms, *atom)? {
-                PhysicalAtomPayload::FieldColumnSegment(column) => column
-                    .get(entity)
-                    .cloned()
-                    .ok_or(RealizationError::MissingFactorizedFieldValue {
+            Self::Direct(atom) => {
+                match atom_payload(atoms, *atom)? {
+                    PhysicalAtomPayload::FieldColumnSegment(column) => column
+                        .get(entity)
+                        .cloned()
+                        .ok_or(RealizationError::MissingFactorizedFieldValue {
+                            atom: *atom,
+                            entity,
+                        }),
+                    PhysicalAtomPayload::PackedSumFieldSegment(column) => column
+                        .get(entity)?
+                        .ok_or(RealizationError::MissingFactorizedFieldValue {
+                            atom: *atom,
+                            entity,
+                        }),
+                    payload => Err(RealizationError::CodecMismatch {
                         atom: *atom,
-                        entity,
+                        expected: PhysicalCodec::FieldColumnSegment,
+                        actual: payload.codec(),
                     }),
-                payload => Err(RealizationError::CodecMismatch {
-                    atom: *atom,
-                    expected: PhysicalCodec::FieldColumnSegment,
-                    actual: payload.codec(),
-                }),
-            },
+                }
+            }
             Self::Constant(value) => Ok(value.clone()),
             Self::I64ToF64Direct(atom) => match atom_payload(atoms, *atom)? {
                 PhysicalAtomPayload::FieldColumnSegment(column) => match column.get(entity) {
@@ -325,6 +368,47 @@ impl FactorizedFieldExpr {
         }
     }
 
+    fn visit_direct_carrier_range<F>(
+        atoms: &PhysicalAtomStore,
+        atom: PhysicalAtomId,
+        order: &[EntityId],
+        start: usize,
+        end: usize,
+        visit: &mut F,
+    ) -> Result<(), RealizationError>
+    where
+        F: FnMut(EntityId, Value),
+    {
+        match atom_payload(atoms, atom)? {
+            PhysicalAtomPayload::FieldColumnSegment(column) => {
+                let entities = &order[start..end];
+                let values = column
+                    .aligned_values(entities)
+                    .ok_or(RealizationError::RealizationChunkShapeMismatch)?;
+                for (&entity, value) in entities.iter().zip(values) {
+                    visit(entity, value.clone());
+                }
+                Ok(())
+            }
+            PhysicalAtomPayload::PackedSumFieldSegment(column) => {
+                for &entity in &order[start..end] {
+                    visit(
+                        entity,
+                        column.get(entity)?.ok_or(
+                            RealizationError::MissingFactorizedFieldValue { atom, entity },
+                        )?,
+                    );
+                }
+                Ok(())
+            }
+            payload => Err(RealizationError::CodecMismatch {
+                atom,
+                expected: PhysicalCodec::FieldColumnSegment,
+                actual: payload.codec(),
+            }),
+        }
+    }
+
     #[allow(
         clippy::cast_precision_loss,
         reason = "This operation explicitly requests IEEE-754 rounding or a diagnostic ratio."
@@ -345,23 +429,9 @@ impl FactorizedFieldExpr {
             return Err(RealizationError::RealizationChunkShapeMismatch);
         }
         match self {
-            Self::Direct(atom) => match atom_payload(atoms, *atom)? {
-                PhysicalAtomPayload::FieldColumnSegment(column) => {
-                    let entities = &order[start..end];
-                    let values = column
-                        .aligned_values(entities)
-                        .ok_or(RealizationError::RealizationChunkShapeMismatch)?;
-                    for (&entity, value) in entities.iter().zip(values) {
-                        visit(entity, value.clone());
-                    }
-                    Ok(())
-                }
-                payload => Err(RealizationError::CodecMismatch {
-                    atom: *atom,
-                    expected: PhysicalCodec::FieldColumnSegment,
-                    actual: payload.codec(),
-                }),
-            },
+            Self::Direct(atom) => {
+                Self::visit_direct_carrier_range(atoms, *atom, order, start, end, visit)
+            }
             Self::I64ToF64Direct(atom) => match atom_payload(atoms, *atom)? {
                 PhysicalAtomPayload::FieldColumnSegment(column) => {
                     let entities = &order[start..end];
@@ -481,6 +551,9 @@ impl FactorizedRelationColumnExpr {
                     .get(row)
                     .cloned()
                     .ok_or(RealizationError::MissingFactorizedRelationRow { atom: *atom, row }),
+                PhysicalAtomPayload::PackedSumRelationSegment(column) => column
+                    .get(row)?
+                    .ok_or(RealizationError::MissingFactorizedRelationRow { atom: *atom, row }),
                 payload => Err(RealizationError::CodecMismatch {
                     atom: *atom,
                     expected: PhysicalCodec::RelationColumnSegment,
@@ -565,6 +638,14 @@ impl FactorizedRelationColumnExpr {
                 PhysicalAtomPayload::RelationColumnSegment(column) => {
                     for row in start..end {
                         visit(column.get(row).cloned().ok_or(
+                            RealizationError::MissingFactorizedRelationRow { atom: *atom, row },
+                        )?);
+                    }
+                    Ok(())
+                }
+                PhysicalAtomPayload::PackedSumRelationSegment(column) => {
+                    for row in start..end {
+                        visit(column.get(row)?.ok_or(
                             RealizationError::MissingFactorizedRelationRow { atom: *atom, row },
                         )?);
                     }
@@ -1253,8 +1334,22 @@ impl FactorizedRealizationRoot {
                 let FactorizedFieldExpr::Direct(atom) = rule.expr else {
                     return Err(RealizationError::NonDirectDurableRealization);
                 };
-                let column = match atom_payload(atoms, atom)? {
-                    PhysicalAtomPayload::FieldColumnSegment(column) => column,
+                match atom_payload(atoms, atom)? {
+                    PhysicalAtomPayload::FieldColumnSegment(column) => {
+                        if column.len() != entities.len()
+                            || column
+                                .iter()
+                                .zip(entities.iter().copied())
+                                .any(|((entity, _), expected)| entity != expected)
+                        {
+                            return Err(RealizationError::RealizationChunkShapeMismatch);
+                        }
+                    }
+                    PhysicalAtomPayload::PackedSumFieldSegment(column) => {
+                        if column.entities() != entities.as_slice() {
+                            return Err(RealizationError::RealizationChunkShapeMismatch);
+                        }
+                    }
                     payload => {
                         return Err(RealizationError::CodecMismatch {
                             atom,
@@ -1262,14 +1357,6 @@ impl FactorizedRealizationRoot {
                             actual: payload.codec(),
                         });
                     }
-                };
-                if column.len() != entities.len()
-                    || column
-                        .iter()
-                        .zip(entities.iter().copied())
-                        .any(|((entity, _), expected)| entity != expected)
-                {
-                    return Err(RealizationError::RealizationChunkShapeMismatch);
                 }
             }
         }
@@ -1293,7 +1380,10 @@ impl FactorizedRealizationRoot {
                 match atom_payload(atoms, *atom)? {
                     PhysicalAtomPayload::RelationColumnSegment(segment)
                         if segment.start_row() == 0 && segment.len() == rule.row_count => {}
-                    PhysicalAtomPayload::RelationColumnSegment(_) => {
+                    PhysicalAtomPayload::PackedSumRelationSegment(segment)
+                        if segment.start_row() == 0 && segment.len() == rule.row_count => {}
+                    PhysicalAtomPayload::RelationColumnSegment(_)
+                    | PhysicalAtomPayload::PackedSumRelationSegment(_) => {
                         return Err(RealizationError::RealizationChunkShapeMismatch);
                     }
                     payload => {
@@ -1630,16 +1720,14 @@ impl FactorizedRealizationRoot {
             .get(&field)
             .ok_or(RealizationError::MissingFactorizedField(field))?;
         let expr = &expr.expr;
-        let column = FieldColumnSegment::from_sorted(
-            entities
-                .into_iter()
-                .map(|entity| {
-                    expr.evaluate_entity(atoms, entity)
-                        .map(|value| (entity, value))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )?;
-        let atom = atoms.insert(PhysicalAtomPayload::FieldColumnSegment(column));
+        let entries = entities
+            .into_iter()
+            .map(|entity| {
+                expr.evaluate_entity(atoms, entity)
+                    .map(|value| (entity, value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let atom = insert_field_column_atom(atoms, entries)?;
         self.fields.get_mut(&field).expect("field exists").expr = FactorizedFieldExpr::Direct(atom);
         Ok(atom)
     }
@@ -2267,9 +2355,7 @@ impl FactorizedRealizationRoot {
         let values = (0..rule.row_count)
             .map(|row| rule.value_at(atoms, column, row))
             .collect::<Result<Vec<_>, _>>()?;
-        let atom = atoms.insert(PhysicalAtomPayload::RelationColumnSegment(
-            RelationColumnSegment::new(values),
-        ));
+        let atom = insert_relation_column_atom(atoms, 0, values)?;
         self.relations
             .get_mut(&relation)
             .expect("relation exists")
@@ -2306,8 +2392,7 @@ pub fn realize_database_state_factorized(
     }
     let mut fields = BTreeMap::new();
     for (field, entries) in grouped {
-        let column = FieldColumnSegment::from_sorted(entries)?;
-        let atom = atoms.insert(PhysicalAtomPayload::FieldColumnSegment(column));
+        let atom = insert_field_column_atom(&mut atoms, entries)?;
         let owner = context
             .schema
             .field(field)
@@ -2341,9 +2426,7 @@ pub fn realize_database_state_factorized(
         }
         let mut columns = BTreeMap::new();
         for (column, values) in column_order.iter().copied().zip(column_values) {
-            let atom = atoms.insert(PhysicalAtomPayload::RelationColumnSegment(
-                RelationColumnSegment::new(values),
-            ));
+            let atom = insert_relation_column_atom(&mut atoms, 0, values)?;
             columns.insert(column, FactorizedRelationColumnExpr::Direct(atom));
         }
         relations.insert(

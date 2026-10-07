@@ -23,6 +23,9 @@ pub(super) const KIND_MEMBERSHIP_VOTE_REF: u8 = 19;
 pub(super) const KIND_AUTHENTICATED_MEMBERSHIP_VOTE_REF: u8 = 20;
 pub(super) const KIND_RECOVERY_LOCK_FRONTIER_OWNER: u8 = 21;
 pub(super) const KIND_AUTHENTICATED_RECOVERY_ACK_REF: u8 = 22;
+pub(super) const KIND_SEMANTIC_AUTHORITY_BASE_BEGIN: u8 = 23;
+pub(super) const KIND_SEMANTIC_AUTHORITY_BASE_RECORD: u8 = 24;
+pub(super) const KIND_SEMANTIC_AUTHORITY_BASE_END: u8 = 25;
 
 mod effects;
 mod evidence;

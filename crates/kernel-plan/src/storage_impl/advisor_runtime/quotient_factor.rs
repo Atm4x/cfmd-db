@@ -71,7 +71,7 @@ fn semantic_quotient_factor_advice_choices(
         };
         let advisor_managed = store
             .advisor_managed_artifacts
-            .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()));
+            .contains(&UnifiedArtifactId::semantic_quotient(binding.clone()));
         let replaced_fixed_bytes = if !compatible_existing && !advisor_managed {
             existing.map_or(0, |state| quotient_factor_estimated_retained_bytes(state))
         } else {
@@ -125,7 +125,7 @@ fn semantic_quotient_factor_advisor_selection(
             .iter()
             .filter(|(binding, _)| {
                 store.advisor_managed_artifacts.contains(
-                    &UnifiedArtifactId::SemanticQuotientFactor((*binding).clone()),
+                    &UnifiedArtifactId::semantic_quotient((*binding).clone()),
                 )
             })
             .map(|(_, state)| quotient_factor_estimated_retained_bytes(state)),
@@ -135,7 +135,7 @@ fn semantic_quotient_factor_advisor_selection(
         .iter()
         .map(|choice| advisor::AdmissionCandidate {
             key: choice.binding.clone(),
-            capabilities: BTreeSet::from([PhysicalCapability::QuotientFiber]),
+            capabilities: SemanticFiberProfile::Quotient.capabilities(),
             work: choice.work,
             managed_units: 0,
             footprint: ResourceFootprint::from_atom(

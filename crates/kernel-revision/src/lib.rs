@@ -232,19 +232,21 @@ impl RelationUpdateCandidate<'_> {
             return Err(RevisionError::InvalidRelationOnlyTransition);
         }
         if let Some(witnesses) = &self.model_rule_witnesses {
-            self.model_rule_witnesses = Some(
-                witnesses
-                    .apply_relation_delta(
-                        &self.source.semantic_context,
-                        relation,
-                        &footprint,
-                        &removed,
-                        &inserted,
-                    )
-                    .map_err(|_| {
-                        RevisionError::InvalidTypedModel(ValidationError::ModelRuleEvaluation)
-                    })?,
-            );
+            self.model_rule_witnesses = match witnesses.apply_relation_delta(
+                &self.source.semantic_context,
+                relation,
+                &footprint,
+                &removed,
+                &inserted,
+            ) {
+                Ok(next) => Some(next),
+                Err(kernel_validation::RuleEvaluationError::Semantic) => None,
+                Err(_) => {
+                    return Err(RevisionError::InvalidTypedModel(
+                        ValidationError::ModelRuleEvaluation,
+                    ));
+                }
+            };
         }
         self.touched_relations.insert(relation);
         self.validation_footprints
@@ -368,10 +370,12 @@ impl RelationUpdateCandidate<'_> {
         }
         let model_rule_witnesses = match self.model_rule_witnesses {
             Some(witnesses) => witnesses,
-            None => ModelRuleWitnessState::build(&self.source.semantic_context, &self.state)
-                .map_err(|_| {
+            None => {
+                ModelRuleWitnessState::build(&self.source.semantic_context, registry, &self.state)
+                    .map_err(|_| {
                     RevisionError::InvalidTypedModel(ValidationError::ModelRuleEvaluation)
-                })?,
+                })?
+            }
         };
         validate_model_rule_witnesses_for_relation_mutations(
             &self.source.semantic_context,
@@ -483,8 +487,9 @@ impl Revision {
                 .ok_or(RevisionError::InvalidRelationOnlyTransition)?;
             let footprint = RelationMutationFootprint::full();
             model_rule_witnesses = model_rule_witnesses
-                .apply_relation_delta(
+                .apply_relation_delta_semantic(
                     &source.semantic_context,
+                    registry,
                     *relation,
                     &footprint,
                     &[],
@@ -553,7 +558,7 @@ impl Revision {
             DenseTypeExtents::compile_with_ids(&state.model, &context.schema, &dense_entities);
         validate_state_with_extents(context, registry, &state, &dense_type_extents)
             .map_err(RevisionError::InvalidTypedModel)?;
-        let model_rule_witnesses = ModelRuleWitnessState::build(context, &state)
+        let model_rule_witnesses = ModelRuleWitnessState::build(context, registry, &state)
             .map_err(|_| RevisionError::InvalidTypedModel(ValidationError::ModelRuleEvaluation))?;
         let dense_lifecycle =
             DenseLifecycleProjection::compile_with_ids(&state.lifecycle, &dense_entities);
@@ -906,10 +911,17 @@ mod tests {
             .unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationCardinality {
-                relation,
-                min: 0,
-                max: Some(1),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: kernel_schema::SemanticRuleExpr::True,
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count {
+                        min: 0,
+                        max: Some(1),
+                    },
+                },
             })
             .unwrap();
         let mut state = DatabaseState::default();
@@ -1024,12 +1036,21 @@ mod tests {
         let column = context.schema.relation_column_id(relation, 0).unwrap();
         context
             .schema
-            .add_model_rule(kernel_schema::ModelRuleExpr::RelationAll {
-                relation,
-                predicate: kernel_schema::SemanticRuleExpr::I64Range {
-                    value: kernel_schema::RuleValueExpr::Field(column),
-                    min: Some(0),
-                    max: Some(10),
+            .add_model_rule(kernel_schema::ModelRuleExpr::RelationExactMeasure {
+                constraint: kernel_schema::ExactMeasureConstraint::Range {
+                    measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                        relation,
+                        predicate: (kernel_schema::SemanticRuleExpr::I64Range {
+                            value: kernel_schema::RuleValueExpr::Field(column),
+                            min: Some(0),
+                            max: Some(10),
+                        })
+                        .negate(),
+                    },
+                    range: kernel_schema::ExactAggregateRange::Count {
+                        min: 0,
+                        max: Some(0),
+                    },
                 },
             })
             .unwrap();
@@ -1051,7 +1072,8 @@ mod tests {
             .unwrap();
         let target = candidate.build(RevisionId::new(2), &registry).unwrap();
         let rebuilt =
-            kernel_validation::ModelRuleWitnessState::build(&context, target.state()).unwrap();
+            kernel_validation::ModelRuleWitnessState::build(&context, &registry, target.state())
+                .unwrap();
         assert_eq!(target.model_rule_witnesses(), &rebuilt);
 
         let mut invalid = target.relation_update_candidate();

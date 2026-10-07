@@ -7,7 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use kernel_auth::{
-    AuthorityDigest, FreshnessCut, TrustRootSet, freshness_record_digest, verify_freshness_cut,
+    AuthorityDigest, FreshnessAuthorityState, FreshnessCut, TrustRootSet,
+    freshness_authority_record_digest, verify_freshness_authority,
 };
 use kernel_durability::{
     ExternalFreshnessAuthority, TcpExternalFreshnessAuthority, TcpExternalFreshnessAuthorityServer,
@@ -102,13 +103,16 @@ fn external_process_anchor_survives_restart_and_fences_regression() {
     let mut authority =
         TcpExternalFreshnessAuthority::new(addr, Duration::from_secs(2), Duration::from_secs(2));
     let first = authority
-        .compare_and_advance_signed(None, cut(1, None, 0))
+        .compare_and_set_signed(None, FreshnessAuthorityState::DurableCut(cut(1, None, 0)))
         .unwrap();
-    verify_freshness_cut(&trust, &first).unwrap();
+    verify_freshness_authority(&trust, &first).unwrap();
     assert_eq!(authority.read_signed([0x31; 32]).unwrap().unwrap(), first);
     assert!(
         authority
-            .compare_and_advance_signed(Some(freshness_record_digest(&first)), cut(0, None, 0))
+            .compare_and_set_signed(
+                Some(freshness_authority_record_digest(&first)),
+                FreshnessAuthorityState::DurableCut(cut(0, None, 0))
+            )
             .is_err()
     );
     assert!(server.wait().unwrap().success());
@@ -119,13 +123,69 @@ fn external_process_anchor_survives_restart_and_fences_regression() {
         TcpExternalFreshnessAuthority::new(addr, Duration::from_secs(2), Duration::from_secs(2));
     let recovered = authority.read_signed([0x31; 32]).unwrap().unwrap();
     assert_eq!(recovered, first);
+    let recovered_cut = recovered.durable_cut().unwrap();
     let second = authority
-        .compare_and_advance_signed(
-            Some(freshness_record_digest(&recovered)),
-            cut(2, Some(recovered.cut.generation_digest), 0),
+        .compare_and_set_signed(
+            Some(freshness_authority_record_digest(&recovered)),
+            FreshnessAuthorityState::DurableCut(cut(2, Some(recovered_cut.generation_digest), 0)),
         )
         .unwrap();
-    verify_freshness_cut(&trust, &second).unwrap();
+    verify_freshness_authority(&trust, &second).unwrap();
+    assert!(restarted.wait().unwrap().success());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn external_process_atomic_rebind_moves_trust_authority_across_store_identity() {
+    let root = env::temp_dir().join(format!(
+        "cfmd-freshness-rebind-mp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let signing = SigningKey::from_bytes(&[73; 32]);
+    let trust = TrustRootSet::bootstrap(9, &[signing.verifying_key().to_bytes()]).unwrap();
+
+    let source_id = [0x31; 32];
+    let target_id = [0x42; 32];
+    let (mut server, addr) = start_server(&root, 4);
+    let mut authority =
+        TcpExternalFreshnessAuthority::new(addr, Duration::from_secs(2), Duration::from_secs(2));
+    let source = authority
+        .compare_and_set_signed(None, FreshnessAuthorityState::DurableCut(cut(1, None, 0)))
+        .unwrap();
+    let source_cut = source.durable_cut().unwrap();
+    let target_cut = FreshnessCut {
+        store_id: target_id,
+        generation: 1,
+        previous_generation: Some(source_cut.generation_digest),
+        generation_digest: AuthorityDigest([0x55; 32]),
+        wal_lsn: 0,
+        wal_digest: AuthorityDigest([0x66; 32]),
+        trust_root_epoch: 9,
+        deployment_policy_epoch: 4,
+    };
+    let target = authority
+        .compare_and_rebind_signed(
+            source_id,
+            freshness_authority_record_digest(&source),
+            FreshnessAuthorityState::DurableCut(target_cut),
+        )
+        .unwrap();
+    verify_freshness_authority(&trust, &target).unwrap();
+    assert!(authority.read_signed(source_id).unwrap().is_none());
+    assert_eq!(authority.read_signed(target_id).unwrap().unwrap(), target);
+    assert!(server.wait().unwrap().success());
+
+    let (mut restarted, addr) = start_server(&root, 2);
+    let mut authority =
+        TcpExternalFreshnessAuthority::new(addr, Duration::from_secs(2), Duration::from_secs(2));
+    assert!(authority.read_signed(source_id).unwrap().is_none());
+    assert_eq!(authority.read_signed(target_id).unwrap().unwrap(), target);
     assert!(restarted.wait().unwrap().success());
 
     fs::remove_dir_all(root).unwrap();

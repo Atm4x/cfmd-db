@@ -2,6 +2,8 @@
 
 Branch scope: anti-dump secret-memory infrastructure without a separate crypto process.
 
+> **Current authority after PASS588 / PASS589 ledger reconciliation:** Linux hardened-memory integration is production-active and R&D04 is the selected architecture. The remaining Windows/macOS/dump-harness/resource-exhaustion items are deferred platform/security-hardening work, not an immediate database-kernel blocker. Do not reopen constructor-transient work unless backend evidence changes the accepted R&D04 capability claim.
+
 ## Architecture decision
 
 `cfmd-secure-memory` is infrastructure, not a database semantic kernel. It is therefore a `cfmd-*` crate rather than `kernel-secure-memory`. It is the only crate in this R&D branch allowed to contain the platform `unsafe` needed for `mmap`/`mlock`/`mprotect`/`madvise`; the rest of the workspace retains the existing unsafe-code prohibition.
@@ -42,7 +44,7 @@ Not claimed:
 - [x] `kernel-durability` 206-test library suite passes.
 - [x] Product encrypted-open and four provider/rewrap regressions pass.
 
-## OPEN
+## OPEN — DEFERRED HARDENING
 
 - [ ] Implement and verify a Windows backend (`VirtualAlloc`/`VirtualLock` plus a defensible crash-dump exclusion policy).
 - [ ] Decide macOS/BSD support contract or explicit unsupported behavior.
@@ -77,7 +79,7 @@ Interpretation: protected mapping creation is intentionally a key/open/rotation 
 - [x] Full workspace check and Clippy `-D warnings` pass.
 - [x] `kernel-durability` 207/207 library tests pass.
 
-## OPEN after R&D02
+## OPEN after R&D02 — HISTORICAL SNAPSHOT
 
 - [ ] Implement and verify Windows hardened-memory backend and dump policy.
 - [ ] Add actual core/minidump marker-search harness.
@@ -103,7 +105,7 @@ Interpretation: protected mapping creation is intentionally a key/open/rotation 
 - [x] Lifecycle benchmark identified and reduced secure codec init from ~156.8 us/op to ~44.0 us/op on this host; raw PASS330-like init is ~1.57 us/op.
 - [x] Full `kernel-durability --lib`: 209 passed, 1 ignored manual benchmark; workspace Clippy `-D warnings` passes.
 
-## OPEN after R&D03
+## OPEN after R&D03 — HISTORICAL SNAPSHOT
 
 - [ ] Implement and verify Windows backend: `VirtualAlloc`/guard pages + `VirtualLock` + WER exclusion, with semantics explicitly limited to native crash reporting.
 - [ ] Run the core-dump marker harness on a Linux host/CI runner that exposes a directly discoverable kernel core file.
@@ -128,7 +130,7 @@ Interpretation: protected mapping creation is intentionally a key/open/rotation 
 - [x] Workspace `cargo check --all-targets`, `cargo fmt --check`, and Clippy `-D warnings` pass.
 - [x] Release backend-dispatch microbench shows no measurable penalty: ~0.995x direct at 4 KiB and ~0.981x at 64 KiB on this host (noise favors backend in this run).
 
-## OPEN after R&D04
+## OPEN after R&D04 — CURRENT DEFERRED HARDENING
 
 - [ ] Implement Windows hardened-memory backend before treating the branch as cross-platform production-ready.
 - [ ] Run the Linux core-dump marker harness on a host/CI runner where kernel core files are directly collectible.
@@ -139,4 +141,4 @@ Interpretation: protected mapping creation is intentionally a key/open/rotation 
 
 ## Merge guidance after R&D04
 
-R&D03 should not be merged as the architectural endpoint: R&D04 materially changes ownership, backend boundaries, capability reporting, and encryption configuration shape. R&D04 is a substantially better merge base for Linux-side development. For a cross-platform PASS334 product merge, the Windows backend remains the main blocker because current fail-closed secure-memory behavior would otherwise make encrypted open unsupported on Windows.
+R&D03 should not be merged as the architectural endpoint: R&D04 materially changes ownership, backend boundaries, capability reporting, and encryption configuration shape. R&D04 is a substantially better merge base for Linux-side development. For cross-platform encrypted-open support, the Windows backend remains the main blocker because current fail-closed secure-memory behavior otherwise leaves that capability unsupported on Windows. This is deferred platform hardening, not the current PASS589 kernel/productization line.

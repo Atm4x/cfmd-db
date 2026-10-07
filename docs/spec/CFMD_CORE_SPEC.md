@@ -338,6 +338,8 @@ Live(M*) = μX. Roots(M*) ∪ K(M*)[X]
 - weak/history refs не создают KeepsAlive;
 - cascade deletion = reachability normalization, а не отдельный delete engine.
 
+**[VERIFIED]** Exclusive relationship ownership is authoritative-schema semantics: the schema persists the owned relationship coordinate, target object relation and orphan policy. A schema bridge may transport `OwnedMany` only when verified migration preserves both relation identities and the orphan policy exactly; relation row identity alone is insufficient.
+
 **[VERIFIED]** Lifecycle normalization, idempotence и hostile reachability cases реализованы и тестируются; модель ограничивается целиком, а не только отдельным lifecycle graph.
 
 ---
@@ -2588,6 +2590,8 @@ The frozen kernel graph remains behind `cfmd-runtime`. Pass283 adds an idiomatic
 
 The external Rust product layer may declare identity-bearing entities independently of kernel lifecycle carriers. `Id<T>` and `Ref<T>` are encoded through the existing typed historical-entity identity domain; they do not create hidden object I/O or a second storage model. Entity plans carry a product-level contract: identity values are unique and every strong reference resolves in the final composed plan state. Validation is identity-indexed (`BTreeMap`/`BTreeSet`), not reference-by-target scanning. Deep reference predicates lower to existing equality joins, then project and semantically distinct the root shape, giving existential path semantics without multiplicity leakage. Kernel relation/query semantics remain unchanged.
 
+**[PASS580 IMPLEMENTED] Value-object mutation identity law.** `cfmd_object!` does not infer semantic identity from field names or scalar shape. Identity-free value objects are rewritten and deleted by their exact selected persisted row value when the query has full object shape; identity-dependent `get`/`require`, references, relationship ownership and lifecycle operations remain reserved for explicit identity-bearing entities. `cfmd_entity!` / derived entity metadata is the authority for semantic identity. This keeps value semantics and entity semantics distinct without an `id`-name heuristic or relation-id plumbing in application code.
+
 ## Pass286 product-layer addendum — explicit object cardinality
 
 The Rust product facade now distinguishes required references, optional references and reverse-many relationships without introducing ORM-style hidden loading. `Option<Ref<T>>` is a real algebraic option value backed by the kernel structural-equivalence calculus. Reverse-many members are symbolic query relationships only and are not fields of materialized Rust objects.
@@ -2718,7 +2722,7 @@ Open product/backend obligation: current strong-reference metadata is owned by `
 
 **[DUAL-SLOT PUBLICATION]** The current pre-release single-file header reserves two independently checksummed wrapped-key slots. A rewrap writes the inactive slot with strictly incremented publication sequence and database key epoch, then durably syncs it. Recovery selects the highest valid sequence; a torn/incomplete new slot leaves the prior valid slot recoverable, while a fully valid newer slot is authoritative and is never error-fallback-routed to the older slot. The data generation/WAL region is not rewritten by rewrap.
 
-**[ROTATION DX]** An opened product database may call `Database::rewrap_encryption(...)`. Provider-backed rotation resolves the new KEK at `EncryptionKeyOperation::Rewrap`, wraps the already-unlocked DMK, publishes the next wrapped-key slot, and returns the new database key epoch. Raw direct-key encryption remains a minimal adapter and is intentionally not advertised as rotatable wrapped-key management. Internal pre-release pass layouts are not retained as an on-disk compatibility promise.
+**[ROTATION DX]** An opened product database may call `Database::reconfigure_protection(...)`. Provider-backed rotation resolves the new KEK at `EncryptionKeyOperation::Rewrap`, wraps the already-unlocked DMK, publishes the next wrapped-key slot, and returns the new database key epoch. Raw direct-key encryption remains a minimal adapter and is intentionally not advertised as rotatable wrapped-key management. Internal pre-release pass layouts are not retained as an on-disk compatibility promise.
 
 **[ROLLBACK BOUNDARY]** Dual-slot publication closes local torn-write/crash recovery for key metadata. It does not by itself prove anti-rollback against an attacker restoring an older complete header/file image. Provider revocation/epoch policy and the existing external-freshness authority remain the mechanisms that can reject obsolete external key state or whole-file rollback.
 
@@ -2728,7 +2732,7 @@ Open product/backend obligation: current strong-reference metadata is owned by `
 
 **[DATABASE-KEY EPOCH FLOOR]** `EncryptionProviderKey` may carry a non-zero minimum accepted database-key epoch. The provider is queried outside the database file and therefore acts as external key authority. Wrapped-key open rejects an otherwise valid authoritative slot when its database-key epoch is below that floor, before DMK unwrap. This closes complete-header rollback once the external provider has durably advanced its floor, even if the old KEK bytes remain available. The default constructor admits epoch 1 for simple providers; security-sensitive providers can raise the floor with `with_minimum_database_key_epoch(...)`.
 
-**[ROTATION HANDOFF]** `Database::rewrap_encryption(...)` returns the newly published database-key epoch. A provider may durably raise its external floor to that returned epoch after successful rewrap. A requested floor above the epoch being created/rewrapped fails closed; create requires admission of epoch 1. This separates crash-safe in-file dual-slot publication from anti-rollback authority without trusting a minimum epoch stored in attacker-controlled database bytes.
+**[ROTATION HANDOFF]** `Database::reconfigure_protection(...)` returns the newly published database-key epoch. A provider may durably raise its external floor to that returned epoch after successful rewrap. A requested floor above the epoch being created/rewrapped fails closed; create requires admission of epoch 1. This separates crash-safe in-file dual-slot publication from anti-rollback authority without trusting a minimum epoch stored in attacker-controlled database bytes.
 
 
 ## Pass318 — acknowledged provider handoff / recoverable key-authority transition
@@ -2763,7 +2767,7 @@ Open product/backend obligation: current strong-reference metadata is owned by `
 
 **[REPLICATION ARCHIVE COMPOSITION]** Replication-authority rotation is a composite stream, not a concatenated archive buffer. The new generation's replication section is the exact sequence `previous authoritative archive || frozen live-frame prefix`. The previous section is read through an independent bounded snapshot reader and live frames are emitted individually. Streaming-checkpoint cuts freeze the prefix by frame count; frames appended after the cut remain the live suffix and are not duplicated into the checkpoint generation. Whole-archive materialization is not a fallback path.
 
-**[REPLICATION COPY-AMPLIFICATION OPEN OBLIGATION]** Bounded streaming removes archive-sized memory but does not certify asymptotically bounded rotation cost. P323 still rewrites the retained replication-authority prefix into each successor generation because that prefix is current recovery authority. A future compaction/snapshot calculus must prove which replication authority state is sufficient to replace historical frames before this repeated-history cost may be removed; silently dropping frames or error-routing to a generic fallback is forbidden.
+**[REPLICATION COPY-AMPLIFICATION CLOSED / PASS588]** The P323 generation-contained archive is superseded by the immutable segment calculus active in production. Each checkpoint appends only the frozen live authority delta as one content/parent-bound `CFAS` segment inside authenticated immutable `CFAO` storage plus one `CFLN` locator; no delta preserves the existing root. Recovery replays the root-reachable chain through the same replication-journal evaluator, and compaction relocates exact authenticated object bytes while rebuilding only physical locators. PASS588 removes the legacy generation `ReplicationAuthority` section discriminator from the active SingleFile grammar, so historical archive copying cannot re-enter as a second representation or fallback. Ordinary checkpoint authority work is `O(new authority delta)`; explicit compaction alone pays `O(reachable retained authority)`.
 
 ## Pass327 — authenticated immutable replication-authority objects
 
@@ -2777,7 +2781,7 @@ Open product/backend obligation: current strong-reference metadata is owned by `
 
 **[MODE LAW]** Plaintext and encrypted databases share the same object semantics but not an error fallback path. Object encryption mode must agree with the opened database encryption mode; mismatch is corruption/protocol failure. An encrypted database cannot downgrade an unreadable encrypted object to plaintext replay.
 
-**[ACTIVATION BOUNDARY]** P327 defines and verifies the object layer but does not make external segments current SingleFile authority. P323's generation-contained replication archive remains the maintained product representation until linked locator/root publication, crash recovery and segment-aware compaction are activated and verified for both plaintext and encrypted stores.
+**[ACTIVATION BOUNDARY — CLOSED BY P328/PASS588]** P327 defined the authenticated object layer. P328 activated linked locator/root publication and exact-object compaction; PASS588 removes the remaining dead `ReplicationAuthority` generation-section discriminator from the active grammar and records immutable `CFAS/CFAO + CFLN` closure as the sole checkpoint authority representation for plaintext and encrypted SingleFile stores.
 
 
 ## Pass342 — object-first relationship authority
@@ -2934,7 +2938,7 @@ Watch bootstrap may consume semantic Scan evidence to construct maintained canon
 
 ## Pass442 — role composition and explicit model/schema authority
 
-**[ROLE LAW]** A product `Role` is an immutable named bundle of `Permission` values. Role composition MUST flatten into the ordinary `PermissionSet` before runtime enforcement. Role names, role hierarchy, and frontend/provider policy MUST NOT form a second authorization semantics layer.
+**[SUPERSEDED BY PASS531]** The old P442 product `Role = immutable Permission bundle` DX is no longer authoritative. PASS531 replaced it with schema-owned `Role -> AccessCapability -> exact PermissionCoordinate`. The surviving P442 law is that runtime enforcement consumes only the flattened `PermissionSet`; role/capability names never participate in authorization checks.
 
 **[MODEL DISCLOSURE]** Full authoritative schema inspection requires `ModelRead`. Ordinary data-read grants do not imply model disclosure. The narrow schema revision/epoch identifier remains observable independently so schema-compatible readers can select a local binding policy without receiving the full model.
 
@@ -3002,3 +3006,200 @@ A hostile Γ-DTC regression also proves that a relational causal observation can
 **[FAIL-CLOSED BREADTH]** Mixed relation+field effects, carrier/lifecycle effects, formation predicates and global/non-local rewrites may join prepared publication only through explicit transport/preservation laws. Whole-state reconstruction/diff, old-schema query routing, migrated ACLs and generic relation-write fallback are forbidden substitutes.
 
 **[NEXT R&D BOUNDARY]** Hosted formation verification currently has an exact historical materialization payer. The next architecture target is a bounded formation-context witness integrated into the same preparation traversal, followed by one mixed prepared effect law and proved carrier/lifecycle delta transport.
+
+### Formation proof across schema epochs (PASS511)
+For an intent formed in semantic epoch A, application requirements and relational observations are A-world proof material, not transportable current-world semantics. At the first crossed migration source revision the runtime MUST certify the rebased A candidate against exact formation evidence: unary field requirements may use normalized deterministic predicates, grouped requirements MUST evaluate atomically over their complete observed vector, and relational observations MUST use exact hidden Gamma-DTC capsule state advanced by durable A-native relation deltas. If certification fails or proof is unavailable, publication fails closed. On success the formation proof terminates at that boundary; only the exact effect is transported into B/C, where native current-world causal certificates govern further reordering/publication.
+
+## PASS512 — formation-proof diagnostics and bounded relational lineage
+
+**[DIAGNOSTIC LAW]** Failure to establish the formation seal is distinct from current-world semantic conflict. Public product diagnostics MUST distinguish `FormationProofUnavailable` (required retained formation authority no longer exists) and `FormationProofInvalidated` (exact formation observation was changed before cutover) from `TransactionConflict` / structured current-world coordination. Kernel coordinates/effect internals are not part of the stable diagnostic vocabulary.
+
+**[RELATIONAL LINEAGE LAW]** Exact formation relational sealing MUST derive from shared retained epoch authority, not from a per-intent scan of the complete durable causal ledger. Runtime history indexes each exact relation delta once under its semantic relation and target revision; the schema-epoch root structurally retains that persistent lineage. `RelCausalCapsule` certification selects only delta timelines for its source relations and advances hidden Gamma-DTC state in revision order. Recovery reconstructs the same lineage from durable effects. Missing lineage fails closed.
+
+**[PERFORMANCE LAW]** Relational formation-seal work is O(number of relevant retained relation deltas plus capsule transition work), independent of unrelated retained revision count. PASS512 release probe with 100 relevant deltas and 2,000 lookups measured 34.3 ms at 1k total revisions and 30.2 ms at 100k total revisions in the sandbox; the measurement is diagnostic, while the structural complexity law is normative. Global revision-chain replay, whole-state reconstruction, query replay and cache fallback are superseded.
+
+
+## Exact model-coordinate publication authority (PASS515)
+
+Prepared schema-aware publication exposes an exact current-world authorization footprint for every non-relation model coordinate it can mutate. The footprint contains carrier-presence, carrier-member, lifecycle-entity, lifecycle-root, keeps-alive-presence and keeps-alive-edge coordinates in addition to the existing relation/field/action coordinates.
+
+Authorization is evaluated against the current session generation at publication time. Generic `Write` does not imply any of these model-coordinate permissions. Presence coordinates are included only when the prepared target changes presence relative to the exact authorized current state; member/edge/entity/root coordinates are included for their exact inserted/removed actions. The prepared footprint is bound to the same `authorized_head_revision` as the transported effect.
+
+Migration never transports ACL grants. Under the current migration theorem, entity/lifecycle structure must remain definitionally equal across a schema migration, so these model coordinates preserve identity; any future broader migration calculus must provide an explicit coordinate-transport theorem before authorization may follow it. A schema-owned role/capability language may be layered above this algebra by compiling roles/capabilities to exact current-world permission coordinates.
+
+## PASS516 semantic-rule product boundary
+
+Authoritative schema invariants are persisted deterministic semantics. The product-facing rule vocabulary is a frontend over the kernel rule algebra, not an application callback mechanism. Field/entity rules lower to `SemanticRuleExpr`/`FieldRule`; database-wide invariants lower to `ModelRuleExpr` (`RelationCardinality`, `RelationExists`, `RelationAll`, `RelationExactF64SumRange`). Publication remains valid only when the existing kernel invariant closure is zero.
+
+Text matching is represented by deterministic `TextPattern`. Derive syntax `#[cfmd(matches = <TextPattern expression>)]` stores that semantic pattern in schema metadata. A future regex syntax is permitted only as a compiler frontend into `TextPattern`; host regex execution is not semantic authority.
+
+## PASS517 — typed object invariant composition
+
+The product layer may construct deterministic rules from generated object fields without exposing numeric semantic identifiers. `E::rule(|e| ...)` binds generated fields to stable persisted field identities. Scalar typed rule fields currently expose the deterministic vocabulary already proved by the kernel (`i64` range and text length/one-of/pattern), and rule expressions compose with conjunction, disjunction and negation.
+
+Object-row schema invariants are relation semantics: `SchemaBuilder::object_rule::<E>(...)` compiles to `ModelRuleExpr::RelationAll { relation: E::relation_id(), ... }`. Database-wide object constructors similarly compile typed cardinality, exists/all predicates and exact finite-f64 sum constraints to the existing model-rule forms. No typed wrapper is persisted.
+
+A client-side `#[cfmd(bind = "persisted_name")]` changes only local spelling. Typed rule coordinates use the bound persisted semantic name, so a legacy local field and the authoritative renamed field resolve to one semantic coordinate. Schema migration does not transport rule grants/callbacks; each authoritative target schema owns its current rules, while typed coordinates preserve the same semantic identity law already used by queries and field transport.
+
+## Deterministic binary semantic predicates (PASS518)
+
+Binary validation is semantic-module-owned. Persisted equality is `Equivalent(left, right, EquivalenceId)` and persisted order is `Ordered(left, right, OrderingId, comparison)`. The host language never decides database equality/order. Validation, VMF construction, witness rebuild, recovery and reopen must evaluate these nodes through the pinned `SemanticRegistry`.
+
+Object rule coordinates are row-local semantic coordinates. Scalar/bool fields use generated `Field::rule()`. Strong and optional references expose generated root-only `<field>_rule()` handles because their ordinary accessor is a traversal path. Deep `RefPath` never gains rule-coordinate authority. All forms lower immediately into the same persisted `SemanticRuleExpr`; no second rule AST or evaluator is permitted.
+
+### PASS519 selected aggregate invariant law
+Database-wide exact-f64 sum invariants are selected exact measures, not replayed aggregate queries. For relation `R`, row predicate `P : row -> Bool`, and finite-f64 coordinate `f`, the authoritative witness is `mu(P,f,R) = sum_{r in R, P(r)} f(r)` using `kernel-aggregate::ExactF64Sum`. An exact delta updates the witness by subtracting selected removed rows and adding selected inserted rows. Therefore incremental cost is proportional to the exact delta, while the dependency coordinate set is `{f} union fields(P)`. `P` is the existing persisted `SemanticRuleExpr`, including registry-owned equivalence/ordering; no host callback, host floating accumulation, SQL-style HAVING layer, or query replay is valid semantics. The pre-existing unfiltered exact-sum rule is definitionally the `P=True` specialization.\n\n### Exact selected-count invariant law (PASS520)\nRelation-level count quantifiers have one semantic authority: `count(P)` is an exact maintained natural measure over rows satisfying persisted `SemanticRuleExpr P`. Cardinality is `count(True)` constrained by a range; existence is `count(P) >= 1`; universal quantification is `count(Not(P)) == 0`. Validation maintains this measure from exact relation deltas using `kernel-aggregate::ExactCount`; semantic predicates use the pinned registry. Implementations MUST NOT replace this law with query replay, host counters, or SQL-style aggregate fallback. `True` may be specialized to select-all so the unconditional count pays no predicate-dispatch cost.\n
+
+### Exact aggregate product comparison (PASS521)
+A database-wide aggregate comparison is a predicate over a finite product of exact maintained measures, not a relational query replay. Each measure `mu_i` owns an exact semantic dependency footprint and is maintained homomorphically from relation deltas. A comparison such as `count_A(P) <= count_B(Q)` therefore updates only the measure whose dependency was touched, then evaluates the scalar comparator in O(1) with respect to relation cardinality.
+
+Supported comparison domains are homogeneous: exact count compares with exact count, and exact finite-f64 sum compares with exact finite-f64 sum. Count comparison VMF mass is the exact integral distance to satisfaction. Finite-f64 sums compare their signed exact-natural representations directly; converting through rounded host `f64` is forbidden. Mixed count/sum coercion is invalid schema semantics. Multi-relation rules are indexed under every exact relation dependency; no relation is designated as the rule's owner merely for execution routing.
+
+### Γ-keyed grouped exact invariants (PASS522)
+A grouped invariant is not a relational `GROUP BY` replay. For relation rows `r`, semantic group coordinates `g(r)`, pinned equivalences `Γ`, and selector `P`, the canonical group key is `κ(r) = canonical_Γ(g(r))`. The live group domain contains exactly keys with nonzero relation membership. For each live key `k`, validation may maintain exact measures over rows whose canonical key is `k`.
+
+The selected-count specialization maintains `W[k] = (members_k, selected_k)` and the total violation mass `V = Σ_k distance(selected_k, [min,max])`. Applying an exact row delta changes only the row's old/new canonical bucket: subtract that bucket's previous contribution from `V`, update exact membership/selection measures, remove the bucket iff membership reaches zero, then add its new contribution. Consequently unchanged groups are not scanned and invariant satisfaction is `V == 0` in O(1) after maintenance.
+
+Canonicalization MUST use the pinned semantic equivalence authority. Host equality/hash, SQL grouping, generic query replay, or registry-free approximations are invalid implementations. Membership and selector support MUST remain distinct so an existing group with zero selected rows is observable by lower-bound invariants.
+
+### Γ-keyed grouped exact measure law (PASS523)
+The grouped invariant witness is measure-generic. For canonical semantic group key `k`, validation maintains `W[k] = (members_k, measure_k)` where `members_k` defines the live group domain and `measure_k` is an exact aggregate witness. Grouped selected count uses `ExactCount`; grouped finite-f64 sum uses `ExactF64Sum`. A live group exists iff `members_k != 0`, independent of selector support, so a group with no selected rows has measure zero rather than disappearing.
+
+For each exact removed/inserted row, CFMD canonicalizes only that row's Γ group key, subtracts the bucket's prior violation contribution, updates membership and the selected exact measure, removes the bucket only when membership becomes zero, then adds its new contribution. No unchanged group is scanned. Canonical group identity remains owned by the pinned `SemanticRegistry`; validation may not substitute host equality/hash, query `GROUP BY`, or a registry-free approximation.
+
+Grouped comparison across distinct group domains is not defined by this law. Missing-group behavior requires an explicit domain-alignment certificate; implementations MUST NOT silently zero-fill, union, intersect, or query-join unrelated grouped witnesses.
+
+### Same-domain Γ-keyed grouped exact measure products (PASS524)
+A grouped aggregate comparator is defined only over one shared live group domain. Let relation `R`, group coordinates `g`, and pinned equivalences `Γ` define `k = canonical_Γ(g(r))`. For each live key CFMD maintains `W[k] = (members_k, μ_left,k, μ_right,k)`. Both measures MUST reference `R`; their domains are therefore definitionally aligned, and the bucket contributes `compare(μ_left,k, μ_right,k)` iff `members_k != 0`.
+
+Applying one exact row delta canonicalizes only that row's key, subtracts the bucket's prior comparator contribution, updates membership and both exact measures, then adds the new contribution or removes the bucket when membership reaches zero. No unchanged group is scanned. Count compares only with count; exact finite-f64 sum compares only with exact finite-f64 sum using exact witness comparison. Cross-relation grouped comparison, mixed-measure coercion, zero-fill, union/intersection of unrelated domains, host equality/hash, query joins, and SQL `GROUP BY/HAVING` are not valid implementations without a separate domain-alignment theorem.
+
+
+### Normalized grouped exact-measure persistence (PASS525)
+Grouped validation has one persisted schema law. A grouped rule consists of a canonical Γ-domain (`group_columns`, `group_equivalences`) and a typed exact-measure constraint. Range constraints pair one exact measure with a codomain-matched range (`ExactCount` or exact finite-f64 sum); comparison constraints pair two homogeneous exact measures. The relation is semantic authority of the measure, not duplicated metadata on the grouped wrapper, and schema validation requires all measures in one grouped constraint to share it.
+
+This normalization is persistence-only. Before state or delta evaluation, validation compiles the rule into a specialized grouped count-range, grouped exact-f64-sum-range, or grouped exact-measure-comparison plan. Implementations MUST NOT interpret the normalized persisted enum dynamically for every row, replay a grouped query, or reintroduce SQL/host grouping semantics. Sparse Γ-keyed witness and delta-maintenance laws from PASS522–524 remain the execution authority.
+
+### Kernel-wide exact-measure persistence normalization (PASS526)
+Database-wide exact invariants have one persisted constraint vocabulary independent of grouping. `ExactMeasureConstraint` is either a codomain-matched `Range(measure, range)` or a homogeneous `Compare(left, right, order)`. An ungrouped invariant persists as `RelationExactMeasure { constraint }`; a grouped invariant persists the same constraint plus its canonical Γ-domain. Global comparison may span relations because its exact measures are independently maintained; grouped comparison additionally requires one relation because the Γ-domain must be definitionally shared.
+
+This is a persistence/schema/durability normalization only. Validation compiles every constraint before maintenance into the existing static count-range, exact-f64-sum-range, exact-measure-comparison, or grouped specializations. No generic exact-measure interpreter, per-row enum routing, query replay, SQL aggregate path, implicit numeric coercion, or unreleased checkpoint compatibility router may be introduced by this normalization.
+
+
+## PASS527 — Exact ordered multiplicity / extrema
+- Added `ExactOrderedMultiset<K>`: exact multiplicities in an ordered sparse index; insert/delete O(log D), min/max from the index without source rescans.
+- Ordered extrema canonicalize values through `SemanticRegistry::canonical_order_key`; host `Ord` is used only on the resulting semantic `CanonicalOrderKey`.
+- `ExactAggregateMeasureExpr::OrderedExtremum { Min|Max }` reuses the normalized exact-measure persistence/compare substrate; no parallel top-level model-rule variant.
+- Partial extrema comparison is support-aligned: None/None satisfies, Some/Some compares, mismatched definedness violates. Non-emptiness remains an explicit count law.
+- Registry-free extrema maintenance is fail-closed; semantic ordering authority is mandatory.
+- Deleting the current min/max updates the ordered multiplicity witness locally and survives durable reopen.
+- OPEN next: hostile-R&D exact order-statistics / quantiles. Do not accept row rescans, SQL MIN/MAX/ORDER BY fallback, host value ordering, or dense rank arrays.
+
+
+## PASS528 — Exact ordered-statistic law
+For a pinned semantic ordering `o`, selected values are represented only by canonical order keys in one exact AVL multiset. Each node stores exact key multiplicity and exact subtree cardinality. This single authority supports extrema, rank and quantile selection without source rescans or a duplicate rank index.
+
+Ordered selectors are:
+- `FromStart(k)`: zero-based kth value from the minimum, counting multiplicity;
+- `FromEnd(k)`: zero-based kth value from the maximum;
+- `LowerQuantile { numerator, denominator }`: for non-empty support and `0 <= numerator <= denominator`, select zero-based rank `floor(numerator * (n - 1) / denominator)`.
+
+Invalid rational selectors are rejected by schema validation. Ordered-statistic comparison remains partial/support-aligned: undefined/undefined satisfies, defined/defined compares canonical semantic-order keys, and mismatched support violates. Min/max are frontend sugar for rank zero from the corresponding end.
+
+### Deterministic exact invariant closure (PASS530)
+A Γ-grouped ordered-statistic range is evaluated over the existing live canonical group domain. Each live group owns one exact ordered-multiplicity witness using canonical semantic-order keys. Bounds are canonicalized under the pinned ordering when the witness is built, not per row. A relation delta may update only the touched Γ bucket and its violation contribution; unchanged groups must not be scanned. Undefined selected support satisfies a range constraint; support existence is expressed separately by exact count. Registry-free evaluation is invalid.
+
+## Schema-owned authorization policy (PASS531)
+**[VERIFIED]** Authorization policy is part of the authoritative current schema and is distinct from cryptographic `kernel-auth` and structural `CapabilityDef`. The persisted law is `Role -> AccessCapability -> exact PermissionCoordinate`. Capabilities contain exact coordinates/global operations only; generic `Read`/`Write` are not expressible through schema policy.
+
+**[VERIFIED]** Role composition is monotone allow-only set union over an acyclic inclusion graph. There is no deny precedence, declaration-order precedence or binding-local evaluator. Unknown capability/role references and inclusion cycles fail closed.
+
+**[VERIFIED]** Role resolution compiles to the existing runtime `PermissionSet`; P503-P515 semantic query/change/publication checks remain the sole enforcement authority. Principal-to-role assignment is authentication/authorizer state, not persisted schema data. Migration transports required current-world authority footprints and never transports grants.
+
+**[VERIFIED]** Typed object capability helpers lower to persisted semantic relation/column IDs. Consumer-local `bind`, Rust field spelling and Context shape do not define permission identity. Checkpoint/reopen preserves the policy exactly.
+
+
+## Authorization authoring and external role assignment (PASS532)
+**[VERIFIED]** `AuthorizationPolicy` is an authoring-only bundle of `AccessCapability` and `Role` descriptors. `SchemaBuilder::authorization(...)` immediately merges those descriptors into the same authoritative PASS531 schema policy; the bundle is not persisted or evaluated as a second policy object.
+
+**[VERIFIED]** Object capability authoring exposes typed exact coordinates for relation read/write, field read/write, object create/delete, and generated many-relationship attach/detach/move. Relationship selectors lower through generated `ManyField` metadata to the internal semantic edge relation; ordinary application policy code does not name raw relationship `RelationId`. Exact global operations (`ModelRead`, history/historical read, watch, schema migration) also have named capability helpers.
+
+**[VERIFIED]** Principal-to-role assignment remains external. `SchemaView::session_for_roles` and `SchemaView::refresh_session_roles` compile externally supplied role IDs against that exact current authoritative schema view and then construct/refresh the ordinary `Session` `PermissionSet`. No role assignment is persisted, migrated, or cached as a second database authority.
+
+**[HOSTILE DX LAW]** Entity/field metadata must not become the ownership location of roles. Fields/relationships define semantic permission coordinates; capabilities and roles compose policy across coordinates and often across multiple entities. Future derive/attribute sugar may only compile into `AuthorizationPolicy` descriptors and must not create per-entity authorization semantics.
+
+### PASS533 — schema-neutral migratable watch foundation
+
+**[AUTHORIZATION FRONTEND CLOSURE]** Schema-owned `AuthorizationPolicy` / Role / AccessCapability descriptors are the sole authorization authoring language. A dedicated role/capability macro or derive is not an independent semantic layer and is not required by the architecture; any future syntax helper MUST lower exclusively into the same descriptors.
+
+**[MIGRATABLE WATCH TYPE LAW]** Ordinary `QueryWatch` is schema-bound. `MigratableQueryWatch` is schema-neutral and MUST NOT expose an implicit mutable current output type. Events identify the authoritative target schema revision and carry exact result deltas; typed materialization is a later explicit caller choice.
+
+**[DEFINITIONAL CUTOVER LAW]** A maintained exact watch may cross a schema revision without rebuilding relation/query state only when source and target semantic contexts are definitionally equivalent. Rebinding may replace reconstructible compiled metadata, but MUST preserve the maintained Γ-DTC state. Structural/non-representable boundaries fail closed; query replay, full-result recomputation, guessed mappings and current-world old-schema routing are forbidden.
+
+## PASS534 — structural schema-neutral watch transport
+A `MigratableQueryWatch` may cross a structural schema migration only from an exact retained `SchemaMigrationProgram` certificate. The first certified structural class is row-observation identity: every watched relation must retain identical row type/semantics and each target ordinal must be the exact identity projection of the same source ordinal. Column semantic IDs may change. Maintained rows are never replayed or rebuilt; only target differential metadata and Γ witness context are rebound. The current target read footprint MUST be reauthorized before the watch advances across the boundary. Typed materialization is late and caller-selected by exact event schema revision; the watch MUST NOT own a mutable current type. Any unproved relation-id retarget, permutation, value conversion, split/merge or general relational transform fails closed.
+
+## PASS535 relation-coordinate MigratableWatch law
+A structural schema migration may retarget an exact maintained observation from source relation coordinate `A` to target relation coordinate `B` without rebuilding observation rows iff the retained verified `SchemaMigrationProgram` proves row-observation identity for that source/target relation rewrite. The watch transport MUST retarget the semantic query scan coordinate, compiled differential metadata, maintained scan coordinate and persistent relation base witness as one metadata transition. Existing maintained rows and their canonical lookup MUST NOT be rescanned or re-canonicalized. Target read authority MUST be recomputed and authorized before advancing the watch schema revision. Distinct source scan relations MUST NOT be silently aliased onto one target relation. Value-changing, permutation, split/merge and general relational rewrites remain fail-closed until their maintained-state transport laws are separately proved.
+
+
+## PASS544 — structured migration diagnostic law
+Migration and old-contract bridge representability failures have one runtime diagnostic algebra. A diagnostic identifies the workflow stage, semantic domain (`DataTransport`, `ReadBridge`, `WriteBridge`, `Lifecycle`, `Access`, or `Preparation`), a stable reason, and the exact semantic coordinates known at the failure boundary. Human-readable text is presentation only and MUST NOT be parsed to recover semantics.
+
+`ErrorKind` remains the coarse control-flow category (`InvalidSchema`, `ContractNotRepresentable`, `InvariantViolation`, ...). Exact migration detail is an optional structured payload and is stored indirectly so ordinary runtime `Error`/`Result` layout is not inflated. Kernel `TransportError` is classified exactly at the runtime boundary; SDK/CLI/bindings may only project this result, never reconstruct their own migration-error semantics from names or messages.
+
+Schema-Owned Access policy migration will use the same diagnostic substrate: policy preservation/change is a distinct `Access` domain, not data-transport equality and not an attached second authorization engine.
+
+### PASS545 — authoritative migration observation law
+
+**[MIGRATION OBSERVATION LAW]** Semantic migration cutover is the committed schema-migration revision effect itself. `observe` and `cut over` MUST NOT introduce a mutable migration-progress authority. Observation of one exact prepared migration is derived from current HEAD and the durable causal effect on its exact source->target revision edge.
+
+**[CUTOVER PROJECTION LAW]** A public `MigrationCutover` is evidence of an already-published semantic transition, not an operation. Later schema advancement does not erase the earlier cutover fact. Physical checkpoint/materialization convergence is representation maintenance and MUST NOT create another semantic cutover state.
+
+**[OBSERVATION COST LAW]** Exact migration observation resolves through the existing target-revision causal frontier and migration identity. It MUST NOT scan/materialize the whole product History or database rows merely to answer whether the prepared semantic cutover was published.
+
+## Pass546 — authoritative `Schema.Access` and migration preservation
+
+**[VERIFIED]** Access is an owned member of the authoritative schema contract, not a separately attachable policy. The active product/kernel vocabulary is `SchemaAccess`, `SchemaBuilder::access(...)`, `Schema::schema_access()`, stable `AccessCapabilityId`, stable `RoleId`, exact `PermissionCoordinate`, and the existing flattened `PermissionSet` enforcement path. The former `AuthorizationPolicy` / `SchemaBuilder::authorization(...)` authoring model is superseded pre-1.0.
+
+**[VERIFIED]** A target schema remains independently authoritative and self-contained. Migration does not synthesize target Access from history; `SchemaMigrationTransport::verify` proves whether the source Access realization transports exactly to the target declaration. Automatic preservation requires the same capability/role identity sets, exact role composition, and exact transported permission realization. Relation/field permissions reuse certified migration identity laws. Same name or same stable ID without the transported contract is not proof.
+
+**[FAIL-CLOSED]** Capability widening/narrowing, role composition changes, authority-shape changes and catalog changes are not silently treated as schema migration. They produce structured `Access`-domain migration diagnostics with `AccessPolicyChangeRequired`. Intentional changes require a separate explicit migration-owned approval theorem before the first released file-format contract is frozen.
+
+**[PERFORMANCE]** Access migration verification is schema/catalog sized and does not scan database rows. Runtime authorization remains exact footprint membership against a pre-resolved `PermissionSet`; migration does not add per-query capability graph traversal or old-schema Access routing.
+
+## PASS547 — durable Schema.Access policy change approval
+
+**[VERIFIED]** Intentional Access policy evolution is owned by the migration program, never by a frontend flag. `SchemaMigrationProgram` durably carries exact approved subjects (`AccessCapabilityId` or `RoleId`). Verification first computes the source-transport vs authoritative target `Schema.Access` diff and rejects every changed subject without its exact approval; an approval for an unchanged subject also fails closed.
+
+**[ACCESS DIFF LAW]** Capability changes are classified as add/remove/widen/narrow/authority-shape-change. Widen/narrow is defined only after exact permission-coordinate transport; if source authority cannot be transported definitionally, the change is authority-shape-changing rather than guessed from spelling. Role changes are add/remove/widen/narrow/composition-change over effective capability closure. Every change carries the transitive set of roles affected directly or through role inclusion.
+
+**[DURABILITY]** Access approvals are part of the canonical durable migration program and therefore participate in migration identity, recovery/reopen verification and historical cutover evidence. Target `Schema.Access` remains the authority; approval is acknowledgement of an exact diff, not a second policy definition and not manual permission transport.
+
+**[PERFORMANCE]** Access diff/affected-role analysis is O(schema access catalog/role graph), never O(database rows), and adds no work to ordinary query/change authorization hot paths.
+
+**[PRE-FORMAT BLOCKER]** Native enum/sum product semantics must be closed before the first released `FORMAT_VERSION`: stable semantic variant identity, schema migration law and the selected physical tag/payload encoding must not be postponed into an immediate post-1.0 format expansion. See `docs/rnd/CFMD_EMBEDDED_DX_FEATURES.md` sections on native enums and packed/payload enum realization.
+
+## PASS557/PASS568 — current pre-release durable FORMAT_VERSION 1
+
+**[PRE-RELEASE CORRECTION]** PASS557 selected and certified V1 as the release candidate, but no product release has occurred. Backward compatibility is therefore not frozen. PASS568 normalizes sole-current pass-era subcodec numbers to `1` and permits obsolete development snapshots to fail closed. The release process, not a PASS number, creates the compatibility obligation.
+
+**[RELEASED FORMAT AUTHORITY]** `kernel_durability::FORMAT_VERSION == 1` is the first public on-disk compatibility boundary. The outer single-file header/root/generation and directory manifest/checkpoint/metadata roots all bind to this released version. Earlier PASS-era component tags are unreleased development artifacts and MUST NOT be treated as readable ancestors.
+
+**[COMPATIBILITY MATRIX]** V1 is read/write. No older released format exists, no downgrade writer exists, and unknown/newer outer formats fail closed before payload interpretation. Read-only support for another released version may exist only when explicitly added to the public compatibility matrix; permissive decoder branches do not constitute support.
+
+**[SUBCODEC LAW]** The exact current persisted internal codecs are part of the V1 byte-language obligation even where they retain local implementation version tags. An incompatible subcodec change therefore requires a new released `FORMAT_VERSION` unless the old V1 byte language remains exactly readable. Pre-release checkpoint semantic codecs 1..6 are removed; V1 uses current codec 7 only.
+
+**[UPGRADE LAW]** A future released format upgrade MUST stage a complete target authority, reopen and verify semantic revision plus causal/retry/prepared/replication/history/freshness/protection authority, and only then atomically publish/swap. Partial in-place rewriting is not an upgrade protocol. Format conversion is not a security declassification operation.
+
+## PASS558 — history-retention authority law
+
+**[RETENTION AUTHORITY]** Exact historical source-epoch materialization is retained by the existing causal-effect-keyed `HistoricalEpochAnchor` / retained realization root. Public `HistoryRetentionPin` is a projection of that authority, not another persisted lease/table and not a reader handle. FORMAT V1 bytes are unchanged.
+
+**[REASON LAW]** The currently public durable reason is `SchemaMigration`: migration publication may create one retained source-epoch authority so `db.at(...)` and exact cross-epoch operations remain reconstructible. Ordinary readers, watches and replication MUST NOT create parallel durable retention authorities.
+
+**[RELEASE LAW]** Release is irreversible and idempotent. It retires only exact source-epoch materialization authority. The migration causal event, retry/idempotency state, current schema/world and replication authority remain. A stale frontend pin MUST NOT recreate released historical authority.
+
+**[RUNTIME CONSISTENCY]** Volatile and Durable persistence owners obey the same release theorem. Whether a physical checkpoint receipt exists is not semantic evidence of release; canonical anchor existence decides whether the matching runtime-derived retained epoch must be retired.
+
+**[WATCH/GC LAW]** Already materialized immutable snapshots may remain alive through ordinary in-process ownership. New historical reconstruction or watch catch-up that requires released source authority fails closed; replay/recompute fallback is forbidden. GC/compaction reclaims historical material by root reachability only after the canonical retention pin is absent.

@@ -222,6 +222,24 @@ impl ExactNatural {
         (self.bit_len() <= 64).then(|| self.shr_to_u64(0))
     }
 
+    /// Divides this exact natural by a non-zero `u64`, returning the remainder.
+    ///
+    /// This is exact limb-wise long division; no floating-point conversion occurs.
+    pub fn div_rem_u64_assign(&mut self, divisor: u64) -> Option<u64> {
+        if divisor == 0 {
+            return None;
+        }
+        let divisor128 = u128::from(divisor);
+        let mut remainder = 0_u128;
+        for limb in self.limbs.iter_mut().rev() {
+            let value = (remainder << 64) | u128::from(*limb);
+            *limb = u64::try_from(value / divisor128).expect("exact quotient limb fits u64");
+            remainder = value % divisor128;
+        }
+        self.normalize();
+        Some(u64::try_from(remainder).expect("remainder is smaller than u64 divisor"))
+    }
+
     #[must_use]
     pub fn to_decimal_string(&self) -> String {
         if self.is_zero() {

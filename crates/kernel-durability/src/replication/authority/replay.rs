@@ -1,19 +1,25 @@
-use super::{ReplicationAuthorityJournal, corruption, membership_vote_index};
+use sha2::Digest;
+
+use super::{
+    ReplicationAuthorityJournal, SemanticAuthorityBaseReplay, corruption, membership_vote_index,
+};
 use crate::replication::codec::{
     KIND_AUTHENTICATED_MEMBERSHIP_VOTE_REF, KIND_AUTHENTICATED_PEER_EVIDENCE,
     KIND_AUTHENTICATED_RECOVERY_ACK_REF, KIND_DECISION_LOCK, KIND_DECISION_VOTE, KIND_EFFECT_VOTE,
     KIND_INGEST, KIND_JOINT_MEMBERSHIP_CERTIFICATE, KIND_LEADER_CERTIFICATE, KIND_LEADER_VOTE,
     KIND_MEMBERSHIP, KIND_MEMBERSHIP_SUCCESSOR_OWNER, KIND_MEMBERSHIP_VOTE,
     KIND_MEMBERSHIP_VOTE_REF, KIND_PEER_AUTH_POLICY, KIND_PUBLISH, KIND_QUORUM, KIND_QUORUM_LOSS,
-    KIND_QUORUM_RECOVERY, KIND_RECOVERY_LOCK_FRONTIER_OWNER, KIND_RETIRE, KIND_TERM_PROMISE,
-    SignedMembershipVoteRef, authentication_receipt, decode_decision_lock, decode_decision_vote,
-    decode_effect_vote, decode_ingest, decode_joint_membership_certificate,
-    decode_leader_certificate, decode_leader_vote, decode_membership_change,
-    decode_membership_successor_owner, decode_membership_vote, decode_membership_vote_ref,
-    decode_peer_auth_policy, decode_publish, decode_quorum_certificate, decode_quorum_loss,
-    decode_recovery_certificate, decode_recovery_lock_frontier_owner, decode_retire,
-    decode_signed_membership_vote_ref, decode_signed_peer_evidence, decode_signed_recovery_ack_ref,
-    decode_term_promise, recovery_lock_frontier_digest, validate_lock_summaries,
+    KIND_QUORUM_RECOVERY, KIND_RECOVERY_LOCK_FRONTIER_OWNER, KIND_RETIRE,
+    KIND_SEMANTIC_AUTHORITY_BASE_BEGIN, KIND_SEMANTIC_AUTHORITY_BASE_END,
+    KIND_SEMANTIC_AUTHORITY_BASE_RECORD, KIND_TERM_PROMISE, SignedMembershipVoteRef,
+    authentication_receipt, decode_decision_lock, decode_decision_vote, decode_effect_vote,
+    decode_ingest, decode_joint_membership_certificate, decode_leader_certificate,
+    decode_leader_vote, decode_membership_change, decode_membership_successor_owner,
+    decode_membership_vote, decode_membership_vote_ref, decode_peer_auth_policy, decode_publish,
+    decode_quorum_certificate, decode_quorum_loss, decode_recovery_certificate,
+    decode_recovery_lock_frontier_owner, decode_retire, decode_signed_membership_vote_ref,
+    decode_signed_peer_evidence, decode_signed_recovery_ack_ref, decode_term_promise,
+    recovery_lock_frontier_digest, validate_lock_summaries,
 };
 use crate::replication::{
     ReplicationPeerEvidence, ReplicationQuorumAvailability, SignedReplicationPeerEvidence,
@@ -244,12 +250,112 @@ impl ReplicationAuthorityJournal {
         Ok(true)
     }
 
+    fn replay_semantic_base_frame(
+        &mut self,
+        kind: u8,
+        payload: &[u8],
+        offset: usize,
+    ) -> Result<bool, DurabilityError> {
+        if kind == KIND_SEMANTIC_AUTHORITY_BASE_BEGIN {
+            if !self.is_empty_authority() || self.semantic_base_replay.is_some() {
+                return Err(corruption(
+                    offset,
+                    "replication semantic authority base begin is not the first authority frame",
+                ));
+            }
+            let expected_records = super::semantic_snapshot::decode_semantic_base_begin(payload)
+                .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
+            self.semantic_base_replay = Some(SemanticAuthorityBaseReplay {
+                expected_records,
+                record_count: 0,
+                canonical_len: 0,
+                hasher: sha2::Sha256::new(),
+                decoder: super::semantic_snapshot::SemanticAuthorityRecordDecoder::new(),
+            });
+            return Ok(true);
+        }
+        if kind == KIND_SEMANTIC_AUTHORITY_BASE_RECORD {
+            let replay = self.semantic_base_replay.as_mut().ok_or_else(|| {
+                corruption(
+                    offset,
+                    "replication semantic authority record has no begin frame",
+                )
+            })?;
+            if replay.record_count >= replay.expected_records {
+                return Err(corruption(
+                    offset,
+                    "replication semantic authority base exceeds declared record count",
+                ));
+            }
+            let record_len =
+                u64::try_from(payload.len()).map_err(|_| DurabilityError::PayloadTooLarge)?;
+            replay.hasher.update(record_len.to_le_bytes());
+            replay.hasher.update(payload);
+            replay.canonical_len = replay
+                .canonical_len
+                .checked_add(8)
+                .and_then(|value| value.checked_add(record_len))
+                .ok_or(DurabilityError::PayloadTooLarge)?;
+            replay
+                .decoder
+                .apply_record(payload)
+                .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
+            replay.record_count = replay
+                .record_count
+                .checked_add(1)
+                .ok_or(DurabilityError::PayloadTooLarge)?;
+            return Ok(true);
+        }
+        if kind == KIND_SEMANTIC_AUTHORITY_BASE_END {
+            let replay = self.semantic_base_replay.take().ok_or_else(|| {
+                corruption(
+                    offset,
+                    "replication semantic authority base end has no begin frame",
+                )
+            })?;
+            let (expected_len, expected_digest) =
+                super::semantic_snapshot::decode_semantic_base_end(payload)
+                    .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
+            if replay.record_count != replay.expected_records
+                || replay.canonical_len != expected_len
+            {
+                return Err(corruption(
+                    offset,
+                    "replication semantic authority base record count or length mismatch",
+                ));
+            }
+            let actual_digest: [u8; 32] = replay.hasher.finalize().into();
+            if actual_digest != expected_digest {
+                return Err(corruption(
+                    offset,
+                    "replication semantic authority base digest mismatch",
+                ));
+            }
+            let snapshot = replay
+                .decoder
+                .finish()
+                .map_err(|reason| DurabilityError::Corruption { offset, reason })?;
+            snapshot.restore(self);
+            return Ok(true);
+        }
+        if self.semantic_base_replay.is_some() {
+            return Err(corruption(
+                offset,
+                "replication authority delta interrupted semantic authority base",
+            ));
+        }
+        Ok(false)
+    }
+
     pub(super) fn apply_replay_frame(
         &mut self,
         kind: u8,
         payload: &[u8],
         offset: usize,
     ) -> Result<(), DurabilityError> {
+        if self.replay_semantic_base_frame(kind, payload, offset)? {
+            return Ok(());
+        }
         match kind {
             KIND_INGEST => self.apply_ingest(
                 decode_ingest(payload)

@@ -256,7 +256,7 @@ impl PhysicalStore {
 
         let releases_advisor_ownership = factor_bindings.iter().any(|binding| {
             self.advisor_managed_artifacts
-                .contains(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()))
+                .contains(&UnifiedArtifactId::semantic_quotient(binding.clone()))
         });
 
         let prepared_support = if let Some(binding) = support_binding {
@@ -303,7 +303,7 @@ impl PhysicalStore {
         }
         for binding in factor_bindings {
             self.advisor_managed_artifacts
-                .remove(&UnifiedArtifactId::SemanticQuotientFactor(binding.clone()));
+                .remove(&UnifiedArtifactId::semantic_quotient(binding.clone()));
         }
         if let Some((binding, state, true)) = prepared_support {
             self.semantic_quotient_supports.insert(binding, state);

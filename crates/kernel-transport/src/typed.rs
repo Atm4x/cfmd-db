@@ -461,6 +461,24 @@ pub enum MigrationRelationSlice {
     },
 }
 
+/// Exact structural class of one source relation as an observation crosses a
+/// verified schema migration.
+///
+/// `RowIdentity` is the metadata-only theorem used by maintained watches: the
+/// already-maintained row payload and its Γ support remain valid verbatim.
+/// `RowLocalStateTransform` is deliberately distinct.  The migration has an
+/// exact pointwise row transform, but an already-materialized observation
+/// state must change value domain and therefore cannot be rebound as metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationRelationTransport {
+    RowIdentity {
+        target_relation: kernel_types::SemanticId,
+    },
+    RowLocalStateTransform {
+        target_relation: kernel_types::SemanticId,
+    },
+}
+
 impl MigrationRelationSlice {
     #[must_use]
     pub const fn target_relation(&self) -> kernel_types::SemanticId {
@@ -502,6 +520,109 @@ pub const fn migration_column_input_id(
 /// source world is supplied by the causal source revision when the program is
 /// verified/replayed, so durable migration identity never needs a second full
 /// target-state snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessPolicyChangeKind {
+    CapabilityAdded,
+    CapabilityRemoved,
+    CapabilityWidened,
+    CapabilityNarrowed,
+    CapabilityAuthorityShapeChanged,
+    RoleAdded,
+    RoleRemoved,
+    RoleWidened,
+    RoleNarrowed,
+    RoleCompositionChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessPolicyChange {
+    subject: crate::AccessPolicySubject,
+    kind: AccessPolicyChangeKind,
+    affected_roles: BTreeSet<kernel_types::SemanticId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AccessObservationFlow {
+    role: kernel_types::SemanticId,
+    source: kernel_schema::PermissionCoordinate,
+    target: kernel_schema::PermissionCoordinate,
+}
+
+impl AccessObservationFlow {
+    #[must_use]
+    pub const fn role(&self) -> kernel_types::SemanticId {
+        self.role
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> kernel_schema::PermissionCoordinate {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> kernel_schema::PermissionCoordinate {
+        self.target
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AccessDeclassificationEdge {
+    role: kernel_types::SemanticId,
+    target: kernel_schema::PermissionCoordinate,
+}
+
+impl AccessDeclassificationEdge {
+    #[must_use]
+    pub const fn role(&self) -> kernel_types::SemanticId {
+        self.role
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> kernel_schema::PermissionCoordinate {
+        self.target
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccessNoninterferenceCertification {
+    flows: Vec<AccessObservationFlow>,
+    declassification_edges: Vec<AccessDeclassificationEdge>,
+}
+
+impl AccessNoninterferenceCertification {
+    #[must_use]
+    pub fn flows(&self) -> &[AccessObservationFlow] {
+        &self.flows
+    }
+
+    #[must_use]
+    pub fn declassification_edges(&self) -> &[AccessDeclassificationEdge] {
+        &self.declassification_edges
+    }
+
+    #[must_use]
+    pub fn is_noninterfering(&self) -> bool {
+        self.declassification_edges.is_empty()
+    }
+}
+
+impl AccessPolicyChange {
+    #[must_use]
+    pub const fn subject(&self) -> crate::AccessPolicySubject {
+        self.subject
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> AccessPolicyChangeKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn affected_roles(&self) -> &BTreeSet<kernel_types::SemanticId> {
+        &self.affected_roles
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaMigrationProgram {
     target: SemanticContext,
@@ -569,14 +690,467 @@ pub struct SchemaMigrationTransport {
     field_passthrough: BTreeSet<kernel_types::SemanticId>,
     relation_rewrites: Vec<PreparedMigrationRelationRewrite>,
     relation_passthrough: BTreeSet<kernel_types::SemanticId>,
+    access_policy_changes: Vec<AccessPolicyChange>,
+}
+
+/// One verified current-world bridge from a source schema language into the
+/// authoritative target schema. The bridge contains no source data and never
+/// revives the source schema as a live database world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaBridge {
+    transport: SchemaMigrationTransport,
+}
+
+fn access_effective_capabilities(
+    access: &kernel_schema::SchemaAccess,
+    role: kernel_types::SemanticId,
+) -> BTreeSet<kernel_types::SemanticId> {
+    fn collect(
+        access: &kernel_schema::SchemaAccess,
+        role: kernel_types::SemanticId,
+        visiting: &mut BTreeSet<kernel_types::SemanticId>,
+        out: &mut BTreeSet<kernel_types::SemanticId>,
+    ) {
+        if !visiting.insert(role) {
+            return;
+        }
+        if let Some(def) = access.roles.get(&role) {
+            out.extend(def.capabilities.iter().copied());
+            for included in &def.includes {
+                collect(access, *included, visiting, out);
+            }
+        }
+        visiting.remove(&role);
+    }
+    let mut out = BTreeSet::new();
+    collect(access, role, &mut BTreeSet::new(), &mut out);
+    out
+}
+
+fn access_roles_using_capability(
+    access: &kernel_schema::SchemaAccess,
+    capability: kernel_types::SemanticId,
+) -> BTreeSet<kernel_types::SemanticId> {
+    access
+        .roles
+        .keys()
+        .copied()
+        .filter(|role| access_effective_capabilities(access, *role).contains(&capability))
+        .collect()
+}
+
+fn access_roles_including_role(
+    access: &kernel_schema::SchemaAccess,
+    changed_role: kernel_types::SemanticId,
+) -> BTreeSet<kernel_types::SemanticId> {
+    fn includes(
+        access: &kernel_schema::SchemaAccess,
+        role: kernel_types::SemanticId,
+        target: kernel_types::SemanticId,
+        visiting: &mut BTreeSet<kernel_types::SemanticId>,
+    ) -> bool {
+        if role == target {
+            return true;
+        }
+        if !visiting.insert(role) {
+            return false;
+        }
+        let result = access.roles.get(&role).is_some_and(|def| {
+            def.includes
+                .iter()
+                .copied()
+                .any(|included| includes(access, included, target, visiting))
+        });
+        visiting.remove(&role);
+        result
+    }
+    access
+        .roles
+        .keys()
+        .copied()
+        .filter(|role| includes(access, *role, changed_role, &mut BTreeSet::new()))
+        .collect()
+}
+
+fn classify_access_capability_change(
+    bridge: &SchemaBridge,
+    source: &kernel_schema::SchemaAccess,
+    target: &kernel_schema::SchemaAccess,
+    id: kernel_types::SemanticId,
+) -> Option<AccessPolicyChangeKind> {
+    let (Some(source_capability), Some(target_capability)) =
+        (source.capabilities.get(&id), target.capabilities.get(&id))
+    else {
+        return if source.capabilities.contains_key(&id) {
+            Some(AccessPolicyChangeKind::CapabilityRemoved)
+        } else {
+            Some(AccessPolicyChangeKind::CapabilityAdded)
+        };
+    };
+    let Ok(transported) = source_capability
+        .permissions
+        .iter()
+        .copied()
+        .map(|permission| bridge.transport_access_permission_exact(permission))
+        .collect::<Result<BTreeSet<_>, _>>()
+    else {
+        return Some(AccessPolicyChangeKind::CapabilityAuthorityShapeChanged);
+    };
+    if transported == target_capability.permissions {
+        None
+    } else if transported.is_subset(&target_capability.permissions) {
+        Some(AccessPolicyChangeKind::CapabilityWidened)
+    } else if target_capability.permissions.is_subset(&transported) {
+        Some(AccessPolicyChangeKind::CapabilityNarrowed)
+    } else {
+        Some(AccessPolicyChangeKind::CapabilityAuthorityShapeChanged)
+    }
+}
+
+fn classify_access_role_change(
+    source: &kernel_schema::SchemaAccess,
+    target: &kernel_schema::SchemaAccess,
+    id: kernel_types::SemanticId,
+) -> Option<AccessPolicyChangeKind> {
+    let (Some(source_role), Some(target_role)) = (source.roles.get(&id), target.roles.get(&id))
+    else {
+        return if source.roles.contains_key(&id) {
+            Some(AccessPolicyChangeKind::RoleRemoved)
+        } else {
+            Some(AccessPolicyChangeKind::RoleAdded)
+        };
+    };
+    if source_role == target_role {
+        return None;
+    }
+    let source_effective = access_effective_capabilities(source, id);
+    let target_effective = access_effective_capabilities(target, id);
+    if source_effective != target_effective && source_effective.is_subset(&target_effective) {
+        Some(AccessPolicyChangeKind::RoleWidened)
+    } else if source_effective != target_effective && target_effective.is_subset(&source_effective)
+    {
+        Some(AccessPolicyChangeKind::RoleNarrowed)
+    } else {
+        Some(AccessPolicyChangeKind::RoleCompositionChanged)
+    }
+}
+
+impl SchemaBridge {
+    pub fn verify(
+        program: &SchemaMigrationProgram,
+        source: &SemanticContext,
+        registry: &SemanticRegistry,
+    ) -> Result<Self, TransportError> {
+        Ok(Self {
+            transport: program.verify(source, registry)?,
+        })
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &SemanticContext {
+        &self.transport.source
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> &SemanticContext {
+        &self.transport.target
+    }
+
+    /// Compiles one source-language relational read directly into the target
+    /// semantic world when every scanned relation has exact row identity.
+    /// Operator structure and result type are preserved; value-changing,
+    /// fan-in/fan-out and global rewrites fail closed.
+    pub fn compile_read_exact(
+        &self,
+        source_query: &RelExpr,
+        registry: &SemanticRegistry,
+    ) -> Result<RelExpr, TransportError> {
+        let source_type = source_query
+            .typecheck(&self.transport.source, registry)
+            .map_err(TransportError::RelationTransformType)?;
+        let mut relation_map = BTreeMap::new();
+        let mut targets = BTreeSet::new();
+        for source_relation in source_query.scan_relations() {
+            let target_relation = match self
+                .transport
+                .classify_observation_relation_transport_exact(source_relation)?
+            {
+                ObservationRelationTransport::RowIdentity { target_relation } => target_relation,
+                ObservationRelationTransport::RowLocalStateTransform { .. } => {
+                    return Err(TransportError::UnrepresentableReadRelation(source_relation));
+                }
+            };
+            if !targets.insert(target_relation) {
+                return Err(TransportError::AliasedReadTarget(target_relation));
+            }
+            relation_map.insert(source_relation, target_relation);
+        }
+        let target_query = source_query
+            .retarget_scan_relations_exact(&relation_map)
+            .map_err(TransportError::RelationTransformType)?;
+        let target_type = target_query
+            .typecheck(&self.transport.target, registry)
+            .map_err(TransportError::RelationTransformType)?;
+        if target_type != source_type {
+            return Err(TransportError::ReadResultTypeMismatch);
+        }
+        Ok(target_query)
+    }
+
+    pub fn transport_relation_delta_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+        delta: &RelationDelta,
+        registry: &SemanticRegistry,
+    ) -> Result<Vec<(kernel_types::SemanticId, RelationDelta)>, TransportError> {
+        self.transport
+            .transport_relation_delta_exact(source_relation, delta, registry)
+    }
+
+    pub fn transport_relation_write_footprint_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+        source_columns: &BTreeSet<kernel_types::SemanticId>,
+    ) -> Result<Vec<MigrationRelationWriteFootprint>, TransportError> {
+        self.transport
+            .transport_relation_write_footprint_exact(source_relation, source_columns)
+    }
+
+    /// Returns the target relation coordinate only when the row representation
+    /// itself survives this migration unchanged. This is the exact coordinate
+    /// law used by bridged typed Context mutation lowering; row-local value
+    /// transforms remain unrepresentable for direct old-language mutation.
+    pub fn transport_relation_identity_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+    ) -> Result<kernel_types::SemanticId, TransportError> {
+        self.transport
+            .transport_observation_relation_identity_exact(source_relation)
+    }
+
+    /// Returns one target field coordinate only when this migration preserves
+    /// the field value definitionally. Split/merge/value transforms fail closed.
+    /// Transports one schema-owned exclusive-ownership contract only when
+    /// relationship row identity, target object relation identity and orphan
+    /// policy are all preserved by the verified migration.
+    pub fn transport_owned_relationship_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+    ) -> Result<kernel_schema::OwnedRelationshipDef, TransportError> {
+        let source = self
+            .transport
+            .source
+            .schema
+            .owned_relationship(source_relation)
+            .ok_or(TransportError::UnrepresentableOwnedRelationship(
+                source_relation,
+            ))?;
+        let target_relation = self.transport_relation_identity_exact(source.relation)?;
+        let target_object_relation =
+            self.transport_relation_identity_exact(source.target_relation)?;
+        let target = self
+            .transport
+            .target
+            .schema
+            .owned_relationship(target_relation)
+            .ok_or(TransportError::UnrepresentableOwnedRelationship(
+                source_relation,
+            ))?;
+        if target.target_relation != target_object_relation
+            || target.orphan_policy != source.orphan_policy
+        {
+            return Err(TransportError::UnrepresentableOwnedRelationship(
+                source_relation,
+            ));
+        }
+        Ok(target.clone())
+    }
+
+    fn transport_access_permission_exact(
+        &self,
+        permission: kernel_schema::PermissionCoordinate,
+    ) -> Result<kernel_schema::PermissionCoordinate, TransportError> {
+        transport_access_permission_exact(&self.transport, permission)
+    }
+}
+
+fn transport_access_permission_exact(
+    transport: &SchemaMigrationTransport,
+    permission: kernel_schema::PermissionCoordinate,
+) -> Result<kernel_schema::PermissionCoordinate, TransportError> {
+    use kernel_schema::PermissionCoordinate as P;
+    Ok(match permission {
+        P::ReadRelation { relation } => P::ReadRelation {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+        },
+        P::WriteRelation { relation } => P::WriteRelation {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+        },
+        P::CreateObject { relation } => P::CreateObject {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+        },
+        P::DeleteObject { relation } => P::DeleteObject {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+        },
+        P::AttachRelationship { relation } => P::AttachRelationship {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+        },
+        P::DetachRelationship { relation } => P::DetachRelationship {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+        },
+        P::MoveRelationship { relation } => P::MoveRelationship {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+        },
+        P::ReadField { relation, column } => P::ReadField {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+            column: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_field_identity_exact(column)?,
+        },
+        P::WriteField { relation, column } => P::WriteField {
+            relation: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_relation_identity_exact(relation)?,
+            column: SchemaBridge {
+                transport: transport.clone(),
+            }
+            .transport_field_identity_exact(column)?,
+        },
+        other => other,
+    })
+}
+
+impl SchemaBridge {
+    fn schema_access_changes(&self) -> Vec<AccessPolicyChange> {
+        let source = self.transport.source.schema.schema_access();
+        let target = self.transport.target.schema.schema_access();
+        let mut changes = Vec::new();
+        let capability_ids: BTreeSet<_> = source
+            .capabilities
+            .keys()
+            .chain(target.capabilities.keys())
+            .copied()
+            .collect();
+        for id in capability_ids {
+            if let Some(kind) = classify_access_capability_change(self, source, target, id) {
+                let mut affected_roles = access_roles_using_capability(source, id);
+                affected_roles.extend(access_roles_using_capability(target, id));
+                changes.push(AccessPolicyChange {
+                    subject: crate::AccessPolicySubject::Capability(id),
+                    kind,
+                    affected_roles,
+                });
+            }
+        }
+        let role_ids: BTreeSet<_> = source
+            .roles
+            .keys()
+            .chain(target.roles.keys())
+            .copied()
+            .collect();
+        for id in role_ids {
+            if let Some(kind) = classify_access_role_change(source, target, id) {
+                let mut affected_roles = access_roles_including_role(source, id);
+                affected_roles.extend(access_roles_including_role(target, id));
+                affected_roles.insert(id);
+                changes.push(AccessPolicyChange {
+                    subject: crate::AccessPolicySubject::Role(id),
+                    kind,
+                    affected_roles,
+                });
+            }
+        }
+        changes
+    }
+
+    pub fn transport_field_identity_exact(
+        &self,
+        source_field: kernel_types::SemanticId,
+    ) -> Result<kernel_types::SemanticId, TransportError> {
+        let source_def = self
+            .transport
+            .source
+            .schema
+            .field(source_field)
+            .ok_or(TransportError::UnknownSourceField(source_field))?;
+        if self.transport.field_passthrough.contains(&source_field) {
+            return Ok(source_field);
+        }
+
+        let mut target = None;
+        for rewrite in &self.transport.field_rewrites {
+            if rewrite.source_fields.as_slice() != [source_field] {
+                continue;
+            }
+            let exact_identity = rewrite.transform.root()
+                == &(kernel_query::Expr::ProductField {
+                    input: Box::new(kernel_query::Expr::Input),
+                    field: source_field,
+                });
+            let target_def = self
+                .transport
+                .target
+                .schema
+                .field(rewrite.target_field)
+                .ok_or(TransportError::UnknownTargetField(rewrite.target_field))?;
+            if !exact_identity
+                || source_def.owner != target_def.owner
+                || source_def.value != target_def.value
+                || target.replace(rewrite.target_field).is_some()
+            {
+                return Err(TransportError::UnrepresentableSourceFieldDependency(
+                    source_field,
+                ));
+            }
+        }
+        target.ok_or(TransportError::UnrepresentableSourceFieldDependency(
+            source_field,
+        ))
+    }
 }
 
 impl SchemaMigrationTransport {
+    pub fn verify(
+        source: &SemanticContext,
+        target: &SemanticContext,
+        registry: &SemanticRegistry,
+        field_rewrites: Vec<MigrationFieldRewrite>,
+        relation_rewrites: Vec<MigrationRelationRewrite>,
+    ) -> Result<Self, TransportError> {
+        Self::verify_transport(source, target, registry, field_rewrites, relation_rewrites)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "Keep the complete operator or protocol case analysis together."
     )]
-    pub fn verify(
+    fn verify_transport(
         source: &SemanticContext,
         target: &SemanticContext,
         registry: &SemanticRegistry,
@@ -803,14 +1377,151 @@ impl SchemaMigrationTransport {
             return Err(TransportError::UnknownTargetRelation(*unknown));
         }
 
-        Ok(Self {
-            source: source.clone(),
-            target: target.clone(),
-            field_rewrites: prepared_fields,
-            field_passthrough,
-            relation_rewrites: prepared_relations,
-            relation_passthrough,
-        })
+        let mut bridge = SchemaBridge {
+            transport: Self {
+                source: source.clone(),
+                target: target.clone(),
+                field_rewrites: prepared_fields,
+                field_passthrough,
+                relation_rewrites: prepared_relations,
+                relation_passthrough,
+                access_policy_changes: Vec::new(),
+            },
+        };
+        bridge.transport.access_policy_changes = bridge.schema_access_changes();
+        Ok(bridge.transport)
+    }
+
+    #[must_use]
+    pub fn access_policy_changes(&self) -> &[AccessPolicyChange] {
+        &self.access_policy_changes
+    }
+
+    /// Proves the client-role observation factorization
+    /// `View_target(role) ∘ M = F_role ∘ View_source(role)` at the exact
+    /// permission-coordinate boundary. Every target observation without an
+    /// exact transported source observation is returned as a declassification
+    /// edge instead of being hidden inside a coarse policy-change category.
+    #[must_use]
+    pub fn certify_access_noninterference(&self) -> AccessNoninterferenceCertification {
+        fn is_observation(permission: kernel_schema::PermissionCoordinate) -> bool {
+            use kernel_schema::PermissionCoordinate as P;
+            matches!(
+                permission,
+                P::ModelRead
+                    | P::ReadRelation { .. }
+                    | P::ReadField { .. }
+                    | P::HistoricalRead
+                    | P::HistoryRead
+                    | P::Watch
+            )
+        }
+
+        let source_access = self.source.schema.schema_access();
+        let target_access = self.target.schema.schema_access();
+        let mut flows = BTreeSet::new();
+        let mut declassification_edges = BTreeSet::new();
+
+        for role in target_access.roles.keys().copied() {
+            let target_permissions = self
+                .target
+                .schema
+                .resolve_access_roles([role])
+                .unwrap_or_default();
+            let source_permissions = if source_access.roles.contains_key(&role) {
+                self.source
+                    .schema
+                    .resolve_access_roles([role])
+                    .unwrap_or_default()
+            } else {
+                BTreeSet::new()
+            };
+
+            let mut transported = BTreeMap::new();
+            for source_permission in source_permissions
+                .into_iter()
+                .filter(|p| is_observation(*p))
+            {
+                if let Ok(target_permission) = (SchemaBridge {
+                    transport: self.clone(),
+                })
+                .transport_access_permission_exact(source_permission)
+                {
+                    transported
+                        .entry(target_permission)
+                        .or_insert(source_permission);
+                }
+            }
+
+            for target_permission in target_permissions
+                .into_iter()
+                .filter(|p| is_observation(*p))
+            {
+                if let Some(source_permission) = transported.get(&target_permission).copied() {
+                    flows.insert(AccessObservationFlow {
+                        role,
+                        source: source_permission,
+                        target: target_permission,
+                    });
+                } else {
+                    declassification_edges.insert(AccessDeclassificationEdge {
+                        role,
+                        target: target_permission,
+                    });
+                }
+            }
+        }
+
+        AccessNoninterferenceCertification {
+            flows: flows.into_iter().collect(),
+            declassification_edges: declassification_edges.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn source_field_dependencies(&self) -> BTreeSet<kernel_types::SemanticId> {
+        self.field_rewrites
+            .iter()
+            .flat_map(|rewrite| rewrite.source_fields.iter().copied())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn source_relation_dependencies(&self) -> BTreeSet<kernel_types::SemanticId> {
+        let mut out = BTreeSet::new();
+        for rewrite in &self.relation_rewrites {
+            match rewrite {
+                PreparedMigrationRelationRewrite::Query {
+                    source_relations, ..
+                } => {
+                    out.extend(source_relations.iter().copied());
+                }
+                PreparedMigrationRelationRewrite::Rows {
+                    source_relation, ..
+                } => {
+                    out.insert(*source_relation);
+                }
+            }
+        }
+        out
+    }
+
+    /// Returns the exact source-field footprint used to produce one target
+    /// field. Definitionally preserved fields depend on themselves; new
+    /// constants have an empty footprint; split/merge rewrites return every
+    /// declared source input.
+    #[must_use]
+    pub fn target_field_source_dependencies(
+        &self,
+        target_field: kernel_types::SemanticId,
+    ) -> Option<BTreeSet<kernel_types::SemanticId>> {
+        if self.field_passthrough.contains(&target_field) {
+            return Some(BTreeSet::from([target_field]));
+        }
+        self.field_rewrites
+            .iter()
+            .find(|rewrite| rewrite.target_field == target_field)
+            .map(|rewrite| rewrite.source_fields.iter().copied().collect())
     }
 
     /// Returns the independently materializable physical coordinate for one
@@ -852,6 +1563,103 @@ impl SchemaMigrationTransport {
                 }),
                 _ => None,
             })
+    }
+
+    /// Classifies the exact row-local observation transport for one source
+    /// relation without evaluating or materializing relation rows.
+    ///
+    /// This separates the zero-row-touch identity theorem from pointwise
+    /// value/shape rewrites.  The latter have an exact row transform and exact
+    /// future delta transport, but do not by themselves prove that an existing
+    /// maintained query state can change value domain without touching that
+    /// state.
+    pub fn classify_observation_relation_transport_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+    ) -> Result<ObservationRelationTransport, TransportError> {
+        let source_def = self
+            .source
+            .schema
+            .relation(source_relation)
+            .ok_or(TransportError::UnknownSourceRelation(source_relation))?;
+        if self.relation_passthrough.contains(&source_relation) {
+            return Ok(ObservationRelationTransport::RowIdentity {
+                target_relation: source_relation,
+            });
+        }
+
+        let mut transport = None;
+        for rewrite in &self.relation_rewrites {
+            let PreparedMigrationRelationRewrite::Rows {
+                source_relation: rewrite_source,
+                target_relation,
+                columns,
+            } = rewrite
+            else {
+                continue;
+            };
+            if *rewrite_source != source_relation {
+                continue;
+            }
+            if transport.is_some() {
+                return Err(TransportError::AmbiguousObservationRelation(
+                    source_relation,
+                ));
+            }
+            let target_def = self
+                .target
+                .schema
+                .relation(*target_relation)
+                .ok_or(TransportError::UnknownTargetRelation(*target_relation))?;
+            let row_identity = source_def.columns == target_def.columns
+                && source_def.semantics == target_def.semantics
+                && columns.len() == source_def.columns.len()
+                && columns.iter().enumerate().all(|(ordinal, column)| {
+                    let [(source_column, source_ordinal)] = column.source_columns.as_slice() else {
+                        return false;
+                    };
+                    *source_ordinal == ordinal
+                        && column.transform.root()
+                            == &(kernel_query::Expr::ProductField {
+                                input: Box::new(kernel_query::Expr::Input),
+                                field: *source_column,
+                            })
+                });
+            transport = Some(if row_identity {
+                ObservationRelationTransport::RowIdentity {
+                    target_relation: *target_relation,
+                }
+            } else {
+                ObservationRelationTransport::RowLocalStateTransform {
+                    target_relation: *target_relation,
+                }
+            });
+        }
+        transport.ok_or(TransportError::UnrepresentableObservationRelation(
+            source_relation,
+        ))
+    }
+
+    /// Returns the target relation for a source observation whose exact row
+    /// representation survives this migration unchanged.
+    ///
+    /// This is deliberately narrower than general migration transport. A
+    /// row-local rewrite is observation-identity only when the target has the
+    /// same relational type/semantics and every target ordinal is the exact
+    /// projection of the source column at the same ordinal. Column semantic
+    /// IDs may change; row values and ordinal meaning may not. General query
+    /// rewrites, permutations, conversions, split/merge and fan-out remain
+    /// fail-closed so maintained query state never needs a result rebuild.
+    pub fn transport_observation_relation_identity_exact(
+        &self,
+        source_relation: kernel_types::SemanticId,
+    ) -> Result<kernel_types::SemanticId, TransportError> {
+        match self.classify_observation_relation_transport_exact(source_relation)? {
+            ObservationRelationTransport::RowIdentity { target_relation } => Ok(target_relation),
+            ObservationRelationTransport::RowLocalStateTransform { .. } => Err(
+                TransportError::UnrepresentableObservationRelation(source_relation),
+            ),
+        }
     }
 
     /// Transports passive field-observation dependencies through the verified

@@ -3,8 +3,8 @@
 //! Maintained query execution uses the exact Γ-measure carrier internally.
 //! `RelationDelta` remains an observation/input boundary whose zero-copy view
 //! embeds unit row insertions/removals into the same exact coefficient algebra.
-//! Legacy machine-word carriers are compatibility/test representations, not an
-//! alternative production calculus.
+//! Machine-word carriers are bounded public/input representations, not an
+//! alternative maintained-query calculus.
 
 /// One weighted row in a finite signed delta.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,7 +382,7 @@ impl<R, const INLINE: usize> DeltaView<R> for AdaptiveDelta<R, INLINE> {
     }
 }
 
-/// Zero-copy compatibility adapter over the current public `RelationDelta`.
+/// Zero-copy boundary view over the current public `RelationDelta`.
 pub struct RelationDeltaView<'a> {
     pub(crate) removed: &'a [crate::Row],
     pub(crate) inserted: &'a [crate::Row],

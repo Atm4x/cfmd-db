@@ -3211,3 +3211,123 @@ fn physical_atom_store_ownership_hostile_benchmark() {
         );
     }
 }
+
+#[test]
+fn packed_sum_column_uses_layout_local_tags_and_dense_payload_carriers() {
+    let idle = SemanticId::new(549_001);
+    let running = SemanticId::new(549_002);
+    let failed = SemanticId::new(549_003);
+    let done = SemanticId::new(549_004);
+    let values = (0..100)
+        .map(|index| match index % 4 {
+            0 => Value::Variant {
+                tag: idle,
+                value: Box::new(Value::Unit),
+            },
+            1 => Value::Variant {
+                tag: running,
+                value: Box::new(Value::I64(index)),
+            },
+            2 => Value::Variant {
+                tag: failed,
+                value: Box::new(Value::Text(format!("e{index}"))),
+            },
+            _ => Value::Variant {
+                tag: done,
+                value: Box::new(Value::Unit),
+            },
+        })
+        .collect::<Vec<_>>();
+    let packed = PackedSumColumn::new(values.clone()).unwrap();
+
+    assert_eq!(packed.bits_per_tag(), 2);
+    assert_eq!(packed.packed_tags().len(), 25);
+    assert_eq!(packed.payload_value_count(), 50);
+    assert!(packed.payload_ordinals().is_some());
+    assert_eq!(packed.value_at(37).unwrap(), values[37]);
+    assert!(packed.matches_variant(37, running).unwrap());
+    assert!(!packed.matches_variant(37, idle).unwrap());
+    assert_eq!(packed.variants(), &[idle, running, failed, done]);
+}
+
+#[test]
+fn fieldless_sum_has_no_per_row_payload_ordinal_stream() {
+    let a = SemanticId::new(549_010);
+    let b = SemanticId::new(549_011);
+    let values = (0..8_192)
+        .map(|index| Value::Variant {
+            tag: if index % 2 == 0 { a } else { b },
+            value: Box::new(Value::Unit),
+        })
+        .collect::<Vec<_>>();
+    let packed = PackedSumColumn::new(values).unwrap();
+    assert_eq!(packed.bits_per_tag(), 1);
+    assert_eq!(packed.packed_tags().len(), 1_024);
+    assert!(packed.payload_ordinals().is_none());
+    assert_eq!(packed.payload_value_count(), 0);
+}
+
+#[test]
+fn factorized_sum_field_materializes_as_packed_native_atom_without_semantic_rewrite() {
+    use kernel_schema::{FieldDef, ScalarType, Schema, SemanticEnvironment, TypeExpr};
+    use kernel_types::{SchemaRevisionId, SemanticEnvId};
+
+    let owner = SemanticId::new(549_100);
+    let field = SemanticId::new(549_101);
+    let idle = SemanticId::new(549_102);
+    let running = SemanticId::new(549_103);
+    let mut schema = Schema::new(SchemaRevisionId::new(549));
+    schema
+        .define_field(FieldDef {
+            id: field,
+            owner,
+            value: TypeExpr::Sum(BTreeMap::from([
+                (idle, TypeExpr::Scalar(ScalarType::Unit)),
+                (running, TypeExpr::Scalar(ScalarType::I64)),
+            ])),
+        })
+        .unwrap();
+    let context = SemanticContext {
+        schema,
+        environment: SemanticEnvironment::new(SemanticEnvId::new(549)),
+    };
+    let mut state = DatabaseState::default();
+    for index in 0..64_u128 {
+        let entity = EntityId::new(index + 1);
+        state.lifecycle.entities.insert(entity);
+        state.lifecycle.roots.insert(entity);
+        state
+            .model
+            .carriers
+            .entry(owner)
+            .or_default()
+            .insert(entity);
+        let value = if index % 2 == 0 {
+            Value::Variant {
+                tag: idle,
+                value: Box::new(Value::Unit),
+            }
+        } else {
+            Value::Variant {
+                tag: running,
+                value: Box::new(Value::I64(
+                    i64::try_from(index).expect("fixture index fits i64"),
+                )),
+            }
+        };
+        state.model.fields.insert((field, entity), value);
+    }
+
+    let (atoms, root) = realize_database_state_factorized(&state, &context).unwrap();
+    let atom = match root.fields()[&field].expr() {
+        FactorizedFieldExpr::Direct(atom) => *atom,
+        other => panic!("unexpected sum realization: {other:?}"),
+    };
+    let PhysicalAtomPayload::PackedSumFieldSegment(segment) = atoms.get(atom).unwrap().payload()
+    else {
+        panic!("sum field must use packed native physical atom");
+    };
+    assert_eq!(segment.column().bits_per_tag(), 1);
+    assert_eq!(segment.column().payload_value_count(), 32);
+    assert_eq!(root.evaluate(&atoms).unwrap(), state);
+}

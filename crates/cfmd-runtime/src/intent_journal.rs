@@ -41,138 +41,6 @@ fn push_len(out: &mut Vec<u8>, len: usize) {
     out.extend_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
 }
 
-fn push_text(out: &mut Vec<u8>, text: &str) {
-    push_len(out, text.len());
-    out.extend_from_slice(text.as_bytes());
-}
-
-fn encode_rule_value(out: &mut Vec<u8>, value: &crate::RuleValueExpr) {
-    match value {
-        crate::RuleValueExpr::Input => out.push(0),
-        crate::RuleValueExpr::Field(field) => {
-            out.push(1);
-            out.extend_from_slice(&field.raw().to_le_bytes());
-        }
-    }
-}
-
-fn encode_text_pattern(out: &mut Vec<u8>, pattern: &crate::TextPattern) {
-    match pattern {
-        crate::TextPattern::Never => out.push(0),
-        crate::TextPattern::Empty => out.push(1),
-        crate::TextPattern::Literal(text) => {
-            out.push(2);
-            push_text(out, text);
-        }
-        crate::TextPattern::AnyScalar => out.push(3),
-        crate::TextPattern::Concat(parts) => {
-            out.push(4);
-            push_len(out, parts.len());
-            for part in parts {
-                encode_text_pattern(out, part);
-            }
-        }
-        crate::TextPattern::Alternate(parts) => {
-            out.push(5);
-            let mut frames = parts
-                .iter()
-                .map(|part| {
-                    let mut frame = Vec::new();
-                    encode_text_pattern(&mut frame, part);
-                    frame
-                })
-                .collect::<Vec<_>>();
-            frames.sort();
-            frames.dedup();
-            push_len(out, frames.len());
-            for frame in frames {
-                push_len(out, frame.len());
-                out.extend_from_slice(&frame);
-            }
-        }
-        crate::TextPattern::ZeroOrMore(pattern) => {
-            out.push(6);
-            encode_text_pattern(out, pattern);
-        }
-    }
-}
-
-fn encode_rule_expr(out: &mut Vec<u8>, expression: &SemanticRuleExpr) {
-    match expression {
-        SemanticRuleExpr::True => out.push(0),
-        SemanticRuleExpr::False => out.push(1),
-        SemanticRuleExpr::And(rules) | SemanticRuleExpr::Or(rules) => {
-            out.push(if matches!(expression, SemanticRuleExpr::And(_)) {
-                2
-            } else {
-                3
-            });
-            let mut frames = rules
-                .iter()
-                .map(|rule| {
-                    let mut frame = Vec::new();
-                    encode_rule_expr(&mut frame, rule);
-                    frame
-                })
-                .collect::<Vec<_>>();
-            frames.sort();
-            frames.dedup();
-            push_len(out, frames.len());
-            for frame in frames {
-                push_len(out, frame.len());
-                out.extend_from_slice(&frame);
-            }
-        }
-        SemanticRuleExpr::Not(rule) => {
-            out.push(4);
-            encode_rule_expr(out, rule);
-        }
-        SemanticRuleExpr::I64Range { value, min, max } => {
-            out.push(5);
-            encode_rule_value(out, value);
-            match min {
-                None => out.push(0),
-                Some(value) => {
-                    out.push(1);
-                    out.extend_from_slice(&value.to_le_bytes());
-                }
-            }
-            match max {
-                None => out.push(0),
-                Some(value) => {
-                    out.push(1);
-                    out.extend_from_slice(&value.to_le_bytes());
-                }
-            }
-        }
-        SemanticRuleExpr::TextLength { value, min, max } => {
-            out.push(6);
-            encode_rule_value(out, value);
-            out.extend_from_slice(&u64::try_from(*min).unwrap_or(u64::MAX).to_le_bytes());
-            match max {
-                None => out.push(0),
-                Some(value) => {
-                    out.push(1);
-                    out.extend_from_slice(&u64::try_from(*value).unwrap_or(u64::MAX).to_le_bytes());
-                }
-            }
-        }
-        SemanticRuleExpr::TextOneOf { value, allowed } => {
-            out.push(7);
-            encode_rule_value(out, value);
-            push_len(out, allowed.len());
-            for text in allowed {
-                push_text(out, text);
-            }
-        }
-        SemanticRuleExpr::TextMatches { value, pattern } => {
-            out.push(8);
-            encode_rule_value(out, value);
-            encode_text_pattern(out, pattern);
-        }
-    }
-}
-
 fn encode_requirement(requirement: &IntentRequirement) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&requirement.relation.raw().to_le_bytes());
@@ -182,7 +50,10 @@ fn encode_requirement(requirement: &IntentRequirement) -> Vec<u8> {
             .unwrap_or(u64::MAX)
             .to_le_bytes(),
     );
-    encode_rule_expr(&mut out, &requirement.expression);
+    let kernel_expression = crate::schema::semantic_rule_to_kernel(requirement.expression.clone());
+    out.extend_from_slice(&kernel_schema::canonical_semantic_rule_bytes(
+        &kernel_expression,
+    ));
     out
 }
 
@@ -322,6 +193,15 @@ impl IntentJournal {
         entity: Id<E>,
         expression: SemanticRuleExpr,
     ) -> Result<&mut Self> {
+        self.require_on_relation(entity, E::relation_id(), expression)
+    }
+
+    pub(crate) fn require_on_relation<E: Object>(
+        &mut self,
+        entity: Id<E>,
+        relation: crate::RelationId,
+        expression: SemanticRuleExpr,
+    ) -> Result<&mut Self> {
         let identity_column = E::identity_column().ok_or_else(|| {
             crate::Error::new(
                 crate::ErrorKind::InvalidSchema,
@@ -332,7 +212,7 @@ impl IntentJournal {
             )
         })?;
         self.requirements.push(IntentRequirement {
-            relation: E::relation_id(),
+            relation,
             entity: entity.raw(),
             identity_column,
             identity_value: entity.into_value(),

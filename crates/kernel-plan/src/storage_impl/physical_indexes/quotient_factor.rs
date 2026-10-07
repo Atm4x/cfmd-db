@@ -3,8 +3,10 @@ pub(super) struct MaterializedSemanticQuotientFactorState {
     binding: SemanticIndexBinding,
     key_binding: kernel_semantic_index::SemanticIndexBinding,
     compiled: Vec<kernel_semantics::CompiledEquivalence>,
-    buckets: PersistentOrdMap<Vec<kernel_semantics::CanonicalEqKey>, OrderedPhysicalRowBucket>,
-    reverse: PersistentOrdMap<PhysicalRowId, Vec<kernel_semantics::CanonicalEqKey>>,
+    retention: kernel_semantics::fiber_retention::DirectRowKeyMassRetention<
+        PhysicalRowId,
+        kernel_semantics::CanonicalEqKey,
+    >,
 }
 
 impl MaterializedSemanticQuotientFactorState {
@@ -33,28 +35,19 @@ impl MaterializedSemanticQuotientFactorState {
         for part in &binding.key_parts {
             compiled.push(registry.compile_equivalence(context, part.equivalence)?);
         }
-        let mut buckets = PersistentOrdMap::<
-            Vec<kernel_semantics::CanonicalEqKey>,
-            OrderedPhysicalRowBucket,
-        >::default();
-        let mut reverse = PersistentOrdMap::default();
+        let mut retention = kernel_semantics::fiber_retention::DirectRowKeyMassRetention::default();
         for row_index in relation.scan_positions() {
             let row = materialize_native_row(&relation.data, row_index)?;
             let key = semantic_quotient_factor_row_key(&binding, &compiled, &row)?;
-            let row_id = relation.row_id_at(row_index)?;
-            let mut bucket = buckets.get(&key).cloned().unwrap_or_default();
-            bucket.push(row_id)?;
-            buckets.insert(key.clone(), bucket);
-            if reverse.insert(row_id, key).is_some() {
-                return Err(RelQueryError::InconsistentIncrementalDelta.into());
-            }
+            retention
+                .insert(relation.row_id_at(row_index)?, key)
+                .map_err(row_key_mass_retention_error_to_physical)?;
         }
         Ok(Self {
             binding,
             key_binding,
             compiled,
-            buckets,
-            reverse,
+            retention,
         })
     }
 
@@ -80,14 +73,22 @@ impl MaterializedSemanticQuotientFactorState {
 
     #[must_use]
     fn row_count(&self) -> usize {
-        self.reverse.len()
+        self.retention.row_count()
+    }
+
+    #[must_use]
+    fn statistics_snapshot(&self) -> SemanticKeyStatistics {
+        SemanticKeyStatistics {
+            row_count: self.row_count(),
+            distinct_key_count: self.retention.distinct_joint_key_count(),
+        }
     }
 
     fn single_key_for(&self, row_id: PhysicalRowId) -> Option<&kernel_semantics::CanonicalEqKey> {
         if self.binding.key_parts.len() != 1 {
             return None;
         }
-        self.reverse.get(&row_id).and_then(|key| key.first())
+        self.retention.row_key(&row_id).and_then(|key| key.first())
     }
 
     fn row_key(
@@ -108,7 +109,7 @@ impl MaterializedSemanticQuotientFactorState {
         }
         for (row_id, row) in &delta.removed {
             let key = self.row_key(row)?;
-            if self.reverse.get(row_id) != Some(&key) {
+            if self.retention.row_key(row_id) != Some(key.as_slice()) {
                 return Err(RelQueryError::InconsistentIncrementalDelta.into());
             }
         }
@@ -126,34 +127,15 @@ impl MaterializedSemanticQuotientFactorState {
     ) -> Result<(), PhysicalExecutionError> {
         for (row_id, row) in &delta.removed {
             let key = self.row_key(row)?;
-            if self.reverse.get(row_id) != Some(&key) {
-                return Err(RelQueryError::InconsistentIncrementalDelta.into());
-            }
-            let mut bucket = self
-                .buckets
-                .get(&key)
-                .cloned()
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
-            if !bucket.remove(*row_id) {
-                return Err(RelQueryError::InconsistentIncrementalDelta.into());
-            }
-            if bucket.is_empty() {
-                self.buckets.remove(&key);
-            } else {
-                self.buckets.insert(key.clone(), bucket);
-            }
-            self.reverse
-                .remove(row_id)
-                .ok_or(RelQueryError::InconsistentIncrementalDelta)?;
+            self.retention
+                .remove(row_id, &key)
+                .map_err(row_key_mass_retention_error_to_physical)?;
         }
         for (row_id, row) in &delta.inserted {
             let key = self.row_key(row)?;
-            if self.reverse.insert(*row_id, key.clone()).is_some() {
-                return Err(RelQueryError::InconsistentIncrementalDelta.into());
-            }
-            let mut bucket = self.buckets.get(&key).cloned().unwrap_or_default();
-            bucket.push(*row_id)?;
-            self.buckets.insert(key, bucket);
+            self.retention
+                .insert(*row_id, key)
+                .map_err(row_key_mass_retention_error_to_physical)?;
         }
         Ok(())
     }
@@ -177,3 +159,17 @@ fn semantic_quotient_factor_row_key(
         .collect()
 }
 
+fn row_key_mass_retention_error_to_physical(
+    error: kernel_semantics::fiber_retention::RowKeyMassRetentionError,
+) -> PhysicalExecutionError {
+    match error {
+        kernel_semantics::fiber_retention::RowKeyMassRetentionError::CountOverflow => {
+            PhysicalExecutionError::StatisticsCountOverflow
+        }
+        kernel_semantics::fiber_retention::RowKeyMassRetentionError::DuplicateRow
+        | kernel_semantics::fiber_retention::RowKeyMassRetentionError::MissingRow
+        | kernel_semantics::fiber_retention::RowKeyMassRetentionError::InconsistentDelta => {
+            RelQueryError::InconsistentIncrementalDelta.into()
+        }
+    }
+}

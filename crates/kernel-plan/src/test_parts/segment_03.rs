@@ -792,7 +792,7 @@ fn observable_atom_state_matches_statistics_view() {
     store.remove_semantic_statistics(&binding);
     assert_eq!(
         store
-            .semantic_statistics(&binding, &context, &registry)
+            .semantic_cardinality(&binding, &context, &registry)
             .unwrap(),
         Some(SemanticKeyStatistics {
             row_count: 3,
@@ -904,7 +904,7 @@ fn observable_atom_state_rejects_gamma_drift_before_relation_mutation() {
         .unwrap();
     assert!(
         store
-            .semantic_statistics(&binding, &changed, &registry)
+            .semantic_cardinality(&binding, &changed, &registry)
             .unwrap()
             .is_none()
     );
@@ -990,11 +990,8 @@ fn observable_atom_state_factors_multi_column_joint_and_projected_fibers() {
     );
     let state = store.observable_atom_state(&binding).unwrap();
     assert_eq!(state.atom_count(), 3);
-    assert_eq!(
-        state.product_projection().source(),
-        &[state.product_observable()]
-    );
-    assert_eq!(state.product_projection().target().len(), 2);
+    assert_eq!(state.arity(), 2);
+    assert_eq!(state.semantic_revision(), context.revision());
 }
 
 #[test]
@@ -1015,7 +1012,7 @@ fn semantic_statistics_are_invalidated_by_gamma_change() {
         .pin_module(equivalence, exact_digest);
     assert_eq!(
         store
-            .semantic_statistics(&binding, &changed_context, &registry)
+            .semantic_cardinality(&binding, &changed_context, &registry)
             .unwrap(),
         None
     );
@@ -1034,7 +1031,7 @@ fn semantic_statistics_are_invalidated_by_gamma_change() {
 }
 
 #[test]
-fn join_reuses_tiny_persisted_semantic_index_while_filter_can_still_reject_it() {
+fn join_and_filter_reuse_shared_revision_semantic_lane() {
     let (context, registry, relation, equivalence, binding, store) = text_semantic_index_fixture();
     let mut catalog = PhysicalCatalog::default();
     catalog.bind_relation(relation, binding);
@@ -1064,9 +1061,9 @@ fn join_reuses_tiny_persisted_semantic_index_while_filter_can_still_reject_it() 
         .execute_native_pinned(&store, &registry)
         .unwrap();
     assert_eq!(filter_value.rows().len(), 2);
-    assert_eq!(filter_stats.persisted_index_hits, 0);
-    assert_eq!(filter_stats.persisted_index_cost_rejections, 1);
-    assert_eq!(filter_stats.scanned_rows, 3);
+    assert_eq!(filter_stats.persisted_index_hits, 1);
+    assert_eq!(filter_stats.persisted_index_cost_rejections, 0);
+    assert_eq!(filter_stats.scanned_rows, 2);
 }
 
 #[test]

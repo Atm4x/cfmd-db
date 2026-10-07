@@ -642,7 +642,7 @@ fn execute_expr(
 /// complete Γ row key. The same sealed evidence is returned with each emitted
 /// row so the physical witness can adopt it instead of canonicalizing output a
 /// second time. `Ok(false)` means this expression has no such lowering; the
-/// caller may use the ordinary one-shot executor, never the legacy evaluator.
+/// caller may use the ordinary one-shot executor; there is no alternate historical evaluator.
 #[allow(
     clippy::too_many_lines,
     reason = "Keep the complete operator or protocol case analysis together."

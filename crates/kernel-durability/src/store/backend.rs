@@ -20,7 +20,7 @@ use crate::single_file::{
     SingleFileContainer, SingleFileSectionKind, compaction_io::SingleFileCompactionIo,
 };
 use crate::storage_encryption::StorageEncryption;
-use crate::wal::FileRevisionWal;
+use crate::wal::RuntimeRevisionWal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DurabilityBackendCapabilities {
@@ -40,6 +40,11 @@ pub(super) struct SingleFileDurabilityBackend {
     container: SingleFileContainer,
 }
 
+#[derive(Debug)]
+pub(super) struct VolatileDurabilityBackend {
+    protection_floor: crate::storage_encryption::StorageProtectionProfile,
+}
+
 /// Owns physical durability resources. Semantic store code must not infer
 /// durability rules from paths or optional sidecars; layout-specific access is
 /// centralized here and explicit.
@@ -47,6 +52,7 @@ pub(super) struct SingleFileDurabilityBackend {
 pub(super) enum DurabilityBackend {
     Directory(DirectoryDurabilityBackend),
     SingleFile(Box<SingleFileDurabilityBackend>),
+    Volatile(VolatileDurabilityBackend),
 }
 
 impl DurabilityBackend {
@@ -58,12 +64,23 @@ impl DurabilityBackend {
         Self::SingleFile(Box::new(SingleFileDurabilityBackend { container }))
     }
 
+    pub(super) const fn volatile(
+        protection_floor: crate::storage_encryption::StorageProtectionProfile,
+    ) -> Self {
+        Self::Volatile(VolatileDurabilityBackend { protection_floor })
+    }
+
     pub(super) const fn capabilities(&self) -> DurabilityBackendCapabilities {
         match self {
             Self::Directory(_) | Self::SingleFile(_) => DurabilityBackendCapabilities {
                 streaming_checkpoint: true,
                 external_freshness: true,
                 physical_compaction: true,
+            },
+            Self::Volatile(_) => DurabilityBackendCapabilities {
+                streaming_checkpoint: false,
+                external_freshness: false,
+                physical_compaction: false,
             },
         }
     }
@@ -75,6 +92,10 @@ impl DurabilityBackend {
                 offset: 0,
                 reason: "historical epoch materialization is not yet representable by the single-file backend",
             }),
+            Self::Volatile(_) => Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "volatile backend has no historical directory root",
+            }),
         }
     }
 
@@ -82,10 +103,23 @@ impl DurabilityBackend {
         matches!(self, Self::SingleFile(_))
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub(super) const fn is_volatile(&self) -> bool {
+        matches!(self, Self::Volatile(_))
+    }
+
+    pub(super) fn path(&self) -> Option<&Path> {
         match self {
-            Self::Directory(backend) => &backend.root,
-            Self::SingleFile(backend) => backend.container.path(),
+            Self::Directory(backend) => Some(&backend.root),
+            Self::SingleFile(backend) => Some(backend.container.path()),
+            Self::Volatile(_) => None,
+        }
+    }
+
+    pub(super) fn protection_profile(&self) -> crate::storage_encryption::StorageProtectionProfile {
+        match self {
+            Self::Directory(_) => crate::storage_encryption::StorageProtectionProfile::Unencrypted,
+            Self::SingleFile(backend) => backend.container.protection_profile(),
+            Self::Volatile(backend) => backend.protection_floor,
         }
     }
 
@@ -95,6 +129,10 @@ impl DurabilityBackend {
             Self::SingleFile(_) => Err(DurabilityError::Protocol {
                 offset: 0,
                 reason: "directory-only durability operation requested for single-file backend",
+            }),
+            Self::Volatile(_) => Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "directory-only durability operation requested for volatile backend",
             }),
         }
     }
@@ -108,11 +146,15 @@ impl DurabilityBackend {
                 offset: 0,
                 reason: "single-file durability operation requested for directory backend",
             }),
+            Self::Volatile(_) => Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "single-file durability operation requested for volatile backend",
+            }),
         }
     }
     pub(super) fn persist_replication_frames(
         &mut self,
-        wal: &mut FileRevisionWal,
+        wal: &mut RuntimeRevisionWal,
         frames: &[Vec<u8>],
     ) -> Result<(), DurabilityError> {
         match self {
@@ -135,6 +177,12 @@ impl DurabilityBackend {
                 }
                 Ok(())
             }
+            Self::Volatile(_) => {
+                for frame in frames {
+                    wal.append_replication_authority_frame(frame)?;
+                }
+                wal.durability_barrier()
+            }
         }
     }
 
@@ -146,6 +194,12 @@ impl DurabilityBackend {
             Self::Directory(backend) => directory_freshness_material(&backend.root)?.generation,
             Self::SingleFile(backend) => {
                 single_file_freshness_material(&mut backend.container)?.generation
+            }
+            Self::Volatile(_) => {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "external freshness is not a volatile-backend operation",
+                });
             }
         };
         if material.generation != expected_generation {
@@ -181,7 +235,7 @@ impl DurabilityBackend {
     )]
     pub(super) fn compact_obsolete_generations(
         &mut self,
-        wal: &mut FileRevisionWal,
+        wal: &mut RuntimeRevisionWal,
         generation: u64,
         checkpoint_revision: RevisionId,
         durable_head: RevisionId,
@@ -290,7 +344,7 @@ impl DurabilityBackend {
                 let mut single_file_fault =
                     |step| hook.hit(StoreFaultPoint::SingleFileCompaction(step));
                 let _ = backend.container.compact_active_generation(
-                    wal,
+                    wal.file_mut()?,
                     checkpoint_revision,
                     &seeds,
                     durable_head,
@@ -299,6 +353,7 @@ impl DurabilityBackend {
                 )?;
                 Ok(())
             }
+            Self::Volatile(_) => Ok(()),
         }
     }
 }

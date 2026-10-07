@@ -102,6 +102,7 @@ name = "cfmd-runtime"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "kernel-auth",
  "kernel-durability",
  "kernel-lens",
  "kernel-model",
@@ -537,6 +538,7 @@ dependencies = [
  "kernel-fixpoint",
  "kernel-model",
  "kernel-persistent",
+ "kernel-proof",
  "kernel-schema",
  "kernel-semantic-index",
  "kernel-semantics",

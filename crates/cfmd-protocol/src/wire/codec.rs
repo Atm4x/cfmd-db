@@ -160,6 +160,10 @@ impl Encoder {
                 self.u8(1)?;
                 self.u64(revision)
             }
+            SnapshotTarget::ContractHead { schema_revision } => {
+                self.u8(2)?;
+                self.u64(schema_revision)
+            }
         }
     }
 
@@ -433,8 +437,12 @@ impl Encoder {
                 self.u8(0)?;
                 self.u64(revision)
             }
-            CommitResponse::AlreadyCommitted { revision } => {
+            CommitResponse::AlreadySatisfied { revision } => {
                 self.u8(1)?;
+                self.u64(revision)
+            }
+            CommitResponse::AlreadyCommitted { revision } => {
+                self.u8(2)?;
                 self.u64(revision)
             }
         }
@@ -459,6 +467,7 @@ impl Encoder {
             }
             HostedRequest::OpenWatch(request) => {
                 self.u8(4)?;
+                self.snapshot_target(request.target)?;
                 self.query(&request.query, next)
             }
             HostedRequest::NextWatch { subscription } => {
@@ -727,6 +736,9 @@ impl<'a> Decoder<'a> {
         match self.u8()? {
             0 => Ok(SnapshotTarget::Head),
             1 => Ok(SnapshotTarget::Revision(self.u64()?)),
+            2 => Ok(SnapshotTarget::ContractHead {
+                schema_revision: self.u64()?,
+            }),
             _ => Err(wire_error("unknown snapshot target")),
         }
     }
@@ -954,7 +966,10 @@ impl<'a> Decoder<'a> {
             0 => Ok(CommitResponse::Committed {
                 revision: self.u64()?,
             }),
-            1 => Ok(CommitResponse::AlreadyCommitted {
+            1 => Ok(CommitResponse::AlreadySatisfied {
+                revision: self.u64()?,
+            }),
+            2 => Ok(CommitResponse::AlreadyCommitted {
                 revision: self.u64()?,
             }),
             _ => Err(wire_error("unknown commit response variant")),
@@ -972,6 +987,7 @@ impl<'a> Decoder<'a> {
             }),
             3 => Ok(HostedRequest::Commit(self.commit_request(next)?)),
             4 => Ok(HostedRequest::OpenWatch(OpenWatchRequest {
+                target: self.snapshot_target()?,
                 query: self.query(next)?,
             })),
             5 => Ok(HostedRequest::NextWatch {
@@ -1164,6 +1180,9 @@ const fn error_code_tag(code: ProtocolErrorCode) -> u8 {
         ProtocolErrorCode::PermissionDenied => 15,
         ProtocolErrorCode::SessionClosed => 16,
         ProtocolErrorCode::Internal => 17,
+        ProtocolErrorCode::FormationProofUnavailable => 18,
+        ProtocolErrorCode::FormationProofInvalidated => 19,
+        ProtocolErrorCode::ContractNotRepresentable => 20,
     }
 }
 
@@ -1187,6 +1206,9 @@ fn error_code_from_tag(tag: u8) -> Result<ProtocolErrorCode> {
         15 => Ok(ProtocolErrorCode::PermissionDenied),
         16 => Ok(ProtocolErrorCode::SessionClosed),
         17 => Ok(ProtocolErrorCode::Internal),
+        18 => Ok(ProtocolErrorCode::FormationProofUnavailable),
+        19 => Ok(ProtocolErrorCode::FormationProofInvalidated),
+        20 => Ok(ProtocolErrorCode::ContractNotRepresentable),
         _ => Err(wire_error("unknown protocol error code")),
     }
 }

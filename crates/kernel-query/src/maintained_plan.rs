@@ -11,6 +11,7 @@ use crate::{
     blocker::{
         BlockerBuildSpec, BlockerDeltaPatch, MaintainedBlockerKind, MaterializedBlockerDeltaState,
     },
+    cq_semantic_identity::{CqSemanticIdentity, semantic_cq_identity},
     delta_abi::{
         CompiledDeltaEdgeIdentity, ExactDeltaSink, ExactDeltaView, ValidatedTransitionFrame,
     },
@@ -399,6 +400,10 @@ pub struct RelObservationForestBuildStats {
     pub root_occurrences: usize,
     pub unique_cells: usize,
     pub reused_subtrees: usize,
+    pub semantic_reused_subtrees: usize,
+    pub cq_identity_attempts: usize,
+    pub cq_identity_successes: usize,
+    pub q_hierarchical_cq_identities: usize,
     pub source_materializations: usize,
     pub source_rows_materialized: usize,
     pub local_cell_initializations: usize,
@@ -653,6 +658,9 @@ impl RelObservationForest {
         }
 
         let mut intern = HashMap::<RelExpr, RelObservationForestNodeId>::new();
+        let mut semantic_intern = HashMap::<CqSemanticIdentity, RelObservationForestNodeId>::new();
+        let mut semantic_identity_cache = HashMap::<RelExpr, Option<CqSemanticIdentity>>::new();
+        let semantic_intern_enabled = roots.len() > 1;
         let mut cells = Vec::<Arc<RelObservationForestCell>>::new();
         let mut outputs = Vec::<RelationValue>::new();
         let mut stats = RelObservationForestBuildStats {
@@ -667,6 +675,9 @@ impl RelObservationForest {
                 context,
                 registry,
                 &mut intern,
+                &mut semantic_intern,
+                &mut semantic_identity_cache,
+                semantic_intern_enabled,
                 &mut cells,
                 &mut outputs,
                 &mut stats,
@@ -885,6 +896,9 @@ impl RelObservationForest {
         context: &kernel_schema::SemanticContext,
         registry: &kernel_semantics::SemanticRegistry,
         intern: &mut HashMap<RelExpr, RelObservationForestNodeId>,
+        semantic_intern: &mut HashMap<CqSemanticIdentity, RelObservationForestNodeId>,
+        semantic_identity_cache: &mut HashMap<RelExpr, Option<CqSemanticIdentity>>,
+        semantic_intern_enabled: bool,
         cells: &mut Vec<Arc<RelObservationForestCell>>,
         outputs: &mut Vec<RelationValue>,
         stats: &mut RelObservationForestBuildStats,
@@ -897,6 +911,42 @@ impl RelObservationForest {
             return Ok(node);
         }
 
+        let semantic_identity = if semantic_intern_enabled {
+            stats.cq_identity_attempts = stats
+                .cq_identity_attempts
+                .checked_add(1)
+                .ok_or(RelQueryError::TransitionEpochExhausted)?;
+            let identity = semantic_identity_cache
+                .entry(expression.clone())
+                .or_insert_with(|| semantic_cq_identity(expression, context, registry))
+                .clone();
+            if let Some(identity) = identity.as_ref() {
+                stats.cq_identity_successes = stats
+                    .cq_identity_successes
+                    .checked_add(1)
+                    .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                if identity.is_q_hierarchical() {
+                    stats.q_hierarchical_cq_identities = stats
+                        .q_hierarchical_cq_identities
+                        .checked_add(1)
+                        .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                }
+                if let Some(&node) = semantic_intern.get(identity) {
+                    stats.semantic_reused_subtrees = stats
+                        .semantic_reused_subtrees
+                        .checked_add(1)
+                        .ok_or(RelQueryError::TransitionEpochExhausted)?;
+                    if intern.insert(expression.clone(), node).is_some() {
+                        return Err(RelQueryError::InconsistentIncrementalDelta);
+                    }
+                    return Ok(node);
+                }
+            }
+            identity
+        } else {
+            None
+        };
+
         let inputs = match expression {
             RelExpr::Scan(_) => RelObservationForestInputs::Source,
             RelExpr::FilterEqConst { input, .. }
@@ -906,18 +956,50 @@ impl RelObservationForest {
             | RelExpr::Distinct { input, .. }
             | RelExpr::Group { input, .. }
             | RelExpr::TopKWithTies { input, .. }
-            | RelExpr::PromoteToBag(input) => RelObservationForestInputs::Unary(
-                Self::intern_subtree(input, old, context, registry, intern, cells, outputs, stats)?,
-            ),
+            | RelExpr::PromoteToBag(input) => {
+                RelObservationForestInputs::Unary(Self::intern_subtree(
+                    input,
+                    old,
+                    context,
+                    registry,
+                    intern,
+                    semantic_intern,
+                    semantic_identity_cache,
+                    semantic_intern_enabled,
+                    cells,
+                    outputs,
+                    stats,
+                )?)
+            }
             RelExpr::JoinEq { left, right, .. }
             | RelExpr::Difference { left, right }
             | RelExpr::Union { left, right }
             | RelExpr::AntiJoin { left, right, .. } => RelObservationForestInputs::Binary {
                 left: Self::intern_subtree(
-                    left, old, context, registry, intern, cells, outputs, stats,
+                    left,
+                    old,
+                    context,
+                    registry,
+                    intern,
+                    semantic_intern,
+                    semantic_identity_cache,
+                    semantic_intern_enabled,
+                    cells,
+                    outputs,
+                    stats,
                 )?,
                 right: Self::intern_subtree(
-                    right, old, context, registry, intern, cells, outputs, stats,
+                    right,
+                    old,
+                    context,
+                    registry,
+                    intern,
+                    semantic_intern,
+                    semantic_identity_cache,
+                    semantic_intern_enabled,
+                    cells,
+                    outputs,
+                    stats,
                 )?,
             },
         };
@@ -1280,6 +1362,12 @@ impl RelObservationForest {
         }));
         outputs.push(output);
         if intern.insert(expression.clone(), node).is_some() {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        if let Some(identity) = semantic_identity
+            && let Some(existing) = semantic_intern.insert(identity, node)
+            && existing != node
+        {
             return Err(RelQueryError::InconsistentIncrementalDelta);
         }
         Ok(node)
@@ -3112,6 +3200,151 @@ impl MaterializedRelPlanState {
     #[must_use]
     pub fn differential(&self) -> &RelDifferentialProgram {
         self.differential.as_ref()
+    }
+
+    /// Rebinds one already-materialized exact plan to a definitionally equal
+    /// semantic context without rebuilding its maintained relation state.
+    ///
+    /// This is deliberately narrower than migration/query rewriting. The
+    /// source and target contexts must have identical schema/environment
+    /// definitions (revision identifiers may differ), so every canonical key,
+    /// ordering/equivalence contract, operator result type and maintained-state
+    /// requirement remains exactly the same. Structural migrations must use a
+    /// stronger transport theorem rather than this boundary.
+    pub fn rebind_definitionally_equivalent_context(
+        &mut self,
+        target: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(), RelQueryError> {
+        if !self.semantic_context.definitionally_equivalent(target) {
+            return Err(RelQueryError::SemanticRevisionMismatch);
+        }
+        if self.revision.is_some() {
+            return Err(RelQueryError::RevisionBindingMismatch);
+        }
+
+        let differential = Arc::new(RelDifferentialProgram::compile(
+            &self.query,
+            target,
+            registry,
+        )?);
+        let graph = differential.physical_program().execution_graph();
+        let root = graph.root();
+        let node_count = graph.node_count();
+        let has_typed_metadata = graph.has_typed_metadata();
+        let result_type_matches = graph.result_type(root) == Some(&self.result_type);
+        if !has_typed_metadata
+            || node_count != self.arena.len()
+            || root.checked_add(1) != Some(self.arena.len())
+            || !result_type_matches
+        {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        let mut bound_requirements = BTreeSet::new();
+        collect_flat_maintained_state_requirements(&self.arena, &mut bound_requirements);
+        if bound_requirements != differential.state_requirements() {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+
+        self.semantic_context = target.clone();
+        self.differential = differential;
+        self.transition_epoch = self
+            .transition_epoch
+            .checked_add(1)
+            .ok_or(RelQueryError::TransitionEpochExhausted)?;
+        #[cfg(debug_assertions)]
+        {
+            self.node = Some(Arc::new(Self::rehydrate_debug_tree(
+                &self.query,
+                root,
+                &self.arena,
+                target,
+                &self.differential,
+            )?));
+        }
+        Ok(())
+    }
+
+    /// Retargets one already-materialized plan across a certified structural
+    /// migration that preserves every scanned relation's exact row
+    /// representation while allowing its semantic relation coordinate to move.
+    ///
+    /// The relation map is an exact transport certificate supplied by the
+    /// migration kernel. Query scan coordinates, flat scan nodes and persistent
+    /// base witnesses are rebound together; maintained rows are never scanned,
+    /// replayed or re-canonicalized.
+    pub fn retarget_row_identity_migration_context(
+        &mut self,
+        relation_map: &BTreeMap<kernel_types::SemanticId, kernel_types::SemanticId>,
+        target: &kernel_schema::SemanticContext,
+        registry: &kernel_semantics::SemanticRegistry,
+    ) -> Result<(), RelQueryError> {
+        if self.revision.is_some() {
+            return Err(RelQueryError::RevisionBindingMismatch);
+        }
+        let query = self.query.retarget_scan_relations_exact(relation_map)?;
+        let differential = Arc::new(RelDifferentialProgram::compile(&query, target, registry)?);
+        let graph = differential.physical_program().execution_graph();
+        let root = graph.root();
+        if !graph.has_typed_metadata()
+            || graph.node_count() != self.arena.len()
+            || root.checked_add(1) != Some(self.arena.len())
+            || graph.result_type(root) != Some(&self.result_type)
+        {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+        let mut bound_requirements = BTreeSet::new();
+        collect_flat_maintained_state_requirements(&self.arena, &mut bound_requirements);
+        if bound_requirements != differential.state_requirements() {
+            return Err(RelQueryError::InconsistentIncrementalDelta);
+        }
+
+        let rebound = self
+            .arena
+            .iter()
+            .map(|node| {
+                let mut node = node.as_ref().clone();
+                if let FlatMaintainedRelPlanNodeKind::Scan {
+                    relation,
+                    base_witness,
+                    ..
+                } = &mut node.kind
+                {
+                    let target_relation = *relation_map
+                        .get(relation)
+                        .ok_or(RelQueryError::UnknownRelation(*relation))?;
+                    if let Some(witness) = base_witness {
+                        *witness = witness.rebind_observation_identity_context(
+                            target_relation,
+                            target,
+                            registry,
+                        )?;
+                    }
+                    *relation = target_relation;
+                }
+                Ok(Arc::new(node))
+            })
+            .collect::<Result<Vec<_>, RelQueryError>>()?;
+
+        self.query = query;
+        self.semantic_context = target.clone();
+        self.differential = differential;
+        self.arena = rebound.into();
+        self.transition_epoch = self
+            .transition_epoch
+            .checked_add(1)
+            .ok_or(RelQueryError::TransitionEpochExhausted)?;
+        #[cfg(debug_assertions)]
+        {
+            self.node = Some(Arc::new(Self::rehydrate_debug_tree(
+                &self.query,
+                root,
+                &self.arena,
+                target,
+                &self.differential,
+            )?));
+        }
+        Ok(())
     }
 
     #[must_use]

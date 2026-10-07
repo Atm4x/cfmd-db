@@ -7,7 +7,8 @@ use std::{
 use cfmd::__private::{IntentJournal, TransactionId};
 use cfmd::{
     CfmdEntity, CfmdSchema, CommitOutcome, Database, DiagnosticCode, EntitySet, ErrorDiagnosticExt,
-    ErrorKind, Id, Object, ObjectPredicate, RuleValueExpr, Schema, SemanticRuleExpr,
+    ErrorKind, Id, ModelRuleExpr, Object, ObjectPredicate, RecoveryAuthority, RecoveryOperation,
+    RecoveryReason, RuleOrderComparison, RuleValueExpr, Schema, SemanticRuleExpr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -22,6 +23,13 @@ struct Todo {
 #[allow(dead_code)]
 #[derive(CfmdSchema)]
 struct TodoSchema {
+    todos: EntitySet<Todo>,
+}
+
+#[allow(dead_code)]
+#[derive(CfmdSchema)]
+#[cfmd(schema_revision = 539)]
+struct VersionedTodoSchema {
     todos: EntitySet<Todo>,
 }
 
@@ -44,6 +52,38 @@ struct RuleUser {
     pub age: i64,
     #[cfmd(one_of("user", "admin"))]
     pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
+#[cfmd(key = "example.binary-rule-task")]
+struct BinaryRuleTask {
+    #[cfmd(id)]
+    pub id: Id<BinaryRuleTask>,
+    pub minimum: i64,
+    pub maximum: i64,
+    pub enabled: bool,
+    pub published: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
+#[cfmd(key = "example.reference-rule-task")]
+struct ReferenceRuleTask {
+    #[cfmd(id)]
+    pub id: Id<ReferenceRuleTask>,
+    pub primary: cfmd::Ref<User>,
+    pub secondary: cfmd::Ref<User>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
+#[cfmd(key = "example.pattern-user")]
+struct PatternUser {
+    #[cfmd(id)]
+    pub id: Id<PatternUser>,
+    #[cfmd(matches = cfmd::TextPattern::concat([
+        cfmd::TextPattern::literal("A"),
+        cfmd::TextPattern::zero_or_more(cfmd::TextPattern::AnyScalar),
+    ]))]
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
@@ -75,6 +115,19 @@ struct PartialTask {
 #[derive(CfmdSchema)]
 struct PartialTaskSchema {
     tasks: EntitySet<PartialTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CfmdEntity)]
+#[cfmd(key = "example.task")]
+struct IdentityOnlyTask {
+    #[cfmd(id)]
+    id: Id<IdentityOnlyTask>,
+}
+
+#[derive(CfmdSchema)]
+#[cfmd(schema_revision = 564)]
+struct VersionedIdentityOnlyTaskSchema {
+    tasks: EntitySet<IdentityOnlyTask>,
 }
 
 #[derive(CfmdSchema)]
@@ -247,6 +300,16 @@ struct OrderedF64 {
 }
 
 #[derive(Debug, Clone, PartialEq, CfmdEntity)]
+#[cfmd(key = "example.filtered-metric")]
+struct FilteredMetric {
+    #[cfmd(id)]
+    pub id: Id<FilteredMetric>,
+    pub value: f64,
+    pub lower: i64,
+    pub upper: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, CfmdEntity)]
 #[cfmd(key = "example.grouped-metric")]
 struct GroupedMetric {
     #[cfmd(id)]
@@ -302,6 +365,47 @@ where
     S: CfmdSchema,
 {
     Database::open(path)?.context::<S>()
+}
+
+#[test]
+fn schema_contract_can_carry_post_cutover_activation_revision() {
+    assert_eq!(
+        <VersionedTodoSchema as CfmdSchema>::contract_schema_revision(),
+        Some(539)
+    );
+}
+
+#[test]
+fn authoritative_memory_database_persists_without_rebinding_typed_contexts() {
+    let path = temp_path().with_extension("cfmd");
+    let _ = fs::remove_file(&path);
+    let database = Database::memory::<AppSchema>().expect("create authoritative memory database");
+    let context = database
+        .context::<AppSchema>()
+        .expect("bind memory context");
+    let revision = context
+        .snapshot()
+        .expect("memory context snapshot")
+        .revision();
+
+    database.persist(&path).expect("persist memory database");
+    assert!(!database.is_memory());
+    assert_eq!(
+        context
+            .snapshot()
+            .expect("promoted context snapshot")
+            .revision(),
+        revision
+    );
+
+    drop(context);
+    drop(database);
+    let reopened = Database::open(&path).expect("reopen persisted typed database");
+    reopened
+        .context::<AppSchema>()
+        .expect("typed contract remains valid after persistence transition");
+    drop(reopened);
+    fs::remove_file(path).expect("remove persisted typed database");
 }
 
 #[test]
@@ -526,6 +630,26 @@ fn scoped_context_keeps_one_admitted_formation_world_while_database_head_advance
 
     drop(snapshot);
     drop(context);
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn context_binding_has_stable_contract_not_representable_error() {
+    let path = temp_path();
+    let schema = Schema::builder().build().expect("empty schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let error = database
+        .context::<TodoSchema>()
+        .expect_err("missing consumer relation must fail closed");
+    assert_eq!(error.kind(), ErrorKind::ContractNotRepresentable);
+    assert!(error.message().contains("typed consumer contract"));
+    assert!(error.message().contains("not representable"));
+
     drop(database);
     fs::remove_file(path).expect("remove database");
 }
@@ -782,7 +906,9 @@ fn snapshot_bound_transaction_composes_preview_and_commit_without_manual_plan_pl
     let first = database.commit(&transaction).expect("commit transaction");
     let revision = match first {
         CommitOutcome::Committed { revision } => revision,
-        CommitOutcome::AlreadyCommitted { .. } => panic!("first publication must commit"),
+        CommitOutcome::AlreadySatisfied { .. } | CommitOutcome::AlreadyCommitted { .. } => {
+            panic!("first publication must commit")
+        }
     };
     assert_eq!(
         database
@@ -886,7 +1012,10 @@ fn snapshot_bound_transaction_rejects_cross_snapshot_plan_and_auto_merges_indepe
         .expect("certified stale transaction must publish on the current head");
     let merged_revision = match merged {
         cfmd::CommitOutcome::Committed { revision } => revision,
-        cfmd::CommitOutcome::AlreadyCommitted { .. } => panic!("first merged publish must commit"),
+        cfmd::CommitOutcome::AlreadySatisfied { .. }
+        | cfmd::CommitOutcome::AlreadyCommitted { .. } => {
+            panic!("first merged publish must commit")
+        }
     };
     assert!(matches!(
         database
@@ -900,6 +1029,10 @@ fn snapshot_bound_transaction_rejects_cross_snapshot_plan_and_auto_merges_indepe
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the complete object carrier idempotency scenario together."
+)]
 fn independent_first_object_inserts_share_idempotent_carrier_presence() {
     let path = temp_path();
     let schema = Schema::builder().object::<Todo>().build().expect("schema");
@@ -955,7 +1088,10 @@ fn independent_first_object_inserts_share_idempotent_carrier_presence() {
         .expect("same carrier intent and distinct entity must merge")
     {
         cfmd::CommitOutcome::Committed { revision } => revision,
-        cfmd::CommitOutcome::AlreadyCommitted { .. } => panic!("first merged publish must commit"),
+        cfmd::CommitOutcome::AlreadySatisfied { .. }
+        | cfmd::CommitOutcome::AlreadyCommitted { .. } => {
+            panic!("first merged publish must commit")
+        }
     };
     assert!(matches!(
         database
@@ -1182,6 +1318,62 @@ fn diagnostics_are_stable_at_public_facade() {
     let diagnostic = error.diagnostic();
     assert_eq!(diagnostic.code(), DiagnosticCode::Recovery);
     assert!(!diagnostic.message().is_empty());
+    let recovery = diagnostic
+        .recovery()
+        .expect("structured recovery diagnostic");
+    assert_eq!(recovery.operation(), RecoveryOperation::Open);
+    assert_eq!(recovery.authority(), RecoveryAuthority::Storage);
+    assert_eq!(recovery.reason(), RecoveryReason::PathUnavailable);
+    assert_eq!(recovery.byte_offset(), None);
+    assert_eq!(recovery.format_version(), None);
+}
+
+#[test]
+fn backup_verification_projects_corruption_without_parsing_message() {
+    let path = temp_path();
+    fs::write(&path, b"not-a-cfmd-backup").expect("write invalid backup");
+    let error = Database::verify_backup(&path, &cfmd::Encryption::None)
+        .expect_err("invalid backup must fail closed");
+    let diagnostic = error.diagnostic();
+    let recovery = diagnostic
+        .recovery()
+        .expect("structured recovery diagnostic");
+    assert_eq!(diagnostic.code(), DiagnosticCode::Recovery);
+    assert_eq!(recovery.operation(), RecoveryOperation::VerifyBackup);
+    assert!(matches!(
+        recovery.reason(),
+        RecoveryReason::Corruption | RecoveryReason::ProtocolViolation
+    ));
+    assert!(matches!(
+        recovery.authority(),
+        RecoveryAuthority::DurableBytes | RecoveryAuthority::SingleFileFormat
+    ));
+    fs::remove_file(path).expect("remove invalid backup");
+}
+
+#[test]
+fn restore_projects_failure_operation_without_parsing_message() {
+    let backup_path = temp_path();
+    let target_path = temp_path();
+    fs::write(&backup_path, b"not-a-cfmd-backup").expect("write invalid backup");
+    let error = Database::restore_backup(
+        &backup_path,
+        &cfmd::Encryption::None,
+        &target_path,
+        cfmd::Encryption::None,
+    )
+    .expect_err("invalid restore source must fail closed");
+    let recovery = error
+        .diagnostic()
+        .recovery()
+        .expect("structured recovery diagnostic");
+    assert_eq!(recovery.operation(), RecoveryOperation::RestoreBackup);
+    assert!(matches!(
+        recovery.reason(),
+        RecoveryReason::Corruption | RecoveryReason::ProtocolViolation
+    ));
+    fs::remove_file(backup_path).expect("remove invalid backup");
+    assert!(!target_path.exists());
 }
 
 #[test]
@@ -1321,6 +1513,57 @@ fn seed_object_many(database: &Database) {
     database
         .commit_plan(&plan, TransactionId::new(342_001))
         .expect("commit object graph");
+}
+
+#[test]
+fn schema_access_dx_lowers_typed_relationships_without_raw_coordinates() {
+    use cfmd::{AccessCapability, Permission, Role, SchemaAccess};
+
+    let capability = AccessCapability::new("example.cap.parent-editor")
+        .read_field::<Parent, String, _>(ParentFields::name)
+        .attach_relationship::<Parent, Child, _>(ParentFields::children)
+        .detach_relationship::<Parent, Child, _>(ParentFields::children)
+        .move_relationship::<Parent, Child, _>(ParentFields::children)
+        .watch();
+    let role = Role::new("example.role.parent-editor").capability(&capability);
+    let policy = SchemaAccess::new()
+        .capability(capability)
+        .role(role.clone());
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<Parent>()
+        .object::<Child>()
+        .access(policy)
+        .build()
+        .expect("authorization schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create authorization database");
+    let permissions = database
+        .snapshot()
+        .expect("snapshot")
+        .schema()
+        .expect("schema")
+        .permissions_for_roles([role.id()])
+        .expect("resolve role");
+    assert!(
+        permissions
+            .iter()
+            .any(|permission| matches!(permission, Permission::AttachRelationship(_)))
+    );
+    assert!(
+        permissions
+            .iter()
+            .any(|permission| matches!(permission, Permission::DetachRelationship(_)))
+    );
+    assert!(
+        permissions
+            .iter()
+            .any(|permission| matches!(permission, Permission::MoveRelationship(_)))
+    );
+    assert!(permissions.contains(Permission::Watch));
+    assert!(!permissions.contains(Permission::Write));
 }
 
 #[test]
@@ -3394,7 +3637,9 @@ fn same_relationship_attach_rebases_as_durable_residual_and_retries_by_client_in
         .expect("same attach must publish certified residual")
     {
         CommitOutcome::Committed { revision } => revision,
-        CommitOutcome::AlreadyCommitted { .. } => panic!("first residual publication must commit"),
+        CommitOutcome::AlreadySatisfied { .. } | CommitOutcome::AlreadyCommitted { .. } => {
+            panic!("first residual publication must commit")
+        }
     };
     assert!(matches!(
         database.commit(&second).expect("retry by original client intent"),
@@ -3503,6 +3748,753 @@ fn database_owned_object_field_rules_reject_invalid_candidates_and_survive_reope
     assert_eq!(error.kind(), ErrorKind::InvariantViolation);
 
     drop(reopened);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn derived_text_pattern_rule_is_deterministic_and_database_owned() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<PatternUser>()
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let mut valid = IntentJournal::new();
+    database
+        .objects::<PatternUser>()
+        .expect("pattern users")
+        .add(
+            &mut valid,
+            PatternUser {
+                id: Id::new(516_101),
+                name: "Artem".to_owned(),
+            },
+        )
+        .expect("valid pattern intent");
+    database.commit(&valid).expect("valid pattern commit");
+
+    let mut invalid = IntentJournal::new();
+    database
+        .objects::<PatternUser>()
+        .expect("pattern users")
+        .add(
+            &mut invalid,
+            PatternUser {
+                id: Id::new(516_102),
+                name: "Boris".to_owned(),
+            },
+        )
+        .expect("invalid pattern may form intent");
+    let error = database
+        .preview(&invalid)
+        .expect_err("deterministic text pattern must reject non-matching candidate");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn database_owned_model_rules_use_the_kernel_invariant_engine_and_survive_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .model_rule(ModelRuleExpr::RelationExactCountRange {
+            relation: RuleUser::relation_id(),
+            predicate: SemanticRuleExpr::True,
+            min: 0,
+            max: Some(1),
+        })
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let mut first = IntentJournal::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut first,
+            RuleUser {
+                id: Id::new(516_001),
+                name: "Artem".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("first insert");
+    database.commit(&first).expect("first commit");
+
+    let mut second = IntentJournal::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut second,
+            RuleUser {
+                id: Id::new(516_002),
+                name: "Alice".to_owned(),
+                age: 20,
+                role: "admin".to_owned(),
+            },
+        )
+        .expect("second intent");
+    let error = database
+        .preview(&second)
+        .expect_err("model cardinality invariant must reject second row");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(second);
+    drop(first);
+    drop(database);
+    let reopened = Database::builder(&path).open().expect("reopen database");
+    let mut after_reopen = IntentJournal::new();
+    reopened
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut after_reopen,
+            RuleUser {
+                id: Id::new(516_003),
+                name: "Anya".to_owned(),
+                age: 21,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("post-reopen intent");
+    let error = reopened
+        .preview(&after_reopen)
+        .expect_err("persisted model invariant must survive reopen");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(reopened);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn typed_object_rule_composition_lowers_to_database_owned_entity_invariants() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .object_rule::<RuleUser, _>(|user| {
+            user.age()
+                .rule()
+                .range(Some(18), None)
+                .and(user.role().rule().one_of(["user"]))
+                .and(user.name().rule().length(3, Some(8)))
+        })
+        .build()
+        .expect("typed object-rule schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let mut valid = IntentJournal::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut valid,
+            RuleUser {
+                id: Id::new(517_001),
+                name: "Artem".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("valid typed-rule intent");
+    database.commit(&valid).expect("valid typed-rule commit");
+
+    let mut invalid = IntentJournal::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut invalid,
+            RuleUser {
+                id: Id::new(517_002),
+                name: "Alice".to_owned(),
+                age: 20,
+                role: "admin".to_owned(),
+            },
+        )
+        .expect("candidate may form before invariant validation");
+    let error = database
+        .preview(&invalid)
+        .expect_err("typed role coordinate must reach the kernel invariant gate");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn typed_binary_rules_use_kernel_equivalence_and_ordering_for_scalar_and_bool_fields() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<BinaryRuleTask>()
+        .object_rule::<BinaryRuleTask, _>(|task| {
+            task.minimum()
+                .rule()
+                .less_than_or_equal_field(task.maximum().rule())
+                .and(task.enabled().rule().equivalent_to(task.published().rule()))
+        })
+        .build()
+        .expect("typed binary-rule schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let mut valid = IntentJournal::new();
+    database
+        .objects::<BinaryRuleTask>()
+        .expect("tasks")
+        .add(
+            &mut valid,
+            BinaryRuleTask {
+                id: Id::new(518_010),
+                minimum: 3,
+                maximum: 7,
+                enabled: true,
+                published: true,
+            },
+        )
+        .expect("valid binary-rule intent");
+    database.commit(&valid).expect("valid binary-rule commit");
+
+    drop(valid);
+    drop(database);
+    let database = Database::open(&path).expect("reopen binary-rule database");
+
+    let mut invalid_order = IntentJournal::new();
+    database
+        .objects::<BinaryRuleTask>()
+        .expect("tasks")
+        .add(
+            &mut invalid_order,
+            BinaryRuleTask {
+                id: Id::new(518_011),
+                minimum: 9,
+                maximum: 7,
+                enabled: true,
+                published: true,
+            },
+        )
+        .expect("candidate may form before invariant validation");
+    let error = database
+        .preview(&invalid_order)
+        .expect_err("semantic ordering must reject the future candidate");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    let mut invalid_bool = IntentJournal::new();
+    database
+        .objects::<BinaryRuleTask>()
+        .expect("tasks")
+        .add(
+            &mut invalid_bool,
+            BinaryRuleTask {
+                id: Id::new(518_012),
+                minimum: 3,
+                maximum: 7,
+                enabled: true,
+                published: false,
+            },
+        )
+        .expect("candidate may form before invariant validation");
+    let error = database
+        .preview(&invalid_bool)
+        .expect_err("semantic bool equivalence must reject the future candidate");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn typed_reference_rules_expose_only_direct_root_coordinates() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<User>()
+        .object::<ReferenceRuleTask>()
+        .object_rule::<ReferenceRuleTask, _>(|task| {
+            task.primary_rule().equivalent_to(task.secondary_rule())
+        })
+        .build()
+        .expect("typed reference-rule schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let user_a = Id::<User>::new(518_100);
+    let user_b = Id::<User>::new(518_101);
+    let mut users = IntentJournal::new();
+    database
+        .objects::<User>()
+        .expect("users")
+        .add(
+            &mut users,
+            User {
+                id: user_a,
+                name: "A".to_owned(),
+            },
+        )
+        .expect("add user A");
+    database
+        .objects::<User>()
+        .expect("users")
+        .add(
+            &mut users,
+            User {
+                id: user_b,
+                name: "B".to_owned(),
+            },
+        )
+        .expect("add user B");
+    database.commit(&users).expect("commit users");
+
+    let mut valid = IntentJournal::new();
+    database
+        .objects::<ReferenceRuleTask>()
+        .expect("tasks")
+        .add(
+            &mut valid,
+            ReferenceRuleTask {
+                id: Id::new(518_110),
+                primary: user_a.reference(),
+                secondary: user_a.reference(),
+            },
+        )
+        .expect("valid reference-rule intent");
+    database
+        .commit(&valid)
+        .expect("valid reference-rule commit");
+
+    let mut invalid = IntentJournal::new();
+    database
+        .objects::<ReferenceRuleTask>()
+        .expect("tasks")
+        .add(
+            &mut invalid,
+            ReferenceRuleTask {
+                id: Id::new(518_111),
+                primary: user_a.reference(),
+                secondary: user_b.reference(),
+            },
+        )
+        .expect("candidate may form before invariant validation");
+    let error = database
+        .preview(&invalid)
+        .expect_err("different references must violate semantic equivalence");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn object_first_model_rules_use_typed_relation_and_column_coordinates() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<OrderedF64>()
+        .model_rule(ModelRuleExpr::object_cardinality::<OrderedF64>(0, Some(2)))
+        .model_rule(ModelRuleExpr::object_exact_f64_sum_range::<OrderedF64, _>(
+            OrderedF64Fields::value,
+            Some(cfmd::FiniteF64::new(0.0).expect("finite lower bound")),
+            Some(cfmd::FiniteF64::new(10.0).expect("finite upper bound")),
+        ))
+        .build()
+        .expect("typed model-rule schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    for (id, value) in [(517_101, 4.0), (517_102, 5.0)] {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<OrderedF64>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                OrderedF64 {
+                    id: Id::new(id),
+                    value,
+                },
+            )
+            .expect("bounded sum intent");
+        database.commit(&intent).expect("bounded sum commit");
+    }
+
+    let mut exceeds_sum = IntentJournal::new();
+    database
+        .objects::<OrderedF64>()
+        .expect("metrics")
+        .add(
+            &mut exceeds_sum,
+            OrderedF64 {
+                id: Id::new(517_103),
+                value: 2.0,
+            },
+        )
+        .expect("overflowing sum may form intent");
+    let error = database
+        .preview(&exceeds_sum)
+        .expect_err("typed exact-sum coordinate must reject the future candidate");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn exact_sum_where_is_delta_maintained_by_semantic_row_predicate_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_exact_f64_sum_where_range::<
+            FilteredMetric,
+            _,
+            _,
+        >(
+            FilteredMetricFields::value,
+            |metric| {
+                metric
+                    .lower()
+                    .rule()
+                    .less_than_or_equal_field(metric.upper().rule())
+            },
+            None,
+            Some(cfmd::FiniteF64::new(10.0).expect("finite upper bound")),
+        ))
+        .build()
+        .expect("filtered exact-sum schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    for (id, value, lower, upper) in [(519_001, 6.0, 1, 2), (519_002, 100.0, 9, 2)] {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value,
+                    lower,
+                    upper,
+                },
+            )
+            .expect("filtered aggregate intent");
+        database
+            .commit(&intent)
+            .expect("only rows selected by the semantic predicate contribute");
+    }
+
+    drop(database);
+    let database = Database::open(&path).expect("reopen filtered aggregate database");
+    let mut violates = IntentJournal::new();
+    database
+        .objects::<FilteredMetric>()
+        .expect("metrics")
+        .add(
+            &mut violates,
+            FilteredMetric {
+                id: Id::new(519_003),
+                value: 5.0,
+                lower: 3,
+                upper: 4,
+            },
+        )
+        .expect("violating candidate may form before invariant validation");
+    let error = database
+        .preview(&violates)
+        .expect_err("selected exact sum must reject the future candidate after reopen");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn exact_count_where_unifies_quantifiers_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_exact_count_where_range::<
+            FilteredMetric,
+            _,
+        >(
+            |metric| {
+                metric
+                    .lower()
+                    .rule()
+                    .less_than_or_equal_field(metric.upper().rule())
+            },
+            0,
+            Some(1),
+        ))
+        .build()
+        .expect("selected exact-count schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    for (id, lower, upper) in [(520_001, 1, 2), (520_002, 9, 2)] {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value: 0.0,
+                    lower,
+                    upper,
+                },
+            )
+            .expect("selected count intent");
+        database
+            .commit(&intent)
+            .expect("only predicate-selected rows contribute to exact count");
+    }
+
+    drop(database);
+    let database = Database::open(&path).expect("reopen selected exact-count database");
+    let mut violates = IntentJournal::new();
+    database
+        .objects::<FilteredMetric>()
+        .expect("metrics")
+        .add(
+            &mut violates,
+            FilteredMetric {
+                id: Id::new(520_003),
+                value: 0.0,
+                lower: 3,
+                upper: 4,
+            },
+        )
+        .expect("violating candidate may form before invariant validation");
+    let error = database
+        .preview(&violates)
+        .expect_err("second selected row must violate the exact-count upper bound after reopen");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn exact_aggregate_compare_maintains_cross_relation_count_product_after_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<User>()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_exact_count_compare::<
+            User,
+            FilteredMetric,
+            _,
+            _,
+        >(
+            |_| SemanticRuleExpr::True,
+            cfmd::RuleOrderComparison::LessOrEqual,
+            |_| SemanticRuleExpr::True,
+        ))
+        .build()
+        .expect("cross-relation exact-count comparison schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let mut metric = IntentJournal::new();
+    database
+        .objects::<FilteredMetric>()
+        .expect("metrics")
+        .add(
+            &mut metric,
+            FilteredMetric {
+                id: Id::new(521_001),
+                value: 1.0,
+                lower: 0,
+                upper: 0,
+            },
+        )
+        .expect("metric intent");
+    database.commit(&metric).expect("metric commit");
+
+    let mut user = IntentJournal::new();
+    database
+        .objects::<User>()
+        .expect("users")
+        .add(
+            &mut user,
+            User {
+                id: Id::new(521_010),
+                name: "one".to_owned(),
+            },
+        )
+        .expect("user intent");
+    database.commit(&user).expect("balanced count commit");
+    drop(metric);
+    drop(user);
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen aggregate comparison database");
+    let mut excess_user = IntentJournal::new();
+    database
+        .objects::<User>()
+        .expect("users")
+        .add(
+            &mut excess_user,
+            User {
+                id: Id::new(521_011),
+                name: "two".to_owned(),
+            },
+        )
+        .expect("excess user intent");
+    let error = database
+        .preview(&excess_user)
+        .expect_err("user count must not exceed metric count");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+    drop(excess_user);
+
+    let mut second_metric = IntentJournal::new();
+    database
+        .objects::<FilteredMetric>()
+        .expect("metrics")
+        .add(
+            &mut second_metric,
+            FilteredMetric {
+                id: Id::new(521_002),
+                value: 1.0,
+                lower: 0,
+                upper: 0,
+            },
+        )
+        .expect("second metric intent");
+    database
+        .commit(&second_metric)
+        .expect("right-side measure update must satisfy comparator");
+    drop(second_metric);
+    let mut balanced_user = IntentJournal::new();
+    database
+        .objects::<User>()
+        .expect("users")
+        .add(
+            &mut balanced_user,
+            User {
+                id: Id::new(521_011),
+                name: "two".to_owned(),
+            },
+        )
+        .expect("balanced user intent");
+    database
+        .commit(&balanced_user)
+        .expect("left-side measure must observe exact right-side delta");
+    drop(balanced_user);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn typed_rule_coordinate_uses_persisted_bind_identity_not_local_field_spelling() {
+    let rule =
+        LegacyRenameAccount::rule(|account| account.doctor_note().rule().length(0, Some(32)));
+    let SemanticRuleExpr::TextLength {
+        value: RuleValueExpr::Field(field),
+        ..
+    } = rule
+    else {
+        panic!("typed text rule must lower to one persisted field coordinate");
+    };
+    assert_eq!(field, RenamedAccount::__field_id("medical_note"));
+    assert_ne!(field, RenamedAccount::__field_id("doctor_note"));
+}
+
+#[test]
+fn typed_rule_frontend_preserves_kernel_schema_diagnostics() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .object_rule::<RuleUser, _>(|user| user.age().rule().range(Some(30), Some(18)))
+        .build()
+        .expect("frontend schema object");
+    let error = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect_err("invalid typed bounds must fail in the existing kernel rule validator");
+    assert_eq!(error.kind(), ErrorKind::InvalidSchema);
+    assert!(error.message().contains("invalid model rule"));
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn typed_transaction_requirement_uses_the_same_object_rule_frontend() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<RuleUser>()
+        .build()
+        .expect("schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+    let id = Id::new(517_201);
+
+    let mut create = IntentJournal::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .add(
+            &mut create,
+            RuleUser {
+                id,
+                name: "Artem".to_owned(),
+                age: 19,
+                role: "user".to_owned(),
+            },
+        )
+        .expect("seed user");
+    database.commit(&create).expect("seed commit");
+
+    let mut invalid = IntentJournal::new();
+    database
+        .objects::<RuleUser>()
+        .expect("users")
+        .set(&mut invalid, id, RuleUserFields::age, 17)
+        .expect("patch intent");
+    invalid
+        .require::<RuleUser>(
+            id,
+            RuleUser::rule(|user| user.age().rule().range(Some(18), None)),
+        )
+        .expect("typed requirement");
+    assert_eq!(
+        database
+            .preview(&invalid)
+            .expect_err("typed requirement must observe exact future candidate")
+            .kind(),
+        ErrorKind::TransactionConflict,
+    );
+
+    drop(database);
     fs::remove_file(path).expect("remove database");
 }
 
@@ -4180,6 +5172,69 @@ fn partial_context_binds_by_semantic_fields_and_blocks_full_row_mutation() {
 }
 
 #[test]
+fn partial_context_remove_where_lowers_selection_to_identity_owned_delete() {
+    use cfmd::{Permission, PermissionSet, PrincipalId, Session};
+
+    let path = temp_path();
+    let seed = create_typed::<HostileAccountSchema>(&path).expect("authoritative account schema");
+    for (id, name, secret) in [(565_001, "drop", "SECRET-A"), (565_002, "keep", "SECRET-B")] {
+        seed.add(
+            |schema| &schema.accounts,
+            HostileAccount {
+                id: Id::new(id),
+                name: name.to_owned(),
+                passport_secret: secret.to_owned(),
+                doctor_note: "hidden-note".to_owned(),
+            },
+        )
+        .expect("seed account");
+    }
+    seed.commit().expect("seed commit");
+    drop(seed);
+
+    let database = Database::open(&path).expect("reopen authoritative account database");
+    let restricted = database.session(Session::new(
+        PrincipalId::new(565_100),
+        PermissionSet::from([
+            Permission::ReadRelation(HostileAccount::relation_id()),
+            Permission::DeleteObject(HostileAccount::relation_id()),
+        ]),
+    ));
+    let ctx = restricted
+        .context::<HostileReaderSchema>()
+        .expect("partial reader context");
+    ctx.remove_where(
+        |schema| &schema.accounts,
+        |account| account.name().eq("drop".to_owned()),
+    )
+    .expect("stage identity-lowered partial query delete");
+    ctx.commit().expect("commit partial query delete");
+
+    let authoritative = database
+        .context::<HostileAccountSchema>()
+        .expect("authoritative reread context");
+    assert!(
+        authoritative
+            .accounts
+            .get(Id::new(565_001))
+            .expect("deleted lookup")
+            .is_none()
+    );
+    let kept = authoritative
+        .accounts
+        .require(Id::new(565_002))
+        .expect("kept authoritative row");
+    assert_eq!(kept.passport_secret, "SECRET-B");
+    assert_eq!(kept.doctor_note, "hidden-note");
+
+    drop(authoritative);
+    drop(ctx);
+    drop(database);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&path);
+}
+
+#[test]
 fn client_bind_preserves_old_local_name_without_polluting_authoritative_schema() {
     use cfmd::{Permission, PermissionSet, PrincipalId, Session};
 
@@ -4363,6 +5418,109 @@ fn partial_context_patches_required_and_optional_references_without_hidden_row_r
     assert_eq!(stored.reviewer.as_ref().map(cfmd::Ref::id), Some(alice.id));
 
     drop(ctx);
+    drop(database);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&path);
+}
+
+#[test]
+fn bridged_partial_identity_delete_preserves_hidden_reference_lifecycle_and_delete_authority() {
+    use cfmd::dynamic::{MigrationHistoryPolicy, MigrationModel};
+    use cfmd::{Permission, PermissionSet, PrincipalId, Session};
+
+    let path = temp_path();
+    let source = Schema::builder()
+        .revisions(564, 1)
+        .object::<User>()
+        .object::<Task>()
+        .build()
+        .expect("source object schema");
+    let database = Database::create(&path, source).expect("source database");
+    let user = User {
+        id: Id::new(564_001),
+        name: "owner".into(),
+    };
+    let task = Task {
+        id: Id::new(564_010),
+        title: "hidden".into(),
+        owner: cfmd::Ref::new(user.id),
+        reviewer: Some(cfmd::Ref::new(user.id)),
+    };
+    let snapshot = database.snapshot().expect("source snapshot");
+    let mut seed = IntentJournal::new();
+    snapshot
+        .objects::<User>()
+        .expect("users")
+        .add(&mut seed, user.clone())
+        .expect("user seed");
+    snapshot
+        .objects::<Task>()
+        .expect("tasks")
+        .add(&mut seed, task.clone())
+        .expect("task seed");
+    database.commit(&seed).expect("seed commit");
+    drop(snapshot);
+
+    let target = Schema::builder()
+        .revisions(565, 1)
+        .object::<User>()
+        .object::<Task>()
+        .build()
+        .expect("target object schema");
+    let migration = MigrationModel::new(564_565, target);
+    let prepared = database
+        .prepare_migration(&migration)
+        .expect("prepare identity migration");
+    database
+        .execute_migration(
+            &prepared,
+            TransactionId::new(564_565),
+            MigrationHistoryPolicy::Forget,
+        )
+        .expect("publish identity migration");
+
+    let denied = database.session(Session::new(
+        PrincipalId::new(564_100),
+        PermissionSet::from([Permission::Read]),
+    ));
+    let denied_ctx = denied
+        .context::<VersionedIdentityOnlyTaskSchema>()
+        .expect("bridged partial context");
+    let error = denied_ctx
+        .remove_id(|schema| &schema.tasks, Id::new(564_010))
+        .expect_err("read authority cannot delete through bridge");
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+
+    let delete_only = database.session(Session::new(
+        PrincipalId::new(564_101),
+        PermissionSet::from([Permission::DeleteObject(Task::relation_id())]),
+    ));
+    let ctx = delete_only
+        .context::<VersionedIdentityOnlyTaskSchema>()
+        .expect("bridged delete-only partial context");
+    ctx.remove_id(|schema| &schema.tasks, Id::new(564_010))
+        .expect("stage bridged identity delete");
+    ctx.commit().expect("commit bridged identity delete");
+
+    let check = database.snapshot().expect("post-delete snapshot");
+    assert_eq!(
+        check
+            .objects::<Task>()
+            .expect("tasks")
+            .count()
+            .expect("task count"),
+        0
+    );
+    assert_eq!(
+        check
+            .objects::<User>()
+            .expect("users")
+            .count()
+            .expect("user count"),
+        1
+    );
+
+    drop(check);
     drop(database);
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&path);
@@ -5013,4 +6171,776 @@ fn scoped_context_carries_session_authority_without_raw_database_escape() {
     drop(database);
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&path);
+}
+
+#[test]
+fn grouped_exact_count_uses_gamma_keyed_sparse_witness_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_group_exact_count_where_range::<
+            FilteredMetric,
+            _,
+            _,
+            _,
+        >(
+            FilteredMetricFields::lower,
+            |metric| {
+                metric
+                    .lower()
+                    .rule()
+                    .less_than_or_equal_field(metric.upper().rule())
+            },
+            1,
+            Some(1),
+        ))
+        .build()
+        .expect("grouped exact-count schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let add = |database: &Database, id, lower, upper| {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value: 0.0,
+                    lower,
+                    upper,
+                },
+            )
+            .expect("grouped count intent");
+        database.commit(&intent)
+    };
+
+    add(&database, 522_001, 1, 2).expect("first selected row establishes group");
+    add(&database, 522_002, 1, 0).expect("unselected row may join an already-satisfied group");
+
+    let error = add(&database, 522_003, 9, 2)
+        .expect_err("a new existing group with zero selected rows must violate min=1");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    add(&database, 522_004, 9, 10).expect("selected row establishes second group");
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen grouped exact-count database");
+    let error = add(&database, 522_005, 1, 3)
+        .expect_err("second selected row in one semantic group must violate max=1");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn grouped_exact_f64_sum_reuses_gamma_sparse_domain_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_group_exact_f64_sum_where_range::<
+            FilteredMetric,
+            _,
+            _,
+            _,
+            _,
+        >(
+            FilteredMetricFields::lower,
+            FilteredMetricFields::value,
+            |metric| {
+                metric
+                    .lower()
+                    .rule()
+                    .less_than_or_equal_field(metric.upper().rule())
+            },
+            Some(cfmd::FiniteF64::new(5.0).expect("finite lower bound")),
+            Some(cfmd::FiniteF64::new(10.0).expect("finite upper bound")),
+        ))
+        .build()
+        .expect("grouped exact-sum schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let add = |database: &Database, id, value, lower, upper| {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value,
+                    lower,
+                    upper,
+                },
+            )
+            .expect("grouped sum intent");
+        database.commit(&intent)
+    };
+
+    add(&database, 523_001, 6.0, 1, 2).expect("selected value establishes valid group sum");
+    add(&database, 523_002, 100.0, 1, 0).expect("unselected value must not affect grouped sum");
+    let error = add(&database, 523_003, 100.0, 9, 2)
+        .expect_err("new live group with zero selected sum violates min=5");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+    add(&database, 523_004, 5.0, 9, 10).expect("selected value establishes second valid group");
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen grouped exact-sum database");
+    let error = add(&database, 523_005, 5.0, 1, 3)
+        .expect_err("group-local exact sum 11 must violate max=10 after reopen");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn grouped_exact_count_product_compare_uses_one_gamma_domain_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_group_exact_count_compare::<
+            FilteredMetric,
+            _,
+            _,
+            _,
+            _,
+        >(
+            FilteredMetricFields::lower,
+            |_| SemanticRuleExpr::True,
+            RuleOrderComparison::LessOrEqual,
+            |metric| {
+                metric
+                    .lower()
+                    .rule()
+                    .less_than_or_equal_field(metric.upper().rule())
+            },
+        ))
+        .build()
+        .expect("grouped exact-count product schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let add = |database: &Database, id, lower, upper| {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value: 1.0,
+                    lower,
+                    upper,
+                },
+            )
+            .expect("grouped count product intent");
+        database.commit(&intent)
+    };
+
+    add(&database, 524_001, 1, 2).expect("one valid row satisfies count(all)<=count(valid)");
+    let error = add(&database, 524_002, 1, 0)
+        .expect_err("invalid row must violate its local group comparator");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+    add(&database, 524_003, 9, 10).expect("second canonical group has independent measures");
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen grouped count product database");
+    let error = add(&database, 524_004, 9, 1)
+        .expect_err("reopened second group must retain exact product comparator");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn grouped_exact_f64_sum_product_compare_is_exact_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_group_exact_f64_sum_compare::<
+            FilteredMetric,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(
+            FilteredMetricFields::lower,
+            FilteredMetricFields::value,
+            |_| SemanticRuleExpr::True,
+            RuleOrderComparison::LessOrEqual,
+            FilteredMetricFields::value,
+            |metric| {
+                metric
+                    .lower()
+                    .rule()
+                    .less_than_or_equal_field(metric.upper().rule())
+            },
+        ))
+        .build()
+        .expect("grouped exact-sum product schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create database");
+
+    let add = |database: &Database, id, value, lower, upper| {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value,
+                    lower,
+                    upper,
+                },
+            )
+            .expect("grouped sum product intent");
+        database.commit(&intent)
+    };
+
+    add(&database, 524_101, 6.0, 1, 2).expect("equal exact group sums satisfy comparator");
+    let error = add(&database, 524_102, 100.0, 1, 0)
+        .expect_err("unselected right-side value must make exact left sum exceed right");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+    add(&database, 524_103, 5.0, 9, 10).expect("independent exact-sum group");
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen grouped exact-sum product database");
+    let error = add(&database, 524_104, 7.0, 9, 0)
+        .expect_err("reopened group must preserve exact sum-to-sum comparison");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+fn ordered_extrema_compare_rule() -> ModelRuleExpr {
+    ModelRuleExpr::object_exact_extremum_compare::<FilteredMetric, FilteredMetric, f64, _, _, _, _>(
+        FilteredMetricFields::value,
+        |metric| {
+            metric
+                .lower()
+                .rule()
+                .less_than_or_equal_field(metric.upper().rule())
+        },
+        cfmd::OrderedExtremumKind::Min,
+        RuleOrderComparison::LessOrEqual,
+        FilteredMetricFields::value,
+        |_| SemanticRuleExpr::True,
+        cfmd::OrderedExtremumKind::Max,
+    )
+}
+
+#[test]
+fn ordered_extrema_use_semantic_multiset_delete_and_support_aligned_partiality() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ordered_extrema_compare_rule())
+        .build()
+        .expect("ordered extrema schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("empty support is aligned and valid");
+
+    let invalid = FilteredMetric {
+        id: Id::new(527_001),
+        value: 100.0,
+        lower: 9,
+        upper: 1,
+    };
+    let mut intent = IntentJournal::new();
+    database
+        .objects::<FilteredMetric>()
+        .expect("metrics")
+        .add(&mut intent, invalid)
+        .expect("invalid-side intent");
+    assert_eq!(
+        database
+            .commit(&intent)
+            .expect_err("one undefined extremum side must fail")
+            .kind(),
+        ErrorKind::InvariantViolation
+    );
+    drop(intent);
+
+    let rows = [
+        FilteredMetric {
+            id: Id::new(527_010),
+            value: 1.0,
+            lower: 1,
+            upper: 2,
+        },
+        FilteredMetric {
+            id: Id::new(527_011),
+            value: 2.0,
+            lower: 1,
+            upper: 2,
+        },
+        FilteredMetric {
+            id: Id::new(527_012),
+            value: 3.0,
+            lower: 1,
+            upper: 2,
+        },
+    ];
+    for row in &rows {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(&mut intent, row.clone())
+            .expect("ordered extrema insert");
+        database.commit(&intent).expect("min <= max");
+    }
+
+    let mut remove_min = IntentJournal::new();
+    database
+        .objects::<FilteredMetric>()
+        .expect("metrics")
+        .remove(&mut remove_min, rows[0].clone())
+        .expect("remove current min intent");
+    database
+        .commit(&remove_min)
+        .expect("deleting current min must advance from maintained ordered multiplicities");
+    drop(remove_min);
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen extrema database");
+    let mut remove_max = IntentJournal::new();
+    database
+        .objects::<FilteredMetric>()
+        .expect("metrics")
+        .remove(&mut remove_max, rows[2].clone())
+        .expect("remove current max intent");
+    database
+        .commit(&remove_max)
+        .expect("reopened ordered witness must delete current max exactly");
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn ordered_lower_quantile_uses_exact_rank_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_exact_order_statistic_compare::<
+            FilteredMetric,
+            FilteredMetric,
+            f64,
+            _,
+            _,
+            _,
+            _,
+        >(
+            FilteredMetricFields::value,
+            |_| SemanticRuleExpr::True,
+            cfmd::OrderedStatisticSelector::LowerQuantile {
+                numerator: 1,
+                denominator: 2,
+            },
+            RuleOrderComparison::LessOrEqual,
+            FilteredMetricFields::value,
+            |_| SemanticRuleExpr::True,
+            cfmd::OrderedStatisticSelector::FromStart(0),
+        ))
+        .build()
+        .expect("ordered statistic schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create ordered statistic database");
+
+    let add = |database: &Database, id, value| {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value,
+                    lower: 0,
+                    upper: 0,
+                },
+            )
+            .expect("ordered statistic intent");
+        database.commit(&intent)
+    };
+
+    add(&database, 528_001, 1.0).expect("single value has median == min");
+    add(&database, 528_002, 3.0).expect("lower median of two values remains min");
+    let error = add(&database, 528_003, 2.0)
+        .expect_err("lower median of three distinct values must exceed min");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen ordered statistic database");
+    let error = add(&database, 528_004, 2.0)
+        .expect_err("reopened lower-quantile selector must preserve exact rank law");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn ordered_statistic_range_uses_semantic_bounds_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_exact_order_statistic_range::<
+            FilteredMetric,
+            f64,
+            _,
+            _,
+        >(
+            FilteredMetricFields::value,
+            |_| SemanticRuleExpr::True,
+            cfmd::OrderedStatisticSelector::LowerQuantile {
+                numerator: 1,
+                denominator: 2,
+            },
+            Some(1.0),
+            Some(2.0),
+        ))
+        .build()
+        .expect("ordered statistic range schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create ordered statistic range database");
+
+    let add = |database: &Database, id, value| {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value,
+                    lower: 0,
+                    upper: 0,
+                },
+            )
+            .expect("ordered statistic range intent");
+        database.commit(&intent)
+    };
+
+    add(&database, 529_001, 1.0).expect("single lower quantile lies on lower bound");
+    add(&database, 529_002, 5.0).expect("lower quantile of two remains first value");
+    let error = add(&database, 529_003, 3.0)
+        .expect_err("lower quantile crossing semantic upper bound must fail");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen ordered statistic range database");
+    let error = add(&database, 529_004, 4.0)
+        .expect_err("reopened range must retain semantic canonical bound");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn grouped_ordered_statistic_range_is_bucket_local_and_survives_reopen() {
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<FilteredMetric>()
+        .model_rule(ModelRuleExpr::object_group_exact_order_statistic_range::<
+            FilteredMetric,
+            _,
+            f64,
+            _,
+            _,
+            _,
+        >(
+            FilteredMetricFields::lower,
+            FilteredMetricFields::value,
+            |_| SemanticRuleExpr::True,
+            cfmd::OrderedStatisticSelector::LowerQuantile {
+                numerator: 1,
+                denominator: 2,
+            },
+            Some(1.0),
+            Some(2.0),
+        ))
+        .build()
+        .expect("grouped ordered-statistic range schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("create grouped ordered-statistic database");
+
+    let add = |database: &Database, id, value, group| {
+        let mut intent = IntentJournal::new();
+        database
+            .objects::<FilteredMetric>()
+            .expect("metrics")
+            .add(
+                &mut intent,
+                FilteredMetric {
+                    id: Id::new(id),
+                    value,
+                    lower: group,
+                    upper: 0,
+                },
+            )
+            .expect("grouped ordered-statistic intent");
+        database.commit(&intent)
+    };
+
+    add(&database, 530_001, 1.0, 1).expect("first group lower quantile is in range");
+    add(&database, 530_002, 5.0, 1).expect("lower median of two stays at first value");
+    add(&database, 530_003, 2.0, 9).expect("independent Γ bucket is valid");
+    let error = add(&database, 530_004, 3.0, 1)
+        .expect_err("only the touched Γ bucket may cross its statistic bound");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+    drop(database);
+
+    let database = Database::open(&path).expect("reopen grouped ordered-statistic database");
+    let error = add(&database, 530_005, 4.0, 1)
+        .expect_err("reopened bucket must preserve ordered multiplicity and bound authority");
+    assert_eq!(error.kind(), ErrorKind::InvariantViolation);
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn migratable_watch_is_public_schema_neutral_surface() {
+    use cfmd::dynamic::Query;
+
+    fn open(database: &Database, query: &Query) -> cfmd::Result<cfmd::MigratableQueryWatch> {
+        database.migratable_watch(query)
+    }
+
+    fn late_materialize(event: &cfmd::MigratableWatchEvent) -> cfmd::Result<usize> {
+        event.materialize_schema(event.schema_revision(), |inserted, removed| {
+            Ok(inserted.len() + removed.len())
+        })
+    }
+
+    let _ = open as fn(&Database, &Query) -> cfmd::Result<cfmd::MigratableQueryWatch>;
+    let _ = cfmd::MigratableWatchEvent::schema_revision as fn(&cfmd::MigratableWatchEvent) -> u64;
+    let _ = late_materialize as fn(&cfmd::MigratableWatchEvent) -> cfmd::Result<usize>;
+}
+
+#[test]
+fn migration_workflow_is_one_public_prepared_artifact() {
+    let path = temp_path();
+    let source = Schema::builder()
+        .revisions(543, 1)
+        .build()
+        .expect("source schema");
+    let database = Database::builder(&path)
+        .schema(source)
+        .create()
+        .expect("create database");
+    let target = Schema::builder()
+        .revisions(544, 1)
+        .build()
+        .expect("target schema");
+    let model = cfmd::dynamic::MigrationModel::new(543_544, target);
+
+    let prepared = database
+        .prepare_migration(&model)
+        .expect("prepare migration");
+    assert_eq!(prepared.plan().source_schema_revision(), 543);
+    assert_eq!(prepared.plan().target_schema_revision(), 544);
+    assert_eq!(
+        prepared.plan().cost_class(),
+        cfmd::MigrationCostClass::MetadataOnly
+    );
+    assert_eq!(prepared.preview().validation(), prepared.validation());
+
+    let before = database
+        .observe_migration(&prepared)
+        .expect("observe prepared migration");
+    assert_eq!(before.state(), cfmd::MigrationObservationState::Prepared);
+    assert!(before.cutover().is_none());
+
+    database
+        .execute_migration(
+            &prepared,
+            TransactionId::new(543_544),
+            cfmd::dynamic::MigrationHistoryPolicy::Forget,
+        )
+        .expect("execute prepared migration");
+    let after = database
+        .observe_migration(&prepared)
+        .expect("observe migration cutover");
+    assert_eq!(after.state(), cfmd::MigrationObservationState::CutOver);
+    assert!(
+        after
+            .cutover()
+            .expect("public cutover projection")
+            .target_schema_is_current()
+    );
+
+    let pins = database
+        .history_retention_pins()
+        .expect("retained migration source epoch");
+    assert_eq!(pins.len(), 1);
+    let pin = pins[0];
+    assert_eq!(pin.reason(), cfmd::HistoryRetentionReason::SchemaMigration);
+    assert_eq!(pin.source_schema_revision(), 543);
+    database
+        .release_history_retention(&pin)
+        .expect("release retained source epoch");
+    assert!(database.history_retention_pins().unwrap().is_empty());
+    database
+        .release_history_retention(&pin)
+        .expect("release is idempotent");
+
+    drop(database);
+    fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn backup_verify_and_fresh_restore_are_public_format_v1_operations() {
+    let source_path = temp_path();
+    let backup_path = temp_path();
+    let restore_path = temp_path();
+    let schema = Schema::builder()
+        .revisions(559, 1)
+        .build()
+        .expect("backup schema");
+    let database = Database::builder(&source_path)
+        .schema(schema)
+        .create()
+        .expect("create backup source");
+    let source_revision = database.snapshot().unwrap().revision();
+
+    let backup = database
+        .backup_to(&backup_path, &cfmd::Encryption::None)
+        .expect("create strict backup");
+    assert_eq!(backup.revision(), source_revision);
+    let verified = Database::verify_backup(&backup_path, &cfmd::Encryption::None)
+        .expect("verify strict backup");
+    assert_eq!(verified.revision(), source_revision);
+
+    let restored = Database::restore_backup(
+        &backup_path,
+        &cfmd::Encryption::None,
+        &restore_path,
+        cfmd::Encryption::None,
+    )
+    .expect("fresh restore");
+    assert_eq!(restored.snapshot().unwrap().revision(), source_revision);
+
+    drop(restored);
+    drop(database);
+    fs::remove_file(source_path).expect("remove backup source");
+    fs::remove_file(backup_path).expect("remove backup artifact");
+    fs::remove_file(restore_path).expect("remove restored database");
+}
+
+#[test]
+fn value_object_query_mutation_does_not_invent_semantic_identity() {
+    cfmd::cfmd_object! {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct ValueUser => ValueUserFields("pass580.value-user") {
+            pub id: i64,
+            pub name: String,
+        }
+    }
+
+    let path = temp_path();
+    let schema = Schema::builder()
+        .object::<ValueUser>()
+        .build()
+        .expect("value-object schema");
+    let database = Database::builder(&path)
+        .schema(schema)
+        .create()
+        .expect("value-object database");
+
+    let snapshot = database.snapshot().expect("snapshot");
+    let values = snapshot.objects::<ValueUser>().expect("value users");
+    let insert = values
+        .insert(ValueUser {
+            id: 1,
+            name: "before".into(),
+        })
+        .expect("insert value object");
+    drop(values);
+    drop(snapshot);
+    database
+        .commit_plan(&insert, TransactionId::new(580_001))
+        .expect("commit insert");
+
+    let snapshot = database.snapshot().expect("snapshot");
+    let values = snapshot.objects::<ValueUser>().expect("value users");
+    let update = values
+        .where_(|value| value.id().eq(1))
+        .update_plan(|mut value| {
+            value.name = "after".into();
+            value
+        })
+        .expect("value-object rewrite");
+    drop(values);
+    drop(snapshot);
+    database
+        .commit_plan(&update, TransactionId::new(580_002))
+        .expect("commit rewrite");
+
+    let snapshot = database.snapshot().expect("snapshot");
+    let values = snapshot.objects::<ValueUser>().expect("value users");
+    assert_eq!(
+        values
+            .where_(|value| value.id().eq(1))
+            .one()
+            .expect("updated value object")
+            .name,
+        "after"
+    );
+    let delete = values
+        .where_(|value| value.id().eq(1))
+        .delete_plan()
+        .expect("value-object delete");
+    drop(values);
+    drop(snapshot);
+    database
+        .commit_plan(&delete, TransactionId::new(580_003))
+        .expect("commit delete");
+
+    assert!(
+        database
+            .snapshot()
+            .expect("snapshot")
+            .objects::<ValueUser>()
+            .expect("value users")
+            .all()
+            .expect("all values")
+            .is_empty()
+    );
+    drop(database);
+    fs::remove_file(path).expect("remove database");
 }

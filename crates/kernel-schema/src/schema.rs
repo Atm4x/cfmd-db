@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use kernel_types::{SchemaRevisionId, SemanticId};
 
 use crate::{
-    CapabilityDef, FieldDef, FieldRule, ModelRuleExpr, RelationDef, RelationSemantics,
-    RuleValueExpr, SemanticRuleExpr, SemanticRuleTypeError, StructuralEquivalenceDef,
+    CapabilityDef, ExactAggregateMeasureExpr, FieldDef, FieldRule, ModelRuleExpr,
+    OwnedRelationshipDef, PermissionCoordinate, RelationDef, RelationSemantics, RuleValueExpr,
+    SchemaAccess, SemanticRuleExpr, SemanticRuleTypeError, StructuralEquivalenceDef,
     StructuralOrderingDef, SubtypeClosure, Symbol, TypeError, TypeExpr,
 };
 
@@ -14,6 +15,7 @@ pub struct Schema {
     symbols: BTreeMap<SemanticId, Symbol>,
     types: BTreeMap<SemanticId, TypeExpr>,
     capabilities: BTreeMap<SemanticId, CapabilityDef>,
+    access: SchemaAccess,
     fields: BTreeMap<SemanticId, FieldDef>,
     field_rules: BTreeMap<SemanticId, Vec<FieldRule>>,
     relation_column_rules: BTreeMap<(SemanticId, SemanticId), Vec<FieldRule>>,
@@ -21,6 +23,7 @@ pub struct Schema {
     model_rules: Vec<ModelRuleExpr>,
     relation_column_ids: BTreeMap<SemanticId, Vec<SemanticId>>,
     relations: BTreeMap<SemanticId, RelationDef>,
+    owned_relationships: BTreeMap<SemanticId, OwnedRelationshipDef>,
     structural_equivalences: BTreeMap<SemanticId, StructuralEquivalenceDef>,
     structural_orderings: BTreeMap<SemanticId, StructuralOrderingDef>,
     inclusions: BTreeSet<(SemanticId, SemanticId)>,
@@ -41,6 +44,101 @@ fn validate_field_rule_type(rule: &FieldRule, ty: &TypeExpr) -> Result<(), Schem
     }
 }
 
+fn validate_permission_coordinate(
+    schema: &Schema,
+    permission: PermissionCoordinate,
+) -> Result<(), SchemaError> {
+    let validate_relation = |relation: SemanticId| {
+        schema
+            .relations
+            .contains_key(&relation)
+            .then_some(())
+            .ok_or(SchemaError::UnknownAuthorizationRelation(relation))
+    };
+    let validate_field = |relation: SemanticId, column: SemanticId| {
+        validate_relation(relation)?;
+        let columns = schema
+            .relation_column_ids
+            .get(&relation)
+            .ok_or(SchemaError::UnknownAuthorizationRelation(relation))?;
+        columns
+            .contains(&column)
+            .then_some(())
+            .ok_or(SchemaError::UnknownAuthorizationColumn { relation, column })
+    };
+    match permission {
+        PermissionCoordinate::ReadRelation { relation }
+        | PermissionCoordinate::WriteRelation { relation }
+        | PermissionCoordinate::CreateObject { relation }
+        | PermissionCoordinate::DeleteObject { relation }
+        | PermissionCoordinate::AttachRelationship { relation }
+        | PermissionCoordinate::DetachRelationship { relation }
+        | PermissionCoordinate::MoveRelationship { relation } => validate_relation(relation),
+        PermissionCoordinate::ReadField { relation, column }
+        | PermissionCoordinate::WriteField { relation, column } => validate_field(relation, column),
+        PermissionCoordinate::ModelRead
+        | PermissionCoordinate::HistoricalRead
+        | PermissionCoordinate::HistoryRead
+        | PermissionCoordinate::Watch
+        | PermissionCoordinate::WriteCarrierPresence { .. }
+        | PermissionCoordinate::WriteCarrierMember { .. }
+        | PermissionCoordinate::WriteLifecycleEntity { .. }
+        | PermissionCoordinate::WriteLifecycleRoot { .. }
+        | PermissionCoordinate::WriteKeepsAlivePresence { .. }
+        | PermissionCoordinate::WriteKeepsAliveEdge { .. } => Ok(()),
+    }
+}
+
+fn visit_access_role(
+    role: SemanticId,
+    policy: &SchemaAccess,
+    visiting: &mut BTreeSet<SemanticId>,
+    visited: &mut BTreeSet<SemanticId>,
+) -> Result<(), SchemaError> {
+    if visited.contains(&role) {
+        return Ok(());
+    }
+    if !visiting.insert(role) {
+        return Err(SchemaError::AccessRoleCycle(role));
+    }
+    let definition = policy
+        .roles
+        .get(&role)
+        .ok_or(SchemaError::UnknownAccessRole(role))?;
+    for included in &definition.includes {
+        visit_access_role(*included, policy, visiting, visited)?;
+    }
+    visiting.remove(&role);
+    visited.insert(role);
+    Ok(())
+}
+
+fn validate_schema_access(schema: &Schema, policy: &SchemaAccess) -> Result<(), SchemaError> {
+    for capability in policy.capabilities.values() {
+        for permission in &capability.permissions {
+            validate_permission_coordinate(schema, *permission)?;
+        }
+    }
+    for role in policy.roles.values() {
+        for capability in &role.capabilities {
+            if !policy.capabilities.contains_key(capability) {
+                return Err(SchemaError::UnknownAccessCapability(*capability));
+            }
+        }
+        for included in &role.includes {
+            if !policy.roles.contains_key(included) {
+                return Err(SchemaError::UnknownAccessRole(*included));
+            }
+        }
+    }
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for role in policy.roles.keys().copied() {
+        visit_access_role(role, policy, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
 impl Schema {
     #[must_use]
     pub fn new(revision: SchemaRevisionId) -> Self {
@@ -49,6 +147,7 @@ impl Schema {
             symbols: BTreeMap::new(),
             types: BTreeMap::new(),
             capabilities: BTreeMap::new(),
+            access: SchemaAccess::default(),
             fields: BTreeMap::new(),
             field_rules: BTreeMap::new(),
             relation_column_rules: BTreeMap::new(),
@@ -56,6 +155,7 @@ impl Schema {
             model_rules: Vec::new(),
             relation_column_ids: BTreeMap::new(),
             relations: BTreeMap::new(),
+            owned_relationships: BTreeMap::new(),
             structural_equivalences: BTreeMap::new(),
             structural_orderings: BTreeMap::new(),
             inclusions: BTreeSet::new(),
@@ -157,32 +257,226 @@ impl Schema {
 
     pub fn add_model_rule(&mut self, rule: ModelRuleExpr) -> Result<(), SchemaError> {
         match &rule {
-            ModelRuleExpr::RelationCardinality { relation, min, max } => {
-                if self.relation(*relation).is_none() {
-                    return Err(SchemaError::UnknownRelationForRule(*relation));
-                }
-                if max.is_some_and(|max| max < *min) {
-                    return Err(SchemaError::InvalidFieldRuleBounds);
+            ModelRuleExpr::RelationExactMeasure { constraint } => {
+                self.validate_exact_measure_constraint(constraint)?;
+            }
+            ModelRuleExpr::RelationGroupedExactMeasure {
+                group_columns,
+                group_equivalences,
+                constraint,
+            } => {
+                self.validate_exact_measure_constraint(constraint)?;
+                let relation = Self::grouped_exact_measure_relation(constraint)?;
+                self.validate_group_coordinates(relation, group_columns, group_equivalences)?;
+            }
+        }
+        self.model_rules.push(rule);
+        Ok(())
+    }
+
+    fn validate_exact_measure_constraint(
+        &self,
+        constraint: &crate::ExactMeasureConstraint,
+    ) -> Result<(), SchemaError> {
+        use crate::{ExactAggregateRange, ExactMeasureConstraint};
+
+        match constraint {
+            ExactMeasureConstraint::Range { measure, range } => {
+                self.validate_exact_aggregate_measure(measure)?;
+                match (measure, range) {
+                    (
+                        ExactAggregateMeasureExpr::Count { .. },
+                        ExactAggregateRange::Count { min, max },
+                    ) => {
+                        if max.is_some_and(|max| max < *min) {
+                            return Err(SchemaError::InvalidFieldRuleBounds);
+                        }
+                    }
+                    (
+                        ExactAggregateMeasureExpr::F64Sum { .. },
+                        ExactAggregateRange::F64Sum { min, max },
+                    ) => {
+                        if min
+                            .zip(*max)
+                            .is_some_and(|(min, max)| min.value() > max.value())
+                        {
+                            return Err(SchemaError::InvalidFieldRuleBounds);
+                        }
+                    }
+                    (
+                        ExactAggregateMeasureExpr::OrderedStatistic {
+                            relation, column, ..
+                        },
+                        ExactAggregateRange::OrderedStatistic { min, max },
+                    ) => {
+                        let ty = self.relation_column_type(*relation, *column).ok_or(
+                            SchemaError::UnknownRelationColumnForRule {
+                                relation: *relation,
+                                column: *column,
+                            },
+                        )?;
+                        if min
+                            .iter()
+                            .chain(max.iter())
+                            .any(|bound| !Self::ordered_statistic_bound_matches_type(bound, ty))
+                        {
+                            return Err(SchemaError::EntityRuleTypeMismatch);
+                        }
+                    }
+                    _ => return Err(SchemaError::EntityRuleTypeMismatch),
                 }
             }
-            ModelRuleExpr::RelationExists {
-                relation,
-                predicate,
+            ExactMeasureConstraint::Compare { left, right, .. } => {
+                self.validate_exact_aggregate_pair(left, right)?;
             }
-            | ModelRuleExpr::RelationAll {
+        }
+        Ok(())
+    }
+
+    fn ordered_statistic_bound_matches_type(
+        bound: &crate::OrderedStatisticBound,
+        ty: &TypeExpr,
+    ) -> bool {
+        match (bound, ty) {
+            (crate::OrderedStatisticBound::Unit, TypeExpr::Scalar(crate::ScalarType::Unit))
+            | (crate::OrderedStatisticBound::Bool(_), TypeExpr::Scalar(crate::ScalarType::Bool))
+            | (crate::OrderedStatisticBound::I64(_), TypeExpr::Scalar(crate::ScalarType::I64))
+            | (
+                crate::OrderedStatisticBound::F64Bits(_),
+                TypeExpr::Scalar(crate::ScalarType::F64),
+            )
+            | (crate::OrderedStatisticBound::Text(_), TypeExpr::Scalar(crate::ScalarType::Text)) => {
+                true
+            }
+            (
+                crate::OrderedStatisticBound::LiveEntityId { entity_type, .. },
+                TypeExpr::Scalar(crate::ScalarType::LiveEntityRef(expected)),
+            )
+            | (
+                crate::OrderedStatisticBound::HistoricalEntityId { entity_type, .. },
+                TypeExpr::Scalar(crate::ScalarType::HistoricalEntityId(expected)),
+            ) => entity_type == expected,
+            _ => false,
+        }
+    }
+
+    fn grouped_exact_measure_relation(
+        constraint: &crate::ExactMeasureConstraint,
+    ) -> Result<SemanticId, SchemaError> {
+        let relation = match constraint {
+            crate::ExactMeasureConstraint::Range { measure, .. } => {
+                Self::exact_aggregate_relation(measure)
+            }
+            crate::ExactMeasureConstraint::Compare { left, right, .. } => {
+                let relation = Self::exact_aggregate_relation(left);
+                if Self::exact_aggregate_relation(right) != relation {
+                    return Err(SchemaError::EntityRuleTypeMismatch);
+                }
+                relation
+            }
+        };
+        Ok(relation)
+    }
+
+    fn exact_aggregate_relation(measure: &ExactAggregateMeasureExpr) -> SemanticId {
+        match measure {
+            ExactAggregateMeasureExpr::Count { relation, .. }
+            | ExactAggregateMeasureExpr::F64Sum { relation, .. }
+            | ExactAggregateMeasureExpr::OrderedStatistic { relation, .. } => *relation,
+        }
+    }
+
+    fn validate_exact_aggregate_pair(
+        &self,
+        left: &ExactAggregateMeasureExpr,
+        right: &ExactAggregateMeasureExpr,
+    ) -> Result<(), SchemaError> {
+        self.validate_exact_aggregate_measure(left)?;
+        self.validate_exact_aggregate_measure(right)?;
+        let homogeneous = match (left, right) {
+            (ExactAggregateMeasureExpr::Count { .. }, ExactAggregateMeasureExpr::Count { .. })
+            | (
+                ExactAggregateMeasureExpr::F64Sum { .. },
+                ExactAggregateMeasureExpr::F64Sum { .. },
+            ) => true,
+            (
+                ExactAggregateMeasureExpr::OrderedStatistic {
+                    ordering: left_ordering,
+                    relation: left_relation,
+                    column: left_column,
+                    ..
+                },
+                ExactAggregateMeasureExpr::OrderedStatistic {
+                    ordering: right_ordering,
+                    relation: right_relation,
+                    column: right_column,
+                    ..
+                },
+            ) => {
+                left_ordering == right_ordering
+                    && self.relation_column_type(*left_relation, *left_column)
+                        == self.relation_column_type(*right_relation, *right_column)
+            }
+            _ => false,
+        };
+        if !homogeneous {
+            return Err(SchemaError::EntityRuleTypeMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_group_coordinates(
+        &self,
+        relation: SemanticId,
+        group_columns: &[SemanticId],
+        group_equivalences: &[SemanticId],
+    ) -> Result<(), SchemaError> {
+        let Some(definition) = self.relation(relation) else {
+            return Err(SchemaError::UnknownRelationForRule(relation));
+        };
+        if group_columns.is_empty() || group_columns.len() != group_equivalences.len() {
+            return Err(SchemaError::RelationEquivalenceArityMismatch);
+        }
+        let declared_equivalences = match &definition.semantics {
+            crate::RelationSemantics::Set {
+                column_equivalences,
+            }
+            | crate::RelationSemantics::Bag {
+                column_equivalences,
+            } => column_equivalences,
+        };
+        for (column, equivalence) in group_columns.iter().zip(group_equivalences) {
+            let Some(ordinal) = self.relation_column_ordinal(relation, *column) else {
+                return Err(SchemaError::UnknownRelationColumnForRule {
+                    relation,
+                    column: *column,
+                });
+            };
+            if declared_equivalences.get(ordinal) != Some(equivalence) {
+                return Err(SchemaError::EntityRuleTypeMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_exact_aggregate_measure(
+        &self,
+        measure: &ExactAggregateMeasureExpr,
+    ) -> Result<(), SchemaError> {
+        match measure {
+            ExactAggregateMeasureExpr::Count {
                 relation,
                 predicate,
             } => {
                 if self.relation(*relation).is_none() {
                     return Err(SchemaError::UnknownRelationForRule(*relation));
                 }
-                self.validate_relation_row_rule(*relation, predicate)?;
+                self.validate_relation_row_rule(*relation, predicate)
             }
-            ModelRuleExpr::RelationExactF64SumRange {
+            ExactAggregateMeasureExpr::F64Sum {
                 relation,
                 column,
-                min,
-                max,
+                predicate,
             } => {
                 if self.relation(*relation).is_none() {
                     return Err(SchemaError::UnknownRelationForRule(*relation));
@@ -192,16 +486,34 @@ impl Schema {
                 {
                     return Err(SchemaError::EntityRuleTypeMismatch);
                 }
-                if min
-                    .zip(*max)
-                    .is_some_and(|(min, max)| min.value() > max.value())
-                {
-                    return Err(SchemaError::InvalidFieldRuleBounds);
+                self.validate_relation_row_rule(*relation, predicate)
+            }
+            ExactAggregateMeasureExpr::OrderedStatistic {
+                relation,
+                column,
+                predicate,
+                selector,
+                ..
+            } => {
+                if self.relation(*relation).is_none() {
+                    return Err(SchemaError::UnknownRelationForRule(*relation));
                 }
+                if self.relation_column_type(*relation, *column).is_none() {
+                    return Err(SchemaError::UnknownRelationColumnForRule {
+                        relation: *relation,
+                        column: *column,
+                    });
+                }
+                if matches!(
+                    selector,
+                    crate::OrderedStatisticSelector::LowerQuantile { numerator, denominator }
+                        if *denominator == 0 || *numerator > *denominator
+                ) {
+                    return Err(SchemaError::InvalidExactOrderStatistic);
+                }
+                self.validate_relation_row_rule(*relation, predicate)
             }
         }
-        self.model_rules.push(rule);
-        Ok(())
     }
 
     #[must_use]
@@ -296,6 +608,79 @@ impl Schema {
             .map(|column| SemanticId::new((column as u128) + 1))
             .collect();
         self.define_relation_with_column_ids(relation, column_ids)
+    }
+
+    pub fn define_owned_relationship(
+        &mut self,
+        definition: OwnedRelationshipDef,
+    ) -> Result<(), SchemaError> {
+        if !self.relations.contains_key(&definition.relation) {
+            return Err(SchemaError::UnknownOwnedRelationshipRelation(
+                definition.relation,
+            ));
+        }
+        if !self.relations.contains_key(&definition.target_relation) {
+            return Err(SchemaError::UnknownOwnedRelationshipTarget(
+                definition.target_relation,
+            ));
+        }
+        if self
+            .owned_relationships
+            .insert(definition.relation, definition)
+            .is_some()
+        {
+            return Err(SchemaError::DuplicateOwnedRelationship);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn owned_relationship(&self, relation: SemanticId) -> Option<&OwnedRelationshipDef> {
+        self.owned_relationships.get(&relation)
+    }
+
+    pub fn owned_relationships(&self) -> impl Iterator<Item = &OwnedRelationshipDef> {
+        self.owned_relationships.values()
+    }
+
+    pub fn set_schema_access(&mut self, policy: SchemaAccess) -> Result<(), SchemaError> {
+        validate_schema_access(self, &policy)?;
+        self.access = policy;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn schema_access(&self) -> &SchemaAccess {
+        &self.access
+    }
+
+    pub fn resolve_access_roles(
+        &self,
+        roles: impl IntoIterator<Item = SemanticId>,
+    ) -> Result<BTreeSet<PermissionCoordinate>, SchemaError> {
+        let mut permissions = BTreeSet::new();
+        let mut pending = roles.into_iter().collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(role) = pending.pop() {
+            if !visited.insert(role) {
+                continue;
+            }
+            let definition = self
+                .access
+                .roles
+                .get(&role)
+                .ok_or(SchemaError::UnknownAccessRole(role))?;
+            for capability in &definition.capabilities {
+                let definition = self
+                    .access
+                    .capabilities
+                    .get(capability)
+                    .ok_or(SchemaError::UnknownAccessCapability(*capability))?;
+                permissions.extend(definition.permissions.iter().copied());
+            }
+            pending.extend(definition.includes.iter().copied());
+        }
+        Ok(permissions)
     }
 
     pub fn define_capability(&mut self, capability: CapabilityDef) -> Result<(), SchemaError> {
@@ -595,6 +980,7 @@ impl Schema {
         self.types == other.types
             && self.capabilities == other.capabilities
             && self.relations == other.relations
+            && self.owned_relationships == other.owned_relationships
             && self.structural_equivalences == other.structural_equivalences
             && self.structural_orderings == other.structural_orderings
             && self.inclusions == other.inclusions
@@ -604,7 +990,9 @@ impl Schema {
     pub fn relation_transport_base_equivalent(&self, other: &Self) -> bool {
         self.types == other.types
             && self.capabilities == other.capabilities
+            && self.access == other.access
             && self.fields == other.fields
+            && self.owned_relationships == other.owned_relationships
             && self.structural_equivalences == other.structural_equivalences
             && self.structural_orderings == other.structural_orderings
             && self.inclusions == other.inclusions
@@ -636,12 +1024,14 @@ impl Schema {
         symbols_match
             && self.types == other.types
             && self.capabilities == other.capabilities
+            && self.access == other.access
             && self.fields == other.fields
             && self.field_rules == other.field_rules
             && self.relation_column_rules == other.relation_column_rules
             && self.relation_column_ids == other.relation_column_ids
             && self.entity_rules == other.entity_rules
             && self.relations == other.relations
+            && self.owned_relationships == other.owned_relationships
             && self.structural_equivalences == other.structural_equivalences
             && self.structural_orderings == other.structural_orderings
             && self.inclusions == other.inclusions
@@ -664,6 +1054,14 @@ pub enum SchemaError {
     UnknownSemanticId,
     DuplicateTypeDefinition,
     DuplicateCapability,
+    UnknownAccessCapability(SemanticId),
+    UnknownAccessRole(SemanticId),
+    UnknownAuthorizationRelation(SemanticId),
+    UnknownAuthorizationColumn {
+        relation: SemanticId,
+        column: SemanticId,
+    },
+    AccessRoleCycle(SemanticId),
     DuplicateField,
     UnknownFieldForRule(SemanticId),
     UnknownRelationForRule(SemanticId),
@@ -675,8 +1073,12 @@ pub enum SchemaError {
     DuplicateRelationColumnIdentity,
     FieldRuleTypeMismatch,
     InvalidFieldRuleBounds,
+    InvalidExactOrderStatistic,
     EntityRuleTypeMismatch,
     DuplicateRelation,
+    DuplicateOwnedRelationship,
+    UnknownOwnedRelationshipRelation(SemanticId),
+    UnknownOwnedRelationshipTarget(SemanticId),
     DuplicateStructuralEquivalence,
     DuplicateStructuralOrdering,
     RelationEquivalenceArityMismatch,

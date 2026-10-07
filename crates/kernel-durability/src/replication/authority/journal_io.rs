@@ -6,7 +6,10 @@ use crate::replication::codec::{FRAME_HEADER_LEN, REPLICATION_FORMAT_TAG, REPLIC
 use crate::runtime::{CodecError, DurabilityError};
 use crate::wal_frame::MAX_PAYLOAD_LEN;
 
-fn encode_replication_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, DurabilityError> {
+pub(in crate::replication::authority) fn encode_replication_frame(
+    kind: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, DurabilityError> {
     if payload.len() > MAX_PAYLOAD_LEN {
         return Err(DurabilityError::PayloadTooLarge);
     }

@@ -19,6 +19,14 @@ pub struct PhysicalStore {
     // reconstructible and intentionally excluded from advisor/durable artifact identity.
     row_occurrence_atoms:
         PersistentOrdMap<(SemanticId, LayoutId), Arc<MaterializedObservableAtomState>>,
+    // Store/revision-scoped atomic semantic equality authority. EqClassId is reconstructible
+    // physical identity only; canonical payload remains here and never becomes durable/public.
+    revision_semantic_catalog:
+        Option<Arc<kernel_semantics::semantic_class_catalog::RevisionSemanticClassCatalog>>,
+    revision_semantic_columns: PersistentOrdMap<
+        (SemanticId, LayoutId, usize, SemanticId),
+        Arc<RevisionSemanticEncodedColumn>,
+    >,
     derived_artifacts_by_relation_layout: DerivedArtifactDependencyCache,
     advisor_managed_artifacts: PersistentOrdSet<UnifiedArtifactId>,
     semantic_quotient_support_local_delta_updates: u64,

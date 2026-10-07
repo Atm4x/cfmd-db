@@ -1,10 +1,10 @@
 use kernel_model::{DatabaseState, Value};
 use kernel_revision::Revision;
 use kernel_schema::{
-    CapabilityDef, FieldDef, FieldRule, FiniteF64, ModelRuleExpr, RelationDef, RelationSemantics,
-    RuleValueExpr, ScalarType, Schema, SemanticContext, SemanticEnvironment, SemanticRuleExpr,
-    StructuralEquivalenceDef, StructuralOrderingDef, Symbol, SymbolKind, TextPattern, TypeExpr,
-    TypeVar,
+    CapabilityDef, FieldDef, FieldRule, FiniteF64, ModelRuleExpr, OrphanPolicyDef,
+    OwnedRelationshipDef, RelationDef, RelationSemantics, RuleValueExpr, ScalarType, Schema,
+    SemanticContext, SemanticEnvironment, SemanticRuleExpr, StructuralEquivalenceDef,
+    StructuralOrderingDef, Symbol, SymbolKind, TextPattern, TypeExpr, TypeVar,
 };
 use kernel_semantics::{EquivalenceModule, OrderingModule, SemanticRegistry};
 use kernel_types::{EntityId, RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
@@ -145,30 +145,51 @@ fn complex_revision() -> (Revision, SemanticRegistry) {
         })
         .unwrap();
     schema
-        .add_model_rule(ModelRuleExpr::RelationCardinality {
-            relation,
-            min: 0,
-            max: Some(8),
+        .add_model_rule(ModelRuleExpr::RelationExactMeasure {
+            constraint: kernel_schema::ExactMeasureConstraint::Range {
+                measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                    relation,
+                    predicate: SemanticRuleExpr::True,
+                },
+                range: kernel_schema::ExactAggregateRange::Count {
+                    min: 0,
+                    max: Some(8),
+                },
+            },
         })
         .unwrap();
     let text_column = schema.relation_column_id(relation, 1).unwrap();
     schema
-        .add_model_rule(ModelRuleExpr::RelationExists {
-            relation,
-            predicate: SemanticRuleExpr::TextLength {
-                value: RuleValueExpr::Field(text_column),
-                min: 1,
-                max: None,
+        .add_model_rule(ModelRuleExpr::RelationExactMeasure {
+            constraint: kernel_schema::ExactMeasureConstraint::Range {
+                measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                    relation,
+                    predicate: SemanticRuleExpr::TextLength {
+                        value: RuleValueExpr::Field(text_column),
+                        min: 1,
+                        max: None,
+                    },
+                },
+                range: kernel_schema::ExactAggregateRange::Count { min: 1, max: None },
             },
         })
         .unwrap();
     schema
-        .add_model_rule(ModelRuleExpr::RelationAll {
-            relation,
-            predicate: SemanticRuleExpr::TextLength {
-                value: RuleValueExpr::Field(text_column),
-                min: 1,
-                max: Some(32),
+        .add_model_rule(ModelRuleExpr::RelationExactMeasure {
+            constraint: kernel_schema::ExactMeasureConstraint::Range {
+                measure: kernel_schema::ExactAggregateMeasureExpr::Count {
+                    relation,
+                    predicate: (SemanticRuleExpr::TextLength {
+                        value: RuleValueExpr::Field(text_column),
+                        min: 1,
+                        max: Some(32),
+                    })
+                    .negate(),
+                },
+                range: kernel_schema::ExactAggregateRange::Count {
+                    min: 0,
+                    max: Some(0),
+                },
             },
         })
         .unwrap();
@@ -181,14 +202,28 @@ fn complex_revision() -> (Revision, SemanticRegistry) {
             },
         })
         .unwrap();
+    schema
+        .define_owned_relationship(OwnedRelationshipDef {
+            relation,
+            target_relation: sum_relation,
+            orphan_policy: OrphanPolicyDef::DeleteIfUnowned,
+        })
+        .unwrap();
     let sum_column = schema.relation_column_id(sum_relation, 0).unwrap();
     let zero = FiniteF64::new(0.0).unwrap();
     schema
-        .add_model_rule(ModelRuleExpr::RelationExactF64SumRange {
-            relation: sum_relation,
-            column: sum_column,
-            min: Some(zero),
-            max: Some(zero),
+        .add_model_rule(ModelRuleExpr::RelationExactMeasure {
+            constraint: kernel_schema::ExactMeasureConstraint::Range {
+                measure: kernel_schema::ExactAggregateMeasureExpr::F64Sum {
+                    relation: sum_relation,
+                    column: sum_column,
+                    predicate: SemanticRuleExpr::True,
+                },
+                range: kernel_schema::ExactAggregateRange::F64Sum {
+                    min: Some(zero),
+                    max: Some(zero),
+                },
+            },
         })
         .unwrap();
     schema

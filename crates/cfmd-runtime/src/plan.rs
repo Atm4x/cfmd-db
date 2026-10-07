@@ -27,8 +27,6 @@ pub(crate) struct ReferenceContract {
     pub(crate) column: usize,
     pub(crate) field: FieldId,
     pub(crate) target_type: TypeId,
-    pub(crate) target_relation: RelationId,
-    pub(crate) target_identity_column: usize,
     pub(crate) optional: bool,
 }
 
@@ -427,5 +425,6 @@ impl Plan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     Committed { revision: RevisionId },
+    AlreadySatisfied { revision: RevisionId },
     AlreadyCommitted { revision: RevisionId },
 }

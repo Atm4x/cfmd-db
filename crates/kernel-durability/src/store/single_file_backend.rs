@@ -9,15 +9,18 @@ use crate::descriptor::{
     DurableArtifactCore, DurableMaterializationSpec, DurablePhysicalArtifactSpec,
     canonical_physical_artifact_specs,
 };
-use crate::domain::IdempotencyEpoch;
+use crate::domain::{DurableExternalFreshnessBinding, IdempotencyEpoch};
 use crate::metadata;
 use crate::realization::DurableFactorizedRealization;
-use crate::replication::authority::ReplicationAuthorityJournal;
+use crate::replication::authority::{
+    ReplicationAuthorityFrameSlice, ReplicationAuthorityFrameSource, ReplicationAuthorityJournal,
+    ReplicationAuthoritySemanticSnapshot,
+};
 use crate::runtime::{DurabilityError, RecoveryScan};
 use crate::single_file::{
     SingleFileContainer, SingleFileSectionInput, SingleFileSectionKind, SingleFileSectionSource,
 };
-use crate::storage_encryption::StorageEncryption;
+use crate::storage_encryption::{StorageEncryption, StorageProtectionProfile};
 
 use super::freshness::{
     ExternalFreshnessAuthority, ExternalFreshnessConfig, ExternalFreshnessState,
@@ -76,6 +79,16 @@ impl SingleFileSectionSource for FactorizedRealizationSectionSource<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct SingleFileCheckpointAuthority<'a> {
+    pub(super) revision: &'a Revision,
+    pub(super) materialization_specs: &'a [DurableMaterializationSpec],
+    pub(super) physical_artifact_specs: &'a [DurablePhysicalArtifactSpec],
+    pub(super) artifact_cores: &'a [DurableArtifactCore],
+    pub(super) physical_realization: Option<&'a DurableFactorizedRealization>,
+    pub(super) portable_historical_epochs: &'a BTreeMap<kernel_change::RevisionEffectId, Vec<u8>>,
+}
+
 impl DurableRevisionStore {
     pub fn rewrap_single_file_database_master_key(
         &mut self,
@@ -84,6 +97,39 @@ impl DurableRevisionStore {
         if self.poisoned {
             return Err(DurabilityError::Poisoned);
         }
+
+        match (self.backend.protection_profile(), next.protection_profile()) {
+            (
+                StorageProtectionProfile::ExternalWrapped {
+                    algorithm: source, ..
+                },
+                StorageProtectionProfile::ExternalWrapped {
+                    algorithm: target, ..
+                },
+            ) if source == target => {}
+            (
+                StorageProtectionProfile::ExternalWrapped { .. },
+                StorageProtectionProfile::ExternalWrapped { .. },
+            ) => {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "database master key rewrap cannot change storage AEAD algorithm",
+                });
+            }
+            (StorageProtectionProfile::ExternalWrapped { .. }, _) => {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "database master key rewrap requires wrapped provider encryption",
+                });
+            }
+            _ => {
+                return Err(DurabilityError::Protocol {
+                    offset: 0,
+                    reason: "database master key rewrap requires an existing wrapped-key store",
+                });
+            }
+        }
+
         self.backend
             .single_file_container()?
             .rewrap_database_master_key(next)
@@ -180,13 +226,36 @@ impl DurableRevisionStore {
         artifact_cores: &[DurableArtifactCore],
         registry: &SemanticRegistry,
     ) -> Result<Self, DurabilityError> {
+        Self::create_single_file_with_encryption_and_materializations_physical_artifacts_and_cores_and_freshness_binding(
+            path,
+            encryption,
+            base_revision,
+            materialization_specs,
+            physical_artifact_specs,
+            artifact_cores,
+            registry,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_single_file_with_encryption_and_materializations_physical_artifacts_and_cores_and_freshness_binding(
+        path: impl AsRef<Path>,
+        encryption: &StorageEncryption,
+        base_revision: &Revision,
+        materialization_specs: &[DurableMaterializationSpec],
+        physical_artifact_specs: &[DurablePhysicalArtifactSpec],
+        artifact_cores: &[DurableArtifactCore],
+        registry: &SemanticRegistry,
+        external_freshness: Option<DurableExternalFreshnessBinding>,
+    ) -> Result<Self, DurabilityError> {
         let path = path.as_ref().to_path_buf();
         let physical_artifact_specs = canonical_physical_artifact_specs(physical_artifact_specs);
         let causal_coverage_root = base_revision.id();
         let revision_effects = BTreeMap::new();
         let revision_effect_frontiers = BTreeMap::from([(causal_coverage_root, BTreeSet::new())]);
         let metadata_record = metadata::DurableStoreMetadata {
-            external_freshness: None,
+            external_freshness,
             current_idempotency_epoch: IdempotencyEpoch::ZERO,
             minimum_retry_epoch: IdempotencyEpoch::ZERO,
             materializations: materialization_specs.to_vec(),
@@ -231,7 +300,7 @@ impl DurableRevisionStore {
             generation: 1,
             checkpoint: base_revision.clone(),
             durable_head: base_revision.id(),
-            wal,
+            wal: wal.into(),
             semantic_registry: registry.clone(),
             materialization_specs: materialization_specs.to_vec(),
             physical_artifact_specs,
@@ -239,6 +308,7 @@ impl DurableRevisionStore {
             artifact_cores: artifact_cores.to_vec(),
             migration_complements: Vec::new(),
             historical_epoch_anchors: BTreeMap::new(),
+            portable_historical_epochs: BTreeMap::new(),
             migration_complement_index: BTreeMap::new(),
             current_idempotency_epoch: IdempotencyEpoch::ZERO,
             minimum_retry_epoch: IdempotencyEpoch::ZERO,
@@ -298,6 +368,13 @@ impl DurableRevisionStore {
         freshness.complete_recovery_advance(pending_advance)?;
         store.external_freshness = Some(freshness);
         Ok((store, scan))
+    }
+
+    pub(super) fn open_single_file_sealed_external_freshness_staging(
+        path: impl AsRef<Path>,
+        encryption: &StorageEncryption,
+    ) -> Result<(Self, RecoveryScan), DurabilityError> {
+        Self::open_single_file_inner(path.as_ref(), true, encryption)
     }
 
     fn open_single_file_inner(
@@ -362,7 +439,7 @@ impl DurableRevisionStore {
         let mut store = canonical.into_store(
             super::backend::DurabilityBackend::single_file(container),
             view.generation,
-            wal,
+            wal.into(),
             replication,
         );
         store.prepared_transactions = prepared_transactions;
@@ -382,12 +459,103 @@ impl DurableRevisionStore {
         artifact_cores: &[DurableArtifactCore],
         physical_realization: Option<&DurableFactorizedRealization>,
     ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        let portable_historical_epochs = BTreeMap::new();
+        self.rotate_single_file_checkpoint_with_portable_history(SingleFileCheckpointAuthority {
+            revision,
+            materialization_specs,
+            physical_artifact_specs,
+            artifact_cores,
+            physical_realization,
+            portable_historical_epochs: &portable_historical_epochs,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep checkpoint authority assembly and publication as one auditable protocol boundary."
+    )]
+    pub(super) fn rotate_single_file_checkpoint_with_portable_history(
+        &mut self,
+        authority: SingleFileCheckpointAuthority<'_>,
+    ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        let external_freshness = self
+            .external_freshness
+            .as_ref()
+            .map(ExternalFreshnessState::metadata_binding);
+        self.rotate_single_file_checkpoint_with_portable_history_inner(
+            authority,
+            external_freshness,
+            true,
+            None,
+        )
+    }
+
+    pub(super) fn rotate_single_file_checkpoint_with_portable_history_sealed_freshness(
+        &mut self,
+        authority: SingleFileCheckpointAuthority<'_>,
+        external_freshness: DurableExternalFreshnessBinding,
+    ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        self.rotate_single_file_checkpoint_with_portable_history_inner(
+            authority,
+            Some(external_freshness),
+            false,
+            None,
+        )
+    }
+
+    pub(super) fn rotate_single_file_checkpoint_with_semantic_base(
+        &mut self,
+        authority: SingleFileCheckpointAuthority<'_>,
+        semantic_base: &ReplicationAuthoritySemanticSnapshot,
+    ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        let external_freshness = self
+            .external_freshness
+            .as_ref()
+            .map(ExternalFreshnessState::metadata_binding);
+        self.rotate_single_file_checkpoint_with_portable_history_inner(
+            authority,
+            external_freshness,
+            true,
+            Some(semantic_base),
+        )
+    }
+
+    pub(super) fn rotate_single_file_checkpoint_with_semantic_base_sealed_freshness(
+        &mut self,
+        authority: SingleFileCheckpointAuthority<'_>,
+        external_freshness: DurableExternalFreshnessBinding,
+        semantic_base: &ReplicationAuthoritySemanticSnapshot,
+    ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        self.rotate_single_file_checkpoint_with_portable_history_inner(
+            authority,
+            Some(external_freshness),
+            false,
+            Some(semantic_base),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep checkpoint authority assembly and publication as one auditable protocol boundary."
+    )]
+    fn rotate_single_file_checkpoint_with_portable_history_inner(
+        &mut self,
+        authority: SingleFileCheckpointAuthority<'_>,
+        external_freshness: Option<DurableExternalFreshnessBinding>,
+        advance_external_freshness: bool,
+        semantic_base: Option<&ReplicationAuthoritySemanticSnapshot>,
+    ) -> Result<DurableGenerationReceipt, DurabilityError> {
+        let SingleFileCheckpointAuthority {
+            revision,
+            materialization_specs,
+            physical_artifact_specs,
+            artifact_cores,
+            physical_realization,
+            portable_historical_epochs,
+        } = authority;
         let physical_artifact_specs = canonical_physical_artifact_specs(physical_artifact_specs);
         let metadata_record = metadata::DurableStoreMetadata {
-            external_freshness: self
-                .external_freshness
-                .as_ref()
-                .map(ExternalFreshnessState::metadata_binding),
+            external_freshness,
             current_idempotency_epoch: self.current_idempotency_epoch,
             minimum_retry_epoch: self.minimum_retry_epoch,
             materializations: materialization_specs.to_vec(),
@@ -414,6 +582,15 @@ impl DurableRevisionStore {
         let replication_frames = self
             .replication
             .single_file_live_frames_prefix(replication_live_count)?;
+        if semantic_base.is_some() && replication_live_count != 0 {
+            return Err(DurabilityError::Protocol {
+                offset: 0,
+                reason: "semantic-base checkpoint source cannot coexist with captured live replication frames",
+            });
+        }
+        let frame_source = ReplicationAuthorityFrameSlice::new(replication_frames);
+        let replication_source: &dyn ReplicationAuthorityFrameSource =
+            semantic_base.map_or(&frame_source, |snapshot| snapshot);
         let mut sections = vec![
             SingleFileSectionInput::streaming(
                 SingleFileSectionKind::Checkpoint,
@@ -435,8 +612,34 @@ impl DurableRevisionStore {
                 source,
             ));
         }
+        let portable_historical_descriptors = portable_historical_epochs
+            .keys()
+            .map(|effect_id| effect_id.0.to_le_bytes())
+            .collect::<Vec<_>>();
+        for (ordinal, ((_, bytes), descriptor)) in portable_historical_epochs
+            .iter()
+            .zip(&portable_historical_descriptors)
+            .enumerate()
+        {
+            let ordinal = u32::try_from(ordinal).map_err(|_| DurabilityError::PayloadTooLarge)?;
+            sections.push(SingleFileSectionInput::bytes(
+                SingleFileSectionKind::PortableHistoricalEpochDescriptor,
+                ordinal,
+                descriptor,
+            ));
+            sections.push(SingleFileSectionInput::bytes(
+                SingleFileSectionKind::PortableHistoricalEpoch,
+                ordinal,
+                bytes,
+            ));
+        }
         let retained_historical_generations =
             self.pinned_historical_generations_for(physical_realization);
+        let retained_historical_effects = self
+            .historical_epoch_anchors
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let archive_outgoing = retained_historical_generations
             .contains(&self.generation)
             .then_some(crate::single_file::HistoricalGenerationArchive {
@@ -447,11 +650,12 @@ impl DurableRevisionStore {
         let container = self.backend.single_file_container()?;
         let view = container
             .publish_generation_after_active_wal(
-                &mut self.wal,
+                self.wal.file_mut()?,
                 &sections,
-                replication_frames,
+                replication_source,
                 archive_outgoing,
                 &retained_historical_generations,
+                &retained_historical_effects,
             )
             .inspect_err(|_| self.poisoned = true)?;
         let seeds = prepared_capsule.scan_seeds();
@@ -468,19 +672,21 @@ impl DurableRevisionStore {
         self.generation = view.generation;
         self.checkpoint = revision.clone();
         self.checkpoint_realization = physical_realization.cloned();
-        self.wal = wal;
+        self.wal = wal.into();
         self.replication.reset_single_file_generation();
         self.materialization_specs = materialization_specs.to_vec();
         self.physical_artifact_specs = physical_artifact_specs;
         self.artifact_cores = artifact_cores.to_vec();
         self.prepared_transactions
             .retain_published_generation(view.journal_first_lsn, prepared_capsule.prepare_lsns());
-        let freshness_digest = self.wal.freshness_digest();
-        self.advance_external_freshness_generation_with_digest(
-            self.generation,
-            self.wal.last_lsn(),
-            freshness_digest,
-        )?;
+        if advance_external_freshness {
+            let freshness_digest = self.wal.freshness_digest();
+            self.advance_external_freshness_generation_with_digest(
+                self.generation,
+                self.wal.last_lsn(),
+                freshness_digest,
+            )?;
+        }
         Ok(DurableGenerationReceipt {
             generation: self.generation,
             base_revision: revision.id(),

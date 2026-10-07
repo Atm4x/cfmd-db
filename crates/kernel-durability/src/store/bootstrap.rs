@@ -30,6 +30,76 @@ use crate::runtime::DurabilityError;
 use crate::wal::FileRevisionWal;
 
 impl DurableRevisionStore {
+    /// Creates a process-local persistence authority with the same canonical
+    /// retry/causal/replication reducer as durable stores and no filesystem
+    /// realization. The protection floor is still carried by the backend so a
+    /// later promotion cannot weaken inherited at-rest policy.
+    pub fn create_volatile(
+        base_revision: &Revision,
+        registry: &SemanticRegistry,
+    ) -> Result<Self, DurabilityError> {
+        Self::create_volatile_with_materializations_physical_artifacts_and_cores(
+            base_revision,
+            &[],
+            &[],
+            &[],
+            registry,
+        )
+    }
+
+    pub fn create_volatile_with_materializations_physical_artifacts_and_cores(
+        base_revision: &Revision,
+        materialization_specs: &[DurableMaterializationSpec],
+        physical_artifact_specs: &[DurablePhysicalArtifactSpec],
+        artifact_cores: &[DurableArtifactCore],
+        registry: &SemanticRegistry,
+    ) -> Result<Self, DurabilityError> {
+        let _ = registry
+            .builtin_modules_for_context(base_revision.semantic_context())
+            .map_err(|_| DurabilityError::Protocol {
+                offset: 0,
+                reason: "base revision requires unavailable semantic implementation",
+            })?;
+        let physical_artifact_specs = canonical_physical_artifact_specs(physical_artifact_specs);
+        let causal_coverage_root = base_revision.id();
+        let revision_effects = BTreeMap::new();
+        let revision_effect_frontiers = BTreeMap::from([(causal_coverage_root, BTreeSet::new())]);
+        let replication = ReplicationAuthorityJournal::open_single_file(
+            "volatile-replication-authority",
+            &[],
+            &[],
+        )?;
+        Ok(Self {
+            backend: super::backend::DurabilityBackend::volatile(
+                crate::storage_encryption::StorageProtectionProfile::Unencrypted,
+            ),
+            generation: 1,
+            checkpoint: base_revision.clone(),
+            durable_head: base_revision.id(),
+            wal: crate::wal::RuntimeRevisionWal::volatile(),
+            semantic_registry: registry.clone(),
+            materialization_specs: materialization_specs.to_vec(),
+            physical_artifact_specs,
+            checkpoint_realization: None,
+            artifact_cores: artifact_cores.to_vec(),
+            migration_complements: Vec::new(),
+            historical_epoch_anchors: BTreeMap::new(),
+            portable_historical_epochs: BTreeMap::new(),
+            migration_complement_index: BTreeMap::new(),
+            current_idempotency_epoch: IdempotencyEpoch::ZERO,
+            minimum_retry_epoch: IdempotencyEpoch::ZERO,
+            committed_transactions: BTreeMap::new(),
+            next_revision_effect_id: 1,
+            causal_coverage_root,
+            revision_effects,
+            revision_effect_frontiers,
+            replication,
+            prepared_transactions: super::prepared_lifecycle::PreparedTransactionLedger::default(),
+            streaming_checkpoint: None,
+            external_freshness: None,
+            poisoned: false,
+        })
+    }
     /// Creates a store only after the target directory has passed the named
     /// supported-platform durability profile and live fsync/rename probe.
     pub fn create_on_supported_platform(
@@ -189,7 +259,7 @@ impl DurableRevisionStore {
             generation,
             checkpoint: base_revision.clone(),
             durable_head: base_revision.id(),
-            wal,
+            wal: wal.into(),
             semantic_registry: registry.clone(),
             materialization_specs: materialization_specs.to_vec(),
             physical_artifact_specs,
@@ -197,6 +267,7 @@ impl DurableRevisionStore {
             artifact_cores: artifact_cores.to_vec(),
             migration_complements: Vec::new(),
             historical_epoch_anchors: BTreeMap::new(),
+            portable_historical_epochs: BTreeMap::new(),
             migration_complement_index: BTreeMap::new(),
             current_idempotency_epoch: IdempotencyEpoch::ZERO,
             minimum_retry_epoch: IdempotencyEpoch::ZERO,

@@ -6,6 +6,22 @@ import tempfile
 import cfmd_async_probe
 
 
+def binding_contract(db):
+    outcome = db.insert("left", -1)
+    assert isinstance(outcome, cfmd_async_probe.CommitOutcome)
+    assert outcome.status == "Committed"
+    assert outcome.revision > 0
+
+    try:
+        db.owner_move_asset(999_001, 999_002, 999_003)
+    except cfmd_async_probe.CfmdError as error:
+        assert error.code == "NotFound"
+        assert error.message
+        assert str(error) == error.message
+    else:
+        raise AssertionError("runtime NotFound must surface as CfmdError")
+
+
 def inserted(event):
     source, target, added, removed = event
     assert target > source
@@ -253,6 +269,7 @@ async def gc_churn_does_not_poison_new_consumers(db):
 
 
 async def main(db):
+    binding_contract(db)
     product_crud_relations_history(db)
     await await_next_roundtrip(db)
     await async_for_roundtrip(db)

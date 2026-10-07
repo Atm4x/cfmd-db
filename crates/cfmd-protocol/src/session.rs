@@ -91,6 +91,7 @@ pub struct CommitRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitResponse {
     Committed { revision: u64 },
+    AlreadySatisfied { revision: u64 },
     AlreadyCommitted { revision: u64 },
 }
 
@@ -378,6 +379,9 @@ impl HostedSession {
     fn context(&self, target: SnapshotTarget) -> Result<cfmd_runtime::ReadContext> {
         Ok(match target {
             SnapshotTarget::Head => self.database.snapshot()?,
+            SnapshotTarget::ContractHead { schema_revision } => {
+                self.database.snapshot_for_contract(schema_revision)?
+            }
             SnapshotTarget::Revision(revision) => self.database.at(RevisionId::new(revision))?,
         })
     }
@@ -402,7 +406,7 @@ impl HostedSession {
 
     fn open_watch(&self, request: OpenWatchRequest) -> Result<OpenWatchResponse> {
         validate_query(&request.query, self.limits)?;
-        let context = self.database.snapshot()?;
+        let context = self.context(request.target)?;
         let watch = context.watch(&request.query.into_runtime())?;
         let initial = QueryResponse::from_runtime(watch.revision(), watch.initial().clone());
         let subscription = self
@@ -477,6 +481,11 @@ impl HostedSession {
             cfmd_runtime::CommitOutcome::Committed { revision } => CommitResponse::Committed {
                 revision: revision.raw(),
             },
+            cfmd_runtime::CommitOutcome::AlreadySatisfied { revision } => {
+                CommitResponse::AlreadySatisfied {
+                    revision: revision.raw(),
+                }
+            }
             cfmd_runtime::CommitOutcome::AlreadyCommitted { revision } => {
                 CommitResponse::AlreadyCommitted {
                     revision: revision.raw(),

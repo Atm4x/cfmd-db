@@ -403,6 +403,7 @@ fn protocol_watch_stream_is_exact_revision_tagged_and_cancellable() {
 
     let opened = hosted
         .execute(HostedRequest::OpenWatch(OpenWatchRequest {
+            target: SnapshotTarget::Head,
             query: watch_query,
         }))
         .expect("open watch");
@@ -492,6 +493,7 @@ fn protocol_watch_preserves_permissions_and_subscription_bounds() {
     )));
     let denied = read_only
         .execute(HostedRequest::OpenWatch(OpenWatchRequest {
+            target: SnapshotTarget::Head,
             query: ProtocolQuery::Scan {
                 relation: relation.raw(),
             },
@@ -512,6 +514,7 @@ fn protocol_watch_preserves_permissions_and_subscription_bounds() {
     );
     let first = bounded
         .execute(HostedRequest::OpenWatch(OpenWatchRequest {
+            target: SnapshotTarget::Head,
             query: ProtocolQuery::Scan {
                 relation: relation.raw(),
             },
@@ -522,6 +525,7 @@ fn protocol_watch_preserves_permissions_and_subscription_bounds() {
     };
     let resource_limit = bounded
         .execute(HostedRequest::OpenWatch(OpenWatchRequest {
+            target: SnapshotTarget::Head,
             query: ProtocolQuery::Scan {
                 relation: relation.raw(),
             },
@@ -535,6 +539,7 @@ fn protocol_watch_preserves_permissions_and_subscription_bounds() {
         .expect("close first watch");
     bounded
         .execute(HostedRequest::OpenWatch(OpenWatchRequest {
+            target: SnapshotTarget::Head,
             query: ProtocolQuery::Scan {
                 relation: relation.raw(),
             },
@@ -553,6 +558,7 @@ fn protocol_session_close_cancels_blocked_watch_and_rejects_future_requests() {
     let hosted = full_session(&database);
     let opened = hosted
         .execute(HostedRequest::OpenWatch(OpenWatchRequest {
+            target: SnapshotTarget::Head,
             query: ProtocolQuery::Scan {
                 relation: relation.raw(),
             },
@@ -675,6 +681,65 @@ fn hosted_schema_aware_commit_uses_explicit_formation_identity_and_current_autho
         )
         .expect("migration");
 
+    let bridged_reader = HostedSession::new(database.session(Session::new(
+        PrincipalId::new(507_012),
+        PermissionSet::from([Permission::ReadRelation(target_relation)]),
+    )));
+    let bridged = bridged_reader
+        .execute(HostedRequest::Query(QueryRequest {
+            target: SnapshotTarget::ContractHead {
+                schema_revision: 507,
+            },
+            query: ProtocolQuery::Scan {
+                relation: source_relation.raw(),
+            },
+        }))
+        .expect("old remote query language must compile directly into current target world");
+    let HostedResponse::Query(bridged) = bridged else {
+        panic!("expected query response");
+    };
+    assert_eq!(bridged.revision, 2);
+    assert!(bridged.rows.is_empty());
+
+    let bridged_watch_session = HostedSession::new(database.session(Session::new(
+        PrincipalId::new(507_014),
+        PermissionSet::from([Permission::Watch, Permission::ReadRelation(target_relation)]),
+    )));
+    let opened = bridged_watch_session
+        .execute(HostedRequest::OpenWatch(OpenWatchRequest {
+            target: SnapshotTarget::ContractHead {
+                schema_revision: 507,
+            },
+            query: ProtocolQuery::Scan {
+                relation: source_relation.raw(),
+            },
+        }))
+        .expect("old remote watch language must compile into current target world");
+    let HostedResponse::WatchOpened(opened) = opened else {
+        panic!("expected watch-open response");
+    };
+    assert!(opened.initial.rows.is_empty());
+    let bridged_subscription = opened.subscription;
+
+    let source_only_reader = HostedSession::new(database.session(Session::new(
+        PrincipalId::new(507_013),
+        PermissionSet::from([Permission::ReadRelation(source_relation)]),
+    )));
+    assert_eq!(
+        source_only_reader
+            .execute(HostedRequest::Query(QueryRequest {
+                target: SnapshotTarget::ContractHead {
+                    schema_revision: 507,
+                },
+                query: ProtocolQuery::Scan {
+                    relation: source_relation.raw(),
+                },
+            }))
+            .expect_err("source-world read grant must not authorize current target relation")
+            .code(),
+        ProtocolErrorCode::PermissionDenied
+    );
+
     let stale = CommitRequest {
         base_revision: 1,
         formation_semantic_revision: SemanticRevision::new(507, 1),
@@ -697,6 +762,56 @@ fn hosted_schema_aware_commit_uses_explicit_formation_identity_and_current_autho
             .execute(HostedRequest::Commit(stale))
             .expect("target-world grant publishes transported intent"),
         HostedResponse::Commit(CommitResponse::Committed { revision: 3 })
+    );
+
+    let watch_event = bridged_watch_session
+        .execute(HostedRequest::NextWatch {
+            subscription: bridged_subscription,
+        })
+        .expect("bridged remote watch must observe current-world target delta");
+    let HostedResponse::WatchEvent(watch_event) = watch_event else {
+        panic!("expected watch event");
+    };
+    assert_eq!(watch_event.inserted, vec![vec![ProtocolValue::I64(7)]]);
+    assert!(watch_event.removed.is_empty());
+
+    let native_target = CommitRequest {
+        base_revision: 3,
+        formation_semantic_revision: SemanticRevision::new(508, 1),
+        idempotency_key: IdempotencyKey::new(9_507_004),
+        mutations: vec![RelationMutation {
+            relation: target_relation.raw(),
+            inserted: vec![vec![ProtocolValue::I64(9)]],
+            removed: vec![],
+        }],
+    };
+    assert_eq!(
+        target_hosted
+            .execute(HostedRequest::Commit(native_target))
+            .expect("target-native seed"),
+        HostedResponse::Commit(CommitResponse::Committed { revision: 4 })
+    );
+    let already_satisfied = CommitRequest {
+        base_revision: 1,
+        formation_semantic_revision: SemanticRevision::new(507, 1),
+        idempotency_key: IdempotencyKey::new(9_507_005),
+        mutations: vec![RelationMutation {
+            relation: source_relation.raw(),
+            inserted: vec![vec![ProtocolValue::I64(9)]],
+            removed: vec![],
+        }],
+    };
+    assert_eq!(
+        target_hosted
+            .execute(HostedRequest::Commit(already_satisfied.clone()))
+            .expect("first already-satisfied transport must seal retry identity"),
+        HostedResponse::Commit(CommitResponse::AlreadySatisfied { revision: 4 })
+    );
+    assert_eq!(
+        target_hosted
+            .execute(HostedRequest::Commit(already_satisfied))
+            .expect("sealed retry"),
+        HostedResponse::Commit(CommitResponse::AlreadyCommitted { revision: 4 })
     );
 
     let bad_identity = CommitRequest {

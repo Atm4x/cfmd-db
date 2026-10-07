@@ -16,7 +16,7 @@ use cfmd_host::{
     AuthorizationGrant, Authorizer, HostedServer, ServerLimits,
 };
 use cfmd_protocol::{
-    HostedRequest, HostedResponse, OpenWatchRequest, ProtocolQuery,
+    HostedRequest, HostedResponse, OpenWatchRequest, ProtocolQuery, SnapshotTarget,
     wire::{
         ProtocolHello, WireResponse, decode_hello_ack_frame, decode_response_frame,
         encode_hello_frame, encode_request_frame,
@@ -245,6 +245,7 @@ fn socket_disconnect_cancels_a_blocked_watch_without_polling() {
     negotiate(&mut client, wire_limits);
 
     let open = HostedRequest::OpenWatch(OpenWatchRequest {
+        target: SnapshotTarget::Head,
         query: ProtocolQuery::Scan {
             relation: fixture.relation.raw(),
         },

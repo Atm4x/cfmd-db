@@ -13,7 +13,10 @@ use crate::runtime::{
 };
 use crate::storage_encryption::{StorageAeadCodec, StorageEncryptionDomain, StorageNonceSequence};
 use crate::wal_frame::{EncodedFrame, RecordKind, encode_frame};
-use crate::wal_payload::{CommitRecord, encode_commit_payload, encode_prepare_payload};
+use crate::wal_payload::{
+    CommitRecord, IntentSealRecord, encode_commit_payload, encode_intent_seal_payload,
+    encode_prepare_payload,
+};
 
 use super::recovery::{
     scan_wal_file_region_seeded, scan_wal_file_seeded, scan_wal_reader_region_seeded,
@@ -401,6 +404,18 @@ impl FileRevisionWal {
             encoded_replication_frame,
         )?;
         Ok(())
+    }
+
+    pub(crate) fn append_intent_seal_unflushed(
+        &mut self,
+        record: &IntentSealRecord,
+    ) -> Result<EncodedFrame, DurabilityError> {
+        let payload = encode_intent_seal_payload(record)?;
+        self.append_frame(
+            RecordKind::SealClientIntent,
+            record.committed.target_revision(),
+            &payload,
+        )
     }
     fn barrier(&mut self) -> Result<(), DurabilityError> {
         if self.poisoned {

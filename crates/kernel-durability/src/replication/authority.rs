@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use kernel_auth::{KeyId, Sha256Digest, sha256};
 use kernel_change::RevisionEffectId;
 use kernel_types::RevisionId;
+use sha2::Sha256;
 
 use super::codec::encode_membership_vote;
 use super::{
@@ -49,12 +50,22 @@ struct MembershipVoteIndex {
 }
 
 #[derive(Debug)]
+struct SemanticAuthorityBaseReplay {
+    expected_records: usize,
+    record_count: usize,
+    canonical_len: u64,
+    hasher: Sha256,
+    decoder: semantic_snapshot::SemanticAuthorityRecordDecoder,
+}
+
+#[derive(Debug)]
 pub(crate) struct ReplicationAuthorityJournal {
     path: PathBuf,
     file: Option<File>,
     single_file_capture: bool,
     pending_single_file_frames: Vec<Vec<u8>>,
     live_single_file_frames: Vec<Vec<u8>>,
+    semantic_base_replay: Option<SemanticAuthorityBaseReplay>,
     effects: BTreeMap<RevisionEffectId, ReplicatedEffectEnvelope>,
     branches: BTreeMap<ReplicationBranchId, ReplicationBranchHead>,
     revision_frontiers: BTreeMap<RevisionId, BTreeSet<RevisionEffectId>>,
@@ -97,10 +108,13 @@ mod membership;
 mod replay;
 #[cfg_attr(not(test), allow(dead_code))]
 mod segments;
-#[cfg(test)]
 mod semantic_snapshot;
+pub(crate) use semantic_snapshot::ReplicationAuthoritySemanticSnapshot;
 
+#[cfg(test)]
+pub(crate) use segments::collect_indexed_segment_object_chain_frames;
 pub(crate) use segments::{
+    ReplicationAuthorityFrameSlice, ReplicationAuthorityFrameSource,
     ReplicationAuthorityLocatorRoot, ReplicationAuthoritySegmentExtent,
     ReplicationAuthoritySegmentId, ReplicationAuthoritySegmentPlan, locator_stored_len,
     recover_locator_chain, replay_indexed_segment_object_chain, write_locator_node,

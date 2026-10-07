@@ -190,12 +190,12 @@ pub fn finite_measure_from_atoms<T: Ord>(atoms: impl IntoIterator<Item = T>) -> 
         .collect()
 }
 
-/// Stable durable encoding revision for [`CanonicalEqKey`].
+/// Current pre-release durable encoding discriminator for [`CanonicalEqKey`].
 ///
 /// This is deliberately independent from Rust enum layout and `Ord`
-/// implementation details. Any change to the byte contract must introduce a
-/// new decoder revision rather than silently reinterpreting persisted keys.
-pub const CANONICAL_EQ_KEY_ENCODING_VERSION: u32 = 2;
+/// implementation details. Before the first compatibility release we keep one
+/// canonical discriminator and do not retain pass-era decoder ladders.
+pub const CANONICAL_EQ_KEY_ENCODING_VERSION: u32 = 1;
 
 pub(super) const CANONICAL_EQ_KEY_MAGIC: [u8; 4] = *b"CEK\0";
 const CANONICAL_EQ_KEY_TUPLE_MAGIC: [u8; 4] = *b"CKT\0";

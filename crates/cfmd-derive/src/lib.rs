@@ -8,7 +8,7 @@ use syn::{
     LitStr, PathArguments, Type, UnOp, parse_macro_input,
 };
 
-#[proc_macro_derive(CfmdSchema)]
+#[proc_macro_derive(CfmdSchema, attributes(cfmd))]
 pub fn derive_cfmd_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand_schema(&input) {
@@ -38,6 +38,7 @@ fn expand_schema(input: &DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     let name = &input.ident;
+    let contract_schema_revision = parse_schema_contract_revision(input)?;
     let mut members = Vec::with_capacity(fields.named.len());
     let mut seen = std::collections::BTreeSet::new();
     for field in &fields.named {
@@ -79,6 +80,14 @@ fn expand_schema(input: &DeriveInput) -> syn::Result<TokenStream2> {
             .map(|(_, target)| target.clone())
             .collect::<Vec<_>>(),
     );
+    let contract_revision = match contract_schema_revision {
+        Some(revision) => quote! {
+            fn contract_schema_revision() -> ::std::option::Option<u64> {
+                ::std::option::Option::Some(#revision)
+            }
+        },
+        None => quote! {},
+    };
 
     Ok(quote! {
         impl ::cfmd::CfmdSchema for #name {
@@ -90,6 +99,8 @@ fn expand_schema(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 builder.build()
             }
 
+            #contract_revision
+
             #[doc(hidden)]
             fn __bind(source: ::std::sync::Arc<::cfmd::__private::ContextSource>) -> ::cfmd::Result<Self> {
                 Ok(Self {
@@ -98,6 +109,26 @@ fn expand_schema(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     })
+}
+
+fn parse_schema_contract_revision(input: &DeriveInput) -> syn::Result<Option<syn::LitInt>> {
+    let mut revision = None;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("cfmd") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("schema_revision") {
+                if revision.is_some() {
+                    return Err(meta.error("duplicate schema_revision"));
+                }
+                revision = Some(meta.value()?.parse::<syn::LitInt>()?);
+                return Ok(());
+            }
+            Err(meta.error("unsupported schema option; expected schema_revision"))
+        })?;
+    }
+    Ok(revision)
 }
 
 fn schema_authority_tree(types: &[Type]) -> TokenStream2 {
@@ -171,6 +202,7 @@ enum FieldRuleSpec {
         max: Option<usize>,
     },
     TextOneOf(Vec<LitStr>),
+    TextMatches(Expr),
 }
 
 #[allow(
@@ -573,7 +605,7 @@ fn append_insert_tokens(
         fn __append_relationships(
             &mut self,
             context: &::cfmd::__private::ReadContext,
-            plan: &mut ::cfmd::Plan,
+            plan: &mut ::cfmd::__private::Plan,
         ) -> ::cfmd::Result<()> {
             let source_id = self.#identity.raw();
             #(#insert_edges)*
@@ -583,7 +615,7 @@ fn append_insert_tokens(
         fn __append_update_relationships(
             &mut self,
             context: &::cfmd::__private::ReadContext,
-            plan: &mut ::cfmd::Plan,
+            plan: &mut ::cfmd::__private::Plan,
         ) -> ::cfmd::Result<()> {
             let source_id = self.#identity.raw();
             #(#update_edges)*
@@ -693,6 +725,7 @@ fn accessor_tokens(name: &Ident, entry: &EntityField<'_>) -> TokenStream2 {
         }
         FieldKind::Reference(target) => {
             let path = entity_path_type(target);
+            let rule_ident = format_ident!("{}_rule", ident);
             quote! {
                 #[must_use]
                 #vis fn #ident(&self) -> #path<#name> {
@@ -700,14 +733,27 @@ fn accessor_tokens(name: &Ident, entry: &EntityField<'_>) -> TokenStream2 {
                         self.inner.__ref::<#target>(stringify!(#ident)).__path()
                     )
                 }
+
+                #[must_use]
+                #vis fn #rule_ident(&self) -> ::cfmd::ObjectRuleField<#name, ::cfmd::Ref<#target>> {
+                    self.inner.__ref_rule::<#target>(stringify!(#ident))
+                }
             }
         }
-        FieldKind::OptionalReference(target) => quote! {
-            #[must_use]
-            #vis fn #ident(&self) -> ::cfmd::OptionalRefField<#name, #target> {
-                self.inner.__optional_ref::<#target>(stringify!(#ident))
+        FieldKind::OptionalReference(target) => {
+            let rule_ident = format_ident!("{}_rule", ident);
+            quote! {
+                #[must_use]
+                #vis fn #ident(&self) -> ::cfmd::OptionalRefField<#name, #target> {
+                    self.inner.__optional_ref::<#target>(stringify!(#ident))
+                }
+
+                #[must_use]
+                #vis fn #rule_ident(&self) -> ::cfmd::ObjectRuleField<#name, Option<::cfmd::Ref<#target>>> {
+                    self.inner.__optional_ref_rule::<#target>(stringify!(#ident))
+                }
             }
-        },
+        }
         FieldKind::VirtualMany { .. } => TokenStream2::new(),
     }
 }
@@ -1106,8 +1152,13 @@ fn parse_field_options(field: &Field) -> syn::Result<FieldOptions> {
                 rules.push(FieldRuleSpec::TextOneOf(values));
                 return Ok(());
             }
+            if meta.path.is_ident("matches") {
+                let pattern = meta.value()?.parse::<Expr>()?;
+                rules.push(FieldRuleSpec::TextMatches(pattern));
+                return Ok(());
+            }
             Err(meta.error(
-                "unsupported field option; expected id, via, orphan, bind, range(...), length(...), or one_of(...)"
+                "unsupported field option; expected id, via, orphan, bind, range(...), length(...), one_of(...), or matches = <TextPattern expression>"
             ))
         })?;
     }
@@ -1164,12 +1215,14 @@ fn validate_field_rules(
                     "#[cfmd(range(...))] requires an i64 field",
                 ));
             }
-            FieldRuleSpec::TextLength { .. } | FieldRuleSpec::TextOneOf(_)
+            FieldRuleSpec::TextLength { .. }
+            | FieldRuleSpec::TextOneOf(_)
+            | FieldRuleSpec::TextMatches(_)
                 if !is_exact_type(&field.ty, "String") =>
             {
                 return Err(syn::Error::new_spanned(
                     &field.ty,
-                    "#[cfmd(length(...))] and #[cfmd(one_of(...))] require a String field",
+                    "#[cfmd(length(...))], #[cfmd(one_of(...))], and #[cfmd(matches = ...)] require a String field",
                 ));
             }
             _ => {}
@@ -1203,6 +1256,9 @@ fn field_rule_tokens(rule: &FieldRuleSpec) -> TokenStream2 {
                 [#(::std::string::String::from(#values)),*].into_iter().collect()
             )
         ),
+        FieldRuleSpec::TextMatches(pattern) => {
+            quote!(::cfmd::FieldRule::TextMatches(#pattern))
+        }
     }
 }
 
@@ -1387,7 +1443,11 @@ mod tests {
             #[cfmd(key = "user")]
             struct User {
                 #[cfmd(id)] id: Id<User>,
-                #[cfmd(length(min = 3, max = 64), one_of("Artem", "Alice"))]
+                #[cfmd(
+                    length(min = 3, max = 64),
+                    one_of("Artem", "Alice"),
+                    matches = ::cfmd::TextPattern::literal("Artem")
+                )]
                 name: String,
                 #[cfmd(range(min = 0, max = 150))]
                 age: i64,
@@ -1399,6 +1459,7 @@ mod tests {
         assert!(output.contains("TextLength"));
         assert!(output.contains("TextOneOf"));
         assert!(output.contains("I64Range"));
+        assert!(output.contains("TextMatches"));
         assert!(output.contains("__with_rules"));
     }
 
@@ -1469,6 +1530,20 @@ mod tests {
         };
         let error = expand_entity(&input).expect_err("range on String must fail");
         assert!(error.to_string().contains("requires an i64 field"));
+    }
+
+    #[test]
+    fn semantic_text_pattern_rule_rejects_non_string_fields() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[cfmd(key = "user")]
+            struct User {
+                #[cfmd(id)] id: Id<User>,
+                #[cfmd(matches = ::cfmd::TextPattern::literal("19"))]
+                age: i64,
+            }
+        };
+        let error = expand_entity(&input).expect_err("text pattern on i64 must fail");
+        assert!(error.to_string().contains("require a String field"));
     }
 
     #[test]

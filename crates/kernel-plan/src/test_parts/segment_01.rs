@@ -517,7 +517,7 @@ fn physical_store_derived_dependency_contour_is_reused_until_topology_changes() 
     let rebuilt = candidate.derived_artifact_ids_for_test(relation, layout.id);
     assert!(!original.shares_derived_artifact_cache_for_test(&candidate));
     assert!(rebuilt.contains(&UnifiedArtifactId::I64Index(index)));
-    assert!(rebuilt.contains(&UnifiedArtifactId::SemanticStatistics(statistics)));
+    assert!(rebuilt.contains(&UnifiedArtifactId::semantic_cardinality(statistics)));
 }
 
 #[test]

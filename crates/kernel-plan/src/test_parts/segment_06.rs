@@ -2082,7 +2082,7 @@ fn durable_checkpoint_rebuilds_physical_index_recipes_on_reopen() {
         !snapshot
             .physical_store()
             .advisor_managed_artifacts_for_test()
-            .contains(&UnifiedArtifactId::ObservableAtom(
+            .contains(&UnifiedArtifactId::semantic_observable(
                 recovered_binding.clone()
             ))
     );
@@ -2380,7 +2380,7 @@ fn durable_initial_recipes_rebuild_samf_statistics_and_quotient_factor_with_owne
         .insert(binding.clone(), Arc::new(factor));
     root.physical_store_mut_for_test()
         .advisor_managed_artifacts_mut()
-        .insert(UnifiedArtifactId::SemanticQuotientFactor(binding.clone()));
+        .insert(UnifiedArtifactId::semantic_quotient(binding.clone()));
 
     assert_eq!(root.durable_physical_artifact_specs().len(), 4);
     drop(DurableRuntime::create(root, &dir, &registry).unwrap());
@@ -2408,7 +2408,7 @@ fn durable_initial_recipes_rebuild_samf_statistics_and_quotient_factor_with_owne
         snapshot
             .physical_store()
             .advisor_managed_artifacts_for_test()
-            .contains(&UnifiedArtifactId::SemanticQuotientFactor(
+            .contains(&UnifiedArtifactId::semantic_quotient(
                 recovered.clone()
             ))
     );
@@ -2416,13 +2416,13 @@ fn durable_initial_recipes_rebuild_samf_statistics_and_quotient_factor_with_owne
         !snapshot
             .physical_store()
             .advisor_managed_artifacts_for_test()
-            .contains(&UnifiedArtifactId::SemanticStatistics(recovered.clone()))
+            .contains(&UnifiedArtifactId::semantic_cardinality(recovered.clone()))
     );
     assert!(
         !snapshot
             .physical_store()
             .advisor_managed_artifacts_for_test()
-            .contains(&UnifiedArtifactId::ObservableAtom(recovered))
+            .contains(&UnifiedArtifactId::semantic_observable(recovered))
     );
     drop(snapshot);
     drop(reopened);

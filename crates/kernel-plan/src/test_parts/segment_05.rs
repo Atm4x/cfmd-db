@@ -1,5 +1,5 @@
 #[test]
-fn retained_statistics_enable_safe_multiway_transient_costing() {
+fn observable_cardinality_enables_safe_multiway_transient_costing() {
     let (context, registry, relation) = planning_context();
     let layout = LayoutBinding {
         id: LayoutId(1_054),
@@ -17,8 +17,52 @@ fn retained_statistics_enable_safe_multiway_transient_costing() {
         )
         .unwrap();
     store
-        .install_semantic_statistics(binding, &context, &registry)
+        .install_observable_atom_state(binding, &context, &registry)
         .unwrap();
+    let decision = multiway_right_access_estimate_for_test(
+        &store,
+        relation,
+        layout,
+        128,
+        0,
+        equivalence,
+        64,
+        &context,
+        &registry,
+    )
+    .unwrap();
+    assert_eq!(decision.family, JoinAccessKind::PersistedSemantic);
+    assert_eq!(decision.estimated_output_rows, 64);
+}
+
+#[test]
+fn quotient_projection_cardinality_enables_same_multiway_costing() {
+    let (context, registry, relation) = planning_context();
+    let layout = LayoutBinding {
+        id: LayoutId(1_055),
+        family: LayoutFamily::Columnar,
+    };
+    let equivalence = sid(101);
+    let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
+    let mut store = PhysicalStore::default();
+    store
+        .install(
+            relation,
+            layout,
+            NativeRelation::typed_columnar(vec![NativeColumn::I64((0_i64..128).collect())])
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .materialize_semantic_quotient_factors(
+                &BTreeSet::from([binding]),
+                &context,
+                &registry,
+            )
+            .unwrap(),
+        1
+    );
     let decision = multiway_right_access_estimate_for_test(
         &store,
         relation,
@@ -36,7 +80,92 @@ fn retained_statistics_enable_safe_multiway_transient_costing() {
 }
 
 #[test]
-fn composite_semantic_statistics_use_the_same_canonical_key_contract_as_indexes() {
+fn semantic_fiber_profiles_expose_a_measured_retained_memory_frontier() {
+    let (context, registry, relation) = planning_context();
+    let layout = LayoutBinding {
+        id: LayoutId(1_056),
+        family: LayoutFamily::Columnar,
+    };
+    let equivalence = sid(101);
+    let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
+    let mut base = PhysicalStore::default();
+    base.install(
+        relation,
+        layout,
+        NativeRelation::typed_columnar(vec![NativeColumn::I64(
+            (0_i64..4096).map(|value| value % 257).collect(),
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut cardinality = base.clone();
+    cardinality
+        .install_semantic_statistics(binding.clone(), &context, &registry)
+        .unwrap();
+    let cardinality_bytes = cardinality
+        .artifact_memory_report()
+        .families
+        .get(&PhysicalArtifactFamily::SemanticFiber(
+            SemanticFiberProfile::Cardinality,
+        ))
+        .unwrap()
+        .estimated_retained_bytes;
+
+    let mut quotient = base.clone();
+    assert_eq!(
+        quotient
+            .materialize_semantic_quotient_factors(
+                &BTreeSet::from([binding.clone()]),
+                &context,
+                &registry,
+            )
+            .unwrap(),
+        1
+    );
+    let quotient_bytes = quotient
+        .artifact_memory_report()
+        .families
+        .get(&PhysicalArtifactFamily::SemanticFiber(
+            SemanticFiberProfile::Quotient,
+        ))
+        .unwrap()
+        .estimated_retained_bytes;
+
+    let mut observable = base;
+    observable
+        .install_observable_atom_state(binding, &context, &registry)
+        .unwrap();
+    let observable_bytes = observable
+        .artifact_memory_report()
+        .families
+        .get(&PhysicalArtifactFamily::SemanticFiber(
+            SemanticFiberProfile::Observable,
+        ))
+        .unwrap()
+        .estimated_retained_bytes;
+
+    eprintln!(
+        "semantic-fiber retained bytes: cardinality={cardinality_bytes} quotient={quotient_bytes} observable={observable_bytes}"
+    );
+    assert!(cardinality_bytes < quotient_bytes);
+    assert!(cardinality_bytes < observable_bytes);
+    assert_ne!(quotient_bytes, observable_bytes);
+    assert!(
+        SemanticFiberDemand::GlobalCardinality
+            .is_satisfied_by(SemanticFiberProfile::Cardinality)
+    );
+    assert!(
+        !SemanticFiberDemand::RowCanonicalKey
+            .is_satisfied_by(SemanticFiberProfile::Cardinality)
+    );
+    assert!(
+        SemanticFiberDemand::RowCanonicalKey.is_satisfied_by(SemanticFiberProfile::Observable)
+    );
+}
+
+#[test]
+fn composite_semantic_cardinality_uses_the_same_canonical_key_contract_as_indexes() {
     let relation = sid(370);
     let text_equivalence = sid(371);
     let i64_equivalence = sid(372);
@@ -84,7 +213,7 @@ fn composite_semantic_statistics_use_the_same_canonical_key_contract_as_indexes(
 }
 
 #[test]
-fn join_access_decision_prefers_canonical_bucket_over_one_shot_semantic_state() {
+fn join_access_decision_reuses_revision_semantic_lane_after_samf_removal() {
     let (context, registry, relation, equivalence, layout, mut store) =
         text_semantic_index_fixture();
     let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
@@ -103,7 +232,7 @@ fn join_access_decision_prefers_canonical_bucket_over_one_shot_semantic_state() 
         &registry,
     )
     .unwrap();
-    assert_eq!(decision.family, JoinAccessKind::FullScan);
+    assert_eq!(decision.family, JoinAccessKind::PersistedSemantic);
 }
 
 #[test]
@@ -894,20 +1023,20 @@ fn observable_atom_convergence_retires_only_advisor_owned_legacy_state() {
         .unwrap();
     store
         .advisor_managed_artifacts_mut()
-        .insert(UnifiedArtifactId::SemanticStatistics(binding.clone()));
+        .insert(UnifiedArtifactId::semantic_cardinality(binding.clone()));
 
     let report = store
         .converge_observable_atom_candidate(binding.clone(), &context, &registry)
         .unwrap();
 
     assert!(report.created);
-    assert_eq!(report.retired_legacy_statistics, vec![binding.clone()]);
+    assert_eq!(report.retired_cardinality_profiles, vec![binding.clone()]);
     assert!(!store.has_semantic_statistics_for_test(&binding));
     assert!(store.observable_atom_states_for_test().contains_key(&binding));
     assert!(
         store
             .advisor_managed_artifacts_for_test()
-            .contains(&UnifiedArtifactId::ObservableAtom(binding.clone()))
+            .contains(&UnifiedArtifactId::semantic_observable(binding.clone()))
     );
 }
 
@@ -934,7 +1063,7 @@ fn observable_atom_convergence_preserves_manual_observable_pin() {
     assert!(
         !store
             .advisor_managed_artifacts_for_test()
-            .contains(&UnifiedArtifactId::ObservableAtom(binding))
+            .contains(&UnifiedArtifactId::semantic_observable(binding))
     );
 }
 
@@ -1001,7 +1130,7 @@ fn unified_observable_advisor_consumes_external_pressure_without_touching_manual
     assert!(
         !store
             .advisor_managed_artifacts_for_test()
-            .contains(&UnifiedArtifactId::ObservableAtom(binding))
+            .contains(&UnifiedArtifactId::semantic_observable(binding))
     );
 }
 
@@ -1013,7 +1142,7 @@ fn unified_observable_advisor_uses_write_telemetry_and_retain_hysteresis() {
     let (context, registry, layout, mut store, prepared) =
         advisor_text_fixture(relation, equivalence, 393, 9_423, values);
     let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
-    let id = UnifiedArtifactId::ObservableAtom(binding.clone());
+    let id = UnifiedArtifactId::semantic_observable(binding.clone());
     let workload = [SemanticIndexWorkloadSample {
         plan: prepared.physical().clone(),
         expected_executions: 2,
@@ -1809,3 +1938,314 @@ fn typed_stateful_distinct_and_group_preserve_text_ci_semantics() {
     assert_eq!(group_stats.typed_stateful_batch_hits, 1);
 }
 
+
+#[test]
+#[ignore = "R&D microbenchmark: run explicitly when evaluating semantic-fiber physical profiles"]
+#[allow(clippy::too_many_lines)]
+fn semantic_fiber_carrier_build_and_delta_frontier_probe() {
+    use kernel_semantics::CanonicalEqKey;
+    use kernel_semantics::fiber_carrier::{FiniteFiberCarrier, FiniteFiberProfile};
+
+    const ROWS: usize = 4096;
+    const DISTINCT: i64 = 257;
+    const REPEATS: u128 = 5;
+
+    fn elapsed_ns(mut run: impl FnMut()) -> u128 {
+        let started = std::time::Instant::now();
+        run();
+        started.elapsed().as_nanos()
+    }
+
+    fn build_carrier(
+        profile: FiniteFiberProfile,
+        values: &[i64],
+    ) -> FiniteFiberCarrier<u32, CanonicalEqKey> {
+        let mut carrier = FiniteFiberCarrier::new(profile, 1);
+        for (row, value) in values.iter().copied().enumerate() {
+            carrier
+                .insert(u32::try_from(row).unwrap(), &[CanonicalEqKey::I64(value)])
+                .unwrap();
+        }
+        carrier
+    }
+
+    let (context, registry, relation) = planning_context();
+    let layout = LayoutBinding {
+        id: LayoutId(1_058),
+        family: LayoutFamily::Columnar,
+    };
+    let equivalence = sid(101);
+    let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
+    let rows_i64 = i64::try_from(ROWS).unwrap();
+    let values = (0_i64..rows_i64)
+        .map(|value| value % DISTINCT)
+        .collect::<Vec<_>>();
+    let mut base = PhysicalStore::default();
+    base.install(
+        relation,
+        layout,
+        NativeRelation::typed_columnar(vec![NativeColumn::I64(values.clone().into())]).unwrap(),
+    )
+    .unwrap();
+
+    let cardinality_build = elapsed_ns(|| {
+        for _ in 0..REPEATS {
+            let mut store = base.clone();
+            std::hint::black_box(
+                store
+                    .install_semantic_statistics(binding.clone(), &context, &registry)
+                    .unwrap(),
+            );
+        }
+    }) / REPEATS;
+    let quotient_build = elapsed_ns(|| {
+        for _ in 0..REPEATS {
+            let mut store = base.clone();
+            std::hint::black_box(
+                store
+                    .materialize_semantic_quotient_factors(
+                        &BTreeSet::from([binding.clone()]),
+                        &context,
+                        &registry,
+                    )
+                    .unwrap(),
+            );
+        }
+    }) / REPEATS;
+    let observable_build = elapsed_ns(|| {
+        for _ in 0..REPEATS {
+            let mut store = base.clone();
+            store
+                .install_observable_atom_state(binding.clone(), &context, &registry)
+                .unwrap();
+            std::hint::black_box(());
+        }
+    }) / REPEATS;
+
+    let carrier_measure_build = elapsed_ns(|| {
+        for _ in 0..REPEATS {
+            std::hint::black_box(build_carrier(FiniteFiberProfile::Measure, &values));
+        }
+    }) / REPEATS;
+    let carrier_exact_build = elapsed_ns(|| {
+        for _ in 0..REPEATS {
+            std::hint::black_box(build_carrier(FiniteFiberProfile::ExactFibers, &values));
+        }
+    }) / REPEATS;
+    let carrier_projected_build = elapsed_ns(|| {
+        for _ in 0..REPEATS {
+            std::hint::black_box(build_carrier(FiniteFiberProfile::ProjectedFibers, &values));
+        }
+    }) / REPEATS;
+
+    let carriers = [
+        build_carrier(FiniteFiberProfile::Measure, &values),
+        build_carrier(FiniteFiberProfile::ExactFibers, &values),
+        build_carrier(FiniteFiberProfile::ProjectedFibers, &values),
+    ];
+    let carrier_bytes = carriers.each_ref().map(|carrier| carrier.estimated_retained_bytes_with(|_| 0));
+
+    let result_type = RelExpr::Scan(relation).typecheck(&context, &registry).unwrap();
+    let delta = RelationDelta {
+        inserted: vec![vec![Value::I64(10_000)]],
+        removed: vec![vec![Value::I64(0)]],
+        result_type,
+    };
+    let mut current_stores = [base.clone(), base.clone(), base.clone()];
+    current_stores[0]
+        .install_semantic_statistics(binding.clone(), &context, &registry)
+        .unwrap();
+    current_stores[1]
+        .materialize_semantic_quotient_factors(
+            &BTreeSet::from([binding.clone()]),
+            &context,
+            &registry,
+        )
+        .unwrap();
+    current_stores[2]
+        .install_observable_atom_state(binding.clone(), &context, &registry)
+        .unwrap();
+    let current_delta = current_stores.each_ref().map(|template| {
+        elapsed_ns(|| {
+            for _ in 0..REPEATS {
+                let mut store = template.clone();
+                store
+                    .apply_relation_delta(relation, layout, &delta, &context, &registry)
+                    .unwrap();
+                std::hint::black_box(store);
+            }
+        }) / REPEATS
+    });
+    let carrier_delta = carriers.each_ref().map(|template| {
+        elapsed_ns(|| {
+            for _ in 0..REPEATS {
+                let mut carrier = template.clone();
+                carrier.remove(&0, &[CanonicalEqKey::I64(0)]).unwrap();
+                carrier
+                    .insert(u32::try_from(ROWS).unwrap(), &[CanonicalEqKey::I64(10_000)])
+                    .unwrap();
+                std::hint::black_box(carrier);
+            }
+        }) / REPEATS
+    });
+
+    eprintln!(
+        "semantic-fiber build ns current=[{cardinality_build},{quotient_build},{observable_build}] carrier=[{carrier_measure_build},{carrier_exact_build},{carrier_projected_build}]"
+    );
+    eprintln!(
+        "semantic-fiber delta ns current={current_delta:?} carrier={carrier_delta:?}; carrier structural bytes={carrier_bytes:?}"
+    );
+
+    assert_eq!(carriers[0].row_count(), ROWS);
+    assert_eq!(carriers[1].distinct_joint_key_count(), usize::try_from(DISTINCT).unwrap());
+    assert_eq!(carriers[2].distinct_joint_key_count(), usize::try_from(DISTINCT).unwrap());
+    assert!(carrier_bytes[0] < carrier_bytes[1]);
+}
+
+#[test]
+#[ignore = "PASS572 hostile frontier probe across cardinality and composite-key distributions"]
+#[allow(clippy::too_many_lines)]
+fn semantic_fiber_hostile_distribution_frontier_pass572() {
+    use kernel_semantics::CanonicalEqKey;
+    use kernel_semantics::fiber_carrier::{FiniteFiberCarrier, FiniteFiberProfile};
+
+    fn family_bytes(store: &PhysicalStore, profile: SemanticFiberProfile) -> usize {
+        store
+            .artifact_memory_report()
+            .families
+            .get(&PhysicalArtifactFamily::SemanticFiber(profile))
+            .expect("semantic-fiber profile installed")
+            .estimated_retained_bytes
+    }
+
+    fn probe_single(rows: usize, distinct: i64, layout_id: u64, label: &str) {
+        let (context, registry, relation) = planning_context();
+        let layout = LayoutBinding {
+            id: LayoutId(u128::from(layout_id)),
+            family: LayoutFamily::Columnar,
+        };
+        let equivalence = sid(101);
+        let binding = SemanticIndexBinding::single(relation, layout, 0, equivalence);
+        let rows_i64 = i64::try_from(rows).unwrap();
+        let values = (0_i64..rows_i64)
+            .map(|value| value % distinct)
+            .collect::<Vec<_>>();
+        let mut base = PhysicalStore::default();
+        base.install(
+            relation,
+            layout,
+            NativeRelation::typed_columnar(vec![NativeColumn::I64(values.clone().into())]).unwrap(),
+        )
+        .unwrap();
+
+        let mut quotient = base.clone();
+        let quotient_started = std::time::Instant::now();
+        quotient
+            .materialize_semantic_quotient_factors(
+                &BTreeSet::from([binding.clone()]),
+                &context,
+                &registry,
+            )
+            .unwrap();
+        let quotient_build = quotient_started.elapsed().as_nanos();
+
+        let mut observable = base;
+        let observable_started = std::time::Instant::now();
+        observable
+            .install_observable_atom_state(binding, &context, &registry)
+            .unwrap();
+        let observable_build = observable_started.elapsed().as_nanos();
+
+        let mut projected = FiniteFiberCarrier::new(FiniteFiberProfile::ProjectedFibers, 1);
+        for (row, value) in values.into_iter().enumerate() {
+            projected
+                .insert(u32::try_from(row).unwrap(), &[CanonicalEqKey::I64(value)])
+                .unwrap();
+        }
+        eprintln!(
+            "PASS572 frontier {label}: rows={rows} distinct={distinct} quotient_bytes={} samf_bytes={} projected_bytes={} quotient_build_ns={quotient_build} samf_build_ns={observable_build}",
+            family_bytes(&quotient, SemanticFiberProfile::Quotient),
+            family_bytes(&observable, SemanticFiberProfile::Observable),
+            projected.estimated_retained_bytes_with(|_| 0),
+        );
+    }
+
+    probe_single(4096, 8, 1_059, "D<<N");
+    probe_single(4096, 4096, 1_060, "D~=N");
+
+    let relation = sid(390);
+    let text_equivalence = sid(391);
+    let i64_equivalence = sid(392);
+    let (context, registry) =
+        text_i64_semantic_fixture(&[relation], text_equivalence, i64_equivalence, 47);
+    let layout = LayoutBinding {
+        id: LayoutId(1_061),
+        family: LayoutFamily::Columnar,
+    };
+    let texts = (0..4096)
+        .map(|row| format!("class-{:02}-{}", row % 64, "x".repeat(128)))
+        .collect::<Vec<_>>();
+    let numbers = (0..4096).map(|row| i64::from(row / 64)).collect::<Vec<_>>();
+    let binding = SemanticIndexBinding {
+        relation,
+        layout,
+        key_parts: vec![
+            SemanticIndexKeyPart {
+                column: 0,
+                equivalence: text_equivalence,
+            },
+            SemanticIndexKeyPart {
+                column: 1,
+                equivalence: i64_equivalence,
+            },
+        ],
+    };
+    let mut base = PhysicalStore::default();
+    base.install(
+        relation,
+        layout,
+        NativeRelation::typed_columnar(vec![
+            NativeColumn::Text(texts.clone().into()),
+            NativeColumn::I64(numbers.clone().into()),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let mut quotient = base.clone();
+    let quotient_started = std::time::Instant::now();
+    quotient
+        .materialize_semantic_quotient_factors(
+            &BTreeSet::from([binding.clone()]),
+            &context,
+            &registry,
+        )
+        .unwrap();
+    let quotient_build = quotient_started.elapsed().as_nanos();
+    let mut observable = base;
+    let observable_started = std::time::Instant::now();
+    observable
+        .install_observable_atom_state(binding, &context, &registry)
+        .unwrap();
+    let observable_build = observable_started.elapsed().as_nanos();
+    let mut projected = FiniteFiberCarrier::new(FiniteFiberProfile::ProjectedFibers, 2);
+    for row in 0..4096 {
+        projected
+            .insert(
+                u32::try_from(row).unwrap(),
+                &[
+                    CanonicalEqKey::TextAsciiCaseInsensitive(texts[row].to_ascii_lowercase()),
+                    CanonicalEqKey::I64(numbers[row]),
+                ],
+            )
+            .unwrap();
+    }
+    eprintln!(
+        "PASS572 frontier Cartesian+large-key: rows=4096 joint=4096 quotient_bytes={} samf_bytes={} projected_bytes={} quotient_build_ns={quotient_build} samf_build_ns={observable_build}",
+        family_bytes(&quotient, SemanticFiberProfile::Quotient),
+        family_bytes(&observable, SemanticFiberProfile::Observable),
+        projected.estimated_retained_bytes_with(|key| match key {
+            CanonicalEqKey::TextExact(value) | CanonicalEqKey::TextAsciiCaseInsensitive(value) => value.capacity(),
+            _ => 0,
+        }),
+    );
+}

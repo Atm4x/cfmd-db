@@ -137,39 +137,17 @@ fn observable_atom_estimated_retained_bytes(state: &MaterializedObservableAtomSt
     let row_bytes = std::mem::size_of::<PhysicalRowId>();
     let atom_rows = state.fabric.row_count();
     let atoms = state.fabric.atom_count();
-    let coordinates = state.observables.len();
+    let coordinates = state.binding.key_parts.len();
     let projection_refs = state.fabric.projection_atom_reference_count();
     let projected_classes = state.fabric.projected_class_count();
-    let projection_mapping_bytes =
-        state
-            .projection
-            .materialized_mapping()
-            .iter()
-            .fold(0_usize, |bytes, (source, target)| {
-                bytes
-                    .saturating_add(std::mem::size_of::<Vec<kernel_types::EqClassId>>() * 2)
-                    .saturating_add(source.capacity().saturating_mul(class_bytes))
-                    .saturating_add(target.capacity().saturating_mul(class_bytes))
-            });
 
     std::mem::size_of::<MaterializedObservableAtomState>()
         .saturating_add(semantic_index_binding_heap_bytes(&state.binding))
-        .saturating_add(
-            state
-                .observables
-                .capacity()
-                .saturating_mul(std::mem::size_of::<kernel_types::RevisionObservableId>()),
-        )
         .saturating_add(atom_rows.saturating_mul(row_bytes.saturating_mul(2)))
         .saturating_add(atom_rows.saturating_mul(class_bytes))
-        .saturating_add(
-            atoms
-                .saturating_mul(coordinates)
-                .saturating_mul(class_bytes),
-        )
+        .saturating_add(atoms.saturating_mul(coordinates).saturating_mul(class_bytes))
         .saturating_add(projection_refs.saturating_mul(class_bytes))
         .saturating_add(projected_classes.saturating_mul(class_bytes))
-        .saturating_add(projection_mapping_bytes)
 }
 
 fn i64_index_estimated_retained_bytes(state: &MaterializedI64IndexState) -> usize {
@@ -186,19 +164,19 @@ fn i64_index_estimated_retained_bytes(state: &MaterializedI64IndexState) -> usiz
 fn quotient_factor_estimated_retained_bytes(
     state: &MaterializedSemanticQuotientFactorState,
 ) -> usize {
-    let mut bytes = std::mem::size_of::<MaterializedSemanticQuotientFactorState>()
-        .saturating_add(semantic_index_binding_heap_bytes(&state.binding));
-    for (key, identities) in &state.buckets {
-        bytes = bytes
-            .saturating_add(semantic_key_retained_bytes(key))
-            .saturating_add(identities.estimated_retained_bytes());
-    }
-    for key in state.reverse.values() {
-        bytes = bytes
-            .saturating_add(std::mem::size_of::<PhysicalRowId>())
-            .saturating_add(semantic_key_retained_bytes(key));
-    }
-    bytes
+    std::mem::size_of::<MaterializedSemanticQuotientFactorState>()
+        .saturating_add(semantic_index_binding_heap_bytes(&state.binding))
+        .saturating_add(
+            state
+                .compiled
+                .capacity()
+                .saturating_mul(std::mem::size_of::<kernel_semantics::CompiledEquivalence>()),
+        )
+        .saturating_add(
+            state
+                .retention
+                .estimated_heap_bytes_with(canonical_eq_key_heap_bytes),
+        )
 }
 
 fn semantic_statistics_estimated_retained_bytes(

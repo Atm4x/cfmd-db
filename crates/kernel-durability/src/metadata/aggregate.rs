@@ -62,7 +62,6 @@ type DecodedRevisionEffectState = (
     BTreeMap<RevisionId, BTreeSet<RevisionEffectId>>,
 );
 
-#[cfg(test)]
 pub(crate) fn encode(metadata: &DurableStoreMetadata) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::new();
     encode_into(&mut out, metadata)?;

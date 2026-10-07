@@ -333,6 +333,7 @@ pub fn relation_dynamic_violation_measure_selective_without_model_rules(
 
 pub fn model_rule_violation_measure_for_relation_mutation(
     context: &SemanticContext,
+    registry: &SemanticRegistry,
     state: &DatabaseState,
     relation: SemanticId,
     footprint: &crate::RelationMutationFootprint,
@@ -341,7 +342,7 @@ pub fn model_rule_violation_measure_for_relation_mutation(
     let mut measure = ViolationMeasure::new();
     for (rule_index, rule) in compiled_rules.model_rules_for_mutation(relation, footprint) {
         let mass = rule
-            .violation_mass(state)
+            .violation_mass_semantic(context, registry, state)
             .map_err(|_| ValidationError::ModelRuleEvaluation)?;
         if mass != 0 {
             measure.add(DynamicViolationWitness::ModelRule { rule_index }, mass)?;
@@ -430,7 +431,7 @@ fn relation_dynamic_violation_measure_with_plan(
         let footprint = footprint.unwrap_or(&full);
         for (rule_index, rule) in compiled_rules.model_rules_for_mutation(relation_id, footprint) {
             let mass = rule
-                .violation_mass(state)
+                .violation_mass_semantic(context, registry, state)
                 .map_err(|_| ValidationError::ModelRuleEvaluation)?;
             if mass != 0 {
                 measure.add(DynamicViolationWitness::ModelRule { rule_index }, mass)?;

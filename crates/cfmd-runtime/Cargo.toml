@@ -9,6 +9,7 @@ license.workspace = true
 kernel-model = { path = "../kernel-model" }
 kernel-lens = { path = "../kernel-lens" }
 kernel-durability = { path = "../kernel-durability" }
+kernel-auth = { path = "../kernel-auth" }
 kernel-plan = { path = "../kernel-plan" }
 kernel-query = { path = "../kernel-query" }
 kernel-realization = { path = "../kernel-realization" }

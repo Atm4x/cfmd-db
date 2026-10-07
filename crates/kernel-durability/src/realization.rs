@@ -5,8 +5,9 @@ use kernel_change::RevisionEffectId;
 use kernel_model::DatabaseState;
 use kernel_realization::{
     DirectFactorizedFieldRoot, DirectFactorizedRealizationRoot, DirectFactorizedRelationRoot,
-    FactorizedRealizationRoot, FieldColumnSegment, PhysicalAtomId, PhysicalAtomPayload,
-    PhysicalAtomStore, RelationColumnSegment,
+    FactorizedRealizationRoot, FieldColumnSegment, PackedSumColumn, PackedSumFieldSegment,
+    PackedSumRelationSegment, PhysicalAtomId, PhysicalAtomPayload, PhysicalAtomStore,
+    RelationColumnSegment,
 };
 use kernel_revision::Revision;
 use kernel_schema::SemanticContext;
@@ -15,14 +16,14 @@ use kernel_types::{EntityId, RevisionId, SemanticId};
 
 use crate::binary_codec::{
     BinarySink, BinarySource, CountingBinarySink, Cursor, ReadBinarySource, StreamingBinarySink,
-    encode_rows, encode_value, push_bytes, push_len, push_u64, push_u128,
+    encode_rows, encode_value, push_bytes, push_len, push_u32, push_u64, push_u128,
 };
 use crate::checkpoint::{decode_state, encode_state};
 use crate::runtime::{CodecError, DurabilityError};
 use crate::{DurableModelDelta, SingleFileContainer, SingleFileSectionKind};
 
 const MAGIC: [u8; 4] = *b"CFPR";
-const VERSION: u16 = 3;
+const VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableHistoricalRealizationRoot {
@@ -193,6 +194,10 @@ impl DurableFactorizedReadSnapshot {
                         .iter()
                         .map(|(entity, value)| (entity, value.clone()))
                         .collect::<BTreeMap<_, _>>(),
+                    Some(PhysicalAtomPayload::PackedSumFieldSegment(column)) => column
+                        .iter()
+                        .collect::<Result<BTreeMap<_, _>, _>>()
+                        .map_err(|_| protocol("historical packed sum field atom is invalid"))?,
                     _ => return Err(protocol("historical factorized field atom is invalid")),
                 },
                 None => BTreeMap::new(),
@@ -237,6 +242,86 @@ impl DurableFactorizedReadSnapshot {
             root,
         })
     }
+}
+
+fn encode_packed_sum_column(
+    out: &mut impl BinarySink,
+    column: &PackedSumColumn,
+) -> Result<(), CodecError> {
+    push_len(out, column.variants().len())?;
+    for variant in column.variants() {
+        push_u128(out, variant.raw());
+    }
+    out.push(column.bits_per_tag());
+    push_len(out, column.len())?;
+    push_bytes(out, column.packed_tags())?;
+    match column.payload_ordinals() {
+        Some(ordinals) => {
+            out.push(1);
+            push_len(out, ordinals.len())?;
+            for ordinal in ordinals {
+                push_u32(out, *ordinal);
+            }
+        }
+        None => out.push(0),
+    }
+    push_len(out, column.payloads().len())?;
+    for (variant, payloads) in column.payloads() {
+        push_u128(out, variant.raw());
+        push_len(out, payloads.len())?;
+        for payload in payloads {
+            encode_value(out, payload, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_packed_sum_column(
+    cursor: &mut impl BinarySource,
+) -> Result<PackedSumColumn, DurabilityError> {
+    let variant_count = cursor.len().map_err(corrupt)?;
+    let mut variants = Vec::with_capacity(cursor.bounded_capacity(variant_count));
+    for _ in 0..variant_count {
+        variants.push(SemanticId::new(cursor.u128().map_err(corrupt)?));
+    }
+    let bits_per_tag = cursor.u8().map_err(corrupt)?;
+    let len = cursor.len().map_err(corrupt)?;
+    let packed_len = cursor.len().map_err(corrupt)?;
+    let packed_tags = cursor.take_owned(packed_len).map_err(corrupt)?;
+    let payload_ordinals = match cursor.u8().map_err(corrupt)? {
+        0 => None,
+        1 => {
+            let ordinal_count = cursor.len().map_err(corrupt)?;
+            let mut ordinals = Vec::with_capacity(cursor.bounded_capacity(ordinal_count));
+            for _ in 0..ordinal_count {
+                ordinals.push(cursor.u32().map_err(corrupt)?);
+            }
+            Some(ordinals)
+        }
+        _ => return Err(corrupt("invalid packed sum payload ordinal presence tag")),
+    };
+    let payload_variant_count = cursor.len().map_err(corrupt)?;
+    let mut payloads = BTreeMap::new();
+    for _ in 0..payload_variant_count {
+        let variant = SemanticId::new(cursor.u128().map_err(corrupt)?);
+        let count = cursor.len().map_err(corrupt)?;
+        let mut values = Vec::with_capacity(cursor.bounded_capacity(count));
+        for _ in 0..count {
+            values.push(cursor.value(0).map_err(corrupt)?);
+        }
+        if payloads.insert(variant, values).is_some() {
+            return Err(corrupt("duplicate packed sum payload variant"));
+        }
+    }
+    PackedSumColumn::from_physical_parts(
+        variants,
+        bits_per_tag,
+        len,
+        packed_tags,
+        payload_ordinals,
+        payloads,
+    )
+    .map_err(|_| corrupt("invalid packed sum physical column"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,6 +628,22 @@ fn encode_atom_payload(
             encode_state(&mut encoded, &state)?;
             push_bytes(out, &encoded)?;
         }
+        PhysicalAtomPayload::PackedSumFieldSegment(segment) => {
+            out.push(7);
+            push_len(out, segment.entities().len())?;
+            for entity in segment.entities() {
+                push_u128(out, entity.raw());
+            }
+            encode_packed_sum_column(out, segment.column())?;
+        }
+        PhysicalAtomPayload::PackedSumRelationSegment(segment) => {
+            out.push(8);
+            push_u64(
+                out,
+                u64::try_from(segment.start_row()).map_err(|_| CodecError::LengthOverflow)?,
+            );
+            encode_packed_sum_column(out, segment.column())?;
+        }
     }
     Ok(())
 }
@@ -620,6 +721,25 @@ fn decode_atom_payload(
                 return Err(corrupt("durable lifecycle atom contains model state"));
             }
             Ok(PhysicalAtomPayload::Lifecycle((*state.lifecycle).clone()))
+        }
+        7 => {
+            let count = cursor.len().map_err(corrupt)?;
+            let mut entities = Vec::with_capacity(cursor.bounded_capacity(count));
+            for _ in 0..count {
+                entities.push(EntityId::new(cursor.u128().map_err(corrupt)?));
+            }
+            let column = decode_packed_sum_column(cursor)?;
+            let segment = PackedSumFieldSegment::from_physical_parts(entities, column)
+                .map_err(|_| corrupt("invalid durable packed sum field segment"))?;
+            Ok(PhysicalAtomPayload::PackedSumFieldSegment(segment))
+        }
+        8 => {
+            let start_row = usize::try_from(cursor.u64().map_err(corrupt)?)
+                .map_err(|_| corrupt("packed sum relation start row overflow"))?;
+            let column = decode_packed_sum_column(cursor)?;
+            Ok(PhysicalAtomPayload::PackedSumRelationSegment(
+                PackedSumRelationSegment::from_physical_parts(start_row, column),
+            ))
         }
         _ => Err(corrupt("unknown durable physical atom payload tag")),
     }
@@ -843,7 +963,7 @@ fn decode_durable_factorized_realization_from_source(
         return Err(corrupt("durable physical realization magic mismatch"));
     }
     let version = cursor.u16().map_err(corrupt)?;
-    if !matches!(version, 1 | 2 | VERSION) || cursor.u16().map_err(corrupt)? != 0 {
+    if version != VERSION || cursor.u16().map_err(corrupt)? != 0 {
         return Err(corrupt("unsupported durable physical realization version"));
     }
     let revision = RevisionId::new(cursor.u64().map_err(corrupt)?);
@@ -860,49 +980,41 @@ fn decode_durable_factorized_realization_from_source(
     }
     let root = decode_direct_root(cursor)?;
     let mut historical_roots = BTreeMap::new();
-    if version >= 2 {
-        let historical_count = cursor.len().map_err(corrupt)?;
-        let mut previous_effect = None;
-        for _ in 0..historical_count {
-            let effect_id = RevisionEffectId(cursor.u128().map_err(corrupt)?);
-            if previous_effect.is_some_and(|previous| previous >= effect_id) {
+    let historical_count = cursor.len().map_err(corrupt)?;
+    let mut previous_effect = None;
+    for _ in 0..historical_count {
+        let effect_id = RevisionEffectId(cursor.u128().map_err(corrupt)?);
+        if previous_effect.is_some_and(|previous| previous >= effect_id) {
+            return Err(corrupt(
+                "historical realization roots are not strictly sorted and unique",
+            ));
+        }
+        previous_effect = Some(effect_id);
+        let historical_revision = RevisionId::new(cursor.u64().map_err(corrupt)?);
+        let semantic_context = match cursor.u8().map_err(corrupt)? {
+            0 => None,
+            1 => {
+                let context_version = cursor.u16().map_err(corrupt)?;
+                if context_version != crate::checkpoint::CHECKPOINT_CODEC_VERSION {
+                    return Err(corrupt("historical semantic context codec is unsupported"));
+                }
+                Some(crate::checkpoint::decode_context(cursor, context_version)?)
+            }
+            _ => {
                 return Err(corrupt(
-                    "historical realization roots are not strictly sorted and unique",
+                    "historical semantic context presence tag is invalid",
                 ));
             }
-            previous_effect = Some(effect_id);
-            let historical_revision = RevisionId::new(cursor.u64().map_err(corrupt)?);
-            let semantic_context = if version >= 3 {
-                match cursor.u8().map_err(corrupt)? {
-                    0 => None,
-                    1 => {
-                        let context_version = cursor.u16().map_err(corrupt)?;
-                        if context_version > crate::checkpoint::CHECKPOINT_CODEC_VERSION {
-                            return Err(corrupt(
-                                "historical semantic context codec is unsupported",
-                            ));
-                        }
-                        Some(crate::checkpoint::decode_context(cursor, context_version)?)
-                    }
-                    _ => {
-                        return Err(corrupt(
-                            "historical semantic context presence tag is invalid",
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-            let historical_root = decode_direct_root(cursor)?;
-            historical_roots.insert(
-                effect_id,
-                DurableHistoricalRealizationRoot {
-                    revision: historical_revision,
-                    semantic_context,
-                    root: historical_root,
-                },
-            );
-        }
+        };
+        let historical_root = decode_direct_root(cursor)?;
+        historical_roots.insert(
+            effect_id,
+            DurableHistoricalRealizationRoot {
+                revision: historical_revision,
+                semantic_context,
+                root: historical_root,
+            },
+        );
     }
     cursor.finish().map_err(corrupt)?;
     let atoms = PhysicalAtomStore::from_exact_atoms(atoms)
@@ -1512,5 +1624,71 @@ mod tests {
         assert_eq!(active_atoms.len(), active_root.dependencies().len());
         drop(final_open);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod pass549_packed_sum_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use kernel_model::{DatabaseState, Value};
+    use kernel_realization::{PhysicalAtomPayload, realize_database_state_factorized};
+    use kernel_schema::{
+        FieldDef, ScalarType, Schema, SemanticContext, SemanticEnvironment, TypeExpr,
+    };
+    use kernel_types::{EntityId, RevisionId, SchemaRevisionId, SemanticEnvId, SemanticId};
+
+    use super::{decode_factorized_realization, encode_factorized_realization};
+
+    #[test]
+    fn packed_sum_physical_atoms_roundtrip_through_durable_realization_v4() {
+        let owner = SemanticId::new(549_200);
+        let field = SemanticId::new(549_201);
+        let idle = SemanticId::new(549_202);
+        let running = SemanticId::new(549_203);
+        let mut schema = Schema::new(SchemaRevisionId::new(549));
+        schema
+            .define_field(FieldDef {
+                id: field,
+                owner,
+                value: TypeExpr::Sum(BTreeMap::from([
+                    (idle, TypeExpr::Scalar(ScalarType::Unit)),
+                    (running, TypeExpr::Scalar(ScalarType::I64)),
+                ])),
+            })
+            .unwrap();
+        let context = SemanticContext {
+            schema,
+            environment: SemanticEnvironment::new(SemanticEnvId::new(549)),
+        };
+        let mut state = DatabaseState::default();
+        state.model.carriers.insert(owner, BTreeSet::new());
+        for index in 0..32_u128 {
+            let entity = EntityId::new(index + 1);
+            state.lifecycle.entities.insert(entity);
+            state.lifecycle.roots.insert(entity);
+            state.model.carriers.get_mut(&owner).unwrap().insert(entity);
+            state.model.fields.insert(
+                (field, entity),
+                Value::Variant {
+                    tag: if index % 2 == 0 { idle } else { running },
+                    value: Box::new(if index % 2 == 0 {
+                        Value::Unit
+                    } else {
+                        Value::I64(i64::try_from(index).expect("fixture index fits i64"))
+                    }),
+                },
+            );
+        }
+        let (atoms, root) = realize_database_state_factorized(&state, &context).unwrap();
+        let bytes = encode_factorized_realization(RevisionId::new(7), &atoms, &root).unwrap();
+        let (revision, decoded_atoms, decoded_root) =
+            decode_factorized_realization(&bytes).unwrap();
+        assert_eq!(revision, RevisionId::new(7));
+        assert_eq!(decoded_root.evaluate(&decoded_atoms).unwrap(), state);
+        assert!(decoded_atoms.iter().any(|(_, atom)| matches!(
+            atom.payload(),
+            PhysicalAtomPayload::PackedSumFieldSegment(_)
+        )));
     }
 }

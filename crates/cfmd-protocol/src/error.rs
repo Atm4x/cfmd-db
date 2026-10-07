@@ -8,10 +8,13 @@ pub enum ProtocolErrorCode {
     InvalidRequest,
     InvalidSchema,
     TypeMismatch,
+    ContractNotRepresentable,
     Cardinality,
     NotFound,
     StaleRevision,
     TransactionConflict,
+    FormationProofUnavailable,
+    FormationProofInvalidated,
     HistoryConflict,
     InvariantViolation,
     NonReversibleHistory,
@@ -76,6 +79,10 @@ impl From<cfmd_runtime::Error> for ProtocolError {
             ErrorKind::TypeMismatch => {
                 (ProtocolErrorCode::TypeMismatch, value.message().to_owned())
             }
+            ErrorKind::ContractNotRepresentable => (
+                ProtocolErrorCode::ContractNotRepresentable,
+                value.message().to_owned(),
+            ),
             ErrorKind::Cardinality => (ProtocolErrorCode::Cardinality, value.message().to_owned()),
             ErrorKind::NotFound => (ProtocolErrorCode::NotFound, value.message().to_owned()),
             ErrorKind::StaleRevision => {
@@ -83,6 +90,14 @@ impl From<cfmd_runtime::Error> for ProtocolError {
             }
             ErrorKind::TransactionConflict => (
                 ProtocolErrorCode::TransactionConflict,
+                value.message().to_owned(),
+            ),
+            ErrorKind::FormationProofUnavailable => (
+                ProtocolErrorCode::FormationProofUnavailable,
+                value.message().to_owned(),
+            ),
+            ErrorKind::FormationProofInvalidated => (
+                ProtocolErrorCode::FormationProofInvalidated,
                 value.message().to_owned(),
             ),
             ErrorKind::HistoryRebaseConflict => (
